@@ -1,0 +1,4 @@
+nimcache/
+nimrod
+*.swp
+.env
