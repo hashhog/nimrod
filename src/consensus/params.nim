@@ -41,6 +41,9 @@ type
     p2pPort*: uint16
     rpcPort*: uint16
 
+# Alias for networkMagic for convenience
+template magic*(p: ConsensusParams): array[4, byte] = p.networkMagic
+
 # Global consensus constants
 const
   MaxMoney* = Satoshi(21_000_000 * 100_000_000'i64)
