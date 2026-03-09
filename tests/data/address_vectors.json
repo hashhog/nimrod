@@ -1,0 +1,81 @@
+{
+  "comment": "Bitcoin address encoding test vectors",
+  "p2pkh_mainnet": [
+    {
+      "comment": "Satoshi's genesis address",
+      "pubkey_hash": "62e907b15cbf27d5425399ebf6f0fb50ebb88f18",
+      "address": "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+    },
+    {
+      "comment": "All zeros pubkey hash",
+      "pubkey_hash": "0000000000000000000000000000000000000000",
+      "address": "1111111111111111111114oLvT2"
+    }
+  ],
+  "p2pkh_testnet": [
+    {
+      "pubkey_hash": "751e76e8199196d454941c45d1b3a323f1433bd6",
+      "address": "mrCDrCybB6J1vRfbwM5hemdJz73FwDBC8r"
+    }
+  ],
+  "p2sh_mainnet": [
+    {
+      "comment": "BIP-16 P2SH address",
+      "script_hash": "89abcdefabbaabbaabbaabbaabbaabbaabbaabba",
+      "address": "3EktnHQD7RiAE6uzMj2ZifT9YgRrkSgzQX"
+    }
+  ],
+  "bech32_vectors": [
+    {
+      "comment": "BIP-173 test vector - P2WPKH mainnet",
+      "hrp": "bc",
+      "witness_version": 0,
+      "witness_program": "751e76e8199196d454941c45d1b3a323f1433bd6",
+      "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    },
+    {
+      "comment": "BIP-173 test vector - P2WSH mainnet",
+      "hrp": "bc",
+      "witness_version": 0,
+      "witness_program": "1863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262",
+      "address": "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+    },
+    {
+      "comment": "BIP-173 test vector - P2WPKH testnet",
+      "hrp": "tb",
+      "witness_version": 0,
+      "witness_program": "751e76e8199196d454941c45d1b3a323f1433bd6",
+      "address": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+    }
+  ],
+  "bech32m_vectors": [
+    {
+      "comment": "BIP-350 test vector - P2TR mainnet",
+      "hrp": "bc",
+      "witness_version": 1,
+      "witness_program": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "address": "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"
+    },
+    {
+      "comment": "BIP-350 test vector - P2TR testnet",
+      "hrp": "tb",
+      "witness_version": 1,
+      "witness_program": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "address": "tb1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq47zagq"
+    }
+  ],
+  "invalid_addresses": [
+    {
+      "comment": "Invalid checksum",
+      "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5"
+    },
+    {
+      "comment": "Mixed case",
+      "address": "bc1qW508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    },
+    {
+      "comment": "Invalid character",
+      "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3tb"
+    }
+  ]
+}
