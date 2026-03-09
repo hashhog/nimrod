@@ -26,8 +26,8 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Difficulty target functions (compact/target conversion)
 - [x] Genesis block construction and verification
 - [x] Block/transaction validation
-- [x] RocksDB storage layer
-- [x] Chainstate and UTXO management
+- [x] RocksDB storage (column families via FFI, UTXO set, block index)
+- [x] Chainstate management (atomic block connect/disconnect, write batches)
 - [x] P2P network messages
 - [x] Peer connection handling (chronos async)
 - [x] Block synchronization
