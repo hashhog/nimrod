@@ -16,6 +16,7 @@ tests/test_consensus
 tests/test_storage
 tests/test_messages
 tests/test_peer
+tests/test_mempool
 
 # Storage test artifacts
 src/storage/chainstate
