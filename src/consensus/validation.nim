@@ -19,6 +19,19 @@ proc ok*(): ValidationResult =
 proc err*(msg: string): ValidationResult =
   ValidationResult(valid: false, error: msg)
 
+proc countLeadingZeroBits(hash: array[32, byte]): int =
+  ## Count leading zero bits in a 256-bit hash (stored little-endian)
+  ## Starts from the most significant byte (index 31)
+  for i in countdown(31, 0):
+    if hash[i] == 0:
+      result += 8
+    else:
+      var b = hash[i]
+      while (b and 0x80) == 0:
+        result += 1
+        b = b shl 1
+      return
+
 proc checkBlockHeader*(
   header: BlockHeader,
   params: ConsensusParams,
@@ -48,17 +61,6 @@ proc checkBlockHeader*(
 
   ok()
 
-proc countLeadingZeroBits(hash: array[32, byte]): int =
-  for i in countdown(31, 0):
-    if hash[i] == 0:
-      result += 8
-    else:
-      var b = hash[i]
-      while (b and 0x80) == 0:
-        result += 1
-        b = b shl 1
-      return
-
 proc checkTransaction*(tx: Transaction, params: ConsensusParams): ValidationResult =
   ## Basic transaction validation
 
@@ -80,10 +82,10 @@ proc checkTransaction*(tx: Transaction, params: ConsensusParams): ValidationResu
   for output in tx.outputs:
     if int64(output.value) < 0:
       return err("negative output value")
-    if output.value > MAX_MONEY:
+    if output.value > MaxMoney:
       return err("output value too large")
     totalOutput = totalOutput + output.value
-    if totalOutput > MAX_MONEY:
+    if totalOutput > MaxMoney:
       return err("total output value too large")
 
   ok()
