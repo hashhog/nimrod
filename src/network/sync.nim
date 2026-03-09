@@ -689,7 +689,7 @@ type
 
 proc newBlockSync*(pm: PeerManager, cs: ChainState,
                    params: ConsensusParams): BlockSync =
-  newSyncManager(pm, cs, params)
+  newSyncManager(pm, cs.db, params)
 
 proc getBlockLocator*(sync: BlockSync): seq[BlockHash] =
   let locator = sync.buildBlockLocator()
