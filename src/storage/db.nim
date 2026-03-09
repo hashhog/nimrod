@@ -1,0 +1,330 @@
+## RocksDB wrapper for persistent storage
+## Uses FFI bindings via importc with column family support
+
+import std/[os, options]
+
+export options
+
+const LibRocksDb* = "librocksdb.so"
+
+type
+  RocksDbError* = object of CatchableError
+
+  # Opaque pointer types for RocksDB C API
+  RocksDbPtr* = pointer
+  RocksDbOptionsPtr* = pointer
+  RocksDbWriteOptionsPtr* = pointer
+  RocksDbReadOptionsPtr* = pointer
+  RocksDbColumnFamilyHandle* = pointer
+  RocksDbWriteBatchPtr* = pointer
+  RocksDbIteratorPtr* = pointer
+
+# RocksDB C API bindings
+{.push importc, dynlib: LibRocksDb.}
+# Options
+proc rocksdb_options_create*(): RocksDbOptionsPtr
+proc rocksdb_options_destroy*(opts: RocksDbOptionsPtr)
+proc rocksdb_options_set_create_if_missing*(opts: RocksDbOptionsPtr, v: uint8)
+proc rocksdb_options_set_create_missing_column_families*(opts: RocksDbOptionsPtr, v: uint8)
+proc rocksdb_options_set_prefix_extractor*(opts: RocksDbOptionsPtr, extractor: pointer)
+proc rocksdb_options_increase_parallelism*(opts: RocksDbOptionsPtr, total_threads: cint)
+proc rocksdb_options_optimize_level_style_compaction*(opts: RocksDbOptionsPtr, memtable_budget: uint64)
+
+# Read/Write options
+proc rocksdb_writeoptions_create*(): RocksDbWriteOptionsPtr
+proc rocksdb_writeoptions_destroy*(opts: RocksDbWriteOptionsPtr)
+proc rocksdb_writeoptions_set_sync*(opts: RocksDbWriteOptionsPtr, v: uint8)
+proc rocksdb_readoptions_create*(): RocksDbReadOptionsPtr
+proc rocksdb_readoptions_destroy*(opts: RocksDbReadOptionsPtr)
+
+# Database operations
+proc rocksdb_open*(opts: RocksDbOptionsPtr, name: cstring, errptr: ptr cstring): RocksDbPtr
+proc rocksdb_open_column_families*(opts: RocksDbOptionsPtr, name: cstring,
+    num_column_families: cint, column_family_names: ptr cstring,
+    column_family_options: ptr RocksDbOptionsPtr,
+    column_family_handles: ptr RocksDbColumnFamilyHandle,
+    errptr: ptr cstring): RocksDbPtr
+proc rocksdb_close*(db: RocksDbPtr)
+
+# Basic CRUD
+proc rocksdb_put*(db: RocksDbPtr, writeOpts: RocksDbWriteOptionsPtr,
+    key: cstring, keylen: csize_t, val: cstring, vallen: csize_t, errptr: ptr cstring)
+proc rocksdb_get*(db: RocksDbPtr, readOpts: RocksDbReadOptionsPtr,
+    key: cstring, keylen: csize_t, vallen: ptr csize_t, errptr: ptr cstring): cstring
+proc rocksdb_delete*(db: RocksDbPtr, writeOpts: RocksDbWriteOptionsPtr,
+    key: cstring, keylen: csize_t, errptr: ptr cstring)
+
+# Column family CRUD
+proc rocksdb_put_cf*(db: RocksDbPtr, writeOpts: RocksDbWriteOptionsPtr,
+    cf: RocksDbColumnFamilyHandle, key: cstring, keylen: csize_t,
+    val: cstring, vallen: csize_t, errptr: ptr cstring)
+proc rocksdb_get_cf*(db: RocksDbPtr, readOpts: RocksDbReadOptionsPtr,
+    cf: RocksDbColumnFamilyHandle, key: cstring, keylen: csize_t,
+    vallen: ptr csize_t, errptr: ptr cstring): cstring
+proc rocksdb_delete_cf*(db: RocksDbPtr, writeOpts: RocksDbWriteOptionsPtr,
+    cf: RocksDbColumnFamilyHandle, key: cstring, keylen: csize_t, errptr: ptr cstring)
+
+# Column family management
+proc rocksdb_create_column_family*(db: RocksDbPtr, opts: RocksDbOptionsPtr,
+    name: cstring, errptr: ptr cstring): RocksDbColumnFamilyHandle
+proc rocksdb_drop_column_family*(db: RocksDbPtr, cf: RocksDbColumnFamilyHandle, errptr: ptr cstring)
+proc rocksdb_column_family_handle_destroy*(cf: RocksDbColumnFamilyHandle)
+proc rocksdb_list_column_families*(opts: RocksDbOptionsPtr, name: cstring,
+    lencf: ptr csize_t, errptr: ptr cstring): ptr cstring
+proc rocksdb_list_column_families_destroy*(list: ptr cstring, len: csize_t)
+
+# Write batch
+proc rocksdb_writebatch_create*(): RocksDbWriteBatchPtr
+proc rocksdb_writebatch_destroy*(batch: RocksDbWriteBatchPtr)
+proc rocksdb_writebatch_clear*(batch: RocksDbWriteBatchPtr)
+proc rocksdb_writebatch_put*(batch: RocksDbWriteBatchPtr,
+    key: cstring, keylen: csize_t, val: cstring, vallen: csize_t)
+proc rocksdb_writebatch_put_cf*(batch: RocksDbWriteBatchPtr,
+    cf: RocksDbColumnFamilyHandle, key: cstring, keylen: csize_t,
+    val: cstring, vallen: csize_t)
+proc rocksdb_writebatch_delete*(batch: RocksDbWriteBatchPtr,
+    key: cstring, keylen: csize_t)
+proc rocksdb_writebatch_delete_cf*(batch: RocksDbWriteBatchPtr,
+    cf: RocksDbColumnFamilyHandle, key: cstring, keylen: csize_t)
+proc rocksdb_write*(db: RocksDbPtr, writeOpts: RocksDbWriteOptionsPtr,
+    batch: RocksDbWriteBatchPtr, errptr: ptr cstring)
+
+# Memory management
+proc rocksdb_free*(p: pointer)
+{.pop.}
+
+type
+  ColumnFamily* = enum
+    cfDefault = "default"
+    cfBlocks = "blocks"           # Full block data
+    cfBlockIndex = "block_index"  # Height -> hash mapping
+    cfUtxo = "utxo"               # UTXO set
+    cfTxIndex = "tx_index"        # TxID -> block location
+    cfMeta = "meta"               # Chain metadata
+
+  Database* = ref object
+    db: RocksDbPtr
+    path: string
+    cfHandles: array[ColumnFamily, RocksDbColumnFamilyHandle]
+    dbOpts: RocksDbOptionsPtr
+    writeOpts: RocksDbWriteOptionsPtr
+    readOpts: RocksDbReadOptionsPtr
+
+  WriteBatch* = ref object
+    batch: RocksDbWriteBatchPtr
+    db: Database
+
+proc checkError(err: cstring) =
+  if err != nil:
+    let msg = $err
+    rocksdb_free(err)
+    raise newException(RocksDbError, msg)
+
+proc cfNames(): array[ColumnFamily, string] =
+  for cf in ColumnFamily:
+    result[cf] = $cf
+
+proc openDatabase*(path: string): Database =
+  ## Open or create a RocksDB database with column families
+  createDir(path)
+
+  result = Database(path: path)
+
+  # Create options
+  result.dbOpts = rocksdb_options_create()
+  rocksdb_options_set_create_if_missing(result.dbOpts, 1)
+  rocksdb_options_set_create_missing_column_families(result.dbOpts, 1)
+  rocksdb_options_increase_parallelism(result.dbOpts, 4)
+  rocksdb_options_optimize_level_style_compaction(result.dbOpts, 512 * 1024 * 1024)
+
+  result.writeOpts = rocksdb_writeoptions_create()
+  result.readOpts = rocksdb_readoptions_create()
+
+  var err: cstring = nil
+
+  # Prepare column family names and options
+  let cfNamesList = cfNames()
+  var
+    cfNamePtrs: array[ColumnFamily, cstring]
+    cfOpts: array[ColumnFamily, RocksDbOptionsPtr]
+
+  for cf in ColumnFamily:
+    cfNamePtrs[cf] = cstring(cfNamesList[cf])
+    cfOpts[cf] = result.dbOpts  # Use same options for all CFs
+
+  # Open with column families
+  result.db = rocksdb_open_column_families(
+    result.dbOpts,
+    cstring(path),
+    cint(ord(high(ColumnFamily)) + 1),
+    addr cfNamePtrs[low(ColumnFamily)],
+    addr cfOpts[low(ColumnFamily)],
+    addr result.cfHandles[low(ColumnFamily)],
+    addr err
+  )
+  checkError(err)
+
+proc close*(db: Database) =
+  if db == nil:
+    return
+
+  for cf in ColumnFamily:
+    if db.cfHandles[cf] != nil:
+      rocksdb_column_family_handle_destroy(db.cfHandles[cf])
+
+  if db.readOpts != nil:
+    rocksdb_readoptions_destroy(db.readOpts)
+  if db.writeOpts != nil:
+    rocksdb_writeoptions_destroy(db.writeOpts)
+  if db.dbOpts != nil:
+    rocksdb_options_destroy(db.dbOpts)
+  if db.db != nil:
+    rocksdb_close(db.db)
+
+proc get*(db: Database, cf: ColumnFamily, key: openArray[byte]): Option[seq[byte]] =
+  var
+    err: cstring = nil
+    vallen: csize_t
+
+  let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
+  let data = rocksdb_get_cf(
+    db.db, db.readOpts, db.cfHandles[cf],
+    keyPtr, csize_t(key.len),
+    addr vallen, addr err
+  )
+  checkError(err)
+
+  if data != nil and vallen > 0:
+    var res = newSeq[byte](vallen)
+    copyMem(addr res[0], data, vallen)
+    rocksdb_free(data)
+    return some(res)
+  elif data != nil:
+    rocksdb_free(data)
+
+  none(seq[byte])
+
+proc get*(db: Database, key: openArray[byte]): Option[seq[byte]] =
+  ## Get from default column family
+  db.get(cfDefault, key)
+
+proc put*(db: Database, cf: ColumnFamily, key, value: openArray[byte]) =
+  var err: cstring = nil
+  let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
+  let valPtr = if value.len > 0: cast[cstring](unsafeAddr value[0]) else: cast[cstring](nil)
+  rocksdb_put_cf(
+    db.db, db.writeOpts, db.cfHandles[cf],
+    keyPtr, csize_t(key.len),
+    valPtr, csize_t(value.len),
+    addr err
+  )
+  checkError(err)
+
+proc put*(db: Database, key, value: openArray[byte]) =
+  ## Put to default column family
+  db.put(cfDefault, key, value)
+
+proc delete*(db: Database, cf: ColumnFamily, key: openArray[byte]) =
+  var err: cstring = nil
+  let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
+  rocksdb_delete_cf(
+    db.db, db.writeOpts, db.cfHandles[cf],
+    keyPtr, csize_t(key.len),
+    addr err
+  )
+  checkError(err)
+
+proc delete*(db: Database, key: openArray[byte]) =
+  ## Delete from default column family
+  db.delete(cfDefault, key)
+
+proc contains*(db: Database, cf: ColumnFamily, key: openArray[byte]): bool =
+  db.get(cf, key).isSome
+
+proc contains*(db: Database, key: openArray[byte]): bool =
+  db.contains(cfDefault, key)
+
+# Write batch operations
+
+proc newWriteBatch*(db: Database): WriteBatch =
+  WriteBatch(batch: rocksdb_writebatch_create(), db: db)
+
+proc put*(batch: WriteBatch, cf: ColumnFamily, key, value: openArray[byte]) =
+  let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
+  let valPtr = if value.len > 0: cast[cstring](unsafeAddr value[0]) else: cast[cstring](nil)
+  rocksdb_writebatch_put_cf(
+    batch.batch, batch.db.cfHandles[cf],
+    keyPtr, csize_t(key.len),
+    valPtr, csize_t(value.len)
+  )
+
+proc put*(batch: WriteBatch, key, value: openArray[byte]) =
+  ## Put to default column family
+  let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
+  let valPtr = if value.len > 0: cast[cstring](unsafeAddr value[0]) else: cast[cstring](nil)
+  rocksdb_writebatch_put(
+    batch.batch,
+    keyPtr, csize_t(key.len),
+    valPtr, csize_t(value.len)
+  )
+
+proc delete*(batch: WriteBatch, cf: ColumnFamily, key: openArray[byte]) =
+  let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
+  rocksdb_writebatch_delete_cf(
+    batch.batch, batch.db.cfHandles[cf],
+    keyPtr, csize_t(key.len)
+  )
+
+proc delete*(batch: WriteBatch, key: openArray[byte]) =
+  ## Delete from default column family
+  let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
+  rocksdb_writebatch_delete(
+    batch.batch,
+    keyPtr, csize_t(key.len)
+  )
+
+proc write*(db: Database, batch: WriteBatch) =
+  var err: cstring = nil
+  rocksdb_write(db.db, db.writeOpts, batch.batch, addr err)
+  checkError(err)
+
+proc clear*(batch: WriteBatch) =
+  rocksdb_writebatch_clear(batch.batch)
+
+proc destroy*(batch: WriteBatch) =
+  if batch.batch != nil:
+    rocksdb_writebatch_destroy(batch.batch)
+
+# Key construction helpers (big-endian for ordered iteration)
+
+proc blockKey*(hash: array[32, byte]): seq[byte] =
+  ## Key for block data: just the hash
+  @hash
+
+proc blockIndexKey*(height: int32): seq[byte] =
+  ## Key for height->hash mapping: big-endian height for ordered iteration
+  let h = cast[uint32](height)
+  result = newSeq[byte](4)
+  result[0] = byte((h shr 24) and 0xff)
+  result[1] = byte((h shr 16) and 0xff)
+  result[2] = byte((h shr 8) and 0xff)
+  result[3] = byte(h and 0xff)
+
+proc utxoKey*(txid: array[32, byte], vout: uint32): seq[byte] =
+  ## UTXO key: txid(32) || vout(4 BE)
+  result = newSeq[byte](36)
+  copyMem(addr result[0], unsafeAddr txid[0], 32)
+  result[32] = byte((vout shr 24) and 0xff)
+  result[33] = byte((vout shr 16) and 0xff)
+  result[34] = byte((vout shr 8) and 0xff)
+  result[35] = byte(vout and 0xff)
+
+proc txIndexKey*(txid: array[32, byte]): seq[byte] =
+  ## Key for tx index: just the txid
+  @txid
+
+proc metaKey*(name: string): seq[byte] =
+  ## Key for metadata
+  result = newSeq[byte](name.len)
+  for i, c in name:
+    result[i] = byte(c)
