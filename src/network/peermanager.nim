@@ -2,7 +2,7 @@
 ## Handles peer discovery, DNS resolution, connection limits, banning, and message routing
 ## 8 outbound + 117 inbound connections, 24h ban duration
 
-import std/[tables, sets, sequtils, random, times, net, strutils, algorithm]
+import std/[tables, sets, sequtils, random, times, net, strutils, algorithm, options]
 import chronos
 import chronicles
 import ./peer
@@ -133,7 +133,7 @@ proc isBanned*(pm: PeerManager, address: string): bool =
     return false
   true
 
-proc banPeer*(pm: PeerManager, address: string, duration: Duration = BanDuration) =
+proc banPeer*(pm: PeerManager, address: string, duration: times.Duration = BanDuration) =
   ## Ban a peer for the specified duration (default 24h)
   pm.bannedPeers[address] = getTime()
   info "peer banned", address = address, duration = $duration
@@ -258,7 +258,7 @@ proc startOutboundConnections*(pm: PeerManager) {.async.} =
     discard await pm.connectToPeer(address, port)
 
     # Small delay between connection attempts
-    await sleepAsync(100.milliseconds)
+    await sleepAsync(100)
 
 proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.} =
   ## Handle a new inbound connection
@@ -416,7 +416,7 @@ proc buildBlockLocatorFromChain*(heights: proc(h: int32): Option[BlockHash],
   ## Build block locator with exponential backoff from a height->hash function
   ## 10 single steps, then exponentially increasing gaps, always ending with genesis
   result = @[]
-  var step = 1
+  var step: int32 = 1
   var height = tipHeight
 
   while height >= 0:
@@ -513,7 +513,7 @@ proc mainLoop*(pm: PeerManager) {.async.} =
     for peer in disconnected:
       await pm.removePeer(peer)
 
-    await sleepAsync(1000.milliseconds)
+    await sleepAsync(1000)
 
   info "peer manager main loop stopped"
 
@@ -528,9 +528,9 @@ proc stop*(pm: PeerManager) =
 
   pm.peers.clear()
 
-proc addKnownAddress*(pm: PeerManager, addr: NetAddress) =
+proc addKnownAddress*(pm: PeerManager, address: NetAddress) =
   ## Add a known address for future connection attempts
-  pm.knownAddresses.add(addr)
+  pm.knownAddresses.add(address)
 
 proc getKnownAddresses*(pm: PeerManager): seq[NetAddress] =
   pm.knownAddresses
