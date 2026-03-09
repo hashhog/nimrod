@@ -4,14 +4,25 @@
 import nimcrypto/[sha2, ripemd, hash]
 import ../primitives/types
 
-proc sha256*(data: openArray[byte]): array[32, byte] =
+proc sha256Single*(data: openArray[byte]): array[32, byte] =
+  ## Single SHA-256 hash
   var ctx: sha256
   ctx.init()
   ctx.update(data)
   result = ctx.finish().data
 
+proc sha256*(data: openArray[byte]): array[32, byte] =
+  ## Alias for sha256Single for compatibility
+  sha256Single(data)
+
+proc sha256d*(data: openArray[byte]): array[32, byte] =
+  ## Double SHA-256 (Bitcoin standard)
+  let first = sha256Single(data)
+  sha256Single(first)
+
 proc doubleSha256*(data: openArray[byte]): array[32, byte] =
-  sha256(sha256(data))
+  ## Alias for sha256d
+  sha256d(data)
 
 proc ripemd160*(data: openArray[byte]): array[20, byte] =
   var ctx: ripemd160
