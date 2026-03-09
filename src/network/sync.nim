@@ -61,7 +61,7 @@ proc getBlockLocator*(sync: BlockSync): seq[BlockHash] =
       step *= 2
 
   # Always include genesis
-  result.add(sync.params.genesisHash)
+  result.add(sync.params.genesisBlockHash)
 
 proc requestHeaders*(sync: BlockSync, peer: Peer) {.async.} =
   ## Request headers from peer
@@ -115,37 +115,17 @@ proc requestBlocks*(sync: BlockSync, peer: Peer) {.async.} =
 
 proc processBlock*(sync: BlockSync, blk: Block): bool =
   ## Process a received block, returns true if valid
-  let result = checkBlock(blk, sync.params)
-  if not result.valid:
-    warn "invalid block", error = result.error
+  let checkResult = checkBlock(blk, sync.params)
+  if not checkResult.valid:
+    warn "invalid block", error = checkResult.error
     return false
 
   let headerBytes = serialize(blk.header)
   let hash = doubleSha256(headerBytes)
-
-  # Store block
   let height = sync.chainState.bestHeight + 1
-  sync.chainState.storeBlock(blk, height)
-  sync.chainState.updateBestBlock(BlockHash(hash), height)
 
-  # Update UTXO set
-  for i, tx in blk.txs:
-    let txBytes = serialize(tx)
-    let txid = TxId(doubleSha256(txBytes))
-
-    # Remove spent UTXOs
-    if not isCoinbase(tx):
-      for input in tx.inputs:
-        sync.chainState.removeUtxo(input.prevOut.txid, input.prevOut.vout)
-
-    # Add new UTXOs
-    for vout, output in tx.outputs:
-      sync.chainState.addUtxo(txid, uint32(vout), Utxo(
-        value: output.value,
-        scriptPubKey: output.scriptPubKey,
-        height: height,
-        coinbase: isCoinbase(tx)
-      ))
+  # Use atomic block apply (handles storage, UTXOs, and index atomically)
+  sync.chainState.applyBlock(blk, height)
 
   sync.pendingBlocks -= 1
   if sync.blockQueue.len > 0:
