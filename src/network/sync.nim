@@ -102,7 +102,7 @@ proc requestBlocks*(sync: BlockSync, peer: Peer) {.async.} =
     let hash = doubleSha256(headerBytes)
 
     inventory.add(InvVector(
-      invType: uint32(MSG_BLOCK),
+      invType: invBlock,
       hash: hash
     ))
     sync.blockQueue.addLast(BlockHash(hash))
