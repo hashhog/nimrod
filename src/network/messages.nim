@@ -1,13 +1,19 @@
-## Bitcoin P2P network messages
-## Protocol message serialization and deserialization
+## Bitcoin P2P protocol messages
+## Serialization and deserialization for all P2P message types
+## Wire format: header envelope + payload
 
-import std/[streams, endians]
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 
 const
-  PROTOCOL_VERSION* = 70016
-  USER_AGENT* = "/nimrod:0.1.0/"
+  MaxMessagePayload* = 33_554_432  # 32 MiB
+  MaxHeadersPerMsg* = 2000
+  MaxInvPerMsg* = 50_000
+  ProtocolVersion* = 70016'u32
+  UserAgent* = "/nimrod:0.1.0/"
+  NodeNetwork* = 1'u64
+  NodeWitness* = 8'u64
+  NodeNetworkLimited* = 1024'u64
 
 type
   MessageHeader* = object
@@ -16,204 +22,576 @@ type
     length*: uint32
     checksum*: array[4, byte]
 
-  NetAddr* = object
+  InvType* = enum
+    invError = 0
+    invTx = 1
+    invBlock = 2
+    invFilteredBlock = 3
+    invCmpctBlock = 4
+    invWitnessTx = 0x40000001
+    invWitnessBlock = 0x40000002
+
+  InvVector* = object
+    invType*: InvType
+    hash*: array[32, byte]
+
+  NetAddress* = object
     services*: uint64
     ip*: array[16, byte]  # IPv6 or IPv4-mapped
     port*: uint16
 
-  VersionMessage* = object
-    version*: int32
+  TimestampedAddr* = object
+    timestamp*: uint32
+    address*: NetAddress
+
+  VersionMsg* = object
+    version*: uint32
     services*: uint64
     timestamp*: int64
-    addrRecv*: NetAddr
-    addrFrom*: NetAddr
+    addrRecv*: NetAddress
+    addrFrom*: NetAddress
     nonce*: uint64
     userAgent*: string
     startHeight*: int32
     relay*: bool
 
-  VerackMessage* = object
-    # Empty
-
-  PingMessage* = object
-    nonce*: uint64
-
-  PongMessage* = object
-    nonce*: uint64
-
-  InvType* = enum
-    MSG_TX = 1
-    MSG_BLOCK = 2
-    MSG_FILTERED_BLOCK = 3
-    MSG_CMPCT_BLOCK = 4
-    MSG_WITNESS_TX = 0x40000001
-    MSG_WITNESS_BLOCK = 0x40000002
-
-  InvVector* = object
-    invType*: uint32
-    hash*: array[32, byte]
-
-  InvMessage* = object
-    inventory*: seq[InvVector]
-
-  GetDataMessage* = object
-    inventory*: seq[InvVector]
-
-  GetBlocksMessage* = object
+  GetHeadersMsg* = object
     version*: uint32
     locatorHashes*: seq[array[32, byte]]
     hashStop*: array[32, byte]
 
-  GetHeadersMessage* = object
+  GetBlocksMsg* = object
     version*: uint32
     locatorHashes*: seq[array[32, byte]]
     hashStop*: array[32, byte]
 
-  HeadersMessage* = object
-    headers*: seq[BlockHeader]
-
-  BlockMessage* = object
-    blk*: Block
-
-  TxMessage* = object
-    tx*: Transaction
-
-  AddrMessage* = object
-    addresses*: seq[tuple[time: uint32, addr: NetAddr]]
-
-  RejectMessage* = object
+  RejectMsg* = object
     message*: string
-    code*: byte
+    code*: uint8
     reason*: string
 
-proc commandToBytes(cmd: string): array[12, byte] =
+  SendCmpctMsg* = object
+    announce*: bool
+    version*: uint64
+
+  MessageKind* = enum
+    mkVersion
+    mkVerack
+    mkPing
+    mkPong
+    mkAddr
+    mkInv
+    mkGetData
+    mkNotFound
+    mkGetBlocks
+    mkGetHeaders
+    mkHeaders
+    mkBlock
+    mkTx
+    mkGetAddr
+    mkReject
+    mkSendHeaders
+    mkSendCmpct
+    mkFeeFilter
+    mkWtxidRelay
+    mkSendAddrV2
+
+  P2PMessage* = object
+    case kind*: MessageKind
+    of mkVersion:
+      version*: VersionMsg
+    of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2:
+      discard
+    of mkPing:
+      pingNonce*: uint64
+    of mkPong:
+      pongNonce*: uint64
+    of mkAddr:
+      addresses*: seq[TimestampedAddr]
+    of mkInv:
+      invItems*: seq[InvVector]
+    of mkGetData:
+      getData*: seq[InvVector]
+    of mkNotFound:
+      notFound*: seq[InvVector]
+    of mkGetBlocks:
+      getBlocks*: GetBlocksMsg
+    of mkGetHeaders:
+      getHeaders*: GetHeadersMsg
+    of mkHeaders:
+      headers*: seq[BlockHeader]
+    of mkBlock:
+      blk*: Block
+    of mkTx:
+      tx*: Transaction
+    of mkReject:
+      reject*: RejectMsg
+    of mkSendCmpct:
+      sendCmpct*: SendCmpctMsg
+    of mkFeeFilter:
+      feeRate*: uint64
+
+# Command name conversion
+
+proc commandToBytes*(cmd: string): array[12, byte] =
+  ## Convert command string to 12-byte null-padded array
   for i in 0 ..< min(cmd.len, 12):
     result[i] = byte(cmd[i])
+  # Remaining bytes are already zero-initialized
 
-proc bytesToCommand(cmd: array[12, byte]): string =
+proc bytesToCommand*(b: array[12, byte]): string =
+  ## Convert 12-byte array to command string, stripping null padding
   result = ""
-  for b in cmd:
-    if b == 0:
+  for c in b:
+    if c == 0:
       break
-    result.add(char(b))
+    result.add(char(c))
 
-proc readNetAddr*(s: Stream, includeTime: bool = false): NetAddr =
-  if includeTime:
-    discard s.readUint32LE()  # timestamp
-  result.services = s.readUint64LE()
-  if s.readData(addr result.ip[0], 16) != 16:
-    raise newException(SerializeError, "unexpected end of stream")
-  var portBuf: array[2, byte]
-  if s.readData(addr portBuf[0], 2) != 2:
-    raise newException(SerializeError, "unexpected end of stream")
-  result.port = (uint16(portBuf[0]) shl 8) or uint16(portBuf[1])  # Big endian
+# NetAddress serialization (port is big-endian, rest is little-endian)
 
-proc writeNetAddr*(s: Stream, addr: NetAddr, includeTime: bool = false) =
-  if includeTime:
-    s.writeUint32LE(0)  # timestamp
-  s.writeUint64LE(addr.services)
-  s.writeData(unsafeAddr addr.ip[0], 16)
-  s.write(byte((addr.port shr 8) and 0xff))
-  s.write(byte(addr.port and 0xff))
+proc writeNetAddress*(w: var BinaryWriter, a: NetAddress) =
+  w.writeUint64LE(a.services)
+  w.writeBytes(a.ip)
+  # Port is big-endian
+  w.data.add(byte((a.port shr 8) and 0xFF))
+  w.data.add(byte(a.port and 0xFF))
 
-proc readVarString*(s: Stream): string =
-  let len = s.readCompactSize()
+proc readNetAddress*(r: var BinaryReader): NetAddress =
+  result.services = r.readUint64LE()
+  let ipBytes = r.readBytes(16)
+  for i in 0 ..< 16:
+    result.ip[i] = ipBytes[i]
+  # Port is big-endian
+  let portHi = r.readUint8()
+  let portLo = r.readUint8()
+  result.port = (uint16(portHi) shl 8) or uint16(portLo)
+
+proc writeTimestampedAddr*(w: var BinaryWriter, ta: TimestampedAddr) =
+  w.writeUint32LE(ta.timestamp)
+  w.writeNetAddress(ta.address)
+
+proc readTimestampedAddr*(r: var BinaryReader): TimestampedAddr =
+  result.timestamp = r.readUint32LE()
+  result.address = r.readNetAddress()
+
+# VarString serialization
+
+proc writeVarString*(w: var BinaryWriter, s: string) =
+  w.writeCompactSize(uint64(s.len))
+  for c in s:
+    w.data.add(byte(c))
+
+proc readVarString*(r: var BinaryReader): string =
+  let length = r.readCompactSize()
   result = ""
-  for i in 0 ..< int(uint64(len)):
-    result.add(char(s.readUint8()))
+  for i in 0 ..< int(length):
+    result.add(char(r.readUint8()))
 
-proc writeVarString*(s: Stream, str: string) =
-  s.writeCompactSize(CompactSize(str.len))
-  for c in str:
-    s.write(byte(c))
+# InvVector serialization
 
-proc readVersionMessage*(s: Stream): VersionMessage =
-  result.version = s.readInt32LE()
-  result.services = s.readUint64LE()
-  result.timestamp = s.readInt64LE()
-  result.addrRecv = s.readNetAddr()
-  result.addrFrom = s.readNetAddr()
-  result.nonce = s.readUint64LE()
-  result.userAgent = s.readVarString()
-  result.startHeight = s.readInt32LE()
-  if result.version >= 70001:
-    result.relay = s.readUint8() != 0
+proc writeInvVector*(w: var BinaryWriter, inv: InvVector) =
+  w.writeUint32LE(uint32(ord(inv.invType)))
+  w.writeHash(inv.hash)
 
-proc writeVersionMessage*(s: Stream, msg: VersionMessage) =
-  s.writeInt32LE(msg.version)
-  s.writeUint64LE(msg.services)
-  s.writeInt64LE(msg.timestamp)
-  s.writeNetAddr(msg.addrRecv)
-  s.writeNetAddr(msg.addrFrom)
-  s.writeUint64LE(msg.nonce)
-  s.writeVarString(msg.userAgent)
-  s.writeInt32LE(msg.startHeight)
-  if msg.version >= 70001:
-    s.writeUint8(if msg.relay: 1 else: 0)
+proc readInvVector*(r: var BinaryReader): InvVector =
+  let invTypeVal = r.readUint32LE()
+  # Map to InvType enum
+  case invTypeVal
+  of 0: result.invType = invError
+  of 1: result.invType = invTx
+  of 2: result.invType = invBlock
+  of 3: result.invType = invFilteredBlock
+  of 4: result.invType = invCmpctBlock
+  of 0x40000001'u32: result.invType = invWitnessTx
+  of 0x40000002'u32: result.invType = invWitnessBlock
+  else: result.invType = invError
+  result.hash = r.readHash()
 
-proc readInvVector*(s: Stream): InvVector =
-  result.invType = s.readUint32LE()
-  result.hash = s.readArray32()
+# VersionMsg serialization
 
-proc writeInvVector*(s: Stream, inv: InvVector) =
-  s.writeUint32LE(inv.invType)
-  s.writeArray32(inv.hash)
+proc writeVersionMsg*(w: var BinaryWriter, msg: VersionMsg) =
+  w.writeUint32LE(msg.version)
+  w.writeUint64LE(msg.services)
+  w.writeInt64LE(msg.timestamp)
+  w.writeNetAddress(msg.addrRecv)
+  w.writeNetAddress(msg.addrFrom)
+  w.writeUint64LE(msg.nonce)
+  w.writeVarString(msg.userAgent)
+  w.writeInt32LE(msg.startHeight)
+  w.writeUint8(if msg.relay: 1 else: 0)
 
-proc readInvMessage*(s: Stream): InvMessage =
-  let count = s.readCompactSize()
-  for i in 0 ..< int(uint64(count)):
-    result.inventory.add(s.readInvVector())
+proc readVersionMsg*(r: var BinaryReader): VersionMsg =
+  result.version = r.readUint32LE()
+  result.services = r.readUint64LE()
+  result.timestamp = r.readInt64LE()
+  result.addrRecv = r.readNetAddress()
+  result.addrFrom = r.readNetAddress()
+  result.nonce = r.readUint64LE()
+  result.userAgent = r.readVarString()
+  result.startHeight = r.readInt32LE()
+  # relay field is optional for older versions
+  if r.remaining() >= 1:
+    result.relay = r.readUint8() != 0
+  else:
+    result.relay = true  # Default for older versions
 
-proc writeInvMessage*(s: Stream, msg: InvMessage) =
-  s.writeCompactSize(CompactSize(msg.inventory.len))
-  for inv in msg.inventory:
-    s.writeInvVector(inv)
+# GetHeaders/GetBlocks serialization
 
-proc readHeadersMessage*(s: Stream): HeadersMessage =
-  let count = s.readCompactSize()
-  for i in 0 ..< int(uint64(count)):
-    result.headers.add(s.readBlockHeader())
-    discard s.readCompactSize()  # txn_count (always 0)
+proc writeGetHeadersMsg*(w: var BinaryWriter, msg: GetHeadersMsg) =
+  w.writeUint32LE(msg.version)
+  w.writeCompactSize(uint64(msg.locatorHashes.len))
+  for h in msg.locatorHashes:
+    w.writeHash(h)
+  w.writeHash(msg.hashStop)
 
-proc writeHeadersMessage*(s: Stream, msg: HeadersMessage) =
-  s.writeCompactSize(CompactSize(msg.headers.len))
-  for header in msg.headers:
-    s.writeBlockHeader(header)
-    s.writeCompactSize(CompactSize(0))  # txn_count
+proc readGetHeadersMsg*(r: var BinaryReader): GetHeadersMsg =
+  result.version = r.readUint32LE()
+  let count = r.readCompactSize()
+  for i in 0 ..< int(count):
+    result.locatorHashes.add(r.readHash())
+  result.hashStop = r.readHash()
 
-proc serializeMessage*(magic: array[4, byte], command: string, payload: seq[byte]): seq[byte] =
-  ## Wrap a payload with message header
-  let s = newStringStream()
+proc writeGetBlocksMsg*(w: var BinaryWriter, msg: GetBlocksMsg) =
+  w.writeUint32LE(msg.version)
+  w.writeCompactSize(uint64(msg.locatorHashes.len))
+  for h in msg.locatorHashes:
+    w.writeHash(h)
+  w.writeHash(msg.hashStop)
 
-  # Header
-  s.writeData(unsafeAddr magic[0], 4)
+proc readGetBlocksMsg*(r: var BinaryReader): GetBlocksMsg =
+  result.version = r.readUint32LE()
+  let count = r.readCompactSize()
+  for i in 0 ..< int(count):
+    result.locatorHashes.add(r.readHash())
+  result.hashStop = r.readHash()
+
+# RejectMsg serialization
+
+proc writeRejectMsg*(w: var BinaryWriter, msg: RejectMsg) =
+  w.writeVarString(msg.message)
+  w.writeUint8(msg.code)
+  w.writeVarString(msg.reason)
+
+proc readRejectMsg*(r: var BinaryReader): RejectMsg =
+  result.message = r.readVarString()
+  result.code = r.readUint8()
+  result.reason = r.readVarString()
+
+# SendCmpctMsg serialization
+
+proc writeSendCmpctMsg*(w: var BinaryWriter, msg: SendCmpctMsg) =
+  w.writeUint8(if msg.announce: 1 else: 0)
+  w.writeUint64LE(msg.version)
+
+proc readSendCmpctMsg*(r: var BinaryReader): SendCmpctMsg =
+  result.announce = r.readUint8() != 0
+  result.version = r.readUint64LE()
+
+# Headers message serialization (with dummy tx count after each header)
+
+proc writeHeadersPayload*(w: var BinaryWriter, headers: seq[BlockHeader]) =
+  w.writeCompactSize(uint64(headers.len))
+  for header in headers:
+    w.writeBlockHeader(header)
+    w.writeCompactSize(0)  # Dummy tx count
+
+proc readHeadersPayload*(r: var BinaryReader): seq[BlockHeader] =
+  let count = r.readCompactSize()
+  for i in 0 ..< int(count):
+    result.add(r.readBlockHeader())
+    discard r.readCompactSize()  # Dummy tx count
+
+# Payload serialization for P2PMessage
+
+proc serializePayload*(msg: P2PMessage): seq[byte] =
+  ## Serialize just the payload (without header)
+  var w = BinaryWriter()
+
+  case msg.kind
+  of mkVersion:
+    w.writeVersionMsg(msg.version)
+  of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2:
+    discard  # Empty payload
+  of mkPing:
+    w.writeUint64LE(msg.pingNonce)
+  of mkPong:
+    w.writeUint64LE(msg.pongNonce)
+  of mkAddr:
+    w.writeCompactSize(uint64(msg.addresses.len))
+    for taddr in msg.addresses:
+      w.writeTimestampedAddr(taddr)
+  of mkInv:
+    w.writeCompactSize(uint64(msg.invItems.len))
+    for inv in msg.invItems:
+      w.writeInvVector(inv)
+  of mkGetData:
+    w.writeCompactSize(uint64(msg.getData.len))
+    for inv in msg.getData:
+      w.writeInvVector(inv)
+  of mkNotFound:
+    w.writeCompactSize(uint64(msg.notFound.len))
+    for inv in msg.notFound:
+      w.writeInvVector(inv)
+  of mkGetBlocks:
+    w.writeGetBlocksMsg(msg.getBlocks)
+  of mkGetHeaders:
+    w.writeGetHeadersMsg(msg.getHeaders)
+  of mkHeaders:
+    w.writeHeadersPayload(msg.headers)
+  of mkBlock:
+    w.writeBlock(msg.blk)
+  of mkTx:
+    w.writeTransaction(msg.tx)
+  of mkReject:
+    w.writeRejectMsg(msg.reject)
+  of mkSendCmpct:
+    w.writeSendCmpctMsg(msg.sendCmpct)
+  of mkFeeFilter:
+    w.writeUint64LE(msg.feeRate)
+
+  result = w.data
+
+proc messageKindToCommand*(kind: MessageKind): string =
+  case kind
+  of mkVersion: "version"
+  of mkVerack: "verack"
+  of mkPing: "ping"
+  of mkPong: "pong"
+  of mkAddr: "addr"
+  of mkInv: "inv"
+  of mkGetData: "getdata"
+  of mkNotFound: "notfound"
+  of mkGetBlocks: "getblocks"
+  of mkGetHeaders: "getheaders"
+  of mkHeaders: "headers"
+  of mkBlock: "block"
+  of mkTx: "tx"
+  of mkGetAddr: "getaddr"
+  of mkReject: "reject"
+  of mkSendHeaders: "sendheaders"
+  of mkSendCmpct: "sendcmpct"
+  of mkFeeFilter: "feefilter"
+  of mkWtxidRelay: "wtxidrelay"
+  of mkSendAddrV2: "sendaddrv2"
+
+proc commandToMessageKind*(cmd: string): MessageKind =
+  case cmd
+  of "version": mkVersion
+  of "verack": mkVerack
+  of "ping": mkPing
+  of "pong": mkPong
+  of "addr": mkAddr
+  of "inv": mkInv
+  of "getdata": mkGetData
+  of "notfound": mkNotFound
+  of "getblocks": mkGetBlocks
+  of "getheaders": mkGetHeaders
+  of "headers": mkHeaders
+  of "block": mkBlock
+  of "tx": mkTx
+  of "getaddr": mkGetAddr
+  of "reject": mkReject
+  of "sendheaders": mkSendHeaders
+  of "sendcmpct": mkSendCmpct
+  of "feefilter": mkFeeFilter
+  of "wtxidrelay": mkWtxidRelay
+  of "sendaddrv2": mkSendAddrV2
+  else:
+    raise newException(SerializationError, "unknown command: " & cmd)
+
+# Message header serialization
+
+proc serializeMessageHeader*(magic: array[4, byte], command: string,
+                              payloadLen: uint32, checksum: array[4, byte]): seq[byte] =
+  var w = BinaryWriter()
+  w.writeBytes(magic)
   let cmdBytes = commandToBytes(command)
-  s.writeData(unsafeAddr cmdBytes[0], 12)
-  s.writeUint32LE(uint32(payload.len))
+  w.writeBytes(cmdBytes)
+  w.writeUint32LE(payloadLen)
+  w.writeBytes(checksum)
+  result = w.data
 
-  # Checksum is first 4 bytes of double SHA256
-  let checksum = doubleSha256(payload)
-  s.writeData(unsafeAddr checksum[0], 4)
+proc deserializeMessageHeader*(r: var BinaryReader): MessageHeader =
+  let magicBytes = r.readBytes(4)
+  for i in 0 ..< 4:
+    result.magic[i] = magicBytes[i]
+  let cmdBytes = r.readBytes(12)
+  for i in 0 ..< 12:
+    result.command[i] = cmdBytes[i]
+  result.length = r.readUint32LE()
+  let checksumBytes = r.readBytes(4)
+  for i in 0 ..< 4:
+    result.checksum[i] = checksumBytes[i]
 
-  # Payload
-  if payload.len > 0:
-    s.writeData(unsafeAddr payload[0], payload.len)
+proc computeChecksum*(payload: seq[byte]): array[4, byte] =
+  ## Compute checksum as first 4 bytes of double SHA256
+  let hash = doubleSha256(payload)
+  for i in 0 ..< 4:
+    result[i] = hash[i]
 
-  s.setPosition(0)
-  result = cast[seq[byte]](s.readAll())
-
-proc parseMessageHeader*(data: openArray[byte]): MessageHeader =
-  if data.len < 24:
-    raise newException(SerializeError, "header too short")
-  copyMem(addr result.magic[0], unsafeAddr data[0], 4)
-  copyMem(addr result.command[0], unsafeAddr data[4], 12)
-  result.length = uint32(data[16]) or (uint32(data[17]) shl 8) or
-                  (uint32(data[18]) shl 16) or (uint32(data[19]) shl 24)
-  copyMem(addr result.checksum[0], unsafeAddr data[20], 4)
-
-proc verifyChecksum*(header: MessageHeader, payload: openArray[byte]): bool =
-  let checksum = doubleSha256(payload)
-  for i in 0..3:
-    if header.checksum[i] != checksum[i]:
+proc verifyChecksum*(header: MessageHeader, payload: seq[byte]): bool =
+  let expected = computeChecksum(payload)
+  for i in 0 ..< 4:
+    if header.checksum[i] != expected[i]:
       return false
   true
+
+# Full message serialization
+
+proc serializeMessage*(magic: array[4, byte], msg: P2PMessage): seq[byte] =
+  ## Serialize a P2PMessage with header envelope
+  let payload = serializePayload(msg)
+  let command = messageKindToCommand(msg.kind)
+  let checksum = computeChecksum(payload)
+
+  var w = BinaryWriter()
+  w.writeBytes(magic)
+  let cmdBytes = commandToBytes(command)
+  w.writeBytes(cmdBytes)
+  w.writeUint32LE(uint32(payload.len))
+  w.writeBytes(checksum)
+  w.writeBytes(payload)
+
+  result = w.data
+
+proc deserializePayload*(cmd: string, payload: seq[byte]): P2PMessage =
+  ## Deserialize a payload given the command name
+  var r = BinaryReader(data: payload, pos: 0)
+
+  case cmd
+  of "version":
+    result = P2PMessage(kind: mkVersion, version: r.readVersionMsg())
+  of "verack":
+    result = P2PMessage(kind: mkVerack)
+  of "ping":
+    result = P2PMessage(kind: mkPing, pingNonce: r.readUint64LE())
+  of "pong":
+    result = P2PMessage(kind: mkPong, pongNonce: r.readUint64LE())
+  of "addr":
+    var addresses: seq[TimestampedAddr]
+    let count = r.readCompactSize()
+    for i in 0 ..< int(count):
+      addresses.add(r.readTimestampedAddr())
+    result = P2PMessage(kind: mkAddr, addresses: addresses)
+  of "inv":
+    var invItems: seq[InvVector]
+    let count = r.readCompactSize()
+    for i in 0 ..< int(count):
+      invItems.add(r.readInvVector())
+    result = P2PMessage(kind: mkInv, invItems: invItems)
+  of "getdata":
+    var getData: seq[InvVector]
+    let count = r.readCompactSize()
+    for i in 0 ..< int(count):
+      getData.add(r.readInvVector())
+    result = P2PMessage(kind: mkGetData, getData: getData)
+  of "notfound":
+    var notFound: seq[InvVector]
+    let count = r.readCompactSize()
+    for i in 0 ..< int(count):
+      notFound.add(r.readInvVector())
+    result = P2PMessage(kind: mkNotFound, notFound: notFound)
+  of "getblocks":
+    result = P2PMessage(kind: mkGetBlocks, getBlocks: r.readGetBlocksMsg())
+  of "getheaders":
+    result = P2PMessage(kind: mkGetHeaders, getHeaders: r.readGetHeadersMsg())
+  of "headers":
+    result = P2PMessage(kind: mkHeaders, headers: r.readHeadersPayload())
+  of "block":
+    result = P2PMessage(kind: mkBlock, blk: r.readBlock())
+  of "tx":
+    result = P2PMessage(kind: mkTx, tx: r.readTransaction())
+  of "getaddr":
+    result = P2PMessage(kind: mkGetAddr)
+  of "reject":
+    result = P2PMessage(kind: mkReject, reject: r.readRejectMsg())
+  of "sendheaders":
+    result = P2PMessage(kind: mkSendHeaders)
+  of "sendcmpct":
+    result = P2PMessage(kind: mkSendCmpct, sendCmpct: r.readSendCmpctMsg())
+  of "feefilter":
+    result = P2PMessage(kind: mkFeeFilter, feeRate: r.readUint64LE())
+  of "wtxidrelay":
+    result = P2PMessage(kind: mkWtxidRelay)
+  of "sendaddrv2":
+    result = P2PMessage(kind: mkSendAddrV2)
+  else:
+    raise newException(SerializationError, "unknown command: " & cmd)
+
+# Convenience constructors
+
+proc newVersionMsg*(version: uint32 = ProtocolVersion,
+                    services: uint64 = NodeNetwork or NodeWitness,
+                    timestamp: int64 = 0,
+                    addrRecv: NetAddress = NetAddress(),
+                    addrFrom: NetAddress = NetAddress(),
+                    nonce: uint64 = 0,
+                    userAgent: string = UserAgent,
+                    startHeight: int32 = 0,
+                    relay: bool = true): P2PMessage =
+  P2PMessage(kind: mkVersion, version: VersionMsg(
+    version: version,
+    services: services,
+    timestamp: timestamp,
+    addrRecv: addrRecv,
+    addrFrom: addrFrom,
+    nonce: nonce,
+    userAgent: userAgent,
+    startHeight: startHeight,
+    relay: relay
+  ))
+
+proc newVerack*(): P2PMessage =
+  P2PMessage(kind: mkVerack)
+
+proc newPing*(nonce: uint64): P2PMessage =
+  P2PMessage(kind: mkPing, pingNonce: nonce)
+
+proc newPong*(nonce: uint64): P2PMessage =
+  P2PMessage(kind: mkPong, pongNonce: nonce)
+
+proc newGetHeaders*(version: uint32, locatorHashes: seq[array[32, byte]],
+                    hashStop: array[32, byte]): P2PMessage =
+  P2PMessage(kind: mkGetHeaders, getHeaders: GetHeadersMsg(
+    version: version,
+    locatorHashes: locatorHashes,
+    hashStop: hashStop
+  ))
+
+proc newGetBlocks*(version: uint32, locatorHashes: seq[array[32, byte]],
+                   hashStop: array[32, byte]): P2PMessage =
+  P2PMessage(kind: mkGetBlocks, getBlocks: GetBlocksMsg(
+    version: version,
+    locatorHashes: locatorHashes,
+    hashStop: hashStop
+  ))
+
+proc newInv*(items: seq[InvVector]): P2PMessage =
+  P2PMessage(kind: mkInv, invItems: items)
+
+proc newGetData*(items: seq[InvVector]): P2PMessage =
+  P2PMessage(kind: mkGetData, getData: items)
+
+proc newHeaders*(headers: seq[BlockHeader]): P2PMessage =
+  P2PMessage(kind: mkHeaders, headers: headers)
+
+proc newGetAddr*(): P2PMessage =
+  P2PMessage(kind: mkGetAddr)
+
+proc newSendHeaders*(): P2PMessage =
+  P2PMessage(kind: mkSendHeaders)
+
+proc newFeeFilter*(feeRate: uint64): P2PMessage =
+  P2PMessage(kind: mkFeeFilter, feeRate: feeRate)
+
+proc newWtxidRelay*(): P2PMessage =
+  P2PMessage(kind: mkWtxidRelay)
+
+proc newSendAddrV2*(): P2PMessage =
+  P2PMessage(kind: mkSendAddrV2)
+
+proc newBlockMsg*(blk: Block): P2PMessage =
+  P2PMessage(kind: mkBlock, blk: blk)
+
+proc newTxMsg*(tx: Transaction): P2PMessage =
+  P2PMessage(kind: mkTx, tx: tx)
