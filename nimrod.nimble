@@ -12,7 +12,7 @@ requires "chronicles >= 0.10.3"
 requires "chronos >= 4.0.0"
 requires "stew >= 0.2.0"
 requires "nimcrypto >= 0.6.0"
-requires "rocksdb >= 0.5.0"
+# rocksdb - using FFI bindings directly (requires librocksdb.so)
 requires "httpbeast >= 0.4.1"
 requires "jsony >= 1.1.5"
 requires "unittest2 >= 0.2.0"
