@@ -2,6 +2,7 @@
 ## Uses distinct types for type safety without runtime cost
 
 import std/strutils
+import std/sequtils
 
 type
   TxId* = distinct array[32, byte]
@@ -79,5 +80,3 @@ proc toBtc*(s: Satoshi): float =
 proc isSegwit*(tx: Transaction): bool =
   ## Returns true if transaction has witness data
   tx.witnesses.len > 0 and tx.witnesses.anyIt(it.len > 0)
-
-import std/sequtils
