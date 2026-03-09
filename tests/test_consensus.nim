@@ -45,7 +45,8 @@ suite "transaction validation":
     let tx = Transaction(
       version: 1,
       inputs: @[],
-      outputs: @[TxOut(value: Satoshi(100), scriptPubKey: ScriptBytes(@[]))],
+      outputs: @[TxOut(value: Satoshi(100), scriptPubKey: @[])],
+      witnesses: @[],
       lockTime: 0
     )
     let result = checkTransaction(tx, params)
@@ -57,11 +58,12 @@ suite "transaction validation":
     let tx = Transaction(
       version: 1,
       inputs: @[TxIn(
-        prevout: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
-        scriptSig: ScriptBytes(@[]),
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],
         sequence: 0xFFFFFFFF
       )],
       outputs: @[],
+      witnesses: @[],
       lockTime: 0
     )
     let result = checkTransaction(tx, params)
@@ -73,14 +75,15 @@ suite "transaction validation":
     let tx = Transaction(
       version: 1,
       inputs: @[TxIn(
-        prevout: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
-        scriptSig: ScriptBytes(@[]),
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],
         sequence: 0xFFFFFFFF
       )],
       outputs: @[TxOut(
         value: Satoshi(int64(MAX_MONEY) + 1),
-        scriptPubKey: ScriptBytes(@[])
+        scriptPubKey: @[]
       )],
+      witnesses: @[],
       lockTime: 0
     )
     let result = checkTransaction(tx, params)
@@ -91,14 +94,15 @@ suite "transaction validation":
     let tx = Transaction(
       version: 1,
       inputs: @[TxIn(
-        prevout: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
-        scriptSig: ScriptBytes(@[0x01]),
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[0x01'u8],
         sequence: 0xFFFFFFFF
       )],
       outputs: @[TxOut(
         value: Satoshi(100_000),
-        scriptPubKey: ScriptBytes(@[0x76, 0xa9])
+        scriptPubKey: @[0x76'u8, 0xa9]
       )],
+      witnesses: @[],
       lockTime: 0
     )
     let result = checkTransaction(tx, params)
@@ -108,17 +112,18 @@ suite "transaction validation":
     let coinbase = Transaction(
       version: 1,
       inputs: @[TxIn(
-        prevout: OutPoint(
+        prevOut: OutPoint(
           txid: TxId(default(array[32, byte])),
           vout: 0xFFFFFFFF
         ),
-        scriptSig: ScriptBytes(@[0x03, 0x01, 0x00, 0x00]),
+        scriptSig: @[0x03'u8, 0x01, 0x00, 0x00],
         sequence: 0xFFFFFFFF
       )],
       outputs: @[TxOut(
         value: Satoshi(50_00000000),
-        scriptPubKey: ScriptBytes(@[])
+        scriptPubKey: @[]
       )],
+      witnesses: @[],
       lockTime: 0
     )
     check isCoinbase(coinbase) == true
@@ -126,18 +131,19 @@ suite "transaction validation":
     let regular = Transaction(
       version: 1,
       inputs: @[TxIn(
-        prevout: OutPoint(
+        prevOut: OutPoint(
           txid: TxId([1'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
           vout: 0
         ),
-        scriptSig: ScriptBytes(@[]),
+        scriptSig: @[],
         sequence: 0xFFFFFFFF
       )],
       outputs: @[TxOut(
         value: Satoshi(100),
-        scriptPubKey: ScriptBytes(@[])
+        scriptPubKey: @[]
       )],
+      witnesses: @[],
       lockTime: 0
     )
     check isCoinbase(regular) == false
