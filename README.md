@@ -28,6 +28,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Block/transaction validation
 - [x] RocksDB storage (column families via FFI, UTXO set, block index)
 - [x] Chainstate management (atomic block connect/disconnect, write batches)
+- [x] UTXO set manager (cache, coinbase maturity, reorg support)
 - [x] P2P message serialization (typed case object, all message types)
 - [x] Peer connection (TCP, message framing, version handshake, ping/pong)
 - [x] Peer manager (DNS discovery, connection limits, banning, message routing)
