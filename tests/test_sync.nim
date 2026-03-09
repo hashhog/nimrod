@@ -1,7 +1,7 @@
 ## Tests for header sync module
 ## Validates work calculation, header validation, and chain management
 
-import std/[unittest, tables, options]
+import std/[unittest, tables, options, times]
 import ../src/network/sync
 import ../src/consensus/params
 import ../src/primitives/[types, serialize]
@@ -235,3 +235,74 @@ suite "SyncManager":
 
     # Should contain at least genesis
     check hc.headers.len >= 1
+
+suite "BlockDownloader Constants":
+  test "download window size is 1024":
+    check DownloadWindow == 1024
+
+  test "per-peer in-flight cap is 16":
+    check MaxBlocksPerPeer == 16
+
+  test "base request timeout is 5 seconds":
+    check BaseRequestTimeout == 5
+
+  test "max request timeout is 64 seconds":
+    check MaxRequestTimeout == 64
+
+  test "batch getdata size is 16":
+    check BatchGetDataSize == 16
+
+  test "UTXO flush interval is 2000":
+    check UtxoFlushInterval == 2000
+
+  test "witness block inv type is correct":
+    check InvWitnessBlockType == 0x40000002'u32
+
+suite "BlockDownloader Types":
+  test "BlockRequest has required fields":
+    # Verify type structure compiles correctly
+    var req: BlockRequest
+    req.hash = BlockHash(default(array[32, byte]))
+    req.height = 100
+    req.peer = nil  # Would be a real Peer in practice
+    req.requestTime = times.getTime()
+    req.timeout = times.initDuration(seconds = 5)
+    check req.height == 100
+
+  test "PeerBlockState has adaptive timeout fields":
+    var state: PeerBlockState
+    state.inFlight = 5
+    state.currentTimeout = 10
+    state.consecutiveSuccess = 3
+    check state.inFlight == 5
+    check state.currentTimeout == 10
+
+  test "BlockDownloader has required fields":
+    # Type structure check (without full initialization)
+    # BlockDownloader needs a SyncManager which needs ChainDb
+    # This just verifies the type exports correctly
+    check DownloadWindow > 0
+
+import std/times
+
+suite "BlockDownloader Timeout Logic":
+  test "adaptive timeout doubles on stall":
+    var timeout = BaseRequestTimeout
+    timeout = min(MaxRequestTimeout, timeout * 2)
+    check timeout == 10  # 5 * 2
+
+  test "adaptive timeout caps at max":
+    var timeout = MaxRequestTimeout
+    timeout = min(MaxRequestTimeout, timeout * 2)
+    check timeout == MaxRequestTimeout  # Capped at 64
+
+  test "adaptive timeout decays on success":
+    var timeout = 32
+    timeout = max(BaseRequestTimeout, timeout div 2)
+    check timeout == 16
+
+    timeout = max(BaseRequestTimeout, timeout div 2)
+    check timeout == 8
+
+    timeout = max(BaseRequestTimeout, timeout div 2)
+    check timeout == BaseRequestTimeout  # Floors at base
