@@ -17,6 +17,10 @@ tests/test_storage
 tests/test_messages
 tests/test_peer
 tests/test_mempool
+tests/test_chainstate
+tests/test_fees
+tests/test_sync
+tests/test_template
 
 # Storage test artifacts
 src/storage/chainstate
