@@ -12,6 +12,7 @@ import ./test_storage
 import ./test_messages
 import ./test_peer
 import ./test_mempool
+import ./test_fees
 
 when isMainModule:
   echo "Running all tests..."
