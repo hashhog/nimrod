@@ -32,6 +32,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Peer connection (TCP, message framing, version handshake, ping/pong)
 - [x] Peer manager (DNS discovery, connection limits, banning, message routing)
 - [x] Block synchronization
+- [x] Headers-first sync (256-bit work calculation, most-work chain selection)
 - [x] Transaction mempool
 - [x] Fee estimation
 - [x] Block template generation
