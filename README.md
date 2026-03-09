@@ -39,7 +39,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Fee estimation (histogram-based, 85% confirmation threshold)
 - [x] Block template generation (BIP-34 coinbase, witness commitment, sigops limit)
 - [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic auth)
-- [x] Basic wallet (key management, addresses)
+- [x] HD Wallet (BIP-32/39/44/84/86 key derivation, P2WPKH signing)
 - [ ] Relay mode (post-IBD block/tx propagation)
 
 ## Quick start
@@ -65,9 +65,9 @@ nimrod/
 │   ├── mempool/            # Transaction pool
 │   ├── mining/             # Fees and block templates
 │   ├── rpc/                # JSON-RPC server
-│   └── wallet/             # Key management
+│   └── wallet/             # HD wallet, BIP-32/39 key derivation
 ├── tests/                  # Test suites
-└── config/                 # Configuration files
+└── resources/              # BIP39 wordlist
 ```
 
 ## Running tests
