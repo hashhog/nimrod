@@ -14,6 +14,7 @@ import ./test_peer
 import ./test_mempool
 import ./test_fees
 import ./test_template
+import ./test_wallet
 
 when isMainModule:
   echo "Running all tests..."
