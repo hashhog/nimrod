@@ -5,3 +5,18 @@ nimrod
 nimble.develop
 nimble.paths
 nimbledeps
+
+# Test binaries
+tests/test_all
+tests/test_serialize
+tests/test_crypto
+tests/test_address
+tests/test_script
+tests/test_consensus
+tests/test_storage
+tests/test_messages
+tests/test_peer
+
+# Storage test artifacts
+src/storage/chainstate
+src/storage/db
