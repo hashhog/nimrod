@@ -52,7 +52,7 @@ proc peerKey(host: string, port: uint16): string =
 
 proc connectedPeerCount*(pm: PeerManager): int =
   for peer in pm.peers.values:
-    if peer.state == Ready:
+    if peer.state == psReady:
       result += 1
 
 proc addPeer*(pm: PeerManager, host: string, port: uint16): Future[bool] {.async.} =
@@ -96,7 +96,7 @@ proc banPeer*(pm: PeerManager, host: string, port: uint16) {.async.} =
 
 proc getReadyPeers*(pm: PeerManager): seq[Peer] =
   for peer in pm.peers.values:
-    if peer.state == Ready:
+    if peer.state == psReady:
       result.add(peer)
 
 proc getBestPeer*(pm: PeerManager): Peer =
@@ -105,7 +105,7 @@ proc getBestPeer*(pm: PeerManager): Peer =
   var bestHeight: int32 = -1
 
   for peer in pm.peers.values:
-    if peer.state == Ready and peer.startHeight > bestHeight:
+    if peer.state == psReady and peer.startHeight > bestHeight:
       best = peer
       bestHeight = peer.startHeight
 
@@ -127,11 +127,11 @@ proc maintainConnections*(pm: PeerManager) {.async.} =
   # Remove stale peers
   var toRemove: seq[string]
   for key, peer in pm.peers:
-    if peer.state == Disconnected:
+    if peer.state == psDisconnected:
       toRemove.add(key)
-    elif peer.state == Ready and getTime() - peer.lastSeen > initDuration(minutes = 30):
+    elif peer.state == psReady and getTime() - peer.lastSeen > initDuration(minutes = 30):
       try:
-        await peer.sendPing(0)
+        await peer.sendPing()
       except CatchableError:
         toRemove.add(key)
 
@@ -147,7 +147,7 @@ proc broadcastTransaction*(pm: PeerManager, tx: Transaction) {.async.} =
   let msg = newTxMsg(tx)
   for peer in pm.getReadyPeers():
     try:
-      await peer.sendP2PMessage(msg)
+      await peer.sendMessage(msg)
     except CatchableError as e:
       debug "failed to broadcast tx", peer = $peer, error = e.msg
 
@@ -156,6 +156,6 @@ proc broadcastInventory*(pm: PeerManager, inventory: seq[InvVector]) {.async.} =
   let msg = newInv(inventory)
   for peer in pm.getReadyPeers():
     try:
-      await peer.sendP2PMessage(msg)
+      await peer.sendMessage(msg)
     except CatchableError as e:
       debug "failed to broadcast inv", peer = $peer, error = e.msg
