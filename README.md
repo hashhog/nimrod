@@ -17,6 +17,9 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] txid and wtxid computation
 - [x] Cryptographic hashing (SHA-256d, RIPEMD-160, HASH160)
 - [x] secp256k1 bindings (ECDSA/Schnorr via libsecp256k1 FFI)
+- [x] Base58Check encoding (legacy P2PKH, P2SH addresses)
+- [x] Bech32/Bech32m encoding (segwit P2WPKH, P2WSH, P2TR addresses)
+- [x] Address encoding/decoding for all Bitcoin address types
 - [x] Script interpreter (stack machine, opcodes)
 - [x] Consensus parameters (mainnet, testnet, regtest)
 - [x] Block/transaction validation
@@ -48,7 +51,7 @@ nimrod/
 ├── src/
 │   ├── nimrod.nim          # Main entry point
 │   ├── primitives/         # Core types and serialization
-│   ├── crypto/             # Hashing and secp256k1
+│   ├── crypto/             # Hashing, secp256k1, address encoding
 │   ├── script/             # Script interpreter
 │   ├── consensus/          # Params and validation
 │   ├── storage/            # RocksDB and chainstate
