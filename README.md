@@ -30,13 +30,14 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Chainstate management (atomic block connect/disconnect, write batches)
 - [x] P2P message serialization (typed case object, all message types)
 - [x] Peer connection (TCP, message framing, version handshake, ping/pong)
+- [x] Peer manager (DNS discovery, connection limits, banning, message routing)
 - [x] Block synchronization
 - [x] Transaction mempool
 - [x] Fee estimation
 - [x] Block template generation
 - [x] JSON-RPC server
 - [x] Basic wallet (key management, addresses)
-- [ ] Initial block download
+- [ ] Full initial block download
 
 ## Quick start
 
