@@ -15,8 +15,8 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Binary serialization (BinaryWriter/BinaryReader, CompactSize)
 - [x] SegWit transaction serialization (witness data, marker/flag)
 - [x] txid and wtxid computation
-- [x] Cryptographic hashing (SHA256, RIPEMD160, Hash160)
-- [x] secp256k1 bindings (FFI to libsecp256k1)
+- [x] Cryptographic hashing (SHA-256d, RIPEMD-160, HASH160)
+- [x] secp256k1 bindings (ECDSA/Schnorr via libsecp256k1 FFI)
 - [x] Script interpreter (stack machine, opcodes)
 - [x] Consensus parameters (mainnet, testnet, regtest)
 - [x] Block/transaction validation
