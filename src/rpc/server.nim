@@ -101,7 +101,7 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   let blockHash = doubleSha256(headerBytes)
 
   var txids: seq[string]
-  for tx in b.transactions:
+  for tx in b.txs:
     let txBytes = serialize(tx)
     let txid = doubleSha256(txBytes)
     txids.add(reverseHex(toHex(txid)))
@@ -132,8 +132,8 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     ])),
     "difficulty": 1.0,
     "chainwork": "0",
-    "nTx": b.transactions.len,
-    "previousblockhash": reverseHex(toHex(array[32, byte](b.header.prevHash)))
+    "nTx": b.txs.len,
+    "previousblockhash": reverseHex(toHex(array[32, byte](b.header.prevBlock)))
   }
 
 proc handleGetMempoolInfo(rpc: RpcServer): JsonNode =

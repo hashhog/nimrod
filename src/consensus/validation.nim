@@ -71,8 +71,8 @@ proc checkTransaction*(tx: Transaction, params: ConsensusParams): ValidationResu
   # Check for duplicate inputs
   for i in 0 ..< tx.inputs.len:
     for j in (i + 1) ..< tx.inputs.len:
-      if tx.inputs[i].prevout.txid == tx.inputs[j].prevout.txid and
-         tx.inputs[i].prevout.vout == tx.inputs[j].prevout.vout:
+      if tx.inputs[i].prevOut.txid == tx.inputs[j].prevOut.txid and
+         tx.inputs[i].prevOut.vout == tx.inputs[j].prevOut.vout:
         return err("duplicate input")
 
   # Check output values
@@ -97,18 +97,18 @@ proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult =
     return headerResult
 
   # Must have at least one transaction (coinbase)
-  if blk.transactions.len == 0:
+  if blk.txs.len == 0:
     return err("block has no transactions")
 
   # Check each transaction
-  for i, tx in blk.transactions:
+  for i, tx in blk.txs:
     let txResult = checkTransaction(tx, params)
     if not txResult.valid:
       return err("invalid transaction " & $i & ": " & txResult.error)
 
   # Verify merkle root
   var txHashes: seq[array[32, byte]]
-  for tx in blk.transactions:
+  for tx in blk.txs:
     let txBytes = serialize(tx)
     txHashes.add(doubleSha256(txBytes))
 
@@ -121,5 +121,5 @@ proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult =
 proc isCoinbase*(tx: Transaction): bool =
   ## Check if transaction is a coinbase transaction
   tx.inputs.len == 1 and
-  tx.inputs[0].prevout.txid == TxId(default(array[32, byte])) and
-  tx.inputs[0].prevout.vout == 0xffffffff'u32
+  tx.inputs[0].prevOut.txid == TxId(default(array[32, byte])) and
+  tx.inputs[0].prevOut.vout == 0xffffffff'u32

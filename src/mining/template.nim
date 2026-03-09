@@ -20,7 +20,7 @@ type
 proc createCoinbase*(
   height: int,
   coinbaseValue: Satoshi,
-  scriptPubKey: ScriptBytes
+  scriptPubKey: seq[byte]
 ): Transaction =
   ## Create a coinbase transaction
   # Build coinbase script (BIP34 requires height in scriptSig)
@@ -49,17 +49,18 @@ proc createCoinbase*(
   Transaction(
     version: 2,
     inputs: @[TxIn(
-      prevout: OutPoint(
+      prevOut: OutPoint(
         txid: TxId(default(array[32, byte])),
         vout: 0xffffffff'u32
       ),
-      scriptSig: ScriptBytes(scriptSig),
+      scriptSig: scriptSig,
       sequence: 0xffffffff'u32
     )],
     outputs: @[TxOut(
       value: coinbaseValue,
       scriptPubKey: scriptPubKey
     )],
+    witnesses: @[],
     lockTime: 0
   )
 
@@ -85,7 +86,7 @@ proc buildBlockTemplate*(
   chainState: ChainState,
   mempool: Mempool,
   params: ConsensusParams,
-  coinbaseScript: ScriptBytes
+  coinbaseScript: seq[byte]
 ): BlockTemplate =
   ## Build a new block template
   let height = chainState.bestHeight + 1
@@ -132,7 +133,7 @@ proc buildBlockTemplate*(
 
   let header = BlockHeader(
     version: 0x20000000,  # BIP9 version bits
-    prevHash: prevHash,
+    prevBlock: prevHash,
     merkleRoot: merkleRoot,
     timestamp: uint32(getTime().toUnix()),
     bits: bits,
@@ -158,13 +159,13 @@ proc updateExtraNonce*(tmpl: var BlockTemplate, extraNonce: uint64) =
     return
 
   # Modify coinbase scriptSig
-  var scriptSig = seq[byte](tmpl.transactions[0].inputs[0].scriptSig)
+  var scriptSig = tmpl.transactions[0].inputs[0].scriptSig
   if scriptSig.len >= 12:
     # Write extra nonce (8 bytes after height encoding)
     let offset = scriptSig.len - 8
     for i in 0 ..< 8:
       scriptSig[offset + i] = byte((extraNonce shr (i * 8)) and 0xff)
-    tmpl.transactions[0].inputs[0].scriptSig = ScriptBytes(scriptSig)
+    tmpl.transactions[0].inputs[0].scriptSig = scriptSig
 
   # Recalculate merkle root
   var txHashes: seq[array[32, byte]]
@@ -195,5 +196,5 @@ proc mine*(tmpl: var BlockTemplate, maxIterations: uint32 = 0xffffffff'u32): boo
 proc toBlock*(tmpl: BlockTemplate): Block =
   Block(
     header: tmpl.header,
-    transactions: tmpl.transactions
+    txs: tmpl.transactions
   )
