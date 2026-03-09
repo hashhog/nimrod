@@ -37,7 +37,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Full initial block download (parallel download, sliding window, adaptive timeouts)
 - [x] Transaction mempool (fee/size policy, CPFP tracking, eviction)
 - [x] Fee estimation (histogram-based, 85% confirmation threshold)
-- [x] Block template generation
+- [x] Block template generation (BIP-34 coinbase, witness commitment, sigops limit)
 - [x] JSON-RPC server
 - [x] Basic wallet (key management, addresses)
 - [ ] Relay mode (post-IBD block/tx propagation)
