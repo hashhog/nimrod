@@ -1,0 +1,64 @@
+[
+  ["Test script evaluation - basic operations"],
+
+  ["", "OP_TRUE", "P2SH,WITNESS", "OK", "Empty scriptSig with OP_TRUE succeeds"],
+  ["OP_1", "OP_1 OP_EQUAL", "P2SH,WITNESS", "OK", "OP_1 equals OP_1"],
+  ["OP_0", "OP_0 OP_EQUAL", "P2SH,WITNESS", "OK", "OP_0 equals OP_0"],
+  ["OP_1 OP_1", "OP_EQUAL", "P2SH,WITNESS", "OK", "Two OP_1s are equal"],
+
+  ["Test script evaluation - arithmetic"],
+
+  ["OP_1 OP_1", "OP_ADD OP_2 OP_EQUAL", "P2SH,WITNESS", "OK", "1+1=2"],
+  ["OP_2 OP_1", "OP_SUB OP_1 OP_EQUAL", "P2SH,WITNESS", "OK", "2-1=1"],
+  ["OP_5", "OP_1ADD OP_6 OP_EQUAL", "P2SH,WITNESS", "OK", "5+1=6"],
+  ["OP_5", "OP_1SUB OP_4 OP_EQUAL", "P2SH,WITNESS", "OK", "5-1=4"],
+  ["OP_5", "OP_NEGATE OP_5 OP_NEGATE OP_EQUAL", "P2SH,WITNESS", "OK", "negate"],
+  ["OP_5", "OP_ABS OP_5 OP_EQUAL", "P2SH,WITNESS", "OK", "abs(5)=5"],
+
+  ["Test script evaluation - stack operations"],
+
+  ["OP_1", "OP_DUP OP_EQUAL", "P2SH,WITNESS", "OK", "DUP creates copy"],
+  ["OP_1 OP_2", "OP_SWAP OP_1 OP_EQUAL", "P2SH,WITNESS", "OK", "SWAP reverses top two"],
+  ["OP_1 OP_2", "OP_DROP OP_1 OP_EQUAL", "P2SH,WITNESS", "OK", "DROP removes top"],
+  ["OP_1 OP_2", "OP_NIP OP_2 OP_EQUAL", "P2SH,WITNESS", "OK", "NIP removes second"],
+  ["OP_1 OP_2", "OP_OVER OP_1 OP_EQUAL", "P2SH,WITNESS", "OK", "OVER copies second to top"],
+
+  ["Test script evaluation - conditionals"],
+
+  ["OP_1", "OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF", "P2SH,WITNESS", "OK", "IF true branch"],
+  ["OP_0", "OP_IF OP_0 OP_ELSE OP_1 OP_ENDIF", "P2SH,WITNESS", "OK", "IF false branch"],
+  ["OP_1", "OP_NOTIF OP_0 OP_ELSE OP_1 OP_ENDIF", "P2SH,WITNESS", "OK", "NOTIF with true"],
+  ["OP_0", "OP_NOTIF OP_1 OP_ELSE OP_0 OP_ENDIF", "P2SH,WITNESS", "OK", "NOTIF with false"],
+
+  ["Test script evaluation - crypto"],
+
+  ["0x01", "OP_HASH160 0x14 0xc51b66bced5e4491001bd702669770dccf440982 OP_EQUAL", "P2SH,WITNESS", "OK", "HASH160 of 0x01"],
+  ["0x01", "OP_SHA256 0x20 0x4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a OP_EQUAL", "P2SH,WITNESS", "OK", "SHA256 of 0x01"],
+
+  ["Test script evaluation - comparison"],
+
+  ["OP_1 OP_2", "OP_LESSTHAN", "P2SH,WITNESS", "OK", "1 < 2"],
+  ["OP_2 OP_1", "OP_GREATERTHAN", "P2SH,WITNESS", "OK", "2 > 1"],
+  ["OP_5 OP_5", "OP_LESSTHANOREQUAL", "P2SH,WITNESS", "OK", "5 <= 5"],
+  ["OP_5 OP_5", "OP_GREATERTHANOREQUAL", "P2SH,WITNESS", "OK", "5 >= 5"],
+  ["OP_3 OP_2 OP_5", "OP_WITHIN", "P2SH,WITNESS", "OK", "3 within [2,5)"],
+
+  ["Test script evaluation - boolean"],
+
+  ["OP_1 OP_1", "OP_BOOLAND", "P2SH,WITNESS", "OK", "true AND true"],
+  ["OP_0 OP_1", "OP_BOOLOR", "P2SH,WITNESS", "OK", "false OR true"],
+  ["OP_0", "OP_NOT", "P2SH,WITNESS", "OK", "NOT false = true"],
+  ["OP_5", "OP_0NOTEQUAL", "P2SH,WITNESS", "OK", "5 != 0"],
+
+  ["Test script evaluation - failures"],
+
+  ["", "OP_RETURN", "P2SH,WITNESS", "EVAL_FALSE", "OP_RETURN fails script"],
+  ["OP_1 OP_2", "OP_EQUALVERIFY OP_1", "P2SH,WITNESS", "EQUALVERIFY", "EQUALVERIFY fails on unequal"],
+  ["", "OP_IF OP_1 OP_ENDIF", "P2SH,WITNESS", "UNBALANCED_CONDITIONAL", "IF without value"],
+
+  ["Test script patterns"],
+
+  ["Comment: P2PKH pattern test would go here with actual signatures"],
+  ["Comment: P2SH pattern test would go here with actual redeem scripts"],
+  ["Comment: P2WPKH pattern test would go here with actual witness data"]
+]

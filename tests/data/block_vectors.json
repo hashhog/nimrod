@@ -1,0 +1,54 @@
+{
+  "comment": "Bitcoin block test vectors",
+  "genesis_blocks": {
+    "mainnet": {
+      "header_hex": "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c",
+      "hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+      "version": 1,
+      "prev_block": "0000000000000000000000000000000000000000000000000000000000000000",
+      "merkle_root": "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+      "timestamp": 1231006505,
+      "bits": "1d00ffff",
+      "nonce": 2083236893
+    },
+    "testnet3": {
+      "header_hex": "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff001d1aa4ae18",
+      "hash": "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
+      "version": 1,
+      "prev_block": "0000000000000000000000000000000000000000000000000000000000000000",
+      "merkle_root": "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+      "timestamp": 1296688602,
+      "bits": "1d00ffff",
+      "nonce": 414098458
+    },
+    "regtest": {
+      "version": 1,
+      "prev_block": "0000000000000000000000000000000000000000000000000000000000000000",
+      "merkle_root": "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+      "timestamp": 1296688602,
+      "bits": "207fffff",
+      "nonce": 2
+    }
+  },
+  "coinbase_transactions": {
+    "genesis_coinbase": {
+      "comment": "The famous Satoshi coinbase message",
+      "scriptSig_text": "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks",
+      "output_address": "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+      "output_value_btc": 50
+    }
+  },
+  "difficulty_vectors": [
+    {
+      "comment": "Genesis block difficulty",
+      "bits": "1d00ffff",
+      "target_hex": "00000000ffff0000000000000000000000000000000000000000000000000000",
+      "difficulty": 1.0
+    },
+    {
+      "comment": "Regtest difficulty (easiest)",
+      "bits": "207fffff",
+      "difficulty": 4.656542373906925e-10
+    }
+  ]
+}
