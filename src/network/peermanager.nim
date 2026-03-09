@@ -7,6 +7,7 @@ import chronicles
 import ./peer
 import ./messages
 import ../consensus/params
+import ../primitives/[types, serialize]
 
 type
   PeerManager* = ref object
@@ -141,27 +142,20 @@ proc maintainConnections*(pm: PeerManager) {.async.} =
   if pm.connectedPeerCount < pm.maxOutbound div 2:
     await pm.connectToSeeds()
 
-proc broadcastTransaction*(pm: PeerManager, tx: seq[byte]) {.async.} =
+proc broadcastTransaction*(pm: PeerManager, tx: Transaction) {.async.} =
   ## Broadcast a transaction to all ready peers
+  let msg = newTxMsg(tx)
   for peer in pm.getReadyPeers():
     try:
-      await peer.sendMessage("tx", tx)
+      await peer.sendP2PMessage(msg)
     except CatchableError as e:
       debug "failed to broadcast tx", peer = $peer, error = e.msg
 
 proc broadcastInventory*(pm: PeerManager, inventory: seq[InvVector]) {.async.} =
   ## Broadcast inventory to all ready peers
-  let s = newStringStream()
-  s.writeCompactSize(CompactSize(inventory.len))
-  for inv in inventory:
-    s.writeInvVector(inv)
-  s.setPosition(0)
-  let payload = cast[seq[byte]](s.readAll())
-
+  let msg = newInv(inventory)
   for peer in pm.getReadyPeers():
     try:
-      await peer.sendMessage("inv", payload)
+      await peer.sendP2PMessage(msg)
     except CatchableError as e:
       debug "failed to broadcast inv", peer = $peer, error = e.msg
-
-import std/streams
