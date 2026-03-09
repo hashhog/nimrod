@@ -13,6 +13,7 @@ import ./test_messages
 import ./test_peer
 import ./test_mempool
 import ./test_fees
+import ./test_template
 
 when isMainModule:
   echo "Running all tests..."
