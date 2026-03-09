@@ -1,11 +1,12 @@
 ## Chainstate management
-## Tracks UTXO set, block index, and blockchain state
+## UTXO set manager with block connect/disconnect, in-memory cache, and reorg support
 ## Uses RocksDB column families for data separation
 
 import std/[options, tables]
 import ./db
 import ../primitives/[types, serialize]
 import ../crypto/hashing
+import ../consensus/params
 
 export db.ColumnFamily
 
@@ -31,14 +32,48 @@ type
     height*: int32
     isCoinbase*: bool
 
+  ## UndoData stores spent outputs for block disconnect
+  UndoData* = object
+    spentOutputs*: seq[tuple[outpoint: OutPoint, entry: UtxoEntry]]
+
+  ## ChainDb provides raw database access
   ChainDb* = ref object
     db*: Database
     bestBlockHash*: BlockHash
     bestHeight*: int32
     utxoCache*: Table[string, UtxoEntry]  ## In-memory cache for hot UTXOs
 
-  # Type alias for compatibility
-  ChainState* = ChainDb
+  ## ChainState wraps ChainDb with cache management and consensus params
+  ChainState* = ref object
+    db*: ChainDb
+    bestBlockHash*: BlockHash
+    bestHeight*: int32
+    totalWork*: array[32, byte]
+    params*: ConsensusParams
+    utxoCache*: Table[OutPoint, UtxoEntry]
+    cacheSize*: int
+    maxCacheSize*: int  ## Flush at 50000
+
+  ## Result type for chainstate operations
+  ChainStateResult*[T] = object
+    case isOk*: bool
+    of true:
+      value*: T
+    of false:
+      error*: string
+
+# Result constructors
+proc ok*[T](val: T): ChainStateResult[T] =
+  ChainStateResult[T](isOk: true, value: val)
+
+proc ok*(): ChainStateResult[void] =
+  ChainStateResult[void](isOk: true)
+
+proc err*(T: typedesc, msg: string): ChainStateResult[T] =
+  ChainStateResult[T](isOk: false, error: msg)
+
+proc err*(msg: string): ChainStateResult[void] =
+  ChainStateResult[void](isOk: false, error: msg)
 
 # Key helpers
 
@@ -92,6 +127,28 @@ proc deserializeUtxoEntry(data: seq[byte]): UtxoEntry =
   result.height = r.readInt32LE()
   result.isCoinbase = r.readUint8() != 0
 
+# Serialization for UndoData
+
+proc serializeUndoData*(undo: UndoData): seq[byte] =
+  var w = BinaryWriter()
+  w.writeCompactSize(uint64(undo.spentOutputs.len))
+  for (outpoint, entry) in undo.spentOutputs:
+    w.writeOutPoint(outpoint)
+    let entryBytes = serializeUtxoEntry(entry)
+    w.writeCompactSize(uint64(entryBytes.len))
+    w.writeBytes(entryBytes)
+  w.data
+
+proc deserializeUndoData*(data: seq[byte]): UndoData =
+  var r = BinaryReader(data: data, pos: 0)
+  let count = r.readCompactSize()
+  for i in 0 ..< int(count):
+    let outpoint = r.readOutPoint()
+    let entryLen = r.readCompactSize()
+    let entryBytes = r.readBytes(int(entryLen))
+    let entry = deserializeUtxoEntry(entryBytes)
+    result.spentOutputs.add((outpoint, entry))
+
 # TxIndex entry: block hash + position in block
 
 type TxLocation* = object
@@ -109,7 +166,7 @@ proc deserializeTxLocation(data: seq[byte]): TxLocation =
   result.blockHash = r.readBlockHash()
   result.txIndex = r.readUint32LE()
 
-# ChainDb operations
+# ChainDb operations (low-level database access)
 
 proc openChainDb*(path: string): ChainDb =
   ## Open the chain database
@@ -135,7 +192,7 @@ proc openChainDb*(path: string): ChainDb =
 proc close*(cdb: var ChainDb) =
   cdb.db.close()
 
-# Block storage
+# Block storage (ChainDb)
 
 proc storeBlock*(cdb: ChainDb, blk: Block) =
   ## Store full block data
@@ -151,7 +208,7 @@ proc getBlock*(cdb: ChainDb, hash: BlockHash): Option[Block] =
     return some(deserializeBlock(data.get()))
   none(Block)
 
-# Block index operations
+# Block index operations (ChainDb)
 
 proc putBlockIndex*(cdb: ChainDb, idx: BlockIndex) =
   ## Store block index entry (by hash)
@@ -182,7 +239,7 @@ proc getBlockByHeight*(cdb: ChainDb, height: int32): Option[Block] =
     return cdb.getBlock(hashOpt.get())
   none(Block)
 
-# UTXO operations
+# UTXO operations (ChainDb - low level)
 
 proc putUtxo*(cdb: ChainDb, outpoint: OutPoint, entry: UtxoEntry) =
   ## Add or update UTXO
@@ -217,7 +274,7 @@ proc deleteUtxo*(cdb: ChainDb, outpoint: OutPoint) =
 proc hasUtxo*(cdb: ChainDb, outpoint: OutPoint): bool =
   cdb.getUtxo(outpoint).isSome
 
-# TX index operations
+# TX index operations (ChainDb)
 
 proc putTxIndex*(cdb: ChainDb, txid: TxId, location: TxLocation) =
   ## Index a transaction
@@ -230,7 +287,29 @@ proc getTxIndex*(cdb: ChainDb, txid: TxId): Option[TxLocation] =
     return some(deserializeTxLocation(data.get()))
   none(TxLocation)
 
-# Chain state updates
+# Undo data operations (ChainDb)
+
+proc undoKey(hash: BlockHash): seq[byte] =
+  ## Key for undo data: "undo:" prefix + block hash
+  result = @[byte('u'), byte('n'), byte('d'), byte('o'), byte(':')]
+  result.add(@(array[32, byte](hash)))
+
+proc putUndoData*(cdb: ChainDb, blockHash: BlockHash, undo: UndoData) =
+  ## Store undo data for a block
+  cdb.db.put(cfMeta, undoKey(blockHash), serializeUndoData(undo))
+
+proc getUndoData*(cdb: ChainDb, blockHash: BlockHash): Option[UndoData] =
+  ## Get undo data for a block
+  let data = cdb.db.get(cfMeta, undoKey(blockHash))
+  if data.isSome:
+    return some(deserializeUndoData(data.get()))
+  none(UndoData)
+
+proc deleteUndoData*(cdb: ChainDb, blockHash: BlockHash) =
+  ## Remove undo data for a block
+  cdb.db.delete(cfMeta, undoKey(blockHash))
+
+# Chain state updates (ChainDb)
 
 proc updateBestBlock*(cdb: ChainDb, hash: BlockHash, height: int32) =
   ## Update best block pointer
@@ -243,10 +322,362 @@ proc updateBestBlock*(cdb: ChainDb, hash: BlockHash, height: int32) =
   w.writeInt32LE(height)
   cdb.db.put(cfMeta, metaKey("height"), w.data)
 
-# Atomic block connect/disconnect using write batches
+# ============================================================================
+# ChainState - High-level UTXO set manager with cache and reorg support
+# ============================================================================
+
+const DefaultMaxCacheSize* = 50000
+
+proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
+  ## Create a new ChainState with given path and consensus params
+  let cdb = openChainDb(dbPath)
+  result = ChainState(
+    db: cdb,
+    bestBlockHash: cdb.bestBlockHash,
+    bestHeight: cdb.bestHeight,
+    totalWork: default(array[32, byte]),
+    params: params,
+    utxoCache: initTable[OutPoint, UtxoEntry](),
+    cacheSize: 0,
+    maxCacheSize: DefaultMaxCacheSize
+  )
+
+  # Load total work from DB if available
+  let workData = cdb.db.get(cfMeta, metaKey("totalwork"))
+  if workData.isSome and workData.get().len >= 32:
+    copyMem(addr result.totalWork[0], addr workData.get()[0], 32)
+
+proc close*(cs: var ChainState) =
+  cs.db.close()
+
+# UTXO operations (ChainState - with cache management)
+
+proc getUtxo*(cs: ChainState, op: OutPoint): Option[UtxoEntry] =
+  ## Get UTXO entry, checking cache first
+  # Check local cache first
+  if op in cs.utxoCache:
+    return some(cs.utxoCache[op])
+
+  # Fall back to database
+  cs.db.getUtxo(op)
+
+proc putUtxoCache*(cs: var ChainState, op: OutPoint, entry: UtxoEntry) =
+  ## Add UTXO to cache (doesn't write to DB until flush)
+  if op notin cs.utxoCache:
+    inc cs.cacheSize
+  cs.utxoCache[op] = entry
+
+proc deleteUtxoCache*(cs: var ChainState, op: OutPoint) =
+  ## Mark UTXO as deleted in cache
+  if op in cs.utxoCache:
+    cs.utxoCache.del(op)
+    dec cs.cacheSize
+
+proc flushCache*(cs: var ChainState) =
+  ## Flush cached UTXOs to database
+  for op, entry in cs.utxoCache:
+    cs.db.putUtxo(op, entry)
+  cs.utxoCache.clear()
+  cs.cacheSize = 0
+
+  # Also save total work
+  cs.db.db.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
+
+proc shouldFlush*(cs: ChainState): bool =
+  cs.cacheSize >= cs.maxCacheSize
+
+# Work calculation helpers
+
+proc addWork(total: var array[32, byte], work: array[32, byte]) =
+  ## Add work to total (256-bit addition, little-endian)
+  var carry: uint32 = 0
+  for i in 0 ..< 32:
+    let sum = uint32(total[i]) + uint32(work[i]) + carry
+    total[i] = byte(sum and 0xff)
+    carry = sum shr 8
+
+proc calculateBlockWork(bits: uint32): array[32, byte] =
+  ## Calculate work from difficulty target
+  ## Work = 2^256 / (target + 1)
+  ## For simplicity, we approximate: work ≈ 2^(256-log2(target))
+  ## A more accurate implementation would use big integer division
+  let target = compactToTarget(bits)
+
+  # Find the highest non-zero byte to estimate difficulty
+  var highestBit = 0
+  for i in countdown(31, 0):
+    if target[i] != 0:
+      highestBit = i * 8
+      var b = target[i]
+      while b != 0:
+        inc highestBit
+        b = b shr 1
+      break
+
+  # Work is approximately 2^(256 - highestBit)
+  # For simplicity, set one bit at position (256 - highestBit)
+  result = default(array[32, byte])
+  if highestBit > 0 and highestBit < 256:
+    let workBit = 256 - highestBit
+    let bytePos = workBit div 8
+    let bitPos = workBit mod 8
+    if bytePos < 32:
+      result[bytePos] = byte(1 shl bitPos)
+  else:
+    # Minimum work
+    result[0] = 1
+
+# Generate undo data before connecting a block
+
+proc generateUndoData*(cs: ChainState, blk: Block): UndoData =
+  ## Generate undo data for a block (record all spent outputs)
+  for txIdx, tx in blk.txs:
+    # Skip coinbase inputs (nothing spent)
+    if txIdx == 0:
+      continue
+
+    for input in tx.inputs:
+      let utxoOpt = cs.getUtxo(input.prevOut)
+      if utxoOpt.isSome:
+        result.spentOutputs.add((input.prevOut, utxoOpt.get()))
+
+# Connect a block to the chain
+
+proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateResult[void] =
+  ## Connect a block: spend inputs, create outputs, update state
+  ## Returns error if any input is missing or immature coinbase
+
+  let headerBytes = serialize(blk.header)
+  let blockHash = BlockHash(doubleSha256(headerBytes))
+
+  # Generate undo data before making changes
+  let undo = cs.generateUndoData(blk)
+
+  # Create a write batch for atomic updates
+  let batch = cs.db.db.newWriteBatch()
+  defer: batch.destroy()
+
+  # Store full block data
+  batch.put(cfBlocks, blockKey(array[32, byte](blockHash)), serialize(blk))
+
+  # Process each transaction
+  for txIdx, tx in blk.txs:
+    let txId = tx.txid()
+
+    # Spend inputs (skip coinbase which has no inputs to spend)
+    if txIdx > 0:
+      for input in tx.inputs:
+        let utxoOpt = cs.getUtxo(input.prevOut)
+        if utxoOpt.isNone:
+          return err("missing input: " & $input.prevOut.txid)
+
+        let entry = utxoOpt.get()
+
+        # Check coinbase maturity
+        if entry.isCoinbase:
+          let age = height - entry.height
+          if age < int32(cs.params.coinbaseMaturity):
+            return err("immature coinbase spend at height " & $height &
+                      ", coinbase height " & $entry.height &
+                      ", age " & $age & " < " & $cs.params.coinbaseMaturity)
+
+        # Delete from DB and cache
+        let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
+        batch.delete(cfUtxo, key)
+        cs.deleteUtxoCache(input.prevOut)
+
+    # Create outputs
+    for voutIdx, output in tx.outputs:
+      let entry = UtxoEntry(
+        output: output,
+        height: height,
+        isCoinbase: txIdx == 0
+      )
+      let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
+      let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
+      batch.put(cfUtxo, key, serializeUtxoEntry(entry))
+      cs.putUtxoCache(outpoint, entry)
+
+    # Index transaction
+    let loc = TxLocation(blockHash: blockHash, txIndex: uint32(txIdx))
+    batch.put(cfTxIndex, txIndexKey(array[32, byte](txId)), serializeTxLocation(loc))
+
+  # Calculate and add work
+  let blockWork = calculateBlockWork(blk.header.bits)
+  addWork(cs.totalWork, blockWork)
+
+  # Create block index entry
+  let idx = BlockIndex(
+    hash: blockHash,
+    height: height,
+    status: bsValidated,
+    prevHash: blk.header.prevBlock,
+    header: blk.header,
+    totalWork: cs.totalWork
+  )
+  batch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
+  batch.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](blockHash)))
+
+  # Store undo data
+  batch.put(cfMeta, undoKey(blockHash), serializeUndoData(undo))
+
+  # Update best block
+  batch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](blockHash)))
+  var w = BinaryWriter()
+  w.writeInt32LE(height)
+  batch.put(cfMeta, metaKey("height"), w.data)
+  batch.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
+
+  # Commit atomically
+  cs.db.db.write(batch)
+
+  # Update in-memory state
+  cs.bestBlockHash = blockHash
+  cs.bestHeight = height
+  cs.db.bestBlockHash = blockHash
+  cs.db.bestHeight = height
+
+  # Flush cache if needed
+  if cs.shouldFlush():
+    cs.flushCache()
+
+  ok()
+
+# Disconnect a block from the chain
+
+proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoData): ChainStateResult[void] =
+  ## Disconnect a block: restore spent outputs, remove created outputs
+  ## Requires undo data to restore spent UTXOs
+
+  let headerBytes = serialize(blk.header)
+  let blockHash = BlockHash(doubleSha256(headerBytes))
+
+  let batch = cs.db.db.newWriteBatch()
+  defer: batch.destroy()
+
+  # Process transactions in reverse order
+  for txIdx in countdown(blk.txs.len - 1, 0):
+    let tx = blk.txs[txIdx]
+    let txId = tx.txid()
+
+    # Remove created outputs
+    for voutIdx in 0 ..< tx.outputs.len:
+      let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
+      batch.delete(cfUtxo, key)
+      let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
+      cs.deleteUtxoCache(outpoint)
+
+    # Remove tx index entry
+    batch.delete(cfTxIndex, txIndexKey(array[32, byte](txId)))
+
+  # Restore spent outputs from undo data
+  for (outpoint, entry) in undo.spentOutputs:
+    let key = utxoKey(array[32, byte](outpoint.txid), outpoint.vout)
+    batch.put(cfUtxo, key, serializeUtxoEntry(entry))
+    cs.putUtxoCache(outpoint, entry)
+
+  # Remove undo data for this block
+  batch.delete(cfMeta, undoKey(blockHash))
+
+  # Remove block index height mapping
+  batch.delete(cfBlockIndex, blockIndexKey(height))
+
+  # Subtract work (reverse the work addition)
+  let blockWork = calculateBlockWork(blk.header.bits)
+  var newTotalWork = cs.totalWork
+  # Subtract: newTotal = total - blockWork
+  var borrow: int32 = 0
+  for i in 0 ..< 32:
+    let diff = int32(newTotalWork[i]) - int32(blockWork[i]) - borrow
+    if diff < 0:
+      newTotalWork[i] = byte((diff + 256) and 0xff)
+      borrow = 1
+    else:
+      newTotalWork[i] = byte(diff)
+      borrow = 0
+  cs.totalWork = newTotalWork
+
+  # Update best block to previous
+  let newBestHeight = height - 1
+  if newBestHeight >= 0:
+    batch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](blk.header.prevBlock)))
+    var w = BinaryWriter()
+    w.writeInt32LE(newBestHeight)
+    batch.put(cfMeta, metaKey("height"), w.data)
+    batch.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
+
+    cs.bestBlockHash = blk.header.prevBlock
+    cs.bestHeight = newBestHeight
+    cs.db.bestBlockHash = blk.header.prevBlock
+    cs.db.bestHeight = newBestHeight
+
+  cs.db.db.write(batch)
+
+  ok()
+
+# Handle a reorg
+
+proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]): ChainStateResult[void] =
+  ## Handle a chain reorganization
+  ## 1. Disconnect blocks from current tip back to forkPoint
+  ## 2. Connect blocks in newChain
+  ##
+  ## forkPoint: the last common ancestor block hash
+  ## newChain: blocks to connect, in order from forkPoint+1 to new tip
+
+  # First, disconnect blocks from current tip to fork point
+  var currentHash = cs.bestBlockHash
+  var currentHeight = cs.bestHeight
+  var disconnectedBlocks: seq[(Block, UndoData)] = @[]
+
+  while currentHash != forkPoint and currentHeight >= 0:
+    # Get the block to disconnect
+    let blkOpt = cs.db.getBlock(currentHash)
+    if blkOpt.isNone:
+      return err("cannot find block to disconnect: " & $currentHash)
+
+    let blk = blkOpt.get()
+
+    # Get undo data
+    let undoOpt = cs.db.getUndoData(currentHash)
+    if undoOpt.isNone:
+      return err("missing undo data for block: " & $currentHash)
+
+    disconnectedBlocks.add((blk, undoOpt.get()))
+
+    # Move to previous block
+    currentHash = blk.header.prevBlock
+    dec currentHeight
+
+  # Disconnect in reverse order (from tip to fork point)
+  var height = cs.bestHeight
+  for (blk, undo) in disconnectedBlocks:
+    let disconnectRes = cs.disconnectBlock(blk, height, undo)
+    if not disconnectRes.isOk:
+      return err("failed to disconnect block at height " & $height & ": " & disconnectRes.error)
+    dec height
+
+  # Verify we're at the fork point
+  if cs.bestBlockHash != forkPoint:
+    return err("failed to reach fork point")
+
+  # Connect new chain
+  var newHeight = cs.bestHeight + 1
+  for blk in newChain:
+    let connectRes = cs.connectBlock(blk, newHeight)
+    if not connectRes.isOk:
+      return err("failed to connect block at height " & $newHeight & ": " & connectRes.error)
+    inc newHeight
+
+  ok()
+
+# ============================================================================
+# Legacy compatibility functions (operate on ChainDb directly)
+# ============================================================================
 
 proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
   ## Atomically apply a block: spend inputs, create outputs, update index
+  ## Legacy function - use ChainState.connectBlock for new code
   let batch = cdb.db.newWriteBatch()
   defer: batch.destroy()
 
@@ -311,6 +742,7 @@ proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
 
 proc disconnectBlock*(cdb: ChainDb, blk: Block, height: int32) =
   ## Atomically disconnect a block: restore spent outputs, remove created outputs
+  ## Legacy function - use ChainState.disconnectBlock for new code
   let batch = cdb.db.newWriteBatch()
   defer: batch.destroy()
 
