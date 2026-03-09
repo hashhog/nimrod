@@ -20,7 +20,8 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Base58Check encoding (legacy P2PKH, P2SH addresses)
 - [x] Bech32/Bech32m encoding (segwit P2WPKH, P2WSH, P2TR addresses)
 - [x] Address encoding/decoding for all Bitcoin address types
-- [x] Script interpreter (stack machine, opcodes)
+- [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
+- [x] Sighash computation (legacy, segwit v0, taproot)
 - [x] Consensus parameters (mainnet, testnet, regtest)
 - [x] Block/transaction validation
 - [x] RocksDB storage layer
@@ -34,7 +35,6 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] JSON-RPC server
 - [x] Basic wallet (key management, addresses)
 - [ ] Initial block download
-- [ ] Full script verification
 
 ## Quick start
 
