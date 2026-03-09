@@ -150,11 +150,11 @@ proc fromInt(n: int64): seq[byte] =
 
 proc execute*(
   interp: var ScriptInterpreter,
-  script: ScriptBytes,
+  script: seq[byte],
   sigChecker: proc(sig, pubkey: seq[byte]): bool = nil
 ): bool =
   ## Execute a script, returning true if successful
-  let scriptData = seq[byte](script)
+  let scriptData = script
   var pc = 0
 
   while pc < scriptData.len:
@@ -274,8 +274,8 @@ proc execute*(
   toBool(interp.peek())
 
 proc verifyScript*(
-  scriptSig: ScriptBytes,
-  scriptPubKey: ScriptBytes,
+  scriptSig: seq[byte],
+  scriptPubKey: seq[byte],
   sigChecker: proc(sig, pubkey: seq[byte]): bool = nil
 ): bool =
   ## Verify a transaction input by running scriptSig then scriptPubKey

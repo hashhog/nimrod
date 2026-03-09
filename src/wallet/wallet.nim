@@ -209,22 +209,20 @@ proc signMessage*(wallet: Wallet, address: string, message: openArray[byte]): Si
   let messageHash = doubleSha256(message)
   sign(key.privateKey, messageHash)
 
-proc createScriptPubKey*(address: string): ScriptBytes =
+proc createScriptPubKey*(address: string): seq[byte] =
   ## Create a scriptPubKey for an address
   let (version, payload) = base58CheckDecode(address)
 
   if version == 0x00 or version == 0x6f:  # P2PKH
     # OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-    var script: seq[byte] = @[0x76'u8, 0xa9, 0x14]
-    script.add(payload)
-    script.add(@[0x88'u8, 0xac])
-    ScriptBytes(script)
+    result = @[0x76'u8, 0xa9, 0x14]
+    result.add(payload)
+    result.add(@[0x88'u8, 0xac])
   elif version == 0x05 or version == 0xc4:  # P2SH
     # OP_HASH160 <20 bytes> OP_EQUAL
-    var script: seq[byte] = @[0xa9'u8, 0x14]
-    script.add(payload)
-    script.add(0x87)
-    ScriptBytes(script)
+    result = @[0xa9'u8, 0x14]
+    result.add(payload)
+    result.add(0x87)
   else:
     raise newException(WalletError, "unsupported address type")
 

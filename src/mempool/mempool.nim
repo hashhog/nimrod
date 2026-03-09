@@ -66,7 +66,7 @@ proc calculateFee*(
   ## Calculate transaction fee from inputs - outputs
   var inputValue = Satoshi(0)
   for input in tx.inputs:
-    let utxoValue = getUtxo(input.prevout.txid, input.prevout.vout)
+    let utxoValue = getUtxo(input.prevOut.txid, input.prevOut.vout)
     if utxoValue.isSome:
       inputValue = inputValue + utxoValue.get()
 
@@ -100,14 +100,14 @@ proc addTransaction*(
 
   # Check inputs are available (not spent)
   for input in tx.inputs:
-    let key = outpointKey(input.prevout.txid, input.prevout.vout)
+    let key = outpointKey(input.prevOut.txid, input.prevOut.vout)
     if key in mp.spentOutpoints:
       return false
 
     # Check UTXO exists
-    if not chainState.hasUtxo(input.prevout.txid, input.prevout.vout):
+    if not chainState.hasUtxo(input.prevOut.txid, input.prevOut.vout):
       # Could be in mempool (child-pays-for-parent)
-      if input.prevout.txid notin mp.entries:
+      if input.prevOut.txid notin mp.entries:
         return false
 
   # Calculate fee
@@ -147,7 +147,7 @@ proc addTransaction*(
 
   # Mark outputs as spent
   for input in tx.inputs:
-    mp.spentOutpoints.incl(outpointKey(input.prevout.txid, input.prevout.vout))
+    mp.spentOutpoints.incl(outpointKey(input.prevOut.txid, input.prevOut.vout))
 
   true
 
@@ -160,13 +160,13 @@ proc removeTransaction*(mp: Mempool, txid: TxId) =
 
   # Unmark spent outpoints
   for input in entry.tx.inputs:
-    mp.spentOutpoints.excl(outpointKey(input.prevout.txid, input.prevout.vout))
+    mp.spentOutpoints.excl(outpointKey(input.prevOut.txid, input.prevOut.vout))
 
   mp.entries.del(txid)
 
 proc removeForBlock*(mp: Mempool, blk: Block) =
   ## Remove transactions that were included in a block
-  for tx in blk.transactions:
+  for tx in blk.txs:
     let txBytes = serialize(tx)
     let txid = TxId(doubleSha256(txBytes))
     mp.removeTransaction(txid)

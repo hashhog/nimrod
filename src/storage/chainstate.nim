@@ -1,7 +1,7 @@
 ## Chainstate management
 ## Tracks UTXO set and blockchain state
 
-import std/[options, tables, streams]
+import std/[options, tables]
 import ./rocksdb
 import ../primitives/[types, serialize]
 import ../crypto/hashing
@@ -11,7 +11,7 @@ type
 
   Utxo* = object
     value*: Satoshi
-    scriptPubKey*: ScriptBytes
+    scriptPubKey*: seq[byte]
     height*: int
     coinbase*: bool
 
@@ -31,22 +31,19 @@ proc utxoCacheKey(txid: TxId, vout: uint32): string =
   result.add(char(vout and 0xff))
 
 proc serializeUtxo(utxo: Utxo): seq[byte] =
-  let s = newStringStream()
-  s.writeInt64LE(int64(utxo.value))
-  s.writeCompactSize(CompactSize(seq[byte](utxo.scriptPubKey).len))
-  s.writeBytes(seq[byte](utxo.scriptPubKey))
-  s.writeInt32LE(int32(utxo.height))
-  s.writeUint8(if utxo.coinbase: 1 else: 0)
-  s.setPosition(0)
-  result = cast[seq[byte]](s.readAll())
+  var w = BinaryWriter()
+  w.writeInt64LE(int64(utxo.value))
+  w.writeVarBytes(utxo.scriptPubKey)
+  w.writeInt32LE(int32(utxo.height))
+  w.writeUint8(if utxo.coinbase: 1 else: 0)
+  w.data
 
 proc deserializeUtxo(data: seq[byte]): Utxo =
-  let s = newStringStream(cast[string](data))
-  result.value = Satoshi(s.readInt64LE())
-  let scriptLen = s.readCompactSize()
-  result.scriptPubKey = ScriptBytes(s.readBytes(int(uint64(scriptLen))))
-  result.height = int(s.readInt32LE())
-  result.coinbase = s.readUint8() != 0
+  var r = BinaryReader(data: data, pos: 0)
+  result.value = Satoshi(r.readInt64LE())
+  result.scriptPubKey = r.readVarBytes()
+  result.height = int(r.readInt32LE())
+  result.coinbase = r.readUint8() != 0
 
 proc openChainState*(path: string): ChainState =
   result = ChainState(
@@ -65,8 +62,8 @@ proc openChainState*(path: string): ChainState =
 
   let heightData = result.db.get(metaKey("height"))
   if heightData.isSome:
-    let s = newStringStream(cast[string](heightData.get()))
-    result.bestHeight = int(s.readInt32LE())
+    var r = BinaryReader(data: heightData.get(), pos: 0)
+    result.bestHeight = int(r.readInt32LE())
 
 proc close*(cs: ChainState) =
   cs.db.close()
@@ -111,10 +108,9 @@ proc updateBestBlock*(cs: ChainState, hash: BlockHash, height: int) =
 
   cs.db.put(metaKey("bestblock"), @(array[32, byte](hash)))
 
-  let s = newStringStream()
-  s.writeInt32LE(int32(height))
-  s.setPosition(0)
-  cs.db.put(metaKey("height"), cast[seq[byte]](s.readAll()))
+  var w = BinaryWriter()
+  w.writeInt32LE(int32(height))
+  cs.db.put(metaKey("height"), w.data)
 
 proc storeBlock*(cs: ChainState, blk: Block, height: int) =
   let headerBytes = serialize(blk.header)
@@ -138,13 +134,11 @@ proc getBlockByHeight*(cs: ChainState, height: int): Option[Block] =
   if blockData.isNone:
     return none(Block)
 
-  let s = newStringStream(cast[string](blockData.get()))
-  some(s.readBlock())
+  some(deserializeBlock(blockData.get()))
 
 proc getBlockByHash*(cs: ChainState, hash: BlockHash): Option[Block] =
   let blockData = cs.db.get(blockKey(array[32, byte](hash)))
   if blockData.isNone:
     return none(Block)
 
-  let s = newStringStream(cast[string](blockData.get()))
-  some(s.readBlock())
+  some(deserializeBlock(blockData.get()))

@@ -129,14 +129,14 @@ proc processBlock*(sync: BlockSync, blk: Block): bool =
   sync.chainState.updateBestBlock(BlockHash(hash), height)
 
   # Update UTXO set
-  for i, tx in blk.transactions:
+  for i, tx in blk.txs:
     let txBytes = serialize(tx)
     let txid = TxId(doubleSha256(txBytes))
 
     # Remove spent UTXOs
     if not isCoinbase(tx):
       for input in tx.inputs:
-        sync.chainState.removeUtxo(input.prevout.txid, input.prevout.vout)
+        sync.chainState.removeUtxo(input.prevOut.txid, input.prevOut.vout)
 
     # Add new UTXOs
     for vout, output in tx.outputs:
