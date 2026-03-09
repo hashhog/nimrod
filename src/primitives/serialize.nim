@@ -1,218 +1,338 @@
 ## Binary serialization for Bitcoin protocol
+## Stream-based BinaryWriter/BinaryReader for wire format
 ## Little-endian encoding for all integer types
-## CompactSize/VarInt encoding for variable-length data
+## CompactSize (varint) encoding for variable-length data
+## Segwit transaction support with txid/wtxid computation
 
-import std/[streams]
 import ./types
 
 type
-  SerializeError* = object of CatchableError
+  BinaryWriter* = object
+    data*: seq[byte]
 
-# Reading primitives
-proc readUint8*(s: Stream): uint8 =
-  if s.readData(addr result, 1) != 1:
-    raise newException(SerializeError, "unexpected end of stream")
+  BinaryReader* = object
+    data*: seq[byte]
+    pos*: int
 
-proc readUint16LE*(s: Stream): uint16 =
-  var buf: array[2, byte]
-  if s.readData(addr buf[0], 2) != 2:
-    raise newException(SerializeError, "unexpected end of stream")
-  result = uint16(buf[0]) or (uint16(buf[1]) shl 8)
+# BinaryWriter procedures
 
-proc readUint32LE*(s: Stream): uint32 =
-  var buf: array[4, byte]
-  if s.readData(addr buf[0], 4) != 4:
-    raise newException(SerializeError, "unexpected end of stream")
-  result = uint32(buf[0]) or (uint32(buf[1]) shl 8) or
-           (uint32(buf[2]) shl 16) or (uint32(buf[3]) shl 24)
+proc writeUint8*(w: var BinaryWriter, v: uint8) =
+  w.data.add(v)
 
-proc readUint64LE*(s: Stream): uint64 =
-  var buf: array[8, byte]
-  if s.readData(addr buf[0], 8) != 8:
-    raise newException(SerializeError, "unexpected end of stream")
-  for i in 0..7:
-    result = result or (uint64(buf[i]) shl (i * 8))
+proc writeUint16LE*(w: var BinaryWriter, v: uint16) =
+  w.data.add(byte(v and 0xFF))
+  w.data.add(byte((v shr 8) and 0xFF))
 
-proc readInt32LE*(s: Stream): int32 =
-  cast[int32](s.readUint32LE())
+proc writeUint32LE*(w: var BinaryWriter, v: uint32) =
+  for i in 0 ..< 4:
+    w.data.add(byte((v shr (i * 8)) and 0xFF))
 
-proc readInt64LE*(s: Stream): int64 =
-  cast[int64](s.readUint64LE())
+proc writeUint64LE*(w: var BinaryWriter, v: uint64) =
+  for i in 0 ..< 8:
+    w.data.add(byte((v shr (i * 8)) and 0xFF))
 
-proc readCompactSize*(s: Stream): CompactSize =
-  let first = s.readUint8()
+proc writeInt32LE*(w: var BinaryWriter, v: int32) =
+  w.writeUint32LE(cast[uint32](v))
+
+proc writeInt64LE*(w: var BinaryWriter, v: int64) =
+  w.writeUint64LE(cast[uint64](v))
+
+proc writeBytes*(w: var BinaryWriter, b: openArray[byte]) =
+  for x in b:
+    w.data.add(x)
+
+proc writeHash*(w: var BinaryWriter, h: array[32, byte]) =
+  w.writeBytes(h)
+
+proc writeCompactSize*(w: var BinaryWriter, v: uint64) =
+  if v < 0xFD:
+    w.writeUint8(uint8(v))
+  elif v <= 0xFFFF:
+    w.writeUint8(0xFD)
+    w.writeUint16LE(uint16(v))
+  elif v <= 0xFFFFFFFF'u64:
+    w.writeUint8(0xFE)
+    w.writeUint32LE(uint32(v))
+  else:
+    w.writeUint8(0xFF)
+    w.writeUint64LE(v)
+
+proc writeVarBytes*(w: var BinaryWriter, b: openArray[byte]) =
+  w.writeCompactSize(uint64(b.len))
+  w.writeBytes(b)
+
+# BinaryReader procedures
+
+proc remaining*(r: BinaryReader): int =
+  r.data.len - r.pos
+
+proc readUint8*(r: var BinaryReader): uint8 =
+  if r.pos >= r.data.len:
+    raise newException(SerializationError, "unexpected end of data")
+  result = r.data[r.pos]
+  inc r.pos
+
+proc readUint16LE*(r: var BinaryReader): uint16 =
+  if r.pos + 2 > r.data.len:
+    raise newException(SerializationError, "unexpected end of data")
+  result = uint16(r.data[r.pos]) or (uint16(r.data[r.pos + 1]) shl 8)
+  r.pos += 2
+
+proc readUint32LE*(r: var BinaryReader): uint32 =
+  if r.pos + 4 > r.data.len:
+    raise newException(SerializationError, "unexpected end of data")
+  for i in 0 ..< 4:
+    result = result or (uint32(r.data[r.pos + i]) shl (i * 8))
+  r.pos += 4
+
+proc readUint64LE*(r: var BinaryReader): uint64 =
+  if r.pos + 8 > r.data.len:
+    raise newException(SerializationError, "unexpected end of data")
+  for i in 0 ..< 8:
+    result = result or (uint64(r.data[r.pos + i]) shl (i * 8))
+  r.pos += 8
+
+proc readInt32LE*(r: var BinaryReader): int32 =
+  cast[int32](r.readUint32LE())
+
+proc readInt64LE*(r: var BinaryReader): int64 =
+  cast[int64](r.readUint64LE())
+
+proc readBytes*(r: var BinaryReader, n: int): seq[byte] =
+  if r.pos + n > r.data.len:
+    raise newException(SerializationError, "unexpected end of data")
+  result = r.data[r.pos ..< r.pos + n]
+  r.pos += n
+
+proc readHash*(r: var BinaryReader): array[32, byte] =
+  if r.pos + 32 > r.data.len:
+    raise newException(SerializationError, "unexpected end of data")
+  copyMem(addr result[0], addr r.data[r.pos], 32)
+  r.pos += 32
+
+proc readCompactSize*(r: var BinaryReader): uint64 =
+  let first = r.readUint8()
   if first < 0xFD:
-    result = CompactSize(first)
+    result = uint64(first)
   elif first == 0xFD:
-    result = CompactSize(s.readUint16LE())
+    result = uint64(r.readUint16LE())
   elif first == 0xFE:
-    result = CompactSize(s.readUint32LE())
+    result = uint64(r.readUint32LE())
   else:
-    result = CompactSize(s.readUint64LE())
+    result = r.readUint64LE()
 
-proc readBytes*(s: Stream, count: int): seq[byte] =
-  result = newSeq[byte](count)
-  if count > 0:
-    if s.readData(addr result[0], count) != count:
-      raise newException(SerializeError, "unexpected end of stream")
+proc readVarBytes*(r: var BinaryReader): seq[byte] =
+  let length = r.readCompactSize()
+  r.readBytes(int(length))
 
-proc readArray32*(s: Stream): array[32, byte] =
-  if s.readData(addr result[0], 32) != 32:
-    raise newException(SerializeError, "unexpected end of stream")
+# High-level serialization for Bitcoin types
 
-# Writing primitives
-proc writeUint8*(s: Stream, v: uint8) =
-  s.write(v)
+proc writeTxId*(w: var BinaryWriter, txid: TxId) =
+  w.writeHash(array[32, byte](txid))
 
-proc writeUint16LE*(s: Stream, v: uint16) =
-  s.write(byte(v and 0xFF))
-  s.write(byte((v shr 8) and 0xFF))
+proc writeBlockHash*(w: var BinaryWriter, hash: BlockHash) =
+  w.writeHash(array[32, byte](hash))
 
-proc writeUint32LE*(s: Stream, v: uint32) =
-  for i in 0..3:
-    s.write(byte((v shr (i * 8)) and 0xFF))
+proc readTxId*(r: var BinaryReader): TxId =
+  TxId(r.readHash())
 
-proc writeUint64LE*(s: Stream, v: uint64) =
-  for i in 0..7:
-    s.write(byte((v shr (i * 8)) and 0xFF))
+proc readBlockHash*(r: var BinaryReader): BlockHash =
+  BlockHash(r.readHash())
 
-proc writeInt32LE*(s: Stream, v: int32) =
-  s.writeUint32LE(cast[uint32](v))
+proc writeOutPoint*(w: var BinaryWriter, op: OutPoint) =
+  w.writeTxId(op.txid)
+  w.writeUint32LE(op.vout)
 
-proc writeInt64LE*(s: Stream, v: int64) =
-  s.writeUint64LE(cast[uint64](v))
+proc readOutPoint*(r: var BinaryReader): OutPoint =
+  result.txid = r.readTxId()
+  result.vout = r.readUint32LE()
 
-proc writeCompactSize*(s: Stream, v: CompactSize) =
-  let n = uint64(v)
-  if n < 0xFD:
-    s.writeUint8(uint8(n))
-  elif n <= 0xFFFF:
-    s.writeUint8(0xFD)
-    s.writeUint16LE(uint16(n))
-  elif n <= 0xFFFFFFFF'u64:
-    s.writeUint8(0xFE)
-    s.writeUint32LE(uint32(n))
-  else:
-    s.writeUint8(0xFF)
-    s.writeUint64LE(n)
+proc writeTxIn*(w: var BinaryWriter, txin: TxIn) =
+  w.writeOutPoint(txin.prevOut)
+  w.writeVarBytes(txin.scriptSig)
+  w.writeUint32LE(txin.sequence)
 
-proc writeBytes*(s: Stream, data: openArray[byte]) =
-  if data.len > 0:
-    s.writeData(unsafeAddr data[0], data.len)
+proc readTxIn*(r: var BinaryReader): TxIn =
+  result.prevOut = r.readOutPoint()
+  result.scriptSig = r.readVarBytes()
+  result.sequence = r.readUint32LE()
 
-proc writeArray32*(s: Stream, data: array[32, byte]) =
-  s.writeData(unsafeAddr data[0], 32)
+proc writeTxOut*(w: var BinaryWriter, txout: TxOut) =
+  w.writeInt64LE(int64(txout.value))
+  w.writeVarBytes(txout.scriptPubKey)
 
-# High-level serialization
-proc readTxId*(s: Stream): TxId =
-  TxId(s.readArray32())
+proc readTxOut*(r: var BinaryReader): TxOut =
+  result.value = Satoshi(r.readInt64LE())
+  result.scriptPubKey = r.readVarBytes()
 
-proc readBlockHash*(s: Stream): BlockHash =
-  BlockHash(s.readArray32())
+proc writeWitness*(w: var BinaryWriter, witness: seq[seq[byte]]) =
+  ## Write a single input's witness stack
+  w.writeCompactSize(uint64(witness.len))
+  for item in witness:
+    w.writeVarBytes(item)
 
-proc writeTxId*(s: Stream, txid: TxId) =
-  s.writeArray32(array[32, byte](txid))
+proc readWitness*(r: var BinaryReader): seq[seq[byte]] =
+  ## Read a single input's witness stack
+  let count = r.readCompactSize()
+  for i in 0 ..< int(count):
+    result.add(r.readVarBytes())
 
-proc writeBlockHash*(s: Stream, hash: BlockHash) =
-  s.writeArray32(array[32, byte](hash))
+proc writeTransaction*(w: var BinaryWriter, tx: Transaction, includeWitness: bool = true) =
+  ## Write transaction in wire format
+  ## If includeWitness is true and tx has witness data, writes segwit format
+  let hasWitness = tx.witnesses.len > 0 and includeWitness
 
-proc readScriptBytes*(s: Stream): ScriptBytes =
-  let length = s.readCompactSize()
-  ScriptBytes(s.readBytes(int(uint64(length))))
+  w.writeInt32LE(tx.version)
 
-proc writeScriptBytes*(s: Stream, script: ScriptBytes) =
-  s.writeCompactSize(CompactSize(seq[byte](script).len))
-  s.writeBytes(seq[byte](script))
+  if hasWitness:
+    # Segwit marker and flag
+    w.writeUint8(0x00)
+    w.writeUint8(0x01)
 
-proc readOutPoint*(s: Stream): OutPoint =
-  result.txid = s.readTxId()
-  result.vout = s.readUint32LE()
-
-proc writeOutPoint*(s: Stream, op: OutPoint) =
-  s.writeTxId(op.txid)
-  s.writeUint32LE(op.vout)
-
-proc readTxIn*(s: Stream): TxIn =
-  result.prevout = s.readOutPoint()
-  result.scriptSig = s.readScriptBytes()
-  result.sequence = s.readUint32LE()
-
-proc writeTxIn*(s: Stream, txin: TxIn) =
-  s.writeOutPoint(txin.prevout)
-  s.writeScriptBytes(txin.scriptSig)
-  s.writeUint32LE(txin.sequence)
-
-proc readTxOut*(s: Stream): TxOut =
-  result.value = Satoshi(s.readInt64LE())
-  result.scriptPubKey = s.readScriptBytes()
-
-proc writeTxOut*(s: Stream, txout: TxOut) =
-  s.writeInt64LE(int64(txout.value))
-  s.writeScriptBytes(txout.scriptPubKey)
-
-proc readTransaction*(s: Stream): Transaction =
-  result.version = s.readInt32LE()
-  let inputCount = s.readCompactSize()
-  for i in 0 ..< int(uint64(inputCount)):
-    result.inputs.add(s.readTxIn())
-  let outputCount = s.readCompactSize()
-  for i in 0 ..< int(uint64(outputCount)):
-    result.outputs.add(s.readTxOut())
-  result.lockTime = s.readUint32LE()
-
-proc writeTransaction*(s: Stream, tx: Transaction) =
-  s.writeInt32LE(tx.version)
-  s.writeCompactSize(CompactSize(tx.inputs.len))
+  # Inputs
+  w.writeCompactSize(uint64(tx.inputs.len))
   for input in tx.inputs:
-    s.writeTxIn(input)
-  s.writeCompactSize(CompactSize(tx.outputs.len))
+    w.writeTxIn(input)
+
+  # Outputs
+  w.writeCompactSize(uint64(tx.outputs.len))
   for output in tx.outputs:
-    s.writeTxOut(output)
-  s.writeUint32LE(tx.lockTime)
+    w.writeTxOut(output)
 
-proc readBlockHeader*(s: Stream): BlockHeader =
-  result.version = s.readInt32LE()
-  result.prevHash = s.readBlockHash()
-  result.merkleRoot = s.readArray32()
-  result.timestamp = s.readUint32LE()
-  result.bits = s.readUint32LE()
-  result.nonce = s.readUint32LE()
+  # Witness data (if segwit)
+  if hasWitness:
+    for i in 0 ..< tx.inputs.len:
+      if i < tx.witnesses.len:
+        w.writeWitness(tx.witnesses[i])
+      else:
+        w.writeCompactSize(0)  # Empty witness stack
 
-proc writeBlockHeader*(s: Stream, header: BlockHeader) =
-  s.writeInt32LE(header.version)
-  s.writeBlockHash(header.prevHash)
-  s.writeArray32(header.merkleRoot)
-  s.writeUint32LE(header.timestamp)
-  s.writeUint32LE(header.bits)
-  s.writeUint32LE(header.nonce)
+  w.writeUint32LE(tx.lockTime)
 
-proc readBlock*(s: Stream): Block =
-  result.header = s.readBlockHeader()
-  let txCount = s.readCompactSize()
-  for i in 0 ..< int(uint64(txCount)):
-    result.transactions.add(s.readTransaction())
+proc readTransaction*(r: var BinaryReader): Transaction =
+  ## Read transaction from wire format, auto-detecting segwit
+  result.version = r.readInt32LE()
 
-proc writeBlock*(s: Stream, blk: Block) =
-  s.writeBlockHeader(blk.header)
-  s.writeCompactSize(CompactSize(blk.transactions.len))
-  for tx in blk.transactions:
-    s.writeTransaction(tx)
+  # Check for segwit marker
+  let marker = r.readUint8()
+  var isSegwit = false
 
-# Convenience functions
-proc serialize*(tx: Transaction): seq[byte] =
-  let s = newStringStream()
-  s.writeTransaction(tx)
-  s.setPosition(0)
-  result = cast[seq[byte]](s.readAll())
+  if marker == 0x00:
+    # Potential segwit transaction
+    let flag = r.readUint8()
+    if flag != 0x01:
+      raise newException(SerializationError, "invalid segwit flag")
+    isSegwit = true
+  else:
+    # Legacy transaction - marker was actually the input count
+    # We need to handle this carefully since we already read the first byte
+    # Reconstruct the compact size
+    var inputCount: uint64
+    if marker < 0xFD:
+      inputCount = uint64(marker)
+    elif marker == 0xFD:
+      inputCount = uint64(r.readUint16LE())
+    elif marker == 0xFE:
+      inputCount = uint64(r.readUint32LE())
+    else:
+      inputCount = r.readUint64LE()
+
+    for i in 0 ..< int(inputCount):
+      result.inputs.add(r.readTxIn())
+
+    let outputCount = r.readCompactSize()
+    for i in 0 ..< int(outputCount):
+      result.outputs.add(r.readTxOut())
+
+    result.lockTime = r.readUint32LE()
+    return
+
+  # Continue reading segwit transaction
+  let inputCount = r.readCompactSize()
+  for i in 0 ..< int(inputCount):
+    result.inputs.add(r.readTxIn())
+
+  let outputCount = r.readCompactSize()
+  for i in 0 ..< int(outputCount):
+    result.outputs.add(r.readTxOut())
+
+  # Read witness data
+  for i in 0 ..< result.inputs.len:
+    result.witnesses.add(r.readWitness())
+
+  result.lockTime = r.readUint32LE()
+
+proc writeBlockHeader*(w: var BinaryWriter, header: BlockHeader) =
+  w.writeInt32LE(header.version)
+  w.writeBlockHash(header.prevBlock)
+  w.writeHash(header.merkleRoot)
+  w.writeUint32LE(header.timestamp)
+  w.writeUint32LE(header.bits)
+  w.writeUint32LE(header.nonce)
+
+proc readBlockHeader*(r: var BinaryReader): BlockHeader =
+  result.version = r.readInt32LE()
+  result.prevBlock = r.readBlockHash()
+  result.merkleRoot = r.readHash()
+  result.timestamp = r.readUint32LE()
+  result.bits = r.readUint32LE()
+  result.nonce = r.readUint32LE()
+
+proc writeBlock*(w: var BinaryWriter, blk: Block) =
+  w.writeBlockHeader(blk.header)
+  w.writeCompactSize(uint64(blk.txs.len))
+  for tx in blk.txs:
+    w.writeTransaction(tx)
+
+proc readBlock*(r: var BinaryReader): Block =
+  result.header = r.readBlockHeader()
+  let txCount = r.readCompactSize()
+  for i in 0 ..< int(txCount):
+    result.txs.add(r.readTransaction())
+
+# Convenience serialization functions
+
+proc serialize*(tx: Transaction, includeWitness: bool = true): seq[byte] =
+  var w = BinaryWriter()
+  w.writeTransaction(tx, includeWitness)
+  result = w.data
+
+proc serializeLegacy*(tx: Transaction): seq[byte] =
+  ## Serialize without witness data (for txid computation)
+  serialize(tx, includeWitness = false)
 
 proc serialize*(header: BlockHeader): seq[byte] =
-  let s = newStringStream()
-  s.writeBlockHeader(header)
-  s.setPosition(0)
-  result = cast[seq[byte]](s.readAll())
+  var w = BinaryWriter()
+  w.writeBlockHeader(header)
+  result = w.data
 
 proc serialize*(blk: Block): seq[byte] =
-  let s = newStringStream()
-  s.writeBlock(blk)
-  s.setPosition(0)
-  result = cast[seq[byte]](s.readAll())
+  var w = BinaryWriter()
+  w.writeBlock(blk)
+  result = w.data
+
+proc deserializeTransaction*(data: seq[byte]): Transaction =
+  var r = BinaryReader(data: data, pos: 0)
+  r.readTransaction()
+
+proc deserializeBlockHeader*(data: seq[byte]): BlockHeader =
+  var r = BinaryReader(data: data, pos: 0)
+  r.readBlockHeader()
+
+proc deserializeBlock*(data: seq[byte]): Block =
+  var r = BinaryReader(data: data, pos: 0)
+  r.readBlock()
+
+# txid and wtxid computation
+import ../crypto/hashing
+
+proc txid*(tx: Transaction): TxId =
+  ## Compute transaction ID (hash of legacy serialization, excludes witness)
+  let legacyData = tx.serializeLegacy()
+  TxId(doubleSha256(legacyData))
+
+proc wtxid*(tx: Transaction): TxId =
+  ## Compute witness transaction ID (hash of full serialization)
+  ## For non-segwit transactions, wtxid equals txid
+  let fullData = tx.serialize(includeWitness = true)
+  TxId(doubleSha256(fullData))
