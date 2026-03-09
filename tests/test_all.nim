@@ -12,9 +12,12 @@ import ./test_storage
 import ./test_messages
 import ./test_peer
 import ./test_mempool
+import ./test_chainstate
 import ./test_fees
 import ./test_template
+import ./test_sync
 import ./test_wallet
+import ./test_rpc
 
 when isMainModule:
   echo "Running all tests..."
