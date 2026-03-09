@@ -3,6 +3,7 @@
 
 import std/strutils
 import std/sequtils
+import std/hashes
 
 type
   TxId* = distinct array[32, byte]
@@ -18,12 +19,20 @@ proc `$`*(a: TxId): string =
   for i in countdown(31, 0):
     result.add(toHex(array[32, byte](a)[i], 2).toLowerAscii)
 
+proc hash*(a: TxId): Hash =
+  ## Hash function for TxId (for use in Tables)
+  hash(array[32, byte](a))
+
 # Borrow operators for BlockHash
 proc `==`*(a, b: BlockHash): bool {.borrow.}
 proc `$`*(a: BlockHash): string =
   result = ""
   for i in countdown(31, 0):
     result.add(toHex(array[32, byte](a)[i], 2).toLowerAscii)
+
+proc hash*(a: BlockHash): Hash =
+  ## Hash function for BlockHash (for use in Tables)
+  hash(array[32, byte](a))
 
 # Borrow operators for Satoshi
 proc `==`*(a, b: Satoshi): bool {.borrow.}
