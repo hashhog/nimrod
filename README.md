@@ -40,6 +40,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Block template generation (BIP-34 coinbase, witness commitment, sigops limit)
 - [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic auth)
 - [x] HD Wallet (BIP-32/39/44/84/86 key derivation, P2WPKH signing)
+- [x] Unified CLI (subcommands for node, RPC, wallet; config file; signal handlers)
 - [ ] Relay mode (post-IBD block/tx propagation)
 
 ## Quick start
@@ -47,7 +48,8 @@ It leverages Nim's Python-like syntax with C-level performance.
 ```bash
 nimble build
 ./nimrod --help
-./nimrod --testnet
+./nimrod --network=regtest start
+./nimrod --network=regtest getinfo
 ```
 
 ## Project structure
@@ -55,7 +57,7 @@ nimble build
 ```
 nimrod/
 ├── src/
-│   ├── nimrod.nim          # Main entry point
+│   ├── nimrod.nim          # Unified CLI entry point
 │   ├── primitives/         # Core types and serialization
 │   ├── crypto/             # Hashing, secp256k1, address encoding
 │   ├── script/             # Script interpreter
