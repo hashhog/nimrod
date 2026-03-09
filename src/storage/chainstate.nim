@@ -37,6 +37,9 @@ type
     bestHeight*: int32
     utxoCache*: Table[string, UtxoEntry]  ## In-memory cache for hot UTXOs
 
+  # Type alias for compatibility
+  ChainState* = ChainDb
+
 # Key helpers
 
 proc outpointKey(txid: TxId, vout: uint32): string =
