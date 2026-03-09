@@ -1,10 +1,11 @@
 ## Tests for consensus rules
 
-import std/strutils
+import std/[strutils, options, tables]
 import unittest2
 import ../src/consensus/[params, validation]
 import ../src/primitives/[types, serialize]
-import ../src/crypto/hashing
+import ../src/crypto/hashing except computeMerkleRoot
+import ../src/script/interpreter
 
 suite "consensus params":
   test "mainnet genesis hash":
@@ -283,8 +284,8 @@ suite "transaction validation":
       lockTime: 0
     )
     let res = checkTransaction(tx, params)
-    check res.valid == false
-    check "no inputs" in res.error
+    check res.isOk == false
+    check res.error == veInputsMissing
 
   test "transaction must have outputs":
     let params = mainnetParams()
@@ -300,8 +301,8 @@ suite "transaction validation":
       lockTime: 0
     )
     let res = checkTransaction(tx, params)
-    check res.valid == false
-    check "no outputs" in res.error
+    check res.isOk == false
+    check res.error == veBadOutputValue
 
   test "output value cannot exceed max money":
     let params = mainnetParams()
@@ -320,7 +321,7 @@ suite "transaction validation":
       lockTime: 0
     )
     let res = checkTransaction(tx, params)
-    check res.valid == false
+    check res.isOk == false
 
   test "valid basic transaction":
     let params = mainnetParams()
@@ -339,7 +340,7 @@ suite "transaction validation":
       lockTime: 0
     )
     let res = checkTransaction(tx, params)
-    check res.valid == true
+    check res.isOk == true
 
   test "coinbase detection":
     let coinbase = Transaction(
@@ -380,3 +381,320 @@ suite "transaction validation":
       lockTime: 0
     )
     check isCoinbase(regular) == false
+
+  test "duplicate input detection":
+    let params = mainnetParams()
+    let duptxid = TxId([1'u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                        17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32])
+    let tx = Transaction(
+      version: 1,
+      inputs: @[
+        TxIn(
+          prevOut: OutPoint(txid: duptxid, vout: 0),
+          scriptSig: @[0x01'u8],
+          sequence: 0xFFFFFFFF'u32
+        ),
+        TxIn(
+          prevOut: OutPoint(txid: duptxid, vout: 0),  # Same outpoint
+          scriptSig: @[0x01'u8],
+          sequence: 0xFFFFFFFF'u32
+        )
+      ],
+      outputs: @[TxOut(
+        value: Satoshi(100_000),
+        scriptPubKey: @[]
+      )],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let res = checkTransaction(tx, params)
+    check res.isOk == false
+    check res.error == veDuplicateInput
+
+suite "merkle root":
+  test "single transaction merkle root":
+    var hash1: array[32, byte]
+    for i in 0..31:
+      hash1[i] = byte(i)
+
+    let root = computeMerkleRoot(@[hash1])
+    check root == hash1
+
+  test "two transaction merkle root":
+    var hash1, hash2: array[32, byte]
+    for i in 0..31:
+      hash1[i] = byte(i)
+      hash2[i] = byte(31 - i)
+
+    let root = computeMerkleRoot(@[hash1, hash2])
+
+    # Manually compute expected root
+    var combined: array[64, byte]
+    copyMem(addr combined[0], addr hash1[0], 32)
+    copyMem(addr combined[32], addr hash2[0], 32)
+    let expected = doubleSha256(combined)
+
+    check root == expected
+
+  test "odd number of transactions duplicates last":
+    var hash1, hash2, hash3: array[32, byte]
+    for i in 0..31:
+      hash1[i] = byte(i)
+      hash2[i] = byte(31 - i)
+      hash3[i] = byte(i xor 0xff)
+
+    let root = computeMerkleRoot(@[hash1, hash2, hash3])
+
+    # With 3 txs: level 1 has hash(hash1||hash2), hash(hash3||hash3)
+    # level 2 has hash of those two
+    var combined12: array[64, byte]
+    copyMem(addr combined12[0], addr hash1[0], 32)
+    copyMem(addr combined12[32], addr hash2[0], 32)
+    let h12 = doubleSha256(combined12)
+
+    var combined33: array[64, byte]
+    copyMem(addr combined33[0], addr hash3[0], 32)
+    copyMem(addr combined33[32], addr hash3[0], 32)  # Duplicate
+    let h33 = doubleSha256(combined33)
+
+    var finalCombined: array[64, byte]
+    copyMem(addr finalCombined[0], addr h12[0], 32)
+    copyMem(addr finalCombined[32], addr h33[0], 32)
+    let expected = doubleSha256(finalCombined)
+
+    check root == expected
+
+suite "block weight":
+  test "legacy transaction weight":
+    # A simple legacy transaction should have weight = size * 4
+    let tx = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(
+          txid: TxId(default(array[32, byte])),
+          vout: 0xFFFFFFFF'u32
+        ),
+        scriptSig: @[0x03'u8, 0x01, 0x00, 0x00],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(
+        value: Satoshi(50_00000000),
+        scriptPubKey: @[0x76'u8, 0xa9]
+      )],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let weight = calculateTransactionWeight(tx)
+    let baseSize = serializeLegacy(tx).len
+    let fullSize = serialize(tx, includeWitness = true).len
+
+    # For legacy tx, baseSize == fullSize
+    check baseSize == fullSize
+    # Weight = baseSize * 3 + fullSize = baseSize * 4
+    check weight == baseSize * 4
+
+  test "segwit transaction weight":
+    # A SegWit transaction has witness data
+    let tx = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(
+          txid: TxId([1'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+          vout: 0
+        ),
+        scriptSig: @[],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(
+        value: Satoshi(1_00000000),
+        scriptPubKey: @[0x00'u8, 0x14] & @[byte(1), 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                           11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+      )],
+      witnesses: @[@[@[0x30'u8, 0x44]]],  # Simplified witness
+      lockTime: 0
+    )
+
+    let weight = calculateTransactionWeight(tx)
+    let baseSize = serializeLegacy(tx).len
+    let fullSize = serialize(tx, includeWitness = true).len
+
+    # SegWit tx: fullSize > baseSize due to witness
+    check fullSize > baseSize
+    # Weight = baseSize * 3 + fullSize
+    check weight == (baseSize * 3) + fullSize
+
+suite "block subsidy":
+  test "subsidy at genesis":
+    let params = mainnetParams()
+    check getBlockSubsidy(0, params) == Satoshi(5_000_000_000)
+
+  test "subsidy at first halving":
+    let params = mainnetParams()
+    check getBlockSubsidy(209_999, params) == Satoshi(5_000_000_000)
+    check getBlockSubsidy(210_000, params) == Satoshi(2_500_000_000)
+
+  test "subsidy at second halving":
+    let params = mainnetParams()
+    check getBlockSubsidy(419_999, params) == Satoshi(2_500_000_000)
+    check getBlockSubsidy(420_000, params) == Satoshi(1_250_000_000)
+
+  test "subsidy after 64 halvings is zero":
+    let params = mainnetParams()
+    # 64 halvings would be at height 64 * 210000
+    let height = int32(64 * 210_000)
+    check getBlockSubsidy(height, params) == Satoshi(0)
+
+  test "regtest subsidy halving":
+    let params = regtestParams()
+    # Regtest halves every 150 blocks
+    check getBlockSubsidy(0, params) == Satoshi(5_000_000_000)
+    check getBlockSubsidy(149, params) == Satoshi(5_000_000_000)
+    check getBlockSubsidy(150, params) == Satoshi(2_500_000_000)
+
+suite "witness commitment":
+  test "witness commitment prefix":
+    check WitnessCommitmentPrefix == [0x6a'u8, 0x24, 0xaa, 0x21, 0xa9, 0xed]
+
+  test "find witness commitment in coinbase":
+    # Create a coinbase with witness commitment
+    var commitment: array[32, byte]
+    for i in 0..31:
+      commitment[i] = byte(i)
+
+    var script: seq[byte] = @WitnessCommitmentPrefix
+    script.add(@commitment)
+
+    let coinbase = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(
+          txid: TxId(default(array[32, byte])),
+          vout: 0xFFFFFFFF'u32
+        ),
+        scriptSig: @[0x03'u8, 0x01, 0x00, 0x00],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[
+        TxOut(value: Satoshi(50_00000000), scriptPubKey: @[]),
+        TxOut(value: Satoshi(0), scriptPubKey: script)
+      ],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let found = findWitnessCommitment(coinbase)
+    check found.isSome
+    check found.get() == commitment
+
+  test "no witness commitment in regular coinbase":
+    let coinbase = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(
+          txid: TxId(default(array[32, byte])),
+          vout: 0xFFFFFFFF'u32
+        ),
+        scriptSig: @[0x03'u8, 0x01, 0x00, 0x00],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(
+        value: Satoshi(50_00000000),
+        scriptPubKey: @[]
+      )],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let found = findWitnessCommitment(coinbase)
+    check found.isNone
+
+suite "script flags":
+  test "early block flags":
+    let params = mainnetParams()
+    let flags = getBlockScriptFlags(1, params)
+    check sfP2SH in flags
+    check sfDERSig notin flags
+    check sfWitness notin flags
+
+  test "post-BIP66 flags":
+    let params = mainnetParams()
+    let flags = getBlockScriptFlags(int32(params.bip66Height), params)
+    check sfP2SH in flags
+    check sfDERSig in flags
+
+  test "post-BIP65 flags":
+    let params = mainnetParams()
+    let flags = getBlockScriptFlags(int32(params.bip65Height), params)
+    check sfP2SH in flags
+    check sfCheckLockTimeVerify in flags
+
+  test "post-segwit flags":
+    let params = mainnetParams()
+    let flags = getBlockScriptFlags(int32(params.segwitHeight), params)
+    check sfWitness in flags
+    check sfNullDummy in flags
+    check sfCheckSequenceVerify in flags
+
+  test "post-taproot flags":
+    let params = mainnetParams()
+    let flags = getBlockScriptFlags(int32(params.taprootHeight), params)
+    check sfTaproot in flags
+
+  test "regtest all flags from genesis":
+    let params = regtestParams()
+    let flags = getBlockScriptFlags(1, params)
+    check sfP2SH in flags
+    check sfWitness in flags
+    check sfTaproot in flags
+
+suite "median time past":
+  test "empty headers":
+    let mtp = getMedianTimePast(@[])
+    check mtp == 0
+
+  test "single header":
+    let header = BlockHeader(timestamp: 1000)
+    let mtp = getMedianTimePast(@[header])
+    check mtp == 1000
+
+  test "three headers":
+    let headers = @[
+      BlockHeader(timestamp: 1000),
+      BlockHeader(timestamp: 3000),
+      BlockHeader(timestamp: 2000)
+    ]
+    let mtp = getMedianTimePast(headers)
+    # Sorted: 1000, 2000, 3000 -> median is 2000
+    check mtp == 2000
+
+  test "eleven headers":
+    var headers: seq[BlockHeader]
+    for i in 0..10:
+      headers.add(BlockHeader(timestamp: uint32(i * 100)))
+
+    let mtp = getMedianTimePast(headers)
+    # Sorted: 0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000
+    # Median (index 5) is 500
+    check mtp == 500
+
+suite "validation result type":
+  test "ok result":
+    let r = ok(42)
+    check r.isOk == true
+    check r.value == 42
+
+  test "error result":
+    let r = err(int, veBadMerkleRoot)
+    check r.isOk == false
+    check r.error == veBadMerkleRoot
+
+  test "void ok result":
+    let r = ok()
+    check r.isOk == true
+
+  test "void error result":
+    let r = voidErr(veBadPow)
+    check r.isOk == false
+    check r.error == veBadPow
