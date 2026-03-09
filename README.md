@@ -28,7 +28,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Block/transaction validation
 - [x] RocksDB storage (column families via FFI, UTXO set, block index)
 - [x] Chainstate management (atomic block connect/disconnect, write batches)
-- [x] P2P network messages
+- [x] P2P message serialization (typed case object, all message types)
 - [x] Peer connection handling (chronos async)
 - [x] Block synchronization
 - [x] Transaction mempool
