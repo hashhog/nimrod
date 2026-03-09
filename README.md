@@ -36,7 +36,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Headers-first sync (256-bit work calculation, most-work chain selection)
 - [x] Full initial block download (parallel download, sliding window, adaptive timeouts)
 - [x] Transaction mempool (fee/size policy, CPFP tracking, eviction)
-- [x] Fee estimation
+- [x] Fee estimation (histogram-based, 85% confirmation threshold)
 - [x] Block template generation
 - [x] JSON-RPC server
 - [x] Basic wallet (key management, addresses)
