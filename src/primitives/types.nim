@@ -69,7 +69,7 @@ type
 # Constants
 const
   COIN* = Satoshi(100_000_000)
-  MAX_MONEY* = Satoshi(21_000_000 * 100_000_000)
+  # Note: MaxMoney is defined in consensus/params.nim to avoid duplication
 
 proc toSatoshi*(btc: float): Satoshi =
   Satoshi(int64(btc * 100_000_000))
