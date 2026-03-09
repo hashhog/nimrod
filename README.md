@@ -22,7 +22,9 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Address encoding/decoding for all Bitcoin address types
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Sighash computation (legacy, segwit v0, taproot)
-- [x] Consensus parameters (mainnet, testnet, regtest)
+- [x] Consensus parameters (mainnet, testnet3, regtest)
+- [x] Difficulty target functions (compact/target conversion)
+- [x] Genesis block construction and verification
 - [x] Block/transaction validation
 - [x] RocksDB storage layer
 - [x] Chainstate and UTXO management
