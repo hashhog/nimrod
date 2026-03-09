@@ -1,5 +1,6 @@
 ## Tests for binary serialization
 
+import std/strutils
 import unittest2
 import ../src/primitives/[types, serialize]
 

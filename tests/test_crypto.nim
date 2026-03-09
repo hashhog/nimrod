@@ -25,6 +25,11 @@ proc bytesToHex(data: openArray[byte]): string =
   for b in data:
     result.add(toHex(b, 2).toLowerAscii)
 
+proc strToBytes(s: string): seq[byte] =
+  result = newSeq[byte](s.len)
+  for i, c in s:
+    result[i] = byte(c)
+
 suite "hashing":
   test "sha256 empty string":
     let hash = sha256(@[])
@@ -32,31 +37,31 @@ suite "hashing":
     check bytesToHex(hash) == expected
 
   test "sha256 hello":
-    let data = "hello".toOpenArrayByte(0, 4)
+    let data = strToBytes("hello")
     let hash = sha256(data)
     let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
     check bytesToHex(hash) == expected
 
   test "double sha256":
-    let data = "hello".toOpenArrayByte(0, 4)
+    let data = strToBytes("hello")
     let hash = doubleSha256(data)
     # SHA256(SHA256("hello"))
     let expected = "9595c9df90075148eb06860365df33584b75bff782a510c6cd4883a419833d50"
     check bytesToHex(hash) == expected
 
   test "hash160":
-    let data = "hello".toOpenArrayByte(0, 4)
+    let data = strToBytes("hello")
     let hash = hash160(data)
     check hash.len == 20
 
   test "merkle root single":
-    let hashes = @[sha256("tx1".toOpenArrayByte(0, 2))]
+    let hashes = @[sha256(strToBytes("tx1"))]
     let root = merkleRoot(hashes)
     check root == hashes[0]
 
   test "merkle root two":
-    let tx1 = sha256("tx1".toOpenArrayByte(0, 2))
-    let tx2 = sha256("tx2".toOpenArrayByte(0, 2))
+    let tx1 = sha256(strToBytes("tx1"))
+    let tx2 = sha256(strToBytes("tx2"))
     let root = merkleRoot(@[tx1, tx2])
 
     # Manual calculation
@@ -68,9 +73,9 @@ suite "hashing":
     check root == expected
 
   test "merkle root odd count":
-    let tx1 = sha256("tx1".toOpenArrayByte(0, 2))
-    let tx2 = sha256("tx2".toOpenArrayByte(0, 2))
-    let tx3 = sha256("tx3".toOpenArrayByte(0, 2))
+    let tx1 = sha256(strToBytes("tx1"))
+    let tx2 = sha256(strToBytes("tx2"))
+    let tx3 = sha256(strToBytes("tx3"))
     let root = merkleRoot(@[tx1, tx2, tx3])
 
     # With odd count, last hash is duplicated
@@ -84,11 +89,11 @@ suite "hashing":
 
   test "sha256d alias":
     # Verify doubleSha256 and sha256d are the same
-    let data = "hello".toOpenArrayByte(0, 4)
+    let data = strToBytes("hello")
     check sha256d(data) == doubleSha256(data)
 
   test "sha256Single":
-    let data = "hello".toOpenArrayByte(0, 4)
+    let data = strToBytes("hello")
     let hash = sha256Single(data)
     let expected = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
     check bytesToHex(hash) == expected
@@ -117,7 +122,7 @@ when defined(useSystemSecp256k1):
       let pubkey = derivePublicKey(privateKey)
       check pubkey.len == 33
 
-      let msgHash = sha256d("test message".toOpenArrayByte(0, 11))
+      let msgHash = sha256d(strToBytes("test message"))
       let sig = sign(privateKey, msgHash)
 
       check verify(pubkey, msgHash, sig)
@@ -131,8 +136,8 @@ when defined(useSystemSecp256k1):
       ]
 
       let pubkey = derivePublicKey(privateKey)
-      let msgHash = sha256d("test message".toOpenArrayByte(0, 11))
-      let wrongHash = sha256d("wrong message".toOpenArrayByte(0, 12))
+      let msgHash = sha256d(strToBytes("test message"))
+      let wrongHash = sha256d(strToBytes("wrong message"))
       let sig = sign(privateKey, msgHash)
 
       check not verify(pubkey, wrongHash, sig)
@@ -155,7 +160,7 @@ when defined(useSystemSecp256k1):
 
       initSecp256k1()
       let pubkey = derivePublicKey(privateKey)
-      let msgHash = sha256d("test".toOpenArrayByte(0, 3))
+      let msgHash = sha256d(strToBytes("test"))
       let sig = sign(privateKey, msgHash)
 
       check engine.verifyEcdsa(@sig, @pubkey, msgHash)
