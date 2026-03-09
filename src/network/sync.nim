@@ -1,8 +1,10 @@
 ## Headers-first block synchronization
 ## Download and validate all headers before block data
 ## Most-work chain wins (not longest chain)
+## Phase 13: Parallel block download with sliding window for IBD
 
-import std/[options, times, deques, tables, algorithm, sequtils]
+import std/[options, deques, tables, algorithm, sequtils, sets, strutils]
+import std/times
 import chronos
 import chronicles
 import ./peer
@@ -12,6 +14,11 @@ import ../primitives/[types, serialize]
 import ../consensus/[params, validation]
 import ../storage/chainstate
 import ../crypto/hashing
+
+# Use std/times for Time and Duration (not chronos/timer)
+type
+  SyncTime = times.Time
+  SyncDuration = times.Duration
 
 type
   SyncState* = enum
@@ -37,7 +44,7 @@ type
     # Block download state
     blockQueue*: Deque[BlockHash]
     pendingBlocks*: int
-    lastSyncTime*: Time
+    lastSyncTime*: SyncTime
     # Separate tracking for header tip vs chain tip (CRITICAL pitfall)
     headerTip*: BlockHash       ## Tip of validated headers
     headerTipHeight*: int32     ## Height of header tip
@@ -48,6 +55,43 @@ const
   MaxHeadersPerRequest* = 2000
   MaxBlocksInFlight* = 16
   SyncTimeoutSeconds* = 60
+
+  # Block download constants
+  DownloadWindow* = 1024            ## Sliding window size for block requests
+  MaxBlocksPerPeer* = 16            ## Per-peer in-flight cap (avoid one slow peer blocking others)
+  BaseRequestTimeout* = 5           ## Base timeout in seconds
+  MaxRequestTimeout* = 64           ## Max timeout after adaptive scaling
+  BatchGetDataSize* = 16            ## Blocks per getdata message (batched)
+  UtxoFlushInterval* = 2000         ## Flush UTXO set every N blocks during IBD
+  InvWitnessBlockType* = 0x40000002'u32  ## Segwit block inv type
+
+type
+  BlockRequest* = object
+    hash*: BlockHash
+    height*: int32
+    peer*: Peer
+    requestTime*: SyncTime
+    timeout*: SyncDuration        ## Adaptive timeout per request
+
+  PeerBlockState* = object
+    inFlight*: int                ## Blocks currently in-flight for this peer
+    lastStall*: SyncTime          ## Last time this peer stalled
+    currentTimeout*: int          ## Current timeout in seconds (adaptive)
+    consecutiveSuccess*: int      ## Consecutive successful block receipts
+
+  BlockDownloader* = ref object
+    syncManager*: SyncManager
+    pendingRequests*: Table[BlockHash, BlockRequest]
+    downloadWindow*: int          ## 1024 blocks
+    nextDownloadHeight*: int32    ## Next height to request
+    nextProcessHeight*: int32     ## Next height to process (in-order)
+    receivedBlocks*: Table[int32, Block]  ## Out-of-order buffer
+    requestTimeout*: SyncDuration ## Base timeout (30s default)
+    peerStates*: Table[string, PeerBlockState]  ## Per-peer tracking
+    ibdActive*: bool              ## True during initial block download
+    lastUtxoFlush*: int32         ## Height of last UTXO flush
+    blocksProcessed*: int         ## Total blocks processed
+    startTime*: SyncTime          ## IBD start time for stats
 
 # =============================================================================
 # 256-bit arithmetic for proof of work calculations
@@ -695,3 +739,355 @@ proc processHeaders*(sync: BlockSync, headers: seq[BlockHeader]): int =
     sync.lastSyncTime = getTime()
 
   accepted
+
+# =============================================================================
+# BlockDownloader - Parallel block download for IBD
+# =============================================================================
+
+proc peerKey(peer: Peer): string =
+  ## Get unique key for peer state tracking
+  peer.address & ":" & $peer.port
+
+proc newBlockDownloader*(sm: SyncManager): BlockDownloader =
+  ## Create a new block downloader attached to a sync manager
+  result = BlockDownloader(
+    syncManager: sm,
+    pendingRequests: initTable[BlockHash, BlockRequest](),
+    downloadWindow: DownloadWindow,
+    nextDownloadHeight: sm.chainTipHeight + 1,
+    nextProcessHeight: sm.chainTipHeight + 1,
+    receivedBlocks: initTable[int32, Block](),
+    requestTimeout: initDuration(seconds = BaseRequestTimeout),
+    peerStates: initTable[string, PeerBlockState](),
+    ibdActive: false,
+    lastUtxoFlush: sm.chainTipHeight,
+    blocksProcessed: 0,
+    startTime: getTime()
+  )
+
+proc getPeerState*(dl: BlockDownloader, peer: Peer): var PeerBlockState =
+  ## Get or create peer state for tracking
+  let key = peerKey(peer)
+  if key notin dl.peerStates:
+    dl.peerStates[key] = PeerBlockState(
+      inFlight: 0,
+      lastStall: getTime() - initDuration(hours = 1),  # Far in past
+      currentTimeout: BaseRequestTimeout,
+      consecutiveSuccess: 0
+    )
+  dl.peerStates[key]
+
+proc supportsWitness*(peer: Peer): bool =
+  ## Check if peer supports segwit (NODE_WITNESS = 8)
+  (peer.services and NodeWitness) != 0
+
+proc selectPeerForRequest*(dl: BlockDownloader): Peer =
+  ## Round-robin selection with per-peer in-flight cap
+  ## Returns nil if no suitable peer available
+  let peers = dl.syncManager.peerManager.getReadyPeers()
+  if peers.len == 0:
+    return nil
+
+  # Find peer with fewest in-flight blocks that's under the cap
+  var bestPeer: Peer = nil
+  var minInFlight = high(int)
+
+  for peer in peers:
+    let state = dl.getPeerState(peer)
+    if state.inFlight < MaxBlocksPerPeer and state.inFlight < minInFlight:
+      bestPeer = peer
+      minInFlight = state.inFlight
+
+  bestPeer
+
+proc requestBlocks*(dl: BlockDownloader) {.async.} =
+  ## Request blocks using round-robin getdata(invWitnessBlock) across peers
+  ## Batches multiple inv items per message for efficiency
+
+  let sm = dl.syncManager
+  let headerTipHeight = sm.headerTipHeight
+
+  # Don't request past header tip
+  if dl.nextDownloadHeight > headerTipHeight:
+    return
+
+  # Calculate how many blocks we can request (within window)
+  let windowEnd = dl.nextProcessHeight + int32(dl.downloadWindow)
+  let maxHeight = min(headerTipHeight, windowEnd)
+
+  # Group requests by peer for batching
+  var peerRequests: Table[string, tuple[peer: Peer, inv: seq[InvVector]]]
+
+  var height = dl.nextDownloadHeight
+  while height <= maxHeight:
+    # Check if already requested or received
+    let hashOpt = sm.headerChain.getHashByHeight(height)
+    if hashOpt.isNone:
+      height += 1
+      continue
+
+    let hash = hashOpt.get()
+    if hash in dl.pendingRequests or height in dl.receivedBlocks:
+      height += 1
+      continue
+
+    # Select peer for this request
+    let peer = dl.selectPeerForRequest()
+    if peer == nil:
+      break  # No available peers
+
+    let key = peerKey(peer)
+
+    # Initialize peer batch if needed
+    if key notin peerRequests:
+      peerRequests[key] = (peer: peer, inv: @[])
+
+    # Determine inv type (witness block for segwit peers)
+    let invType = if peer.supportsWitness(): invWitnessBlock else: invBlock
+
+    # Add to batch
+    peerRequests[key].inv.add(InvVector(
+      invType: invType,
+      hash: array[32, byte](hash)
+    ))
+
+    # Track request
+    var peerState = dl.getPeerState(peer)
+    let timeout = initDuration(seconds = peerState.currentTimeout)
+
+    dl.pendingRequests[hash] = BlockRequest(
+      hash: hash,
+      height: height,
+      peer: peer,
+      requestTime: getTime(),
+      timeout: timeout
+    )
+    peerState.inFlight += 1
+    dl.peerStates[key] = peerState
+
+    # Check if we should send batch (BatchGetDataSize reached)
+    if peerRequests[key].inv.len >= BatchGetDataSize:
+      try:
+        await peer.sendGetData(peerRequests[key].inv)
+        trace "sent batched getdata", peer = $peer, count = peerRequests[key].inv.len
+      except CatchableError as e:
+        warn "failed to send getdata", peer = $peer, error = e.msg
+      peerRequests[key].inv = @[]
+
+    height += 1
+
+  # Send remaining batched requests
+  for key, batch in peerRequests:
+    if batch.inv.len > 0:
+      try:
+        await batch.peer.sendGetData(batch.inv)
+        trace "sent batched getdata", peer = $batch.peer, count = batch.inv.len
+      except CatchableError as e:
+        warn "failed to send getdata", peer = $batch.peer, error = e.msg
+
+  dl.nextDownloadHeight = height
+
+proc processReceivedBlocks*(dl: BlockDownloader) =
+  ## Process received blocks in sequential order
+  ## Only processes blocks at nextProcessHeight
+
+  let sm = dl.syncManager
+
+  while dl.nextProcessHeight in dl.receivedBlocks:
+    let blk = dl.receivedBlocks[dl.nextProcessHeight]
+    let height = dl.nextProcessHeight
+
+    # Validate block
+    let checkResult = checkBlock(blk, sm.params)
+    if not checkResult.isOk:
+      warn "invalid block during IBD", height = height, error = $checkResult.error
+      # Remove from buffer and continue (don't process)
+      dl.receivedBlocks.del(height)
+      # TODO: Consider banning the peer that sent this
+      continue
+
+    # Apply block to chainstate
+    sm.chainDb.applyBlock(blk, height)
+
+    # Update chain tip
+    let headerBytes = serialize(blk.header)
+    let hash = BlockHash(doubleSha256(headerBytes))
+    sm.chainTip = hash
+    sm.chainTipHeight = height
+
+    # Update stats
+    dl.blocksProcessed += 1
+    dl.receivedBlocks.del(height)
+    dl.nextProcessHeight = height + 1
+
+    # Progress logging every 1000 blocks
+    if dl.blocksProcessed mod 1000 == 0:
+      let elapsed = getTime() - dl.startTime
+      let rate = float(dl.blocksProcessed) / max(1.0, elapsed.inSeconds.float)
+      info "IBD progress", height = height, processed = dl.blocksProcessed,
+           buffered = dl.receivedBlocks.len, pending = dl.pendingRequests.len,
+           rate = rate.formatFloat(ffDecimal, 1) & " blk/s"
+
+    # UTXO flush interval check
+    if height - dl.lastUtxoFlush >= UtxoFlushInterval:
+      # Trigger UTXO flush (the applyBlock uses write batches which are atomic)
+      # For now we rely on RocksDB's WAL for durability
+      dl.lastUtxoFlush = height
+      debug "UTXO checkpoint", height = height
+
+proc handleBlock*(dl: BlockDownloader, peer: Peer, blk: Block) {.async.} =
+  ## Handle a received block - buffer out-of-order, process sequentially
+
+  let headerBytes = serialize(blk.header)
+  let hash = BlockHash(doubleSha256(headerBytes))
+
+  # Check if this was a requested block
+  if hash notin dl.pendingRequests:
+    # Unsolicited block - ignore during IBD
+    trace "received unsolicited block during IBD", hash = $hash
+    return
+
+  let request = dl.pendingRequests[hash]
+  let height = request.height
+
+  # Update peer state - successful delivery
+  let key = peerKey(peer)
+  if key in dl.peerStates:
+    var peerState = dl.peerStates[key]
+    peerState.inFlight = max(0, peerState.inFlight - 1)
+    peerState.consecutiveSuccess += 1
+
+    # Adaptive timeout: decay timeout on success
+    if peerState.consecutiveSuccess >= 3:
+      peerState.currentTimeout = max(BaseRequestTimeout,
+                                      peerState.currentTimeout div 2)
+      peerState.consecutiveSuccess = 0
+
+    dl.peerStates[key] = peerState
+
+  # Remove from pending
+  dl.pendingRequests.del(hash)
+  dl.syncManager.peerManager.completeInFlightBlock(hash)
+
+  # Buffer block (may be out of order)
+  dl.receivedBlocks[height] = blk
+
+  trace "received block", height = height, hash = $hash,
+        buffered = dl.receivedBlocks.len
+
+  # Try to process in-order blocks
+  dl.processReceivedBlocks()
+
+proc handleStaleRequests*(dl: BlockDownloader) {.async.} =
+  ## Handle timed-out requests with adaptive stalling
+  ## Double timeout on stall, reassign to different peer
+
+  let now = getTime()
+  var staleRequests: seq[BlockHash]
+  var stalePeers: HashSet[string]
+
+  # Find stale requests
+  for hash, request in dl.pendingRequests:
+    if now - request.requestTime > request.timeout:
+      staleRequests.add(hash)
+      stalePeers.incl(peerKey(request.peer))
+
+  if staleRequests.len == 0:
+    return
+
+  info "handling stale block requests", count = staleRequests.len
+
+  # Update timeout for stalling peers (adaptive)
+  for key in stalePeers:
+    if key in dl.peerStates:
+      var peerState = dl.peerStates[key]
+      peerState.lastStall = now
+      peerState.consecutiveSuccess = 0
+
+      # Double timeout, capped at max
+      peerState.currentTimeout = min(MaxRequestTimeout,
+                                      peerState.currentTimeout * 2)
+      peerState.inFlight = 0  # Reset in-flight count (requests will be re-queued)
+      dl.peerStates[key] = peerState
+
+      debug "increased peer timeout due to stall", peer = key,
+            newTimeout = peerState.currentTimeout
+
+  # Re-queue stale requests for reassignment
+  for hash in staleRequests:
+    let request = dl.pendingRequests[hash]
+
+    # Clear from pending (will be re-requested)
+    dl.pendingRequests.del(hash)
+
+    # Reset download height to re-request this block
+    if request.height < dl.nextDownloadHeight:
+      dl.nextDownloadHeight = request.height
+
+  # Request blocks again (will use round-robin to different peers)
+  await dl.requestBlocks()
+
+proc startIBD*(dl: BlockDownloader) {.async.} =
+  ## Start Initial Block Download
+  ## Downloads blocks in parallel using sliding window
+
+  let sm = dl.syncManager
+  dl.ibdActive = true
+  dl.startTime = getTime()
+  dl.blocksProcessed = 0
+  dl.nextDownloadHeight = sm.chainTipHeight + 1
+  dl.nextProcessHeight = sm.chainTipHeight + 1
+  dl.lastUtxoFlush = sm.chainTipHeight
+
+  info "starting IBD", fromHeight = sm.chainTipHeight,
+       toHeight = sm.headerTipHeight,
+       blocksToDownload = sm.headerTipHeight - sm.chainTipHeight
+
+  # Skip mempool during IBD (don't relay or accept txs)
+  # This is handled by the sync state check in mempool
+
+  while dl.ibdActive and dl.nextProcessHeight <= sm.headerTipHeight:
+    # Request more blocks if window allows
+    let pendingCount = dl.pendingRequests.len
+    let bufferedCount = dl.receivedBlocks.len
+
+    if pendingCount + bufferedCount < dl.downloadWindow:
+      await dl.requestBlocks()
+
+    # Handle stale requests
+    await dl.handleStaleRequests()
+
+    # Process any in-order blocks we have
+    dl.processReceivedBlocks()
+
+    # Check if IBD complete
+    if dl.nextProcessHeight > sm.headerTipHeight:
+      break
+
+    # Small sleep to avoid busy loop
+    await sleepAsync(50)
+
+    # Check for peer availability
+    if dl.syncManager.peerManager.connectedPeerCount() == 0:
+      warn "no peers available during IBD, waiting"
+      await sleepAsync(5000)
+
+  # IBD complete
+  dl.ibdActive = false
+  let elapsed = getTime() - dl.startTime
+  let rate = float(dl.blocksProcessed) / max(1.0, elapsed.inSeconds.float)
+
+  info "IBD complete", blocks = dl.blocksProcessed,
+       elapsed = $elapsed,
+       rate = rate.formatFloat(ffDecimal, 1) & " blk/s",
+       chainHeight = sm.chainTipHeight
+
+  # Switch to relay mode
+  sm.state = ssSynced
+
+proc stopIBD*(dl: BlockDownloader) =
+  ## Stop IBD (e.g., on shutdown)
+  dl.ibdActive = false
+
+proc isIBDActive*(dl: BlockDownloader): bool =
+  dl.ibdActive
