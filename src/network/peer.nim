@@ -1,7 +1,7 @@
 ## P2P peer connection handling
 ## Uses chronos for async networking
 
-import std/[streams, strformat, options, times]
+import std/[strformat, times]
 import chronos
 import chronicles
 import ../primitives/[types, serialize]
@@ -23,7 +23,7 @@ type
     port*: uint16
     transport*: StreamTransport
     state*: PeerState
-    version*: int32
+    version*: uint32
     services*: uint64
     userAgent*: string
     startHeight*: int32
@@ -74,74 +74,61 @@ proc disconnect*(peer: Peer) {.async.} =
   peer.state = Disconnected
   info "disconnected from peer", peer = $peer
 
-proc sendMessage*(peer: Peer, command: string, payload: seq[byte]) {.async.} =
-  ## Send a message to the peer
+proc sendP2PMessage*(peer: Peer, msg: P2PMessage) {.async.} =
+  ## Send a P2P message to the peer
   if peer.state == Disconnected or peer.transport == nil:
     raise newException(PeerError, "not connected")
 
-  let msg = serializeMessage(peer.params.magic, command, payload)
-  let written = await peer.transport.write(msg)
-  if written != msg.len:
+  let data = serializeMessage(peer.params.magic, msg)
+  let written = await peer.transport.write(data)
+  if written != data.len:
     raise newException(PeerError, "failed to send complete message")
 
-  trace "sent message", peer = $peer, command = command, size = payload.len
+  trace "sent message", peer = $peer, kind = msg.kind, size = data.len - 24
 
 proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
   ## Send version message
-  let msg = VersionMessage(
-    version: PROTOCOL_VERSION,
-    services: 1,  # NODE_NETWORK
-    timestamp: getTime().toUnix(),
-    addrRecv: NetAddr(services: 1, port: peer.port),
-    addrFrom: NetAddr(services: 1, port: peer.params.p2pPort),
-    nonce: 0,  # Should be random
-    userAgent: USER_AGENT,
-    startHeight: ourHeight,
-    relay: true
+  let msg = newVersionMsg(
+    version = ProtocolVersion,
+    services = NodeNetwork or NodeWitness,
+    timestamp = getTime().toUnix(),
+    addrRecv = NetAddress(services: NodeNetwork, port: peer.port),
+    addrFrom = NetAddress(services: NodeNetwork, port: peer.params.p2pPort),
+    nonce = 0,  # Should be random
+    userAgent = UserAgent,
+    startHeight = ourHeight,
+    relay = true
   )
 
-  let s = newStringStream()
-  s.writeVersionMessage(msg)
-  s.setPosition(0)
-  let payload = cast[seq[byte]](s.readAll())
-
-  await peer.sendMessage("version", payload)
+  await peer.sendP2PMessage(msg)
   peer.state = Handshaking
 
 proc sendVerack*(peer: Peer) {.async.} =
-  await peer.sendMessage("verack", @[])
+  await peer.sendP2PMessage(newVerack())
 
 proc sendPing*(peer: Peer, nonce: uint64) {.async.} =
-  let s = newStringStream()
-  s.writeUint64LE(nonce)
-  s.setPosition(0)
-  await peer.sendMessage("ping", cast[seq[byte]](s.readAll()))
+  await peer.sendP2PMessage(newPing(nonce))
 
 proc sendPong*(peer: Peer, nonce: uint64) {.async.} =
-  let s = newStringStream()
-  s.writeUint64LE(nonce)
-  s.setPosition(0)
-  await peer.sendMessage("pong", cast[seq[byte]](s.readAll()))
+  await peer.sendP2PMessage(newPong(nonce))
 
 proc sendGetHeaders*(peer: Peer, locators: seq[BlockHash], hashStop: BlockHash) {.async.} =
-  let s = newStringStream()
-  s.writeUint32LE(PROTOCOL_VERSION.uint32)
-  s.writeCompactSize(CompactSize(locators.len))
+  var locatorHashes: seq[array[32, byte]]
   for loc in locators:
-    s.writeArray32(array[32, byte](loc))
-  s.writeArray32(array[32, byte](hashStop))
-  s.setPosition(0)
-  await peer.sendMessage("getheaders", cast[seq[byte]](s.readAll()))
+    locatorHashes.add(array[32, byte](loc))
+
+  let msg = newGetHeaders(
+    ProtocolVersion,
+    locatorHashes,
+    array[32, byte](hashStop)
+  )
+  await peer.sendP2PMessage(msg)
 
 proc sendGetData*(peer: Peer, inventory: seq[InvVector]) {.async.} =
-  let s = newStringStream()
-  s.writeCompactSize(CompactSize(inventory.len))
-  for inv in inventory:
-    s.writeInvVector(inv)
-  s.setPosition(0)
-  await peer.sendMessage("getdata", cast[seq[byte]](s.readAll()))
+  let msg = newGetData(inventory)
+  await peer.sendP2PMessage(msg)
 
-proc readMessage*(peer: Peer): Future[tuple[command: string, payload: seq[byte]]] {.async.} =
+proc readMessage*(peer: Peer): Future[P2PMessage] {.async.} =
   ## Read a complete message from the peer
   if peer.transport == nil or peer.transport.closed:
     raise newException(PeerError, "not connected")
@@ -154,14 +141,15 @@ proc readMessage*(peer: Peer): Future[tuple[command: string, payload: seq[byte]]
       raise newException(PeerError, "connection closed")
     peer.recvBuffer.add(buf[0 ..< bytesRead])
 
-  let header = parseMessageHeader(peer.recvBuffer[0 ..< 24])
+  var r = BinaryReader(data: peer.recvBuffer[0 ..< 24], pos: 0)
+  let header = r.deserializeMessageHeader()
 
   # Verify magic
   if header.magic != peer.params.magic:
     raise newException(PeerError, "invalid magic")
 
   # Check length
-  if header.length > 32 * 1024 * 1024:  # 32 MB max
+  if header.length > MaxMessagePayload:
     raise newException(PeerError, "message too large")
 
   # Read payload
@@ -186,39 +174,76 @@ proc readMessage*(peer: Peer): Future[tuple[command: string, payload: seq[byte]]
   let command = bytesToCommand(header.command)
   trace "received message", peer = $peer, command = command, size = payload.len
 
-  return (command, @payload)
+  return deserializePayload(command, @payload)
 
-proc bytesToCommand(cmd: array[12, byte]): string =
-  result = ""
-  for b in cmd:
-    if b == 0:
-      break
-    result.add(char(b))
-
-proc handleMessage*(peer: Peer, command: string, payload: seq[byte]): Future[void] {.async.} =
+proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
   ## Process an incoming message
-  let s = newStringStream(cast[string](payload))
-
-  case command
-  of "version":
-    let msg = s.readVersionMessage()
-    peer.version = msg.version
-    peer.services = msg.services
-    peer.userAgent = msg.userAgent
-    peer.startHeight = msg.startHeight
-    info "received version", peer = $peer, version = msg.version, height = msg.startHeight
+  case msg.kind
+  of mkVersion:
+    peer.version = msg.version.version
+    peer.services = msg.version.services
+    peer.userAgent = msg.version.userAgent
+    peer.startHeight = msg.version.startHeight
+    info "received version", peer = $peer, version = msg.version.version,
+         height = msg.version.startHeight
     await peer.sendVerack()
 
-  of "verack":
+  of mkVerack:
     peer.state = Ready
     info "handshake complete", peer = $peer
 
-  of "ping":
-    let nonce = s.readUint64LE()
-    await peer.sendPong(nonce)
+  of mkPing:
+    await peer.sendPong(msg.pingNonce)
 
-  of "pong":
+  of mkPong:
     discard  # Could track latency
 
-  else:
-    trace "unhandled message", peer = $peer, command = command
+  of mkAddr:
+    trace "received addr", peer = $peer, count = msg.addresses.len
+
+  of mkInv:
+    trace "received inv", peer = $peer, count = msg.invItems.len
+
+  of mkHeaders:
+    trace "received headers", peer = $peer, count = msg.headers.len
+
+  of mkBlock:
+    trace "received block", peer = $peer
+
+  of mkTx:
+    trace "received tx", peer = $peer
+
+  of mkGetAddr:
+    discard  # TODO: respond with addr
+
+  of mkGetHeaders:
+    discard  # TODO: respond with headers
+
+  of mkGetBlocks:
+    discard  # TODO: respond with inv
+
+  of mkGetData:
+    discard  # TODO: respond with block/tx
+
+  of mkNotFound:
+    trace "received notfound", peer = $peer, count = msg.notFound.len
+
+  of mkReject:
+    warn "received reject", peer = $peer, message = msg.reject.message,
+         reason = msg.reject.reason
+
+  of mkSendHeaders:
+    trace "peer prefers headers", peer = $peer
+
+  of mkSendCmpct:
+    trace "peer supports compact blocks", peer = $peer,
+          version = msg.sendCmpct.version
+
+  of mkFeeFilter:
+    trace "peer feefilter", peer = $peer, feeRate = msg.feeRate
+
+  of mkWtxidRelay:
+    trace "peer supports wtxidrelay", peer = $peer
+
+  of mkSendAddrV2:
+    trace "peer supports addrv2", peer = $peer
