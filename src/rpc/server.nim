@@ -2,7 +2,7 @@
 ## Bitcoin Core compatible RPC interface with HTTP Basic auth
 ## JSON-RPC 2.0 compliant with proper error codes
 
-import std/[json, strutils, tables, options, base64, parseutils]
+import std/[json, strutils, tables, options, base64, parseutils, times]
 import chronos
 import chronicles
 import jsony
@@ -11,7 +11,7 @@ import ../consensus/[params, validation]
 import ../storage/chainstate
 import ../mempool/mempool
 import ../crypto/[hashing, secp256k1, address]
-import ../network/peermanager
+import ../network/[peer, peermanager]
 import ../mining/[fees, blocktemplate]
 
 type
@@ -592,16 +592,19 @@ proc handleAddNode(rpc: RpcServer, params: JsonNode): JsonNode =
     except ValueError:
       raise newRpcError(RpcInvalidParams, "invalid port number")
 
+  proc connectAsync(pm: PeerManager, h: string, p: uint16) {.async.} =
+    discard await pm.connectToPeer(h, p)
+
   case command
   of "add":
-    asyncSpawn rpc.peerManager.connectToPeer(host, port)
+    asyncSpawn connectAsync(rpc.peerManager, host, port)
   of "remove":
     for peer in rpc.peerManager.getReadyPeers():
       if peer.address == host and peer.port == port:
         asyncSpawn rpc.peerManager.removePeer(peer)
         break
   of "onetry":
-    asyncSpawn rpc.peerManager.connectToPeer(host, port)
+    asyncSpawn connectAsync(rpc.peerManager, host, port)
   else:
     raise newRpcError(RpcInvalidParams, "invalid command: " & command)
 
@@ -826,6 +829,11 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
   of "validateaddress":
     rpc.handleValidateAddress(params)
 
+  # Control
+  of "stop":
+    # Return success - actual shutdown handled by caller
+    %"nimrod server stopping"
+
   else:
     raise newRpcError(RpcMethodNotFound, "method not found: " & methodName)
 
@@ -858,13 +866,21 @@ proc handleRequest(rpc: RpcServer, body: string): string =
       "message": e.msg
     }
     response.result = newJNull()
-  except JsonError as e:
+  except json.JsonParsingError as e:
     return makeErrorResponse(requestId, RpcParseError, "parse error: " & e.msg)
   except CatchableError as e:
     response.id = requestId
     response.error = %*{
       "code": RpcInternalError,
       "message": "internal error: " & e.msg
+    }
+    response.result = newJNull()
+  except Exception as e:
+    # Catch jsony parse errors which inherit from Exception
+    response.id = requestId
+    response.error = %*{
+      "code": RpcParseError,
+      "message": "parse error: " & e.msg
     }
     response.result = newJNull()
 
@@ -922,11 +938,19 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
             let bodyData = await transp.read(contentLength)
             let body = cast[string](bodyData)
 
-            let result = rpc.handleRequest(body)
+            var respResult: string
+            {.gcsafe.}:
+              try:
+                respResult = rpc.handleRequest(body)
+              except CatchableError:
+                respResult = makeErrorResponse(newJNull(), RpcInternalError, "internal error")
+              except Exception:
+                respResult = makeErrorResponse(newJNull(), RpcParseError, "parse error")
+
             let httpResponse = "HTTP/1.1 200 OK\r\n" &
                               "Content-Type: application/json\r\n" &
-                              "Content-Length: " & $result.len & "\r\n" &
-                              "\r\n" & result
+                              "Content-Length: " & $respResult.len & "\r\n" &
+                              "\r\n" & respResult
             discard await transp.write(httpResponse)
 
           # Reset for next request (keep-alive)
