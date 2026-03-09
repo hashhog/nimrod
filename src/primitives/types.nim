@@ -1,12 +1,14 @@
 ## Core Bitcoin primitive types
 ## Uses distinct types for type safety without runtime cost
 
+import std/strutils
+
 type
   TxId* = distinct array[32, byte]
   BlockHash* = distinct array[32, byte]
-  ScriptBytes* = distinct seq[byte]
-  CompactSize* = distinct uint64
   Satoshi* = distinct int64
+
+  SerializationError* = object of CatchableError
 
 # Borrow operators for TxId
 proc `==`*(a, b: TxId): bool {.borrow.}
@@ -29,11 +31,6 @@ proc `<=`*(a, b: Satoshi): bool {.borrow.}
 proc `+`*(a, b: Satoshi): Satoshi {.borrow.}
 proc `-`*(a, b: Satoshi): Satoshi {.borrow.}
 
-# ScriptBytes helpers
-proc len*(s: ScriptBytes): int {.borrow.}
-proc `[]`*(s: ScriptBytes, i: int): byte =
-  seq[byte](s)[i]
-
 # Bitcoin protocol structures
 type
   OutPoint* = object
@@ -41,23 +38,24 @@ type
     vout*: uint32
 
   TxIn* = object
-    prevout*: OutPoint
-    scriptSig*: ScriptBytes
+    prevOut*: OutPoint
+    scriptSig*: seq[byte]
     sequence*: uint32
 
   TxOut* = object
     value*: Satoshi
-    scriptPubKey*: ScriptBytes
+    scriptPubKey*: seq[byte]
 
   Transaction* = object
     version*: int32
     inputs*: seq[TxIn]
     outputs*: seq[TxOut]
+    witnesses*: seq[seq[seq[byte]]]  ## Per-input witness stacks
     lockTime*: uint32
 
   BlockHeader* = object
     version*: int32
-    prevHash*: BlockHash
+    prevBlock*: BlockHash
     merkleRoot*: array[32, byte]
     timestamp*: uint32
     bits*: uint32
@@ -65,10 +63,7 @@ type
 
   Block* = object
     header*: BlockHeader
-    transactions*: seq[Transaction]
-
-# Import for toHex
-import std/strutils
+    txs*: seq[Transaction]
 
 # Constants
 const
@@ -80,3 +75,9 @@ proc toSatoshi*(btc: float): Satoshi =
 
 proc toBtc*(s: Satoshi): float =
   float(int64(s)) / 100_000_000
+
+proc isSegwit*(tx: Transaction): bool =
+  ## Returns true if transaction has witness data
+  tx.witnesses.len > 0 and tx.witnesses.anyIt(it.len > 0)
+
+import std/sequtils
