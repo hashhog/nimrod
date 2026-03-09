@@ -10,6 +10,7 @@ const
   SECP256K1_FLAGS_TYPE_CONTEXT* = 1'u32 shl 0
   SECP256K1_FLAGS_BIT_CONTEXT_SIGN* = 1'u32 shl 9
   SECP256K1_FLAGS_BIT_CONTEXT_VERIFY* = 1'u32 shl 8
+  SECP256K1_EC_COMPRESSED* = 258'u32
 
 type
   Secp256k1Context* = distinct pointer
@@ -19,12 +20,17 @@ type
     data*: array[64, byte]
   Secp256k1EcdsaSignature* = object
     data*: array[64, byte]
+  Secp256k1XonlyPubkey* = object
+    ## X-only public key for Schnorr signatures (BIP340)
+    data*: array[64, byte]
 
   Secp256k1Error* = object of CatchableError
   PrivateKey* = array[32, byte]
   PublicKey* = array[33, byte]  # Compressed
   UncompressedPublicKey* = array[65, byte]
   Signature* = array[64, byte]
+  SchnorrSignature* = array[64, byte]
+  XonlyPubkey* = array[32, byte]
 
 # FFI bindings to libsecp256k1
 when defined(useSystemSecp256k1):
@@ -83,6 +89,27 @@ when defined(useSystemSecp256k1):
     pubkey: ptr Secp256k1Pubkey,
     input: ptr byte,
     inputLen: csize_t
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_ecdsa_signature_parse_der(
+    ctx: Secp256k1Context,
+    sig: ptr Secp256k1EcdsaSignature,
+    input: ptr byte,
+    inputLen: csize_t
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_xonly_pubkey_parse(
+    ctx: Secp256k1Context,
+    pubkey: ptr Secp256k1XonlyPubkey,
+    input32: ptr byte
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_schnorrsig_verify(
+    ctx: Secp256k1Context,
+    sig64: ptr byte,
+    msg: ptr byte,
+    msgLen: csize_t,
+    pubkey: ptr Secp256k1XonlyPubkey
   ): cint {.importc, cdecl.}
 
   var globalContext: Secp256k1Context
@@ -148,6 +175,130 @@ when defined(useSystemSecp256k1):
     var msg = msgHash
     result = secp256k1_ecdsa_verify(getContext(), addr sig, addr msg[0], addr pubkey) == 1
 
+  proc verifyDer*(
+    publicKey: openArray[byte],
+    msgHash: array[32, byte],
+    derSignature: openArray[byte]
+  ): bool =
+    ## Verify ECDSA signature with DER-encoded signature
+    if publicKey.len == 0 or derSignature.len == 0:
+      return false
+
+    var pubkey: Secp256k1Pubkey
+    var pk = newSeq[byte](publicKey.len)
+    for i, b in publicKey:
+      pk[i] = b
+    if secp256k1_ec_pubkey_parse(
+      getContext(), addr pubkey, addr pk[0], csize_t(publicKey.len)
+    ) != 1:
+      return false
+
+    var sig: Secp256k1EcdsaSignature
+    var sigData = newSeq[byte](derSignature.len)
+    for i, b in derSignature:
+      sigData[i] = b
+    if secp256k1_ecdsa_signature_parse_der(
+      getContext(), addr sig, addr sigData[0], csize_t(derSignature.len)
+    ) != 1:
+      return false
+
+    var msg = msgHash
+    result = secp256k1_ecdsa_verify(getContext(), addr sig, addr msg[0], addr pubkey) == 1
+
+  proc verifySchnorr*(
+    pubkey: XonlyPubkey,
+    msg: openArray[byte],
+    signature: SchnorrSignature
+  ): bool =
+    ## Verify BIP340 Schnorr signature
+    var xonlyPk: Secp256k1XonlyPubkey
+    var pk = pubkey
+    if secp256k1_xonly_pubkey_parse(
+      getContext(), addr xonlyPk, addr pk[0]
+    ) != 1:
+      return false
+
+    var sig = signature
+    if msg.len == 0:
+      return false
+
+    var msgData = newSeq[byte](msg.len)
+    for i, b in msg:
+      msgData[i] = b
+
+    result = secp256k1_schnorrsig_verify(
+      getContext(), addr sig[0], addr msgData[0], csize_t(msg.len), addr xonlyPk
+    ) == 1
+
+  # High-level CryptoEngine wrapper
+  type
+    CryptoEngine* = object
+      ## High-level wrapper for secp256k1 crypto operations
+      ctx: Secp256k1Context
+
+  proc newCryptoEngine*(): CryptoEngine =
+    ## Create a new crypto engine with its own context
+    result.ctx = secp256k1_context_create(
+      SECP256K1_CONTEXT_SIGN or SECP256K1_CONTEXT_VERIFY
+    )
+
+  proc close*(e: var CryptoEngine) =
+    ## Close and cleanup the crypto engine
+    if pointer(e.ctx) != nil:
+      secp256k1_context_destroy(e.ctx)
+      e.ctx = Secp256k1Context(nil)
+
+  proc verifyEcdsa*(e: CryptoEngine, sig, pubkey: openArray[byte], msgHash: array[32, byte]): bool =
+    ## Verify ECDSA signature using the engine's context
+    ## Supports both DER and compact signature formats
+    if sig.len == 0 or pubkey.len == 0:
+      return false
+
+    var pk: Secp256k1Pubkey
+    var pubkeyData = newSeq[byte](pubkey.len)
+    for i, b in pubkey:
+      pubkeyData[i] = b
+    if secp256k1_ec_pubkey_parse(
+      e.ctx, addr pk, addr pubkeyData[0], csize_t(pubkey.len)
+    ) != 1:
+      return false
+
+    var ecdsaSig: Secp256k1EcdsaSignature
+    var sigData = newSeq[byte](sig.len)
+    for i, b in sig:
+      sigData[i] = b
+
+    # Try DER first, then compact
+    if sig.len != 64:
+      if secp256k1_ecdsa_signature_parse_der(
+        e.ctx, addr ecdsaSig, addr sigData[0], csize_t(sig.len)
+      ) != 1:
+        return false
+    else:
+      if secp256k1_ecdsa_signature_parse_compact(
+        e.ctx, addr ecdsaSig, addr sigData[0]
+      ) != 1:
+        return false
+
+    var msg = msgHash
+    result = secp256k1_ecdsa_verify(e.ctx, addr ecdsaSig, addr msg[0], addr pk) == 1
+
+  proc verifySchnorr*(e: CryptoEngine, sig: array[64, byte], msg, pubkey: array[32, byte]): bool =
+    ## Verify BIP340 Schnorr signature using the engine's context
+    var xonlyPk: Secp256k1XonlyPubkey
+    var pk = pubkey
+    if secp256k1_xonly_pubkey_parse(
+      e.ctx, addr xonlyPk, addr pk[0]
+    ) != 1:
+      return false
+
+    var signature = sig
+    var msgData = msg
+
+    result = secp256k1_schnorrsig_verify(
+      e.ctx, addr signature[0], addr msgData[0], csize_t(32), addr xonlyPk
+    ) == 1
+
 else:
   # Stub implementations when libsecp256k1 not available
   proc initSecp256k1*() =
@@ -165,4 +316,35 @@ else:
     msgHash: array[32, byte],
     signature: Signature
   ): bool =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc verifyDer*(
+    publicKey: openArray[byte],
+    msgHash: array[32, byte],
+    derSignature: openArray[byte]
+  ): bool =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc verifySchnorr*(
+    pubkey: XonlyPubkey,
+    msg: openArray[byte],
+    signature: SchnorrSignature
+  ): bool =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  # Stub CryptoEngine
+  type
+    CryptoEngine* = object
+      discard
+
+  proc newCryptoEngine*(): CryptoEngine =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc close*(e: var CryptoEngine) =
+    discard
+
+  proc verifyEcdsa*(e: CryptoEngine, sig, pubkey: openArray[byte], msgHash: array[32, byte]): bool =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc verifySchnorr*(e: CryptoEngine, sig: array[64, byte], msg, pubkey: array[32, byte]): bool =
     raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
