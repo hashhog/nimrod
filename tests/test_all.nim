@@ -11,6 +11,7 @@ import ./test_consensus
 import ./test_storage
 import ./test_messages
 import ./test_peer
+import ./test_mempool
 
 when isMainModule:
   echo "Running all tests..."
