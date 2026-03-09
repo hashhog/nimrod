@@ -12,7 +12,9 @@ It leverages Nim's Python-like syntax with C-level performance.
 
 - [x] Project scaffold and module structure
 - [x] Primitive types (TxId, BlockHash, Satoshi)
-- [x] Binary serialization (CompactSize, little-endian)
+- [x] Binary serialization (BinaryWriter/BinaryReader, CompactSize)
+- [x] SegWit transaction serialization (witness data, marker/flag)
+- [x] txid and wtxid computation
 - [x] Cryptographic hashing (SHA256, RIPEMD160, Hash160)
 - [x] secp256k1 bindings (FFI to libsecp256k1)
 - [x] Script interpreter (stack machine, opcodes)
@@ -30,7 +32,6 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Basic wallet (key management, addresses)
 - [ ] Initial block download
 - [ ] Full script verification
-- [ ] SegWit support
 
 ## Quick start
 
