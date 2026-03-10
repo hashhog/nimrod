@@ -42,6 +42,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] HD Wallet (BIP-32/39/44/84/86 key derivation, P2WPKH signing)
 - [x] Unified CLI (subcommands for node, RPC, wallet; config file; signal handlers)
 - [x] Comprehensive test suite (unit tests, integration tests, Bitcoin Core vectors)
+- [x] Performance optimization (parallel sig verification, UTXO cache, RocksDB tuning)
 - [ ] Relay mode (post-IBD block/tx propagation)
 
 ## Quick start
@@ -68,7 +69,8 @@ nimrod/
 │   ├── mempool/            # Transaction pool
 │   ├── mining/             # Fees and block templates
 │   ├── rpc/                # JSON-RPC server
-│   └── wallet/             # HD wallet, BIP-32/39 key derivation
+│   ├── wallet/             # HD wallet, BIP-32/39 key derivation
+│   └── perf/               # Benchmarking and parallel verification
 ├── tests/                  # Test suites with Bitcoin Core vectors
 │   └── data/               # Test vectors (script, BIP-32, addresses)
 └── resources/              # BIP39 wordlist
