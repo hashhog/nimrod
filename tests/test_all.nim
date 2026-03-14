@@ -10,6 +10,7 @@ import ./test_script
 import ./test_sighash
 import ./test_witness_cleanstack
 import ./test_witness_pubkeytype
+import ./test_minimalif
 import ./test_consensus
 import ./test_storage
 import ./test_messages
