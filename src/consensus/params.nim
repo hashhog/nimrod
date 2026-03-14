@@ -8,7 +8,9 @@ type
   Network* = enum
     Mainnet
     Testnet3
+    Testnet4
     Regtest
+    Signet
 
   ConsensusParams* = object
     network*: Network
@@ -36,6 +38,10 @@ type
     powTargetTimespan*: int
     powTargetSpacing*: int
     difficultyAdjustmentInterval*: int
+    # PoW adjustment rules
+    powAllowMinDifficultyBlocks*: bool  # Allow min-difficulty blocks (testnet/regtest)
+    powNoRetargeting*: bool             # Never retarget (regtest)
+    enforceBIP94*: bool                 # Testnet4 time-warp fix
     minRelayTxFee*: Satoshi
     dustLimit*: Satoshi
     # Legacy aliases
@@ -111,6 +117,10 @@ proc mainnetParams*(): ConsensusParams =
   result.powTargetTimespan = 1_209_600  # 14 days
   result.powTargetSpacing = 600  # 10 minutes
   result.difficultyAdjustmentInterval = 2016
+  # PoW rules: mainnet does normal retargeting
+  result.powAllowMinDifficultyBlocks = false
+  result.powNoRetargeting = false
+  result.enforceBIP94 = false
   result.minRelayTxFee = Satoshi(1000)
   result.dustLimit = Satoshi(546)
   # Legacy aliases
@@ -151,11 +161,104 @@ proc testnet3Params*(): ConsensusParams =
   result.powTargetTimespan = 1_209_600
   result.powTargetSpacing = 600
   result.difficultyAdjustmentInterval = 2016
+  # PoW rules: testnet3 allows min-difficulty blocks
+  result.powAllowMinDifficultyBlocks = true
+  result.powNoRetargeting = false
+  result.enforceBIP94 = false
   result.minRelayTxFee = Satoshi(1000)
   result.dustLimit = Satoshi(546)
   # Legacy aliases
   result.p2pPort = 18333
   result.rpcPort = 18332
+
+proc testnet4Params*(): ConsensusParams =
+  ## Testnet4 parameters (BIP94)
+  result.network = Testnet4
+  result.networkMagic = [0x1c'u8, 0x16, 0x3f, 0x28]  # 0x1c163f28
+  result.defaultPort = 48333
+  result.dnsSeeds = @[
+    "seed.testnet4.bitcoin.sprovoost.nl",
+    "seed.testnet4.wiz.biz"
+  ]
+  result.genesisBlockHash = BlockHash(hexToBytes32(
+    "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"
+  ))
+  result.genesisPrevHash = BlockHash(default(array[32, byte]))
+  result.genesisTimestamp = 1714777860
+  result.genesisBits = 0x1d00ffff'u32
+  result.genesisNonce = 393743547'u32
+  result.genesisVersion = 1
+  result.subsidyHalvingInterval = 210_000
+  result.maxBlockWeight = 4_000_000
+  result.maxBlockSize = 1_000_000
+  result.maxBlockSigopsCost = 80_000
+  result.coinbaseMaturity = 100
+  # All soft forks active from genesis on testnet4
+  result.bip34Height = 1
+  result.bip65Height = 1
+  result.bip66Height = 1
+  result.csvHeight = 1
+  result.segwitHeight = 1
+  result.taprootHeight = 1
+  result.powLimit = hexToBytes32(
+    "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  )
+  result.powTargetTimespan = 1_209_600
+  result.powTargetSpacing = 600
+  result.difficultyAdjustmentInterval = 2016
+  # PoW rules: testnet4 allows min-difficulty + BIP94 time-warp fix
+  result.powAllowMinDifficultyBlocks = true
+  result.powNoRetargeting = false
+  result.enforceBIP94 = true
+  result.minRelayTxFee = Satoshi(1000)
+  result.dustLimit = Satoshi(546)
+  # Legacy aliases
+  result.p2pPort = 48333
+  result.rpcPort = 48332
+
+proc signetParams*(): ConsensusParams =
+  ## Signet parameters (BIP325)
+  result.network = Signet
+  result.networkMagic = [0x0a'u8, 0x03, 0xcf, 0x40]  # 0x0a03cf40
+  result.defaultPort = 38333
+  result.dnsSeeds = @[
+    "seed.signet.bitcoin.sprovoost.nl"
+  ]
+  result.genesisBlockHash = BlockHash(hexToBytes32(
+    "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"
+  ))
+  result.genesisPrevHash = BlockHash(default(array[32, byte]))
+  result.genesisTimestamp = 1598918400
+  result.genesisBits = 0x1e0377ae'u32
+  result.genesisNonce = 52613770'u32
+  result.genesisVersion = 1
+  result.subsidyHalvingInterval = 210_000
+  result.maxBlockWeight = 4_000_000
+  result.maxBlockSize = 1_000_000
+  result.maxBlockSigopsCost = 80_000
+  result.coinbaseMaturity = 100
+  # All soft forks active from genesis on signet
+  result.bip34Height = 1
+  result.bip65Height = 1
+  result.bip66Height = 1
+  result.csvHeight = 1
+  result.segwitHeight = 1
+  result.taprootHeight = 1
+  result.powLimit = hexToBytes32(
+    "00000377ae000000000000000000000000000000000000000000000000000000"
+  )
+  result.powTargetTimespan = 1_209_600
+  result.powTargetSpacing = 600
+  result.difficultyAdjustmentInterval = 2016
+  # PoW rules: signet does NOT allow min-difficulty blocks (PoW is controlled)
+  result.powAllowMinDifficultyBlocks = false
+  result.powNoRetargeting = false
+  result.enforceBIP94 = false
+  result.minRelayTxFee = Satoshi(1000)
+  result.dustLimit = Satoshi(546)
+  # Legacy aliases
+  result.p2pPort = 38333
+  result.rpcPort = 38332
 
 proc regtestParams*(): ConsensusParams =
   result.network = Regtest
@@ -187,6 +290,10 @@ proc regtestParams*(): ConsensusParams =
   result.powTargetTimespan = 1_209_600
   result.powTargetSpacing = 600
   result.difficultyAdjustmentInterval = 2016
+  # PoW rules: regtest never retargets, always allows min-difficulty
+  result.powAllowMinDifficultyBlocks = true
+  result.powNoRetargeting = true
+  result.enforceBIP94 = false
   result.minRelayTxFee = Satoshi(1000)
   result.dustLimit = Satoshi(546)
   # Legacy aliases
@@ -197,7 +304,9 @@ proc getParams*(network: Network): ConsensusParams =
   case network
   of Mainnet: mainnetParams()
   of Testnet3: testnet3Params()
+  of Testnet4: testnet4Params()
   of Regtest: regtestParams()
+  of Signet: signetParams()
 
 proc getBlockSubsidy*(height: int, params: ConsensusParams): Satoshi =
   ## Calculate block subsidy at given height
