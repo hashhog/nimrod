@@ -271,6 +271,7 @@ proc getBlockScriptFlags*(height: int32, params: ConsensusParams): set[ScriptFla
     result.incl(sfWitness)
     result.incl(sfNullDummy)
     result.incl(sfNullFail)
+    result.incl(sfWitnessPubkeyType)  # BIP141: witness pubkeys must be compressed
 
   # Taproot (BIP341/342)
   if height >= int32(params.taprootHeight):
