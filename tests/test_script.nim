@@ -660,3 +660,156 @@ suite "script interpreter - NULLFAIL (BIP146)":
     let err = interp.eval(script, ctx)
     # Should succeed - signature was empty
     check err == seOk
+
+suite "script interpreter - P2SH push-only (BIP16)":
+  test "P2SH scriptSig with push operations only succeeds":
+    # P2SH scriptPubKey: OP_HASH160 <20 bytes> OP_EQUAL
+    # Redeem script: OP_1 (always succeeds)
+    let redeemScript = @[OP_1]
+    let redeemHash = hash160(redeemScript)
+
+    var scriptPubKey: seq[byte] = @[OP_HASH160, 0x14'u8]
+    scriptPubKey.add(redeemHash)
+    scriptPubKey.add(OP_EQUAL)
+
+    # Push-only scriptSig: just push the redeem script
+    var scriptSig: seq[byte] = @[byte(redeemScript.len)]
+    scriptSig.add(redeemScript)
+
+    # Create empty tx for verification
+    var tx = Transaction()
+    tx.inputs.add(TxIn(
+      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+      scriptSig: scriptSig,
+      sequence: 0xFFFFFFFF'u32
+    ))
+    tx.outputs.add(TxOut(value: Satoshi(0), scriptPubKey: @[]))
+
+    let result = verifyScript(scriptSig, scriptPubKey, tx, 0, Satoshi(0), {sfP2SH})
+    check result == true
+
+  test "P2SH scriptSig with OP_DUP fails":
+    # P2SH scriptPubKey: OP_HASH160 <20 bytes> OP_EQUAL
+    # Redeem script: OP_1 (always succeeds)
+    let redeemScript = @[OP_1]
+    let redeemHash = hash160(redeemScript)
+
+    var scriptPubKey: seq[byte] = @[OP_HASH160, 0x14'u8]
+    scriptPubKey.add(redeemHash)
+    scriptPubKey.add(OP_EQUAL)
+
+    # Non-push scriptSig: includes OP_DUP (a computational opcode)
+    # OP_DUP duplicates top of stack, then push the redeem script
+    var scriptSig: seq[byte] = @[byte(redeemScript.len)]
+    scriptSig.add(redeemScript)
+    scriptSig.add(OP_DUP)  # Non-push opcode!
+    scriptSig.add(OP_DROP) # Clean up the duplicate
+
+    # Create empty tx for verification
+    var tx = Transaction()
+    tx.inputs.add(TxIn(
+      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+      scriptSig: scriptSig,
+      sequence: 0xFFFFFFFF'u32
+    ))
+    tx.outputs.add(TxOut(value: Satoshi(0), scriptPubKey: @[]))
+
+    let result = verifyScript(scriptSig, scriptPubKey, tx, 0, Satoshi(0), {sfP2SH})
+    check result == false
+
+  test "P2SH scriptSig with OP_DUP returns seSigPushOnly error":
+    # Same as above but using verifyScriptWithError to get the specific error
+    let redeemScript = @[OP_1]
+    let redeemHash = hash160(redeemScript)
+
+    var scriptPubKey: seq[byte] = @[OP_HASH160, 0x14'u8]
+    scriptPubKey.add(redeemHash)
+    scriptPubKey.add(OP_EQUAL)
+
+    # Non-push scriptSig: starts with push, but has OP_DUP in it
+    var scriptSig: seq[byte] = @[byte(redeemScript.len)]
+    scriptSig.add(redeemScript)
+    scriptSig.add(OP_DUP)
+
+    # Create empty tx for verification
+    var tx = Transaction()
+    tx.inputs.add(TxIn(
+      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+      scriptSig: scriptSig,
+      sequence: 0xFFFFFFFF'u32
+    ))
+    tx.outputs.add(TxOut(value: Satoshi(0), scriptPubKey: @[]))
+
+    let err = verifyScriptWithError(scriptSig, scriptPubKey, tx, 0, Satoshi(0), {sfP2SH})
+    check err == seSigPushOnly
+
+  test "isPushOnly returns false for script containing OP_DUP":
+    let script = @[OP_1, OP_DUP]
+    check isPushOnly(script) == false
+
+  test "isPushOnly returns false for script containing OP_HASH160":
+    let script = @[0x01'u8, 0xAB, OP_HASH160]
+    check isPushOnly(script) == false
+
+  test "isPushOnly returns true for OP_0":
+    let script = @[OP_0]
+    check isPushOnly(script) == true
+
+  test "isPushOnly returns true for OP_1 through OP_16":
+    for op in OP_1..OP_16:
+      let script = @[op]
+      check isPushOnly(script) == true
+
+  test "isPushOnly returns true for OP_1NEGATE":
+    let script = @[OP_1NEGATE]
+    check isPushOnly(script) == true
+
+  test "isPushOnly returns true for direct push (1-75 bytes)":
+    # Push 3 bytes
+    let script = @[0x03'u8, 0xAA, 0xBB, 0xCC]
+    check isPushOnly(script) == true
+
+  test "isPushOnly returns true for OP_PUSHDATA1":
+    var script: seq[byte] = @[OP_PUSHDATA1, 0x02]
+    script.add([0xAA'u8, 0xBB])
+    check isPushOnly(script) == true
+
+  test "isPushOnly returns true for OP_PUSHDATA2":
+    var script: seq[byte] = @[OP_PUSHDATA2, 0x02, 0x00]  # 2 bytes length (little endian)
+    script.add([0xAA'u8, 0xBB])
+    check isPushOnly(script) == true
+
+  test "isPushOnly returns false for truncated PUSHDATA1":
+    let script = @[OP_PUSHDATA1]  # Missing length byte
+    check isPushOnly(script) == false
+
+  test "isPushOnly returns false for truncated PUSHDATA2":
+    let script = @[OP_PUSHDATA2, 0x02]  # Missing second length byte
+    check isPushOnly(script) == false
+
+  test "P2SH push-only is unconditional (enforced even without sfSigPushOnly)":
+    # This test verifies that P2SH push-only checking is done unconditionally
+    # when sfP2SH flag is set, NOT gated by sfSigPushOnly (which is policy-only)
+    let redeemScript = @[OP_1]
+    let redeemHash = hash160(redeemScript)
+
+    var scriptPubKey: seq[byte] = @[OP_HASH160, 0x14'u8]
+    scriptPubKey.add(redeemHash)
+    scriptPubKey.add(OP_EQUAL)
+
+    # Non-push scriptSig
+    var scriptSig: seq[byte] = @[byte(redeemScript.len)]
+    scriptSig.add(redeemScript)
+    scriptSig.add(OP_NOP)  # OP_NOP > OP_16, so not push-only
+
+    var tx = Transaction()
+    tx.inputs.add(TxIn(
+      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+      scriptSig: scriptSig,
+      sequence: 0xFFFFFFFF'u32
+    ))
+    tx.outputs.add(TxOut(value: Satoshi(0), scriptPubKey: @[]))
+
+    # sfP2SH only, NO sfSigPushOnly - should still fail
+    let result = verifyScript(scriptSig, scriptPubKey, tx, 0, Satoshi(0), {sfP2SH})
+    check result == false
