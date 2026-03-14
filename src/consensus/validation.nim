@@ -266,10 +266,11 @@ proc getBlockScriptFlags*(height: int32, params: ConsensusParams): set[ScriptFla
   if height >= int32(params.segwitHeight):
     result.incl(sfCheckSequenceVerify)
 
-  # SegWit (BIP141/143/147)
+  # SegWit (BIP141/143/147) and BIP146 NULLFAIL
   if height >= int32(params.segwitHeight):
     result.incl(sfWitness)
     result.incl(sfNullDummy)
+    result.incl(sfNullFail)
 
   # Taproot (BIP341/342)
   if height >= int32(params.taprootHeight):
