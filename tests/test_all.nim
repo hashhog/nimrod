@@ -24,6 +24,8 @@ import ./test_sync
 import ./test_wallet
 import ./test_rpc
 import ./test_perf
+import ./test_sequence_lock
+import ./test_bip68
 
 when isMainModule:
   echo "Running all tests..."
