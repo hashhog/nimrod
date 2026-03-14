@@ -46,7 +46,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Full initial block download (parallel download, sliding window, adaptive timeouts)
 - [x] Transaction mempool (fee/size policy, CPFP tracking, eviction)
 - [x] Fee estimation (histogram-based, 85% confirmation threshold)
-- [x] Block template generation (BIP-34 coinbase, witness commitment, sigops limit)
+- [x] Block template generation (BIP-34 coinbase, witness commitment, sigops limit, locktime finality)
 - [x] JSON-RPC server (Bitcoin Core compatible, HTTP Basic auth)
 - [x] HD Wallet (BIP-32/39/44/84/86 key derivation, P2WPKH signing)
 - [x] Unified CLI (subcommands for node, RPC, wallet; config file; signal handlers)
