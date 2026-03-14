@@ -28,8 +28,8 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Witness cleanstack enforcement (exactly one true element after execution)
 - [x] MINIMALIF enforcement (OP_IF/NOTIF argument must be empty or @[0x01])
 - [x] Sighash computation (legacy with FindAndDelete/OP_CODESEPARATOR, segwit v0, taproot)
-- [x] Consensus parameters (mainnet, testnet3, regtest)
-- [x] Difficulty target functions (compact/target conversion)
+- [x] Consensus parameters (mainnet, testnet3, testnet4, regtest, signet)
+- [x] Difficulty adjustment (mainnet retarget, testnet 20-min rule, BIP94 time-warp fix)
 - [x] Genesis block construction and verification
 - [x] Block/transaction validation
 - [x] Sigop cost counting with witness discount (BIP-141: 80K limit, legacy 4x, witness 1x)
