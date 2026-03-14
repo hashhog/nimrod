@@ -32,6 +32,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Difficulty target functions (compact/target conversion)
 - [x] Genesis block construction and verification
 - [x] Block/transaction validation
+- [x] BIP-68 sequence locks (relative lock-time enforcement in block validation)
 - [x] RocksDB storage (column families via FFI, UTXO set, block index)
 - [x] Chainstate management (atomic block connect/disconnect, write batches)
 - [x] UTXO set manager (cache, coinbase maturity, reorg support)
