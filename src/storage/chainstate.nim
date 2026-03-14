@@ -1,14 +1,17 @@
 ## Chainstate management
 ## UTXO set manager with block connect/disconnect, in-memory cache, and reorg support
 ## Uses RocksDB column families for data separation
+## Undo data stored in flat files (rev*.dat) for efficient reorg handling
 
-import std/[options, tables]
+import std/[options, tables, os]
 import ./db
+import ./undo
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 import ../consensus/params
 
 export db.ColumnFamily
+export undo.BlockUndo, undo.TxUndo, undo.SpentOutput, undo.FlatFilePos
 
 type
   ChainStateError* = object of CatchableError
@@ -26,6 +29,7 @@ type
     prevHash*: BlockHash
     header*: BlockHeader
     totalWork*: array[32, byte]  ## Cumulative chain work
+    undoPos*: FlatFilePos        ## Position of undo data in rev*.dat files
 
   UtxoEntry* = object
     output*: TxOut
@@ -53,6 +57,7 @@ type
     utxoCache*: Table[OutPoint, UtxoEntry]
     cacheSize*: int
     maxCacheSize*: int  ## Flush at 50000
+    undoMgr*: UndoFileManager  ## Manages flat file undo storage
 
   ## Result type for chainstate operations
   ChainStateResult*[T] = object
@@ -101,6 +106,9 @@ proc serializeBlockIndex(idx: BlockIndex): seq[byte] =
   w.writeBlockHash(idx.prevHash)
   w.writeBlockHeader(idx.header)
   w.writeBytes(idx.totalWork)
+  # Serialize undo file position
+  w.writeInt32LE(idx.undoPos.fileNum)
+  w.writeInt32LE(idx.undoPos.pos)
   w.data
 
 proc deserializeBlockIndex(data: seq[byte]): BlockIndex =
@@ -111,6 +119,13 @@ proc deserializeBlockIndex(data: seq[byte]): BlockIndex =
   result.prevHash = r.readBlockHash()
   result.header = r.readBlockHeader()
   result.totalWork = r.readHash()
+  # Deserialize undo file position (with backward compatibility)
+  if r.remaining() >= 8:
+    result.undoPos.fileNum = r.readInt32LE()
+    result.undoPos.pos = r.readInt32LE()
+  else:
+    # Legacy format without undo position
+    result.undoPos = FlatFilePos(fileNum: -1, pos: -1)
 
 # Serialization for UtxoEntry
 
@@ -339,7 +354,8 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     params: params,
     utxoCache: initTable[OutPoint, UtxoEntry](),
     cacheSize: 0,
-    maxCacheSize: DefaultMaxCacheSize
+    maxCacheSize: DefaultMaxCacheSize,
+    undoMgr: newUndoFileManager(dbPath / "blocks")
   )
 
   # Load total work from DB if available
@@ -348,6 +364,7 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     copyMem(addr result.totalWork[0], addr workData.get()[0], 32)
 
 proc close*(cs: var ChainState) =
+  cs.undoMgr.close()
   cs.db.close()
 
 # UTXO operations (ChainState - with cache management)
@@ -431,6 +448,7 @@ proc calculateBlockWork(bits: uint32): array[32, byte] =
 
 proc generateUndoData*(cs: ChainState, blk: Block): UndoData =
   ## Generate undo data for a block (record all spent outputs)
+  ## Legacy format - kept for backward compatibility
   for txIdx, tx in blk.txs:
     # Skip coinbase inputs (nothing spent)
     if txIdx == 0:
@@ -441,17 +459,47 @@ proc generateUndoData*(cs: ChainState, blk: Block): UndoData =
       if utxoOpt.isSome:
         result.spentOutputs.add((input.prevOut, utxoOpt.get()))
 
+proc generateBlockUndo*(cs: ChainState, blk: Block): BlockUndo =
+  ## Generate BlockUndo data for flat file storage
+  ## One TxUndo per non-coinbase transaction, each containing all spent outputs
+  for txIdx, tx in blk.txs:
+    # Skip coinbase (has no inputs to spend)
+    if txIdx == 0:
+      continue
+
+    var txUndo = TxUndo()
+    for input in tx.inputs:
+      let utxoOpt = cs.getUtxo(input.prevOut)
+      if utxoOpt.isSome:
+        let entry = utxoOpt.get()
+        txUndo.prevOutputs.add(SpentOutput(
+          output: entry.output,
+          height: entry.height,
+          isCoinbase: entry.isCoinbase
+        ))
+    result.txUndo.add(txUndo)
+
 # Connect a block to the chain
 
 proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateResult[void] =
   ## Connect a block: spend inputs, create outputs, update state
   ## Returns error if any input is missing or immature coinbase
+  ## Undo data is written to flat files (rev*.dat) for efficient reorg handling
 
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
-  # Generate undo data before making changes
+  # Generate undo data before making changes (both formats for compatibility)
   let undo = cs.generateUndoData(blk)
+  let blockUndo = cs.generateBlockUndo(blk)
+
+  # Write undo data to flat file
+  var undoPos = FlatFilePos(fileNum: -1, pos: -1)
+  if blk.txs.len > 1:  # Only write undo if there are non-coinbase transactions
+    let (pos, ok) = cs.undoMgr.writeBlockUndo(blockUndo, blk.header.prevBlock, cs.params)
+    if not ok:
+      return err("failed to write undo data for block " & $blockHash)
+    undoPos = pos
 
   # Create a write batch for atomic updates
   let batch = cs.db.db.newWriteBatch()
@@ -506,19 +554,20 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   let blockWork = calculateBlockWork(blk.header.bits)
   addWork(cs.totalWork, blockWork)
 
-  # Create block index entry
+  # Create block index entry with undo position
   let idx = BlockIndex(
     hash: blockHash,
     height: height,
     status: bsValidated,
     prevHash: blk.header.prevBlock,
     header: blk.header,
-    totalWork: cs.totalWork
+    totalWork: cs.totalWork,
+    undoPos: undoPos
   )
   batch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
   batch.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](blockHash)))
 
-  # Store undo data
+  # Store undo data (legacy RocksDB format for backward compatibility)
   batch.put(cfMeta, undoKey(blockHash), serializeUndoData(undo))
 
   # Update best block
@@ -614,6 +663,50 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
   cs.db.db.write(batch)
 
   ok()
+
+proc disconnectBlock*(cs: var ChainState, blk: Block): ChainStateResult[void] =
+  ## Disconnect a block by reading undo data from flat files
+  ## This is the preferred method for disconnection as it reads from rev*.dat
+
+  let headerBytes = serialize(blk.header)
+  let blockHash = BlockHash(doubleSha256(headerBytes))
+
+  # Get block index to find undo position
+  let idxOpt = cs.db.getBlockIndex(blockHash)
+  if idxOpt.isNone:
+    return err("block index not found for " & $blockHash)
+
+  let idx = idxOpt.get()
+  let height = idx.height
+
+  # Try to read undo from flat files first
+  if not idx.undoPos.isNull:
+    let (blockUndo, ok) = cs.undoMgr.readBlockUndo(idx.undoPos, blk.header.prevBlock, cs.params)
+    if ok:
+      # Convert BlockUndo to UndoData format for the existing disconnection logic
+      var undo = UndoData()
+      var inputIdx = 0
+      for txIdx in 1 ..< blk.txs.len:  # Skip coinbase
+        let tx = blk.txs[txIdx]
+        if txIdx - 1 < blockUndo.txUndo.len:
+          let txUndo = blockUndo.txUndo[txIdx - 1]
+          for i, spent in txUndo.prevOutputs:
+            if i < tx.inputs.len:
+              let outpoint = tx.inputs[i].prevOut
+              let entry = UtxoEntry(
+                output: spent.output,
+                height: spent.height,
+                isCoinbase: spent.isCoinbase
+              )
+              undo.spentOutputs.add((outpoint, entry))
+      return cs.disconnectBlock(blk, height, undo)
+
+  # Fall back to RocksDB undo data
+  let undoOpt = cs.db.getUndoData(blockHash)
+  if undoOpt.isNone:
+    return err("undo data not found for " & $blockHash)
+
+  cs.disconnectBlock(blk, height, undoOpt.get())
 
 # Handle a reorg
 
