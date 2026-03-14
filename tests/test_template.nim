@@ -380,3 +380,121 @@ suite "Block Template":
   test "max block sigops constant":
     # BIP-141 specifies 80K sigops cost limit
     check params.MaxBlockSigopsCost == 80000
+
+  # Locktime finality tests
+  test "isFinalTx with lockTime=0 is always final":
+    let tx = Transaction(
+      version: 2,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],
+        sequence: 0x00000000'u32  # Non-final sequence
+      )],
+      outputs: @[TxOut(value: Satoshi(1_0000_0000), scriptPubKey: @[0x51'u8])],
+      witnesses: @[],
+      lockTime: 0  # lockTime=0 is always final
+    )
+    check isFinalTx(tx, blockHeight = 500000, blockTime = 1600000000)
+
+  test "isFinalTx with height-based locktime satisfied":
+    let tx = Transaction(
+      version: 2,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],
+        sequence: 0x00000000'u32  # Non-final sequence
+      )],
+      outputs: @[TxOut(value: Satoshi(1_0000_0000), scriptPubKey: @[0x51'u8])],
+      witnesses: @[],
+      lockTime: 100  # Height-based (< 500_000_000)
+    )
+    # Block height 100 means lockTime 100 is satisfied (100 < 100 is false, so not final)
+    check not isFinalTx(tx, blockHeight = 100, blockTime = 1600000000)
+    # Block height 101 means lockTime 100 is satisfied (100 < 101)
+    check isFinalTx(tx, blockHeight = 101, blockTime = 1600000000)
+
+  test "isFinalTx with time-based locktime satisfied":
+    let tx = Transaction(
+      version: 2,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],
+        sequence: 0x00000000'u32  # Non-final sequence
+      )],
+      outputs: @[TxOut(value: Satoshi(1_0000_0000), scriptPubKey: @[0x51'u8])],
+      witnesses: @[],
+      lockTime: 500_000_001'u32  # Time-based (>= 500_000_000)
+    )
+    # Block time 500_000_001 means lockTime is not satisfied
+    check not isFinalTx(tx, blockHeight = 700000, blockTime = 500_000_001)
+    # Block time 500_000_002 means lockTime is satisfied
+    check isFinalTx(tx, blockHeight = 700000, blockTime = 500_000_002)
+
+  test "isFinalTx with all inputs SEQUENCE_FINAL ignores lockTime":
+    let tx = Transaction(
+      version: 2,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],
+        sequence: 0xFFFFFFFF'u32  # SEQUENCE_FINAL
+      )],
+      outputs: @[TxOut(value: Satoshi(1_0000_0000), scriptPubKey: @[0x51'u8])],
+      witnesses: @[],
+      lockTime: 999_999_999'u32  # Very far in the future (time-based)
+    )
+    # Even though lockTime is not satisfied, all inputs are final
+    check isFinalTx(tx, blockHeight = 100, blockTime = 1000)
+
+  test "isFinalTx with mixed sequence - not final":
+    let tx = Transaction(
+      version: 2,
+      inputs: @[
+        TxIn(
+          prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+          scriptSig: @[],
+          sequence: 0xFFFFFFFF'u32  # SEQUENCE_FINAL
+        ),
+        TxIn(
+          prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 1),
+          scriptSig: @[],
+          sequence: 0x00000000'u32  # Non-final
+        )
+      ],
+      outputs: @[TxOut(value: Satoshi(1_0000_0000), scriptPubKey: @[0x51'u8])],
+      witnesses: @[],
+      lockTime: 999_999_999'u32  # Very far in the future
+    )
+    # Not all inputs are final, so lockTime applies and tx is not final
+    check not isFinalTx(tx, blockHeight = 100, blockTime = 1000)
+
+  test "coinbase has correct sequence (SEQUENCE_FINAL)":
+    let height = int32(500000)
+    let subsidy = Satoshi(12_5000_0000)
+    let fees = Satoshi(0)
+    let scriptPubKey = @[0x51'u8]  # OP_1
+    let emptyCommitment: array[32, byte] = default(array[32, byte])
+
+    let coinbase = createCoinbaseTx(height, subsidy, fees, scriptPubKey, emptyCommitment)
+
+    # Coinbase input sequence should be 0xFFFFFFFF (SEQUENCE_FINAL)
+    # This opts out of BIP68 relative timelocks for the coinbase
+    check coinbase.inputs[0].sequence == 0xFFFFFFFF'u32
+
+  test "coinbase has lockTime=0":
+    let height = int32(500000)
+    let subsidy = Satoshi(12_5000_0000)
+    let fees = Satoshi(0)
+    let scriptPubKey = @[0x51'u8]
+    let emptyCommitment: array[32, byte] = default(array[32, byte])
+
+    let coinbase = createCoinbaseTx(height, subsidy, fees, scriptPubKey, emptyCommitment)
+
+    # Coinbase lockTime should be 0
+    check coinbase.lockTime == 0
+
+  test "locktime threshold constant":
+    # Below 500_000_000 is height-based, at or above is time-based
+    check LocktimeThreshold == 500_000_000'u32
+
+  test "sequence final constant":
+    check SequenceFinal == 0xFFFFFFFF'u32
