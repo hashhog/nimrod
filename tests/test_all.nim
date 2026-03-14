@@ -7,6 +7,7 @@ import ./test_serialize
 import ./test_crypto
 import ./test_address
 import ./test_script
+import ./test_sighash
 import ./test_witness_cleanstack
 import ./test_witness_pubkeytype
 import ./test_consensus
