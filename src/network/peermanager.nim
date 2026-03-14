@@ -108,6 +108,15 @@ proc newPeerManager*(params: ConsensusParams, maxOut: int = DefaultMaxOutbound,
     result.fallbackPeers = @[
       ("127.0.0.1", 18444'u16)
     ]
+  of Testnet4:
+    result.seedNodes = @[
+      ("seed.testnet4.bitcoin.sprovoost.nl", 48333'u16),
+      ("seed.testnet4.wiz.biz", 48333'u16)
+    ]
+  of Signet:
+    result.seedNodes = @[
+      ("seed.signet.bitcoin.sprovoost.nl", 38333'u16)
+    ]
 
 proc connectedPeerCount*(pm: PeerManager): int =
   for peer in pm.peers.values:
