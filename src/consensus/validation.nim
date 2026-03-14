@@ -35,6 +35,7 @@ type
     veFeeTooLow = "transaction fee too low"
     veBadBlockVersion = "invalid block version"
     vePrevBlockMissing = "previous block not found"
+    veSequenceLockNotSatisfied = "BIP68 relative lock-time not satisfied"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -243,6 +244,29 @@ proc getMedianTimePast*(prevHeaders: seq[BlockHeader]): uint32 =
   timestamps.sort()
   timestamps[timestamps.len div 2]
 
+proc getMtpForHeight*(utxos: ChainDb, height: int32): uint32 =
+  ## Get Median Time Past for a given block height
+  ## Uses the previous 11 block headers (or fewer if near genesis)
+  ## This is the MTP at the tip of the chain when block `height` is being mined
+  if height < 0:
+    return 0
+
+  var headers: seq[BlockHeader]
+  var h = height
+  for i in 0 ..< MedianTimeSpan:
+    if h < 0:
+      break
+    let idxOpt = utxos.getBlockHashByHeight(h)
+    if idxOpt.isNone:
+      break
+    let blockIdxOpt = utxos.getBlockIndex(idxOpt.get())
+    if blockIdxOpt.isNone:
+      break
+    headers.add(blockIdxOpt.get().header)
+    dec h
+
+  getMedianTimePast(headers)
+
 # Get script flags for block validation
 proc getBlockScriptFlags*(height: int32, params: ConsensusParams): set[ScriptFlags] =
   ## Get consensus-only script verification flags for a block at given height
@@ -262,8 +286,8 @@ proc getBlockScriptFlags*(height: int32, params: ConsensusParams): set[ScriptFla
   if height >= int32(params.bip65Height):
     result.incl(sfCheckLockTimeVerify)
 
-  # CHECKSEQUENCEVERIFY (BIP112) - same height as SegWit for simplicity
-  if height >= int32(params.segwitHeight):
+  # CHECKSEQUENCEVERIFY (BIP112) - activated with CSV (BIP68/112/113)
+  if height >= int32(params.csvHeight):
     result.incl(sfCheckSequenceVerify)
 
   # SegWit (BIP141/143/147) and BIP146 NULLFAIL
@@ -276,6 +300,160 @@ proc getBlockScriptFlags*(height: int32, params: ConsensusParams): set[ScriptFla
   # Taproot (BIP341/342)
   if height >= int32(params.taprootHeight):
     result.incl(sfTaproot)
+
+# ============================================================================
+# BIP68 Sequence Lock Functions
+# ============================================================================
+
+type
+  SequenceLock* = object
+    ## The result of calculating sequence locks for a transaction
+    minHeight*: int32    ## Minimum block height for inclusion (-1 = no height constraint)
+    minTime*: int64      ## Minimum MTP for inclusion (-1 = no time constraint)
+
+proc calculateSequenceLocks*(
+  tx: Transaction,
+  prevHeights: var seq[int32],
+  blockHeight: int32,
+  getMtpAtHeight: proc(height: int32): uint32,
+  params: ConsensusParams
+): SequenceLock =
+  ## Calculate the sequence locks for a transaction per BIP68
+  ##
+  ## prevHeights: height at which each input's UTXO was mined (modified in place;
+  ##              set to 0 for inputs with disable flag set)
+  ## blockHeight: the height of the block we're evaluating for inclusion
+  ## getMtpAtHeight: function to get median time past at a given height
+  ##
+  ## Returns SequenceLock with minHeight and minTime that must be satisfied
+  ## The semantics use nLockTime convention: values are the LAST INVALID height/time,
+  ## so the tx is valid when blockHeight > minHeight and blockMTP > minTime.
+  ## A value of -1 means no constraint.
+  ##
+  ## BIP68 only applies when tx.version >= 2.
+
+  result.minHeight = -1
+  result.minTime = -1
+
+  # BIP68 only applies to transactions with version >= 2
+  if tx.version < 2:
+    return result
+
+  # BIP68 must be enforced (caller should check height >= csvHeight)
+  assert prevHeights.len == tx.inputs.len
+
+  for i, input in tx.inputs:
+    let nSequence = input.sequence
+
+    # If bit 31 is set, this input opts out of BIP68 relative lock-time
+    if (nSequence and SequenceLockDisableFlag) != 0:
+      # Mark this input as not contributing to sequence locks
+      prevHeights[i] = 0
+      continue
+
+    let coinHeight = prevHeights[i]
+
+    # Check if this is a time-based or height-based lock
+    if (nSequence and SequenceLockTypeFlag) != 0:
+      # Time-based relative lock
+      # The lock is measured from the MTP of the block *prior* to the one containing
+      # the UTXO being spent (i.e., MTP when that UTXO was the chain tip)
+      let coinMtp = getMtpAtHeight(max(coinHeight - 1, 0))
+
+      # Extract the 16-bit lock value and convert to seconds (512-second granularity)
+      let lockValue = int64(nSequence and SequenceLockMask) shl SequenceLockGranularity
+
+      # The required time is coinMtp + lockValue - 1 (nLockTime semantics: last invalid)
+      let requiredTime = int64(coinMtp) + lockValue - 1
+      if requiredTime > result.minTime:
+        result.minTime = requiredTime
+    else:
+      # Height-based relative lock
+      # The lock is the number of blocks that must be mined after the UTXO's block
+      let lockValue = int32(nSequence and SequenceLockMask)
+
+      # Required height is coinHeight + lockValue - 1 (nLockTime semantics: last invalid)
+      let requiredHeight = coinHeight + lockValue - 1
+      if requiredHeight > result.minHeight:
+        result.minHeight = requiredHeight
+
+proc checkSequenceLocks*(
+  lock: SequenceLock,
+  blockHeight: int32,
+  blockMtp: uint32
+): bool =
+  ## Check if the sequence locks are satisfied for inclusion in a block
+  ##
+  ## blockHeight: the height of the block being created/validated
+  ## blockMtp: the median time past of the PREVIOUS block (block at height - 1)
+  ##
+  ## Returns true if the transaction can be included in this block.
+  ## The semantics follow nLockTime: lock values are the LAST INVALID height/time.
+
+  # Height check: blockHeight must be > minHeight
+  if lock.minHeight >= blockHeight:
+    return false
+
+  # Time check: blockMtp must be > minTime
+  if lock.minTime >= int64(blockMtp):
+    return false
+
+  true
+
+proc checkSequenceLocksForTx*(
+  tx: Transaction,
+  utxos: proc(op: OutPoint): Option[UtxoEntry],
+  blockHeight: int32,
+  prevBlockMtp: uint32,
+  getMtpAtHeight: proc(height: int32): uint32,
+  params: ConsensusParams,
+  intraBlockUtxos: Table[string, UtxoEntry] = initTable[string, UtxoEntry]()
+): ValidationResult[void] =
+  ## Check BIP68 sequence locks for a single transaction
+  ##
+  ## tx: the transaction to check
+  ## utxos: function to look up UTXOs by outpoint
+  ## blockHeight: height of the block we're checking for inclusion
+  ## prevBlockMtp: MTP of the block at height (blockHeight - 1)
+  ## getMtpAtHeight: function to get MTP at any height
+  ## intraBlockUtxos: UTXOs created earlier in the same block
+  ##
+  ## Returns error if sequence locks are not satisfied
+
+  # BIP68 only applies if tx version >= 2
+  if tx.version < 2:
+    return ok()
+
+  # Coinbase transactions don't have sequence locks
+  if isCoinbase(tx):
+    return ok()
+
+  # Build the prevHeights array: height at which each input's UTXO was mined
+  var prevHeights = newSeq[int32](tx.inputs.len)
+
+  for i, input in tx.inputs:
+    let intraKey = $array[32, byte](input.prevOut.txid) & ":" & $input.prevOut.vout
+    var utxoOpt: Option[UtxoEntry]
+
+    if intraKey in intraBlockUtxos:
+      utxoOpt = some(intraBlockUtxos[intraKey])
+    else:
+      utxoOpt = utxos(input.prevOut)
+
+    if utxoOpt.isNone:
+      # Input not found - let validateTransaction handle this error
+      return ok()
+
+    prevHeights[i] = utxoOpt.get().height
+
+  # Calculate sequence locks
+  let lock = calculateSequenceLocks(tx, prevHeights, blockHeight, getMtpAtHeight, params)
+
+  # Check if locks are satisfied
+  if not checkSequenceLocks(lock, blockHeight, prevBlockMtp):
+    return voidErr(veSequenceLockNotSatisfied)
+
+  ok()
 
 # Transaction validation
 proc validateTransaction*(
@@ -510,6 +688,18 @@ proc validateBlock*(
       isCoinbase: true
     )
 
+  # Check if BIP68 (CSV) is active at this height
+  let bip68Active = height >= int32(params.csvHeight)
+
+  # Precompute the MTP of the previous block for sequence lock checking
+  var prevBlockMtp: uint32 = 0
+  if bip68Active and prevIndex.height >= 0:
+    prevBlockMtp = getMtpForHeight(utxos, prevIndex.height)
+
+  # Create a closure for getMtpAtHeight that can be passed to sequence lock functions
+  proc getMtpAtHeight(h: int32): uint32 =
+    getMtpForHeight(utxos, h)
+
   # Validate non-coinbase transactions
   for i in 1 ..< blk.txs.len:
     let tx = blk.txs[i]
@@ -526,6 +716,14 @@ proc validateBlock*(
       return voidErr(txResult.error)
 
     totalFees += txResult.value
+
+    # BIP68 sequence lock check (only if CSV is active and tx version >= 2)
+    if bip68Active and tx.version >= 2:
+      let seqLockResult = checkSequenceLocksForTx(
+        tx, lookupUtxo, height, prevBlockMtp, getMtpAtHeight, params, intraBlockUtxos
+      )
+      if not seqLockResult.isOk:
+        return voidErr(seqLockResult.error)
 
     # Mark spent UTXOs (remove from intra-block set or mark for removal from UTXO set)
     for inp in tx.inputs:
