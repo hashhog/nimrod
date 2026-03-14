@@ -17,6 +17,7 @@ import ./test_messages
 import ./test_peer
 import ./test_mempool
 import ./test_chainstate
+import ./test_undo
 import ./test_fees
 import ./test_template
 import ./test_sync
