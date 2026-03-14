@@ -35,6 +35,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] RocksDB storage (column families via FFI, UTXO set, block index)
 - [x] Chainstate management (atomic block connect/disconnect, write batches)
 - [x] UTXO set manager (cache, coinbase maturity, reorg support)
+- [x] Undo data storage (flat file rev*.dat, checksums, block disconnect)
 - [x] P2P message serialization (typed case object, all message types)
 - [x] Peer connection (TCP, message framing, version handshake, ping/pong)
 - [x] Peer manager (DNS discovery, connection limits, banning, message routing)
@@ -70,7 +71,7 @@ nimrod/
 │   ├── crypto/             # Hashing, secp256k1, address encoding
 │   ├── script/             # Script interpreter
 │   ├── consensus/          # Params and validation
-│   ├── storage/            # RocksDB and chainstate
+│   ├── storage/            # RocksDB, chainstate, undo files
 │   ├── network/            # P2P messaging and sync
 │   ├── mempool/            # Transaction pool
 │   ├── mining/             # Fees and block templates
