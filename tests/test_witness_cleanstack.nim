@@ -209,3 +209,88 @@ suite "witness cleanstack - castToBool":
     check castToBool(@[0x01'u8]) == true
     check castToBool(@[0x81'u8]) == true
     check castToBool(@[0x00'u8, 0x01]) == true
+
+suite "witness cleanstack - error codes":
+  test "verifyWitnessProgramWithError returns seCleanStack for extra items":
+    # Script leaves 2 items on stack - should return seCleanStack
+    let witnessScript = @[OP_1, OP_1]
+    let scriptHash = sha256(witnessScript)
+
+    var dummyTx = Transaction()
+    dummyTx.version = 2
+    dummyTx.inputs = @[TxIn(
+      prevOut: OutPoint(txid: default(TxId), vout: 0),
+      scriptSig: @[],
+      sequence: 0xffffffff'u32
+    )]
+    dummyTx.outputs = @[TxOut(value: Satoshi(1000), scriptPubKey: @[])]
+    dummyTx.lockTime = 0
+
+    let flags = {sfWitness}
+    let witness = @[witnessScript]
+
+    let err = verifyWitnessProgramWithError(witness, 0, @scriptHash, dummyTx, 0, Satoshi(1000), flags)
+    check err == seCleanStack
+
+  test "verifyWitnessProgramWithError returns seCleanStack for empty stack":
+    # Script leaves 0 items on stack - should return seCleanStack
+    let witnessScript = @[OP_1, OP_DROP]
+    let scriptHash = sha256(witnessScript)
+
+    var dummyTx = Transaction()
+    dummyTx.version = 2
+    dummyTx.inputs = @[TxIn(
+      prevOut: OutPoint(txid: default(TxId), vout: 0),
+      scriptSig: @[],
+      sequence: 0xffffffff'u32
+    )]
+    dummyTx.outputs = @[TxOut(value: Satoshi(1000), scriptPubKey: @[])]
+    dummyTx.lockTime = 0
+
+    let flags = {sfWitness}
+    let witness = @[witnessScript]
+
+    let err = verifyWitnessProgramWithError(witness, 0, @scriptHash, dummyTx, 0, Satoshi(1000), flags)
+    check err == seCleanStack
+
+  test "verifyWitnessProgramWithError returns seVerify for false result":
+    # Script leaves exactly 1 item but it's false - should return seVerify
+    let witnessScript = @[OP_0]
+    let scriptHash = sha256(witnessScript)
+
+    var dummyTx = Transaction()
+    dummyTx.version = 2
+    dummyTx.inputs = @[TxIn(
+      prevOut: OutPoint(txid: default(TxId), vout: 0),
+      scriptSig: @[],
+      sequence: 0xffffffff'u32
+    )]
+    dummyTx.outputs = @[TxOut(value: Satoshi(1000), scriptPubKey: @[])]
+    dummyTx.lockTime = 0
+
+    let flags = {sfWitness}
+    let witness = @[witnessScript]
+
+    let err = verifyWitnessProgramWithError(witness, 0, @scriptHash, dummyTx, 0, Satoshi(1000), flags)
+    check err == seVerify
+
+  test "verifyWitnessProgramWithError returns seOk for valid execution":
+    # Script leaves exactly 1 true item - should return seOk
+    let witnessScript = @[OP_1]
+    let scriptHash = sha256(witnessScript)
+
+    var dummyTx = Transaction()
+    dummyTx.version = 2
+    dummyTx.inputs = @[TxIn(
+      prevOut: OutPoint(txid: default(TxId), vout: 0),
+      scriptSig: @[],
+      sequence: 0xffffffff'u32
+    )]
+    dummyTx.outputs = @[TxOut(value: Satoshi(1000), scriptPubKey: @[])]
+    dummyTx.lockTime = 0
+
+    let flags = {sfWitness}
+    let witness = @[witnessScript]
+
+    let err = verifyWitnessProgramWithError(witness, 0, @scriptHash, dummyTx, 0, Satoshi(1000), flags)
+    check err == seOk

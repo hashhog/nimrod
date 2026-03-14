@@ -2126,12 +2126,181 @@ proc verifyWitnessProgramWithError*(
   flags: set[ScriptFlags]
 ): ScriptError =
   ## Verify a witness program, returning the specific error on failure
-  ## This is a thin wrapper that converts bool result to ScriptError
 
-  if verifyWitnessProgram(witness, version, program, tx, inputIndex, amount, flags):
-    return seOk
+  if version == 0:
+    # SegWit v0
+    if program.len == 20:
+      # P2WPKH
+      if witness.len != 2:
+        return seWitnessProgramMismatch
+
+      # Construct P2PKH script
+      var scriptCode: seq[byte] = @[OP_DUP, OP_HASH160, 0x14'u8]
+      scriptCode.add(program)
+      scriptCode.add([OP_EQUALVERIFY, OP_CHECKSIG])
+
+      var interp = newInterpreter(flags)
+      for item in witness:
+        interp.push(item)
+
+      var ctx = SigCheckContext(
+        tx: tx,
+        inputIndex: inputIndex,
+        amount: amount,
+        scriptPubKey: @[OP_0, 0x14'u8] & program,
+        sigVersion: sigWitnessV0,
+        amounts: @[amount],
+        scriptPubKeys: @[@[OP_0, 0x14'u8] & program],
+        codesepPos: 0xFFFFFFFF'u32
+      )
+
+      let err = interp.eval(scriptCode, ctx)
+      if err != seOk:
+        return err
+
+      # Witness cleanstack: must have exactly one element
+      if interp.stack.len != 1:
+        return seCleanStack
+
+      if not castToBool(interp.peek()):
+        return seVerify
+
+      return seOk
+
+    elif program.len == 32:
+      # P2WSH
+      if witness.len == 0:
+        return seWitnessProgramMismatch
+
+      let witnessScript = witness[witness.len - 1]
+      let computedHash = sha256(witnessScript)
+      for i in 0 ..< 32:
+        if computedHash[i] != program[i]:
+          return seWitnessProgramMismatch
+
+      var interp = newInterpreter(flags)
+      for i in 0 ..< witness.len - 1:
+        interp.push(witness[i])
+
+      var ctx = SigCheckContext(
+        tx: tx,
+        inputIndex: inputIndex,
+        amount: amount,
+        scriptPubKey: @[OP_0, 0x20'u8] & program,
+        sigVersion: sigWitnessV0,
+        amounts: @[amount],
+        scriptPubKeys: @[@[OP_0, 0x20'u8] & program],
+        codesepPos: 0xFFFFFFFF'u32
+      )
+
+      let err = interp.eval(witnessScript, ctx)
+      if err != seOk:
+        return err
+
+      # Witness cleanstack: must have exactly one element
+      if interp.stack.len != 1:
+        return seCleanStack
+
+      if not castToBool(interp.peek()):
+        return seVerify
+
+      return seOk
+
+    else:
+      return seWitnessProgramMismatch
+
+  elif version == 1 and sfTaproot in flags:
+    # Taproot (SegWit v1)
+    if program.len != 32:
+      return seWitnessProgramMismatch
+
+    if witness.len == 0:
+      return seWitnessProgramMismatch
+
+    # Check for annex
+    var annex: seq[byte]
+    var witnessStack = witness
+    if witnessStack.len >= 2 and witnessStack[witnessStack.len - 1].len > 0 and
+       witnessStack[witnessStack.len - 1][0] == 0x50:
+      annex = witnessStack[witnessStack.len - 1]
+      witnessStack = witnessStack[0 ..< witnessStack.len - 1]
+
+    if witnessStack.len == 1:
+      # Key path spend - delegate to bool version for signature check
+      if verifyWitnessProgram(witness, version, program, tx, inputIndex, amount, flags):
+        return seOk
+      else:
+        return seTaprootError
+
+    else:
+      # Script path spend
+      if witnessStack.len < 2:
+        return seWitnessProgramMismatch
+
+      let controlBlock = witnessStack[witnessStack.len - 1]
+      let tapscript = witnessStack[witnessStack.len - 2]
+
+      if controlBlock.len < 33 or (controlBlock.len - 33) mod 32 != 0:
+        return seTaprootError
+
+      let leafVersion = controlBlock[0] and 0xFE
+
+      if leafVersion != 0xC0:
+        # Unknown leaf version - succeed for forward compatibility
+        return seOk
+
+      # Compute leaf hash
+      var leafData: seq[byte]
+      leafData.add(leafVersion)
+      var w = BinaryWriter()
+      w.writeVarBytes(tapscript)
+      leafData.add(w.data)
+      let tapleafHash = taggedHash("TapLeaf", leafData)
+
+      # Execute tapscript
+      var interp = newInterpreter(flags)
+      for i in 0 ..< witnessStack.len - 2:
+        interp.push(witnessStack[i])
+
+      var amounts: seq[Satoshi]
+      var scriptPubKeys: seq[seq[byte]]
+      for i, inp in tx.inputs:
+        if i == inputIndex:
+          amounts.add(amount)
+          scriptPubKeys.add(@[OP_1, 0x20'u8] & program)
+        else:
+          amounts.add(Satoshi(0))
+          scriptPubKeys.add(@[])
+
+      var ctx = SigCheckContext(
+        tx: tx,
+        inputIndex: inputIndex,
+        amount: amount,
+        scriptPubKey: @[OP_1, 0x20'u8] & program,
+        sigVersion: sigTapscript,
+        amounts: amounts,
+        scriptPubKeys: scriptPubKeys,
+        annex: annex,
+        tapleafHash: tapleafHash,
+        codesepPos: 0xFFFFFFFF'u32
+      )
+
+      let err = interp.eval(tapscript, ctx)
+      if err != seOk:
+        return err
+
+      # Witness cleanstack: must have exactly one element
+      if interp.stack.len != 1:
+        return seCleanStack
+
+      if not castToBool(interp.peek()):
+        return seVerify
+
+      return seOk
+
   else:
-    return seWitnessProgramMismatch
+    # Unknown witness version - succeed for forward compatibility
+    return seOk
 
 # Backward compatibility: simple execute without full tx context
 proc execute*(
