@@ -27,6 +27,7 @@ import ./test_perf
 import ./test_sequence_lock
 import ./test_bip68
 import ./test_sigop
+import ./test_difficulty
 
 when isMainModule:
   echo "Running all tests..."
