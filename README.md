@@ -21,7 +21,9 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Bech32/Bech32m encoding (segwit P2WPKH, P2WSH, P2TR addresses)
 - [x] Address encoding/decoding for all Bitcoin address types
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
-- [x] BIP141 witness pubkey type enforcement (compressed keys only in witness v0)
+- [x] BIP-141 witness pubkey type enforcement (compressed keys only in witness v0)
+- [x] BIP-146 NULLFAIL enforcement (failed sig checks require empty signatures)
+- [x] BIP-147 NULLDUMMY enforcement (CHECKMULTISIG dummy must be empty)
 - [x] Sighash computation (legacy, segwit v0, taproot)
 - [x] Consensus parameters (mainnet, testnet3, regtest)
 - [x] Difficulty target functions (compact/target conversion)
