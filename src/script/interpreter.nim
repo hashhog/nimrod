@@ -58,6 +58,7 @@ type
     sfCheckSequenceVerify  # BIP112: OP_CHECKSEQUENCEVERIFY
     sfLowS             # Require low S signatures (policy only)
     sfSigPushOnly      # scriptSig must be push-only (policy only)
+    sfWitnessPubkeyType  # BIP141: witness pubkeys must be compressed
 
   SigVersion* = enum
     sigBase = 0        # Legacy scripts
@@ -349,6 +350,18 @@ proc isDisabled(opcode: uint8): bool =
   opcode in [OP_CAT, OP_SUBSTR, OP_LEFT, OP_RIGHT, OP_INVERT, OP_AND, OP_OR,
              OP_XOR, OP_2MUL, OP_2DIV, OP_MUL, OP_DIV, OP_MOD, OP_LSHIFT,
              OP_RSHIFT, OP_VERIF, OP_VERNOTIF]
+
+# Check if pubkey is compressed (33 bytes, starting with 0x02 or 0x03)
+proc isCompressedPubkey*(pubkey: seq[byte]): bool =
+  ## BIP141 WITNESS_PUBKEYTYPE check: pubkeys in witness v0 must be compressed
+  ## Compressed pubkey: 33 bytes, first byte is 0x02 or 0x03
+  if pubkey.len != 33:
+    return false
+  case pubkey[0]
+  of 0x02, 0x03:
+    return true
+  else:
+    return false
 
 # Check if opcode counts toward op limit
 proc countsTowardOpLimit(opcode: uint8): bool =
@@ -1318,6 +1331,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
         of sigWitnessV0:
           # SegWit v0 signature check
+          # BIP141 WITNESS_PUBKEYTYPE: pubkeys must be compressed in witness v0
+          if sfWitnessPubkeyType in interp.flags and not isCompressedPubkey(pubkey):
+            return seWitnessPubkeyType
+
           if sig.len >= 1:
             let hashType = uint32(sig[sig.len - 1])
             let sigWithoutHashType = sig[0 ..< sig.len - 1]
@@ -1443,6 +1460,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
               verified = verifyDer(pubkey, sighash, sigWithoutHashType)
 
           of sigWitnessV0:
+            # BIP141 WITNESS_PUBKEYTYPE: pubkeys must be compressed in witness v0
+            if sfWitnessPubkeyType in interp.flags and not isCompressedPubkey(pubkey):
+              return seWitnessPubkeyType
+
             if sig.len >= 1:
               let hashType = uint32(sig[sig.len - 1])
               let sigWithoutHashType = sig[0 ..< sig.len - 1]
