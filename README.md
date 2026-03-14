@@ -24,6 +24,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] BIP-141 witness pubkey type enforcement (compressed keys only in witness v0)
 - [x] BIP-146 NULLFAIL enforcement (failed sig checks require empty signatures)
 - [x] BIP-147 NULLDUMMY enforcement (CHECKMULTISIG dummy must be empty)
+- [x] Witness cleanstack enforcement (exactly one true element after execution)
 - [x] Sighash computation (legacy, segwit v0, taproot)
 - [x] Consensus parameters (mainnet, testnet3, regtest)
 - [x] Difficulty target functions (compact/target conversion)
