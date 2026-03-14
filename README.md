@@ -26,6 +26,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] BIP-146 NULLFAIL enforcement (failed sig checks require empty signatures)
 - [x] BIP-147 NULLDUMMY enforcement (CHECKMULTISIG dummy must be empty)
 - [x] Witness cleanstack enforcement (exactly one true element after execution)
+- [x] MINIMALIF enforcement (OP_IF/NOTIF argument must be empty or @[0x01])
 - [x] Sighash computation (legacy with FindAndDelete/OP_CODESEPARATOR, segwit v0, taproot)
 - [x] Consensus parameters (mainnet, testnet3, regtest)
 - [x] Difficulty target functions (compact/target conversion)
