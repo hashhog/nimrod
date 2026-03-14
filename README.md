@@ -32,6 +32,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Difficulty target functions (compact/target conversion)
 - [x] Genesis block construction and verification
 - [x] Block/transaction validation
+- [x] Sigop cost counting with witness discount (BIP-141: 80K limit, legacy 4x, witness 1x)
 - [x] BIP-68 sequence locks (relative lock-time enforcement in block validation)
 - [x] RocksDB storage (column families via FFI, UTXO set, block index)
 - [x] Chainstate management (atomic block connect/disconnect, write batches)
