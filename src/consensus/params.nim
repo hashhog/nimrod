@@ -29,6 +29,7 @@ type
     bip34Height*: int
     bip65Height*: int
     bip66Height*: int
+    csvHeight*: int      # BIP68/112/113 (CSV) activation height
     segwitHeight*: int
     taprootHeight*: int
     powLimit*: array[32, byte]
@@ -58,6 +59,14 @@ const
   TargetSpacing* = 600         # 10 minutes in seconds
   DifficultyAdjustmentInterval* = 2016
   MaxCompactTarget* = 0x1d00ffff'u32
+
+  # BIP68 sequence lock constants
+  # Note: These are also defined in script/interpreter.nim for OP_CHECKSEQUENCEVERIFY
+  # Using SequenceLock prefix to avoid name collision
+  SequenceLockDisableFlag* = 1'u32 shl 31   # Bit 31: disable relative timelock
+  SequenceLockTypeFlag* = 1'u32 shl 22      # Bit 22: 0=height-based, 1=time-based
+  SequenceLockMask* = 0x0000ffff'u32        # Lower 16 bits: lock value
+  SequenceLockGranularity* = 9              # Time-based locks are in 512-second increments (2^9)
 
 proc hexToBytes32(hex: string): array[32, byte] =
   assert hex.len == 64
@@ -93,6 +102,7 @@ proc mainnetParams*(): ConsensusParams =
   result.bip34Height = 227931
   result.bip65Height = 388381
   result.bip66Height = 363725
+  result.csvHeight = 419328    # BIP68/112/113 activation
   result.segwitHeight = 481824
   result.taprootHeight = 709632
   result.powLimit = hexToBytes32(
@@ -132,6 +142,7 @@ proc testnet3Params*(): ConsensusParams =
   result.bip34Height = 21111
   result.bip65Height = 581885
   result.bip66Height = 330776
+  result.csvHeight = 770112    # BIP68/112/113 activation on testnet3
   result.segwitHeight = 834624
   result.taprootHeight = 0  # Active from genesis on testnet3
   result.powLimit = hexToBytes32(
@@ -167,8 +178,9 @@ proc regtestParams*(): ConsensusParams =
   result.bip34Height = 500
   result.bip65Height = 1351
   result.bip66Height = 1251
-  result.segwitHeight = 0  # Active from genesis
-  result.taprootHeight = 0  # Active from genesis
+  result.csvHeight = 0       # BIP68/112/113 active from genesis on regtest
+  result.segwitHeight = 0    # Active from genesis
+  result.taprootHeight = 0   # Active from genesis
   result.powLimit = hexToBytes32(
     "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
   )
