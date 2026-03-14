@@ -54,6 +54,21 @@ type
     NullDummy      # BIP147
     Taproot        # BIP341/342
 
+  # Generic SigopResult type for sigop counting functions
+  SigopResult*[T] = object
+    case isOk*: bool
+    of true:
+      value*: T
+    of false:
+      error*: string
+
+# Result constructors for SigopResult type
+proc sigopOk*[T](val: T): SigopResult[T] =
+  SigopResult[T](isOk: true, value: val)
+
+proc sigopErr*[T](e: string): SigopResult[T] =
+  SigopResult[T](isOk: false, error: e)
+
 # Result constructors
 proc ok*[T](val: T): ValidationResult[T] =
   ValidationResult[T](isOk: true, value: val)
@@ -568,7 +583,8 @@ proc validateBlockHeader*(
 # Count sigops in a script
 proc countScriptSigops*(script: seq[byte], accurate: bool = false): int =
   ## Count signature operations in a script
-  ## If accurate=true, uses precise counting (for P2SH)
+  ## If accurate=true, uses precise counting for OP_CHECKMULTISIG
+  ## (reads the n value from previous OP_1..OP_16)
   var pc = 0
   var lastOpcode: uint8 = 0
 
@@ -598,9 +614,278 @@ proc countScriptSigops*(script: seq[byte], accurate: bool = false): int =
 
     lastOpcode = opcode
 
+# ============================================================================
+# Sigop Cost Functions (BIP-141)
+# ============================================================================
+# Reference: Bitcoin Core's GetTransactionSigOpCost() in consensus/tx_verify.cpp
+#
+# The key insight: sigops are counted in "cost" units where:
+# - Legacy/P2SH sigops cost WitnessScaleFactor (4) each
+# - Witness sigops cost 1 each
+# - Total block sigop cost cannot exceed MaxBlockSigopsCost (80,000)
+
+proc isPayToScriptHash*(script: seq[byte]): bool =
+  ## Check if script is P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+  script.len == 23 and
+  script[0] == 0xa9 and  # OP_HASH160
+  script[1] == 0x14 and  # Push 20 bytes
+  script[22] == 0x87     # OP_EQUAL
+
+proc isWitnessProgram*(script: seq[byte]): tuple[valid: bool, version: int, program: seq[byte]] =
+  ## Check if script is a witness program (P2WPKH, P2WSH, P2TR)
+  ## Returns (isWitness, version, program)
+  ##
+  ## Format: OP_n <2-40 bytes>
+  ## - OP_0 (0x00) = version 0
+  ## - OP_1..OP_16 (0x51..0x60) = version 1..16
+  if script.len < 4 or script.len > 42:
+    return (false, 0, @[])
+
+  let version = if script[0] == 0x00:
+    0
+  elif script[0] >= 0x51 and script[0] <= 0x60:
+    int(script[0] - 0x50)
+  else:
+    return (false, 0, @[])
+
+  let programLen = int(script[1])
+  if programLen < 2 or programLen > 40:
+    return (false, 0, @[])
+  if script.len != 2 + programLen:
+    return (false, 0, @[])
+
+  (true, version, script[2 ..< 2 + programLen])
+
+proc isPushOnly*(script: seq[byte]): bool =
+  ## Check if script contains only push operations (no opcodes > OP_16)
+  var pc = 0
+  while pc < script.len:
+    let opcode = script[pc]
+    if opcode > OP_16:
+      return false
+    pc += 1
+    if opcode >= 0x01 and opcode <= 0x4b:
+      pc += int(opcode)
+    elif opcode == OP_PUSHDATA1 and pc < script.len:
+      pc += 1 + int(script[pc])
+    elif opcode == OP_PUSHDATA2 and pc + 1 < script.len:
+      let len = int(script[pc]) or (int(script[pc + 1]) shl 8)
+      pc += 2 + len
+    elif opcode == OP_PUSHDATA4 and pc + 3 < script.len:
+      let len = int(script[pc]) or (int(script[pc + 1]) shl 8) or
+                (int(script[pc + 2]) shl 16) or (int(script[pc + 3]) shl 24)
+      pc += 4 + len
+  true
+
+proc getLastPushData*(script: seq[byte]): seq[byte] =
+  ## Extract the last data push from a script
+  ## Used to get the P2SH redeem script from scriptSig
+  var pc = 0
+  var lastData: seq[byte] = @[]
+
+  while pc < script.len:
+    let opcode = script[pc]
+    pc += 1
+
+    if opcode == 0x00:
+      lastData = @[]
+    elif opcode >= 0x01 and opcode <= 0x4b:
+      let pushLen = int(opcode)
+      if pc + pushLen <= script.len:
+        lastData = script[pc ..< pc + pushLen]
+        pc += pushLen
+      else:
+        return @[]
+    elif opcode == OP_PUSHDATA1:
+      if pc < script.len:
+        let pushLen = int(script[pc])
+        pc += 1
+        if pc + pushLen <= script.len:
+          lastData = script[pc ..< pc + pushLen]
+          pc += pushLen
+        else:
+          return @[]
+    elif opcode == OP_PUSHDATA2:
+      if pc + 1 < script.len:
+        let pushLen = int(script[pc]) or (int(script[pc + 1]) shl 8)
+        pc += 2
+        if pc + pushLen <= script.len:
+          lastData = script[pc ..< pc + pushLen]
+          pc += pushLen
+        else:
+          return @[]
+    elif opcode == OP_PUSHDATA4:
+      if pc + 3 < script.len:
+        let pushLen = int(script[pc]) or (int(script[pc + 1]) shl 8) or
+                      (int(script[pc + 2]) shl 16) or (int(script[pc + 3]) shl 24)
+        pc += 4
+        if pc + pushLen <= script.len:
+          lastData = script[pc ..< pc + pushLen]
+          pc += pushLen
+        else:
+          return @[]
+    elif opcode >= OP_1NEGATE and opcode <= OP_16:
+      # Small integer push - not real data
+      lastData = @[]
+    elif opcode > OP_16:
+      # Non-push opcode - invalid for push-only
+      return @[]
+
+  lastData
+
+proc countWitnessSigops*(witnessVersion: int, witnessProgram: seq[byte],
+                         witness: seq[seq[byte]]): int =
+  ## Count sigops in a witness program
+  ## Per BIP-141:
+  ## - P2WPKH (v0, 20 bytes): 1 sigop
+  ## - P2WSH (v0, 32 bytes): count from witness script
+  ## - Taproot (v1): handled by sigops budget, returns 0 here
+  if witnessVersion == 0:
+    if witnessProgram.len == 20:
+      # P2WPKH: 1 sigop
+      return 1
+    elif witnessProgram.len == 32 and witness.len > 0:
+      # P2WSH: count sigops from the witness script (last stack item)
+      let witnessScript = witness[witness.len - 1]
+      return countScriptSigops(witnessScript, accurate = true)
+  # Version 1+ (Taproot) and other versions: sigops handled differently
+  0
+
+proc getLegacySigOpCount*(tx: Transaction): int =
+  ## Count legacy sigops in scriptSig and scriptPubKey
+  ## This is GetLegacySigOpCount in Bitcoin Core
+  for inp in tx.inputs:
+    result += countScriptSigops(inp.scriptSig, accurate = false)
+  for outp in tx.outputs:
+    result += countScriptSigops(outp.scriptPubKey, accurate = false)
+
+proc getP2SHSigOpCount*(tx: Transaction, utxos: proc(op: OutPoint): Option[UtxoEntry]): int =
+  ## Count P2SH sigops (from redeem scripts)
+  ## This is GetP2SHSigOpCount in Bitcoin Core
+  if isCoinbase(tx):
+    return 0
+
+  for inp in tx.inputs:
+    let utxoOpt = utxos(inp.prevOut)
+    if utxoOpt.isNone:
+      continue
+    let prevOut = utxoOpt.get().output
+
+    if isPayToScriptHash(prevOut.scriptPubKey):
+      # Get redeem script from scriptSig
+      let redeemScript = getLastPushData(inp.scriptSig)
+      if redeemScript.len > 0:
+        result += countScriptSigops(redeemScript, accurate = true)
+
+proc countWitnessSigOpsForInput*(scriptSig: seq[byte], scriptPubKey: seq[byte],
+                                  witness: seq[seq[byte]]): int =
+  ## Count witness sigops for a single input
+  ## This is CountWitnessSigOps in Bitcoin Core
+  let wp = isWitnessProgram(scriptPubKey)
+  if wp.valid:
+    return countWitnessSigops(wp.version, wp.program, witness)
+
+  # Check for P2SH-wrapped witness
+  if isPayToScriptHash(scriptPubKey) and isPushOnly(scriptSig):
+    let redeemScript = getLastPushData(scriptSig)
+    let wpInner = isWitnessProgram(redeemScript)
+    if wpInner.valid:
+      return countWitnessSigops(wpInner.version, wpInner.program, witness)
+
+  0
+
+proc getTransactionSigOpCost*(tx: Transaction,
+                               utxos: proc(op: OutPoint): Option[UtxoEntry],
+                               useP2SH: bool = true,
+                               useWitness: bool = true): SigopResult[int] =
+  ## Calculate the total sigop cost for a transaction
+  ## This matches Bitcoin Core's GetTransactionSigOpCost
+  ##
+  ## Returns the total cost where:
+  ## - Legacy sigops cost WitnessScaleFactor (4) each
+  ## - P2SH sigops cost WitnessScaleFactor (4) each
+  ## - Witness sigops cost 1 each
+  ##
+  ## Result type allows returning errors for missing UTXOs
+
+  # Start with legacy sigops, scaled by witness factor
+  var sigOpCost = getLegacySigOpCount(tx) * WitnessScaleFactor
+
+  if isCoinbase(tx):
+    return sigopOk[int](sigOpCost)
+
+  # Add P2SH sigops if enabled
+  if useP2SH:
+    sigOpCost += getP2SHSigOpCount(tx, utxos) * WitnessScaleFactor
+
+  # Add witness sigops if enabled (no scaling, cost = 1)
+  if useWitness:
+    for i, inp in tx.inputs:
+      let utxoOpt = utxos(inp.prevOut)
+      if utxoOpt.isNone:
+        return sigopErr[int]("missing utxo for input " & $i)
+
+      let prevOut = utxoOpt.get().output
+      var witness: seq[seq[byte]] = @[]
+      if i < tx.witnesses.len:
+        witness = tx.witnesses[i]
+
+      sigOpCost += countWitnessSigOpsForInput(inp.scriptSig, prevOut.scriptPubKey, witness)
+
+  sigopOk[int](sigOpCost)
+
+proc countBlockSigopsCost*(blk: Block,
+                           utxos: proc(op: OutPoint): Option[UtxoEntry],
+                           height: int32,
+                           params: ConsensusParams): SigopResult[int] =
+  ## Count total sigop cost for a block with proper witness discount
+  ## This matches Bitcoin Core's ConnectBlock sigops check
+  ##
+  ## Uses:
+  ## - P2SH sigops if height >= p2shHeight (always on mainnet)
+  ## - Witness sigops if height >= segwitHeight
+  ##
+  ## Returns Result to propagate UTXO lookup errors
+
+  let useP2SH = true  # P2SH always active
+  let useWitness = height >= int32(params.segwitHeight)
+
+  var totalCost = 0
+
+  # Track intra-block UTXOs for proper sigop counting
+  var intraBlockUtxos = initTable[string, UtxoEntry]()
+
+  # Process each transaction
+  for txIdx, tx in blk.txs:
+    # Create lookup that includes intra-block UTXOs
+    proc lookupUtxo(op: OutPoint): Option[UtxoEntry] =
+      let key = $array[32, byte](op.txid) & ":" & $op.vout
+      if key in intraBlockUtxos:
+        return some(intraBlockUtxos[key])
+      utxos(op)
+
+    let costResult = getTransactionSigOpCost(tx, lookupUtxo, useP2SH, useWitness)
+    if not costResult.isOk:
+      return sigopErr[int]("tx " & $txIdx & ": " & costResult.error)
+
+    totalCost += costResult.value
+
+    # Add this tx's outputs to intra-block UTXOs
+    let thisTxid = tx.txid()
+    for vout, output in tx.outputs:
+      let key = $array[32, byte](thisTxid) & ":" & $vout
+      intraBlockUtxos[key] = UtxoEntry(
+        output: output,
+        height: height,
+        isCoinbase: isCoinbase(tx)
+      )
+
+  sigopOk[int](totalCost)
+
+# Legacy function for backward compatibility
 proc countBlockSigops*(blk: Block, params: ConsensusParams): int =
-  ## Count total sigops in a block
-  ## Includes scriptSig and scriptPubKey sigops
+  ## Count total sigops in a block (legacy, without witness discount)
+  ## Use countBlockSigopsCost for proper cost-based counting
 
   for tx in blk.txs:
     # Count sigops in inputs (scriptSig)
@@ -668,17 +953,16 @@ proc validateBlock*(
   if weight > params.maxBlockWeight:
     return voidErr(veBlockOverweight)
 
-  # Check sigops
-  let sigops = countBlockSigops(blk, params)
-  if sigops > params.maxBlockSigopsCost:
-    return voidErr(veSigopExceeded)
-
   # Validate transactions and track fees
   # CRITICAL: Maintain intra-block UTXOs for txs that spend outputs from earlier txs in same block
   var totalFees = int64(0)
   var intraBlockUtxos = initTable[string, UtxoEntry]()
+  var totalSigopCost = 0  # Track sigop cost with witness discount
 
-  # Add coinbase outputs to intra-block UTXOs
+  # Determine which sigop rules apply at this height
+  let useWitnessSigops = height >= int32(params.segwitHeight)
+
+  # Add coinbase outputs to intra-block UTXOs and count coinbase sigops
   let coinbaseTxid = blk.txs[0].txid()
   for vout, output in blk.txs[0].outputs:
     let key = $array[32, byte](coinbaseTxid) & ":" & $vout
@@ -687,6 +971,9 @@ proc validateBlock*(
       height: height,
       isCoinbase: true
     )
+
+  # Coinbase legacy sigops (scaled by WitnessScaleFactor)
+  totalSigopCost += getLegacySigOpCount(blk.txs[0]) * WitnessScaleFactor
 
   # Check if BIP68 (CSV) is active at this height
   let bip68Active = height >= int32(params.csvHeight)
@@ -717,6 +1004,12 @@ proc validateBlock*(
 
     totalFees += txResult.value
 
+    # Count sigops for this transaction with proper witness discount
+    let sigopResult = getTransactionSigOpCost(tx, lookupUtxo, useP2SH = true, useWitness = useWitnessSigops)
+    if sigopResult.isOk:
+      totalSigopCost += sigopResult.value
+    # Note: If sigop counting fails (missing UTXO), validation would have already failed above
+
     # BIP68 sequence lock check (only if CSV is active and tx version >= 2)
     if bip68Active and tx.version >= 2:
       let seqLockResult = checkSequenceLocksForTx(
@@ -739,6 +1032,10 @@ proc validateBlock*(
         height: height,
         isCoinbase: false
       )
+
+  # Check sigop cost limit (BIP-141: 80,000 max)
+  if totalSigopCost > MaxBlockSigopsCost:
+    return voidErr(veSigopExceeded)
 
   # Check coinbase output value
   let subsidy = getBlockSubsidy(height, params)
