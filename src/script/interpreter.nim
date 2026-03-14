@@ -293,6 +293,11 @@ proc toBool*(data: seq[byte]): bool =
       return true
   false
 
+# Alias matching Bitcoin Core naming
+proc castToBool*(data: seq[byte]): bool =
+  ## Alias for toBool, matching Bitcoin Core's CastToBool naming
+  toBool(data)
+
 proc toScriptNum*(data: seq[byte], requireMinimal: bool = false, maxLen: int = 4): (int64, bool) =
   ## Convert stack element to script number
   ## Returns (value, success)
@@ -1769,7 +1774,12 @@ proc verifyWitnessProgram*(
       if err != seOk:
         return false
 
-      return interp.stack.len >= 1 and toBool(interp.peek())
+      # Witness scripts implicitly require cleanstack: exactly one element on stack
+      # This is NOT gated by the CLEANSTACK flag - it's always enforced for witness
+      if interp.stack.len != 1:
+        return false
+
+      return castToBool(interp.peek())
 
     elif program.len == 32:
       # P2WSH
@@ -1780,8 +1790,12 @@ proc verifyWitnessProgram*(
       let witnessScript = witness[witness.len - 1]
 
       # Verify script hash
-      if sha256(witnessScript) != cast[array[32, byte]](program):
+      let computedHash = sha256(witnessScript)
+      if program.len != 32:
         return false
+      for i in 0 ..< 32:
+        if computedHash[i] != program[i]:
+          return false
 
       var interp = newInterpreter(flags)
       # Push witness items (except script) onto stack
@@ -1804,11 +1818,12 @@ proc verifyWitnessProgram*(
       if err != seOk:
         return false
 
-      # Clean stack for P2WSH
+      # Witness scripts implicitly require cleanstack: exactly one element on stack
+      # This is NOT gated by the CLEANSTACK flag - it's always enforced for witness
       if interp.stack.len != 1:
         return false
 
-      return toBool(interp.peek())
+      return castToBool(interp.peek())
 
     else:
       return false
@@ -1970,11 +1985,12 @@ proc verifyWitnessProgram*(
       if err != seOk:
         return false
 
-      # Tapscript requires exactly one true element on stack
+      # Witness scripts implicitly require cleanstack: exactly one element on stack
+      # This is NOT gated by the CLEANSTACK flag - it's always enforced for witness
       if interp.stack.len != 1:
         return false
 
-      return toBool(interp.peek())
+      return castToBool(interp.peek())
 
   else:
     # Unknown witness version - succeed for forward compatibility
