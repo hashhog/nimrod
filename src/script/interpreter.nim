@@ -42,6 +42,7 @@ type
     seCheckMultisigVerify = "OP_CHECKMULTISIGVERIFY failed"
     seWitnessPubkeyType = "witness pubkey type mismatch"
     seTaprootError = "taproot validation error"
+    seSigPushOnly = "scriptSig must be push-only"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -1693,9 +1694,11 @@ proc verifyScript*(
     )
 
   # P2SH handling
+  # BIP16: P2SH scriptSig must be push-only (unconditional consensus rule)
+  # This is NOT gated by SCRIPT_VERIFY_SIGPUSHONLY - it's always enforced for P2SH
   if sfP2SH in flags and isP2SH(scriptPubKey):
     if not isPushOnly(scriptSig):
-      return false
+      return false  # seSigPushOnly
 
     if stackCopy.len == 0:
       return false
@@ -1730,6 +1733,112 @@ proc verifyScript*(
       return false
 
   true
+
+# Forward declaration for verifyScriptWithError
+proc verifyWitnessProgramWithError*(
+  witness: seq[seq[byte]],
+  version: int,
+  program: seq[byte],
+  tx: Transaction,
+  inputIndex: int,
+  amount: Satoshi,
+  flags: set[ScriptFlags]
+): ScriptError
+
+proc verifyScriptWithError*(
+  scriptSig: seq[byte],
+  scriptPubKey: seq[byte],
+  tx: Transaction,
+  inputIndex: int,
+  amount: Satoshi = Satoshi(0),
+  flags: set[ScriptFlags] = {},
+  witness: seq[seq[byte]] = @[]
+): ScriptError =
+  ## Verify a transaction input, returning the specific error on failure
+
+  var interp = newInterpreter(flags)
+
+  # Create signature check context
+  var ctx = SigCheckContext(
+    tx: tx,
+    inputIndex: inputIndex,
+    amount: amount,
+    scriptPubKey: scriptPubKey,
+    sigVersion: sigBase,
+    amounts: @[amount],
+    scriptPubKeys: @[scriptPubKey],
+    codesepPos: 0xFFFFFFFF'u32
+  )
+
+  # Execute scriptSig
+  if scriptSig.len > 0:
+    let err = interp.eval(scriptSig, ctx)
+    if err != seOk:
+      return err
+
+  # Copy stack for P2SH
+  let stackCopy = interp.stack
+
+  # Execute scriptPubKey
+  let err = interp.eval(scriptPubKey, ctx)
+  if err != seOk:
+    return err
+
+  if interp.stack.len == 0 or not toBool(interp.peek()):
+    return seVerify
+
+  # Check for witness program
+  let (isWitness, witnessVersion, witnessProgram) = isWitnessProgram(scriptPubKey)
+
+  if sfWitness in flags and isWitness:
+    if scriptSig.len > 0:
+      # Native witness programs must have empty scriptSig
+      return seWitnessMalleated
+
+    return verifyWitnessProgramWithError(
+      witness, witnessVersion, witnessProgram, tx, inputIndex, amount, flags
+    )
+
+  # P2SH handling
+  # BIP16: P2SH scriptSig must be push-only (unconditional consensus rule)
+  # This is NOT gated by SCRIPT_VERIFY_SIGPUSHONLY - it's always enforced for P2SH
+  if sfP2SH in flags and isP2SH(scriptPubKey):
+    if not isPushOnly(scriptSig):
+      return seSigPushOnly
+
+    if stackCopy.len == 0:
+      return seVerify
+
+    # The serialized script is the last item pushed by scriptSig
+    let serializedScript = stackCopy[stackCopy.len - 1]
+
+    # Reset interpreter with P2SH stack (without the serialized script)
+    interp = newInterpreter(flags)
+    for i in 0 ..< stackCopy.len - 1:
+      interp.push(stackCopy[i])
+
+    ctx.sigVersion = sigBase
+    let scriptErr = interp.eval(serializedScript, ctx)
+    if scriptErr != seOk:
+      return scriptErr
+
+    if interp.stack.len == 0 or not toBool(interp.peek()):
+      return seVerify
+
+    # Check for witness program in P2SH
+    let (isP2shWitness, p2shVersion, p2shProgram) = isWitnessProgram(serializedScript)
+
+    if sfWitness in flags and isP2shWitness:
+      return verifyWitnessProgramWithError(
+        witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags
+      )
+
+  # Clean stack check
+  if sfCleanStack in flags:
+    if interp.stack.len != 1:
+      return seCleanStack
+
+  seOk
 
 proc verifyWitnessProgram*(
   witness: seq[seq[byte]],
@@ -1996,6 +2105,23 @@ proc verifyWitnessProgram*(
     # Unknown witness version - succeed for forward compatibility
     # (but only if DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM is not set)
     return true
+
+proc verifyWitnessProgramWithError*(
+  witness: seq[seq[byte]],
+  version: int,
+  program: seq[byte],
+  tx: Transaction,
+  inputIndex: int,
+  amount: Satoshi,
+  flags: set[ScriptFlags]
+): ScriptError =
+  ## Verify a witness program, returning the specific error on failure
+  ## This is a thin wrapper that converts bool result to ScriptError
+
+  if verifyWitnessProgram(witness, version, program, tx, inputIndex, amount, flags):
+    return seOk
+  else:
+    return seWitnessProgramMismatch
 
 # Backward compatibility: simple execute without full tx context
 proc execute*(
