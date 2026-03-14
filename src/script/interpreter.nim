@@ -30,6 +30,7 @@ type
     seNegativeLocktime = "negative locktime"
     seUnsatisfiedLocktime = "unsatisfied locktime"
     seNullDummy = "CHECKMULTISIG dummy must be empty"
+    seNullFail = "signature must be empty on failed check"
     seWitnessMalleated = "witness malleated"
     seSigHashType = "invalid sighash type"
     seInvalidPubkey = "invalid public key"
@@ -52,6 +53,7 @@ type
     sfWitness          # BIP141: verify witness programs
     sfTaproot          # BIP341/342: taproot rules
     sfNullDummy        # BIP147: CHECKMULTISIG dummy must be empty
+    sfNullFail         # BIP146: signature must be empty on failed check
     sfCheckLockTimeVerify  # BIP65: OP_CHECKLOCKTIMEVERIFY
     sfCheckSequenceVerify  # BIP112: OP_CHECKSEQUENCEVERIFY
     sfLowS             # Require low S signatures (policy only)
@@ -1363,6 +1365,11 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
             success = verifySchnorr(xonlyPk, @sighash, sigBytes)
 
+      # BIP146 NULLFAIL: if signature check failed and NULLFAIL flag is set,
+      # the signature must be empty
+      if not success and sfNullFail in interp.flags and sig.len > 0:
+        return seNullFail
+
       if opcode == OP_CHECKSIGVERIFY:
         if not success:
           return seCheckSigVerify
@@ -1454,6 +1461,13 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
         # Not enough pubkeys left
         if int(nSigs) - iSig > int(nPubkeys) - iPubkey:
           success = false
+
+      # BIP146 NULLFAIL: if multisig failed and NULLFAIL flag is set,
+      # ALL signatures must be empty
+      if not success and sfNullFail in interp.flags:
+        for sigItem in sigs:
+          if sigItem.len > 0:
+            return seNullFail
 
       if opcode == OP_CHECKMULTISIGVERIFY:
         if not success:
