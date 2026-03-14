@@ -563,3 +563,100 @@ suite "script interpreter - P2PKH simulation":
     check interp.stackSize == 2
     let hashed = interp.peek()
     check hashed.len == 20
+
+suite "script interpreter - NULLFAIL (BIP146)":
+  test "CHECKSIG with empty sig on failure passes without NULLFAIL":
+    # Without NULLFAIL flag, a failed CHECKSIG with any sig should just push false
+    var interp = newInterpreter()
+    # Push empty signature and empty pubkey (to skip crypto lib call)
+    interp.push(@[])  # empty signature
+    interp.push(@[])  # empty pubkey
+    let script = @[OP_CHECKSIG]
+    let res = interp.execute(script)
+    # Should push false (0) onto the stack - script evaluates false but no error
+    check res == false
+
+  test "CHECKSIG with non-empty sig on failure fails with NULLFAIL":
+    # With NULLFAIL flag, a failed CHECKSIG with non-empty sig must error
+    # Use empty pubkey to skip crypto lib call but non-empty sig to trigger NULLFAIL
+    var interp = newInterpreter({sfNullFail})
+    interp.push(@[0x30'u8, 0x01, 0x02])  # non-empty signature
+    interp.push(@[])  # empty pubkey (skips verification, success=false)
+    let script = @[OP_CHECKSIG]
+
+    var emptyTx = Transaction()
+    var ctx = SigCheckContext(
+      tx: emptyTx,
+      inputIndex: 0,
+      amount: Satoshi(0),
+      sigVersion: sigBase,
+      codesepPos: 0xFFFFFFFF'u32
+    )
+    let err = interp.eval(script, ctx)
+    check err == seNullFail
+
+  test "CHECKSIG with empty sig on failure passes with NULLFAIL":
+    # With NULLFAIL flag, a failed CHECKSIG with empty sig should still work
+    var interp = newInterpreter({sfNullFail})
+    # Both empty - verification skipped, success=false, but empty sig passes NULLFAIL
+    interp.push(@[])  # empty signature
+    interp.push(@[])  # empty pubkey
+    let script = @[OP_CHECKSIG]
+
+    var emptyTx = Transaction()
+    var ctx = SigCheckContext(
+      tx: emptyTx,
+      inputIndex: 0,
+      amount: Satoshi(0),
+      sigVersion: sigBase,
+      codesepPos: 0xFFFFFFFF'u32
+    )
+    let err = interp.eval(script, ctx)
+    # Should succeed (return seOk) - signature was empty so no NULLFAIL violation
+    check err == seOk
+
+  test "CHECKMULTISIG with non-empty sig on failure fails with NULLFAIL":
+    # With NULLFAIL, failed CHECKMULTISIG with non-empty signatures should error
+    var interp = newInterpreter({sfNullFail})
+    # Stack for 1-of-1 multisig: dummy, sig, nSigs, pubkey, nPubkeys
+    # Use empty pubkey to skip crypto, but non-empty sig to trigger NULLFAIL
+    interp.push(@[])  # dummy element (BIP147 requires empty)
+    interp.push(@[0x30'u8, 0x01, 0x02])  # non-empty signature
+    interp.push(@[0x01'u8])  # nSigs = 1
+    interp.push(@[])  # empty pubkey (skips verification)
+    interp.push(@[0x01'u8])  # nPubkeys = 1
+    let script = @[OP_CHECKMULTISIG]
+
+    var emptyTx = Transaction()
+    var ctx = SigCheckContext(
+      tx: emptyTx,
+      inputIndex: 0,
+      amount: Satoshi(0),
+      sigVersion: sigBase,
+      codesepPos: 0xFFFFFFFF'u32
+    )
+    let err = interp.eval(script, ctx)
+    check err == seNullFail
+
+  test "CHECKMULTISIG with empty sig on failure passes with NULLFAIL":
+    # With NULLFAIL, failed CHECKMULTISIG with empty signatures should work
+    var interp = newInterpreter({sfNullFail})
+    # Stack for 1-of-1 multisig with empty signature
+    interp.push(@[])  # dummy element
+    interp.push(@[])  # empty signature
+    interp.push(@[0x01'u8])  # nSigs = 1
+    interp.push(@[])  # empty pubkey
+    interp.push(@[0x01'u8])  # nPubkeys = 1
+    let script = @[OP_CHECKMULTISIG]
+
+    var emptyTx = Transaction()
+    var ctx = SigCheckContext(
+      tx: emptyTx,
+      inputIndex: 0,
+      amount: Satoshi(0),
+      sigVersion: sigBase,
+      codesepPos: 0xFFFFFFFF'u32
+    )
+    let err = interp.eval(script, ctx)
+    # Should succeed - signature was empty
+    check err == seOk

@@ -635,6 +635,7 @@ suite "script flags":
     let flags = getBlockScriptFlags(int32(params.segwitHeight), params)
     check sfWitness in flags
     check sfNullDummy in flags
+    check sfNullFail in flags
     check sfCheckSequenceVerify in flags
 
   test "post-taproot flags":
