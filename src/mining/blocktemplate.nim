@@ -3,7 +3,7 @@
 
 import std/[times, options]
 import ../primitives/[types, serialize]
-import ../consensus/params
+import ../consensus/[params, validation]
 import ../mempool/mempool
 import ../crypto/hashing
 import ../storage/chainstate
@@ -11,6 +11,38 @@ import ../storage/chainstate
 const
   WitnessCommitmentHeader* = @[0x6a'u8, 0x24, 0xaa, 0x21, 0xa9, 0xed]
   CoinbaseReservedWeight* = 4000  ## Reserved weight units for coinbase tx
+  LocktimeThreshold* = 500_000_000'u32  ## Below this: block height, at or above: Unix timestamp
+  SequenceFinal* = 0xFFFFFFFF'u32  ## Final sequence number (disables relative locktime)
+
+proc isFinalTx*(tx: Transaction, blockHeight: uint32, blockTime: uint32): bool =
+  ## Check if a transaction is final for inclusion in a block
+  ## A transaction is final if:
+  ## - lockTime == 0, OR
+  ## - lockTime < threshold (height-based vs time-based), OR
+  ## - all input sequences == SEQUENCE_FINAL (0xFFFFFFFF)
+  ##
+  ## Reference: Bitcoin Core IsFinalTx() in consensus/tx_verify.cpp
+
+  # lockTime == 0 is always final
+  if tx.lockTime == 0:
+    return true
+
+  # Compare lockTime against block height or time depending on threshold
+  let threshold = if tx.lockTime < LocktimeThreshold:
+    blockHeight
+  else:
+    blockTime
+
+  if tx.lockTime < threshold:
+    return true
+
+  # If lockTime is not satisfied, tx is still final if all inputs have
+  # sequence == SEQUENCE_FINAL (which disables lockTime checking)
+  for input in tx.inputs:
+    if input.sequence != SequenceFinal:
+      return false
+
+  true
 
 type
   BlockTemplate* = object
@@ -68,7 +100,7 @@ proc computeWitnessCommitment*(txs: seq[Transaction]): array[32, byte] =
     wtxids.add(array[32, byte](wtxidVal))
 
   # Compute merkle root of wtxids
-  let witnessMerkleRoot = computeMerkleRoot(wtxids)
+  let witnessMerkleRoot = hashing.computeMerkleRoot(wtxids)
 
   # Concatenate with witness reserved value (32 zero bytes)
   var commitment: array[64, byte]
@@ -212,9 +244,14 @@ proc buildBlockTemplate*(
   ## Build a new block template
   ## Greedy selection by ancestor fee rate
   ## Reserve 4K WU for coinbase, sigops <= 80K
+  ## Filters out transactions that are not final (locktime not satisfied)
 
   let height = chainState.bestHeight + 1
   let subsidy = getBlockSubsidy(height, params)
+
+  # Get the lock time cutoff (Median Time Past of the previous block)
+  # This is used for time-based locktime checks
+  let lockTimeCutoff = getMtpForHeight(chainState.db, chainState.bestHeight)
 
   # Reserve space for coinbase
   let maxTxWeight = params.maxBlockWeight - CoinbaseReservedWeight
@@ -223,12 +260,18 @@ proc buildBlockTemplate*(
   let selectedEntries = mempool.getTransactionsByFeeRate(maxTxWeight)
 
   # Build transaction list and enforce sigops limit
+  # Also filter out non-final transactions
   var txList: seq[Transaction]
   var totalFees = Satoshi(0)
   var totalWeight = 0
   var totalSigops = 0
 
   for entry in selectedEntries:
+    # Check transaction finality (locktime)
+    # Reference: Bitcoin Core TestChunkTransactions() in node/miner.cpp
+    if not isFinalTx(entry.tx, uint32(height), lockTimeCutoff):
+      continue  # Skip non-final transactions
+
     let txSigops = estimateTxSigops(entry.tx)
 
     # Check sigops limit
@@ -288,7 +331,7 @@ proc buildBlockTemplate*(
   for tx in transactions:
     let txBytes = serialize(tx)
     txHashes.add(doubleSha256(txBytes))
-  let merkleRoot = computeMerkleRoot(txHashes)
+  let merkleRoot = hashing.computeMerkleRoot(txHashes)
 
   # Get previous block hash
   let prevHash = chainState.bestBlockHash
@@ -352,7 +395,7 @@ proc updateExtraNonce*(tmpl: var BlockTemplate, extraNonce: uint64) =
   for tx in tmpl.transactions:
     let txBytes = serialize(tx)
     txHashes.add(doubleSha256(txBytes))
-  tmpl.header.merkleRoot = computeMerkleRoot(txHashes)
+  tmpl.header.merkleRoot = hashing.computeMerkleRoot(txHashes)
 
 proc hashMeetsTarget*(hash: array[32, byte], target: array[32, byte]): bool =
   ## Check if hash meets difficulty target
