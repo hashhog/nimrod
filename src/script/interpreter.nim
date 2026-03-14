@@ -43,6 +43,8 @@ type
     seWitnessPubkeyType = "witness pubkey type mismatch"
     seTaprootError = "taproot validation error"
     seSigPushOnly = "scriptSig must be push-only"
+    seMinimalIf = "OP_IF/NOTIF argument must be minimal"
+    seTapscriptMinimalIf = "tapscript OP_IF/NOTIF argument must be exactly 0 or 1"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -60,6 +62,7 @@ type
     sfLowS             # Require low S signatures (policy only)
     sfSigPushOnly      # scriptSig must be push-only (policy only)
     sfWitnessPubkeyType  # BIP141: witness pubkeys must be compressed
+    sfMinimalIf        # Require minimal encoding for OP_IF/NOTIF (policy for witness v0)
 
   SigVersion* = enum
     sigBase = 0        # Legacy scripts
@@ -907,10 +910,17 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       var val = interp.pop()
       var condition = toBool(val)
 
-      # For witness v0, require minimal IF/NOTIF argument
-      if ctx.sigVersion == sigWitnessV0 and sfWitness in interp.flags:
-        if val.len > 1 or (val.len == 1 and val[0] != 0 and val[0] != 1):
-          return seMinimalData
+      # Tapscript requires minimal IF/NOTIF inputs as a consensus rule.
+      # The input argument must be exactly empty (false) or exactly @[0x01] (true).
+      if ctx.sigVersion == sigTapscript:
+        if val.len > 1 or (val.len == 1 and val[0] != 1):
+          return seTapscriptMinimalIf
+
+      # Under witness v0 rules it is only a policy rule, enabled through sfMinimalIf.
+      # Same check: must be empty or exactly @[0x01].
+      if ctx.sigVersion == sigWitnessV0 and sfMinimalIf in interp.flags:
+        if val.len > 1 or (val.len == 1 and val[0] != 1):
+          return seMinimalIf
 
       if opcode == OP_NOTIF:
         condition = not condition
