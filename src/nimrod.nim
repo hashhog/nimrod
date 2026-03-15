@@ -40,6 +40,7 @@ type
     rpcUser*: string
     rpcPassword*: string
     bindAddr*: string
+    pruneTarget*: uint64  ## Prune target in MiB (0 = disabled, 1 = manual only)
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -67,7 +68,8 @@ proc defaultConfig*(): NimrodConfig =
     rpcEnabled: true,
     rpcUser: "",
     rpcPassword: "",
-    bindAddr: "0.0.0.0"
+    bindAddr: "0.0.0.0",
+    pruneTarget: 0  # Pruning disabled by default
   )
 
 proc loadConfigFile*(config: var NimrodConfig) =
@@ -122,6 +124,12 @@ proc loadConfigFile*(config: var NimrodConfig) =
         config.network = "regtest"
         if config.rpcPort == 8332: config.rpcPort = 18443
         if config.p2pPort == 8333: config.p2pPort = 18444
+    of "prune":
+      try:
+        let pruneMiB = parseInt(value)
+        if pruneMiB > 0:
+          config.pruneTarget = uint64(pruneMiB)
+      except ValueError: discard
     else:
       discard
 
@@ -158,6 +166,7 @@ Options:
   --rpcpassword=PASS     RPC password
   --bind=ADDR            P2P bind address (default: 0.0.0.0)
   --norpc                Disable RPC server
+  --prune=SIZE_MB        Enable pruning to keep SIZE_MB of blocks (min: 550)
   -h, --help             Show this help
   -v, --version          Show version
 
@@ -227,6 +236,19 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
         result.config.network = "regtest"
         if result.config.rpcPort == 8332: result.config.rpcPort = 18443
         if result.config.p2pPort == 8333: result.config.p2pPort = 18444
+      of "prune":
+        try:
+          let pruneMiB = parseInt(p.val)
+          if pruneMiB < 0:
+            echo "Invalid prune value: must be non-negative"
+            quit(1)
+          elif pruneMiB > 0 and pruneMiB < 550:
+            echo "Prune configured below the minimum of 550 MiB"
+            quit(1)
+          result.config.pruneTarget = uint64(pruneMiB)
+        except ValueError:
+          echo "Invalid prune value: " & p.val
+          quit(1)
       of "help", "h":
         showHelp()
         quit(0)
