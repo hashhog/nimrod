@@ -12,6 +12,12 @@ type
     Regtest
     Signet
 
+  HeadersSyncParams* = object
+    ## Configuration for headers sync memory usage (anti-DoS)
+    ## Used to bound memory during PRESYNC/REDOWNLOAD header sync
+    commitmentPeriod*: int      ## Distance in blocks between commitments
+    redownloadBufferSize*: int  ## Min headers to accumulate before feeding to chain
+
   ConsensusParams* = object
     network*: Network
     networkMagic*: array[4, byte]
@@ -44,6 +50,8 @@ type
     enforceBIP94*: bool                 # Testnet4 time-warp fix
     minRelayTxFee*: Satoshi
     dustLimit*: Satoshi
+    # Header sync anti-DoS params
+    headersSyncParams*: HeadersSyncParams
     # Legacy aliases
     p2pPort*: uint16
     rpcPort*: uint16
@@ -123,6 +131,11 @@ proc mainnetParams*(): ConsensusParams =
   result.enforceBIP94 = false
   result.minRelayTxFee = Satoshi(1000)
   result.dustLimit = Satoshi(546)
+  # Header sync anti-DoS params (from Bitcoin Core headerssync-params.py)
+  result.headersSyncParams = HeadersSyncParams(
+    commitmentPeriod: 641,
+    redownloadBufferSize: 15218  # ~23.7 commitments
+  )
   # Legacy aliases
   result.p2pPort = 8333
   result.rpcPort = 8332
@@ -167,6 +180,11 @@ proc testnet3Params*(): ConsensusParams =
   result.enforceBIP94 = false
   result.minRelayTxFee = Satoshi(1000)
   result.dustLimit = Satoshi(546)
+  # Header sync anti-DoS params (from Bitcoin Core headerssync-params.py)
+  result.headersSyncParams = HeadersSyncParams(
+    commitmentPeriod: 673,
+    redownloadBufferSize: 14460  # ~21.5 commitments
+  )
   # Legacy aliases
   result.p2pPort = 18333
   result.rpcPort = 18332
@@ -212,6 +230,11 @@ proc testnet4Params*(): ConsensusParams =
   result.enforceBIP94 = true
   result.minRelayTxFee = Satoshi(1000)
   result.dustLimit = Satoshi(546)
+  # Header sync anti-DoS params (from Bitcoin Core headerssync-params.py)
+  result.headersSyncParams = HeadersSyncParams(
+    commitmentPeriod: 606,
+    redownloadBufferSize: 16092  # ~26.6 commitments
+  )
   # Legacy aliases
   result.p2pPort = 48333
   result.rpcPort = 48332
@@ -256,6 +279,11 @@ proc signetParams*(): ConsensusParams =
   result.enforceBIP94 = false
   result.minRelayTxFee = Satoshi(1000)
   result.dustLimit = Satoshi(546)
+  # Header sync anti-DoS params (from Bitcoin Core headerssync-params.py)
+  result.headersSyncParams = HeadersSyncParams(
+    commitmentPeriod: 620,
+    redownloadBufferSize: 15724  # ~25.4 commitments
+  )
   # Legacy aliases
   result.p2pPort = 38333
   result.rpcPort = 38332
@@ -296,6 +324,11 @@ proc regtestParams*(): ConsensusParams =
   result.enforceBIP94 = false
   result.minRelayTxFee = Satoshi(1000)
   result.dustLimit = Satoshi(546)
+  # Header sync anti-DoS params (smaller for regtest)
+  result.headersSyncParams = HeadersSyncParams(
+    commitmentPeriod: 275,
+    redownloadBufferSize: 7017  # ~25.5 commitments
+  )
   # Legacy aliases
   result.p2pPort = 18444
   result.rpcPort = 18443
