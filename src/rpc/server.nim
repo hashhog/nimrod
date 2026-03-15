@@ -149,21 +149,58 @@ proc targetToDifficulty(target: array[32, byte]): float64 =
 
 # Blockchain RPCs
 proc handleGetBlockchainInfo(rpc: RpcServer): JsonNode =
-  let target = bitsToTarget(rpc.params.genesisBits)
+  ## Return an object containing various state info regarding blockchain processing
+  ## Reference: Bitcoin Core rpc/blockchain.cpp getblockchaininfo
+
+  # Get current tip block for difficulty/bits/target
+  var bits = rpc.params.genesisBits
+  var blockTime: uint32 = 0
+  var medianTime: int64 = 0
+
+  let tipOpt = rpc.chainState.db.getBlock(rpc.chainState.bestBlockHash)
+  if tipOpt.isSome:
+    let tip = tipOpt.get()
+    bits = tip.header.bits
+    blockTime = tip.header.timestamp
+    medianTime = int64(tip.header.timestamp)  # Simplified: real impl would compute median
+
+  let target = bitsToTarget(bits)
+
+  # Calculate verification progress (simplified)
+  let verificationProgress = if rpc.chainState.bestHeight < 100:
+    float64(rpc.chainState.bestHeight) / 100.0
+  else:
+    1.0
+
+  # Determine chain name
+  let chainName = case rpc.params.network
+    of Mainnet: "main"
+    of Testnet3: "test"
+    of Testnet4: "testnet4"
+    of Regtest: "regtest"
+    of Signet: "signet"
+
   %*{
-    "chain": (if rpc.params.network == Mainnet: "main"
-              elif rpc.params.network == Testnet3: "test"
-              else: "regtest"),
+    "chain": chainName,
     "blocks": rpc.chainState.bestHeight,
     "headers": rpc.chainState.bestHeight,
     "bestblockhash": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
+    "bits": toHex(cast[array[4, byte]]([
+      byte(bits and 0xff),
+      byte((bits shr 8) and 0xff),
+      byte((bits shr 16) and 0xff),
+      byte((bits shr 24) and 0xff)
+    ])),
+    "target": reverseHex(toHex(target)),
     "difficulty": targetToDifficulty(target),
-    "mediantime": 0,
-    "verificationprogress": 1.0,
+    "time": blockTime,
+    "mediantime": medianTime,
+    "verificationprogress": verificationProgress,
     "initialblockdownload": rpc.chainState.bestHeight < 100,
     "chainwork": toHex(rpc.chainState.totalWork),
     "size_on_disk": 0,
-    "pruned": false
+    "pruned": false,
+    "warnings": ""
   }
 
 proc handleGetBlockCount(rpc: RpcServer): JsonNode =
@@ -1018,9 +1055,36 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
 # Network RPCs
 proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
+  ## Return information about P2P networking
+  ## Reference: Bitcoin Core rpc/net.cpp getnetworkinfo
   let connCount = if rpc.peerManager != nil: rpc.peerManager.connectedPeerCount() else: 0
   let inCount = if rpc.peerManager != nil: rpc.peerManager.inboundCount() else: 0
   let outCount = if rpc.peerManager != nil: rpc.peerManager.outboundCount() else: 0
+
+  # Build networks array
+  let networks = %*[
+    {
+      "name": "ipv4",
+      "limited": false,
+      "reachable": true,
+      "proxy": "",
+      "proxy_randomize_credentials": false
+    },
+    {
+      "name": "ipv6",
+      "limited": true,
+      "reachable": false,
+      "proxy": "",
+      "proxy_randomize_credentials": false
+    },
+    {
+      "name": "onion",
+      "limited": true,
+      "reachable": false,
+      "proxy": "",
+      "proxy_randomize_credentials": false
+    }
+  ]
 
   %*{
     "version": 210000,
@@ -1034,7 +1098,7 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
     "connections": connCount,
     "connections_in": inCount,
     "connections_out": outCount,
-    "networks": [],
+    "networks": networks,
     "relayfee": 0.00001,
     "incrementalfee": 0.00001,
     "localaddresses": [],
@@ -1042,29 +1106,84 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
   }
 
 proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
+  ## Return data about each connected network peer
+  ## Reference: Bitcoin Core rpc/net.cpp getpeerinfo
   var peers = newJArray()
 
   if rpc.peerManager != nil:
     var id = 0
+    let now = getTime().toUnix()
+
     for peer in rpc.peerManager.getReadyPeers():
+      # Calculate connection time in seconds
+      let connTime = if peer.lastSeen.toUnix() > 0:
+        now - (now - peer.lastSeen.toUnix())  # Connection start time
+      else:
+        now
+
+      # Format services as hex string
+      let servicesHex = toHex(cast[array[8, byte]]([
+        byte(peer.services and 0xff),
+        byte((peer.services shr 8) and 0xff),
+        byte((peer.services shr 16) and 0xff),
+        byte((peer.services shr 24) and 0xff),
+        byte((peer.services shr 32) and 0xff),
+        byte((peer.services shr 40) and 0xff),
+        byte((peer.services shr 48) and 0xff),
+        byte((peer.services shr 56) and 0xff)
+      ]))
+
+      # Build services names
+      var servicesNames = newJArray()
+      if (peer.services and 1) != 0:
+        servicesNames.add(%"NETWORK")
+      if (peer.services and 8) != 0:
+        servicesNames.add(%"WITNESS")
+      if (peer.services and 1024) != 0:
+        servicesNames.add(%"NETWORK_LIMITED")
+
+      # Calculate ping time in seconds
+      let pingTime = if peer.latencyMs > 0:
+        float64(peer.latencyMs) / 1000.0
+      else:
+        0.0
+
       peers.add(%*{
         "id": id,
         "addr": peer.address & ":" & $peer.port,
-        "services": "0000000000000409",
+        "services": servicesHex,
+        "servicesnames": servicesNames,
         "relaytxes": true,
-        "lastsend": 0,
-        "lastrecv": 0,
+        "lastsend": peer.lastSeen.toUnix(),
+        "lastrecv": peer.lastSeen.toUnix(),
+        "last_transaction": 0,
+        "last_block": 0,
         "bytessent": 0,
         "bytesrecv": 0,
-        "conntime": 0,
+        "conntime": connTime,
         "timeoffset": 0,
-        "pingtime": 0,
+        "pingtime": pingTime,
+        "minping": pingTime,
         "version": peer.version,
         "subver": peer.userAgent,
         "inbound": peer.direction == pdInbound,
+        "bip152_hb_to": false,
+        "bip152_hb_from": false,
         "startingheight": peer.startHeight,
+        "presynced_headers": -1,
         "synced_headers": rpc.chainState.bestHeight,
-        "synced_blocks": rpc.chainState.bestHeight
+        "synced_blocks": rpc.chainState.bestHeight,
+        "inflight": newJArray(),
+        "addr_relay_enabled": true,
+        "addr_processed": 0,
+        "addr_rate_limited": 0,
+        "permissions": newJArray(),
+        "minfeefilter": float64(peer.feeFilterRate) / 100000000.0,
+        "bytessent_per_msg": newJObject(),
+        "bytesrecv_per_msg": newJObject(),
+        "connection_type": (if peer.direction == pdInbound: "inbound" else: "outbound-full-relay"),
+        "transport_protocol_type": "v1",
+        "session_id": ""
       })
       inc id
 
