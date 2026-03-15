@@ -83,10 +83,18 @@ type
     # Eclipse protection state
     outboundNetGroups*: HashSet[NetGroup]  # Network groups of current outbound peers
     netgroupKey*: uint64
+    # Stale tip detection state (Bitcoin Core net_processing.cpp)
+    lastTipUpdate*: chronos.Moment          # When we last received a new block
+    staleTipCheckTime*: chronos.Moment      # When we next check for stale tip
+    lastExtraPeerCheckTime*: chronos.Moment # When we last checked for extra peers
+    tryNewOutboundPeer*: bool               # Whether to try connecting to an extra peer
+    initialSyncFinished*: bool              # Whether initial block download is complete
+    blockStallingTimeout*: chronos.Duration # Adaptive timeout for block stalling
 
 # Forward declarations
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
 proc tryEvictInbound(pm: PeerManager): Option[string]
+proc runStalePeerChecks*(pm: PeerManager) {.async.}
 
 proc peerKey(host: string, port: uint16): string =
   host & ":" & $port
@@ -100,6 +108,7 @@ proc newPeerManager*(params: ConsensusParams,
                      maxIn: int = DefaultMaxInbound,
                      dataDir: string = "."): PeerManager =
   randomize()
+  let now = chronos.Moment.now()
   result = PeerManager(
     params: params,
     peers: initTable[string, Peer](),
@@ -118,7 +127,14 @@ proc newPeerManager*(params: ConsensusParams,
     running: false,
     dataDir: dataDir,
     outboundNetGroups: initHashSet[NetGroup](),
-    netgroupKey: NetgroupKey
+    netgroupKey: NetgroupKey,
+    # Stale tip detection
+    lastTipUpdate: now,
+    staleTipCheckTime: now + chronos.minutes(StaleTipCheckIntervalSec div 60),
+    lastExtraPeerCheckTime: now,
+    tryNewOutboundPeer: false,
+    initialSyncFinished: false,
+    blockStallingTimeout: chronos.seconds(BlockStallingTimeoutDefaultSec)
   )
 
   # Load existing ban list and anchors
@@ -740,11 +756,13 @@ proc mainLoop*(pm: PeerManager) {.async.} =
   var lastReconnect = getTime()
   var lastPing = getTime()
   var lastGetAddr = getTime()
+  var lastStalePeerCheck = chronos.Moment.now()
 
   info "peer manager main loop started"
 
   while pm.running:
     let now = getTime()
+    let nowMoment = chronos.Moment.now()
 
     if (now - lastReconnect).inSeconds >= ReconnectInterval:
       await pm.maintainConnections()
@@ -758,9 +776,16 @@ proc mainLoop*(pm: PeerManager) {.async.} =
       await pm.requestAddresses()
       lastGetAddr = now
 
+    # Run stale peer checks every second (the functions handle their own intervals)
+    if nowMoment - lastStalePeerCheck >= chronos.seconds(1):
+      await pm.runStalePeerChecks()
+      lastStalePeerCheck = nowMoment
+
     var disconnected: seq[Peer]
     for peer in pm.peers.values:
       if peer.state == psDisconnected:
+        disconnected.add(peer)
+      elif peer.shouldDisconnect:
         disconnected.add(peer)
 
     for peer in disconnected:
@@ -814,3 +839,319 @@ proc getInFlightBlocks*(pm: PeerManager): seq[BlockHash] =
 # Legacy compatibility: keep maxOutbound as alias
 proc maxOutbound*(pm: PeerManager): int =
   pm.maxOutboundFullRelay + pm.maxOutboundBlockRelay
+
+# =============================================================================
+# Stale peer eviction and ping timeout handling
+# Reference: Bitcoin Core net_processing.cpp ConsiderEviction, EvictExtraOutboundPeers,
+#            CheckForStaleTipAndEvictPeers, MaybeSendPing
+# =============================================================================
+
+proc tipMayBeStale*(pm: PeerManager): bool =
+  ## Check if our tip may be stale (no new block in > 30 minutes)
+  ## Reference: Bitcoin Core TipMayBeStale()
+  let elapsed = chronos.Moment.now() - pm.lastTipUpdate
+  elapsed > chronos.minutes(30)
+
+proc recordNewTip*(pm: PeerManager) =
+  ## Record that we received a new block at our tip
+  pm.lastTipUpdate = chronos.Moment.now()
+
+proc getExtraBlockRelayCount*(pm: PeerManager): int =
+  ## Get count of block-relay-only peers beyond our target
+  let current = pm.outboundBlockRelayCount()
+  max(0, current - pm.maxOutboundBlockRelay)
+
+proc getExtraFullOutboundCount*(pm: PeerManager): int =
+  ## Get count of full-relay outbound peers beyond our target
+  let current = pm.outboundFullRelayCount()
+  max(0, current - pm.maxOutboundFullRelay)
+
+proc hasMultipleOutboundConnections*(pm: PeerManager, peer: Peer): bool =
+  ## Check if we have other outbound connections besides this peer
+  ## Used to protect the only connection to a network
+  var count = 0
+  for key, ext in pm.extendedPeers:
+    if ext.connType in {pctFullRelay, pctBlockRelayOnly} and ext.peer != peer:
+      if ext.peer.state == psReady:
+        inc count
+  count > 0
+
+proc considerEviction*(pm: PeerManager, peer: var Peer) =
+  ## Consider whether to evict an outbound peer for having a stale chain
+  ## Reference: Bitcoin Core ConsiderEviction()
+  ##
+  ## Logic:
+  ## 1. If peer's best known height >= our height, reset timeout
+  ## 2. If timeout not set or peer made progress, set new timeout (20 min)
+  ## 3. If timeout expired and we haven't sent getheaders, send it and reduce timeout
+  ## 4. If timeout expired and we already sent getheaders, disconnect
+
+  # Only consider outbound peers that have started syncing
+  if not peer.isOutbound() or not peer.syncStarted:
+    return
+
+  # Don't evict protected peers
+  if peer.isProtectedFromChainSyncEviction():
+    return
+
+  let nowUnix = getTime().toUnix()
+
+  # If peer's chain has at least as much work as ours, reset timeout
+  if peer.bestKnownHeight >= pm.ourHeight:
+    if peer.chainSyncState.timeout != 0:
+      peer.resetChainSyncTimeout()
+    return
+
+  # Peer is behind - manage timeout
+  if peer.chainSyncState.timeout == 0:
+    # First time we notice peer is behind - set initial timeout
+    peer.setChainSyncTimeout(pm.ourHeight, nowUnix)
+    debug "peer behind our chain, setting timeout",
+          peer = $peer,
+          peerHeight = peer.bestKnownHeight,
+          ourHeight = pm.ourHeight
+  elif peer.chainSyncState.workHeaderHeight > 0 and
+       peer.bestKnownHeight >= peer.chainSyncState.workHeaderHeight:
+    # Peer caught up to where we were when timeout was set, but we've advanced
+    # Reset timeout based on current tip
+    peer.setChainSyncTimeout(pm.ourHeight, nowUnix)
+    debug "peer caught up to old tip, resetting timeout",
+          peer = $peer
+  elif peer.isChainSyncTimedOut(nowUnix):
+    # Timeout expired
+    if peer.chainSyncState.sentGetheaders:
+      # We already sent getheaders and they didn't respond in time
+      warn "outbound peer has stale chain, disconnecting",
+           peer = $peer,
+           peerHeight = peer.bestKnownHeight,
+           ourHeight = pm.ourHeight
+      peer.shouldDisconnect = true
+    else:
+      # First timeout - send getheaders to give them a chance
+      debug "sending getheaders to verify chain work",
+            peer = $peer
+      peer.markChainSyncGetheadersSent(nowUnix)
+      # Note: Actual getheaders message should be sent by caller
+
+proc evictExtraBlockRelayPeers*(pm: PeerManager) {.async.} =
+  ## Evict extra block-relay-only peers beyond our target
+  ## Prefer to evict the youngest unless it gave us a block recently
+  ## Reference: Bitcoin Core EvictExtraOutboundPeers() - block-relay section
+
+  if pm.getExtraBlockRelayCount() <= 0:
+    return
+
+  let now = chronos.Moment.now()
+
+  # Find youngest and second-youngest block-relay-only peers
+  var youngest: tuple[key: string, peer: Peer, lastBlock: chronos.Moment]
+  var nextYoungest: tuple[key: string, peer: Peer, lastBlock: chronos.Moment]
+  youngest.key = ""
+  nextYoungest.key = ""
+
+  for key, ext in pm.extendedPeers:
+    if ext.connType != pctBlockRelayOnly:
+      continue
+    if ext.peer.state != psReady or ext.peer.shouldDisconnect:
+      continue
+
+    # "Youngest" = most recently connected (we use connectedTime)
+    # Bitcoin Core uses nodeId, but we'll use connection time as proxy
+    if youngest.key == "" or ext.peer.connectedTime > youngest.peer.connectedTime:
+      nextYoungest = youngest
+      youngest = (key, ext.peer, ext.peer.lastBlockTime)
+
+  if youngest.key == "":
+    return
+
+  # Decide which to evict
+  var toEvictKey = youngest.key
+  if nextYoungest.key != "" and youngest.lastBlock > nextYoungest.lastBlock:
+    # Youngest gave us a block more recently - evict second youngest
+    toEvictKey = nextYoungest.key
+
+  let peer = pm.peers[toEvictKey]
+
+  # Don't evict if:
+  # - Connected too recently (< MINIMUM_CONNECT_TIME)
+  # - Currently downloading blocks
+  if not peer.hasMinimumConnectTime():
+    debug "keeping block-relay peer, too recently connected",
+          peer = $peer
+    return
+
+  if peer.hasBlocksInFlight():
+    debug "keeping block-relay peer, blocks in flight",
+          peer = $peer
+    return
+
+  info "evicting extra block-relay-only peer",
+       peer = $peer
+  await pm.removePeer(peer)
+
+proc evictExtraFullOutboundPeers*(pm: PeerManager) {.async.} =
+  ## Evict extra full-relay outbound peers beyond our target
+  ## Evict the peer with oldest block announcement
+  ## Reference: Bitcoin Core EvictExtraOutboundPeers() - full-relay section
+
+  if pm.getExtraFullOutboundCount() <= 0:
+    return
+
+  let now = chronos.Moment.now()
+
+  # Find the peer with oldest block announcement
+  var worstKey = ""
+  var oldestAnnouncement = high(int64)
+
+  for key, ext in pm.extendedPeers:
+    if ext.connType != pctFullRelay:
+      continue
+    if ext.peer.state != psReady or ext.peer.shouldDisconnect:
+      continue
+
+    # Don't evict protected peers
+    if ext.peer.isProtectedFromChainSyncEviction():
+      continue
+
+    # Don't evict if this is our only connection (protect network diversity)
+    if not pm.hasMultipleOutboundConnections(ext.peer):
+      continue
+
+    if ext.peer.lastBlockAnnouncement < oldestAnnouncement:
+      oldestAnnouncement = ext.peer.lastBlockAnnouncement
+      worstKey = key
+
+  if worstKey == "":
+    return
+
+  let peer = pm.peers[worstKey]
+
+  # Don't evict if:
+  # - Connected too recently (< MINIMUM_CONNECT_TIME)
+  # - Currently downloading blocks
+  if not peer.hasMinimumConnectTime():
+    debug "keeping full-relay peer, too recently connected",
+          peer = $peer
+    return
+
+  if peer.hasBlocksInFlight():
+    debug "keeping full-relay peer, blocks in flight",
+          peer = $peer
+    return
+
+  info "evicting extra full-relay outbound peer",
+       peer = $peer,
+       lastAnnouncement = oldestAnnouncement
+  await pm.removePeer(peer)
+
+  # If we disconnected, don't try more extra peers until stale tip detected again
+  pm.tryNewOutboundPeer = false
+
+proc evictExtraOutboundPeers*(pm: PeerManager) {.async.} =
+  ## Evict extra outbound peers (both block-relay and full-relay)
+  ## Called every EXTRA_PEER_CHECK_INTERVAL (45 seconds)
+  ## Reference: Bitcoin Core EvictExtraOutboundPeers()
+  await pm.evictExtraBlockRelayPeers()
+  await pm.evictExtraFullOutboundPeers()
+
+proc checkForStaleTipAndEvictPeers*(pm: PeerManager) {.async.} =
+  ## Main stale tip detection and peer eviction loop
+  ## Called every EXTRA_PEER_CHECK_INTERVAL (45 seconds)
+  ## Reference: Bitcoin Core CheckForStaleTipAndEvictPeers()
+
+  let now = chronos.Moment.now()
+
+  # First evict any extra outbound peers
+  await pm.evictExtraOutboundPeers()
+
+  # Then check if we should allow an extra outbound peer due to stale tip
+  if now > pm.staleTipCheckTime:
+    if pm.initialSyncFinished and pm.tipMayBeStale():
+      info "potential stale tip detected, allowing extra outbound peer",
+           lastTipUpdate = (now - pm.lastTipUpdate).seconds
+      pm.tryNewOutboundPeer = true
+    elif pm.tryNewOutboundPeer:
+      pm.tryNewOutboundPeer = false
+
+    pm.staleTipCheckTime = now + chronos.minutes(StaleTipCheckIntervalSec div 60)
+
+proc checkPingTimeouts*(pm: PeerManager) {.async.} =
+  ## Check all peers for ping timeouts
+  ## Reference: Bitcoin Core MaybeSendPing() timeout logic
+
+  var toDisconnect: seq[Peer]
+
+  for key, peer in pm.peers:
+    if peer.state != psReady:
+      continue
+
+    if peer.isPingTimedOut():
+      warn "peer ping timeout, disconnecting",
+           peer = $peer
+      toDisconnect.add(peer)
+
+  for peer in toDisconnect:
+    await pm.removePeer(peer)
+
+proc sendPings*(pm: PeerManager) {.async.} =
+  ## Send pings to peers that need them
+  ## Reference: Bitcoin Core MaybeSendPing()
+
+  for key, peer in pm.peers.mpairs:
+    if peer.state != psReady:
+      continue
+
+    if peer.shouldSendPing():
+      try:
+        peer.startPing()
+        await peer.sendPing()
+      except CatchableError as e:
+        debug "failed to send ping", peer = $peer, error = e.msg
+
+proc checkHeadersTimeouts*(pm: PeerManager) {.async.} =
+  ## Check for headers request timeouts
+  ## Reference: Bitcoin Core HEADERS_RESPONSE_TIME
+
+  for key, peer in pm.peers.mpairs:
+    if peer.state != psReady:
+      continue
+
+    if peer.isHeadersRequestTimedOut():
+      warn "headers request timeout, marking peer misbehaving",
+           peer = $peer
+      misbehaving(peer, ScoreProtocolViolation, "headers timeout")
+
+proc checkChainSyncTimeouts*(pm: PeerManager) =
+  ## Check all outbound peers for chain sync timeouts
+  ## Reference: Bitcoin Core ConsiderEviction()
+
+  for key, peer in pm.peers.mpairs:
+    if peer.state != psReady:
+      continue
+
+    if peer.isOutbound() and peer.syncStarted:
+      pm.considerEviction(peer)
+
+proc runStalePeerChecks*(pm: PeerManager) {.async.} =
+  ## Run all stale peer checks
+  ## Called periodically from main loop
+
+  let now = chronos.Moment.now()
+
+  # Check for extra peer eviction every 45 seconds
+  if now - pm.lastExtraPeerCheckTime >= chronos.seconds(ExtraPeerCheckIntervalSec):
+    await pm.checkForStaleTipAndEvictPeers()
+    pm.lastExtraPeerCheckTime = now
+
+  # Check chain sync timeouts for outbound peers
+  pm.checkChainSyncTimeouts()
+
+  # Check ping timeouts
+  await pm.checkPingTimeouts()
+
+  # Check headers timeouts
+  await pm.checkHeadersTimeouts()
+
+proc markInitialSyncComplete*(pm: PeerManager) =
+  ## Mark that initial block download is complete
+  pm.initialSyncFinished = true
