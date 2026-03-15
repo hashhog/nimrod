@@ -2,6 +2,7 @@
 ## Download and validate all headers before block data
 ## Most-work chain wins (not longest chain)
 ## Phase 13: Parallel block download with sliding window for IBD
+## Phase 13+: PRESYNC/REDOWNLOAD anti-DoS header sync protection
 
 import std/[options, deques, tables, algorithm, sequtils, sets, strutils]
 import std/times
@@ -10,7 +11,8 @@ import chronicles
 import ./peer
 import ./peermanager
 import ./messages
-import ../primitives/[types, serialize]
+import ./headerssync
+import ../primitives/[types, serialize, uint256]
 import ../consensus/[params, validation]
 import ../storage/chainstate
 import ../crypto/hashing
@@ -34,6 +36,13 @@ type
     tipHeight*: int32
     totalWork*: array[32, byte]  ## Cumulative work of the chain
 
+  ## Statistics for header presync (anti-DoS tracking)
+  HeadersPresyncStats* = object
+    work*: UInt256              ## Total verified work accumulated
+    height*: int64              ## Height reached (only valid in PRESYNC)
+    timestamp*: uint32          ## Block timestamp of last header (only valid in PRESYNC)
+    inPresync*: bool            ## True if in PRESYNC phase, false if in REDOWNLOAD
+
   SyncManager* = ref object
     state*: SyncState
     headerChain*: HeaderChain
@@ -50,6 +59,12 @@ type
     headerTipHeight*: int32     ## Height of header tip
     chainTip*: BlockHash        ## Tip of fully validated blocks
     chainTipHeight*: int32      ## Height of chain tip
+    # Anti-DoS header sync state (per-peer PRESYNC/REDOWNLOAD)
+    peerHeadersSync*: Table[int64, HeadersSyncState]  ## peerId -> sync state
+    headersPresyncStats*: Table[int64, HeadersPresyncStats]  ## Per-peer stats
+    presyncBestPeer*: int64     ## Peer with most work in presync
+    presyncBestWork*: UInt256   ## Best work seen in presync
+    minimumChainWork*: UInt256  ## Anti-DoS work threshold
 
 const
   MaxHeadersPerRequest* = 2000
@@ -389,7 +404,13 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     headerTip: BlockHash(default(array[32, byte])),
     headerTipHeight: -1,
     chainTip: BlockHash(default(array[32, byte])),
-    chainTipHeight: -1
+    chainTipHeight: -1,
+    # Anti-DoS header sync state
+    peerHeadersSync: initTable[int64, HeadersSyncState](),
+    headersPresyncStats: initTable[int64, HeadersPresyncStats](),
+    presyncBestPeer: -1,
+    presyncBestWork: initUInt256(),
+    minimumChainWork: initUInt256()  # Will be set from chainstate
   )
 
   # Initialize with genesis if chain is empty
@@ -444,6 +465,206 @@ proc buildBlockLocator*(sm: SyncManager): seq[array[32, byte]] =
   if result.len == 0 or result[^1] != genesisHash:
     result.add(genesisHash)
 
+# =============================================================================
+# Anti-DoS Header Sync (PRESYNC/REDOWNLOAD)
+# =============================================================================
+
+proc getPeerId*(peer: Peer): int64 =
+  ## Generate a stable peer ID from address and port
+  ## Used for tracking per-peer header sync state
+  var h: int64 = 0
+  for c in peer.address:
+    h = h * 31 + int64(ord(c))
+  h = h * 31 + int64(peer.port)
+  h
+
+proc getAntiDoSWorkThreshold*(sm: SyncManager): UInt256 =
+  ## Calculate the minimum chain work to accept headers without anti-DoS protection
+  ## Returns max(near_chaintip_work, minimumChainWork)
+  ## Reference: Bitcoin Core GetAntiDoSWorkThreshold() in net_processing.cpp
+
+  # Start with the configured minimum chain work
+  var threshold = sm.minimumChainWork
+
+  # If we have a chain tip, use work within 144 blocks of tip
+  if sm.chainTipHeight >= 0:
+    # Get current tip work from header chain
+    let tipWork = initUInt256(sm.headerChain.totalWork)
+
+    # Calculate work for ~144 blocks (1 day)
+    # Approximate: each block adds some work based on current difficulty
+    # For simplicity, we use 144 times minimum block work
+    # In practice, this should be calculated from actual difficulty
+    let bufferBlocks = 144
+    let tipHeader = sm.headerChain.getHeaderByHeight(sm.chainTipHeight)
+    if tipHeader.isSome:
+      let blockWork = headerssync.getBlockProof(tipHeader.get())
+      let bufferWork = blockWork * uint64(bufferBlocks)
+
+      # near_chaintip_work = tip_work - buffer_work (clamped to 0)
+      var nearTipWork = initUInt256()
+      if tipWork > bufferWork:
+        nearTipWork = tipWork - bufferWork
+
+      # Return max of near-tip work and configured minimum
+      if nearTipWork > threshold:
+        threshold = nearTipWork
+
+  threshold
+
+proc calculateClaimedHeadersWork*(headers: seq[BlockHeader]): UInt256 =
+  ## Calculate the claimed work from a batch of headers
+  result = initUInt256()
+  for header in headers:
+    result = result + headerssync.getBlockProof(header)
+
+proc tryLowWorkHeadersSync*(sm: SyncManager, peer: Peer,
+                             chainStartHeight: int32,
+                             chainStartHash: BlockHash,
+                             chainStartBits: uint32,
+                             chainStartWork: UInt256,
+                             headers: var seq[BlockHeader]): bool =
+  ## Try to initiate low-work header sync for a peer
+  ## Returns true if headers should be processed through anti-DoS sync
+  ## Reference: Bitcoin Core TryLowWorkHeadersSync() in net_processing.cpp
+
+  let peerId = getPeerId(peer)
+
+  # Calculate total claimed work
+  let claimedWork = calculateClaimedHeadersWork(headers)
+  let totalWork = chainStartWork + claimedWork
+
+  # Get anti-DoS threshold
+  let threshold = sm.getAntiDoSWorkThreshold()
+
+  # If claimed work meets threshold, no need for anti-DoS sync
+  if totalWork >= threshold:
+    return false
+
+  # Only trigger if message is full (peer has more headers)
+  if headers.len < MaxHeadersPerRequest:
+    debug "ignoring low-work headers (incomplete message)",
+          peer = $peer, headers = headers.len, work = $totalWork
+    headers = @[]  # Clear headers to prevent normal processing
+    return true
+
+  # Initialize header sync state for this peer
+  info "starting low-work header sync",
+       peer = $peer, height = chainStartHeight, work = $totalWork
+
+  let syncState = newHeadersSyncState(
+    peerId = peerId,
+    params = sm.params,
+    chainStartHeight = chainStartHeight,
+    chainStartHash = chainStartHash,
+    chainStartBits = chainStartBits,
+    chainStartWork = chainStartWork,
+    minimumRequiredWork = threshold
+  )
+
+  sm.peerHeadersSync[peerId] = syncState
+
+  # Process the initial batch of headers through the sync state
+  let result = syncState.processNextHeaders(headers, headers.len >= MaxHeadersPerRequest)
+
+  if result.success:
+    # Update presync stats
+    sm.headersPresyncStats[peerId] = HeadersPresyncStats(
+      work: syncState.getPresyncWork(),
+      height: syncState.getPresyncHeight(),
+      timestamp: syncState.getPresyncTime(),
+      inPresync: syncState.getState() == Presync
+    )
+
+    # Track best peer for presync
+    if syncState.getPresyncWork() > sm.presyncBestWork:
+      sm.presyncBestWork = syncState.getPresyncWork()
+      sm.presyncBestPeer = peerId
+
+  # Clear original headers (processed through sync state)
+  headers = result.powValidatedHeaders
+  true
+
+proc isContinuationOfLowWorkHeadersSync*(sm: SyncManager, peer: Peer,
+                                          headers: var seq[BlockHeader]): bool =
+  ## Check if this peer has an active low-work header sync and process headers
+  ## Returns true if headers were processed through anti-DoS sync
+  ## Reference: Bitcoin Core IsContinuationOfLowWorkHeadersSync()
+
+  let peerId = getPeerId(peer)
+
+  if peerId notin sm.peerHeadersSync:
+    return false
+
+  let syncState = sm.peerHeadersSync[peerId]
+
+  if syncState.getState() == Done:
+    # Sync is complete, clean up
+    sm.peerHeadersSync.del(peerId)
+    sm.headersPresyncStats.del(peerId)
+    return false
+
+  # Process headers through the sync state
+  let fullMessage = headers.len >= MaxHeadersPerRequest
+  let result = syncState.processNextHeaders(headers, fullMessage)
+
+  if not result.success:
+    # Peer misbehaved during sync
+    warn "low-work header sync failed",
+         peer = $peer, state = $syncState.getState()
+    sm.peerHeadersSync.del(peerId)
+    sm.headersPresyncStats.del(peerId)
+    headers = @[]
+    return true
+
+  # Update stats
+  if syncState.getState() != Done:
+    sm.headersPresyncStats[peerId] = HeadersPresyncStats(
+      work: syncState.getPresyncWork(),
+      height: syncState.getPresyncHeight(),
+      timestamp: syncState.getPresyncTime(),
+      inPresync: syncState.getState() == Presync
+    )
+
+    # Update best peer tracking
+    if syncState.getPresyncWork() > sm.presyncBestWork:
+      sm.presyncBestWork = syncState.getPresyncWork()
+      sm.presyncBestPeer = peerId
+
+    # Request more headers if needed
+    if result.requestMore:
+      let locator = syncState.nextHeadersRequestLocator()
+      if locator.len > 0:
+        debug "requesting more headers for low-work sync",
+              peer = $peer, locatorLen = locator.len
+        # Note: caller should send getheaders with this locator
+  else:
+    # Sync complete
+    info "low-work header sync complete",
+         peer = $peer, height = syncState.getRedownloadHeight()
+    sm.peerHeadersSync.del(peerId)
+    sm.headersPresyncStats.del(peerId)
+
+  # Return validated headers for normal processing
+  headers = result.powValidatedHeaders
+  true
+
+proc cleanupPeerHeadersSync*(sm: SyncManager, peerId: int64) =
+  ## Clean up header sync state for a disconnected peer
+  sm.peerHeadersSync.del(peerId)
+  sm.headersPresyncStats.del(peerId)
+
+  # Update best peer if this was the best
+  if sm.presyncBestPeer == peerId:
+    sm.presyncBestPeer = -1
+    sm.presyncBestWork = initUInt256()
+
+    # Find new best peer
+    for pid, stats in sm.headersPresyncStats:
+      if stats.work > sm.presyncBestWork:
+        sm.presyncBestWork = stats.work
+        sm.presyncBestPeer = pid
+
 proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
   ## Request headers from peer using getheaders message
   let locator = sm.buildBlockLocator()
@@ -462,18 +683,93 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
                     headers: seq[BlockHeader]) {.async.} =
   ## Handle received headers message
   ## Validate PoW, chain linkage, MTP, difficulty retarget
+  ## Implements PRESYNC/REDOWNLOAD anti-DoS protection for low-work headers
   ## Request more if 2000 headers received, tip reached if < 2000
 
   if headers.len == 0:
-    # No headers = we're at tip
+    # No headers = we're at tip (or peer has nothing more)
+    # Check if we have an active low-work sync for this peer
+    if getPeerId(peer) in sm.peerHeadersSync:
+      let syncState = sm.peerHeadersSync[getPeerId(peer)]
+      if syncState.getState() != Done:
+        # Empty response during low-work sync - peer stopped early
+        debug "peer stopped sending during low-work sync",
+              peer = $peer, state = $syncState.getState()
+        sm.cleanupPeerHeadersSync(getPeerId(peer))
+
     info "header sync complete", tipHeight = sm.headerChain.tipHeight
     sm.state = ssDownloadingBlocks
     return
 
+  # Make a mutable copy for anti-DoS processing
+  var headersToProcess = headers
+
+  # Check if this is a continuation of an active low-work header sync
+  if sm.isContinuationOfLowWorkHeadersSync(peer, headersToProcess):
+    # Headers were processed through anti-DoS sync
+    if headersToProcess.len == 0:
+      # All headers consumed by presync phase, request more
+      if getPeerId(peer) in sm.peerHeadersSync:
+        let syncState = sm.peerHeadersSync[getPeerId(peer)]
+        if syncState.getState() != Done:
+          let locator = syncState.nextHeadersRequestLocator()
+          if locator.len > 0:
+            await peer.sendGetHeaders(locator, BlockHash(default(array[32, byte])))
+      return
+    # Otherwise, fall through to normal processing with validated headers
+  else:
+    # Check if we need to start a new low-work header sync
+    # This happens when headers don't connect to our best chain
+    # and have low claimed work
+
+    # Find where headers connect to our chain
+    if headersToProcess.len > 0:
+      let firstHeader = headersToProcess[0]
+
+      # Check if headers connect directly to our tip
+      if firstHeader.prevBlock != sm.headerTip and sm.headerTipHeight >= 0:
+        # Headers don't connect to tip - check if they branch from our chain
+        let prevHashOpt = sm.headerChain.getHeader(firstHeader.prevBlock)
+
+        if prevHashOpt.isNone:
+          # Headers don't connect to any known block
+          # Could be a fork from earlier or completely disconnected
+          warn "headers don't connect to our chain",
+               peer = $peer, prevBlock = $firstHeader.prevBlock
+          # For now, reject unconnected headers
+          sm.peerManager.misbehavingPeer(peer, 20, "unconnected headers")
+          return
+
+        # Headers branch from an earlier point - check work threshold
+        let branchHeight = sm.headerChain.byHash.getOrDefault(firstHeader.prevBlock, -1)
+        if branchHeight >= 0:
+          let branchHeader = sm.headerChain.headers[branchHeight]
+          let branchHash = firstHeader.prevBlock
+
+          # Calculate work up to branch point
+          var branchWork = initUInt256()
+          for i in 0..branchHeight:
+            let w = headerssync.getBlockProof(sm.headerChain.headers[i])
+            branchWork = branchWork + w
+
+          # Try low-work sync if claimed work is below threshold
+          if sm.tryLowWorkHeadersSync(peer, int32(branchHeight), branchHash,
+                                       branchHeader.bits, branchWork, headersToProcess):
+            # Headers being processed through anti-DoS sync
+            if headersToProcess.len == 0:
+              # Request more headers through low-work sync
+              if getPeerId(peer) in sm.peerHeadersSync:
+                let syncState = sm.peerHeadersSync[getPeerId(peer)]
+                let locator = syncState.nextHeadersRequestLocator()
+                if locator.len > 0:
+                  await peer.sendGetHeaders(locator, BlockHash(default(array[32, byte])))
+              return
+
+  # Normal header processing (either direct or validated through anti-DoS)
   var accepted = 0
   var lastValidHeight = sm.headerChain.tipHeight
 
-  for header in headers:
+  for header in headersToProcess:
     # Calculate hash
     let headerBytes = serialize(header)
     let hash = BlockHash(doubleSha256(headerBytes))
