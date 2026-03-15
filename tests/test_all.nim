@@ -21,6 +21,7 @@ import ./test_undo
 import ./test_fees
 import ./test_template
 import ./test_sync
+import ./test_headerssync
 import ./test_wallet
 import ./test_rpc
 import ./test_perf
