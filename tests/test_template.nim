@@ -467,7 +467,7 @@ suite "Block Template":
     # Not all inputs are final, so lockTime applies and tx is not final
     check not isFinalTx(tx, blockHeight = 100, blockTime = 1000)
 
-  test "coinbase has correct sequence (SEQUENCE_FINAL)":
+  test "coinbase has correct sequence (MAX_SEQUENCE_NONFINAL)":
     let height = int32(500000)
     let subsidy = Satoshi(12_5000_0000)
     let fees = Satoshi(0)
@@ -476,11 +476,13 @@ suite "Block Template":
 
     let coinbase = createCoinbaseTx(height, subsidy, fees, scriptPubKey, emptyCommitment)
 
-    # Coinbase input sequence should be 0xFFFFFFFF (SEQUENCE_FINAL)
-    # This opts out of BIP68 relative timelocks for the coinbase
-    check coinbase.inputs[0].sequence == 0xFFFFFFFF'u32
+    # Coinbase input sequence should be MAX_SEQUENCE_NONFINAL (0xFFFFFFFE)
+    # This ensures locktime is still enforced (unlike SEQUENCE_FINAL which disables it)
+    # Reference: Bitcoin Core miner.cpp line 171
+    check coinbase.inputs[0].sequence == MaxSequenceNonFinal
+    check coinbase.inputs[0].sequence == 0xFFFFFFFE'u32
 
-  test "coinbase has lockTime=0":
+  test "coinbase has lockTime=height-1 for anti-fee-sniping":
     let height = int32(500000)
     let subsidy = Satoshi(12_5000_0000)
     let fees = Satoshi(0)
@@ -489,8 +491,22 @@ suite "Block Template":
 
     let coinbase = createCoinbaseTx(height, subsidy, fees, scriptPubKey, emptyCommitment)
 
-    # Coinbase lockTime should be 0
-    check coinbase.lockTime == 0
+    # Coinbase lockTime should be height - 1 for anti-fee-sniping
+    # This prevents miners from reorging to steal fees from recent blocks
+    # Reference: Bitcoin Core miner.cpp line 196
+    check coinbase.lockTime == uint32(height - 1)
+    check coinbase.lockTime == 499999'u32
+
+  test "coinbase lockTime=0 for height 1":
+    # Edge case: at height 1, lockTime = 0 (since height - 1 = 0)
+    let height = int32(1)
+    let subsidy = Satoshi(50_0000_0000)
+    let fees = Satoshi(0)
+    let scriptPubKey = @[0x51'u8]
+    let emptyCommitment: array[32, byte] = default(array[32, byte])
+
+    let coinbase = createCoinbaseTx(height, subsidy, fees, scriptPubKey, emptyCommitment)
+    check coinbase.lockTime == 0'u32
 
   test "locktime threshold constant":
     # Below 500_000_000 is height-based, at or above is time-based
@@ -498,3 +514,9 @@ suite "Block Template":
 
   test "sequence final constant":
     check SequenceFinal == 0xFFFFFFFF'u32
+
+  test "max sequence nonfinal constant":
+    # MAX_SEQUENCE_NONFINAL = SEQUENCE_FINAL - 1
+    # Used for anti-fee-sniping to ensure locktime is enforced
+    check MaxSequenceNonFinal == 0xFFFFFFFE'u32
+    check MaxSequenceNonFinal == SequenceFinal - 1
