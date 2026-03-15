@@ -36,6 +36,9 @@ type
     veBadBlockVersion = "invalid block version"
     vePrevBlockMissing = "previous block not found"
     veSequenceLockNotSatisfied = "BIP68 relative lock-time not satisfied"
+    veCheckpointMismatch = "block hash does not match checkpoint"
+    veForkBelowCheckpoint = "cannot fork before the last checkpoint"
+    veInsufficientChainWork = "chain does not meet minimum work requirement"
 
   ValidationResult*[T] = object
     case isOk*: bool
