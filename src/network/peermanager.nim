@@ -1,7 +1,14 @@
 ## Peer connection management
 ## Handles peer discovery, DNS resolution, connection limits, banning, and message routing
-## 8 outbound + 117 inbound connections, 24h ban duration
-## Misbehavior scoring: 100 points = ban (Bitcoin Core compatible)
+## 8 full-relay outbound + 2 block-relay-only outbound + 117 inbound connections
+## 24h ban duration, misbehavior scoring: 100 points = ban (Bitcoin Core compatible)
+##
+## Eclipse attack protections:
+## - Network group diversity: no two outbound peers share same /16 (IPv4) or /32 (IPv6)
+## - Anchor connections: persist 2 block-relay-only peers to anchors.dat
+## - Inbound eviction: protect diverse categories when slots are full
+##
+## Reference: Bitcoin Core net.cpp, node/eviction.cpp
 
 import std/[tables, sets, sequtils, random, times, net, strutils, algorithm, options]
 import chronos
@@ -9,22 +16,44 @@ import chronicles
 import ./peer
 import ./messages
 import ./banman
+import ./netgroup
+import ./eviction
+import ./anchors
 import ../consensus/params
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 
-export banman
+export banman, netgroup, eviction, anchors
 
 const
   BanDuration* = initDuration(hours = 24)
   ReconnectInterval* = 30  # seconds
   PingInterval* = 120      # seconds
   GetAddrInterval* = 300   # seconds
-  DefaultMaxOutbound* = 8
+  DefaultMaxOutboundFullRelay* = 8
+  DefaultMaxOutboundBlockRelay* = 2
   DefaultMaxInbound* = 117
+  NetgroupKey* = 0x6c0edd8036ef4036'u64  # SHA256("netgroup")[0:8]
 
 type
   PeerCallback* = proc(peer: Peer, msg: P2PMessage): Future[void] {.async.}
+
+  PeerConnectionType* = enum
+    pctFullRelay       # Full-relay outbound (8 slots)
+    pctBlockRelayOnly  # Block-relay-only outbound (2 slots)
+    pctInbound         # Inbound
+
+  ExtendedPeer* = ref object
+    ## Extended peer info for eclipse protection
+    peer*: Peer
+    connType*: PeerConnectionType
+    connectedTime*: Time
+    lastBlockTime*: Time
+    lastTxTime*: Time
+    minPingTime*: times.Duration
+    netGroup*: NetGroup
+    keyedNetGroup*: uint64
+    noBan*: bool
 
   InFlightBlock* = object
     hash*: BlockHash
@@ -33,13 +62,16 @@ type
 
   PeerManager* = ref object
     peers*: Table[string, Peer]
-    maxOutbound*: int
+    extendedPeers*: Table[string, ExtendedPeer]
+    maxOutboundFullRelay*: int
+    maxOutboundBlockRelay*: int
     maxInbound*: int
     networkMagic*: array[4, byte]
     params*: ConsensusParams
     localVersion*: VersionMsg
     knownAddresses*: seq[NetAddress]
     banManager*: BanManager
+    anchorList*: AnchorList
     listener*: StreamServer
     onMessage*: PeerCallback
     ourHeight*: int32
@@ -48,9 +80,13 @@ type
     inFlightBlocks*: Table[BlockHash, InFlightBlock]
     running*: bool
     dataDir*: string
+    # Eclipse protection state
+    outboundNetGroups*: HashSet[NetGroup]  # Network groups of current outbound peers
+    netgroupKey*: uint64
 
 # Forward declarations
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
+proc tryEvictInbound(pm: PeerManager): Option[string]
 
 proc peerKey(host: string, port: uint16): string =
   host & ":" & $port
@@ -58,27 +94,36 @@ proc peerKey(host: string, port: uint16): string =
 proc peerKey(peer: Peer): string =
   peerKey(peer.address, peer.port)
 
-proc newPeerManager*(params: ConsensusParams, maxOut: int = DefaultMaxOutbound,
+proc newPeerManager*(params: ConsensusParams,
+                     maxOutFullRelay: int = DefaultMaxOutboundFullRelay,
+                     maxOutBlockRelay: int = DefaultMaxOutboundBlockRelay,
                      maxIn: int = DefaultMaxInbound,
                      dataDir: string = "."): PeerManager =
+  randomize()
   result = PeerManager(
     params: params,
     peers: initTable[string, Peer](),
-    maxOutbound: maxOut,
+    extendedPeers: initTable[string, ExtendedPeer](),
+    maxOutboundFullRelay: maxOutFullRelay,
+    maxOutboundBlockRelay: maxOutBlockRelay,
     maxInbound: maxIn,
     networkMagic: params.magic,
     knownAddresses: @[],
     banManager: newBanManager(dataDir),
+    anchorList: newAnchorList(dataDir),
     seedNodes: @[],
     fallbackPeers: @[],
     ourHeight: 0,
     inFlightBlocks: initTable[BlockHash, InFlightBlock](),
     running: false,
-    dataDir: dataDir
+    dataDir: dataDir,
+    outboundNetGroups: initHashSet[NetGroup](),
+    netgroupKey: NetgroupKey
   )
 
-  # Load existing ban list
+  # Load existing ban list and anchors
   result.banManager.load()
+  discard result.anchorList.load()
 
   # Set up local version message
   result.localVersion = VersionMsg(
@@ -110,14 +155,12 @@ proc newPeerManager*(params: ConsensusParams, maxOut: int = DefaultMaxOutbound,
       ("seed.tbtc.petertodd.net", 18333'u16),
       ("testnet-seed.bluematt.me", 18333'u16)
     ]
-    # Fallback peers for testnet (DNS can be unreliable)
     result.fallbackPeers = @[
       ("18.27.79.17", 18333'u16),
       ("85.10.199.56", 18333'u16),
       ("91.203.5.166", 18333'u16)
     ]
   of Regtest:
-    # Regtest: no DNS seeds, use localhost or explicit peers
     result.fallbackPeers = @[
       ("127.0.0.1", 18444'u16)
     ]
@@ -131,6 +174,11 @@ proc newPeerManager*(params: ConsensusParams, maxOut: int = DefaultMaxOutbound,
       ("seed.signet.bitcoin.sprovoost.nl", 38333'u16)
     ]
 
+# Legacy compatibility constructor
+proc newPeerManager*(params: ConsensusParams, maxOut: int, maxIn: int,
+                     dataDir: string = "."): PeerManager =
+  newPeerManager(params, maxOut, 2, maxIn, dataDir)
+
 proc connectedPeerCount*(pm: PeerManager): int =
   for peer in pm.peers.values:
     if peer.state == psReady:
@@ -141,21 +189,28 @@ proc outboundCount*(pm: PeerManager): int =
     if peer.direction == pdOutbound and peer.state == psReady:
       result += 1
 
+proc outboundFullRelayCount*(pm: PeerManager): int =
+  for key, ext in pm.extendedPeers:
+    if ext.connType == pctFullRelay and ext.peer.state == psReady:
+      result += 1
+
+proc outboundBlockRelayCount*(pm: PeerManager): int =
+  for key, ext in pm.extendedPeers:
+    if ext.connType == pctBlockRelayOnly and ext.peer.state == psReady:
+      result += 1
+
 proc inboundCount*(pm: PeerManager): int =
   for peer in pm.peers.values:
     if peer.direction == pdInbound and peer.state == psReady:
       result += 1
 
 proc isBanned*(pm: PeerManager, address: string): bool =
-  ## Check if address is banned (delegated to BanManager)
   pm.banManager.isBanned(address)
 
 proc banPeer*(pm: PeerManager, address: string, duration: times.Duration = BanDuration,
               reason: BanReason = brMisbehaving) =
-  ## Ban a peer for the specified duration (default 24h)
   pm.banManager.ban(address, duration, reason)
 
-  # Disconnect if currently connected
   let normalizedAddr = normalizeAddress(address)
   var toRemove: seq[string]
   for key, peer in pm.peers:
@@ -164,80 +219,96 @@ proc banPeer*(pm: PeerManager, address: string, duration: times.Duration = BanDu
 
   for key in toRemove:
     let peer = pm.peers[key]
+    # Remove from netgroup tracking if outbound
+    if key in pm.extendedPeers:
+      let ext = pm.extendedPeers[key]
+      if ext.connType in {pctFullRelay, pctBlockRelayOnly}:
+        pm.outboundNetGroups.excl(ext.netGroup)
+      pm.extendedPeers.del(key)
     asyncSpawn peer.disconnect("banned")
     pm.peers.del(key)
 
 proc unbanPeer*(pm: PeerManager, address: string): bool =
-  ## Remove ban on a peer. Returns true if ban was removed.
   pm.banManager.unban(address)
 
 proc cleanupBans(pm: PeerManager) =
-  ## Remove expired bans
   pm.banManager.sweepExpired()
 
 proc misbehavingPeer*(pm: PeerManager, peer: Peer, score: uint32, message: string) =
-  ## Record misbehavior for a peer. At 100 points, the peer is banned.
-  ## Reference: Bitcoin Core net_processing.cpp Misbehaving()
   var p = peer
   misbehaving(p, score, message)
 
   if p.shouldBan():
-    # Ban the peer
     pm.banPeer(peer.address, BanDuration, brMisbehaving)
-    # Remove peer from our list
     asyncSpawn pm.removePeer(peer)
 
 proc listBanned*(pm: PeerManager): seq[BanEntry] =
-  ## Get list of all currently banned peers
   pm.banManager.listBanned()
 
 proc clearBanned*(pm: PeerManager) =
-  ## Clear all bans
   pm.banManager.clearBanned()
 
+proc getNetGroupForAddress*(pm: PeerManager, address: string): NetGroup =
+  ## Get network group for an address
+  getNetGroup(address)
+
+proc hasNetGroupCollision*(pm: PeerManager, address: string): bool =
+  ## Check if connecting to this address would cause a netgroup collision
+  ## with existing outbound peers (eclipse protection)
+  let ng = getNetGroup(address)
+  ng in pm.outboundNetGroups
+
 proc resolveDnsSeeds*(pm: PeerManager): Future[seq[string]] {.async.} =
-  ## Resolve DNS seed nodes to IP addresses
-  ## Shuffles results for randomization
   var addresses: seq[string]
 
   for (host, port) in pm.seedNodes:
     try:
-      # Use getAddrInfo for DNS resolution
       let resolvedAddrs = resolveTAddress(host, Port(port))
       for ta in resolvedAddrs:
         addresses.add($ta.address)
     except CatchableError as e:
       debug "DNS resolution failed", host = host, error = e.msg
 
-  # Shuffle results
   if addresses.len > 0:
-    randomize()
     shuffle(addresses)
 
-  # Add fallback peers if DNS fails or returns few results
-  if addresses.len < pm.maxOutbound:
+  if addresses.len < pm.maxOutboundFullRelay:
     for (host, port) in pm.fallbackPeers:
       if host notin addresses:
         addresses.add(host)
 
   return addresses
 
-proc connectToPeer*(pm: PeerManager, address: string, port: uint16): Future[bool] {.async.} =
-  ## Connect to a peer at the given address
+proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
+                            connType: PeerConnectionType): Future[bool] {.async.} =
+  ## Connect to a peer with specific connection type
   let key = peerKey(address, port)
 
-  # Check ban status
   if pm.isBanned(address):
     debug "peer is banned", address = address
     return false
 
-  # Check if already connected
   if key in pm.peers:
     return false
 
+  # Check netgroup diversity for outbound connections
+  if connType in {pctFullRelay, pctBlockRelayOnly}:
+    let ng = getNetGroup(address)
+    if ng in pm.outboundNetGroups:
+      debug "skipping peer due to netgroup collision", address = address, netgroup = $ng
+      return false
+
   # Check connection limits
-  if pm.outboundCount >= pm.maxOutbound:
-    return false
+  case connType
+  of pctFullRelay:
+    if pm.outboundFullRelayCount >= pm.maxOutboundFullRelay:
+      return false
+  of pctBlockRelayOnly:
+    if pm.outboundBlockRelayCount >= pm.maxOutboundBlockRelay:
+      return false
+  of pctInbound:
+    if pm.inboundCount >= pm.maxInbound:
+      return false
 
   let peer = newPeer(address, port, pm.params, pdOutbound)
   pm.peers[key] = peer
@@ -245,7 +316,28 @@ proc connectToPeer*(pm: PeerManager, address: string, port: uint16): Future[bool
   if await peer.connect():
     try:
       await peer.performHandshake(pm.ourHeight)
-      info "connected to peer", peer = $peer, height = peer.startHeight
+
+      # Create extended peer info
+      let ip = parseIpAddr(address)
+      let ng = getNetGroup(ip)
+      let ext = ExtendedPeer(
+        peer: peer,
+        connType: connType,
+        connectedTime: getTime(),
+        lastBlockTime: Time(),
+        lastTxTime: Time(),
+        minPingTime: initDuration(seconds = 60),
+        netGroup: ng,
+        keyedNetGroup: getKeyedNetGroup(ip, pm.netgroupKey),
+        noBan: false
+      )
+      pm.extendedPeers[key] = ext
+
+      # Add to netgroup tracking for outbound
+      if connType in {pctFullRelay, pctBlockRelayOnly}:
+        pm.outboundNetGroups.incl(ng)
+
+      info "connected to peer", peer = $peer, height = peer.startHeight, connType = $connType
       return true
     except CatchableError as e:
       error "handshake failed", peer = $peer, error = e.msg
@@ -256,13 +348,23 @@ proc connectToPeer*(pm: PeerManager, address: string, port: uint16): Future[bool
     pm.peers.del(key)
     return false
 
+proc connectToPeer*(pm: PeerManager, address: string, port: uint16): Future[bool] {.async.} =
+  ## Connect to a peer (full-relay outbound)
+  return await pm.connectToPeerWithType(address, port, pctFullRelay)
+
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.} =
   let key = peerKey(peer)
   if key in pm.peers:
+    # Remove from netgroup tracking
+    if key in pm.extendedPeers:
+      let ext = pm.extendedPeers[key]
+      if ext.connType in {pctFullRelay, pctBlockRelayOnly}:
+        pm.outboundNetGroups.excl(ext.netGroup)
+      pm.extendedPeers.del(key)
+
     await peer.disconnect()
     pm.peers.del(key)
 
-    # Re-queue any in-flight blocks from this peer
     var toRequeue: seq[BlockHash]
     for hash, inflight in pm.inFlightBlocks:
       if inflight.peer == peer:
@@ -272,49 +374,141 @@ proc removePeer*(pm: PeerManager, peer: Peer) {.async.} =
       pm.inFlightBlocks.del(hash)
       debug "re-queued in-flight block on peer disconnect", hash = $hash
 
+proc connectToAnchors*(pm: PeerManager) {.async.} =
+  ## Connect to anchor peers first (block-relay-only)
+  ## Reference: Bitcoin Core net.cpp ThreadOpenConnections
+  while not pm.anchorList.isEmpty():
+    let anchorOpt = pm.anchorList.pop()
+    if anchorOpt.isNone:
+      break
+
+    let anchor = anchorOpt.get()
+    let address = ipToString(anchor.ip)
+    let port = anchor.port
+
+    if pm.isBanned(address):
+      continue
+
+    # Check netgroup collision
+    if pm.hasNetGroupCollision(address):
+      continue
+
+    if pm.outboundBlockRelayCount >= pm.maxOutboundBlockRelay:
+      break
+
+    info "connecting to anchor peer", address = address, port = port
+    discard await pm.connectToPeerWithType(address, port, pctBlockRelayOnly)
+
 proc startOutboundConnections*(pm: PeerManager) {.async.} =
-  ## Discover peers and establish outbound connections
-  info "starting outbound connections", maxOutbound = pm.maxOutbound
+  info "starting outbound connections",
+       maxFullRelay = pm.maxOutboundFullRelay,
+       maxBlockRelay = pm.maxOutboundBlockRelay
+
+  # First, try to connect to anchor peers
+  await pm.connectToAnchors()
 
   # Resolve DNS seeds
   let addresses = await pm.resolveDnsSeeds()
   info "resolved addresses", count = addresses.len
 
-  # Connect to peers
+  # Connect to full-relay peers with netgroup diversity
   for address in addresses:
-    if pm.outboundCount >= pm.maxOutbound:
+    if pm.outboundFullRelayCount >= pm.maxOutboundFullRelay:
       break
 
-    let port = pm.params.defaultPort
-    discard await pm.connectToPeer(address, port)
+    # Skip if netgroup collision
+    if pm.hasNetGroupCollision(address):
+      debug "skipping address due to netgroup collision", address = address
+      continue
 
-    # Small delay between connection attempts
+    let port = pm.params.defaultPort
+    discard await pm.connectToPeerWithType(address, port, pctFullRelay)
     await sleepAsync(100)
 
+  # Fill remaining block-relay-only slots
+  for address in addresses:
+    if pm.outboundBlockRelayCount >= pm.maxOutboundBlockRelay:
+      break
+
+    if pm.hasNetGroupCollision(address):
+      continue
+
+    let port = pm.params.defaultPort
+    discard await pm.connectToPeerWithType(address, port, pctBlockRelayOnly)
+    await sleepAsync(100)
+
+proc tryEvictInbound(pm: PeerManager): Option[string] =
+  ## Try to select an inbound peer to evict
+  ## Returns peer key if eviction candidate found
+  var candidates: seq[EvictionCandidate]
+
+  var peerId: int64 = 0
+  for key, ext in pm.extendedPeers:
+    if ext.connType != pctInbound:
+      continue
+
+    let ip = parseIpAddr(ext.peer.address)
+    candidates.add(EvictionCandidate(
+      id: peerId,
+      address: ext.peer.address,
+      connected: ext.connectedTime,
+      minPingTime: ext.minPingTime,
+      lastBlockTime: ext.lastBlockTime,
+      lastTxTime: ext.lastTxTime,
+      relevantServices: (ext.peer.services and (NodeNetwork or NodeWitness)) != 0,
+      relayTxs: true,  # TODO: track this properly
+      bloomFilter: false,
+      keyedNetGroup: ext.keyedNetGroup,
+      preferEvict: false,
+      isLocal: ip.isLocal(),
+      netGroup: ext.netGroup,
+      noBan: ext.noBan,
+      connType: ctInbound
+    ))
+    inc peerId
+
+  let evictIdOpt = selectNodeToEvict(candidates)
+  if evictIdOpt.isSome:
+    let evictId = evictIdOpt.get()
+    # Find the key for this ID
+    var idx: int64 = 0
+    for key, ext in pm.extendedPeers:
+      if ext.connType == pctInbound:
+        if idx == evictId:
+          return some(key)
+        inc idx
+
+  return none(string)
+
 proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.} =
-  ## Handle a new inbound connection
   let remoteAddr = transp.remoteAddress()
   let address = $remoteAddr.address
   let port = uint16(remoteAddr.port)
   let key = peerKey(address, port)
 
-  # Check ban status
   if pm.isBanned(address):
     debug "rejecting banned inbound connection", address = address
     await transp.closeWait()
     return
 
-  # Check connection limits
-  if pm.inboundCount >= pm.maxInbound:
-    debug "rejecting inbound connection (limit reached)", address = address
-    await transp.closeWait()
-    return
-
-  # Check if already connected
   if key in pm.peers:
     debug "rejecting duplicate connection", address = address
     await transp.closeWait()
     return
+
+  # Check connection limits - try eviction if full
+  if pm.inboundCount >= pm.maxInbound:
+    let evictKeyOpt = pm.tryEvictInbound()
+    if evictKeyOpt.isSome:
+      let evictKey = evictKeyOpt.get()
+      info "evicting inbound peer to make room", evictKey = evictKey
+      if evictKey in pm.peers:
+        let evictPeer = pm.peers[evictKey]
+        await pm.removePeer(evictPeer)
+    else:
+      debug "rejecting inbound connection (limit reached, no eviction candidate)", address = address
+      await transp.closeWait()
+      return
 
   let peer = newPeer(address, port, pm.params, pdInbound)
   peer.transport = transp
@@ -325,9 +519,25 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
 
   try:
     await peer.performHandshake(pm.ourHeight)
+
+    # Create extended peer info
+    let ip = parseIpAddr(address)
+    let ng = getNetGroup(ip)
+    let ext = ExtendedPeer(
+      peer: peer,
+      connType: pctInbound,
+      connectedTime: getTime(),
+      lastBlockTime: Time(),
+      lastTxTime: Time(),
+      minPingTime: initDuration(seconds = 60),
+      netGroup: ng,
+      keyedNetGroup: getKeyedNetGroup(ip, pm.netgroupKey),
+      noBan: false
+    )
+    pm.extendedPeers[key] = ext
+
     info "inbound handshake complete", peer = $peer, height = peer.startHeight
 
-    # Start message loop for this peer
     if pm.onMessage != nil:
       asyncSpawn peer.messageLoop(pm.onMessage)
     else:
@@ -336,9 +546,10 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
     error "inbound handshake failed", peer = $peer, error = e.msg
     await peer.disconnect()
     pm.peers.del(key)
+    if key in pm.extendedPeers:
+      pm.extendedPeers.del(key)
 
 proc inboundConnectionCallback(server: StreamServer, transp: StreamTransport) {.async: (raises: []).} =
-  ## Callback for StreamServer when a new connection arrives
   let pm = cast[PeerManager](server.udata)
   try:
     await pm.handleInboundConnection(transp)
@@ -350,20 +561,18 @@ proc inboundConnectionCallback(server: StreamServer, transp: StreamTransport) {.
       discard
 
 proc startListener*(pm: PeerManager, bindAddr: string, port: uint16) {.async.} =
-  ## Start listening for inbound connections
   let ta = initTAddress(bindAddr, Port(port))
 
   pm.listener = createStreamServer(
     ta,
     inboundConnectionCallback,
-    {},  # flags
+    {},
     udata = cast[pointer](pm)
   )
   pm.listener.start()
   info "listening for connections", address = bindAddr, port = port
 
 proc stopListener*(pm: PeerManager) =
-  ## Stop the listener
   if pm.listener != nil:
     pm.listener.stop()
     pm.listener.close()
@@ -375,7 +584,6 @@ proc getReadyPeers*(pm: PeerManager): seq[Peer] =
       result.add(peer)
 
 proc getBestPeer*(pm: PeerManager): Peer =
-  ## Get peer with highest reported height
   var best: Peer = nil
   var bestHeight: int32 = -1
 
@@ -386,8 +594,25 @@ proc getBestPeer*(pm: PeerManager): Peer =
 
   best
 
+proc getBlockRelayOnlyPeers*(pm: PeerManager): seq[Peer] =
+  ## Get all block-relay-only outbound peers
+  for key, ext in pm.extendedPeers:
+    if ext.connType == pctBlockRelayOnly and ext.peer.state == psReady:
+      result.add(ext.peer)
+
+proc saveAnchors*(pm: PeerManager) =
+  ## Save current block-relay-only connections as anchors
+  var addresses: seq[(string, uint16, uint64)]
+  for peer in pm.getBlockRelayOnlyPeers():
+    addresses.add((peer.address, peer.port, peer.services))
+
+  if addresses.len > 0:
+    let anchors = getCurrentBlockRelayOnlyAddresses(addresses)
+    pm.anchorList.anchors = anchors
+    pm.anchorList.isDirty = true
+    pm.anchorList.save()
+
 proc broadcastTx*(pm: PeerManager, tx: Transaction) {.async.} =
-  ## Broadcast a transaction to all ready peers via inv
   let txBytes = serialize(tx)
   let txHash = doubleSha256(txBytes)
 
@@ -401,7 +626,6 @@ proc broadcastTx*(pm: PeerManager, tx: Transaction) {.async.} =
       debug "failed to broadcast tx inv", peer = $peer, error = e.msg
 
 proc broadcastBlock*(pm: PeerManager, blk: Block) {.async.} =
-  ## Broadcast a block to all ready peers via inv
   let headerBytes = serialize(blk.header)
   let blockHash = doubleSha256(headerBytes)
 
@@ -415,7 +639,6 @@ proc broadcastBlock*(pm: PeerManager, blk: Block) {.async.} =
       debug "failed to broadcast block inv", peer = $peer, error = e.msg
 
 proc broadcastInventory*(pm: PeerManager, inventory: seq[InvVector]) {.async.} =
-  ## Broadcast inventory to all ready peers
   let msg = newInv(inventory)
   for peer in pm.getReadyPeers():
     try:
@@ -424,19 +647,8 @@ proc broadcastInventory*(pm: PeerManager, inventory: seq[InvVector]) {.async.} =
       debug "failed to broadcast inv", peer = $peer, error = e.msg
 
 proc buildBlockLocator*(pm: PeerManager, tip: BlockHash): seq[array[32, byte]] =
-  ## Build block locator with exponential backoff
-  ## Returns: 10 single steps, then 2, 4, 8, 16... gaps, ending with genesis
-  ##
-  ## This requires access to the chainstate to walk back from tip.
-  ## For now, we return just the tip and genesis as a minimal locator.
-  ## The full implementation needs integration with ChainState.
-
   result = @[]
-
-  # Add the tip
   result.add(array[32, byte](tip))
-
-  # Always include genesis
   let genesisHash = array[32, byte](pm.params.genesisBlockHash)
   if result[^1] != genesisHash:
     result.add(genesisHash)
@@ -444,8 +656,6 @@ proc buildBlockLocator*(pm: PeerManager, tip: BlockHash): seq[array[32, byte]] =
 proc buildBlockLocatorFromChain*(heights: proc(h: int32): Option[BlockHash],
                                   tipHeight: int32,
                                   genesisHash: BlockHash): seq[array[32, byte]] =
-  ## Build block locator with exponential backoff from a height->hash function
-  ## 10 single steps, then exponentially increasing gaps, always ending with genesis
   result = @[]
   var step: int32 = 1
   var height = tipHeight
@@ -455,40 +665,61 @@ proc buildBlockLocatorFromChain*(heights: proc(h: int32): Option[BlockHash],
     if hashOpt.isSome:
       result.add(array[32, byte](hashOpt.get()))
 
-    # After 10 hashes, start exponential backoff
     if result.len > 10:
       step *= 2
 
     height -= step
 
-  # Always include genesis if not already present
   let genesisArr = array[32, byte](genesisHash)
   if result.len == 0 or result[^1] != genesisArr:
     result.add(genesisArr)
 
-proc maintainConnections(pm: PeerManager) {.async.} =
-  ## Periodic connection maintenance
-  ## Remove stale peers, reconnect if needed
+proc updatePeerPingTime*(pm: PeerManager, peer: Peer, pingTime: times.Duration) =
+  ## Update minimum ping time for a peer (for eviction scoring)
+  let key = peerKey(peer)
+  if key in pm.extendedPeers:
+    if pingTime < pm.extendedPeers[key].minPingTime:
+      pm.extendedPeers[key].minPingTime = pingTime
 
-  # Remove disconnected peers
+proc updatePeerBlockTime*(pm: PeerManager, peer: Peer) =
+  ## Update last block time for a peer (for eviction scoring)
+  let key = peerKey(peer)
+  if key in pm.extendedPeers:
+    pm.extendedPeers[key].lastBlockTime = getTime()
+
+proc updatePeerTxTime*(pm: PeerManager, peer: Peer) =
+  ## Update last tx time for a peer (for eviction scoring)
+  let key = peerKey(peer)
+  if key in pm.extendedPeers:
+    pm.extendedPeers[key].lastTxTime = getTime()
+
+proc maintainConnections(pm: PeerManager) {.async.} =
   var toRemove: seq[string]
   for key, peer in pm.peers:
     if peer.state == psDisconnected:
       toRemove.add(key)
 
   for key in toRemove:
+    if key in pm.extendedPeers:
+      let ext = pm.extendedPeers[key]
+      if ext.connType in {pctFullRelay, pctBlockRelayOnly}:
+        pm.outboundNetGroups.excl(ext.netGroup)
+      pm.extendedPeers.del(key)
     pm.peers.del(key)
 
-  # Cleanup expired bans
   pm.cleanupBans()
 
-  # Try to maintain minimum outbound connections
-  if pm.outboundCount < pm.maxOutbound div 2:
-    info "reconnecting to maintain peer count", current = pm.outboundCount, target = pm.maxOutbound
+  # Try to maintain connections
+  let fullRelayDeficit = pm.maxOutboundFullRelay - pm.outboundFullRelayCount
+  let blockRelayDeficit = pm.maxOutboundBlockRelay - pm.outboundBlockRelayCount
+
+  if fullRelayDeficit > 0 or blockRelayDeficit > 0:
+    info "reconnecting to maintain peer count",
+         fullRelay = pm.outboundFullRelayCount,
+         blockRelay = pm.outboundBlockRelayCount
     await pm.startOutboundConnections()
 
 proc pingPeers(pm: PeerManager) {.async.} =
-  ## Send ping to all ready peers
   for peer in pm.getReadyPeers():
     try:
       await peer.sendPing()
@@ -496,7 +727,6 @@ proc pingPeers(pm: PeerManager) {.async.} =
       debug "failed to ping peer", peer = $peer, error = e.msg
 
 proc requestAddresses(pm: PeerManager) {.async.} =
-  ## Request addresses from peers
   let msg = newGetAddr()
   for peer in pm.getReadyPeers():
     try:
@@ -505,10 +735,6 @@ proc requestAddresses(pm: PeerManager) {.async.} =
       debug "failed to request addresses", peer = $peer, error = e.msg
 
 proc mainLoop*(pm: PeerManager) {.async.} =
-  ## Main peer manager loop
-  ## 30s: reconnect check
-  ## 120s: ping all peers
-  ## 300s: request addresses
   pm.running = true
 
   var lastReconnect = getTime()
@@ -520,22 +746,18 @@ proc mainLoop*(pm: PeerManager) {.async.} =
   while pm.running:
     let now = getTime()
 
-    # 30s: check connections and reconnect
     if (now - lastReconnect).inSeconds >= ReconnectInterval:
       await pm.maintainConnections()
       lastReconnect = now
 
-    # 120s: ping all peers
     if (now - lastPing).inSeconds >= PingInterval:
       await pm.pingPeers()
       lastPing = now
 
-    # 300s: request addresses
     if (now - lastGetAddr).inSeconds >= GetAddrInterval:
       await pm.requestAddresses()
       lastGetAddr = now
 
-    # Process any peer state changes
     var disconnected: seq[Peer]
     for peer in pm.peers.values:
       if peer.state == psDisconnected:
@@ -549,18 +771,20 @@ proc mainLoop*(pm: PeerManager) {.async.} =
   info "peer manager main loop stopped"
 
 proc stop*(pm: PeerManager) =
-  ## Stop the peer manager
   pm.running = false
   pm.stopListener()
 
-  # Disconnect all peers
+  # Save anchors before shutdown
+  pm.saveAnchors()
+
   for peer in pm.peers.values:
     asyncSpawn peer.disconnect()
 
   pm.peers.clear()
+  pm.extendedPeers.clear()
+  pm.outboundNetGroups.clear()
 
 proc addKnownAddress*(pm: PeerManager, address: NetAddress) =
-  ## Add a known address for future connection attempts
   pm.knownAddresses.add(address)
 
 proc getKnownAddresses*(pm: PeerManager): seq[NetAddress] =
@@ -586,3 +810,7 @@ proc completeInFlightBlock*(pm: PeerManager, hash: BlockHash) =
 proc getInFlightBlocks*(pm: PeerManager): seq[BlockHash] =
   for hash in pm.inFlightBlocks.keys:
     result.add(hash)
+
+# Legacy compatibility: keep maxOutbound as alias
+proc maxOutbound*(pm: PeerManager): int =
+  pm.maxOutboundFullRelay + pm.maxOutboundBlockRelay
