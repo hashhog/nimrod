@@ -50,6 +50,14 @@ const
   RpcInvalidParams* = -32602
   RpcInternalError* = -32603
 
+  # Bitcoin Core specific error codes
+  RpcTransactionError* = -25       # Generic transaction error
+  RpcTransactionRejected* = -26    # Transaction rejected by mempool
+  RpcTransactionAlreadyInChain* = -27  # Transaction already confirmed
+
+  # Default maxfeerate: 0.10 BTC/kvB = 10,000,000 sat/kvB = 10,000 sat/vB
+  DefaultMaxFeeRate* = 0.10  # BTC/kvB
+
 proc newRpcError(code: int, msg: string): ref RpcError =
   result = newException(RpcError, msg)
   result.code = code
@@ -482,33 +490,108 @@ proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "invalid transaction: " & e.msg)
 
 proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Submit a raw transaction to the network
+  ## Reference: Bitcoin Core sendrawtransaction RPC
+  ##
+  ## Params:
+  ## [0] hexstring - The hex-encoded raw transaction
+  ## [1] maxfeerate - (optional) Maximum fee rate in BTC/kvB (default 0.10)
+  ##
+  ## Returns: txid as hex string
+  ## Errors:
+  ## - RPC_TRANSACTION_REJECTED (-26): Mempool rejected the tx
+  ## - RPC_TRANSACTION_ALREADY_IN_CHAIN (-27): Tx already confirmed
+  ## - RPC_TRANSACTION_ERROR (-25): Generic tx error (missing inputs, etc.)
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing hexstring parameter")
 
   let txHex = params[0].getStr()
 
+  # Parse maxfeerate parameter (BTC/kvB, default 0.10)
+  var maxFeeRate = DefaultMaxFeeRate  # 0.10 BTC/kvB
+  if params.len >= 2:
+    if params[1].kind == JFloat:
+      maxFeeRate = params[1].getFloat()
+    elif params[1].kind == JInt:
+      maxFeeRate = float64(params[1].getInt())
+    elif params[1].kind == JString:
+      try:
+        maxFeeRate = parseFloat(params[1].getStr())
+      except ValueError:
+        raise newRpcError(RpcInvalidParams, "invalid maxfeerate")
+
+  # Reject fee rates > 1 BTC/kvB (sanity check per Bitcoin Core)
+  if maxFeeRate > 1.0:
+    raise newRpcError(RpcInvalidParams, "maxfeerate cannot exceed 1 BTC/kvB")
+
   try:
     let txBytes = hexToBytes(txHex)
     let tx = deserializeTransaction(txBytes)
+    let txid = tx.txid()
+    let txidHex = reverseHex(toHex(array[32, byte](txid)))
+
+    # Check if transaction is already in chain
+    # If any output of this transaction exists in the UTXO set, it's confirmed
+    let utxo = rpc.chainState.getUtxo(OutPoint(txid: txid, vout: 0))
+    if utxo.isSome:
+      raise newRpcError(RpcTransactionAlreadyInChain, "transaction already in block chain")
+
+    # Also check tx index if available
+    let locOpt = rpc.chainState.db.getTxIndex(txid)
+    if locOpt.isSome:
+      raise newRpcError(RpcTransactionAlreadyInChain, "transaction already in block chain")
+
+    # Check if already in mempool - this is idempotent, return txid without error
+    if rpc.mempool.contains(txid):
+      # Already in mempool, just return the txid (idempotent)
+      # Re-broadcast to peers to help propagation
+      if rpc.peerManager != nil:
+        asyncSpawn rpc.peerManager.broadcastTx(tx)
+      return %txidHex
+
+    # Calculate transaction weight and fee rate
+    let weight = calculateTransactionWeight(tx)
+    let vsize = (weight + 3) div 4  # Round up
 
     # Add to mempool (validates the transaction)
     var mp = rpc.mempool
     let acceptResult = mp.acceptTransaction(tx, rpc.crypto)
 
     if not acceptResult.isOk:
-      raise newRpcError(RpcInvalidParams, acceptResult.error)
+      let errMsg = acceptResult.error
+      # Map error messages to appropriate error codes
+      if errMsg.contains("input not found") or errMsg.contains("missing"):
+        raise newRpcError(RpcTransactionError, "missing inputs: " & errMsg)
+      elif errMsg.contains("double spend"):
+        raise newRpcError(RpcTransactionRejected, errMsg)
+      else:
+        raise newRpcError(RpcTransactionRejected, errMsg)
 
-    let txid = acceptResult.value
+    # Get the fee from mempool entry to check maxfeerate
+    let entry = rpc.mempool.get(txid)
+    if entry.isSome:
+      let fee = int64(entry.get().fee)
+      # Convert maxfeerate from BTC/kvB to sat/vB
+      # 0.10 BTC/kvB = 0.10 * 100,000,000 / 1000 = 10,000 sat/vB
+      let maxFeeRateSatPerVb = maxFeeRate * 100_000_000.0 / 1000.0
+      let actualFeeRate = float64(fee) / float64(vsize)
 
-    # Broadcast to peers
+      if maxFeeRate > 0 and actualFeeRate > maxFeeRateSatPerVb:
+        # Remove from mempool - fee too high
+        mp.removeTransaction(txid)
+        let feeRateBtcKvb = actualFeeRate * 1000.0 / 100_000_000.0
+        raise newRpcError(RpcTransactionRejected,
+          "fee rate " & $feeRateBtcKvb & " BTC/kvB exceeds maxfeerate " & $maxFeeRate & " BTC/kvB")
+
+    # Broadcast inv to peers (let them request the full tx)
     if rpc.peerManager != nil:
       asyncSpawn rpc.peerManager.broadcastTx(tx)
 
-    %reverseHex(toHex(array[32, byte](txid)))
+    %txidHex
   except RpcError:
     raise
   except CatchableError as e:
-    raise newRpcError(RpcInvalidParams, "invalid transaction: " & e.msg)
+    raise newRpcError(RpcInvalidParams, "TX decode failed: " & e.msg)
 
 # Network RPCs
 proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
