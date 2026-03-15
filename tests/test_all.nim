@@ -35,6 +35,10 @@ import ./test_versionbits
 import ./test_handshake
 import ./test_pre_handshake
 import ./test_relay
+import ./test_netgroup
+import ./test_eviction
+import ./test_anchor
+import ./test_eclipse
 
 when isMainModule:
   echo "Running all tests..."
