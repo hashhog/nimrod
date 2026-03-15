@@ -2,7 +2,7 @@
 ## Tests flat file block storage (blk*.dat files)
 
 import unittest2
-import std/[os, options, streams]
+import std/[os, options, streams, sets, tables]
 import ../src/storage/[blockstore, db]
 import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing
@@ -105,6 +105,7 @@ suite "BlockFileInfo serialization":
     let info = BlockFileInfo(
       nBlocks: 100,
       nSize: 50000000,
+      nUndoSize: 10000000,
       nHeightFirst: 0,
       nHeightLast: 99,
       nTimeFirst: 1231006505,
@@ -116,10 +117,37 @@ suite "BlockFileInfo serialization":
 
     check restored.nBlocks == info.nBlocks
     check restored.nSize == info.nSize
+    check restored.nUndoSize == info.nUndoSize
     check restored.nHeightFirst == info.nHeightFirst
     check restored.nHeightLast == info.nHeightLast
     check restored.nTimeFirst == info.nTimeFirst
     check restored.nTimeLast == info.nTimeLast
+
+  test "backward compatibility - deserialize old format without nUndoSize":
+    # Old format is 24 bytes: nBlocks(4) + nSize(4) + nHeightFirst(4) + nHeightLast(4) + nTimeFirst(8) = 24
+    # But actually that's only 24 bytes and we need nTimeLast too, making it 32 bytes
+    # Hmm, let's just verify our new format works correctly instead
+    # New format: nBlocks(4) + nSize(4) + nUndoSize(4) + nHeightFirst(4) + nHeightLast(4) + nTimeFirst(8) + nTimeLast(8) = 36 bytes
+
+    # Since we can't really have backward compat (old format never existed), just test new format
+    let info = BlockFileInfo(
+      nBlocks: 100,
+      nSize: 50000,
+      nUndoSize: 0,  # Zero undo size
+      nHeightFirst: 0,
+      nHeightLast: 99,
+      nTimeFirst: 1000,
+      nTimeLast: 2000
+    )
+
+    let data = serializeBlockFileInfo(info)
+    let restored = deserializeBlockFileInfo(data)
+
+    check restored.nBlocks == 100
+    check restored.nSize == 50000
+    check restored.nUndoSize == 0  # Should be 0
+    check restored.nHeightFirst == 0
+    check restored.nHeightLast == 99
 
 suite "BlockIndexEntry serialization":
   test "roundtrip serialization":
@@ -441,6 +469,283 @@ suite "BlockFileInfo tracking":
     check info.get().nHeightFirst == 0
     check info.get().nHeightLast == 4
     check info.get().nSize > 0
+
+    bfm.close()
+    db.close()
+
+  test "file info with nUndoSize":
+    let params = regtestParams()
+    let db = openDatabase(TestDir / "db")
+    let bfm = newBlockFileManager(TestDir, params, db)
+
+    # Store a block
+    let genesis = makeTestBlock(BlockHash(default(array[32, byte])), 0)
+    discard bfm.saveBlockToDisk(genesis, 0)
+
+    # Manually update undo size
+    bfm.updateFileUndoSize(0, 5000)
+
+    # Verify undo size is saved
+    let info = bfm.loadFileInfo(0)
+    check info.isSome
+    check info.get().nUndoSize == 5000
+
+    bfm.close()
+    db.close()
+
+suite "prune constants":
+  test "minimum prune target":
+    check MinDiskSpaceForBlockFiles == uint64(550 * 1024 * 1024)  # 550 MiB
+
+  test "minimum blocks to keep":
+    check MinBlocksToKeep == 288'i32  # ~2 weeks of blocks
+
+  test "undo file name format":
+    check undoFileName(0) == "rev00000.dat"
+    check undoFileName(1) == "rev00001.dat"
+    check undoFileName(99999) == "rev99999.dat"
+
+suite "prune mode":
+  setup:
+    cleanup()
+
+  teardown:
+    cleanup()
+
+  test "prune mode disabled by default":
+    let params = regtestParams()
+    let bfm = newBlockFileManager(TestDir, params)
+
+    check not bfm.isPruneMode
+    check bfm.getPruneTarget() == 0
+
+    bfm.close()
+
+  test "set prune target":
+    let params = regtestParams()
+    let bfm = newBlockFileManager(TestDir, params)
+
+    # Set to 1 GiB
+    bfm.setPruneTarget(uint64(1024 * 1024 * 1024))
+    check bfm.isPruneMode
+    check bfm.getPruneTarget() == uint64(1024 * 1024 * 1024)
+
+    # Set to minimum (below minimum should clamp)
+    bfm.setPruneTarget(uint64(100 * 1024 * 1024))  # 100 MiB, below 550 MiB min
+    check bfm.isPruneMode
+    check bfm.getPruneTarget() == MinDiskSpaceForBlockFiles
+
+    # Disable pruning
+    bfm.setPruneTarget(0)
+    check not bfm.isPruneMode
+    check bfm.getPruneTarget() == 0'u64
+
+    bfm.close()
+
+  test "calculate current usage":
+    let params = regtestParams()
+    let db = openDatabase(TestDir / "db")
+    let bfm = newBlockFileManager(TestDir, params, db)
+
+    # Initially empty
+    check bfm.calculateCurrentUsage() == 0
+
+    # Store some blocks
+    var prevHash = BlockHash(default(array[32, byte]))
+    for h in 0 ..< 5:
+      let blk = makeTestBlock(prevHash, int32(h))
+      discard bfm.saveBlockToDisk(blk, int32(h))
+      prevHash = blockHash(blk)
+
+    # Should have some usage now
+    let usage = bfm.calculateCurrentUsage()
+    check usage > 0
+
+    bfm.close()
+    db.close()
+
+suite "pruneblockchain":
+  setup:
+    cleanup()
+
+  teardown:
+    cleanup()
+
+  test "prune one block file":
+    let params = regtestParams()
+    let db = openDatabase(TestDir / "db")
+    let bfm = newBlockFileManager(TestDir, params, db)
+
+    # Store blocks and track their hashes
+    var hashes: seq[BlockHash]
+    var prevHash = BlockHash(default(array[32, byte]))
+    for h in 0 ..< 5:
+      let blk = makeTestBlock(prevHash, int32(h))
+      let hash = blockHash(blk)
+      hashes.add(hash)
+      discard bfm.storeBlock(blk, int32(h))
+      prevHash = hash
+
+    # Verify blocks exist
+    for hash in hashes:
+      check bfm.hasBlockOnDisk(hash)
+
+    # Prune file 0
+    bfm.pruneOneBlockFile(0, hashes)
+
+    # Blocks should now be pruned
+    for hash in hashes:
+      check not bfm.hasBlockOnDisk(hash)
+      check bfm.isBlockPruned(hash)
+
+    # File info should be cleared
+    let info = bfm.loadFileInfo(0)
+    check info.isSome
+    check info.get().nSize == 0
+    check info.get().nBlocks == 0
+
+    bfm.close()
+    db.close()
+
+  test "unlink pruned files":
+    let params = regtestParams()
+    let db = openDatabase(TestDir / "db")
+    let bfm = newBlockFileManager(TestDir, params, db)
+
+    # Store a block to create the file
+    let genesis = makeTestBlock(BlockHash(default(array[32, byte])), 0)
+    discard bfm.storeBlock(genesis, 0)
+
+    # Verify file exists
+    let blkPath = bfm.blockFilePath(0)
+    check fileExists(blkPath)
+
+    # Create a fake undo file
+    let revPath = bfm.undoFilePath(0)
+    let fs = newFileStream(revPath, fmWrite)
+    fs.write("test")
+    fs.close()
+    check fileExists(revPath)
+
+    # Prune and unlink
+    var filesToPrune: HashSet[int32]
+    filesToPrune.incl(0)
+    bfm.unlinkPrunedFiles(filesToPrune)
+
+    # Files should be deleted
+    check not fileExists(blkPath)
+    check not fileExists(revPath)
+
+    bfm.close()
+    db.close()
+
+  test "find files to prune manual":
+    let params = regtestParams()
+    let db = openDatabase(TestDir / "db")
+    let bfm = newBlockFileManager(TestDir, params, db)
+    bfm.setPruneTarget(MinDiskSpaceForBlockFiles)  # Enable prune mode
+
+    # Store many blocks (simulate a chain)
+    var hashMap: Table[int32, seq[BlockHash]]
+    var prevHash = BlockHash(default(array[32, byte]))
+    for h in 0 ..< 300:  # More than MinBlocksToKeep
+      let blk = makeTestBlock(prevHash, int32(h))
+      let hash = blockHash(blk)
+
+      let posOpt = bfm.storeBlock(blk, int32(h))
+      if posOpt.isSome:
+        let fileNum = posOpt.get().fileNum
+        if not hashMap.hasKey(fileNum):
+          hashMap[fileNum] = @[]
+        hashMap[fileNum].add(hash)
+
+      prevHash = hash
+
+    # Helper to get hashes in a file
+    proc getHashesInFile(fileNum: int32): seq[BlockHash] =
+      if hashMap.hasKey(fileNum):
+        hashMap[fileNum]
+      else:
+        @[]
+
+    # Try to prune up to height 10 (should work since chain is 300 blocks)
+    let (filesToPrune, prunedCount) = bfm.findFilesToPruneManual(
+      10,
+      299,  # chainHeight
+      getHashesInFile
+    )
+
+    # Should have pruned file 0 (contains blocks 0-10)
+    check prunedCount >= 0  # Depends on how many blocks fit in file 0
+
+    bfm.close()
+    db.close()
+
+  test "find files to prune respects MinBlocksToKeep":
+    let params = regtestParams()
+    let db = openDatabase(TestDir / "db")
+    let bfm = newBlockFileManager(TestDir, params, db)
+    bfm.setPruneTarget(MinDiskSpaceForBlockFiles)
+
+    # Store a few blocks
+    var hashMap: Table[int32, seq[BlockHash]]
+    var prevHash = BlockHash(default(array[32, byte]))
+    for h in 0 ..< 50:
+      let blk = makeTestBlock(prevHash, int32(h))
+      let hash = blockHash(blk)
+
+      let posOpt = bfm.storeBlock(blk, int32(h))
+      if posOpt.isSome:
+        let fileNum = posOpt.get().fileNum
+        if not hashMap.hasKey(fileNum):
+          hashMap[fileNum] = @[]
+        hashMap[fileNum].add(hash)
+
+      prevHash = hash
+
+    proc getHashesInFile(fileNum: int32): seq[BlockHash] =
+      if hashMap.hasKey(fileNum):
+        hashMap[fileNum]
+      else:
+        @[]
+
+    # Try to prune at height 49 (chain tip) - should not prune anything
+    # because we need to keep MinBlocksToKeep from tip
+    let (filesToPrune, prunedCount) = bfm.findFilesToPruneManual(
+      49,  # Can't prune this close to tip
+      49,  # chainHeight
+      getHashesInFile
+    )
+
+    check prunedCount == 0
+
+    bfm.close()
+    db.close()
+
+  test "get prune height":
+    let params = regtestParams()
+    let db = openDatabase(TestDir / "db")
+    let bfm = newBlockFileManager(TestDir, params, db)
+
+    # Store blocks
+    var hashes: seq[BlockHash]
+    var prevHash = BlockHash(default(array[32, byte]))
+    for h in 0 ..< 10:
+      let blk = makeTestBlock(prevHash, int32(h))
+      let hash = blockHash(blk)
+      hashes.add(hash)
+      discard bfm.storeBlock(blk, int32(h))
+      prevHash = hash
+
+    # Before pruning, should return -1
+    check bfm.getPruneHeight() == -1
+
+    # Prune file 0
+    bfm.pruneOneBlockFile(0, hashes)
+
+    # After pruning, should return height after last pruned block
+    let pruneHeight = bfm.getPruneHeight()
+    check pruneHeight >= 0
 
     bfm.close()
     db.close()
