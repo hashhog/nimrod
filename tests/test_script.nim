@@ -429,6 +429,16 @@ suite "script interpreter - script patterns":
       script.add(byte(i))
     check isP2TR(script) == true
 
+  test "P2A script pattern detection":
+    # OP_1 <0x4e73> (Pay-to-Anchor)
+    let script = @[0x51'u8, 0x02, 0x4e, 0x73]
+    check isP2A(script) == true
+    # Verify it's also a witness program v1
+    let (isWitness, version, program) = isWitnessProgram(script)
+    check isWitness == true
+    check version == 1
+    check program.len == 2
+
   test "witness program detection v0":
     var script: seq[byte] = @[OP_0, 0x14'u8]
     for i in 0 ..< 20:
