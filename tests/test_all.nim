@@ -39,6 +39,7 @@ import ./test_netgroup
 import ./test_eviction
 import ./test_anchor
 import ./test_eclipse
+import ./test_blockstore
 
 when isMainModule:
   echo "Running all tests..."
