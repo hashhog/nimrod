@@ -7,8 +7,10 @@ import ../primitives/[types, serialize]
 import ../crypto/[hashing, secp256k1, address, base58]
 import ../consensus/params
 import ../storage/chainstate
+import ./coinselection
 
 export address.AddressType, address.Address
+export coinselection
 
 type
   WalletError* = object of CatchableError
@@ -353,7 +355,7 @@ proc newWalletFromSeed*(seed: array[64, byte],
   result.mainnet = params.network == Mainnet
 
 proc derivePath(wallet: Wallet, purpose, coinType, account, chain, index: uint32): DerivedKey =
-  ## Derive a key at the specified BIP44/84/86 path
+  ## Derive a key at the specified BIP44/49/84/86 path
   let path = "m/" & $purpose & "'/" & $coinType & "'/" & $account & "'/" & $chain & "/" & $index
   let extKey = derivePathStr(wallet.masterKey, path)
 
@@ -365,6 +367,14 @@ proc derivePath(wallet: Wallet, purpose, coinType, account, chain, index: uint32
   of 44:  # BIP44 - P2PKH
     let pkh = hash160(extKey.publicKey)
     result.address = Address(kind: P2PKH, pubkeyHash: pkh)
+  of 49:  # BIP49 - P2SH-P2WPKH (wrapped segwit)
+    # The redeemScript is: OP_0 <20-byte-hash>
+    # The scriptHash is: HASH160(redeemScript)
+    let wpkh = hash160(extKey.publicKey)
+    var redeemScript = @[0x00'u8, 0x14]  # OP_0 PUSH20
+    redeemScript.add(@wpkh)
+    let scriptHash = hash160(redeemScript)
+    result.address = Address(kind: P2SH, scriptHash: scriptHash)
   of 84:  # BIP84 - P2WPKH
     let wpkh = hash160(extKey.publicKey)
     result.address = Address(kind: P2WPKH, wpkh: wpkh)
@@ -416,13 +426,60 @@ proc ensureGap(wallet: var Wallet, account: var Account, isInternal: bool) =
     else:
       account.externalKeys.add(newKey)
 
+proc purposeForAddressType*(addrType: AddressType): uint32 =
+  ## Get the BIP purpose number for an address type
+  case addrType
+  of P2PKH: 44
+  of P2SH: 49   # P2SH-P2WPKH
+  of P2WPKH: 84
+  of P2TR: 86
+  of P2WSH: 84  # Use same as P2WPKH for now
+
+proc findOrCreateAccountForType*(wallet: var Wallet, addrType: AddressType): int =
+  ## Find an existing account for the address type, or create one
+  let purpose = purposeForAddressType(addrType)
+
+  # Look for existing account with matching purpose
+  for i, account in wallet.accounts:
+    if account.purpose == purpose:
+      return i
+
+  # No matching account found, create one
+  let coinType: uint32 = if wallet.mainnet: 0 else: 1
+  let accountIndex: uint32 = 0
+  let gap = 20
+
+  var account = Account(
+    purpose: purpose,
+    coinType: coinType,
+    accountIndex: accountIndex,
+    externalKeys: @[],
+    internalKeys: @[],
+    nextExternal: 0,
+    nextInternal: 0,
+    gap: gap
+  )
+
+  # Pre-derive initial keys up to gap limit
+  for i in 0 ..< gap:
+    account.externalKeys.add(wallet.derivePath(purpose, coinType, accountIndex, 0, uint32(i)))
+    account.internalKeys.add(wallet.derivePath(purpose, coinType, accountIndex, 1, uint32(i)))
+
+  wallet.accounts.add(account)
+  wallet.accounts.len - 1
+
 proc getNewAddress*(wallet: var Wallet, addrType: AddressType = P2WPKH,
-                    accountIdx: int = 0, isChange: bool = false): Address =
+                    accountIdx: int = -1, isChange: bool = false): Address =
   ## Get a new receiving or change address
-  if accountIdx >= wallet.accounts.len:
+  ## If accountIdx is -1, automatically find/create appropriate account for address type
+
+  var actualIdx = accountIdx
+  if actualIdx < 0:
+    actualIdx = wallet.findOrCreateAccountForType(addrType)
+  elif actualIdx >= wallet.accounts.len:
     raise newException(WalletError, "account not found: " & $accountIdx)
 
-  var account = wallet.accounts[accountIdx]
+  var account = wallet.accounts[actualIdx]
 
   let key = if isChange:
     let idx = account.nextInternal
@@ -435,13 +492,27 @@ proc getNewAddress*(wallet: var Wallet, addrType: AddressType = P2WPKH,
     wallet.ensureGap(account, false)
     account.externalKeys[idx]
 
-  wallet.accounts[accountIdx] = account
+  wallet.accounts[actualIdx] = account
   result = key.address
 
 proc getNewAddressStr*(wallet: var Wallet, addrType: AddressType = P2WPKH,
-                       accountIdx: int = 0, isChange: bool = false): string =
+                       accountIdx: int = -1, isChange: bool = false): string =
   ## Get a new address as a string
   encodeAddress(wallet.getNewAddress(addrType, accountIdx, isChange), wallet.mainnet)
+
+proc getNewAddressByTypeName*(wallet: var Wallet, typeName: string,
+                               isChange: bool = false): string =
+  ## Get a new address by type name string (for RPC compatibility)
+  ## Supported: "legacy", "p2sh-segwit", "bech32", "bech32m"
+  let addrType = case typeName.toLowerAscii()
+    of "legacy": P2PKH
+    of "p2sh-segwit": P2SH  # P2SH-P2WPKH
+    of "bech32": P2WPKH
+    of "bech32m": P2TR
+    else:
+      raise newException(WalletError, "unknown address type: " & typeName)
+
+  wallet.getNewAddressStr(addrType, -1, isChange)
 
 proc getAllAddresses*(wallet: Wallet, accountIdx: int = 0): seq[string] =
   ## Get all generated addresses for an account
@@ -551,10 +622,72 @@ type
   CoinSelectionResult = object
     inputs: seq[WalletUtxo]
     totalIn: Satoshi
+    totalEffective: Satoshi
     fee: Satoshi
+    needsChange: bool
 
-proc selectCoins(wallet: Wallet, targetAmount: Satoshi, feeRate: float64): CoinSelectionResult =
-  ## Simple coin selection - largest first
+proc getInputWeight(scriptPubKey: seq[byte]): int =
+  ## Determine input weight based on scriptPubKey type
+  if scriptPubKey.len == 22 and scriptPubKey[0] == 0x00 and scriptPubKey[1] == 0x14:
+    # P2WPKH
+    return P2WpkhInputWeight
+  elif scriptPubKey.len == 34 and scriptPubKey[0] == 0x51 and scriptPubKey[1] == 0x20:
+    # P2TR
+    return P2TrInputWeight
+  elif scriptPubKey.len == 25 and scriptPubKey[0] == 0x76 and scriptPubKey[1] == 0xa9:
+    # P2PKH
+    return P2PkhInputWeight
+  elif scriptPubKey.len == 23 and scriptPubKey[0] == 0xa9 and scriptPubKey[1] == 0x14:
+    # P2SH (assume P2SH-P2WPKH)
+    return P2ShP2WpkhInputWeight
+  else:
+    # Default to P2WPKH
+    return P2WpkhInputWeight
+
+proc selectCoinsAdvanced(wallet: Wallet, targetAmount: Satoshi, feeRate: float64): CoinSelectionResult =
+  ## Advanced coin selection using BnB and Knapsack algorithms
+  var selectableCoins: seq[SelectableCoin]
+
+  # Convert wallet UTXOs to selectable coins
+  for _, utxo in wallet.utxos:
+    let weight = getInputWeight(utxo.output.scriptPubKey)
+    let coin = newSelectableCoin(
+      utxo.outpoint,
+      utxo.output.value,
+      weight,
+      feeRate,
+      feeRate  # Using same rate for long-term estimate
+    )
+    if int64(coin.effectiveValue) > 0:
+      selectableCoins.add(coin)
+
+  if selectableCoins.len == 0:
+    raise newException(WalletError, "no spendable UTXOs")
+
+  # Calculate cost of change output
+  let changeCost = Satoshi(int64((float64(P2WpkhOutputWeight) / 4.0 + float64(P2WpkhInputWeight) / 4.0) * feeRate))
+  let minChange = Satoshi(max(int64(MinChangeValue), int64(changeCost)))
+
+  # Run coin selection
+  let selection = selectCoins(selectableCoins, targetAmount, changeCost, minChange)
+
+  # Map selected coins back to wallet UTXOs
+  for coin in selection.coins:
+    for _, utxo in wallet.utxos:
+      if utxo.outpoint == coin.outpoint:
+        result.inputs.add(utxo)
+        result.totalIn = Satoshi(int64(result.totalIn) + int64(utxo.output.value))
+        break
+
+  result.totalEffective = selection.totalEffectiveValue
+  result.fee = selection.totalFee
+
+  # Determine if change is needed
+  let excess = int64(selection.totalEffectiveValue) - int64(targetAmount)
+  result.needsChange = excess >= int64(minChange)
+
+proc selectCoinsSimple(wallet: Wallet, targetAmount: Satoshi, feeRate: float64): CoinSelectionResult =
+  ## Simple coin selection - largest first (fallback)
   var available: seq[WalletUtxo]
   for _, utxo in wallet.utxos:
     available.add(utxo)
@@ -562,8 +695,7 @@ proc selectCoins(wallet: Wallet, targetAmount: Satoshi, feeRate: float64): CoinS
   # Sort by value descending
   available.sort(proc(a, b: WalletUtxo): int = cmp(int64(b.output.value), int64(a.output.value)))
 
-  # Estimate input size for fee calculation (P2WPKH: ~68 vbytes)
-  const inputVsize = 68
+  # Estimate input size for fee calculation
   const outputVsize = 31  # P2WPKH output
   const txOverhead = 10   # version + locktime + segwit marker
 
@@ -575,23 +707,29 @@ proc selectCoins(wallet: Wallet, targetAmount: Satoshi, feeRate: float64): CoinS
     totalIn = totalIn + utxo.output.value
 
     # Estimate transaction size and fee
-    let numInputs = selectedInputs.len
+    var totalInputVsize = 0
+    for inp in selectedInputs:
+      totalInputVsize += getInputWeight(inp.output.scriptPubKey) div 4
+
     let numOutputs = 2  # target + change
-    let estVsize = txOverhead + numInputs * inputVsize + numOutputs * outputVsize
+    let estVsize = txOverhead + totalInputVsize + numOutputs * outputVsize
     let fee = Satoshi(int64(float64(estVsize) * feeRate))
 
     if int64(totalIn) >= int64(targetAmount) + int64(fee):
       result.inputs = selectedInputs
       result.totalIn = totalIn
       result.fee = fee
+      result.needsChange = true
       return
 
   raise newException(WalletError, "insufficient funds")
 
 proc createTransaction*(wallet: var Wallet, outputs: seq[TxOut],
-                        feeRate: float64 = 1.0): Transaction =
+                        feeRate: float64 = 1.0,
+                        useAdvancedCoinSelection: bool = true): Transaction =
   ## Create a new transaction
   ## feeRate is in satoshis per virtual byte
+  ## useAdvancedCoinSelection: use BnB/Knapsack (true) or largest-first (false)
 
   # Calculate total output amount
   var totalOut = Satoshi(0)
@@ -599,7 +737,14 @@ proc createTransaction*(wallet: var Wallet, outputs: seq[TxOut],
     totalOut = totalOut + output.value
 
   # Select coins
-  let selection = selectCoins(wallet, totalOut, feeRate)
+  let selection = if useAdvancedCoinSelection:
+    try:
+      selectCoinsAdvanced(wallet, totalOut, feeRate)
+    except CoinSelectionError:
+      # Fall back to simple selection
+      selectCoinsSimple(wallet, totalOut, feeRate)
+  else:
+    selectCoinsSimple(wallet, totalOut, feeRate)
 
   # Build transaction
   result.version = 2
@@ -611,7 +756,7 @@ proc createTransaction*(wallet: var Wallet, outputs: seq[TxOut],
   for utxo in selection.inputs:
     result.inputs.add(TxIn(
       prevOut: utxo.outpoint,
-      scriptSig: @[],  # Empty for segwit
+      scriptSig: @[],  # Empty for segwit (filled in for P2SH-P2WPKH)
       sequence: 0xfffffffd'u32  # RBF enabled
     ))
 
@@ -621,8 +766,21 @@ proc createTransaction*(wallet: var Wallet, outputs: seq[TxOut],
 
   # Add change output if needed
   let change = selection.totalIn - totalOut - selection.fee
-  if int64(change) > int64(wallet.params.dustLimit):
-    let changeAddr = wallet.getNewAddress(P2WPKH, 0, true)
+  if selection.needsChange and int64(change) > int64(wallet.params.dustLimit):
+    # Use same address type as first output for change
+    var changeAddrType = P2WPKH
+    if outputs.len > 0:
+      let spk = outputs[0].scriptPubKey
+      if spk.len == 22 and spk[0] == 0x00:
+        changeAddrType = P2WPKH
+      elif spk.len == 34 and spk[0] == 0x51:
+        changeAddrType = P2TR
+      elif spk.len == 25 and spk[0] == 0x76:
+        changeAddrType = P2PKH
+      elif spk.len == 23 and spk[0] == 0xa9:
+        changeAddrType = P2SH
+
+    let changeAddr = wallet.getNewAddress(changeAddrType, -1, true)
     result.outputs.add(TxOut(
       value: change,
       scriptPubKey: scriptPubKeyForAddress(changeAddr)
