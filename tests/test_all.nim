@@ -24,6 +24,9 @@ import ./test_sync
 import ./test_headerssync
 import ./test_wallet
 import ./test_coinselection
+import ./test_maturity
+import ./test_encrypt
+import ./test_label
 import ./test_rpc
 import ./test_perf
 import ./test_sequence_lock
