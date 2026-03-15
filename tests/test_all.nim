@@ -28,6 +28,8 @@ import ./test_sequence_lock
 import ./test_bip68
 import ./test_sigop
 import ./test_difficulty
+import ./test_misbehavior
+import ./test_banman
 
 when isMainModule:
   echo "Running all tests..."
