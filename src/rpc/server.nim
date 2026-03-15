@@ -13,6 +13,7 @@ import ../mempool/mempool
 import ../crypto/[hashing, secp256k1, address]
 import ../network/[peer, peermanager, banman]
 import ../mining/[fees, blocktemplate]
+import ../wallet/wallet
 
 type
   RpcError* = object of CatchableError
@@ -30,6 +31,7 @@ type
     running*: bool
     crypto*: CryptoEngine
     blockFileManager*: BlockFileManager  ## Optional: for pruning support
+    wallet*: Wallet                      ## Optional: for wallet RPC commands
 
   RpcRequest = object
     jsonrpc: string
@@ -1550,6 +1552,147 @@ proc handlePruneBlockchain(rpc: RpcServer, params: JsonNode): JsonNode =
   let pruneHeight = rpc.blockFileManager.getPruneHeight()
   %pruneHeight
 
+# ============================================================================
+# Wallet RPCs
+# ============================================================================
+
+proc handleGetNewAddress(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Generate a new address for receiving payments
+  ## Reference: Bitcoin Core wallet/rpc/addresses.cpp getnewaddress
+  ##
+  ## Arguments:
+  ## 1. label (string, optional) - Account label (ignored for now)
+  ## 2. address_type (string, optional) - Address type: "legacy", "p2sh-segwit", "bech32", "bech32m"
+  ##
+  ## Returns: New address string
+  ##
+  ## Note: Requires wallet to be loaded
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  # Parse address type (default to bech32/P2WPKH)
+  var addressType = "bech32"
+  if params.len >= 2 and params[1].kind == JString:
+    addressType = params[1].getStr()
+
+  try:
+    var w = rpc.wallet
+    let addrStr = w.getNewAddressByTypeName(addressType)
+    %addrStr
+  except WalletError as e:
+    raise newRpcError(RpcMiscError, e.msg)
+
+proc handleGetRawChangeAddress(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Generate a new change address
+  ## Reference: Bitcoin Core wallet/rpc/addresses.cpp getrawchangeaddress
+  ##
+  ## Arguments:
+  ## 1. address_type (string, optional) - Address type: "legacy", "p2sh-segwit", "bech32", "bech32m"
+  ##
+  ## Returns: New change address string
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  var addressType = "bech32"
+  if params.len >= 1 and params[0].kind == JString:
+    addressType = params[0].getStr()
+
+  try:
+    var w = rpc.wallet
+    # Use the internal chain for change addresses
+    let addrType = case addressType.toLowerAscii()
+      of "legacy": P2PKH
+      of "p2sh-segwit": P2SH
+      of "bech32": P2WPKH
+      of "bech32m": P2TR
+      else:
+        raise newException(WalletError, "unknown address type: " & addressType)
+
+    let addrStr = w.getNewAddressStr(addrType, -1, true)
+    %addrStr
+  except WalletError as e:
+    raise newRpcError(RpcMiscError, e.msg)
+
+proc handleGetBalance(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Get wallet balance
+  ## Reference: Bitcoin Core wallet/rpc/coins.cpp getbalance
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  let balance = rpc.wallet.getBalance()
+  %*(float64(int64(balance)) / 100_000_000.0)
+
+proc handleListUnspent(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## List unspent transaction outputs
+  ## Reference: Bitcoin Core wallet/rpc/coins.cpp listunspent
+  ##
+  ## Arguments:
+  ## 1. minconf (numeric, optional, default=1) - Minimum confirmations
+  ## 2. maxconf (numeric, optional, default=9999999) - Maximum confirmations
+  ##
+  ## Returns: Array of UTXOs
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  let minconf = if params.len >= 1: params[0].getInt() else: 1
+  let maxconf = if params.len >= 2: params[1].getInt() else: 9999999
+
+  let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
+  let mainnet = rpc.params.network == Mainnet
+
+  var utxoArray = newJArray()
+  for _, utxo in rpc.wallet.utxos:
+    let confs = if utxo.height > 0: currentHeight - utxo.height + 1 else: 0
+    if confs >= minconf and confs <= maxconf:
+      let addrOpt = extractAddressFromScript(utxo.output.scriptPubKey, mainnet)
+      var entry = %*{
+        "txid": reverseHex(toHex(array[32, byte](utxo.outpoint.txid))),
+        "vout": utxo.outpoint.vout,
+        "amount": float64(int64(utxo.output.value)) / 100_000_000.0,
+        "confirmations": confs,
+        "scriptPubKey": toHex(utxo.output.scriptPubKey),
+        "spendable": true,
+        "solvable": true,
+        "safe": true
+      }
+      if addrOpt.isSome:
+        entry["address"] = %addrOpt.get()
+      utxoArray.add(entry)
+
+  utxoArray
+
+proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Get wallet information
+  ## Reference: Bitcoin Core wallet/rpc/wallet.cpp getwalletinfo
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  let balance = rpc.wallet.getBalance()
+  let txCount = rpc.wallet.utxos.len  # Simplified: count UTXOs as proxy for tx count
+
+  %*{
+    "walletname": "default",
+    "walletversion": 1,
+    "format": "nimrod",
+    "balance": float64(int64(balance)) / 100_000_000.0,
+    "unconfirmed_balance": 0.0,
+    "immature_balance": 0.0,
+    "txcount": txCount,
+    "keypoolsize": 20,
+    "keypoolsize_hd_internal": 20,
+    "paytxfee": 0.0,
+    "private_keys_enabled": true,
+    "avoid_reuse": false,
+    "scanning": false,
+    "descriptors": false,
+    "external_signer": false
+  }
+
 proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
   case methodName
   # Blockchain
@@ -1615,6 +1758,18 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
   # Utility
   of "validateaddress":
     rpc.handleValidateAddress(params)
+
+  # Wallet
+  of "getnewaddress":
+    rpc.handleGetNewAddress(params)
+  of "getrawchangeaddress":
+    rpc.handleGetRawChangeAddress(params)
+  of "getbalance":
+    rpc.handleGetBalance(params)
+  of "listunspent":
+    rpc.handleListUnspent(params)
+  of "getwalletinfo":
+    rpc.handleGetWalletInfo(params)
 
   # Control
   of "stop":
