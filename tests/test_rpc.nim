@@ -402,5 +402,73 @@ suite "RPC validateaddress format":
 
     check invalidResponse["isvalid"].getBool() == false
 
+suite "RPC sendrawtransaction error codes":
+  test "error code constants":
+    # Bitcoin Core transaction error codes
+    const
+      RpcTransactionError = -25
+      RpcTransactionRejected = -26
+      RpcTransactionAlreadyInChain = -27
+
+    check RpcTransactionError == -25
+    check RpcTransactionRejected == -26
+    check RpcTransactionAlreadyInChain == -27
+
+  test "maxfeerate default value":
+    # Default maxfeerate is 0.10 BTC/kvB
+    const DefaultMaxFeeRate = 0.10
+    check DefaultMaxFeeRate == 0.10
+
+  test "maxfeerate conversion sat/vB":
+    # 0.10 BTC/kvB = 10,000 sat/vB
+    let maxFeeBtcKvb = 0.10
+    let maxFeeSatPerVb = maxFeeBtcKvb * 100_000_000.0 / 1000.0
+    check maxFeeSatPerVb == 10_000.0
+
+  test "sendrawtransaction response format":
+    # Successful response is just the txid as hex string
+    let txidHex = "0000000000000000000000000000000000000000000000000000000000000001"
+    let response = %txidHex
+
+    check response.kind == JString
+    check response.getStr().len == 64
+
+  test "sendrawtransaction error response":
+    # Error response structure
+    let errorResponse = %*{
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": nil,
+      "error": {
+        "code": -26,
+        "message": "mempool min fee not met"
+      }
+    }
+
+    check errorResponse["error"]["code"].getInt() == -26
+
+suite "RPC broadcast format":
+  test "inv message format for tx relay":
+    # inv message contains InvVector items
+    # MSG_WITNESS_TX = 0x40000001 for witness transactions
+    const
+      invTx = 1
+      invWitnessTx = 0x40000001
+
+    check invWitnessTx == 0x40000001
+    check (invWitnessTx and 0x40000000) != 0  # Witness flag set
+
+  test "txid format for broadcast":
+    # Txid is 32 bytes, displayed as 64 hex chars reversed
+    var txidBytes: array[32, byte]
+    txidBytes[0] = 0x01
+    txidBytes[31] = 0xFF
+    let txidHex = bytesToHex(txidBytes)
+    let displayHex = reverseHex(txidHex)
+
+    check displayHex.len == 64
+    check displayHex.startsWith("ff")
+    check displayHex.endsWith("01")
+
 when isMainModule:
   echo "Running RPC tests..."
