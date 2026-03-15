@@ -35,6 +35,7 @@ type
     height*: int32
     keyPath*: string
     isInternal*: bool
+    isCoinbase*: bool                       # True if from a coinbase transaction
     spentInTxid*: Option[array[32, byte]]  # Set when spent
 
   ## Wallet metadata
@@ -145,6 +146,7 @@ proc open*(wdb: var WalletDb) =
       height INTEGER NOT NULL,
       key_path TEXT NOT NULL,
       is_internal INTEGER NOT NULL,
+      is_coinbase INTEGER NOT NULL DEFAULT 0,
       spent_in_txid BLOB,
       UNIQUE(txid, vout)
     );
@@ -171,9 +173,22 @@ proc open*(wdb: var WalletDb) =
       UNIQUE(purpose, coin_type, account_index)
     );
 
+    CREATE TABLE IF NOT EXISTS labels (
+      address TEXT PRIMARY KEY NOT NULL,
+      label TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS encryption (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      encrypted_seed BLOB NOT NULL,
+      salt BLOB NOT NULL,
+      rounds INTEGER NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_keys_address ON keys(address);
     CREATE INDEX IF NOT EXISTS idx_utxos_key_path ON utxos(key_path);
     CREATE INDEX IF NOT EXISTS idx_utxos_spent ON utxos(spent_in_txid);
+    CREATE INDEX IF NOT EXISTS idx_labels_label ON labels(label);
   """
 
   var errmsg: cstring
@@ -379,8 +394,8 @@ proc saveUtxo*(wdb: WalletDb, utxo: StoredUtxo) =
   let db = Sqlite3(wdb.db)
   let sql = """
     INSERT OR REPLACE INTO utxos
-    (txid, vout, value, script_pubkey, height, key_path, is_internal, spent_in_txid)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    (txid, vout, value, script_pubkey, height, key_path, is_internal, is_coinbase, spent_in_txid)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   """
 
   var stmt: Sqlite3Stmt
@@ -411,11 +426,14 @@ proc saveUtxo*(wdb: WalletDb, utxo: StoredUtxo) =
   rc = sqlite3_bind_int(stmt, 7, cint(if utxo.isInternal: 1 else: 0))
   checkError(db, rc, "bind is_internal")
 
+  rc = sqlite3_bind_int(stmt, 8, cint(if utxo.isCoinbase: 1 else: 0))
+  checkError(db, rc, "bind is_coinbase")
+
   if utxo.spentInTxid.isSome:
     let spent = utxo.spentInTxid.get()
-    rc = sqlite3_bind_blob(stmt, 8, addr spent[0], 32, SQLITE_TRANSIENT)
+    rc = sqlite3_bind_blob(stmt, 9, addr spent[0], 32, SQLITE_TRANSIENT)
   else:
-    rc = sqlite3_bind_blob(stmt, 8, nil, 0, nil)
+    rc = sqlite3_bind_blob(stmt, 9, nil, 0, nil)
   checkError(db, rc, "bind spent_in_txid")
 
   rc = sqlite3_step(stmt)
@@ -464,7 +482,7 @@ proc getUnspentUtxos*(wdb: WalletDb): seq[StoredUtxo] =
 
   let db = Sqlite3(wdb.db)
   let sql = """
-    SELECT txid, vout, value, script_pubkey, height, key_path, is_internal
+    SELECT txid, vout, value, script_pubkey, height, key_path, is_internal, is_coinbase
     FROM utxos WHERE spent_in_txid IS NULL
   """
 
@@ -496,6 +514,7 @@ proc getUnspentUtxos*(wdb: WalletDb): seq[StoredUtxo] =
     utxo.height = int32(sqlite3_column_int(stmt, 4))
     utxo.keyPath = $sqlite3_column_text(stmt, 5)
     utxo.isInternal = sqlite3_column_int(stmt, 6) != 0
+    utxo.isCoinbase = sqlite3_column_int(stmt, 7) != 0
 
     result.add(utxo)
 
@@ -572,3 +591,194 @@ proc getTotalBalance*(wdb: WalletDb): int64 =
 
   result = sqlite3_column_int64(stmt, 0)
   discard sqlite3_finalize(stmt)
+
+# =============================================================================
+# Address Labels
+# =============================================================================
+
+proc saveLabel*(wdb: WalletDb, address: string, label: string) =
+  ## Save or update a label for an address
+  if not wdb.isOpen:
+    raise newException(WalletDbError, "database not open")
+
+  let db = Sqlite3(wdb.db)
+
+  if label.len == 0:
+    # Delete the label
+    let sql = "DELETE FROM labels WHERE address = ?"
+    var stmt: Sqlite3Stmt
+    var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+    if rc == SQLITE_OK:
+      discard sqlite3_bind_text(stmt, 1, address.cstring, -1, SQLITE_TRANSIENT)
+      discard sqlite3_step(stmt)
+      discard sqlite3_finalize(stmt)
+  else:
+    # Insert or update
+    let sql = "INSERT OR REPLACE INTO labels (address, label) VALUES (?, ?)"
+    var stmt: Sqlite3Stmt
+    var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+    checkError(db, rc, "prepare label insert")
+
+    rc = sqlite3_bind_text(stmt, 1, address.cstring, -1, SQLITE_TRANSIENT)
+    checkError(db, rc, "bind address")
+
+    rc = sqlite3_bind_text(stmt, 2, label.cstring, -1, SQLITE_TRANSIENT)
+    checkError(db, rc, "bind label")
+
+    rc = sqlite3_step(stmt)
+    if rc != SQLITE_DONE:
+      checkError(db, rc, "step label insert")
+
+    discard sqlite3_finalize(stmt)
+
+proc getLabel*(wdb: WalletDb, address: string): string =
+  ## Get the label for an address (empty string if none)
+  if not wdb.isOpen:
+    return ""
+
+  let db = Sqlite3(wdb.db)
+  let sql = "SELECT label FROM labels WHERE address = ?"
+
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  if rc != SQLITE_OK:
+    return ""
+
+  rc = sqlite3_bind_text(stmt, 1, address.cstring, -1, SQLITE_TRANSIENT)
+  if rc != SQLITE_OK:
+    discard sqlite3_finalize(stmt)
+    return ""
+
+  rc = sqlite3_step(stmt)
+  if rc != SQLITE_ROW:
+    discard sqlite3_finalize(stmt)
+    return ""
+
+  result = $sqlite3_column_text(stmt, 0)
+  discard sqlite3_finalize(stmt)
+
+proc getAddressesByLabel*(wdb: WalletDb, label: string): seq[string] =
+  ## Get all addresses with a specific label
+  result = @[]
+
+  if not wdb.isOpen:
+    return
+
+  let db = Sqlite3(wdb.db)
+  let sql = "SELECT address FROM labels WHERE label = ?"
+
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  if rc != SQLITE_OK:
+    return
+
+  rc = sqlite3_bind_text(stmt, 1, label.cstring, -1, SQLITE_TRANSIENT)
+  if rc != SQLITE_OK:
+    discard sqlite3_finalize(stmt)
+    return
+
+  while true:
+    rc = sqlite3_step(stmt)
+    if rc != SQLITE_ROW:
+      break
+    result.add($sqlite3_column_text(stmt, 0))
+
+  discard sqlite3_finalize(stmt)
+
+proc getAllLabels*(wdb: WalletDb): seq[tuple[address: string, label: string]] =
+  ## Get all address-label pairs
+  result = @[]
+
+  if not wdb.isOpen:
+    return
+
+  let db = Sqlite3(wdb.db)
+  let sql = "SELECT address, label FROM labels"
+
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  if rc != SQLITE_OK:
+    return
+
+  while true:
+    rc = sqlite3_step(stmt)
+    if rc != SQLITE_ROW:
+      break
+    result.add(($sqlite3_column_text(stmt, 0), $sqlite3_column_text(stmt, 1)))
+
+  discard sqlite3_finalize(stmt)
+
+# =============================================================================
+# Encryption Storage
+# =============================================================================
+
+proc saveEncryption*(wdb: WalletDb, encryptedSeed: seq[byte], salt: array[8, byte],
+                      rounds: int) =
+  ## Save encryption parameters
+  if not wdb.isOpen:
+    raise newException(WalletDbError, "database not open")
+
+  let db = Sqlite3(wdb.db)
+  let sql = """
+    INSERT OR REPLACE INTO encryption (id, encrypted_seed, salt, rounds)
+    VALUES (1, ?, ?, ?)
+  """
+
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  checkError(db, rc, "prepare encryption insert")
+
+  if encryptedSeed.len > 0:
+    rc = sqlite3_bind_blob(stmt, 1, addr encryptedSeed[0], cint(encryptedSeed.len), SQLITE_TRANSIENT)
+  else:
+    rc = sqlite3_bind_blob(stmt, 1, nil, 0, nil)
+  checkError(db, rc, "bind encrypted_seed")
+
+  rc = sqlite3_bind_blob(stmt, 2, addr salt[0], 8, SQLITE_TRANSIENT)
+  checkError(db, rc, "bind salt")
+
+  rc = sqlite3_bind_int(stmt, 3, cint(rounds))
+  checkError(db, rc, "bind rounds")
+
+  rc = sqlite3_step(stmt)
+  if rc != SQLITE_DONE:
+    checkError(db, rc, "step encryption insert")
+
+  discard sqlite3_finalize(stmt)
+
+proc getEncryption*(wdb: WalletDb): Option[tuple[encryptedSeed: seq[byte],
+                                                   salt: array[8, byte],
+                                                   rounds: int]] =
+  ## Get encryption parameters
+  if not wdb.isOpen:
+    return none(tuple[encryptedSeed: seq[byte], salt: array[8, byte], rounds: int])
+
+  let db = Sqlite3(wdb.db)
+  let sql = "SELECT encrypted_seed, salt, rounds FROM encryption WHERE id = 1"
+
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  if rc != SQLITE_OK:
+    return none(tuple[encryptedSeed: seq[byte], salt: array[8, byte], rounds: int])
+
+  rc = sqlite3_step(stmt)
+  if rc != SQLITE_ROW:
+    discard sqlite3_finalize(stmt)
+    return none(tuple[encryptedSeed: seq[byte], salt: array[8, byte], rounds: int])
+
+  var encryptedSeed: seq[byte]
+  let seedLen = sqlite3_column_bytes(stmt, 0)
+  if seedLen > 0:
+    let seedPtr = sqlite3_column_blob(stmt, 0)
+    encryptedSeed = newSeq[byte](seedLen)
+    copyMem(addr encryptedSeed[0], seedPtr, seedLen)
+
+  var salt: array[8, byte]
+  let saltPtr = sqlite3_column_blob(stmt, 1)
+  if saltPtr != nil:
+    copyMem(addr salt[0], saltPtr, 8)
+
+  let rounds = sqlite3_column_int(stmt, 2)
+
+  discard sqlite3_finalize(stmt)
+  some((encryptedSeed, salt, int(rounds)))
