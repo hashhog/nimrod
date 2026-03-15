@@ -55,6 +55,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Performance optimization (parallel sig verification, UTXO cache, RocksDB tuning)
 - [x] BIP-9 version bits (soft fork signaling state machine, deployment tracking)
 - [x] Misbehavior scoring (100-point threshold, persistent ban list, RPC commands)
+- [x] Pre-handshake message rejection (VERSION/VERACK enforcement, protocol version check, self-connection detection, 60s timeout)
 - [ ] Relay mode (post-IBD block/tx propagation)
 
 ## Quick start
