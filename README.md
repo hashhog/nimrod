@@ -63,6 +63,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] sendrawtransaction RPC (maxfeerate validation, idempotent mempool handling, inv broadcast)
 - [x] getrawtransaction RPC (mempool lookup, txindex lookup, blockhash parameter, verbose output with asm/address)
 - [x] Multi-layer UTXO cache (CoinsView hierarchy, dirty/fresh tracking, memory-aware flushing)
+- [x] Block pruning (auto/manual deletion of old blk/rev files, 550 MiB minimum, 288-block safety margin)
 - [ ] Compact block relay (BIP-152)
 
 ## Quick start
