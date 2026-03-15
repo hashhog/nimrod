@@ -1,15 +1,19 @@
 ## Peer connection management
 ## Handles peer discovery, DNS resolution, connection limits, banning, and message routing
 ## 8 outbound + 117 inbound connections, 24h ban duration
+## Misbehavior scoring: 100 points = ban (Bitcoin Core compatible)
 
 import std/[tables, sets, sequtils, random, times, net, strutils, algorithm, options]
 import chronos
 import chronicles
 import ./peer
 import ./messages
+import ./banman
 import ../consensus/params
 import ../primitives/[types, serialize]
 import ../crypto/hashing
+
+export banman
 
 const
   BanDuration* = initDuration(hours = 24)
@@ -35,7 +39,7 @@ type
     params*: ConsensusParams
     localVersion*: VersionMsg
     knownAddresses*: seq[NetAddress]
-    bannedPeers*: Table[string, Time]
+    banManager*: BanManager
     listener*: StreamServer
     onMessage*: PeerCallback
     ourHeight*: int32
@@ -43,6 +47,10 @@ type
     fallbackPeers*: seq[tuple[host: string, port: uint16]]
     inFlightBlocks*: Table[BlockHash, InFlightBlock]
     running*: bool
+    dataDir*: string
+
+# Forward declarations
+proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
 
 proc peerKey(host: string, port: uint16): string =
   host & ":" & $port
@@ -51,7 +59,8 @@ proc peerKey(peer: Peer): string =
   peerKey(peer.address, peer.port)
 
 proc newPeerManager*(params: ConsensusParams, maxOut: int = DefaultMaxOutbound,
-                     maxIn: int = DefaultMaxInbound): PeerManager =
+                     maxIn: int = DefaultMaxInbound,
+                     dataDir: string = "."): PeerManager =
   result = PeerManager(
     params: params,
     peers: initTable[string, Peer](),
@@ -59,13 +68,17 @@ proc newPeerManager*(params: ConsensusParams, maxOut: int = DefaultMaxOutbound,
     maxInbound: maxIn,
     networkMagic: params.magic,
     knownAddresses: @[],
-    bannedPeers: initTable[string, Time](),
+    banManager: newBanManager(dataDir),
     seedNodes: @[],
     fallbackPeers: @[],
     ourHeight: 0,
     inFlightBlocks: initTable[BlockHash, InFlightBlock](),
-    running: false
+    running: false,
+    dataDir: dataDir
   )
+
+  # Load existing ban list
+  result.banManager.load()
 
   # Set up local version message
   result.localVersion = VersionMsg(
@@ -134,23 +147,19 @@ proc inboundCount*(pm: PeerManager): int =
       result += 1
 
 proc isBanned*(pm: PeerManager, address: string): bool =
-  if address notin pm.bannedPeers:
-    return false
-  let banTime = pm.bannedPeers[address]
-  if getTime() > banTime + BanDuration:
-    pm.bannedPeers.del(address)
-    return false
-  true
+  ## Check if address is banned (delegated to BanManager)
+  pm.banManager.isBanned(address)
 
-proc banPeer*(pm: PeerManager, address: string, duration: times.Duration = BanDuration) =
+proc banPeer*(pm: PeerManager, address: string, duration: times.Duration = BanDuration,
+              reason: BanReason = brMisbehaving) =
   ## Ban a peer for the specified duration (default 24h)
-  pm.bannedPeers[address] = getTime()
-  info "peer banned", address = address, duration = $duration
+  pm.banManager.ban(address, duration, reason)
 
   # Disconnect if currently connected
+  let normalizedAddr = normalizeAddress(address)
   var toRemove: seq[string]
   for key, peer in pm.peers:
-    if peer.address == address:
+    if normalizeAddress(peer.address) == normalizedAddr:
       toRemove.add(key)
 
   for key in toRemove:
@@ -158,20 +167,33 @@ proc banPeer*(pm: PeerManager, address: string, duration: times.Duration = BanDu
     asyncSpawn peer.disconnect("banned")
     pm.peers.del(key)
 
-proc unbanPeer*(pm: PeerManager, address: string) =
-  ## Remove ban on a peer
-  pm.bannedPeers.del(address)
-  info "peer unbanned", address = address
+proc unbanPeer*(pm: PeerManager, address: string): bool =
+  ## Remove ban on a peer. Returns true if ban was removed.
+  pm.banManager.unban(address)
 
 proc cleanupBans(pm: PeerManager) =
   ## Remove expired bans
-  var expired: seq[string]
-  let now = getTime()
-  for address, banTime in pm.bannedPeers:
-    if now > banTime + BanDuration:
-      expired.add(address)
-  for address in expired:
-    pm.bannedPeers.del(address)
+  pm.banManager.sweepExpired()
+
+proc misbehavingPeer*(pm: PeerManager, peer: Peer, score: uint32, message: string) =
+  ## Record misbehavior for a peer. At 100 points, the peer is banned.
+  ## Reference: Bitcoin Core net_processing.cpp Misbehaving()
+  var p = peer
+  misbehaving(p, score, message)
+
+  if p.shouldBan():
+    # Ban the peer
+    pm.banPeer(peer.address, BanDuration, brMisbehaving)
+    # Remove peer from our list
+    asyncSpawn pm.removePeer(peer)
+
+proc listBanned*(pm: PeerManager): seq[BanEntry] =
+  ## Get list of all currently banned peers
+  pm.banManager.listBanned()
+
+proc clearBanned*(pm: PeerManager) =
+  ## Clear all bans
+  pm.banManager.clearBanned()
 
 proc resolveDnsSeeds*(pm: PeerManager): Future[seq[string]] {.async.} =
   ## Resolve DNS seed nodes to IP addresses
