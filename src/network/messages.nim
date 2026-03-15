@@ -4,6 +4,7 @@
 
 import ../primitives/[types, serialize]
 import ../crypto/hashing
+import ./compact_blocks
 
 const
   MaxMessagePayload* = 33_554_432  # 32 MiB
@@ -95,6 +96,9 @@ type
     mkFeeFilter
     mkWtxidRelay
     mkSendAddrV2
+    mkCmpctBlock
+    mkGetBlockTxn
+    mkBlockTxn
 
   P2PMessage* = object
     case kind*: MessageKind
@@ -130,6 +134,12 @@ type
       sendCmpct*: SendCmpctMsg
     of mkFeeFilter:
       feeRate*: uint64
+    of mkCmpctBlock:
+      cmpctBlock*: CompactBlock
+    of mkGetBlockTxn:
+      getBlockTxn*: BlockTxnRequest
+    of mkBlockTxn:
+      blockTxn*: BlockTxnResponse
 
 # Command name conversion
 
@@ -348,6 +358,12 @@ proc serializePayload*(msg: P2PMessage): seq[byte] =
     w.writeSendCmpctMsg(msg.sendCmpct)
   of mkFeeFilter:
     w.writeUint64LE(msg.feeRate)
+  of mkCmpctBlock:
+    w.writeCompactBlock(msg.cmpctBlock)
+  of mkGetBlockTxn:
+    w.writeBlockTxnRequest(msg.getBlockTxn)
+  of mkBlockTxn:
+    w.writeBlockTxnResponse(msg.blockTxn)
 
   result = w.data
 
@@ -373,6 +389,9 @@ proc messageKindToCommand*(kind: MessageKind): string =
   of mkFeeFilter: "feefilter"
   of mkWtxidRelay: "wtxidrelay"
   of mkSendAddrV2: "sendaddrv2"
+  of mkCmpctBlock: "cmpctblock"
+  of mkGetBlockTxn: "getblocktxn"
+  of mkBlockTxn: "blocktxn"
 
 proc commandToMessageKind*(cmd: string): MessageKind =
   case cmd
@@ -396,6 +415,9 @@ proc commandToMessageKind*(cmd: string): MessageKind =
   of "feefilter": mkFeeFilter
   of "wtxidrelay": mkWtxidRelay
   of "sendaddrv2": mkSendAddrV2
+  of "cmpctblock": mkCmpctBlock
+  of "getblocktxn": mkGetBlockTxn
+  of "blocktxn": mkBlockTxn
   else:
     raise newException(SerializationError, "unknown command: " & cmd)
 
@@ -515,6 +537,12 @@ proc deserializePayload*(cmd: string, payload: seq[byte]): P2PMessage =
     result = P2PMessage(kind: mkWtxidRelay)
   of "sendaddrv2":
     result = P2PMessage(kind: mkSendAddrV2)
+  of "cmpctblock":
+    result = P2PMessage(kind: mkCmpctBlock, cmpctBlock: r.readCompactBlock())
+  of "getblocktxn":
+    result = P2PMessage(kind: mkGetBlockTxn, getBlockTxn: r.readBlockTxnRequest())
+  of "blocktxn":
+    result = P2PMessage(kind: mkBlockTxn, blockTxn: r.readBlockTxnResponse())
   else:
     raise newException(SerializationError, "unknown command: " & cmd)
 
@@ -595,3 +623,18 @@ proc newBlockMsg*(blk: Block): P2PMessage =
 
 proc newTxMsg*(tx: Transaction): P2PMessage =
   P2PMessage(kind: mkTx, tx: tx)
+
+proc newCmpctBlockMsg*(cb: CompactBlock): P2PMessage =
+  P2PMessage(kind: mkCmpctBlock, cmpctBlock: cb)
+
+proc newGetBlockTxnMsg*(blockHash: BlockHash, indexes: seq[uint16]): P2PMessage =
+  P2PMessage(kind: mkGetBlockTxn, getBlockTxn: BlockTxnRequest(
+    blockHash: blockHash,
+    indexes: indexes
+  ))
+
+proc newBlockTxnMsg*(blockHash: BlockHash, txns: seq[Transaction]): P2PMessage =
+  P2PMessage(kind: mkBlockTxn, blockTxn: BlockTxnResponse(
+    blockHash: blockHash,
+    transactions: txns
+  ))
