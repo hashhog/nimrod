@@ -58,6 +58,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Pre-handshake message rejection (VERSION/VERACK enforcement, protocol version check, self-connection detection, 60s timeout)
 - [x] Inventory trickling (Poisson-distributed tx relay, per-peer queues, immediate block relay)
 - [x] Stale peer eviction (chain sync timeout, ping timeout, headers timeout, extra outbound eviction)
+- [x] Checkpoint verification (minimum chain work, assume-valid, fork rejection below checkpoints)
 - [ ] Compact block relay (BIP-152)
 
 ## Quick start
