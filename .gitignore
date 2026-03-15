@@ -21,6 +21,19 @@ tests/test_chainstate
 tests/test_fees
 tests/test_sync
 tests/test_template
+tests/test_sighash
+tests/test_wallet
+tests/test_rpc
+tests/test_perf
+tests/test_sequence_lock
+tests/test_bip68
+tests/test_sigop
+tests/test_difficulty
+tests/test_undo
+tests/test_witness_cleanstack
+tests/test_witness_pubkeytype
+tests/test_minimalif
+tests/debug_sigop
 
 # Storage test artifacts
 src/storage/chainstate
