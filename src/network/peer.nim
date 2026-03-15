@@ -21,6 +21,17 @@ const
   ScorePreHandshakeMessage* = 10'u32  # Misbehavior for pre-handshake messages
   ScoreDuplicateVersion* = 1'u32      # Misbehavior for duplicate version
 
+  # Stale peer detection constants (Bitcoin Core net_processing.cpp)
+  ChainSyncTimeoutSec* = 20 * 60      # 20 minutes - timeout for peer to catch up to our chain
+  HeadersResponseTimeSec* = 2 * 60    # 2 minutes - time to wait for headers response
+  StaleTipCheckIntervalSec* = 10 * 60 # 10 minutes - how often to check for stale tip
+  ExtraPeerCheckIntervalSec* = 45     # 45 seconds - how often to evict extra outbound peers
+  PingIntervalSec* = 2 * 60           # 2 minutes - interval between ping messages
+  PingTimeoutIntervalSec* = 20 * 60   # 20 minutes - disconnect if no pong received
+  MinimumConnectTimeSec* = 30         # 30 seconds - minimum time before eviction allowed
+  BlockStallingTimeoutDefaultSec* = 2  # 2 seconds - default block stalling timeout
+  BlockStallingTimeoutMaxSec* = 64    # 64 seconds - maximum block stalling timeout
+
 type
   PeerState* = enum
     psDisconnected
@@ -34,6 +45,14 @@ type
     pdOutbound
 
   PeerCallback* = proc(peer: Peer, msg: P2PMessage): Future[void] {.async.}
+
+  ## Chain sync state for outbound peer eviction
+  ## Reference: Bitcoin Core net_processing.cpp ChainSyncTimeoutState
+  ChainSyncState* = object
+    timeout*: int64              # Deadline for peer to catch up (unix seconds, 0 = not set)
+    workHeaderHeight*: int32     # Height of our tip when timeout was set
+    sentGetheaders*: bool        # Whether we've sent getheaders since timeout started
+    protect*: bool               # Protected from chain sync eviction
 
   Peer* = ref object
     address*: string
@@ -73,6 +92,19 @@ type
     # Internal state
     recvBuffer*: seq[byte]
     closing*: bool
+    # Stale peer tracking (Bitcoin Core net_processing.cpp)
+    connectedTime*: chronos.Moment     # When connection was established
+    lastBlockTime*: chronos.Moment     # When peer last sent us a block
+    lastTxTime*: chronos.Moment        # When peer last sent us a transaction
+    lastBlockAnnouncement*: int64      # Unix time of last block announcement (for eviction)
+    bestKnownHeight*: int32            # Best known block height from this peer
+    pingStartTime*: chronos.Moment     # When current ping was sent (for timeout)
+    pingPending*: bool                 # Whether we're waiting for a pong
+    headersRequested*: bool            # Whether we've requested headers from this peer
+    headersRequestTime*: chronos.Moment  # When headers were requested
+    syncStarted*: bool                 # Whether we've started syncing from this peer
+    chainSyncState*: ChainSyncState    # Chain sync timeout state
+    blocksInFlight*: int               # Number of blocks we're downloading from this peer
 
   PeerError* = object of CatchableError
 
@@ -83,6 +115,7 @@ type
 proc newPeer*(address: string, port: uint16, params: ConsensusParams,
               direction: PeerDirection = pdOutbound): Peer =
   randomize()
+  let now = chronos.Moment.now()
   Peer(
     address: address,
     port: port,
@@ -101,7 +134,20 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     verackReceived: false,
     verackSent: false,
     localNonce: uint64(rand(high(int))),  # Generate unique nonce for self-connection detection
-    remoteNonce: 0
+    remoteNonce: 0,
+    # Stale peer tracking
+    connectedTime: now,
+    lastBlockTime: now,              # Initialize to now, not epoch
+    lastTxTime: now,
+    lastBlockAnnouncement: 0,
+    bestKnownHeight: 0,
+    pingStartTime: now,
+    pingPending: false,
+    headersRequested: false,
+    headersRequestTime: now,
+    syncStarted: false,
+    chainSyncState: ChainSyncState(),
+    blocksInFlight: 0
   )
 
 proc `$`*(peer: Peer): string =
@@ -723,3 +769,133 @@ proc markHandshakeComplete*(peer: var Peer) =
     peer.handshakeComplete = true
     peer.state = psReady
     info "handshake complete", peer = $peer
+
+# Stale peer detection functions
+# Reference: Bitcoin Core net_processing.cpp
+
+proc recordBlockReceived*(peer: var Peer) =
+  ## Record that we received a block from this peer
+  peer.lastBlockTime = chronos.Moment.now()
+
+proc recordTxReceived*(peer: var Peer) =
+  ## Record that we received a transaction from this peer
+  peer.lastTxTime = chronos.Moment.now()
+
+proc recordBlockAnnouncement*(peer: var Peer, unixTime: int64) =
+  ## Record when this peer announced a block to us
+  peer.lastBlockAnnouncement = unixTime
+
+proc updateBestKnownHeight*(peer: var Peer, height: int32) =
+  ## Update the best known block height from this peer
+  if height > peer.bestKnownHeight:
+    peer.bestKnownHeight = height
+
+proc startPing*(peer: var Peer) =
+  ## Record that we're starting a ping
+  peer.pingStartTime = chronos.Moment.now()
+  peer.pingPending = true
+
+proc completePing*(peer: var Peer) =
+  ## Record that we received a pong
+  peer.pingPending = false
+  let elapsed = chronos.Moment.now() - peer.pingStartTime
+  peer.latencyMs = int(elapsed.milliseconds)
+
+proc isPingTimedOut*(peer: Peer): bool =
+  ## Check if a pending ping has timed out (20 minutes)
+  ## Reference: Bitcoin Core TIMEOUT_INTERVAL = 20min
+  if not peer.pingPending:
+    return false
+  let elapsed = chronos.Moment.now() - peer.pingStartTime
+  result = elapsed > chronos.minutes(PingTimeoutIntervalSec div 60)
+  if result:
+    warn "ping timeout", peer = $peer,
+         elapsedSec = elapsed.seconds
+
+proc shouldSendPing*(peer: Peer): bool =
+  ## Check if it's time to send a ping (every 2 minutes)
+  ## Reference: Bitcoin Core PING_INTERVAL = 2min
+  if peer.pingPending:
+    return false  # Still waiting for pong
+  let elapsed = chronos.Moment.now() - peer.pingStartTime
+  elapsed > chronos.minutes(PingIntervalSec div 60)
+
+proc startHeadersRequest*(peer: var Peer) =
+  ## Record that we've requested headers
+  peer.headersRequested = true
+  peer.headersRequestTime = chronos.Moment.now()
+
+proc completeHeadersRequest*(peer: var Peer) =
+  ## Record that we've received headers
+  peer.headersRequested = false
+
+proc isHeadersRequestTimedOut*(peer: Peer): bool =
+  ## Check if a headers request has timed out (2 minutes)
+  ## Reference: Bitcoin Core HEADERS_RESPONSE_TIME = 2min
+  if not peer.headersRequested:
+    return false
+  let elapsed = chronos.Moment.now() - peer.headersRequestTime
+  result = elapsed > chronos.minutes(HeadersResponseTimeSec div 60)
+  if result:
+    warn "headers request timeout", peer = $peer,
+         elapsedSec = elapsed.seconds
+
+proc connectionAge*(peer: Peer): chronos.Duration =
+  ## Get how long this peer has been connected
+  chronos.Moment.now() - peer.connectedTime
+
+proc hasMinimumConnectTime*(peer: Peer): bool =
+  ## Check if peer has been connected long enough for eviction consideration
+  ## Reference: Bitcoin Core MINIMUM_CONNECT_TIME = 30s
+  peer.connectionAge() >= chronos.seconds(MinimumConnectTimeSec)
+
+proc isOutbound*(peer: Peer): bool =
+  ## Check if this is an outbound connection
+  peer.direction == pdOutbound
+
+proc isInbound*(peer: Peer): bool =
+  ## Check if this is an inbound connection
+  peer.direction == pdInbound
+
+proc hasBlocksInFlight*(peer: Peer): bool =
+  ## Check if we're downloading blocks from this peer
+  peer.blocksInFlight > 0
+
+proc resetChainSyncTimeout*(peer: var Peer) =
+  ## Reset chain sync timeout when peer catches up
+  ## Reference: Bitcoin Core ConsiderEviction() - reset when peer has sufficient work
+  peer.chainSyncState.timeout = 0
+  peer.chainSyncState.workHeaderHeight = 0
+  peer.chainSyncState.sentGetheaders = false
+
+proc setChainSyncTimeout*(peer: var Peer, ourHeight: int32, unixTime: int64) =
+  ## Set chain sync timeout for an outbound peer that's behind
+  ## Reference: Bitcoin Core ConsiderEviction()
+  peer.chainSyncState.timeout = unixTime + ChainSyncTimeoutSec
+  peer.chainSyncState.workHeaderHeight = ourHeight
+  peer.chainSyncState.sentGetheaders = false
+
+proc isChainSyncTimedOut*(peer: Peer, nowUnix: int64): bool =
+  ## Check if chain sync has timed out
+  peer.chainSyncState.timeout > 0 and nowUnix > peer.chainSyncState.timeout
+
+proc markChainSyncGetheadersSent*(peer: var Peer, nowUnix: int64) =
+  ## Mark that we've sent getheaders and reduce timeout to HEADERS_RESPONSE_TIME
+  ## Reference: Bitcoin Core ConsiderEviction() - after sending getheaders
+  peer.chainSyncState.sentGetheaders = true
+  peer.chainSyncState.timeout = nowUnix + HeadersResponseTimeSec
+
+proc shouldDisconnectForChainSync*(peer: Peer, nowUnix: int64): bool =
+  ## Check if peer should be disconnected for chain sync timeout
+  ## Returns true if timeout expired AND we already sent getheaders
+  if not peer.isChainSyncTimedOut(nowUnix):
+    return false
+  peer.chainSyncState.sentGetheaders
+
+proc isProtectedFromChainSyncEviction*(peer: Peer): bool =
+  ## Check if peer is protected from chain sync eviction
+  peer.chainSyncState.protect
+
+proc protectFromChainSyncEviction*(peer: var Peer) =
+  ## Protect this peer from chain sync eviction
+  peer.chainSyncState.protect = true
