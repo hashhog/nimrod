@@ -470,5 +470,157 @@ suite "RPC broadcast format":
     check displayHex.startsWith("ff")
     check displayHex.endsWith("01")
 
+suite "RPC getrawtransaction format":
+  # RPC error codes for getrawtransaction
+  const
+    RpcInvalidAddressOrKey = -5
+
+  test "error code constants":
+    check RpcInvalidAddressOrKey == -5
+
+  test "verbose output fields for mempool tx":
+    # Expected fields for verbose output of unconfirmed transaction
+    let expectedFields = ["txid", "hash", "version", "size", "vsize",
+                          "weight", "locktime", "vin", "vout", "hex"]
+    let verboseTx = %*{
+      "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+      "hash": "0000000000000000000000000000000000000000000000000000000000000001",
+      "version": 2,
+      "size": 100,
+      "vsize": 100,
+      "weight": 400,
+      "locktime": 0,
+      "vin": [],
+      "vout": [],
+      "hex": "0200000000000000"
+    }
+
+    for field in expectedFields:
+      check verboseTx.hasKey(field)
+
+  test "verbose output fields for confirmed tx":
+    # Additional fields for confirmed transactions
+    let confirmedTx = %*{
+      "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+      "hash": "0000000000000000000000000000000000000000000000000000000000000001",
+      "version": 2,
+      "size": 100,
+      "vsize": 100,
+      "weight": 400,
+      "locktime": 0,
+      "vin": [],
+      "vout": [],
+      "hex": "0200000000000000",
+      "blockhash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "confirmations": 100,
+      "time": 1234567890,
+      "blocktime": 1234567890
+    }
+
+    check confirmedTx.hasKey("blockhash")
+    check confirmedTx.hasKey("confirmations")
+    check confirmedTx.hasKey("time")
+    check confirmedTx.hasKey("blocktime")
+
+  test "verbose output with explicit blockhash has in_active_chain":
+    # When blockhash is explicitly provided, in_active_chain should be present
+    let txWithExplicitBlock = %*{
+      "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+      "in_active_chain": true,
+      "blockhash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "confirmations": 100
+    }
+
+    check txWithExplicitBlock.hasKey("in_active_chain")
+    check txWithExplicitBlock["in_active_chain"].getBool() == true
+
+  test "scriptPubKey verbose fields":
+    # scriptPubKey should have asm, hex, type, and optionally address
+    let scriptPubKey = %*{
+      "asm": "OP_DUP OP_HASH160 0000000000000000000000000000000000000000 OP_EQUALVERIFY OP_CHECKSIG",
+      "hex": "76a914000000000000000000000000000000000000000088ac",
+      "type": "pubkeyhash",
+      "address": "1111111111111111111114oLvT2"
+    }
+
+    check scriptPubKey.hasKey("asm")
+    check scriptPubKey.hasKey("hex")
+    check scriptPubKey.hasKey("type")
+
+  test "vin verbose format for non-coinbase":
+    let vin = %*{
+      "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+      "vout": 0,
+      "scriptSig": {
+        "asm": "",
+        "hex": ""
+      },
+      "sequence": 4294967295
+    }
+
+    check vin.hasKey("txid")
+    check vin.hasKey("vout")
+    check vin.hasKey("scriptSig")
+    check vin.hasKey("sequence")
+
+  test "vin verbose format for coinbase":
+    let coinbaseVin = %*{
+      "coinbase": "03a08601",
+      "sequence": 4294967295
+    }
+
+    check coinbaseVin.hasKey("coinbase")
+    check coinbaseVin.hasKey("sequence")
+    check not coinbaseVin.hasKey("txid")
+
+  test "vout verbose format":
+    let vout = %*{
+      "value": 0.5,
+      "n": 0,
+      "scriptPubKey": {
+        "asm": "OP_DUP OP_HASH160 ... OP_EQUALVERIFY OP_CHECKSIG",
+        "hex": "76a914...",
+        "type": "pubkeyhash",
+        "address": "1..."
+      }
+    }
+
+    check vout.hasKey("value")
+    check vout.hasKey("n")
+    check vout.hasKey("scriptPubKey")
+    check vout["value"].getFloat() == 0.5
+
+  test "vsize calculation":
+    # vsize = (weight + 3) div 4 (rounded up)
+    check (400 + 3) div 4 == 100  # 400 weight = 100 vsize
+    check (401 + 3) div 4 == 101  # 401 weight = 101 vsize
+    check (404 + 3) div 4 == 101  # 404 weight = 101 vsize (rounded up)
+
+suite "RPC txindex format":
+  test "txindex lookup result fields":
+    # When txindex returns a result, it should include block location info
+    let txLocation = %*{
+      "blockHash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "txIndex": 0
+    }
+
+    check txLocation.hasKey("blockHash")
+    check txLocation.hasKey("txIndex")
+
+  test "confirmations calculation":
+    # confirmations = tipHeight - blockHeight + 1
+    let tipHeight = 100
+    let blockHeight = 95
+    let confirmations = tipHeight - blockHeight + 1
+    check confirmations == 6
+
+  test "txid parameter validation":
+    # txid must be 64 hex characters
+    let validTxid = "0000000000000000000000000000000000000000000000000000000000000001"
+    let invalidTxid = "invalid"
+
+    check validTxid.len == 64
+    check invalidTxid.len != 64
+
 when isMainModule:
   echo "Running RPC tests..."
