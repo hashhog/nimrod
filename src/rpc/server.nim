@@ -11,7 +11,7 @@ import ../consensus/[params, validation]
 import ../storage/chainstate
 import ../mempool/mempool
 import ../crypto/[hashing, secp256k1, address]
-import ../network/[peer, peermanager]
+import ../network/[peer, peermanager, banman]
 import ../mining/[fees, blocktemplate]
 
 type
@@ -736,6 +736,67 @@ proc handleEstimateSmartFee(rpc: RpcServer, params: JsonNode): JsonNode =
   }
 
 # Address validation RPC
+# Ban management RPCs
+proc handleListBanned(rpc: RpcServer): JsonNode =
+  ## Return all currently banned addresses
+  if rpc.peerManager == nil:
+    return %*[]
+
+  var banned = newJArray()
+  for entry in rpc.peerManager.listBanned():
+    banned.add(%*{
+      "address": entry.address,
+      "ban_created": entry.banCreated,
+      "banned_until": entry.banUntil,
+      "ban_reason": $entry.reason
+    })
+  banned
+
+proc handleSetBan(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Add or remove a peer from the ban list
+  ## setban "address" "add|remove" [bantime] [absolute]
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams, "missing required parameters: address, command")
+
+  if rpc.peerManager == nil:
+    raise newRpcError(RpcInternalError, "peer manager not available")
+
+  let address = params[0].getStr()
+  let command = params[1].getStr()
+
+  case command
+  of "add":
+    var bantime = int64(24 * 60 * 60)  # Default 24 hours
+    var absolute = false
+
+    if params.len >= 3:
+      bantime = params[2].getBiggestInt()
+    if params.len >= 4:
+      absolute = params[3].getBool()
+
+    if absolute:
+      # bantime is absolute unix timestamp
+      rpc.peerManager.banManager.banAbsolute(address, bantime, brManuallyAdded)
+    else:
+      # bantime is relative duration in seconds
+      let duration = initDuration(seconds = bantime)
+      rpc.peerManager.banPeer(address, duration, brManuallyAdded)
+
+  of "remove":
+    if not rpc.peerManager.unbanPeer(address):
+      raise newRpcError(RpcInvalidParams, "address not found in ban list")
+
+  else:
+    raise newRpcError(RpcInvalidParams, "invalid command: " & command & " (expected add or remove)")
+
+  newJNull()
+
+proc handleClearBanned(rpc: RpcServer): JsonNode =
+  ## Clear all banned addresses
+  if rpc.peerManager != nil:
+    rpc.peerManager.clearBanned()
+  newJNull()
+
 proc handleValidateAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing address parameter")
@@ -814,6 +875,12 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
     rpc.handleGetConnectionCount()
   of "addnode":
     rpc.handleAddNode(params)
+  of "listbanned":
+    rpc.handleListBanned()
+  of "setban":
+    rpc.handleSetBan(params)
+  of "clearbanned":
+    rpc.handleClearBanned()
 
   # Mining
   of "getblocktemplate":
