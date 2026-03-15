@@ -14,9 +14,12 @@ import ./messages
 export chronicles
 
 const
-  HandshakeTimeoutSec* = 10  # 10 seconds
+  HandshakeTimeoutSec* = 60  # 60 seconds (Bitcoin Core compatible)
   PingTimeoutSec* = 30       # 30 seconds
   ReadTimeoutSec* = 120      # 2 minutes
+  MinProtocolVersion* = 70015'u32  # Minimum for witness support
+  ScorePreHandshakeMessage* = 10'u32  # Misbehavior for pre-handshake messages
+  ScoreDuplicateVersion* = 1'u32      # Misbehavior for duplicate version
 
 type
   PeerState* = enum
@@ -55,7 +58,15 @@ type
     feeFilterRate*: uint64
     sendHeaders*: bool
     wtxidRelay*: bool
-    handshakeComplete*: bool
+    # Handshake state tracking (Bitcoin Core: pfrom.nVersion != 0, fSuccessfullyConnected)
+    handshakeComplete*: bool     # True after both VERSION and VERACK exchanged
+    versionReceived*: bool       # True after receiving VERSION
+    versionSent*: bool           # True after sending VERSION
+    verackReceived*: bool        # True after receiving VERACK
+    verackSent*: bool            # True after sending VERACK
+    localNonce*: uint64          # Our nonce for self-connection detection
+    remoteNonce*: uint64         # Their nonce from version message
+    handshakeStartTime*: stdtimes.Time  # When handshake started (for timeout)
     # Misbehavior scoring (Bitcoin Core: 100 = ban threshold)
     misbehaviorScore*: uint32
     shouldDisconnect*: bool
@@ -65,8 +76,13 @@ type
 
   PeerError* = object of CatchableError
 
+  # Callback type for self-connection detection
+  # Must be {.raises: [].} for chronos async compatibility
+  SelfConnectChecker* = proc(nonce: uint64): bool {.gcsafe, raises: [].}
+
 proc newPeer*(address: string, port: uint16, params: ConsensusParams,
               direction: PeerDirection = pdOutbound): Peer =
+  randomize()
   Peer(
     address: address,
     port: port,
@@ -77,7 +93,15 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     recvBuffer: @[],
     closing: false,
     misbehaviorScore: 0,
-    shouldDisconnect: false
+    shouldDisconnect: false,
+    # Handshake state
+    handshakeComplete: false,
+    versionReceived: false,
+    versionSent: false,
+    verackReceived: false,
+    verackSent: false,
+    localNonce: uint64(rand(high(int))),  # Generate unique nonce for self-connection detection
+    remoteNonce: 0
   )
 
 proc `$`*(peer: Peer): string =
@@ -191,26 +215,26 @@ proc readMessage*(peer: Peer): Future[P2PMessage] {.async.} =
 
 proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
   ## Send version message
-  randomize()
-  let nonce = uint64(rand(high(int)))
-
   let msg = newVersionMsg(
     version = ProtocolVersion,
     services = NodeNetwork or NodeWitness,
     timestamp = stdtimes.getTime().toUnix(),
     addrRecv = NetAddress(services: NodeNetwork, port: peer.port),
     addrFrom = NetAddress(services: NodeNetwork or NodeWitness, port: peer.params.p2pPort),
-    nonce = nonce,
+    nonce = peer.localNonce,  # Use our unique nonce for self-connection detection
     userAgent = UserAgent,
     startHeight = ourHeight,
     relay = true
   )
 
   await peer.sendMessage(msg)
+  peer.versionSent = true
   peer.state = psHandshaking
+  peer.handshakeStartTime = stdtimes.getTime()
 
 proc sendVerack*(peer: Peer) {.async.} =
   await peer.sendMessage(newVerack())
+  peer.verackSent = true
 
 proc sendPing*(peer: Peer) {.async.} =
   ## Send a ping and record the nonce/time for latency measurement
@@ -254,10 +278,22 @@ proc sendSendCmpct*(peer: Peer, announce: bool = false, version: uint64 = 2) {.a
 proc sendFeeFilter*(peer: Peer, feeRate: uint64) {.async.} =
   await peer.sendMessage(newFeeFilter(feeRate))
 
-proc performHandshake*(peer: Peer, ourHeight: int32) {.async.} =
+proc performHandshake*(peer: Peer, ourHeight: int32,
+                       checkSelfConnect: SelfConnectChecker = nil) {.async.} =
   ## Perform version handshake with peer
   ## Outbound: send version -> recv version -> send verack -> recv verack
+  ## Inbound: recv version -> send version -> send verack -> recv verack
   ## Then send wtxidrelay, sendheaders, sendcmpct
+  ##
+  ## Enforces:
+  ## - Minimum protocol version (70015 for witness support)
+  ## - Self-connection detection via nonce
+  ## - 60 second handshake timeout
+  ##
+  ## Reference: Bitcoin Core net_processing.cpp ProcessMessage()
+
+  peer.handshakeStartTime = stdtimes.getTime()
+
   if peer.direction == pdOutbound:
     # Send our version first
     await peer.sendVersion(ourHeight)
@@ -271,10 +307,18 @@ proc performHandshake*(peer: Peer, ourHeight: int32) {.async.} =
     if versionMsg.kind != mkVersion:
       raise newException(PeerError, "expected version message")
 
-    peer.version = versionMsg.version.version
-    peer.services = versionMsg.version.services
-    peer.userAgent = versionMsg.version.userAgent
-    peer.startHeight = versionMsg.version.startHeight
+    # Validate version (protocol version, etc.)
+    let versionData = versionMsg.version
+    if versionData.version < MinProtocolVersion:
+      raise newException(PeerError, "peer using obsolete protocol version: " &
+                         $versionData.version & " < " & $MinProtocolVersion)
+
+    peer.version = versionData.version
+    peer.services = versionData.services
+    peer.userAgent = versionData.userAgent
+    peer.startHeight = versionData.startHeight
+    peer.versionReceived = true
+    peer.remoteNonce = versionData.nonce
 
     info "received version", peer = $peer, version = peer.version,
          userAgent = peer.userAgent, height = peer.startHeight
@@ -291,6 +335,8 @@ proc performHandshake*(peer: Peer, ourHeight: int32) {.async.} =
     if verackMsg.kind != mkVerack:
       raise newException(PeerError, "expected verack message")
 
+    peer.verackReceived = true
+
   else:
     # Inbound: wait for version first
     let recvVersionFut = peer.readMessage()
@@ -301,10 +347,23 @@ proc performHandshake*(peer: Peer, ourHeight: int32) {.async.} =
     if versionMsg.kind != mkVersion:
       raise newException(PeerError, "expected version message")
 
-    peer.version = versionMsg.version.version
-    peer.services = versionMsg.version.services
-    peer.userAgent = versionMsg.version.userAgent
-    peer.startHeight = versionMsg.version.startHeight
+    let versionData = versionMsg.version
+
+    # Check minimum protocol version
+    if versionData.version < MinProtocolVersion:
+      raise newException(PeerError, "peer using obsolete protocol version: " &
+                         $versionData.version & " < " & $MinProtocolVersion)
+
+    # Check for self-connection (inbound only)
+    if checkSelfConnect != nil and not checkSelfConnect(versionData.nonce):
+      raise newException(PeerError, "connected to self")
+
+    peer.version = versionData.version
+    peer.services = versionData.services
+    peer.userAgent = versionData.userAgent
+    peer.startHeight = versionData.startHeight
+    peer.versionReceived = true
+    peer.remoteNonce = versionData.nonce
 
     info "received version", peer = $peer, version = peer.version,
          userAgent = peer.userAgent, height = peer.startHeight
@@ -323,6 +382,8 @@ proc performHandshake*(peer: Peer, ourHeight: int32) {.async.} =
     let verackMsg = recvVerackFut.value()
     if verackMsg.kind != mkVerack:
       raise newException(PeerError, "expected verack message")
+
+    peer.verackReceived = true
 
   # Send feature negotiation messages
   # These should be sent after verack but before other messages
@@ -424,9 +485,18 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
   of mkSendAddrV2:
     trace "peer supports addrv2", peer = $peer
 
+# Pre-handshake message validation types and forward declarations
+type
+  MessageAcceptResult* = enum
+    marAccept           # Accept and process the message
+    marDropSilent       # Drop without misbehavior (e.g., redundant verack)
+    marDropMisbehave    # Drop with misbehavior points
+    marDisconnect       # Disconnect immediately (self-connect, old version)
+
 proc messageLoop*(peer: Peer, callback: PeerCallback) {.async.} =
   ## Main message loop - auto-handles ping/pong, dispatches others to callback
   ## Runs until peer disconnects or error occurs
+  ## Note: For full pre-handshake validation, use messageLoopWithValidation
   while peer.isConnected() and not peer.closing:
     try:
       let msg = await peer.readMessage()
@@ -520,3 +590,136 @@ proc resetMisbehavior*(peer: var Peer) =
   ## Reset misbehavior score (used during testing)
   peer.misbehaviorScore = 0
   peer.shouldDisconnect = false
+
+# Pre-handshake message validation
+# Reference: Bitcoin Core net_processing.cpp ProcessMessage()
+# - Non-version messages before version: drop and misbehave
+# - Messages before verack (except allowed ones): drop and misbehave
+# - Duplicate version: misbehave
+# - Self-connection detection via nonce
+# - Minimum protocol version check
+
+proc isPreHandshakeMessageAllowed*(peer: Peer, kind: MessageKind): bool =
+  ## Check if a message type is allowed before handshake completes
+  ## Reference: Bitcoin Core net_processing.cpp
+  ##
+  ## Before VERSION received: only VERSION allowed
+  ## After VERSION, before VERACK: VERSION, VERACK, and negotiation messages
+  ## After VERACK: all messages allowed
+
+  if peer.handshakeComplete:
+    return true
+
+  if not peer.versionReceived:
+    # Only VERSION allowed before we receive VERSION
+    return kind == mkVersion
+
+  # After VERSION received, before VERACK
+  # Allowed: VERACK, and some negotiation messages (wtxidrelay, sendaddrv2, sendheaders)
+  case kind
+  of mkVerack, mkWtxidRelay, mkSendAddrV2, mkSendHeaders, mkSendCmpct, mkFeeFilter:
+    true
+  else:
+    false
+
+proc validatePreHandshakeMessage*(peer: var Peer, kind: MessageKind): MessageAcceptResult =
+  ## Validate if a message should be accepted during handshake
+  ## Returns what action to take (accept, drop, misbehave, disconnect)
+
+  if peer.handshakeComplete:
+    return marAccept
+
+  if not peer.versionReceived:
+    # Before VERSION received, only VERSION is allowed
+    if kind == mkVersion:
+      return marAccept
+    else:
+      # Non-version message before version handshake
+      warn "pre-version message rejected", peer = $peer, kind = kind
+      misbehaving(peer, ScorePreHandshakeMessage, "non-version message before version")
+      return marDropMisbehave
+
+  # VERSION received, check specific messages
+  case kind
+  of mkVersion:
+    # Duplicate VERSION - misbehave (score 1 per Bitcoin Core)
+    warn "duplicate version message", peer = $peer
+    misbehaving(peer, ScoreDuplicateVersion, "duplicate version")
+    return marDropMisbehave
+
+  of mkVerack:
+    if peer.verackReceived:
+      # Redundant verack - drop silently (Bitcoin Core ignores)
+      debug "ignoring redundant verack", peer = $peer
+      return marDropSilent
+    return marAccept
+
+  of mkWtxidRelay, mkSendAddrV2:
+    # These must come between VERSION and VERACK
+    if peer.verackReceived:
+      # wtxidrelay/sendaddrv2 after verack is a protocol violation
+      warn "negotiation message after verack", peer = $peer, kind = kind
+      return marDisconnect
+    return marAccept
+
+  of mkSendHeaders, mkSendCmpct, mkFeeFilter:
+    # These can come any time after VERSION
+    return marAccept
+
+  else:
+    # Other messages before verack
+    if not peer.verackReceived:
+      warn "unsupported message prior to verack", peer = $peer, kind = kind
+      misbehaving(peer, ScorePreHandshakeMessage, "message before verack")
+      return marDropMisbehave
+    return marAccept
+
+proc validateVersionMessage*(peer: var Peer, version: uint32, nonce: uint64,
+                             checkSelfConnect: SelfConnectChecker): MessageAcceptResult =
+  ## Validate a version message
+  ## - Check minimum protocol version (70015 for witness)
+  ## - Check for self-connection via nonce
+  ## - Mark version as received
+
+  # Check minimum protocol version
+  if version < MinProtocolVersion:
+    warn "peer using obsolete version", peer = $peer, version = version,
+         minimum = MinProtocolVersion
+    return marDisconnect
+
+  # Check for self-connection (only for inbound connections)
+  # Reference: Bitcoin Core net_processing.cpp CheckIncomingNonce()
+  if peer.direction == pdInbound:
+    if checkSelfConnect != nil and not checkSelfConnect(nonce):
+      warn "connected to self, disconnecting", peer = $peer
+      return marDisconnect
+
+  # Store remote nonce and mark version received
+  peer.remoteNonce = nonce
+  peer.versionReceived = true
+
+  return marAccept
+
+proc checkHandshakeTimeout*(peer: Peer): bool =
+  ## Check if handshake has timed out (60 seconds)
+  ## Returns true if timed out
+  if peer.handshakeComplete:
+    return false
+
+  if peer.handshakeStartTime == stdtimes.Time():
+    # Handshake hasn't started yet
+    return false
+
+  let elapsed = stdtimes.getTime() - peer.handshakeStartTime
+  result = elapsed.inSeconds >= HandshakeTimeoutSec
+
+  if result:
+    warn "handshake timeout", peer = $peer, elapsed = elapsed.inSeconds
+
+proc markHandshakeComplete*(peer: var Peer) =
+  ## Mark the handshake as complete after both VERSION and VERACK exchanged
+  if peer.versionReceived and peer.versionSent and
+     peer.verackReceived and peer.verackSent:
+    peer.handshakeComplete = true
+    peer.state = psReady
+    info "handshake complete", peer = $peer
