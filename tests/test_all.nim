@@ -32,6 +32,8 @@ import ./test_difficulty
 import ./test_misbehavior
 import ./test_banman
 import ./test_versionbits
+import ./test_handshake
+import ./test_pre_handshake
 
 when isMainModule:
   echo "Running all tests..."
