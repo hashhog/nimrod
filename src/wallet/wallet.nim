@@ -1,13 +1,14 @@
 ## HD Wallet implementation
 ## BIP-32/39/44/84/86 key derivation, transaction creation and signing
 
-import std/[tables, options, strutils, sysrand, algorithm]
+import std/[tables, options, strutils, sysrand, algorithm, times]
 import nimcrypto/[sha2, hmac, pbkdf2]
 import ../primitives/[types, serialize]
 import ../crypto/[hashing, secp256k1, address, base58]
 import ../consensus/params
 import ../storage/chainstate
 import ./coinselection
+import ./crypter
 
 export address.AddressType, address.Address
 export coinselection
@@ -36,6 +37,7 @@ type
     height*: int32
     keyPath*: string                ## Path to the key that owns this UTXO
     isInternal*: bool               ## True if change address
+    isCoinbase*: bool               ## True if from a coinbase transaction
 
   Account* = object
     purpose*: uint32                ## 44, 84, or 86
@@ -47,6 +49,11 @@ type
     nextInternal*: int              ## Next unused internal index
     gap*: int                       ## Gap limit (default 20)
 
+  ## Address label entry
+  AddressLabel* = object
+    address*: string
+    label*: string
+
   Wallet* = ref object
     seed*: array[64, byte]
     masterKey*: ExtendedKey
@@ -55,12 +62,25 @@ type
     chainState*: ChainState
     params*: ConsensusParams
     mainnet*: bool
+    # Encryption state
+    isEncrypted*: bool              ## True if wallet is encrypted
+    isLocked*: bool                 ## True if wallet is locked (key not in memory)
+    encryptedSeed*: seq[byte]       ## Encrypted seed when wallet is encrypted
+    encryptionSalt*: array[8, byte] ## Salt used for key derivation
+    encryptionRounds*: int          ## Number of key derivation rounds
+    masterKeyCache*: array[32, byte] ## Cached decryption key (cleared on lock)
+    unlockExpiry*: int64            ## Unix timestamp when wallet auto-locks (0 = no expiry)
+    # Labels
+    labels*: Table[string, string]  ## Address -> label mapping
 
 # BIP39 wordlist - loaded at compile time
 const BIP39_WORDLIST* = staticRead("../../resources/bip39-english.txt").strip().splitLines()
 
 # Hardened derivation constant
 const HARDENED* = 0x80000000'u32
+
+# Coinbase maturity - outputs can only be spent after this many confirmations
+const CoinbaseMaturity* = 100
 
 # =============================================================================
 # BIP39: Mnemonic Generation and Seed Derivation
@@ -568,14 +588,16 @@ proc findKeyForScript*(wallet: Wallet, scriptPubKey: seq[byte]): Option[DerivedK
 # =============================================================================
 
 proc addUtxo*(wallet: var Wallet, outpoint: OutPoint, output: TxOut,
-              height: int32, keyPath: string, isInternal: bool) =
+              height: int32, keyPath: string, isInternal: bool,
+              isCoinbase: bool = false) =
   ## Add a UTXO to the wallet
   wallet.utxos[outpoint] = WalletUtxo(
     outpoint: outpoint,
     output: output,
     height: height,
     keyPath: keyPath,
-    isInternal: isInternal
+    isInternal: isInternal,
+    isCoinbase: isCoinbase
   )
 
 proc removeUtxo*(wallet: var Wallet, outpoint: OutPoint) =
@@ -588,17 +610,44 @@ proc getBalance*(wallet: Wallet): Satoshi =
   for _, utxo in wallet.utxos:
     result = result + utxo.output.value
 
+proc isMatureCoinbase*(utxo: WalletUtxo, currentHeight: int32): bool =
+  ## Check if a coinbase UTXO has reached maturity
+  ## Coinbase outputs require CoinbaseMaturity (100) confirmations
+  if not utxo.isCoinbase:
+    return true  # Non-coinbase outputs are always mature
+  if utxo.height <= 0:
+    return false  # Unconfirmed coinbase is never mature
+  let confirmations = currentHeight - utxo.height + 1
+  confirmations >= CoinbaseMaturity
+
 proc getSpendableBalance*(wallet: Wallet, currentHeight: int32): Satoshi =
   ## Get spendable balance (excluding immature coinbase)
   result = Satoshi(0)
   for _, utxo in wallet.utxos:
-    # Skip immature coinbase (would need to track isCoinbase, simplified here)
-    result = result + utxo.output.value
+    # Skip immature coinbase outputs
+    if utxo.isMatureCoinbase(currentHeight):
+      result = result + utxo.output.value
+
+proc isCoinbaseTx*(tx: Transaction): bool =
+  ## Check if a transaction is a coinbase transaction
+  ## Coinbase has exactly one input with prevOut.txid all zeros and prevOut.vout = 0xFFFFFFFF
+  if tx.inputs.len != 1:
+    return false
+  let input = tx.inputs[0]
+  # Check if prevOut txid is all zeros
+  var allZeros = true
+  let txidBytes = array[32, byte](input.prevOut.txid)
+  for b in txidBytes:
+    if b != 0:
+      allZeros = false
+      break
+  allZeros and input.prevOut.vout == 0xFFFFFFFF'u32
 
 proc scanBlockForWallet*(wallet: var Wallet, blk: Block, height: int32) =
   ## Scan a block for transactions relevant to the wallet
   for txIdx, tx in blk.txs:
     let txId = tx.txid()
+    let coinbase = tx.isCoinbaseTx()
 
     # Check outputs for payments to our addresses
     for voutIdx, output in tx.outputs:
@@ -607,7 +656,7 @@ proc scanBlockForWallet*(wallet: var Wallet, blk: Block, height: int32) =
         let key = keyOpt.get()
         let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
         let isInternal = key.path.contains("/1/")
-        wallet.addUtxo(outpoint, output, height, key.path, isInternal)
+        wallet.addUtxo(outpoint, output, height, key.path, isInternal, coinbase)
 
     # Check inputs for spent UTXOs
     for input in tx.inputs:
@@ -644,12 +693,18 @@ proc getInputWeight(scriptPubKey: seq[byte]): int =
     # Default to P2WPKH
     return P2WpkhInputWeight
 
-proc selectCoinsAdvanced(wallet: Wallet, targetAmount: Satoshi, feeRate: float64): CoinSelectionResult =
+proc selectCoinsAdvanced(wallet: Wallet, targetAmount: Satoshi, feeRate: float64,
+                          currentHeight: int32 = 0): CoinSelectionResult =
   ## Advanced coin selection using BnB and Knapsack algorithms
+  ## Skips immature coinbase outputs when currentHeight > 0
   var selectableCoins: seq[SelectableCoin]
 
   # Convert wallet UTXOs to selectable coins
   for _, utxo in wallet.utxos:
+    # Skip immature coinbase outputs
+    if currentHeight > 0 and not utxo.isMatureCoinbase(currentHeight):
+      continue
+
     let weight = getInputWeight(utxo.output.scriptPubKey)
     let coin = newSelectableCoin(
       utxo.outpoint,
@@ -686,10 +741,15 @@ proc selectCoinsAdvanced(wallet: Wallet, targetAmount: Satoshi, feeRate: float64
   let excess = int64(selection.totalEffectiveValue) - int64(targetAmount)
   result.needsChange = excess >= int64(minChange)
 
-proc selectCoinsSimple(wallet: Wallet, targetAmount: Satoshi, feeRate: float64): CoinSelectionResult =
+proc selectCoinsSimple(wallet: Wallet, targetAmount: Satoshi, feeRate: float64,
+                        currentHeight: int32 = 0): CoinSelectionResult =
   ## Simple coin selection - largest first (fallback)
+  ## Skips immature coinbase outputs when currentHeight > 0
   var available: seq[WalletUtxo]
   for _, utxo in wallet.utxos:
+    # Skip immature coinbase outputs
+    if currentHeight > 0 and not utxo.isMatureCoinbase(currentHeight):
+      continue
     available.add(utxo)
 
   # Sort by value descending
@@ -730,21 +790,28 @@ proc createTransaction*(wallet: var Wallet, outputs: seq[TxOut],
   ## Create a new transaction
   ## feeRate is in satoshis per virtual byte
   ## useAdvancedCoinSelection: use BnB/Knapsack (true) or largest-first (false)
+  ## Automatically skips immature coinbase outputs
 
   # Calculate total output amount
   var totalOut = Satoshi(0)
   for output in outputs:
     totalOut = totalOut + output.value
 
-  # Select coins
+  # Get current height for coinbase maturity check
+  let currentHeight = if wallet.chainState != nil:
+    wallet.chainState.bestHeight
+  else:
+    0'i32
+
+  # Select coins (skipping immature coinbase)
   let selection = if useAdvancedCoinSelection:
     try:
-      selectCoinsAdvanced(wallet, totalOut, feeRate)
+      selectCoinsAdvanced(wallet, totalOut, feeRate, currentHeight)
     except CoinSelectionError:
       # Fall back to simple selection
-      selectCoinsSimple(wallet, totalOut, feeRate)
+      selectCoinsSimple(wallet, totalOut, feeRate, currentHeight)
   else:
-    selectCoinsSimple(wallet, totalOut, feeRate)
+    selectCoinsSimple(wallet, totalOut, feeRate, currentHeight)
 
   # Build transaction
   result.version = 2
@@ -947,3 +1014,234 @@ proc getAccountXpub*(wallet: Wallet, accountIdx: int = 0): string =
   var accKey = derivePathStr(wallet.masterKey, path)
   accKey.isPrivate = false
   serializeExtendedKey(accKey, wallet.mainnet)
+
+# =============================================================================
+# Wallet Encryption
+# =============================================================================
+
+proc encryptWallet*(wallet: var Wallet, passphrase: string): bool =
+  ## Encrypt the wallet with a passphrase
+  ## Returns true on success, false if already encrypted
+  ## Reference: Bitcoin Core wallet/wallet.cpp EncryptWallet
+  if wallet.isEncrypted:
+    raise newException(WalletError, "wallet is already encrypted")
+
+  if passphrase.len == 0:
+    raise newException(WalletError, "passphrase cannot be empty")
+
+  # Generate salt for key derivation
+  wallet.encryptionSalt = generateSalt()
+  wallet.encryptionRounds = DefaultKeyDerivationRounds
+
+  # Derive encryption key from passphrase
+  let (encKey, _) = bytesToKeySha512Aes(wallet.encryptionSalt, passphrase,
+                                         wallet.encryptionRounds)
+
+  # Encrypt the seed
+  let crypter = newWalletCrypter()
+  let iv = generateIv()
+
+  # Use the seed's hash as IV prefix for deterministic decryption
+  var fullIv: array[32, byte]
+  copyMem(addr fullIv[0], addr iv[0], 16)
+
+  wallet.encryptedSeed = encryptSecret(encKey, wallet.seed, fullIv)
+
+  # Prepend the IV to the encrypted data so we can decrypt later
+  var encryptedWithIv = newSeq[byte](16 + wallet.encryptedSeed.len)
+  copyMem(addr encryptedWithIv[0], addr iv[0], 16)
+  copyMem(addr encryptedWithIv[16], addr wallet.encryptedSeed[0], wallet.encryptedSeed.len)
+  wallet.encryptedSeed = encryptedWithIv
+
+  # Clear the plaintext seed from memory
+  for i in 0 ..< wallet.seed.len:
+    wallet.seed[i] = 0
+
+  wallet.isEncrypted = true
+  wallet.isLocked = true
+
+  # Clear the master key cache
+  for i in 0 ..< wallet.masterKeyCache.len:
+    wallet.masterKeyCache[i] = 0
+
+  true
+
+proc unlockWallet*(wallet: var Wallet, passphrase: string, timeout: int = 0): bool =
+  ## Unlock an encrypted wallet for a specified duration
+  ## timeout: seconds until auto-lock (0 = no auto-lock)
+  ## Returns true on success
+  ## Reference: Bitcoin Core wallet/wallet.cpp Unlock
+  if not wallet.isEncrypted:
+    raise newException(WalletError, "wallet is not encrypted")
+
+  if not wallet.isLocked:
+    # Already unlocked, just update expiry
+    if timeout > 0:
+      wallet.unlockExpiry = getTime().toUnix() + int64(timeout)
+    else:
+      wallet.unlockExpiry = 0
+    return true
+
+  # Derive encryption key from passphrase
+  let (encKey, _) = bytesToKeySha512Aes(wallet.encryptionSalt, passphrase,
+                                         wallet.encryptionRounds)
+
+  # Extract IV from encrypted seed
+  if wallet.encryptedSeed.len < 17:  # 16 bytes IV + at least 1 byte data
+    raise newException(WalletError, "invalid encrypted seed data")
+
+  var iv: array[16, byte]
+  copyMem(addr iv[0], addr wallet.encryptedSeed[0], 16)
+
+  var fullIv: array[32, byte]
+  copyMem(addr fullIv[0], addr iv[0], 16)
+
+  # Decrypt the seed
+  let encryptedPart = wallet.encryptedSeed[16 ..< wallet.encryptedSeed.len]
+  try:
+    let decrypted = decryptSecret(encKey, encryptedPart, fullIv)
+    if decrypted.len != 64:
+      return false
+
+    # Restore the seed
+    copyMem(addr wallet.seed[0], addr decrypted[0], 64)
+
+    # Restore master key
+    wallet.masterKey = masterKeyFromSeed(wallet.seed)
+
+    # Cache the encryption key for signing operations
+    wallet.masterKeyCache = encKey
+
+    wallet.isLocked = false
+
+    # Set unlock expiry
+    if timeout > 0:
+      wallet.unlockExpiry = getTime().toUnix() + int64(timeout)
+    else:
+      wallet.unlockExpiry = 0
+
+    true
+  except CrypterError:
+    false
+
+proc lockWallet*(wallet: var Wallet) =
+  ## Lock the wallet, clearing sensitive data from memory
+  ## Reference: Bitcoin Core wallet/wallet.cpp Lock
+  if not wallet.isEncrypted:
+    raise newException(WalletError, "wallet is not encrypted")
+
+  if wallet.isLocked:
+    return
+
+  # Clear sensitive data
+  for i in 0 ..< wallet.seed.len:
+    wallet.seed[i] = 0
+
+  for i in 0 ..< wallet.masterKeyCache.len:
+    wallet.masterKeyCache[i] = 0
+
+  for i in 0 ..< wallet.masterKey.key.len:
+    wallet.masterKey.key[i] = 0
+
+  wallet.isLocked = true
+  wallet.unlockExpiry = 0
+
+proc changePassphrase*(wallet: var Wallet, oldPassphrase: string,
+                        newPassphrase: string): bool =
+  ## Change the wallet encryption passphrase
+  ## Returns true on success
+  ## Reference: Bitcoin Core wallet/wallet.cpp ChangeWalletPassphrase
+  if not wallet.isEncrypted:
+    raise newException(WalletError, "wallet is not encrypted")
+
+  if newPassphrase.len == 0:
+    raise newException(WalletError, "new passphrase cannot be empty")
+
+  # First unlock with old passphrase
+  let wasLocked = wallet.isLocked
+  if wallet.isLocked:
+    if not wallet.unlockWallet(oldPassphrase):
+      return false
+
+  # Generate new salt
+  let newSalt = generateSalt()
+
+  # Derive new encryption key
+  let (newEncKey, _) = bytesToKeySha512Aes(newSalt, newPassphrase,
+                                            wallet.encryptionRounds)
+
+  # Re-encrypt the seed with new key
+  let iv = generateIv()
+  var fullIv: array[32, byte]
+  copyMem(addr fullIv[0], addr iv[0], 16)
+
+  let newEncrypted = encryptSecret(newEncKey, wallet.seed, fullIv)
+
+  # Prepend the IV
+  var encryptedWithIv = newSeq[byte](16 + newEncrypted.len)
+  copyMem(addr encryptedWithIv[0], addr iv[0], 16)
+  copyMem(addr encryptedWithIv[16], addr newEncrypted[0], newEncrypted.len)
+
+  # Update wallet state
+  wallet.encryptedSeed = encryptedWithIv
+  wallet.encryptionSalt = newSalt
+  wallet.masterKeyCache = newEncKey
+
+  # Re-lock if it was locked before
+  if wasLocked:
+    wallet.lockWallet()
+
+  true
+
+proc checkUnlockExpiry*(wallet: var Wallet) =
+  ## Check if the wallet unlock has expired and lock if necessary
+  if wallet.isEncrypted and not wallet.isLocked and wallet.unlockExpiry > 0:
+    if getTime().toUnix() >= wallet.unlockExpiry:
+      wallet.lockWallet()
+
+proc isWalletLocked*(wallet: Wallet): bool =
+  ## Check if wallet operations requiring private keys are available
+  if not wallet.isEncrypted:
+    return false
+  wallet.isLocked
+
+# =============================================================================
+# Address Labels
+# =============================================================================
+
+proc setLabel*(wallet: var Wallet, address: string, label: string) =
+  ## Set a label for an address
+  ## Reference: Bitcoin Core wallet/wallet.cpp SetAddressBook
+  if label.len == 0:
+    # Empty label removes the label
+    wallet.labels.del(address)
+  else:
+    wallet.labels[address] = label
+
+proc getLabel*(wallet: Wallet, address: string): string =
+  ## Get the label for an address
+  ## Returns empty string if no label set
+  wallet.labels.getOrDefault(address, "")
+
+proc getAddressesByLabel*(wallet: Wallet, label: string): seq[string] =
+  ## Get all addresses with a specific label
+  result = @[]
+  for address, addrLabel in wallet.labels:
+    if addrLabel == label:
+      result.add(address)
+
+proc listLabels*(wallet: Wallet): seq[string] =
+  ## List all unique labels
+  var labelSet: Table[string, bool]
+  for _, label in wallet.labels:
+    labelSet[label] = true
+  result = @[]
+  for label, _ in labelSet:
+    result.add(label)
+
+proc getImmatureBalance*(wallet: Wallet, currentHeight: int32): Satoshi =
+  ## Get total immature coinbase balance
+  result = Satoshi(0)
+  for _, utxo in wallet.utxos:
+    if utxo.isCoinbase and not utxo.isMatureCoinbase(currentHeight):
+      result = result + utxo.output.value
