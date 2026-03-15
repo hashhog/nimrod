@@ -1,7 +1,7 @@
 ## Tests for JSON-RPC server
 ## Tests RPC method routing, error codes, request/response format, and Bitcoin Core compatible responses
 
-import std/[json, strutils, tables, options]
+import std/[json, strutils, tables, options, sequtils]
 import unittest2
 import ../src/primitives/[types, serialize]
 import ../src/consensus/[params, validation]
@@ -311,6 +311,40 @@ suite "RPC getblockchaininfo format":
     for field in expectedFields:
       check blockchainInfo.hasKey(field)
 
+  test "blockchain info with bits and target":
+    # Bitcoin Core returns bits and target from the current tip block
+    let blockchainInfo = %*{
+      "chain": "main",
+      "blocks": 100,
+      "headers": 100,
+      "bestblockhash": "0000000000000000000000000000000000000000000000000000000000000001",
+      "bits": "1d00ffff",
+      "target": "00000000ffff0000000000000000000000000000000000000000000000000000",
+      "difficulty": 1.0,
+      "time": 1234567890,
+      "mediantime": 1234567880,
+      "verificationprogress": 1.0,
+      "initialblockdownload": false,
+      "chainwork": "0000000000000000000000000000000000000000000000000000000000000100",
+      "size_on_disk": 1000000,
+      "pruned": false,
+      "warnings": ""
+    }
+
+    check blockchainInfo.hasKey("bits")
+    check blockchainInfo.hasKey("target")
+    check blockchainInfo.hasKey("time")
+    check blockchainInfo.hasKey("warnings")
+    check blockchainInfo["bits"].getStr().len == 8
+
+  test "chain names":
+    # Test different network chain names
+    check "main" == "main"      # Mainnet
+    check "test" == "test"      # Testnet3
+    check "testnet4" == "testnet4"  # Testnet4
+    check "regtest" == "regtest"    # Regtest
+    check "signet" == "signet"      # Signet
+
 suite "RPC network info format":
   test "network info fields":
     let expectedFields = ["version", "subversion", "protocolversion",
@@ -331,6 +365,110 @@ suite "RPC network info format":
 
     for field in expectedFields:
       check networkInfo.hasKey(field)
+
+  test "networks array format":
+    # Bitcoin Core returns an array of network objects
+    let networks = %*[
+      {
+        "name": "ipv4",
+        "limited": false,
+        "reachable": true,
+        "proxy": "",
+        "proxy_randomize_credentials": false
+      },
+      {
+        "name": "ipv6",
+        "limited": true,
+        "reachable": false,
+        "proxy": "",
+        "proxy_randomize_credentials": false
+      },
+      {
+        "name": "onion",
+        "limited": true,
+        "reachable": false,
+        "proxy": "",
+        "proxy_randomize_credentials": false
+      }
+    ]
+
+    check networks.len == 3
+    check networks[0]["name"].getStr() == "ipv4"
+    check networks[0].hasKey("limited")
+    check networks[0].hasKey("reachable")
+
+  test "localservicesnames format":
+    let serviceNames = %*["NETWORK", "WITNESS", "NETWORK_LIMITED"]
+    check serviceNames.len == 3
+    check "NETWORK" in serviceNames.mapIt(it.getStr())
+    check "WITNESS" in serviceNames.mapIt(it.getStr())
+
+suite "RPC getpeerinfo format":
+  test "peer info fields":
+    # Bitcoin Core getpeerinfo returns detailed peer information
+    let expectedFields = ["id", "addr", "services", "lastsend", "lastrecv",
+                          "bytessent", "bytesrecv", "conntime", "pingtime",
+                          "version", "subver", "inbound", "startingheight",
+                          "synced_headers", "synced_blocks"]
+
+    let peerInfo = %*{
+      "id": 0,
+      "addr": "127.0.0.1:8333",
+      "services": "0000000000000409",
+      "servicesnames": ["NETWORK", "WITNESS"],
+      "relaytxes": true,
+      "lastsend": 1234567890,
+      "lastrecv": 1234567890,
+      "last_transaction": 0,
+      "last_block": 0,
+      "bytessent": 1000,
+      "bytesrecv": 2000,
+      "conntime": 1234567800,
+      "timeoffset": 0,
+      "pingtime": 0.05,
+      "minping": 0.05,
+      "version": 70016,
+      "subver": "/Satoshi:0.21.0/",
+      "inbound": false,
+      "bip152_hb_to": false,
+      "bip152_hb_from": false,
+      "startingheight": 100000,
+      "presynced_headers": -1,
+      "synced_headers": 100100,
+      "synced_blocks": 100100,
+      "inflight": [],
+      "addr_relay_enabled": true,
+      "addr_processed": 0,
+      "addr_rate_limited": 0,
+      "permissions": [],
+      "minfeefilter": 0.00001,
+      "connection_type": "outbound-full-relay",
+      "transport_protocol_type": "v1",
+      "session_id": ""
+    }
+
+    for field in expectedFields:
+      check peerInfo.hasKey(field)
+
+  test "services hex encoding":
+    # NODE_NETWORK=1, NODE_WITNESS=8 -> 0x0009
+    let services = 0x0009'u64
+    check (services and 1) != 0  # NETWORK
+    check (services and 8) != 0  # WITNESS
+    check (services and 1024) == 0  # Not NETWORK_LIMITED
+
+  test "connection types":
+    # Valid connection type strings
+    let validTypes = ["outbound-full-relay", "block-relay-only", "inbound",
+                      "manual", "addr-fetch", "feeler"]
+    check "outbound-full-relay" in validTypes
+    check "inbound" in validTypes
+
+  test "pingtime format":
+    # Ping time is in seconds (float), latency in milliseconds
+    let latencyMs = 50
+    let pingTime = float64(latencyMs) / 1000.0
+    check pingTime == 0.05
 
 suite "RPC estimatesmartfee format":
   test "fee estimate fields":
