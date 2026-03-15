@@ -40,6 +40,7 @@ import ./test_eviction
 import ./test_anchor
 import ./test_eclipse
 import ./test_blockstore
+import ./test_utxo_cache
 
 when isMainModule:
   echo "Running all tests..."
