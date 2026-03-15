@@ -18,6 +18,9 @@ type
     commitmentPeriod*: int      ## Distance in blocks between commitments
     redownloadBufferSize*: int  ## Min headers to accumulate before feeding to chain
 
+  ## Checkpoint entry: height -> expected block hash
+  Checkpoint* = tuple[height: uint32, hash: BlockHash]
+
   ConsensusParams* = object
     network*: Network
     networkMagic*: array[4, byte]
@@ -52,6 +55,10 @@ type
     dustLimit*: Satoshi
     # Header sync anti-DoS params
     headersSyncParams*: HeadersSyncParams
+    # Checkpoint verification (anti-DoS and fork protection)
+    minimumChainWork*: array[32, byte]  # Minimum cumulative PoW required
+    assumeValidBlockHash*: BlockHash    # Skip script verification before this block
+    checkpoints*: seq[Checkpoint]       # Known block hashes at specific heights
     # Legacy aliases
     p2pPort*: uint16
     rpcPort*: uint16
@@ -136,6 +143,32 @@ proc mainnetParams*(): ConsensusParams =
     commitmentPeriod: 641,
     redownloadBufferSize: 15218  # ~23.7 commitments
   )
+  # Checkpoint verification (from Bitcoin Core chainparams.cpp)
+  # nMinimumChainWork: minimum cumulative PoW to accept as valid chain
+  result.minimumChainWork = hexToBytes32(
+    "0000000000000000000000000000000000000001128750f82f4c366153a3a030"
+  )
+  # defaultAssumeValid: block hash up to which scripts are assumed valid
+  result.assumeValidBlockHash = BlockHash(hexToBytes32(
+    "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"  # 938343
+  ))
+  # Well-known mainnet checkpoints (height -> hash)
+  # These prevent long-range attacks by rejecting forks below these heights
+  result.checkpoints = @[
+    (11111'u32, BlockHash(hexToBytes32("0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d"))),
+    (33333'u32, BlockHash(hexToBytes32("000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6"))),
+    (74000'u32, BlockHash(hexToBytes32("0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20"))),
+    (105000'u32, BlockHash(hexToBytes32("00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97"))),
+    (134444'u32, BlockHash(hexToBytes32("00000000000005b12ffd4cd315cd34ffd4a594f430ac814c91184a0d42d2b0fe"))),
+    (168000'u32, BlockHash(hexToBytes32("000000000000099e61ea72015e79632f216fe6cb33d7899acb35b75c8303b763"))),
+    (193000'u32, BlockHash(hexToBytes32("000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317"))),
+    (210000'u32, BlockHash(hexToBytes32("000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e"))),
+    (216116'u32, BlockHash(hexToBytes32("00000000000001b4f4b433e81ee46494af945cf96014816a4e2370f11b23df4e"))),
+    (225430'u32, BlockHash(hexToBytes32("00000000000001c108384350f74090433e7fcf79a606b8e797f065b130575932"))),
+    (250000'u32, BlockHash(hexToBytes32("000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214"))),
+    (279000'u32, BlockHash(hexToBytes32("0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40"))),
+    (295000'u32, BlockHash(hexToBytes32("00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983")))
+  ]
   # Legacy aliases
   result.p2pPort = 8333
   result.rpcPort = 8332
@@ -185,6 +218,17 @@ proc testnet3Params*(): ConsensusParams =
     commitmentPeriod: 673,
     redownloadBufferSize: 14460  # ~21.5 commitments
   )
+  # Checkpoint verification (from Bitcoin Core chainparams.cpp)
+  result.minimumChainWork = hexToBytes32(
+    "0000000000000000000000000000000000000000000017dde1c649f3708d14b6"
+  )
+  result.assumeValidBlockHash = BlockHash(hexToBytes32(
+    "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"  # 4842348
+  ))
+  # Testnet3 checkpoints
+  result.checkpoints = @[
+    (546'u32, BlockHash(hexToBytes32("000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70")))
+  ]
   # Legacy aliases
   result.p2pPort = 18333
   result.rpcPort = 18332
@@ -235,6 +279,15 @@ proc testnet4Params*(): ConsensusParams =
     commitmentPeriod: 606,
     redownloadBufferSize: 16092  # ~26.6 commitments
   )
+  # Checkpoint verification (from Bitcoin Core chainparams.cpp)
+  result.minimumChainWork = hexToBytes32(
+    "0000000000000000000000000000000000000000000009a0fe15d0177d086304"
+  )
+  result.assumeValidBlockHash = BlockHash(hexToBytes32(
+    "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"  # 123613
+  ))
+  # Testnet4 has no historical checkpoints (fresh network)
+  result.checkpoints = @[]
   # Legacy aliases
   result.p2pPort = 48333
   result.rpcPort = 48332
@@ -284,6 +337,15 @@ proc signetParams*(): ConsensusParams =
     commitmentPeriod: 620,
     redownloadBufferSize: 15724  # ~25.4 commitments
   )
+  # Checkpoint verification (from Bitcoin Core chainparams.cpp)
+  result.minimumChainWork = hexToBytes32(
+    "00000000000000000000000000000000000000000000000000000b463ea0a4b8"
+  )
+  result.assumeValidBlockHash = BlockHash(hexToBytes32(
+    "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"  # 293175
+  ))
+  # Signet has no historical checkpoints
+  result.checkpoints = @[]
   # Legacy aliases
   result.p2pPort = 38333
   result.rpcPort = 38332
@@ -329,6 +391,10 @@ proc regtestParams*(): ConsensusParams =
     commitmentPeriod: 275,
     redownloadBufferSize: 7017  # ~25.5 commitments
   )
+  # Checkpoint verification: regtest has no checkpoints (private testing network)
+  result.minimumChainWork = default(array[32, byte])  # No minimum work requirement
+  result.assumeValidBlockHash = BlockHash(default(array[32, byte]))  # No assume-valid
+  result.checkpoints = @[]  # No checkpoints for regtest
   # Legacy aliases
   result.p2pPort = 18444
   result.rpcPort = 18443
