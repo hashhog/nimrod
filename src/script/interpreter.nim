@@ -707,6 +707,21 @@ proc isP2TR*(script: seq[byte]): bool =
     script[0] == OP_1 and
     script[1] == 0x20  # Push 32 bytes
 
+# Pay-to-Anchor script constant: OP_1 PUSHBYTES_2 0x4e73
+const P2AScript* = @[0x51'u8, 0x02, 0x4e, 0x73]
+
+proc isP2A*(script: seq[byte]): bool =
+  ## OP_1 <0x4e73> (witness v1 with 2-byte program "Ns")
+  ## Pay-to-Anchor output for fee bumping via CPFP
+  script == P2AScript
+
+proc isP2AFromProgram*(version: int, program: seq[byte]): bool =
+  ## Check if witness program represents a P2A output
+  version == 1 and
+    program.len == 2 and
+    program[0] == 0x4e and
+    program[1] == 0x73
+
 proc isWitnessProgram*(script: seq[byte]): (bool, int, seq[byte]) =
   ## Returns (isWitness, version, program)
   if script.len < 4 or script.len > 42:
