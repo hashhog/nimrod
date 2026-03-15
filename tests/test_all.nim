@@ -57,6 +57,7 @@ import ./test_miniscript
 import ./test_feefilter
 import ./test_cluster
 import ./test_p2a
+import ./test_rest
 
 when isMainModule:
   echo "Running all tests..."
