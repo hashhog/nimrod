@@ -71,6 +71,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Multi-layer UTXO cache (CoinsView hierarchy, dirty/fresh tracking, memory-aware flushing)
 - [x] Block pruning (auto/manual deletion of old blk/rev files, 550 MiB minimum, 288-block safety margin)
 - [x] Compact block relay (BIP-152 short ID, cmpctblock/getblocktxn/blocktxn, mempool reconstruction)
+- [x] Cluster mempool (connected component clustering, greedy linearization, chunk-based mining scores, cluster size limits)
 
 ## Quick start
 
