@@ -51,9 +51,11 @@ const
   RpcInternalError* = -32603
 
   # Bitcoin Core specific error codes
+  RpcInvalidAddressOrKey* = -5     # Invalid address or key
   RpcTransactionError* = -25       # Generic transaction error
   RpcTransactionRejected* = -26    # Transaction rejected by mempool
   RpcTransactionAlreadyInChain* = -27  # Transaction already confirmed
+  RpcMiscError* = -1               # Generic misc error
 
   # Default maxfeerate: 0.10 BTC/kvB = 10,000,000 sat/kvB = 10,000 sat/vB
   DefaultMaxFeeRate* = 0.10  # BTC/kvB
@@ -374,49 +376,481 @@ proc handleGetRawMempool(rpc: RpcServer, params: JsonNode): JsonNode =
     return %txids
 
 # Raw transaction RPCs
+
+# Script type detection and address extraction for verbose output
+proc getScriptType(script: seq[byte]): string =
+  ## Detect script type for verbose output
+  if script.len == 0:
+    return "nonstandard"
+
+  # P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+  if script.len == 25 and script[0] == 0x76 and script[1] == 0xa9 and
+     script[2] == 0x14 and script[23] == 0x88 and script[24] == 0xac:
+    return "pubkeyhash"
+
+  # P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+  if script.len == 23 and script[0] == 0xa9 and script[1] == 0x14 and
+     script[22] == 0x87:
+    return "scripthash"
+
+  # P2WPKH: OP_0 <20 bytes>
+  if script.len == 22 and script[0] == 0x00 and script[1] == 0x14:
+    return "witness_v0_keyhash"
+
+  # P2WSH: OP_0 <32 bytes>
+  if script.len == 34 and script[0] == 0x00 and script[1] == 0x20:
+    return "witness_v0_scripthash"
+
+  # P2TR: OP_1 <32 bytes>
+  if script.len == 34 and script[0] == 0x51 and script[1] == 0x20:
+    return "witness_v1_taproot"
+
+  # P2PK: <33 or 65 bytes pubkey> OP_CHECKSIG
+  if script.len >= 35 and script[^1] == 0xac:
+    let pushLen = script[0]
+    if (pushLen == 33 or pushLen == 65) and script.len == int(pushLen) + 2:
+      return "pubkey"
+
+  # OP_RETURN: null data
+  if script.len >= 1 and script[0] == 0x6a:
+    return "nulldata"
+
+  # Multisig: OP_M <pubkeys> OP_N OP_CHECKMULTISIG
+  if script.len >= 4 and script[^1] == 0xae:
+    let opM = script[0]
+    let opN = script[^2]
+    if opM >= 0x51 and opM <= 0x60 and opN >= 0x51 and opN <= 0x60:
+      return "multisig"
+
+  return "nonstandard"
+
+proc extractAddressFromScript(script: seq[byte], mainnet: bool): Option[string] =
+  ## Extract address from scriptPubKey if possible
+  let scriptType = getScriptType(script)
+
+  case scriptType
+  of "pubkeyhash":
+    # P2PKH: extract 20-byte hash
+    var hash: array[20, byte]
+    for i in 0 ..< 20:
+      hash[i] = script[3 + i]
+    let addr = Address(kind: P2PKH, pubkeyHash: hash)
+    return some(encodeAddress(addr, mainnet))
+
+  of "scripthash":
+    # P2SH: extract 20-byte hash
+    var hash: array[20, byte]
+    for i in 0 ..< 20:
+      hash[i] = script[2 + i]
+    let addr = Address(kind: P2SH, scriptHash: hash)
+    return some(encodeAddress(addr, mainnet))
+
+  of "witness_v0_keyhash":
+    # P2WPKH: extract 20-byte hash
+    var hash: array[20, byte]
+    for i in 0 ..< 20:
+      hash[i] = script[2 + i]
+    let addr = Address(kind: P2WPKH, wpkh: hash)
+    return some(encodeAddress(addr, mainnet))
+
+  of "witness_v0_scripthash":
+    # P2WSH: extract 32-byte hash
+    var hash: array[32, byte]
+    for i in 0 ..< 32:
+      hash[i] = script[2 + i]
+    let addr = Address(kind: P2WSH, wsh: hash)
+    return some(encodeAddress(addr, mainnet))
+
+  of "witness_v1_taproot":
+    # P2TR: extract 32-byte x-only pubkey
+    var key: array[32, byte]
+    for i in 0 ..< 32:
+      key[i] = script[2 + i]
+    let addr = Address(kind: P2TR, taprootKey: key)
+    return some(encodeAddress(addr, mainnet))
+
+  else:
+    return none(string)
+
+proc disassembleScript(script: seq[byte]): string =
+  ## Disassemble script to human-readable asm format
+  var result = ""
+  var i = 0
+
+  while i < script.len:
+    if result.len > 0:
+      result.add(" ")
+
+    let op = script[i]
+
+    # Push data opcodes (1-75 bytes)
+    if op >= 0x01 and op <= 0x4b:
+      let dataLen = int(op)
+      if i + 1 + dataLen <= script.len:
+        var data = ""
+        for j in 0 ..< dataLen:
+          data.add(toHex(script[i + 1 + j], 2).toLowerAscii())
+        result.add(data)
+        i += 1 + dataLen
+      else:
+        result.add("[error]")
+        break
+    elif op == 0x4c:  # OP_PUSHDATA1
+      if i + 1 < script.len:
+        let dataLen = int(script[i + 1])
+        if i + 2 + dataLen <= script.len:
+          var data = ""
+          for j in 0 ..< dataLen:
+            data.add(toHex(script[i + 2 + j], 2).toLowerAscii())
+          result.add(data)
+          i += 2 + dataLen
+        else:
+          result.add("[error]")
+          break
+      else:
+        result.add("[error]")
+        break
+    elif op == 0x4d:  # OP_PUSHDATA2
+      if i + 2 < script.len:
+        let dataLen = int(script[i + 1]) or (int(script[i + 2]) shl 8)
+        if i + 3 + dataLen <= script.len:
+          var data = ""
+          for j in 0 ..< dataLen:
+            data.add(toHex(script[i + 3 + j], 2).toLowerAscii())
+          result.add(data)
+          i += 3 + dataLen
+        else:
+          result.add("[error]")
+          break
+      else:
+        result.add("[error]")
+        break
+    elif op == 0x4e:  # OP_PUSHDATA4
+      if i + 4 < script.len:
+        let dataLen = int(script[i + 1]) or (int(script[i + 2]) shl 8) or
+                      (int(script[i + 3]) shl 16) or (int(script[i + 4]) shl 24)
+        if i + 5 + dataLen <= script.len:
+          var data = ""
+          for j in 0 ..< dataLen:
+            data.add(toHex(script[i + 5 + j], 2).toLowerAscii())
+          result.add(data)
+          i += 5 + dataLen
+        else:
+          result.add("[error]")
+          break
+      else:
+        result.add("[error]")
+        break
+    else:
+      # Map opcode to name
+      let opName = case op
+        of 0x00: "0"
+        of 0x4f: "-1"
+        of 0x51: "1"
+        of 0x52: "2"
+        of 0x53: "3"
+        of 0x54: "4"
+        of 0x55: "5"
+        of 0x56: "6"
+        of 0x57: "7"
+        of 0x58: "8"
+        of 0x59: "9"
+        of 0x5a: "10"
+        of 0x5b: "11"
+        of 0x5c: "12"
+        of 0x5d: "13"
+        of 0x5e: "14"
+        of 0x5f: "15"
+        of 0x60: "16"
+        of 0x61: "OP_NOP"
+        of 0x63: "OP_IF"
+        of 0x64: "OP_NOTIF"
+        of 0x67: "OP_ELSE"
+        of 0x68: "OP_ENDIF"
+        of 0x69: "OP_VERIFY"
+        of 0x6a: "OP_RETURN"
+        of 0x6b: "OP_TOALTSTACK"
+        of 0x6c: "OP_FROMALTSTACK"
+        of 0x6d: "OP_2DROP"
+        of 0x6e: "OP_2DUP"
+        of 0x6f: "OP_3DUP"
+        of 0x70: "OP_2OVER"
+        of 0x71: "OP_2ROT"
+        of 0x72: "OP_2SWAP"
+        of 0x73: "OP_IFDUP"
+        of 0x74: "OP_DEPTH"
+        of 0x75: "OP_DROP"
+        of 0x76: "OP_DUP"
+        of 0x77: "OP_NIP"
+        of 0x78: "OP_OVER"
+        of 0x79: "OP_PICK"
+        of 0x7a: "OP_ROLL"
+        of 0x7b: "OP_ROT"
+        of 0x7c: "OP_SWAP"
+        of 0x7d: "OP_TUCK"
+        of 0x82: "OP_SIZE"
+        of 0x87: "OP_EQUAL"
+        of 0x88: "OP_EQUALVERIFY"
+        of 0x8b: "OP_1ADD"
+        of 0x8c: "OP_1SUB"
+        of 0x8f: "OP_NEGATE"
+        of 0x90: "OP_ABS"
+        of 0x91: "OP_NOT"
+        of 0x92: "OP_0NOTEQUAL"
+        of 0x93: "OP_ADD"
+        of 0x94: "OP_SUB"
+        of 0x9a: "OP_BOOLAND"
+        of 0x9b: "OP_BOOLOR"
+        of 0x9c: "OP_NUMEQUAL"
+        of 0x9d: "OP_NUMEQUALVERIFY"
+        of 0x9e: "OP_NUMNOTEQUAL"
+        of 0x9f: "OP_LESSTHAN"
+        of 0xa0: "OP_GREATERTHAN"
+        of 0xa1: "OP_LESSTHANOREQUAL"
+        of 0xa2: "OP_GREATERTHANOREQUAL"
+        of 0xa3: "OP_MIN"
+        of 0xa4: "OP_MAX"
+        of 0xa5: "OP_WITHIN"
+        of 0xa6: "OP_RIPEMD160"
+        of 0xa7: "OP_SHA1"
+        of 0xa8: "OP_SHA256"
+        of 0xa9: "OP_HASH160"
+        of 0xaa: "OP_HASH256"
+        of 0xab: "OP_CODESEPARATOR"
+        of 0xac: "OP_CHECKSIG"
+        of 0xad: "OP_CHECKSIGVERIFY"
+        of 0xae: "OP_CHECKMULTISIG"
+        of 0xaf: "OP_CHECKMULTISIGVERIFY"
+        of 0xb0: "OP_NOP1"
+        of 0xb1: "OP_CHECKLOCKTIMEVERIFY"
+        of 0xb2: "OP_CHECKSEQUENCEVERIFY"
+        of 0xb3: "OP_NOP4"
+        of 0xb4: "OP_NOP5"
+        of 0xb5: "OP_NOP6"
+        of 0xb6: "OP_NOP7"
+        of 0xb7: "OP_NOP8"
+        of 0xb8: "OP_NOP9"
+        of 0xb9: "OP_NOP10"
+        of 0xba: "OP_CHECKSIGADD"
+        else: "OP_UNKNOWN[" & toHex(op, 2) & "]"
+      result.add(opName)
+      i += 1
+
+  return result
+
+proc buildScriptPubKeyJson(script: seq[byte], mainnet: bool): JsonNode =
+  ## Build scriptPubKey JSON object with type, asm, hex, address
+  let scriptType = getScriptType(script)
+  let addrOpt = extractAddressFromScript(script, mainnet)
+
+  result = %*{
+    "asm": disassembleScript(script),
+    "hex": toHex(script),
+    "type": scriptType
+  }
+
+  if addrOpt.isSome:
+    result["address"] = %addrOpt.get()
+
+proc buildVinJson(tx: Transaction, inputIndex: int): JsonNode =
+  ## Build vin JSON object for an input
+  let inp = tx.inputs[inputIndex]
+  let isCoinbase = inp.prevOut.txid == TxId(default(array[32, byte])) and
+                   inp.prevOut.vout == 0xFFFFFFFF'u32
+
+  if isCoinbase:
+    result = %*{
+      "coinbase": toHex(inp.scriptSig),
+      "sequence": inp.sequence
+    }
+  else:
+    result = %*{
+      "txid": reverseHex(toHex(array[32, byte](inp.prevOut.txid))),
+      "vout": inp.prevOut.vout,
+      "scriptSig": %*{
+        "asm": disassembleScript(inp.scriptSig),
+        "hex": toHex(inp.scriptSig)
+      },
+      "sequence": inp.sequence
+    }
+
+  # Add witness data if present
+  if tx.witnesses.len > inputIndex and tx.witnesses[inputIndex].len > 0:
+    var txinwitness = newJArray()
+    for item in tx.witnesses[inputIndex]:
+      txinwitness.add(%toHex(item))
+    result["txinwitness"] = txinwitness
+
+proc buildVoutJson(output: TxOut, index: int, mainnet: bool): JsonNode =
+  ## Build vout JSON object for an output
+  %*{
+    "value": float64(int64(output.value)) / 100_000_000.0,
+    "n": index,
+    "scriptPubKey": buildScriptPubKeyJson(output.scriptPubKey, mainnet)
+  }
+
+proc buildVerboseTxJson(tx: Transaction, blockHash: Option[BlockHash],
+                        confirmations: int32, blocktime: uint32,
+                        inActiveChain: Option[bool], mainnet: bool): JsonNode =
+  ## Build complete verbose transaction JSON
+  let txid = tx.txid()
+  let wtxid = tx.wtxid()
+  let weight = calculateTransactionWeight(tx)
+  let vsize = (weight + 3) div 4
+
+  result = %*{
+    "txid": reverseHex(toHex(array[32, byte](txid))),
+    "hash": reverseHex(toHex(array[32, byte](wtxid))),
+    "version": tx.version,
+    "size": serialize(tx).len,
+    "vsize": vsize,
+    "weight": weight,
+    "locktime": tx.lockTime
+  }
+
+  # Add vin array
+  var vinArray = newJArray()
+  for i in 0 ..< tx.inputs.len:
+    vinArray.add(buildVinJson(tx, i))
+  result["vin"] = vinArray
+
+  # Add vout array
+  var voutArray = newJArray()
+  for i, outp in tx.outputs:
+    voutArray.add(buildVoutJson(outp, i, mainnet))
+  result["vout"] = voutArray
+
+  # Add hex
+  result["hex"] = %toHex(serialize(tx))
+
+  # Add block info if confirmed
+  if blockHash.isSome:
+    result["blockhash"] = %reverseHex(toHex(array[32, byte](blockHash.get())))
+    result["confirmations"] = %confirmations
+    result["time"] = %blocktime
+    result["blocktime"] = %blocktime
+
+  # Add in_active_chain if blockhash was explicitly provided
+  if inActiveChain.isSome:
+    result["in_active_chain"] = %inActiveChain.get()
+
 proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getrawtransaction "txid" ( verbose "blockhash" )
+  ##
+  ## Returns raw transaction data. If verbose=false (default), returns hex string.
+  ## If verbose=true, returns JSON object with decoded transaction data.
+  ##
+  ## By default, only mempool transactions are returned. With txindex enabled,
+  ## confirmed transactions can also be retrieved. If blockhash is provided,
+  ## the transaction is searched for only in that specific block.
+  ##
+  ## Reference: Bitcoin Core /src/rpc/rawtransaction.cpp getrawtransaction
+
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing txid parameter")
 
   let txidHex = params[0].getStr()
-  let verbose = if params.len >= 2: params[1].getBool() else: false
+  if txidHex.len != 64:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid txid")
+
+  # Parse verbose parameter (supports bool or int)
+  var verbose = false
+  if params.len >= 2:
+    if params[1].kind == JBool:
+      verbose = params[1].getBool()
+    elif params[1].kind == JInt:
+      verbose = params[1].getInt() > 0
+    elif params[1].kind == JNull:
+      discard  # Keep default false
+    else:
+      raise newRpcError(RpcInvalidParams, "verbose must be a boolean or integer")
 
   let txid = parseTxId(txidHex)
 
-  # Check mempool first
-  let mempoolTx = rpc.mempool.getTransaction(txid)
-  if mempoolTx.isSome:
-    let tx = mempoolTx.get()
+  # Parse optional blockhash parameter
+  var explicitBlockHash: Option[BlockHash] = none(BlockHash)
+  if params.len >= 3 and params[2].kind == JString:
+    let blockHashHex = params[2].getStr()
+    if blockHashHex.len != 64:
+      raise newRpcError(RpcInvalidAddressOrKey, "Invalid block hash")
+    explicitBlockHash = some(parseBlockHash(blockHashHex))
+
+  let mainnet = rpc.params.network == Mainnet
+
+  # If blockhash is explicitly provided, search only in that block
+  if explicitBlockHash.isSome:
+    let blockHash = explicitBlockHash.get()
+
+    # Check if block exists
+    let blkOpt = rpc.chainState.db.getBlock(blockHash)
+    if blkOpt.isNone:
+      raise newRpcError(RpcInvalidAddressOrKey, "Block hash not found")
+
+    let blk = blkOpt.get()
+
+    # Check if block has data (not pruned)
+    let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
+    if idxOpt.isNone:
+      raise newRpcError(RpcMiscError, "Block not available")
+
+    # Search for transaction in block
+    var foundTx: Option[Transaction] = none(Transaction)
+    for tx in blk.txs:
+      if tx.txid() == txid:
+        foundTx = some(tx)
+        break
+
+    if foundTx.isNone:
+      raise newRpcError(RpcInvalidAddressOrKey,
+        "No such transaction found in the provided block. Use gettransaction for wallet transactions.")
+
+    let tx = foundTx.get()
+
     if not verbose:
       return %toHex(serialize(tx))
 
-    let entry = rpc.mempool.get(txid)
-    let vsize = (entry.get().weight + 3) div 4
+    # Check if block is in active chain
+    let blockIdx = idxOpt.get()
+    let tipHashOpt = rpc.chainState.db.getBlockHashByHeight(rpc.chainState.bestHeight)
+    var inActiveChain = false
+    if tipHashOpt.isSome:
+      # Block is in active chain if we can reach it from the tip by height
+      let heightHashOpt = rpc.chainState.db.getBlockHashByHeight(blockIdx.height)
+      inActiveChain = heightHashOpt.isSome and heightHashOpt.get() == blockHash
 
-    return %*{
-      "txid": reverseHex(toHex(array[32, byte](txid))),
-      "hash": reverseHex(toHex(array[32, byte](tx.wtxid()))),
-      "version": tx.version,
-      "size": serialize(tx).len,
-      "vsize": vsize,
-      "weight": entry.get().weight,
-      "locktime": tx.lockTime,
-      "hex": toHex(serialize(tx))
-    }
+    let confirmations = if inActiveChain:
+      rpc.chainState.bestHeight - blockIdx.height + 1
+    else:
+      -1'i32  # Not in active chain
 
-  # Check tx index
+    return buildVerboseTxJson(tx, some(blockHash), confirmations,
+                              blk.header.timestamp, some(inActiveChain), mainnet)
+
+  # No explicit blockhash: check mempool first, then txindex
+  let mempoolTx = rpc.mempool.getTransaction(txid)
+  if mempoolTx.isSome:
+    let tx = mempoolTx.get()
+
+    if not verbose:
+      return %toHex(serialize(tx))
+
+    # Unconfirmed transaction - no block info
+    return buildVerboseTxJson(tx, none(BlockHash), 0, 0, none(bool), mainnet)
+
+  # Check tx index for confirmed transactions
   let locOpt = rpc.chainState.db.getTxIndex(txid)
   if locOpt.isNone:
-    raise newRpcError(RpcInvalidParams, "transaction not found")
+    raise newRpcError(RpcInvalidAddressOrKey,
+      "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.")
 
   let loc = locOpt.get()
   let blkOpt = rpc.chainState.db.getBlock(loc.blockHash)
   if blkOpt.isNone:
-    raise newRpcError(RpcInternalError, "block not found for indexed transaction")
+    raise newRpcError(RpcInternalError, "Block not found for indexed transaction")
 
   let blk = blkOpt.get()
   if int(loc.txIndex) >= blk.txs.len:
-    raise newRpcError(RpcInternalError, "invalid tx index")
+    raise newRpcError(RpcInternalError, "Invalid transaction index")
 
   let tx = blk.txs[loc.txIndex]
 
@@ -425,21 +859,10 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let idxOpt = rpc.chainState.db.getBlockIndex(loc.blockHash)
   let blockHeight = if idxOpt.isSome: idxOpt.get().height else: 0'i32
+  let confirmations = rpc.chainState.bestHeight - blockHeight + 1
 
-  %*{
-    "txid": reverseHex(toHex(array[32, byte](txid))),
-    "hash": reverseHex(toHex(array[32, byte](tx.wtxid()))),
-    "version": tx.version,
-    "size": serialize(tx).len,
-    "vsize": (calculateTransactionWeight(tx) + 3) div 4,
-    "weight": calculateTransactionWeight(tx),
-    "locktime": tx.lockTime,
-    "hex": toHex(serialize(tx)),
-    "blockhash": reverseHex(toHex(array[32, byte](loc.blockHash))),
-    "confirmations": rpc.chainState.bestHeight - blockHeight + 1,
-    "time": blk.header.timestamp,
-    "blocktime": blk.header.timestamp
-  }
+  buildVerboseTxJson(tx, some(loc.blockHash), confirmations,
+                     blk.header.timestamp, none(bool), mainnet)
 
 proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1:
