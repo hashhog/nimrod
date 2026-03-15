@@ -1674,6 +1674,8 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let balance = rpc.wallet.getBalance()
   let txCount = rpc.wallet.utxos.len  # Simplified: count UTXOs as proxy for tx count
+  let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
+  let immatureBalance = rpc.wallet.getImmatureBalance(currentHeight)
 
   %*{
     "walletname": "default",
@@ -1681,7 +1683,7 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
     "format": "nimrod",
     "balance": float64(int64(balance)) / 100_000_000.0,
     "unconfirmed_balance": 0.0,
-    "immature_balance": 0.0,
+    "immature_balance": float64(int64(immatureBalance)) / 100_000_000.0,
     "txcount": txCount,
     "keypoolsize": 20,
     "keypoolsize_hd_internal": 20,
@@ -1690,8 +1692,192 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
     "avoid_reuse": false,
     "scanning": false,
     "descriptors": false,
-    "external_signer": false
+    "external_signer": false,
+    "unlocked_until": (if rpc.wallet.isEncrypted and not rpc.wallet.isLocked:
+                        rpc.wallet.unlockExpiry else: 0)
   }
+
+# ============================================================================
+# Wallet Encryption RPCs
+# ============================================================================
+
+proc handleEncryptWallet(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Encrypt the wallet with a passphrase
+  ## Reference: Bitcoin Core wallet/rpc/encrypt.cpp encryptwallet
+  ##
+  ## Arguments:
+  ## 1. passphrase (string, required) - The passphrase to encrypt the wallet with
+  ##
+  ## Returns: Status message
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "missing passphrase parameter")
+
+  let passphrase = params[0].getStr()
+
+  if rpc.wallet.isEncrypted:
+    raise newRpcError(RpcMiscError, "wallet is already encrypted")
+
+  try:
+    var w = rpc.wallet
+    discard w.encryptWallet(passphrase)
+    %"wallet encrypted successfully"
+  except WalletError as e:
+    raise newRpcError(RpcMiscError, e.msg)
+
+proc handleWalletPassphrase(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Unlock an encrypted wallet
+  ## Reference: Bitcoin Core wallet/rpc/encrypt.cpp walletpassphrase
+  ##
+  ## Arguments:
+  ## 1. passphrase (string, required) - The wallet passphrase
+  ## 2. timeout (numeric, required) - Seconds to keep wallet unlocked
+  ##
+  ## Returns: null on success
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams, "missing passphrase and/or timeout parameter")
+
+  let passphrase = params[0].getStr()
+  let timeout = params[1].getInt()
+
+  if not rpc.wallet.isEncrypted:
+    raise newRpcError(RpcMiscError, "wallet is not encrypted")
+
+  try:
+    var w = rpc.wallet
+    if not w.unlockWallet(passphrase, timeout):
+      raise newRpcError(RpcMiscError, "incorrect passphrase")
+    newJNull()
+  except WalletError as e:
+    raise newRpcError(RpcMiscError, e.msg)
+
+proc handleWalletLock(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Lock the wallet
+  ## Reference: Bitcoin Core wallet/rpc/encrypt.cpp walletlock
+  ##
+  ## Returns: null on success
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  if not rpc.wallet.isEncrypted:
+    raise newRpcError(RpcMiscError, "wallet is not encrypted")
+
+  try:
+    var w = rpc.wallet
+    w.lockWallet()
+    newJNull()
+  except WalletError as e:
+    raise newRpcError(RpcMiscError, e.msg)
+
+proc handleWalletPassphraseChange(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Change the wallet passphrase
+  ## Reference: Bitcoin Core wallet/rpc/encrypt.cpp walletpassphrasechange
+  ##
+  ## Arguments:
+  ## 1. oldpassphrase (string, required) - Current passphrase
+  ## 2. newpassphrase (string, required) - New passphrase
+  ##
+  ## Returns: null on success
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams, "missing oldpassphrase and/or newpassphrase parameter")
+
+  let oldPassphrase = params[0].getStr()
+  let newPassphrase = params[1].getStr()
+
+  if not rpc.wallet.isEncrypted:
+    raise newRpcError(RpcMiscError, "wallet is not encrypted")
+
+  try:
+    var w = rpc.wallet
+    if not w.changePassphrase(oldPassphrase, newPassphrase):
+      raise newRpcError(RpcMiscError, "incorrect old passphrase")
+    newJNull()
+  except WalletError as e:
+    raise newRpcError(RpcMiscError, e.msg)
+
+# ============================================================================
+# Address Label RPCs
+# ============================================================================
+
+proc handleSetLabel(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Set a label for an address
+  ## Reference: Bitcoin Core wallet/rpc/addresses.cpp setlabel
+  ##
+  ## Arguments:
+  ## 1. address (string, required) - The address to set label for
+  ## 2. label (string, required) - The label (empty string removes label)
+  ##
+  ## Returns: null on success
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams, "missing address and/or label parameter")
+
+  let address = params[0].getStr()
+  let label = params[1].getStr()
+
+  # Validate address
+  try:
+    discard decodeAddress(address)
+  except AddressError:
+    raise newRpcError(RpcInvalidAddressOrKey, "invalid address: " & address)
+
+  var w = rpc.wallet
+  w.setLabel(address, label)
+  newJNull()
+
+proc handleGetAddressesByLabel(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Get addresses with a label
+  ## Reference: Bitcoin Core wallet/rpc/addresses.cpp getaddressesbylabel
+  ##
+  ## Arguments:
+  ## 1. label (string, required) - The label
+  ##
+  ## Returns: Object with address keys
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing label parameter")
+
+  let label = params[0].getStr()
+  let addresses = rpc.wallet.getAddressesByLabel(label)
+
+  var result = newJObject()
+  for addr in addresses:
+    result[addr] = %*{"purpose": "receive"}
+
+  result
+
+proc handleListLabels(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## List all labels
+  ## Reference: Bitcoin Core wallet/rpc/addresses.cpp listlabels
+  ##
+  ## Returns: Array of labels
+
+  if rpc.wallet == nil:
+    raise newRpcError(RpcMiscError, "wallet not loaded")
+
+  let labels = rpc.wallet.listLabels()
+  var result = newJArray()
+  for label in labels:
+    result.add(%label)
+  result
 
 proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
   case methodName
@@ -1770,6 +1956,24 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
     rpc.handleListUnspent(params)
   of "getwalletinfo":
     rpc.handleGetWalletInfo(params)
+
+  # Wallet encryption
+  of "encryptwallet":
+    rpc.handleEncryptWallet(params)
+  of "walletpassphrase":
+    rpc.handleWalletPassphrase(params)
+  of "walletlock":
+    rpc.handleWalletLock(params)
+  of "walletpassphrasechange":
+    rpc.handleWalletPassphraseChange(params)
+
+  # Address labels
+  of "setlabel":
+    rpc.handleSetLabel(params)
+  of "getaddressesbylabel":
+    rpc.handleGetAddressesByLabel(params)
+  of "listlabels":
+    rpc.handleListLabels(params)
 
   # Control
   of "stop":
