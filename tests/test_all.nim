@@ -23,6 +23,7 @@ import ./test_template
 import ./test_sync
 import ./test_headerssync
 import ./test_wallet
+import ./test_coinselection
 import ./test_rpc
 import ./test_perf
 import ./test_sequence_lock
