@@ -60,6 +60,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Stale peer eviction (chain sync timeout, ping timeout, headers timeout, extra outbound eviction)
 - [x] Checkpoint verification (minimum chain work, assume-valid, fork rejection below checkpoints)
 - [x] sendrawtransaction RPC (maxfeerate validation, idempotent mempool handling, inv broadcast)
+- [x] getrawtransaction RPC (mempool lookup, txindex lookup, blockhash parameter, verbose output with asm/address)
 - [ ] Compact block relay (BIP-152)
 
 ## Quick start
