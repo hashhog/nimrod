@@ -1,6 +1,7 @@
 ## Tests for BIP9 Version Bits State Machine
 
-import std/[unittest, tables, options]
+import std/[tables, options]
+import unittest2
 import ../src/consensus/versionbits
 import ../src/consensus/params
 import ../src/primitives/types

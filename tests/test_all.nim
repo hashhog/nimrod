@@ -30,6 +30,7 @@ import ./test_sigop
 import ./test_difficulty
 import ./test_misbehavior
 import ./test_banman
+import ./test_versionbits
 
 when isMainModule:
   echo "Running all tests..."
