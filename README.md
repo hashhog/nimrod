@@ -38,6 +38,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Chainstate management (atomic block connect/disconnect, write batches)
 - [x] UTXO set manager (cache, coinbase maturity, reorg support)
 - [x] Undo data storage (flat file rev*.dat, checksums, block disconnect)
+- [x] Flat file block storage (blk*.dat files, 128 MiB max, 16 MiB pre-alloc)
 - [x] P2P message serialization (typed case object, all message types)
 - [x] Peer connection (TCP, message framing, version handshake, ping/pong)
 - [x] Peer manager (DNS discovery, connection limits, banning, message routing)
