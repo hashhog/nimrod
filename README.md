@@ -54,6 +54,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Comprehensive test suite (unit tests, integration tests, Bitcoin Core vectors)
 - [x] Performance optimization (parallel sig verification, UTXO cache, RocksDB tuning)
 - [x] BIP-9 version bits (soft fork signaling state machine, deployment tracking)
+- [x] Misbehavior scoring (100-point threshold, persistent ban list, RPC commands)
 - [ ] Relay mode (post-IBD block/tx propagation)
 
 ## Quick start
