@@ -2,13 +2,13 @@
 ## Bitcoin Core compatible RPC interface with HTTP Basic auth
 ## JSON-RPC 2.0 compliant with proper error codes
 
-import std/[json, strutils, tables, options, base64, parseutils, times]
+import std/[json, strutils, tables, options, base64, parseutils, times, sets]
 import chronos
 import chronicles
 import jsony
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation]
-import ../storage/chainstate
+import ../storage/[chainstate, blockstore]
 import ../mempool/mempool
 import ../crypto/[hashing, secp256k1, address]
 import ../network/[peer, peermanager, banman]
@@ -29,6 +29,7 @@ type
     authPass*: string
     running*: bool
     crypto*: CryptoEngine
+    blockFileManager*: BlockFileManager  ## Optional: for pruning support
 
   RpcRequest = object
     jsonrpc: string
@@ -183,7 +184,18 @@ proc handleGetBlockchainInfo(rpc: RpcServer): JsonNode =
     of Regtest: "regtest"
     of Signet: "signet"
 
-  %*{
+  # Get pruning info
+  var pruned = false
+  var pruneHeight: int32 = -1
+  var sizeOnDisk: uint64 = 0
+
+  if rpc.blockFileManager != nil:
+    pruned = rpc.blockFileManager.isPruneMode
+    sizeOnDisk = rpc.blockFileManager.calculateCurrentUsage()
+    if pruned:
+      pruneHeight = rpc.blockFileManager.getPruneHeight()
+
+  var response = %*{
     "chain": chainName,
     "blocks": rpc.chainState.bestHeight,
     "headers": rpc.chainState.bestHeight,
@@ -201,10 +213,20 @@ proc handleGetBlockchainInfo(rpc: RpcServer): JsonNode =
     "verificationprogress": verificationProgress,
     "initialblockdownload": rpc.chainState.bestHeight < 100,
     "chainwork": toHex(rpc.chainState.totalWork),
-    "size_on_disk": 0,
-    "pruned": false,
+    "size_on_disk": sizeOnDisk,
+    "pruned": pruned,
     "warnings": ""
   }
+
+  # Add pruneheight only if pruned
+  if pruned and pruneHeight >= 0:
+    response["pruneheight"] = %pruneHeight
+
+  # Add prune_target_size if pruning is enabled
+  if rpc.blockFileManager != nil and rpc.blockFileManager.isPruneMode:
+    response["prune_target_size"] = %rpc.blockFileManager.getPruneTarget()
+
+  response
 
 proc handleGetBlockCount(rpc: RpcServer): JsonNode =
   %rpc.chainState.bestHeight
@@ -290,6 +312,11 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   let verbosity = if params.len >= 2: params[1].getInt() else: 1
 
   let blockHash = parseBlockHash(hashHex)
+
+  # Check if block has been pruned
+  if rpc.blockFileManager != nil and rpc.blockFileManager.isBlockPruned(blockHash):
+    raise newRpcError(RpcMiscError, "Block not available (pruned data)")
+
   let blkOpt = rpc.chainState.db.getBlock(blockHash)
   if blkOpt.isNone:
     raise newRpcError(RpcInvalidParams, "block not found")
@@ -1460,6 +1487,69 @@ proc handleValidateAddress(rpc: RpcServer, params: JsonNode): JsonNode =
       "address": addrStr
     }
 
+# ============================================================================
+# Pruning RPCs
+# ============================================================================
+
+proc handlePruneBlockchain(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Prune the blockchain up to a specified height
+  ## Reference: Bitcoin Core rpc/blockchain.cpp pruneblockchain
+  ##
+  ## Arguments:
+  ## 1. height (numeric, required) - The block height to prune up to
+  ##
+  ## Returns:
+  ## The height of the last block pruned
+  ##
+  ## Note: Pruning requires -prune option to be enabled
+
+  if rpc.blockFileManager == nil:
+    raise newRpcError(RpcMiscError, "pruning is not enabled")
+
+  if not rpc.blockFileManager.isPruneMode:
+    raise newRpcError(RpcMiscError, "cannot prune blocks because node is not in prune mode")
+
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing height parameter")
+
+  let targetHeight = params[0].getInt()
+  let chainHeight = rpc.chainState.bestHeight
+
+  if targetHeight < 0:
+    raise newRpcError(RpcInvalidParams, "height must be non-negative")
+
+  if targetHeight > chainHeight - MinBlocksToKeep:
+    raise newRpcError(RpcInvalidParams,
+      "Blockchain is shorter than the target height - " & $MinBlocksToKeep & " blocks")
+
+  # Helper to get block hashes in a file
+  proc getBlockHashesInFile(fileNum: int32): seq[BlockHash] =
+    result = @[]
+    # Iterate through known heights and find blocks in this file
+    # This is a simplified approach - in production we'd use an index
+    let infoOpt = rpc.blockFileManager.loadFileInfo(fileNum)
+    if infoOpt.isSome:
+      let info = infoOpt.get()
+      for height in int32(info.nHeightFirst) .. int32(info.nHeightLast):
+        let hashOpt = rpc.chainState.db.getBlockHashByHeight(height)
+        if hashOpt.isSome:
+          let entry = rpc.blockFileManager.getBlockIndex(hashOpt.get())
+          if entry.isSome and entry.get().fileNum == fileNum:
+            result.add(hashOpt.get())
+
+  let (filesToPrune, prunedCount) = rpc.blockFileManager.findFilesToPruneManual(
+    int32(targetHeight),
+    chainHeight,
+    getBlockHashesInFile
+  )
+
+  # Delete the pruned files
+  rpc.blockFileManager.unlinkPrunedFiles(filesToPrune)
+
+  # Return the last pruned height
+  let pruneHeight = rpc.blockFileManager.getPruneHeight()
+  %pruneHeight
+
 proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
   case methodName
   # Blockchain
@@ -1479,6 +1569,8 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
     rpc.handleGetDifficulty()
   of "getchaintips":
     rpc.handleGetChainTips()
+  of "pruneblockchain":
+    rpc.handlePruneBlockchain(params)
 
   # Mempool
   of "getmempoolinfo":
