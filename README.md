@@ -49,7 +49,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Transaction mempool (fee/size policy, CPFP tracking, eviction, ancestor/descendant limits)
 - [x] Fee estimation (histogram-based, 85% confirmation threshold)
 - [x] Block template generation (BIP-34 coinbase, witness commitment, sigops limit, locktime finality, anti-fee-sniping)
-- [x] JSON-RPC server (getblockchaininfo, getnetworkinfo, getpeerinfo, getmempoolinfo, getrawmempool, estimatesmartfee, validateaddress, getblocktemplate)
+- [x] JSON-RPC server (getblockchaininfo, getnetworkinfo, getpeerinfo, getmempoolinfo, getrawmempool, estimatesmartfee, validateaddress, getblocktemplate, batch requests)
 - [x] HD Wallet (BIP-32/39/44/84/86 key derivation, P2WPKH signing)
 - [x] Unified CLI (subcommands for node, RPC, wallet; config file; signal handlers)
 - [x] Comprehensive test suite (unit tests, integration tests, Bitcoin Core vectors)
