@@ -2,7 +2,7 @@
 ## Tests transaction acceptance, double-spend detection, fee policy, eviction, and block removal
 
 import unittest2
-import std/[os, options, tables, strutils, times]
+import std/[os, options, tables, strutils, times, sets]
 import ../src/mempool/mempool
 import ../src/storage/[db, chainstate]
 import ../src/primitives/[types, serialize]
@@ -726,6 +726,489 @@ suite "Mempool expiration":
     check mp.count == 1
     check TxId(txid1) notin mp.entries  # Old tx expired
     check TxId(txid2) in mp.entries     # Recent tx kept
+
+    cs.close()
+
+suite "Mempool ancestor limits":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "ancestor limit constants":
+    check DefaultAncestorLimit == 25
+    check DefaultDescendantLimit == 25
+    check DefaultAncestorSizeLimitKvB == 101
+    check DefaultDescendantSizeLimitKvB == 101
+    check DefaultAncestorSizeLimit == 101_000
+    check DefaultDescendantSizeLimit == 101_000
+
+  test "accept chain of 25 transactions (at limit)":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Build a chain of txs where each spends the previous
+    # Since ancestor limit = 25 (including self), we can have up to 24 ancestors
+    var prevTxid: array[32, byte]
+    prevTxid[0] = 0x01
+
+    # Create chain of 25 transactions
+    for i in 0 ..< 25:
+      var txid: array[32, byte]
+      txid[0] = byte(i + 1)
+
+      let tx = if i == 0:
+        # First tx has no mempool parent
+        Transaction(version: 1, inputs: @[], outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[])], witnesses: @[], lockTime: 0)
+      else:
+        # Subsequent txs spend from previous
+        Transaction(
+          version: 1,
+          inputs: @[TxIn(prevOut: OutPoint(txid: TxId(prevTxid), vout: 0), scriptSig: @[], sequence: 0)],
+          outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+          witnesses: @[],
+          lockTime: 0
+        )
+
+      # Manually add to mempool (bypassing validation for simplicity)
+      let weight = 400
+      let vsize = 100
+      let ancestorCount = i + 1  # Including self
+      let ancestorSize = ancestorCount * vsize
+
+      mp.entries[TxId(txid)] = MempoolEntry(
+        tx: tx, txid: TxId(txid), fee: Satoshi(100),
+        weight: weight, feeRate: 1.0, timeAdded: getTime(),
+        height: 100, ancestorFee: Satoshi(100 * ancestorCount), ancestorWeight: weight * ancestorCount,
+        ancestorCount: ancestorCount, ancestorSize: ancestorSize
+      )
+
+      # Track spent outpoint
+      if i > 0:
+        mp.spentBy[OutPoint(txid: TxId(prevTxid), vout: 0)] = TxId(txid)
+
+      prevTxid = txid
+
+    check mp.count == 25
+
+    # Verify last tx has ancestor count of 25 (including self)
+    var lastTxid: array[32, byte]
+    lastTxid[0] = 25
+    check mp.entries[TxId(lastTxid)].ancestorCount == 25
+
+    cs.close()
+
+  test "reject transaction that exceeds ancestor count limit":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Build a chain of 25 transactions first
+    var prevTxid: array[32, byte]
+    prevTxid[0] = 0x01
+
+    for i in 0 ..< 25:
+      var txid: array[32, byte]
+      txid[0] = byte(i + 1)
+
+      let tx = if i == 0:
+        Transaction(version: 1, inputs: @[], outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[])], witnesses: @[], lockTime: 0)
+      else:
+        Transaction(
+          version: 1,
+          inputs: @[TxIn(prevOut: OutPoint(txid: TxId(prevTxid), vout: 0), scriptSig: @[], sequence: 0)],
+          outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+          witnesses: @[],
+          lockTime: 0
+        )
+
+      let weight = 400
+      let vsize = 100
+      let ancestorCount = i + 1
+      let ancestorSize = ancestorCount * vsize
+
+      mp.entries[TxId(txid)] = MempoolEntry(
+        tx: tx, txid: TxId(txid), fee: Satoshi(100),
+        weight: weight, feeRate: 1.0, timeAdded: getTime(),
+        height: 100, ancestorFee: Satoshi(100 * ancestorCount), ancestorWeight: weight * ancestorCount,
+        ancestorCount: ancestorCount, ancestorSize: ancestorSize
+      )
+
+      if i > 0:
+        mp.spentBy[OutPoint(txid: TxId(prevTxid), vout: 0)] = TxId(txid)
+
+      prevTxid = txid
+
+    check mp.count == 25
+
+    # Try to add a 26th transaction - should be rejected
+    var tx26id: array[32, byte]
+    tx26id[0] = 26
+    let tx26 = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(prevTxid), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    # Check package limits directly
+    let result = mp.checkPackageLimits(tx26, 400)
+    check not result.isOk
+    check "exceeds ancestor limit" in result.error
+
+    cs.close()
+
+  test "calculateAncestors returns correct ancestor set":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Create a simple parent-child chain: A -> B -> C
+    var txidA: array[32, byte]
+    txidA[0] = 0x01
+    var txidB: array[32, byte]
+    txidB[0] = 0x02
+    var txidC: array[32, byte]
+    txidC[0] = 0x03
+
+    let txA = Transaction(version: 1, inputs: @[], outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[])], witnesses: @[], lockTime: 0)
+    let txB = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(txidA), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let txC = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(txidB), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(txidA)] = MempoolEntry(tx: txA, txid: TxId(txidA), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400, ancestorCount: 1, ancestorSize: 100)
+    mp.entries[TxId(txidB)] = MempoolEntry(tx: txB, txid: TxId(txidB), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(200), ancestorWeight: 800, ancestorCount: 2, ancestorSize: 200)
+
+    # Calculate ancestors for txC (should include A and B)
+    let ancestors = mp.calculateAncestors(txC)
+    check len(ancestors) == 2
+    check TxId(txidA) in ancestors
+    check TxId(txidB) in ancestors
+
+    cs.close()
+
+  test "calculateAncestorStats returns correct count and size":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Create parent A
+    var txidA: array[32, byte]
+    txidA[0] = 0x01
+    let txA = Transaction(version: 1, inputs: @[], outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[])], witnesses: @[], lockTime: 0)
+
+    mp.entries[TxId(txidA)] = MempoolEntry(tx: txA, txid: TxId(txidA), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400, ancestorCount: 1, ancestorSize: 100)
+
+    # Create child B that spends from A
+    let txB = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(txidA), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    # Calculate ancestor stats for B (self weight 400 -> vsize 100)
+    let (count, size) = mp.calculateAncestorStats(txB, 100)
+    check count == 2  # A + B (self)
+    check size == 200 # 100 (A) + 100 (B self)
+
+    cs.close()
+
+suite "Mempool descendant limits":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "calculateDescendants returns correct descendant set":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Create a simple parent-child chain: A -> B -> C
+    var txidA: array[32, byte]
+    txidA[0] = 0x01
+    var txidB: array[32, byte]
+    txidB[0] = 0x02
+    var txidC: array[32, byte]
+    txidC[0] = 0x03
+
+    let txA = Transaction(version: 1, inputs: @[], outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[])], witnesses: @[], lockTime: 0)
+    let txB = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(txidA), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let txC = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(txidB), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(txidA)] = MempoolEntry(tx: txA, txid: TxId(txidA), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400, ancestorCount: 1, ancestorSize: 100)
+    mp.entries[TxId(txidB)] = MempoolEntry(tx: txB, txid: TxId(txidB), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(200), ancestorWeight: 800, ancestorCount: 2, ancestorSize: 200)
+    mp.entries[TxId(txidC)] = MempoolEntry(tx: txC, txid: TxId(txidC), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(300), ancestorWeight: 1200, ancestorCount: 3, ancestorSize: 300)
+
+    # Calculate descendants for A (should include B and C)
+    let descendants = mp.calculateDescendants(TxId(txidA))
+    check len(descendants) == 2
+    check TxId(txidB) in descendants
+    check TxId(txidC) in descendants
+
+    # Calculate descendants for B (should include only C)
+    let descendantsB = mp.calculateDescendants(TxId(txidB))
+    check len(descendantsB) == 1
+    check TxId(txidC) in descendantsB
+
+    # Calculate descendants for C (should be empty)
+    let descendantsC = mp.calculateDescendants(TxId(txidC))
+    check len(descendantsC) == 0
+
+    cs.close()
+
+  test "calculateDescendantStats returns correct count and size":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Create A -> B chain
+    var txidA: array[32, byte]
+    txidA[0] = 0x01
+    var txidB: array[32, byte]
+    txidB[0] = 0x02
+
+    let txA = Transaction(version: 1, inputs: @[], outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[])], witnesses: @[], lockTime: 0)
+    let txB = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(txidA), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(txidA)] = MempoolEntry(tx: txA, txid: TxId(txidA), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400, ancestorCount: 1, ancestorSize: 100)
+    mp.entries[TxId(txidB)] = MempoolEntry(tx: txB, txid: TxId(txidB), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(200), ancestorWeight: 800, ancestorCount: 2, ancestorSize: 200)
+
+    # Calculate descendant stats for A (should include self and B)
+    let (count, size) = mp.calculateDescendantStats(TxId(txidA))
+    check count == 2  # A + B
+    check size == 200 # 100 (A) + 100 (B)
+
+    # Calculate descendant stats for B (should be just self)
+    let (countB, sizeB) = mp.calculateDescendantStats(TxId(txidB))
+    check countB == 1  # Just B
+    check sizeB == 100 # Just B
+
+    cs.close()
+
+  test "reject transaction that would exceed descendant limit":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Create a parent with 24 descendants (total 25 including parent - at limit)
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0x01
+
+    let parentTx = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(10000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 400, feeRate: 1.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+
+    # Add 24 children (all spending from parent)
+    for i in 1 .. 24:
+      var childTxid: array[32, byte]
+      childTxid[0] = byte(i + 1)
+
+      let childTx = Transaction(
+        version: 1,
+        inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0), scriptSig: @[], sequence: 0)],
+        outputs: @[TxOut(value: Satoshi(100), scriptPubKey: @[])],
+        witnesses: @[],
+        lockTime: 0
+      )
+
+      mp.entries[TxId(childTxid)] = MempoolEntry(
+        tx: childTx, txid: TxId(childTxid), fee: Satoshi(100),
+        weight: 400, feeRate: 1.0, timeAdded: getTime(),
+        height: 100, ancestorFee: Satoshi(200), ancestorWeight: 800,
+        ancestorCount: 2, ancestorSize: 200
+      )
+
+    check mp.count == 25
+
+    # Parent now has 24 descendants + self = 25 (at limit)
+    let (descCount, _) = mp.calculateDescendantStats(TxId(parentTxid))
+    check descCount == 25
+
+    # Try to add 25th child - should be rejected
+    var child25Txid: array[32, byte]
+    child25Txid[0] = 26
+    let child25 = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(100), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let result = mp.checkPackageLimits(child25, 400)
+    check not result.isOk
+    check "descendant limit" in result.error
+
+    cs.close()
+
+suite "Mempool package_limit combined tests":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "custom package limits":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    # Create mempool with custom limits
+    var mp = newMempool(cs, params, ancestorLimit = 10, descendantLimit = 10,
+                        ancestorSizeLimit = 50000, descendantSizeLimit = 50000)
+
+    check mp.ancestorLimit == 10
+    check mp.descendantLimit == 10
+    check mp.ancestorSizeLimit == 50000
+    check mp.descendantSizeLimit == 50000
+
+    cs.close()
+
+  test "reject transaction exceeding ancestor size limit":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    # Very small ancestor size limit for testing
+    var mp = newMempool(cs, params, ancestorSizeLimit = 500)
+
+    # Create parent with large weight (2000 weight = 500 vbytes)
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0x01
+
+    let parentTx = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(10000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(1000),
+      weight: 2000, feeRate: 2.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(1000), ancestorWeight: 2000,
+      ancestorCount: 1, ancestorSize: 500  # 500 vbytes
+    )
+
+    # Try to add child - would exceed 500 vbyte limit
+    let childTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(9000), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    # Child has weight 400 -> vsize 100, plus parent 500 = 600 > 500 limit
+    let result = mp.checkPackageLimits(childTx, 400)
+    check not result.isOk
+    check "ancestor size limit" in result.error
+
+    cs.close()
+
+  test "diamond dependency pattern":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Create diamond: A -> B, A -> C, B -> D, C -> D
+    #     A
+    #    / \
+    #   B   C
+    #    \ /
+    #     D
+
+    var txidA: array[32, byte]
+    txidA[0] = 0x01
+    var txidB: array[32, byte]
+    txidB[0] = 0x02
+    var txidC: array[32, byte]
+    txidC[0] = 0x03
+
+    let txA = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[]), TxOut(value: Satoshi(1000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let txB = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(txidA), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let txC = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(txidA), vout: 1), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(txidA)] = MempoolEntry(tx: txA, txid: TxId(txidA), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400, ancestorCount: 1, ancestorSize: 100)
+    mp.entries[TxId(txidB)] = MempoolEntry(tx: txB, txid: TxId(txidB), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(200), ancestorWeight: 800, ancestorCount: 2, ancestorSize: 200)
+    mp.entries[TxId(txidC)] = MempoolEntry(tx: txC, txid: TxId(txidC), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(200), ancestorWeight: 800, ancestorCount: 2, ancestorSize: 200)
+
+    # D spends from both B and C
+    let txD = Transaction(
+      version: 1,
+      inputs: @[
+        TxIn(prevOut: OutPoint(txid: TxId(txidB), vout: 0), scriptSig: @[], sequence: 0),
+        TxIn(prevOut: OutPoint(txid: TxId(txidC), vout: 0), scriptSig: @[], sequence: 0)
+      ],
+      outputs: @[TxOut(value: Satoshi(1700), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    # D's ancestors are A, B, C (3 ancestors + self = 4)
+    let ancestors = mp.calculateAncestors(txD)
+    check len(ancestors) == 3
+    check TxId(txidA) in ancestors
+    check TxId(txidB) in ancestors
+    check TxId(txidC) in ancestors
+
+    let (count, size) = mp.calculateAncestorStats(txD, 100)
+    check count == 4  # A, B, C + D
+    check size == 400 # 100 * 4
+
+    # Should pass package limits
+    let result = mp.checkPackageLimits(txD, 400)
+    check result.isOk
 
     cs.close()
 
