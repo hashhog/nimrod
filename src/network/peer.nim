@@ -56,6 +56,9 @@ type
     sendHeaders*: bool
     wtxidRelay*: bool
     handshakeComplete*: bool
+    # Misbehavior scoring (Bitcoin Core: 100 = ban threshold)
+    misbehaviorScore*: uint32
+    shouldDisconnect*: bool
     # Internal state
     recvBuffer*: seq[byte]
     closing*: bool
@@ -72,7 +75,9 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     params: params,
     networkMagic: params.magic,
     recvBuffer: @[],
-    closing: false
+    closing: false,
+    misbehaviorScore: 0,
+    shouldDisconnect: false
   )
 
 proc `$`*(peer: Peer): string =
@@ -478,3 +483,40 @@ proc extractIPv4*(ip: array[16, byte]): array[4, byte] =
   result[1] = ip[13]
   result[2] = ip[14]
   result[3] = ip[15]
+
+# Misbehavior scoring constants (Bitcoin Core compatible)
+# See net_processing.cpp Misbehaving() - threshold is 100 points
+const
+  MisbehaviorThreshold* = 100'u32
+  # Score values (from Bitcoin Core)
+  ScoreInvalidBlockHeader* = 100'u32    # Instant ban
+  ScoreInvalidBlock* = 100'u32          # Instant ban
+  ScoreInvalidTransaction* = 10'u32
+  ScoreUnsolicitedMessage* = 20'u32
+  ScoreProtocolViolation* = 10'u32
+  ScoreInvalidHeaders* = 100'u32        # Instant ban (invalid PoW/structure)
+  ScoreInvalidCompactBlock* = 100'u32   # Instant ban
+  ScoreOversizedMessage* = 20'u32
+
+proc misbehaving*(peer: var Peer, howmuch: uint32, message: string) =
+  ## Add misbehavior points to a peer. At 100 points, peer is flagged for disconnect.
+  ## Match Bitcoin Core's Misbehaving() behavior from net_processing.cpp
+  let oldScore = peer.misbehaviorScore
+  peer.misbehaviorScore = min(peer.misbehaviorScore + howmuch, MisbehaviorThreshold)
+
+  let messagePart = if message.len > 0: ": " & message else: ""
+  warn "peer misbehaving", peer = $peer, score = howmuch,
+       total = peer.misbehaviorScore, reason = messagePart
+
+  if peer.misbehaviorScore >= MisbehaviorThreshold and oldScore < MisbehaviorThreshold:
+    peer.shouldDisconnect = true
+    warn "peer exceeded misbehavior threshold, flagged for ban", peer = $peer
+
+proc shouldBan*(peer: Peer): bool =
+  ## Check if peer should be banned (score >= threshold)
+  peer.misbehaviorScore >= MisbehaviorThreshold
+
+proc resetMisbehavior*(peer: var Peer) =
+  ## Reset misbehavior score (used during testing)
+  peer.misbehaviorScore = 0
+  peer.shouldDisconnect = false
