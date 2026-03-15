@@ -5,11 +5,17 @@
 ## File size capped at 128 MiB (MaxBlockfileSize)
 ## Pre-allocation in 16 MiB chunks (BlockfileChunkSize)
 ##
+## Pruning support:
+## - Automatically delete old block/undo files when storage exceeds target
+## - Keep at least 288 blocks of data from the tip for reorg safety
+## - Mark pruned blocks in the index (status flags cleared)
+##
 ## References:
 ## - Bitcoin Core: node/blockstorage.cpp (SaveBlockToDisk, ReadBlockFromDisk)
+## - Bitcoin Core: node/blockstorage.cpp (PruneOneBlockFile, FindFilesToPrune)
 ## - Bitcoin Core: flatfile.cpp (FlatFileSeq, FlatFilePos)
 
-import std/[os, options, streams, strformat]
+import std/[os, options, streams, strformat, sets, algorithm]
 import ./db
 import ../primitives/[types, serialize]
 import ../crypto/hashing
@@ -27,6 +33,7 @@ type
   BlockFileInfo* = object
     nBlocks*: uint32      ## Number of blocks stored in this file
     nSize*: uint32        ## Used bytes in the block file
+    nUndoSize*: uint32    ## Used bytes in the corresponding undo file
     nHeightFirst*: uint32 ## Lowest block height in this file
     nHeightLast*: uint32  ## Highest block height in this file
     nTimeFirst*: uint64   ## Earliest block timestamp
@@ -50,14 +57,22 @@ type
     fileInfos*: seq[BlockFileInfo]  ## Cached file metadata
     params*: ConsensusParams
     db*: Database         ## RocksDB for block index
+    pruneTarget*: uint64  ## Prune target in bytes (0 = disabled)
+    pruneMode*: bool      ## Whether pruning is enabled
 
 const
   BlockFilePrefix* = "blk"
+  UndoFilePrefix* = "rev"
   BlockFileSuffix* = ".dat"
   StorageHeaderBytes* = 8           ## 4 bytes magic + 4 bytes size
   MaxBlockfileSize* = 128 * 1024 * 1024  ## 128 MiB per file
   BlockfileChunkSize* = 0x1000000   ## 16 MiB pre-allocation chunks
+  UndofileChunkSize* = 0x1000000    ## 16 MiB pre-allocation chunks for undo
   MaxBlockSerializedSize* = 4_000_000  ## Max block size (4MB with witness)
+
+  # Pruning constants (matching Bitcoin Core)
+  MinDiskSpaceForBlockFiles* = uint64(550 * 1024 * 1024)  ## 550 MiB minimum prune target
+  MinBlocksToKeep* = 288            ## Keep at least 288 blocks from tip (safety margin for reorgs)
 
   # Block status flags (matching Bitcoin Core)
   BlockHaveData* = 8'u8
@@ -73,8 +88,15 @@ proc blockFileName*(fileNum: int32): string =
   ## Generate block file name: blk00000.dat, blk00001.dat, etc.
   fmt"{BlockFilePrefix}{fileNum:05d}{BlockFileSuffix}"
 
+proc undoFileName*(fileNum: int32): string =
+  ## Generate undo file name: rev00000.dat, rev00001.dat, etc.
+  fmt"{UndoFilePrefix}{fileNum:05d}{BlockFileSuffix}"
+
 proc blockFilePath*(bfm: BlockFileManager, fileNum: int32): string =
   bfm.dataDir / blockFileName(fileNum)
+
+proc undoFilePath*(bfm: BlockFileManager, fileNum: int32): string =
+  bfm.dataDir / undoFileName(fileNum)
 
 # ============================================================================
 # Position helpers
@@ -94,6 +116,7 @@ proc serializeBlockFileInfo*(info: BlockFileInfo): seq[byte] =
   var w = BinaryWriter()
   w.writeUint32LE(info.nBlocks)
   w.writeUint32LE(info.nSize)
+  w.writeUint32LE(info.nUndoSize)
   w.writeUint32LE(info.nHeightFirst)
   w.writeUint32LE(info.nHeightLast)
   w.writeUint64LE(info.nTimeFirst)
@@ -104,10 +127,22 @@ proc deserializeBlockFileInfo*(data: seq[byte]): BlockFileInfo =
   var r = BinaryReader(data: data, pos: 0)
   result.nBlocks = r.readUint32LE()
   result.nSize = r.readUint32LE()
-  result.nHeightFirst = r.readUint32LE()
-  result.nHeightLast = r.readUint32LE()
-  result.nTimeFirst = r.readUint64LE()
-  result.nTimeLast = r.readUint64LE()
+  # Handle backward compatibility: old format has 24 bytes, new has 28
+  # Old format: nBlocks(4) + nSize(4) + nHeightFirst(4) + nHeightLast(4) + nTimeFirst(8) = 24
+  # New format: adds nUndoSize(4) after nSize for 28 bytes
+  if data.len >= 28:
+    result.nUndoSize = r.readUint32LE()
+    result.nHeightFirst = r.readUint32LE()
+    result.nHeightLast = r.readUint32LE()
+    result.nTimeFirst = r.readUint64LE()
+    result.nTimeLast = r.readUint64LE()
+  else:
+    # Old format - no nUndoSize field
+    result.nUndoSize = 0
+    result.nHeightFirst = r.readUint32LE()
+    result.nHeightLast = r.readUint32LE()
+    result.nTimeFirst = r.readUint64LE()
+    result.nTimeLast = r.readUint64LE()
 
 # ============================================================================
 # BlockIndexEntry serialization
@@ -546,3 +581,265 @@ proc setBlockFailed*(bfm: BlockFileManager, hash: BlockHash) =
     var entry = entryOpt.get()
     entry.status = entry.status or BlockFailed
     bfm.putBlockIndex(hash, entry)
+
+# ============================================================================
+# Undo size tracking
+# ============================================================================
+
+proc updateFileUndoSize*(bfm: BlockFileManager, fileNum: int32, undoSize: uint32) =
+  ## Update file info with undo data size
+  var info = bfm.loadFileInfo(fileNum).get(BlockFileInfo(
+    nBlocks: 0,
+    nSize: 0,
+    nUndoSize: 0,
+    nHeightFirst: high(uint32),
+    nHeightLast: 0,
+    nTimeFirst: high(uint64),
+    nTimeLast: 0
+  ))
+
+  info.nUndoSize += undoSize
+  bfm.saveFileInfo(fileNum, info)
+
+# ============================================================================
+# Pruning support
+# ============================================================================
+
+proc isPruneMode*(bfm: BlockFileManager): bool =
+  ## Check if pruning is enabled
+  bfm.pruneMode
+
+proc getPruneTarget*(bfm: BlockFileManager): uint64 =
+  ## Get the pruning target in bytes
+  bfm.pruneTarget
+
+proc setPruneTarget*(bfm: BlockFileManager, target: uint64) =
+  ## Set the pruning target in bytes
+  ## Minimum is 550 MiB (MinDiskSpaceForBlockFiles)
+  if target > 0:
+    bfm.pruneTarget = max(target, MinDiskSpaceForBlockFiles)
+    bfm.pruneMode = true
+  else:
+    bfm.pruneTarget = 0
+    bfm.pruneMode = false
+
+proc maxBlockfileNum*(bfm: BlockFileManager): int32 =
+  ## Get the highest block file number
+  bfm.currentFileNum
+
+proc calculateCurrentUsage*(bfm: BlockFileManager): uint64 =
+  ## Calculate total disk usage for block and undo files
+  ## Reference: Bitcoin Core BlockManager::CalculateCurrentUsage
+  var total: uint64 = 0
+  for fileNum in 0 .. bfm.currentFileNum:
+    let infoOpt = bfm.loadFileInfo(fileNum)
+    if infoOpt.isSome:
+      let info = infoOpt.get()
+      total += uint64(info.nSize) + uint64(info.nUndoSize)
+  total
+
+proc isBlockPruned*(bfm: BlockFileManager, hash: BlockHash): bool =
+  ## Check if a block has been pruned (data no longer available)
+  let entry = bfm.getBlockIndex(hash)
+  if entry.isNone:
+    return false  # Block doesn't exist
+  # Block is pruned if we know about it but don't have data
+  (entry.get().status and BlockHaveData) == 0
+
+proc pruneOneBlockFile*(bfm: BlockFileManager, fileNum: int32,
+                        blockHashes: seq[BlockHash]) =
+  ## Mark all blocks in a file as pruned
+  ## Clears BLOCK_HAVE_DATA and BLOCK_HAVE_UNDO flags, resets file positions
+  ## Reference: Bitcoin Core BlockManager::PruneOneBlockFile
+  ##
+  ## blockHashes: list of block hashes that are in this file
+  ##              (caller should iterate block index to find them)
+
+  for hash in blockHashes:
+    let entryOpt = bfm.getBlockIndex(hash)
+    if entryOpt.isSome:
+      var entry = entryOpt.get()
+      if entry.fileNum == fileNum:
+        # Clear data and undo flags
+        entry.status = entry.status and (not BlockHaveData)
+        entry.status = entry.status and (not BlockHaveUndo)
+        # Reset file positions
+        entry.fileNum = 0
+        entry.dataPos = 0
+        entry.undoPos = 0
+        bfm.putBlockIndex(hash, entry)
+
+  # Get current file info to preserve height info for getPruneHeight
+  let existingInfo = bfm.loadFileInfo(fileNum).get(BlockFileInfo())
+
+  # Clear the file info but preserve height info for pruning tracking
+  let emptyInfo = BlockFileInfo(
+    nBlocks: 0,
+    nSize: 0,
+    nUndoSize: 0,
+    nHeightFirst: existingInfo.nHeightFirst,  # Preserve for tracking
+    nHeightLast: existingInfo.nHeightLast,    # Preserve for tracking
+    nTimeFirst: 0,
+    nTimeLast: 0
+  )
+  bfm.saveFileInfo(fileNum, emptyInfo)
+
+proc unlinkPrunedFiles*(bfm: BlockFileManager, filesToPrune: HashSet[int32]) =
+  ## Delete pruned block and undo files from disk
+  ## Reference: Bitcoin Core BlockManager::UnlinkPrunedFiles
+  for fileNum in filesToPrune:
+    let blkPath = bfm.blockFilePath(fileNum)
+    let revPath = bfm.undoFilePath(fileNum)
+
+    if fileExists(blkPath):
+      try:
+        removeFile(blkPath)
+      except OSError:
+        discard  # Ignore deletion errors
+
+    if fileExists(revPath):
+      try:
+        removeFile(revPath)
+      except OSError:
+        discard  # Ignore deletion errors
+
+proc findFilesToPruneManual*(
+  bfm: BlockFileManager,
+  targetHeight: int32,
+  chainHeight: int32,
+  getBlockHashesInFile: proc(fileNum: int32): seq[BlockHash]
+): tuple[filesToPrune: HashSet[int32], prunedCount: int] =
+  ## Find files that can be pruned up to a target height (manual pruning)
+  ## Returns set of file numbers to prune
+  ## Reference: Bitcoin Core BlockManager::FindFilesToPruneManual
+  ##
+  ## targetHeight: prune blocks up to this height
+  ## chainHeight: current chain tip height
+  ## getBlockHashesInFile: callback to get block hashes in a file (for pruneOneBlockFile)
+
+  result.filesToPrune.init()
+  result.prunedCount = 0
+
+  if not bfm.pruneMode:
+    return
+
+  if chainHeight < 0:
+    return
+
+  # Calculate safe prune range
+  # Never prune within MinBlocksToKeep of the tip
+  let lastBlockCanPrune = min(targetHeight, chainHeight - MinBlocksToKeep)
+  if lastBlockCanPrune < 0:
+    return
+
+  for fileNum in 0 .. bfm.currentFileNum:
+    let infoOpt = bfm.loadFileInfo(fileNum)
+    if infoOpt.isNone:
+      continue
+
+    let info = infoOpt.get()
+
+    # Skip already pruned files
+    if info.nSize == 0:
+      continue
+
+    # Skip if file contains blocks we need to keep
+    if int32(info.nHeightLast) > lastBlockCanPrune:
+      continue
+
+    # Mark blocks in this file as pruned
+    let hashes = getBlockHashesInFile(fileNum)
+    bfm.pruneOneBlockFile(fileNum, hashes)
+
+    result.filesToPrune.incl(fileNum)
+    inc result.prunedCount
+
+proc findFilesToPrune*(
+  bfm: BlockFileManager,
+  chainHeight: int32,
+  getBlockHashesInFile: proc(fileNum: int32): seq[BlockHash]
+): tuple[filesToPrune: HashSet[int32], prunedCount: int] =
+  ## Find files that should be pruned to stay under the target size
+  ## Returns set of file numbers to prune
+  ## Reference: Bitcoin Core BlockManager::FindFilesToPrune
+  ##
+  ## chainHeight: current chain tip height
+  ## getBlockHashesInFile: callback to get block hashes in a file
+
+  result.filesToPrune.init()
+  result.prunedCount = 0
+
+  if not bfm.pruneMode or bfm.pruneTarget == 0:
+    return
+
+  if chainHeight < 0:
+    return
+
+  let target = bfm.pruneTarget
+  var currentUsage = bfm.calculateCurrentUsage()
+
+  # Buffer for upcoming allocations
+  let buffer = uint64(BlockfileChunkSize + UndofileChunkSize)
+
+  if currentUsage + buffer < target:
+    return  # No pruning needed
+
+  # Calculate safe prune range
+  let lastBlockCanPrune = chainHeight - MinBlocksToKeep
+  if lastBlockCanPrune < 0:
+    return
+
+  # Prune files in order (oldest first)
+  for fileNum in 0 .. bfm.currentFileNum:
+    # Check if we've pruned enough
+    if currentUsage + buffer < target:
+      break
+
+    let infoOpt = bfm.loadFileInfo(fileNum)
+    if infoOpt.isNone:
+      continue
+
+    let info = infoOpt.get()
+
+    # Skip already pruned files
+    if info.nSize == 0:
+      continue
+
+    # Skip if file contains blocks we need to keep
+    if int32(info.nHeightLast) > lastBlockCanPrune:
+      continue
+
+    let bytesToPrune = uint64(info.nSize) + uint64(info.nUndoSize)
+
+    # Mark blocks in this file as pruned
+    let hashes = getBlockHashesInFile(fileNum)
+    bfm.pruneOneBlockFile(fileNum, hashes)
+
+    result.filesToPrune.incl(fileNum)
+    inc result.prunedCount
+    currentUsage -= bytesToPrune
+
+proc getPruneHeight*(bfm: BlockFileManager): int32 =
+  ## Get the lowest height of pruned blocks (first block we don't have data for)
+  ## Returns -1 if nothing has been pruned
+  ## This helps determine what data is available
+  var lowestPrunedHeight: int32 = -1
+
+  for fileNum in 0 .. bfm.currentFileNum:
+    let infoOpt = bfm.loadFileInfo(fileNum)
+    if infoOpt.isNone:
+      continue
+
+    let info = infoOpt.get()
+
+    # If nSize is 0, this file was pruned
+    # The highest height in a pruned file tells us how far we've pruned
+    if info.nSize == 0 and info.nHeightLast > 0:
+      if lowestPrunedHeight < 0 or int32(info.nHeightLast) > lowestPrunedHeight:
+        lowestPrunedHeight = int32(info.nHeightLast)
+
+  # Return the height after the last pruned block
+  if lowestPrunedHeight >= 0:
+    lowestPrunedHeight + 1
+  else:
+    -1
