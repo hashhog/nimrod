@@ -13,6 +13,7 @@ const
   CoinbaseReservedWeight* = 4000  ## Reserved weight units for coinbase tx
   LocktimeThreshold* = 500_000_000'u32  ## Below this: block height, at or above: Unix timestamp
   SequenceFinal* = 0xFFFFFFFF'u32  ## Final sequence number (disables relative locktime)
+  MaxSequenceNonFinal* = 0xFFFFFFFE'u32  ## Max sequence that still allows locktime enforcement
 
 proc isFinalTx*(tx: Transaction, blockHeight: uint32, blockTime: uint32): bool =
   ## Check if a transaction is final for inclusion in a block
@@ -133,6 +134,12 @@ proc createCoinbaseTx*(
   ## Create a coinbase transaction
   ## BIP-34: height in scriptSig
   ## Witness commitment in OP_RETURN output (if not all zeros)
+  ##
+  ## Anti-fee-sniping (Bitcoin Core behavior):
+  ## - nSequence = MAX_SEQUENCE_NONFINAL (0xFFFFFFFE) to allow locktime enforcement
+  ## - nLockTime = height - 1 for anti-fee-sniping protection
+  ##
+  ## Reference: Bitcoin Core node/miner.cpp CreateNewBlock()
 
   # Build coinbase scriptSig with BIP-34 height
   var scriptSig = encodeBip34Height(height)
@@ -172,6 +179,11 @@ proc createCoinbaseTx*(
     witnessStack.add(witnessReserved)
     witnesses.add(witnessStack)
 
+  # Coinbase lockTime for anti-fee-sniping: set to height - 1
+  # This prevents miners from building on old blocks to steal fees
+  # Reference: Bitcoin Core miner.cpp line 196
+  let coinbaseLockTime = if height > 0: uint32(height - 1) else: 0'u32
+
   Transaction(
     version: 2,
     inputs: @[TxIn(
@@ -180,11 +192,13 @@ proc createCoinbaseTx*(
         vout: 0xffffffff'u32
       ),
       scriptSig: scriptSig,
-      sequence: 0xffffffff'u32
+      # Use MAX_SEQUENCE_NONFINAL (0xFFFFFFFE) to ensure locktime is enforced
+      # Reference: Bitcoin Core miner.cpp line 171
+      sequence: MaxSequenceNonFinal
     )],
     outputs: outputs,
     witnesses: witnesses,
-    lockTime: 0
+    lockTime: coinbaseLockTime
   )
 
 proc computeTarget*(bits: uint32): array[32, byte] =
