@@ -34,6 +34,7 @@ import ./test_banman
 import ./test_versionbits
 import ./test_handshake
 import ./test_pre_handshake
+import ./test_relay
 
 when isMainModule:
   echo "Running all tests..."
