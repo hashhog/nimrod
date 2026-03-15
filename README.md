@@ -44,6 +44,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Block synchronization
 - [x] Headers-first sync (256-bit work calculation, most-work chain selection)
 - [x] Full initial block download (parallel download, sliding window, adaptive timeouts)
+- [x] Header sync anti-DoS (PRESYNC/REDOWNLOAD two-phase sync, commitment verification)
 - [x] Transaction mempool (fee/size policy, CPFP tracking, eviction)
 - [x] Fee estimation (histogram-based, 85% confirmation threshold)
 - [x] Block template generation (BIP-34 coinbase, witness commitment, sigops limit, locktime finality, anti-fee-sniping)
