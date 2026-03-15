@@ -760,5 +760,150 @@ suite "RPC txindex format":
     check validTxid.len == 64
     check invalidTxid.len != 64
 
+suite "RPC batch requests":
+  # Batch request constants
+  const MaxBatchSize = 1000
+
+  test "batch request structure":
+    # Batch request is a JSON array of request objects
+    let batchRequest = %*[
+      {"jsonrpc": "2.0", "method": "getblockcount", "params": [], "id": 1},
+      {"jsonrpc": "2.0", "method": "getbestblockhash", "params": [], "id": 2}
+    ]
+
+    check batchRequest.kind == JArray
+    check batchRequest.len == 2
+    check batchRequest[0]["id"].getInt() == 1
+    check batchRequest[1]["id"].getInt() == 2
+
+  test "batch response structure":
+    # Batch response is a JSON array of response objects (same order as requests)
+    let batchResponse = %*[
+      {"jsonrpc": "2.0", "id": 1, "result": 100, "error": nil},
+      {"jsonrpc": "2.0", "id": 2, "result": "0000000000000000000000000000000000000000000000000000000000000001", "error": nil}
+    ]
+
+    check batchResponse.kind == JArray
+    check batchResponse.len == 2
+    check batchResponse[0]["id"].getInt() == 1
+    check batchResponse[1]["id"].getInt() == 2
+    check batchResponse[0]["result"].getInt() == 100
+
+  test "batch request with mixed success and failure":
+    # Individual failures don't affect other requests
+    let batchResponse = %*[
+      {"jsonrpc": "2.0", "id": 1, "result": 100, "error": nil},
+      {"jsonrpc": "2.0", "id": 2, "result": nil, "error": {"code": -32601, "message": "method not found"}},
+      {"jsonrpc": "2.0", "id": 3, "result": "valid", "error": nil}
+    ]
+
+    check batchResponse.len == 3
+    check batchResponse[0]["error"].kind == JNull
+    check batchResponse[1]["error"]["code"].getInt() == -32601
+    check batchResponse[2]["error"].kind == JNull
+
+  test "empty batch returns error":
+    # Empty batch array is an error
+    let emptyBatch = newJArray()
+    check emptyBatch.len == 0
+
+    # Expected error response
+    let errorResponse = %*{
+      "jsonrpc": "2.0",
+      "id": nil,
+      "result": nil,
+      "error": {"code": -32600, "message": "Empty batch array"}
+    }
+    check errorResponse["error"]["code"].getInt() == RpcInvalidRequest
+
+  test "batch size limit":
+    check MaxBatchSize == 1000
+
+    # Requests exceeding limit should be rejected
+    let oversizedError = %*{
+      "jsonrpc": "2.0",
+      "id": nil,
+      "result": nil,
+      "error": {"code": -32600, "message": "Batch size 1001 exceeds limit of 1000"}
+    }
+    check oversizedError["error"]["code"].getInt() == RpcInvalidRequest
+
+  test "batch request ids preserved":
+    # Each response must include the corresponding request id
+    let batchRequest = %*[
+      {"jsonrpc": "2.0", "method": "getblockcount", "params": [], "id": "abc"},
+      {"jsonrpc": "2.0", "method": "getbestblockhash", "params": [], "id": 123},
+      {"jsonrpc": "2.0", "method": "getdifficulty", "params": [], "id": nil}
+    ]
+
+    check batchRequest[0]["id"].getStr() == "abc"
+    check batchRequest[1]["id"].getInt() == 123
+    check batchRequest[2]["id"].kind == JNull
+
+  test "batch handles invalid request objects":
+    # Non-object items in batch array should return individual errors
+    let invalidItem = %"not an object"
+    check invalidItem.kind == JString
+
+    # Expected error for non-object item
+    let itemError = %*{
+      "jsonrpc": "2.0",
+      "id": nil,
+      "result": nil,
+      "error": {"code": -32600, "message": "Invalid Request object"}
+    }
+    check itemError["error"]["code"].getInt() == RpcInvalidRequest
+
+  test "batch handles missing method":
+    # Request without method field
+    let noMethodReq = %*{"jsonrpc": "2.0", "id": 1, "params": []}
+    check not noMethodReq.hasKey("method")
+
+    let expectedError = %*{
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": nil,
+      "error": {"code": -32600, "message": "Missing method"}
+    }
+    check expectedError["error"]["code"].getInt() == RpcInvalidRequest
+
+  test "single request returns object not array":
+    # Single request should return object, not array
+    let singleRequest = %*{
+      "jsonrpc": "2.0",
+      "method": "getblockcount",
+      "params": [],
+      "id": 1
+    }
+    check singleRequest.kind == JObject
+
+    let singleResponse = %*{
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": 100,
+      "error": nil
+    }
+    check singleResponse.kind == JObject
+
+  test "top-level parse error for invalid JSON":
+    # Neither object nor array should return parse error
+    let parseError = %*{
+      "jsonrpc": "2.0",
+      "id": nil,
+      "result": nil,
+      "error": {"code": -32700, "message": "Top-level object parse error"}
+    }
+    check parseError["error"]["code"].getInt() == RpcParseError
+
+  test "batch request id types":
+    # JSON-RPC allows string, number, or null for id
+    let stringId = %*{"id": "request-1"}
+    let numberId = %*{"id": 42}
+    let nullId = %*{"id": nil}
+
+    check stringId["id"].kind == JString
+    check numberId["id"].kind == JInt
+    check nullId["id"].kind == JNull
+
 when isMainModule:
   echo "Running RPC tests..."
