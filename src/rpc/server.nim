@@ -60,6 +60,9 @@ const
   # Default maxfeerate: 0.10 BTC/kvB = 10,000,000 sat/kvB = 10,000 sat/vB
   DefaultMaxFeeRate* = 0.10  # BTC/kvB
 
+  # Batch request limit to prevent DoS
+  MaxBatchSize* = 1000
+
 proc newRpcError(code: int, msg: string): ref RpcError =
   result = newException(RpcError, msg)
   result.code = code
@@ -1540,48 +1543,111 @@ proc makeErrorResponse(id: JsonNode, code: int, message: string): string =
     }
   }
 
-proc handleRequest(rpc: RpcServer, body: string): string =
-  var response: RpcResponse
-  response.jsonrpc = "2.0"
+proc handleSingleRequest(rpc: RpcServer, reqJson: JsonNode): JsonNode =
+  ## Handle a single JSON-RPC request object
+  ## Returns the JSON response object (not stringified)
   var requestId = newJNull()
 
   try:
-    let request = body.fromJson(RpcRequest)
-    requestId = request.id
-    response.id = request.id
-    response.result = rpc.handleMethod(request.`method`, request.params)
-    response.error = newJNull()
-  except RpcError as e:
-    response.id = requestId
-    response.error = %*{
-      "code": e.code,
-      "message": e.msg
-    }
-    response.result = newJNull()
-  except json.JsonParsingError as e:
-    return makeErrorResponse(requestId, RpcParseError, "parse error: " & e.msg)
-  except CatchableError as e:
-    response.id = requestId
-    response.error = %*{
-      "code": RpcInternalError,
-      "message": "internal error: " & e.msg
-    }
-    response.result = newJNull()
-  except Exception as e:
-    # Catch jsony parse errors which inherit from Exception
-    response.id = requestId
-    response.error = %*{
-      "code": RpcParseError,
-      "message": "parse error: " & e.msg
-    }
-    response.result = newJNull()
+    # Extract id first so error responses include it
+    if reqJson.hasKey("id"):
+      requestId = reqJson["id"]
 
-  $ %*{
-    "jsonrpc": response.jsonrpc,
-    "id": response.id,
-    "result": response.result,
-    "error": response.error
-  }
+    # Validate request is an object
+    if reqJson.kind != JObject:
+      return %*{
+        "jsonrpc": "2.0",
+        "id": requestId,
+        "result": newJNull(),
+        "error": %*{"code": RpcInvalidRequest, "message": "Invalid Request object"}
+      }
+
+    # Extract method
+    if not reqJson.hasKey("method"):
+      return %*{
+        "jsonrpc": "2.0",
+        "id": requestId,
+        "result": newJNull(),
+        "error": %*{"code": RpcInvalidRequest, "message": "Missing method"}
+      }
+
+    let methodName = reqJson["method"].getStr()
+    if methodName == "":
+      return %*{
+        "jsonrpc": "2.0",
+        "id": requestId,
+        "result": newJNull(),
+        "error": %*{"code": RpcInvalidRequest, "message": "Method must be a string"}
+      }
+
+    # Extract params (default to empty array)
+    var params = newJArray()
+    if reqJson.hasKey("params"):
+      params = reqJson["params"]
+
+    # Execute the method
+    let methodResult = rpc.handleMethod(methodName, params)
+    return %*{
+      "jsonrpc": "2.0",
+      "id": requestId,
+      "result": methodResult,
+      "error": newJNull()
+    }
+  except RpcError as e:
+    return %*{
+      "jsonrpc": "2.0",
+      "id": requestId,
+      "result": newJNull(),
+      "error": %*{"code": e.code, "message": e.msg}
+    }
+  except CatchableError as e:
+    return %*{
+      "jsonrpc": "2.0",
+      "id": requestId,
+      "result": newJNull(),
+      "error": %*{"code": RpcInternalError, "message": "internal error: " & e.msg}
+    }
+
+proc handleRequest(rpc: RpcServer, body: string): string =
+  ## Handle a JSON-RPC request (single or batch)
+  ## Reference: Bitcoin Core httprpc.cpp HTTPReq_JSONRPC
+  var parsedJson: JsonNode
+
+  # Parse the JSON body
+  try:
+    parsedJson = parseJson(body)
+  except json.JsonParsingError as e:
+    return makeErrorResponse(newJNull(), RpcParseError, "Parse error: " & e.msg)
+  except CatchableError as e:
+    return makeErrorResponse(newJNull(), RpcParseError, "Parse error: " & e.msg)
+
+  # Handle batch requests (JSON array)
+  if parsedJson.kind == JArray:
+    # Empty batch is an error per JSON-RPC 2.0 spec, but Bitcoin Core
+    # returns empty array for backwards compatibility
+    if parsedJson.len == 0:
+      return makeErrorResponse(newJNull(), RpcInvalidRequest, "Empty batch array")
+
+    # Limit batch size to prevent DoS
+    if parsedJson.len > MaxBatchSize:
+      return makeErrorResponse(newJNull(), RpcInvalidRequest,
+        "Batch size " & $parsedJson.len & " exceeds limit of " & $MaxBatchSize)
+
+    # Execute each request and collect responses
+    var responses = newJArray()
+    for reqJson in parsedJson:
+      let response = rpc.handleSingleRequest(reqJson)
+      responses.add(response)
+
+    return $responses
+
+  # Handle single request (JSON object)
+  if parsedJson.kind == JObject:
+    let response = rpc.handleSingleRequest(parsedJson)
+    return $response
+
+  # Neither object nor array - invalid
+  return makeErrorResponse(newJNull(), RpcParseError, "Top-level object parse error")
 
 proc checkAuth(rpc: RpcServer, authHeader: string): bool =
   ## Verify HTTP Basic auth credentials
