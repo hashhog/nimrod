@@ -19,10 +19,15 @@ proc makeTestTransaction(
   prevTxid: TxId,
   prevVout: uint32,
   value: int64,
-  isCoinbase: bool = false
+  isCoinbase: bool = false,
+  height: int32 = 0,
+  extraNonce: array[4, byte] = default(array[4, byte])
 ): Transaction =
   ## Create a simple test transaction
   if isCoinbase:
+    # Make coinbase unique by including height + extra nonce in scriptSig (BIP 34)
+    let heightBytes = @[byte(height and 0xFF), byte((height shr 8) and 0xFF),
+                        byte((height shr 16) and 0xFF), byte((height shr 24) and 0xFF)]
     result = Transaction(
       version: 1,
       inputs: @[TxIn(
@@ -30,7 +35,7 @@ proc makeTestTransaction(
           txid: TxId(default(array[32, byte])),
           vout: 0xFFFFFFFF'u32
         ),
-        scriptSig: @[byte(0x01), 0x01],
+        scriptSig: @[byte(0x08)] & heightBytes & @extraNonce,
         sequence: 0xFFFFFFFF'u32
       )],
       outputs: @[TxOut(
@@ -56,8 +61,9 @@ proc makeTestTransaction(
       lockTime: 0
     )
 
-proc makeTestBlock(prevHash: BlockHash, height: int32, txs: seq[Transaction]): Block =
+proc makeTestBlock(prevHash: BlockHash, height: int32, txs: seq[Transaction], chainId: int32 = 0): Block =
   ## Create a test block with the given transactions
+  ## chainId allows creating different blocks at the same height/prevHash
   var txHashes: seq[array[32, byte]]
   for tx in txs:
     txHashes.add(array[32, byte](tx.txid()))
@@ -67,16 +73,25 @@ proc makeTestBlock(prevHash: BlockHash, height: int32, txs: seq[Transaction]): B
       version: 1,
       prevBlock: prevHash,
       merkleRoot: merkleRoot(txHashes),
-      timestamp: 1231006505 + uint32(height * 600),
+      timestamp: 1231006505 + uint32(height * 600) + uint32(chainId * 10),
       bits: 0x207fffff'u32,
-      nonce: uint32(height)
+      nonce: uint32(height) + uint32(chainId * 1000000)
     ),
     txs: txs
   )
 
-proc makeSimpleBlock(prevHash: BlockHash, height: int32): Block =
-  let coinbase = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true)
-  makeTestBlock(prevHash, height, @[coinbase])
+proc makeSimpleBlock(prevHash: BlockHash, height: int32, chainId: int32 = 0): Block =
+  ## Create a simple block with just a coinbase transaction
+  ## chainId allows creating different blocks at the same height/prevHash
+  var extraNonce: array[4, byte]
+  let prevHashArr = array[32, byte](prevHash)
+  for i in 0..3:
+    extraNonce[i] = prevHashArr[i]
+  # Add chainId to extraNonce to differentiate coinbase txids
+  extraNonce[0] = extraNonce[0] xor byte(chainId and 0xFF)
+  extraNonce[1] = extraNonce[1] xor byte((chainId shr 8) and 0xFF)
+  let coinbase = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true, height, extraNonce)
+  makeTestBlock(prevHash, height, @[coinbase], chainId)
 
 proc getBlockHash(blk: Block): BlockHash =
   let headerBytes = serialize(blk.header)
@@ -335,7 +350,7 @@ suite "ChainState disconnect with flat file undo":
 
     # Spend genesis coinbase at height 100
     let spendTx = makeTestTransaction(coinbaseTxid, 0, 4999000000, false)
-    let coinbase = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true)
+    let coinbase = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true, 100)
     let spendBlock = makeTestBlock(prevHash, 100, @[coinbase, spendTx])
     discard cs.connectBlock(spendBlock, 100)
 
@@ -370,16 +385,16 @@ suite "Chain reorg with flat file undo":
     var cs = newChainState(TestDbPath, regtestParams())
 
     # Connect genesis
-    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0, chainId = 0)
     discard cs.connectBlock(genesis, 0)
     let genesisHash = getBlockHash(genesis)
 
-    # Connect chain A: blocks 1A, 2A
-    let block1A = makeSimpleBlock(genesisHash, 1)
+    # Connect chain A: blocks 1A, 2A (chainId = 1)
+    let block1A = makeSimpleBlock(genesisHash, 1, chainId = 1)
     discard cs.connectBlock(block1A, 1)
     let block1AHash = getBlockHash(block1A)
 
-    let block2A = makeSimpleBlock(block1AHash, 2)
+    let block2A = makeSimpleBlock(block1AHash, 2, chainId = 1)
     discard cs.connectBlock(block2A, 2)
 
     check cs.bestHeight == 2
@@ -390,14 +405,14 @@ suite "Chain reorg with flat file undo":
     check cs.getUtxo(OutPoint(txid: coinbase1A, vout: 0)).isSome
     check cs.getUtxo(OutPoint(txid: coinbase2A, vout: 0)).isSome
 
-    # Create alternative chain B: blocks 1B, 2B, 3B
-    let block1B = makeSimpleBlock(genesisHash, 1)
+    # Create alternative chain B: blocks 1B, 2B, 3B (chainId = 2)
+    let block1B = makeSimpleBlock(genesisHash, 1, chainId = 2)
     let block1BHash = getBlockHash(block1B)
 
-    let block2B = makeSimpleBlock(block1BHash, 2)
+    let block2B = makeSimpleBlock(block1BHash, 2, chainId = 2)
     let block2BHash = getBlockHash(block2B)
 
-    let block3B = makeSimpleBlock(block2BHash, 3)
+    let block3B = makeSimpleBlock(block2BHash, 3, chainId = 2)
 
     # Perform reorg
     let newChain = @[block1B, block2B, block3B]
@@ -425,31 +440,31 @@ suite "Chain reorg with flat file undo":
     var cs = newChainState(TestDbPath, regtestParams())
 
     # Connect genesis
-    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0, chainId = 0)
     discard cs.connectBlock(genesis, 0)
     let genesisHash = getBlockHash(genesis)
     let genesisCoinbase = genesis.txs[0].txid()
 
-    # Build to maturity and spend genesis coinbase
+    # Build to maturity and spend genesis coinbase (chainId = 1 for this chain)
     var prevHash = genesisHash
     for h in 1 ..< 100:
-      let blk = makeSimpleBlock(prevHash, int32(h))
+      let blk = makeSimpleBlock(prevHash, int32(h), chainId = 1)
       discard cs.connectBlock(blk, int32(h))
       prevHash = getBlockHash(blk)
 
     # Spend genesis at height 100
     let spendTx = makeTestTransaction(genesisCoinbase, 0, 4999000000, false)
-    let cb100 = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true)
-    let block100 = makeTestBlock(prevHash, 100, @[cb100, spendTx])
+    let cb100 = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true, 100)
+    let block100 = makeTestBlock(prevHash, 100, @[cb100, spendTx], chainId = 1)
     discard cs.connectBlock(block100, 100)
 
     check cs.getUtxo(OutPoint(txid: genesisCoinbase, vout: 0)).isNone
     check cs.getUtxo(OutPoint(txid: spendTx.txid(), vout: 0)).isSome
 
-    # Create alternative chain from height 99 that doesn't spend genesis
-    let altBlock100 = makeSimpleBlock(prevHash, 100)
+    # Create alternative chain from height 99 that doesn't spend genesis (chainId = 2)
+    let altBlock100 = makeSimpleBlock(prevHash, 100, chainId = 2)
     let altBlock100Hash = getBlockHash(altBlock100)
-    let altBlock101 = makeSimpleBlock(altBlock100Hash, 101)
+    let altBlock101 = makeSimpleBlock(altBlock100Hash, 101, chainId = 2)
 
     # Reorg: fork at height 99
     let reorgRes = cs.handleReorg(prevHash, @[altBlock100, altBlock101])
