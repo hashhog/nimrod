@@ -50,6 +50,12 @@ import ./test_txindex
 import ./test_blockfilter
 import ./test_coinstatsindex
 import ./test_compact_blocks
+import ./test_psbt
+import ./test_bip174
+import ./test_descriptor
+import ./test_miniscript
+import ./test_feefilter
+import ./test_cluster
 
 when isMainModule:
   echo "Running all tests..."
