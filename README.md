@@ -57,6 +57,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Misbehavior scoring (100-point threshold, persistent ban list, RPC commands)
 - [x] Pre-handshake message rejection (VERSION/VERACK enforcement, protocol version check, self-connection detection, 60s timeout)
 - [x] Inventory trickling (Poisson-distributed tx relay, per-peer queues, immediate block relay)
+- [x] Stale peer eviction (chain sync timeout, ping timeout, headers timeout, extra outbound eviction)
 - [ ] Compact block relay (BIP-152)
 
 ## Quick start
