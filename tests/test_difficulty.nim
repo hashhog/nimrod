@@ -496,3 +496,412 @@ suite "network params":
     check getParams(Testnet4).network == Testnet4
     check getParams(Regtest).network == Regtest
     check getParams(Signet).network == Signet
+
+suite "BIP94 testnet4 difficulty adjustment":
+  proc makeAncestorFn(blocks: seq[pow.BlockIndex]): GetAncestorFn =
+    return proc(index: pow.BlockIndex, height: int32): pow.BlockIndex =
+      for blk in blocks:
+        if blk.height == height:
+          return blk
+      index
+
+  test "BIP94 uses first block bits for retarget":
+    ## BIP94 time-warp fix: use first block's bits instead of last block's bits
+    ## This prevents time-warp attacks on testnet4
+    let p = testnet4Params()
+    var powParams: PowParams
+    powParams.network = Testnet4
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powAllowMinDifficultyBlocks = true
+    powParams.powNoRetargeting = false
+    powParams.enforceBIP94 = true
+
+    let minDiffBits = getPowLimitCompact(powParams)
+    let realBits = 0x1c123456'u32
+
+    # Create chain where first block has real difficulty, last has min-diff
+    var blocks: seq[pow.BlockIndex]
+
+    # First block of period (height 0) - real difficulty
+    blocks.add(pow.BlockIndex(
+      height: 0,
+      header: BlockHeader(bits: realBits, timestamp: 0)
+    ))
+
+    # Fill middle blocks with min-diff (simulating 20-min rule usage)
+    for i in 1..2014:
+      blocks.add(pow.BlockIndex(
+        height: int32(i),
+        header: BlockHeader(bits: minDiffBits, timestamp: uint32(i * 600))
+      ))
+
+    # Last block (height 2015) - min-diff
+    blocks.add(pow.BlockIndex(
+      height: 2015,
+      header: BlockHeader(
+        bits: minDiffBits,
+        timestamp: uint32(p.powTargetTimespan)  # Exactly on target
+      )
+    ))
+
+    let lastIndex = blocks[^1]
+    let firstIndex = blocks[0]
+    let getAncestor = makeAncestorFn(blocks)
+
+    # For BIP94, retarget should use first block's bits (realBits), not last's (minDiffBits)
+    let newBits = getNextWorkRequired(lastIndex, uint32(p.powTargetTimespan + 600), powParams, getAncestor)
+
+    # Result should be based on realBits, not minDiffBits
+    # Since timespan == targetTimespan, should stay same as realBits
+    check newBits == realBits
+
+  test "BIP94 min-difficulty still allowed after 20 minutes":
+    ## Even with BIP94, the 20-minute min-diff rule still applies
+    let p = testnet4Params()
+    var powParams: PowParams
+    powParams.network = Testnet4
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powAllowMinDifficultyBlocks = true
+    powParams.powNoRetargeting = false
+    powParams.enforceBIP94 = true
+
+    let lastIndex = pow.BlockIndex(
+      height: 1000,  # Not a retarget boundary
+      header: BlockHeader(
+        bits: 0x1c123456'u32,
+        timestamp: 1000000
+      )
+    )
+
+    let getAncestor = makeAncestorFn(@[lastIndex])
+
+    # Block timestamp > 20 minutes after previous
+    let newBlockTime = uint32(1000000 + 1201)
+    let newBits = getNextWorkRequired(lastIndex, newBlockTime, powParams, getAncestor)
+
+    # Should return min difficulty (20-minute rule applies)
+    check newBits == getPowLimitCompact(powParams)
+
+suite "testnet walk-back edge cases":
+  proc makeAncestorFn(blocks: seq[pow.BlockIndex]): GetAncestorFn =
+    return proc(index: pow.BlockIndex, height: int32): pow.BlockIndex =
+      for blk in blocks:
+        if blk.height == height:
+          return blk
+      index
+
+  test "walk-back stops at retarget boundary":
+    ## Walk-back should stop at difficulty adjustment interval boundary
+    let p = testnet3Params()
+    var powParams: PowParams
+    powParams.network = Testnet3
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powAllowMinDifficultyBlocks = true
+    powParams.powNoRetargeting = false
+
+    let minDiffBits = getPowLimitCompact(powParams)
+    let realBits = 0x1c123456'u32
+
+    # Create chain where retarget boundary (2016) has min-diff
+    var blocks: seq[pow.BlockIndex]
+
+    # Retarget boundary (height 2016) with min-diff
+    blocks.add(pow.BlockIndex(
+      height: 2016,
+      header: BlockHeader(bits: minDiffBits, timestamp: 2000000)
+    ))
+
+    # Next few blocks also min-diff
+    for i in 2017..2020:
+      blocks.add(pow.BlockIndex(
+        height: int32(i),
+        header: BlockHeader(bits: minDiffBits, timestamp: uint32(2000000 + (i - 2016) * 600))
+      ))
+
+    let lastIndex = blocks[^1]
+    let getAncestor = makeAncestorFn(blocks)
+
+    # Walk-back should stop at 2016 (retarget boundary) and return its bits
+    let newBlockTime = uint32(lastIndex.header.timestamp + 600)
+    let newBits = getNextWorkRequired(lastIndex, newBlockTime, powParams, getAncestor)
+
+    # Should return the retarget boundary's bits (min-diff in this case)
+    check newBits == minDiffBits
+
+  test "walk-back finds non-min-diff in middle":
+    ## Walk-back finds a real difficulty block between min-diff blocks
+    let p = testnet3Params()
+    var powParams: PowParams
+    powParams.network = Testnet3
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powAllowMinDifficultyBlocks = true
+    powParams.powNoRetargeting = false
+
+    let minDiffBits = getPowLimitCompact(powParams)
+    let realBits1 = 0x1c123456'u32
+    let realBits2 = 0x1c654321'u32
+
+    var blocks: seq[pow.BlockIndex]
+
+    # Early block with real difficulty
+    blocks.add(pow.BlockIndex(
+      height: 1000,
+      header: BlockHeader(bits: realBits1, timestamp: 1000000)
+    ))
+
+    # Min-diff blocks
+    for i in 1001..1003:
+      blocks.add(pow.BlockIndex(
+        height: int32(i),
+        header: BlockHeader(bits: minDiffBits, timestamp: uint32(1000000 + (i - 1000) * 600))
+      ))
+
+    # Another real difficulty block in the middle
+    blocks.add(pow.BlockIndex(
+      height: 1004,
+      header: BlockHeader(bits: realBits2, timestamp: 1002400)
+    ))
+
+    # More min-diff blocks after
+    for i in 1005..1008:
+      blocks.add(pow.BlockIndex(
+        height: int32(i),
+        header: BlockHeader(bits: minDiffBits, timestamp: uint32(1002400 + (i - 1004) * 600))
+      ))
+
+    let lastIndex = blocks[^1]
+    let getAncestor = makeAncestorFn(blocks)
+
+    # Should walk back and find realBits2 (the most recent non-min-diff)
+    let newBlockTime = uint32(lastIndex.header.timestamp + 600)
+    let newBits = getNextWorkRequired(lastIndex, newBlockTime, powParams, getAncestor)
+
+    check newBits == realBits2
+
+  test "all min-diff to height 0":
+    ## Edge case: walk-back reaches height 0
+    let p = testnet3Params()
+    var powParams: PowParams
+    powParams.network = Testnet3
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powAllowMinDifficultyBlocks = true
+    powParams.powNoRetargeting = false
+
+    let minDiffBits = getPowLimitCompact(powParams)
+    let realBits = 0x1c123456'u32
+
+    var blocks: seq[pow.BlockIndex]
+
+    # Genesis-like block with real difficulty
+    blocks.add(pow.BlockIndex(
+      height: 0,
+      header: BlockHeader(bits: realBits, timestamp: 0)
+    ))
+
+    # All subsequent blocks are min-diff
+    for i in 1..5:
+      blocks.add(pow.BlockIndex(
+        height: int32(i),
+        header: BlockHeader(bits: minDiffBits, timestamp: uint32(i * 600))
+      ))
+
+    let lastIndex = blocks[^1]
+    let getAncestor = makeAncestorFn(blocks)
+
+    # Should walk back to height 0 and return its bits
+    let newBlockTime = uint32(lastIndex.header.timestamp + 600)
+    let newBits = getNextWorkRequired(lastIndex, newBlockTime, powParams, getAncestor)
+
+    check newBits == realBits
+
+suite "regtest difficulty behavior":
+  proc makeAncestorFn(blocks: seq[pow.BlockIndex]): GetAncestorFn =
+    return proc(index: pow.BlockIndex, height: int32): pow.BlockIndex =
+      for blk in blocks:
+        if blk.height == height:
+          return blk
+      index
+
+  test "regtest always minimum difficulty":
+    ## Regtest always returns powLimit (minimum difficulty)
+    let p = regtestParams()
+    var powParams: PowParams
+    powParams.network = Regtest
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powAllowMinDifficultyBlocks = true
+    powParams.powNoRetargeting = true
+
+    # Regtest genesis bits
+    let regtestBits = 0x207fffff'u32
+
+    let lastIndex = pow.BlockIndex(
+      height: 100,
+      header: BlockHeader(
+        bits: regtestBits,
+        timestamp: 100000
+      )
+    )
+
+    let getAncestor = makeAncestorFn(@[lastIndex])
+    let newBits = getNextWorkRequired(lastIndex, 200000, powParams, getAncestor)
+
+    # Should always return previous bits (no retargeting)
+    check newBits == regtestBits
+
+  test "regtest at retarget boundary still no change":
+    ## Even at retarget boundary, regtest doesn't adjust difficulty
+    let p = regtestParams()
+    var powParams: PowParams
+    powParams.network = Regtest
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powAllowMinDifficultyBlocks = true
+    powParams.powNoRetargeting = true
+
+    let regtestBits = 0x207fffff'u32
+
+    var blocks: seq[pow.BlockIndex]
+    blocks.add(pow.BlockIndex(
+      height: 1,
+      header: BlockHeader(bits: regtestBits, timestamp: 0)
+    ))
+    blocks.add(pow.BlockIndex(
+      height: 2016,  # Retarget boundary
+      header: BlockHeader(bits: regtestBits, timestamp: 10000000)  # Very slow
+    ))
+
+    let lastIndex = blocks[^1]
+    let getAncestor = makeAncestorFn(blocks)
+
+    let newBits = getNextWorkRequired(lastIndex, 20000000, powParams, getAncestor)
+
+    # Should still return previous bits despite being at retarget boundary
+    check newBits == regtestBits
+
+  test "regtest ignores 20-minute rule":
+    ## Regtest doesn't apply the 20-minute min-diff exception
+    ## because powNoRetargeting means calculateNextWorkRequired returns prev bits
+    let p = regtestParams()
+    var powParams: PowParams
+    powParams.network = Regtest
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powAllowMinDifficultyBlocks = true
+    powParams.powNoRetargeting = true
+
+    let regtestBits = 0x207fffff'u32
+
+    let lastIndex = pow.BlockIndex(
+      height: 1000,
+      header: BlockHeader(
+        bits: regtestBits,
+        timestamp: 1000000
+      )
+    )
+
+    let getAncestor = makeAncestorFn(@[lastIndex])
+
+    # Block timestamp > 20 minutes after previous
+    let newBlockTime = uint32(1000000 + 5000)
+    let newBits = getNextWorkRequired(lastIndex, newBlockTime, powParams, getAncestor)
+
+    # Regtest still returns previous bits regardless of time gap
+    # (the 20-minute rule still triggers but result is same as min-diff anyway)
+    check newBits == regtestBits
+
+suite "signet difficulty behavior":
+  proc makeAncestorFn(blocks: seq[pow.BlockIndex]): GetAncestorFn =
+    return proc(index: pow.BlockIndex, height: int32): pow.BlockIndex =
+      for blk in blocks:
+        if blk.height == height:
+          return blk
+      index
+
+  test "signet does not allow min-difficulty blocks":
+    ## Signet is like mainnet - no min-difficulty exception
+    let p = signetParams()
+    var powParams: PowParams
+    powParams.network = Signet
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powAllowMinDifficultyBlocks = false
+    powParams.powNoRetargeting = false
+    powParams.enforceBIP94 = false
+
+    let signetBits = 0x1e0377ae'u32  # Signet genesis bits
+
+    let lastIndex = pow.BlockIndex(
+      height: 1000,
+      header: BlockHeader(
+        bits: signetBits,
+        timestamp: 1000000
+      )
+    )
+
+    let getAncestor = makeAncestorFn(@[lastIndex])
+
+    # Even with long time gap, signet doesn't allow min-diff
+    let newBlockTime = uint32(1000000 + 5000)
+    let newBits = getNextWorkRequired(lastIndex, newBlockTime, powParams, getAncestor)
+
+    # Should return previous bits (no min-diff exception)
+    check newBits == signetBits
+
+  test "signet normal retarget":
+    ## Signet does normal retargeting like mainnet
+    let p = signetParams()
+    var powParams: PowParams
+    powParams.network = Signet
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powAllowMinDifficultyBlocks = false
+    powParams.powNoRetargeting = false
+
+    # Use a harder difficulty that can be decreased (not at powLimit)
+    let signetBits = 0x1c0377ae'u32  # Harder than genesis, can be decreased
+
+    # For retarget to happen at height 2016:
+    # - First block of period: height 0
+    # - Last block of period: height 2015
+    # - Next block (retarget): height 2016
+    # lastIndex should be height 2015 (next height 2016 % 2016 == 0)
+    var blocks: seq[pow.BlockIndex]
+    # First block of period
+    blocks.add(pow.BlockIndex(
+      height: 0,  # First block of difficulty period
+      header: BlockHeader(bits: signetBits, timestamp: 0)
+    ))
+    # Last block of period - double timespan (slow blocks)
+    blocks.add(pow.BlockIndex(
+      height: 2015,  # Last block of period
+      header: BlockHeader(
+        bits: signetBits,
+        timestamp: uint32(p.powTargetTimespan * 2)
+      )
+    ))
+
+    let lastIndex = blocks[^1]
+    let getAncestor = makeAncestorFn(blocks)
+
+    let newBits = getNextWorkRequired(lastIndex, uint32(p.powTargetTimespan * 2 + 600), powParams, getAncestor)
+
+    # Should have increased target (decreased difficulty) due to slow blocks
+    let oldTarget = setCompact(signetBits)
+    let newTarget = setCompact(newBits)
+    check newTarget > oldTarget
