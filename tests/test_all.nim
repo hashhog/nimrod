@@ -45,6 +45,11 @@ import ./test_anchor
 import ./test_eclipse
 import ./test_blockstore
 import ./test_utxo_cache
+import ./test_gcs
+import ./test_txindex
+import ./test_blockfilter
+import ./test_coinstatsindex
+import ./test_compact_blocks
 
 when isMainModule:
   echo "Running all tests..."
