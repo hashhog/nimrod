@@ -2,7 +2,7 @@
 ## Uses Bitcoin Core test vectors from sighash.json
 
 import unittest2
-import std/strutils
+import std/[strutils, json, os]
 import ../src/script/sighash
 import ../src/primitives/types
 import ../src/primitives/serialize
@@ -21,9 +21,26 @@ proc bytesToHex(bytes: openArray[byte]): string =
   for b in bytes:
     result.add(b.toHex(2).toLowerAscii)
 
-# Bitcoin Core sighash.json test vectors (subset)
-# Format: [raw_transaction, script, input_index, hashType, expected_hash]
-const testVectors = [
+# Load all Bitcoin Core sighash.json test vectors
+proc loadSighashVectors(): seq[tuple[rawTx, script: string, inputIdx: int, hashType: int32, expected: string]] =
+  let testDataPath = "/home/max/hashhog/bitcoin/src/test/data/sighash.json"
+  if fileExists(testDataPath):
+    let content = readFile(testDataPath)
+    let jsonData = parseJson(content)
+    for item in jsonData:
+      if item.kind == JArray and item.len == 5:
+        # Skip header row
+        if item[0].kind == JString and item[0].getStr().startsWith("raw_"):
+          continue
+        let rawTx = item[0].getStr()
+        let script = item[1].getStr()
+        let inputIdx = item[2].getInt()
+        let hashType = int32(item[3].getInt())
+        let expected = item[4].getStr()
+        result.add((rawTx, script, inputIdx, hashType, expected))
+
+# Bitcoin Core sighash.json test vectors (subset for quick testing)
+const testVectorsSubset = [
   ("907c2bc503ade11cc3b04eb2918b6f547b0630ab569273824748c87ea14b0696526c66ba740200000004ab65ababfd1f9bdd4ef073c7afc4ae00da8a66f429c917a0081ad1e1dabce28d373eab81d8628de802000000096aab5253ab52000052ad042b5f25efb33beec9f3364e8a9139e8439d9d7e26529c3c30b6c3fd89f8684cfd68ea0200000009ab53526500636a52ab599ac2fe02a526ed040000000008535300516352515164370e010000000003006300ab2ec229", "", 2, 1864164639'i32, "31af167a6cf3f9d5f6875caa4d31704ceb0eba078d132b78dab52c3b8997317e"),
   ("a0aa3126041621a6dea5b800141aa696daf28408959dfb2df96095db9fa425ad3f427f2f6103000000015360290e9c6063fa26912c2e7fb6a0ad80f1c5fea1771d42f12976092e7a85a4229fdb6e890000000001abc109f6e47688ac0e4682988785744602b8c87228fcef0695085edf19088af1a9db126e93000000000665516aac536affffffff8fe53e0806e12dfd05d67ac68f4768fdbe23fc48ace22a5aa8ba04c96d58e2750300000009ac51abac63ab5153650524aa680455ce7b000000000000499e50030000000008636a00ac526563ac5051ee030000000003abacabd2b6fe000000000003516563910fb6b5", "65", 0, -1391424484'i32, "48d6a1bd2cd9eec54eb866fc71209418a950402b5d7e52363bfb75c98e141175"),
   ("6e7e9d4b04ce17afa1e8546b627bb8d89a6a7fefd9d892ec8a192d79c2ceafc01694a6a7e7030000000953ac6a51006353636a33bced1544f797f08ceed02f108da22cd24c9e7809a446c61eb3895914508ac91f07053a01000000055163ab516affffffff11dc54eee8f9e4ff0bcf6b1a1a35b1cd10d63389571375501af7444073bcec3c02000000046aab53514a821f0ce3956e235f71e4c69d91abe1e93fb703bd33039ac567249ed339bf0ba0883ef300000000090063ab65000065ac654bec3cc504bcf499020000000005ab6a52abac64eb060100000000076a6a5351650053bbbc130100000000056a6aab53abd6e1380100000000026a51c4e509b8", "acab655151", 0, 479279909'i32, "2a3d95b09237b72034b23f2d2bb29fa32a58ab5c6aa72f6aafdfa178ab1dd01c"),
@@ -39,8 +56,8 @@ const testVectors = [
   ("a93e93440250f97012d466a6cc24839f572def241c814fe6ae94442cf58ea33eb0fdd9bcc1030000000600636a0065acffffffff5dee3a6e7e5ad6310dea3e5b3ddda1a56bf8de7d3b75889fc024b5e233ec10f80300000007ac53635253ab53ffffffff0160468b04000000000800526a5300ac526a00000000", "ac00636a53", 1, 1773442520'i32, "5c9d3a2ce9365bb72cfabbaa4579c843bb8abf200944612cf8ae4b56a908bcbd"),
 ]
 
-suite "legacy sighash - Bitcoin Core test vectors":
-  for i, vec in testVectors:
+suite "legacy sighash - Bitcoin Core test vectors (subset)":
+  for i, vec in testVectorsSubset:
     test "vector " & $i:
       let (rawTxHex, scriptHex, inputIndex, hashType, expectedHashHex) = vec
 
@@ -61,6 +78,34 @@ suite "legacy sighash - Bitcoin Core test vectors":
       let computedHashHex = bytesToHex(hashReversed)
 
       check computedHashHex == expectedHashHex
+
+suite "legacy sighash - all Bitcoin Core test vectors":
+  let vectors = loadSighashVectors()
+  if vectors.len > 0:
+    for i, vec in vectors:
+      test "vector " & $i & " (of " & $vectors.len & ")":
+        let (rawTxHex, scriptHex, inputIndex, hashType, expectedHashHex) = vec
+
+        # Parse transaction
+        let txBytes = hexToBytes(rawTxHex)
+        let tx = deserializeTransaction(txBytes)
+
+        # Parse script
+        let scriptCode = hexToBytes(scriptHex)
+
+        # Compute sighash (no signature to FindAndDelete in these tests)
+        let hash = computeLegacySighash(tx, inputIndex, scriptCode, cast[uint32](hashType))
+
+        # Convert to hex for comparison (reversed because Bitcoin displays hashes in big-endian)
+        var hashReversed: array[32, byte]
+        for j in 0 ..< 32:
+          hashReversed[j] = hash[31 - j]
+        let computedHashHex = bytesToHex(hashReversed)
+
+        check computedHashHex == expectedHashHex
+  else:
+    test "skipped - test vectors not found":
+      skip()
 
 suite "sighash - findAndDelete":
   test "empty signature returns original script":
@@ -106,6 +151,19 @@ suite "sighash - findAndDelete":
     let result = findAndDelete(script, sig)
     check result == @[0x51'u8]
 
+  test "respects opcode boundaries":
+    # Script where 0x03 AA BB CC appears but not as a push
+    # OP_3 (0x53) followed by data that happens to contain AA BB CC
+    let script = @[0x53'u8, 0x03, 0xAA, 0xBB, 0xCC]  # OP_3, then raw bytes
+    let sig = @[0xAA'u8, 0xBB, 0xCC]
+    # Should NOT remove because 0x03 here is not a push opcode at an opcode boundary
+    # Actually 0x03 at position 1 IS a push opcode (push 3 bytes)
+    # Let's use a different test: put the data inside a larger push
+    let script2 = @[0x05'u8, 0x03, 0xAA, 0xBB, 0xCC, 0x00]  # push 5 bytes
+    let result2 = findAndDelete(script2, sig)
+    # Should NOT remove because the bytes are inside a larger push
+    check result2 == script2
+
 suite "sighash - removeCodeSeparators":
   test "removes single OP_CODESEPARATOR":
     let script = @[0x51'u8, 0xab, 0x52]  # OP_1 OP_CODESEPARATOR OP_2
@@ -128,6 +186,11 @@ suite "sighash - removeCodeSeparators":
     let removeResult = removeCodeSeparators(emptyScript)
     check removeResult.len == 0
 
+  test "handles script with only OP_CODESEPARATOR":
+    let script = @[0xab'u8, 0xab, 0xab]
+    let removeResult = removeCodeSeparators(script)
+    check removeResult.len == 0
+
 suite "sighash - getSubscriptAfterCodeSeparator":
   test "no codeseparator returns full script":
     let script = @[0x51'u8, 0x52, 0x53]
@@ -144,6 +207,12 @@ suite "sighash - getSubscriptAfterCodeSeparator":
     let script = @[0x51'u8, 0x52, 0xab]
     let subResult = getSubscriptAfterCodeSeparator(script, 3)
     check subResult.len == 0
+
+  test "codesep at start":
+    let script = @[0xab'u8, 0x51, 0x52]
+    # codesepPos = 1 (after the OP_CODESEP at position 0)
+    let subResult = getSubscriptAfterCodeSeparator(script, 1)
+    check subResult == @[0x51'u8, 0x52]
 
 suite "sighash - SIGHASH_SINGLE out of range":
   test "returns uint256(1) when input index >= output count":
@@ -174,6 +243,31 @@ suite "sighash - SIGHASH_SINGLE out of range":
     expectedHash[0] = 1
     check hash == expectedHash
 
+  test "SIGHASH_SINGLE | ANYONECANPAY out of range":
+    var tx = Transaction()
+    tx.version = 1
+    tx.lockTime = 0
+
+    tx.inputs.add(TxIn(
+      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+      scriptSig: @[],
+      sequence: 0xFFFFFFFF'u32
+    ))
+    tx.inputs.add(TxIn(
+      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 1),
+      scriptSig: @[],
+      sequence: 0xFFFFFFFF'u32
+    ))
+
+    tx.outputs.add(TxOut(value: Satoshi(100000), scriptPubKey: @[0x51'u8]))
+
+    # SIGHASH_SINGLE | ANYONECANPAY for input 1
+    let hash = computeLegacySighash(tx, 1, @[], SIGHASH_SINGLE or SIGHASH_ANYONECANPAY)
+
+    var expectedHash: array[32, byte]
+    expectedHash[0] = 1
+    check hash == expectedHash
+
 suite "sighash - complete signatureHash function":
   test "applies FindAndDelete to signature":
     var tx = Transaction()
@@ -198,3 +292,27 @@ suite "sighash - complete signatureHash function":
 
     # They should match because signatureHash removes the sig
     check hashWithSig == hashWithoutSig
+
+  test "handles OP_CODESEPARATOR position":
+    var tx = Transaction()
+    tx.version = 1
+    tx.lockTime = 0
+    tx.inputs.add(TxIn(
+      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+      scriptSig: @[],
+      sequence: 0xFFFFFFFF'u32
+    ))
+    tx.outputs.add(TxOut(value: Satoshi(100000), scriptPubKey: @[0x51'u8]))
+
+    # scriptCode with OP_CODESEPARATOR
+    let scriptCode = @[0x51'u8, 0xab, 0x52, 0x53]  # OP_1 OP_CODESEP OP_2 OP_3
+    let emptySig: seq[byte] = @[]
+
+    # Hash with codesepPos = 2 (after the OP_CODESEPARATOR)
+    let hashWithCodesep = signatureHash(tx, 0, scriptCode, emptySig, SIGHASH_ALL, 2)
+
+    # Should be same as hashing just OP_2 OP_3
+    let subscript = @[0x52'u8, 0x53]
+    let hashDirect = computeLegacySighash(tx, 0, subscript, SIGHASH_ALL)
+
+    check hashWithCodesep == hashDirect
