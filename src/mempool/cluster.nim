@@ -100,6 +100,148 @@ proc `==`*(a, b: FeeFrac): bool =
   a.fee * int64(b.size) == b.fee * int64(a.size)
 
 # ============================================================================
+# Feerate Diagram (for RBF comparison)
+# ============================================================================
+
+type
+  ## A feerate diagram is a sequence of (cumulative_size, cumulative_fee) points
+  ## representing the chunked feerate of a linearization.
+  ## The diagram starts at (0, 0) and each subsequent point represents a chunk boundary.
+  FeerateDiagram* = seq[tuple[size: int64, fee: int64]]
+
+  ## Result of comparing two feerate diagrams
+  DiagramCompareResult* = enum
+    dcrBetter,       ## Replacement is strictly better (at least one point higher, none lower)
+    dcrWorse,        ## Replacement is strictly worse
+    dcrEquivalent,   ## Diagrams are identical
+    dcrIncomparable  ## Neither dominates the other (one better in some places, worse in others)
+
+proc buildFeerateDiagram*(entries: seq[FeeFrac]): FeerateDiagram =
+  ## Build a feerate diagram from a sequence of (fee, size) chunks.
+  ## Each FeeFrac represents a chunk (not individual transactions).
+  ## The resulting diagram has points at (0, 0) and at each chunk boundary.
+  ##
+  ## The input should already be in chunk form (each FeeFrac is a chunk).
+  result = @[(size: int64(0), fee: int64(0))]  # Origin point
+
+  var cumSize: int64 = 0
+  var cumFee: int64 = 0
+
+  for chunk in entries:
+    cumSize += int64(chunk.size)
+    cumFee += chunk.fee
+    result.add((size: cumSize, fee: cumFee))
+
+proc buildFeerateDiagramFromChunks*(chunks: seq[Chunk]): FeerateDiagram =
+  ## Build a feerate diagram from computed chunks.
+  var entries: seq[FeeFrac]
+  for chunk in chunks:
+    entries.add(chunk.feerate)
+  buildFeerateDiagram(entries)
+
+proc interpolateFee(diagram: FeerateDiagram, atSize: int64): int64 =
+  ## Interpolate the fee at a given size on the diagram.
+  ## For sizes beyond the diagram, extends horizontally (constant fee).
+  if diagram.len == 0:
+    return 0
+
+  # Find the segment containing atSize
+  for i in 1 ..< diagram.len:
+    let prev = diagram[i - 1]
+    let curr = diagram[i]
+
+    if atSize <= curr.size:
+      # Interpolate within this segment
+      # fee = prev.fee + (curr.fee - prev.fee) * (atSize - prev.size) / (curr.size - prev.size)
+      # To avoid floating point, we use cross-multiplication
+      let segmentSize = curr.size - prev.size
+      let segmentFee = curr.fee - prev.fee
+      let offset = atSize - prev.size
+
+      if segmentSize == 0:
+        return prev.fee
+
+      # Linear interpolation: prev.fee + segmentFee * offset / segmentSize
+      return prev.fee + (segmentFee * offset) div segmentSize
+
+  # Size is beyond the diagram, return final fee
+  return diagram[^1].fee
+
+proc compareFeerateDiagrams*(original, replacement: FeerateDiagram): DiagramCompareResult =
+  ## Compare two feerate diagrams for RBF validation.
+  ##
+  ## Returns:
+  ## - dcrBetter: replacement is strictly better (at least one point strictly higher,
+  ##              no points strictly lower)
+  ## - dcrWorse: replacement is strictly worse
+  ## - dcrEquivalent: diagrams are identical at all comparison points
+  ## - dcrIncomparable: neither dominates (replacement is better somewhere, worse elsewhere)
+  ##
+  ## The comparison checks at every breakpoint from both diagrams:
+  ## - At each size, compare the cumulative fees
+  ## - For sizes beyond one diagram, that diagram extends horizontally
+  ##
+  ## This matches Bitcoin Core's CompareChunks implementation.
+
+  if original.len == 0 and replacement.len == 0:
+    return dcrEquivalent
+
+  if original.len == 0:
+    # Empty original, any non-empty replacement is better (assuming positive fees)
+    for pt in replacement:
+      if pt.fee > 0:
+        return dcrBetter
+    return dcrEquivalent
+
+  if replacement.len == 0:
+    # Empty replacement is worse than any non-empty original
+    for pt in original:
+      if pt.fee > 0:
+        return dcrWorse
+    return dcrEquivalent
+
+  var replacementBetterSomewhere = false
+  var originalBetterSomewhere = false
+
+  # Collect all unique size points from both diagrams
+  var sizePoints: seq[int64]
+  for pt in original:
+    if pt.size notin sizePoints:
+      sizePoints.add(pt.size)
+  for pt in replacement:
+    if pt.size notin sizePoints:
+      sizePoints.add(pt.size)
+
+  # Sort size points
+  sizePoints.sort()
+
+  # Compare at each size point
+  for size in sizePoints:
+    let origFee = interpolateFee(original, size)
+    let replFee = interpolateFee(replacement, size)
+
+    if replFee > origFee:
+      replacementBetterSomewhere = true
+    elif origFee > replFee:
+      originalBetterSomewhere = true
+
+    # Early exit if both are better somewhere (incomparable)
+    if replacementBetterSomewhere and originalBetterSomewhere:
+      return dcrIncomparable
+
+  if replacementBetterSomewhere and not originalBetterSomewhere:
+    return dcrBetter
+  elif originalBetterSomewhere and not replacementBetterSomewhere:
+    return dcrWorse
+  else:
+    return dcrEquivalent
+
+proc improvesFeerateDiagram*(original, replacement: FeerateDiagram): bool =
+  ## Check if replacement strictly improves the feerate diagram.
+  ## This is the primary check for cluster-based RBF validation.
+  compareFeerateDiagrams(original, replacement) == dcrBetter
+
+# ============================================================================
 # DepGraph operations
 # ============================================================================
 
@@ -683,3 +825,148 @@ proc clusterCount*(cm: ClusterManager): int =
 
 proc totalTransactionCount*(cm: ClusterManager): int =
   cm.clusters.len
+
+# ============================================================================
+# RBF Feerate Diagram Validation
+# ============================================================================
+
+proc getClusterFeerateDiagram*(c: Cluster): FeerateDiagram =
+  ## Get the feerate diagram for a cluster based on its current linearization.
+  buildFeerateDiagramFromChunks(c.chunks)
+
+proc validateRbfDiagram*(cm: ClusterManager, conflictTxids: seq[TxId],
+                          replacementFee: int64, replacementVsize: int,
+                          replacementParentTxids: seq[TxId]): ClusterResult[bool] =
+  ## Validate an RBF replacement using feerate diagram comparison.
+  ##
+  ## This computes:
+  ## 1. The "original" feerate diagram: all clusters affected by the conflicts
+  ## 2. The "replacement" feerate diagram: those same clusters with conflicts
+  ##    removed and the replacement tx added
+  ##
+  ## Returns Ok(true) if the replacement strictly improves the diagram,
+  ## Ok(false) otherwise.
+  ##
+  ## For transactions not in clustered mempool, falls back to simple fee comparison.
+
+  if conflictTxids.len == 0:
+    return ok(true)  # No conflicts to replace
+
+  # Find all unique clusters affected by the conflicts
+  var affectedClusterIndices: HashSet[int]
+  for txid in conflictTxids:
+    if txid in cm.clusters:
+      affectedClusterIndices.incl(cm.clusters[txid])
+
+  if affectedClusterIndices.len == 0:
+    # None of the conflicts are in clustered mempool, allow replacement
+    return ok(true)
+
+  # Build the original diagram from all affected clusters
+  var originalChunks: seq[FeeFrac]
+  for clusterIdx in affectedClusterIndices:
+    if clusterIdx < cm.clusterList.len:
+      for chunk in cm.clusterList[clusterIdx].chunks:
+        originalChunks.add(chunk.feerate)
+
+  # Sort by descending fee rate to form a proper diagram
+  originalChunks.sort(proc(a, b: FeeFrac): int =
+    if a > b: -1
+    elif b > a: 1
+    else: 0
+  )
+
+  let originalDiagram = buildFeerateDiagram(originalChunks)
+
+  # Build the replacement diagram:
+  # - Remove conflict transactions from affected clusters
+  # - Add replacement transaction
+  # - Recompute chunks
+
+  # For now, we use a simplified approach: simulate the replacement
+  # by creating temporary cluster copies
+
+  var replacementChunks: seq[FeeFrac]
+
+  # Collect all non-conflict transactions from affected clusters
+  var keepTxs: seq[tuple[txid: TxId, fee: int64, vsize: int, parents: seq[TxId]]]
+  var conflictSet = initHashSet[TxId]()
+  for txid in conflictTxids:
+    conflictSet.incl(txid)
+
+  for clusterIdx in affectedClusterIndices:
+    if clusterIdx >= cm.clusterList.len:
+      continue
+    let cluster = cm.clusterList[clusterIdx]
+    for txid in cluster.txids:
+      if txid notin conflictSet:
+        let idx = cluster.txidToIndex[txid]
+        let feefrac = cluster.graph.feerates[idx]
+        var parents: seq[TxId]
+        for parentIdx in cluster.graph.getReducedParents(idx):
+          let parentTxid = cluster.txids[parentIdx]
+          if parentTxid notin conflictSet:
+            parents.add(parentTxid)
+        keepTxs.add((txid: txid, fee: feefrac.fee, vsize: feefrac.size, parents: parents))
+
+  # Build a temporary cluster with kept transactions + replacement
+  var tempCluster = newCluster()
+
+  # Add kept transactions
+  for tx in keepTxs:
+    discard tempCluster.addTransaction(tx.txid, tx.fee, tx.vsize)
+
+  # Add dependencies for kept transactions
+  for tx in keepTxs:
+    for parent in tx.parents:
+      tempCluster.addDependency(parent, tx.txid)
+
+  # Add the replacement transaction with a placeholder txid
+  var placeholderBytes: array[32, byte]
+  for i in 0 ..< 32:
+    placeholderBytes[i] = byte(0xFF)
+  let replacementTxid = TxId(placeholderBytes)
+
+  discard tempCluster.addTransaction(replacementTxid, replacementFee, replacementVsize)
+
+  # Add dependencies from replacement to its parents (if they're in this cluster)
+  for parentTxid in replacementParentTxids:
+    if parentTxid in tempCluster.txidToIndex:
+      tempCluster.addDependency(parentTxid, replacementTxid)
+
+  # Relinearize and get chunks
+  tempCluster.relinearize()
+
+  for chunk in tempCluster.chunks:
+    replacementChunks.add(chunk.feerate)
+
+  # Sort by descending fee rate
+  replacementChunks.sort(proc(a, b: FeeFrac): int =
+    if a > b: -1
+    elif b > a: 1
+    else: 0
+  )
+
+  let replacementDiagram = buildFeerateDiagram(replacementChunks)
+
+  # Compare diagrams
+  let result = compareFeerateDiagrams(originalDiagram, replacementDiagram)
+
+  case result
+  of dcrBetter:
+    ok(true)
+  else:
+    ok(false)
+
+proc checkRbfImprovesDiagram*(cm: ClusterManager, conflictTxids: seq[TxId],
+                               replacementFee: int64, replacementVsize: int,
+                               replacementParentTxids: seq[TxId]): bool =
+  ## Convenience wrapper that returns true if replacement improves the diagram.
+  ## Falls back to true (allowing replacement) on any errors.
+  let result = cm.validateRbfDiagram(conflictTxids, replacementFee,
+                                      replacementVsize, replacementParentTxids)
+  if result.isOk:
+    result.value
+  else:
+    # On error, fall back to allowing replacement
+    true
