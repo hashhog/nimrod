@@ -72,6 +72,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Block pruning (auto/manual deletion of old blk/rev files, 550 MiB minimum, 288-block safety margin)
 - [x] Compact block relay (BIP-152 short ID, cmpctblock/getblocktxn/blocktxn, mempool reconstruction)
 - [x] Cluster mempool (connected component clustering, greedy linearization, chunk-based mining scores, cluster size limits)
+- [x] Feerate diagram RBF validation (diagram construction, interpolation, strict improvement comparison)
 - [x] Pay-to-Anchor (P2A) script detection (BIP-TBD: OP_1 <0x4e73> anyone-can-spend for CPFP fee bumping)
 - [x] REST API (read-only endpoints: block, headers, tx, getutxos, mempool in JSON/binary/hex formats)
 
