@@ -573,3 +573,232 @@ suite "Mining score edge cases":
     check a1Score < 8.0
     check b1Score > 14.0
     check b1Score < 16.0
+
+suite "Feerate diagram construction":
+  test "build diagram from empty chunks":
+    let chunks: seq[FeeFrac] = @[]
+    let diagram = buildFeerateDiagram(chunks)
+
+    check diagram.len == 1
+    check diagram[0].size == 0
+    check diagram[0].fee == 0
+
+  test "build diagram from single chunk":
+    let chunks = @[FeeFrac(fee: 1000, size: 100)]
+    let diagram = buildFeerateDiagram(chunks)
+
+    check diagram.len == 2
+    check diagram[0] == (size: int64(0), fee: int64(0))
+    check diagram[1] == (size: int64(100), fee: int64(1000))
+
+  test "build diagram from multiple chunks":
+    # Two chunks: first 10 sat/vbyte, second 5 sat/vbyte
+    let chunks = @[
+      FeeFrac(fee: 1000, size: 100),  # 10 sat/vbyte
+      FeeFrac(fee: 500, size: 100)    # 5 sat/vbyte
+    ]
+    let diagram = buildFeerateDiagram(chunks)
+
+    check diagram.len == 3
+    check diagram[0] == (size: int64(0), fee: int64(0))
+    check diagram[1] == (size: int64(100), fee: int64(1000))
+    check diagram[2] == (size: int64(200), fee: int64(1500))
+
+  test "build diagram from cluster chunks":
+    var c = newCluster()
+    let tx1 = makeTxId(1)
+    let tx2 = makeTxId(2)
+
+    discard c.addTransaction(tx1, 1000, 100)  # 10 sat/vbyte
+    discard c.addTransaction(tx2, 500, 100)   # 5 sat/vbyte
+
+    c.relinearize()
+
+    let diagram = c.getClusterFeerateDiagram()
+
+    # Should have origin + 2 chunk boundaries
+    check diagram.len >= 2
+    check diagram[0] == (size: int64(0), fee: int64(0))
+
+suite "Feerate diagram comparison":
+  test "empty diagrams are equivalent":
+    let a: FeerateDiagram = @[(size: int64(0), fee: int64(0))]
+    let b: FeerateDiagram = @[(size: int64(0), fee: int64(0))]
+
+    check compareFeerateDiagrams(a, b) == dcrEquivalent
+
+  test "identical diagrams are equivalent":
+    let a = @[(size: int64(0), fee: int64(0)), (size: int64(100), fee: int64(1000))]
+    let b = @[(size: int64(0), fee: int64(0)), (size: int64(100), fee: int64(1000))]
+
+    check compareFeerateDiagrams(a, b) == dcrEquivalent
+
+  test "higher fee at all points is better":
+    let original = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(100), fee: int64(1000))
+    ]
+    let replacement = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(100), fee: int64(1500))  # Higher fee
+    ]
+
+    check compareFeerateDiagrams(original, replacement) == dcrBetter
+    check improvesFeerateDiagram(original, replacement) == true
+
+  test "lower fee at all points is worse":
+    let original = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(100), fee: int64(1000))
+    ]
+    let replacement = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(100), fee: int64(500))  # Lower fee
+    ]
+
+    check compareFeerateDiagrams(original, replacement) == dcrWorse
+    check improvesFeerateDiagram(original, replacement) == false
+
+  test "higher fee but larger size is incomparable":
+    # Original: 1000 fee at 100 vbytes (10 sat/vbyte)
+    # Replacement: 1500 fee at 200 vbytes (7.5 sat/vbyte)
+    # At size 100: original has 1000, replacement has ~750 (worse)
+    # At size 200: original has 1000, replacement has 1500 (better)
+    let original = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(100), fee: int64(1000))
+    ]
+    let replacement = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(200), fee: int64(1500))
+    ]
+
+    check compareFeerateDiagrams(original, replacement) == dcrIncomparable
+
+  test "replacement strictly dominates at every point":
+    # Multi-chunk diagrams
+    let original = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(100), fee: int64(800)),
+      (size: int64(200), fee: int64(1200))
+    ]
+    let replacement = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(100), fee: int64(1000)),
+      (size: int64(200), fee: int64(1500))
+    ]
+
+    check compareFeerateDiagrams(original, replacement) == dcrBetter
+
+  test "replacement worse at first point":
+    let original = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(100), fee: int64(1000)),
+      (size: int64(200), fee: int64(1500))
+    ]
+    let replacement = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(100), fee: int64(800)),   # Worse here
+      (size: int64(200), fee: int64(2000))   # Better here
+    ]
+
+    check compareFeerateDiagrams(original, replacement) == dcrIncomparable
+
+  test "different chunk boundaries":
+    # Original: one chunk of 200 vbytes, 1000 fee
+    # Replacement: two chunks, same total but front-loaded
+    let original = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(200), fee: int64(1000))
+    ]
+    # Replacement with higher feerate in first chunk
+    let replacement = @[
+      (size: int64(0), fee: int64(0)),
+      (size: int64(100), fee: int64(800)),   # 8 sat/vbyte for first 100
+      (size: int64(200), fee: int64(1100))   # 3 sat/vbyte for next 100
+    ]
+
+    # At size 100: original ~500, replacement 800 (better)
+    # At size 200: original 1000, replacement 1100 (better)
+    check compareFeerateDiagrams(original, replacement) == dcrBetter
+
+suite "RBF diagram validation":
+  test "simple replacement improves diagram":
+    var cm = newClusterManager()
+    let origTx = makeTxId(1)
+
+    discard cm.addTransaction(origTx, 1000, 100, @[])  # 10 sat/vbyte
+
+    # Replacement with higher fee
+    let improves = cm.checkRbfImprovesDiagram(
+      @[origTx],           # conflicts
+      2000,                # replacement fee (20 sat/vbyte)
+      100,                 # same size
+      @[]                  # no parents
+    )
+
+    check improves == true
+
+  test "replacement with lower fee fails":
+    var cm = newClusterManager()
+    let origTx = makeTxId(1)
+
+    discard cm.addTransaction(origTx, 1000, 100, @[])  # 10 sat/vbyte
+
+    # Replacement with lower fee
+    let improves = cm.checkRbfImprovesDiagram(
+      @[origTx],           # conflicts
+      500,                 # replacement fee (5 sat/vbyte)
+      100,                 # same size
+      @[]                  # no parents
+    )
+
+    check improves == false
+
+  test "replacement must beat CPFP package":
+    var cm = newClusterManager()
+    let parent = makeTxId(1)
+    let child = makeTxId(2)
+
+    # Low-fee parent with high-fee child (CPFP)
+    discard cm.addTransaction(parent, 100, 100, @[])      # 1 sat/vbyte
+    discard cm.addTransaction(child, 900, 100, @[parent]) # 9 sat/vbyte
+    # Package: 1000/200 = 5 sat/vbyte
+
+    # Replacement that's slightly better per-byte but must beat the package
+    let improves = cm.checkRbfImprovesDiagram(
+      @[parent],           # conflicts (evicts parent, which evicts child)
+      600,                 # 6 sat/vbyte > 5 sat/vbyte package
+      100,
+      @[]
+    )
+
+    # This should improve because 600/100 = 6 sat/vbyte > 1000/200 = 5 sat/vbyte
+    check improves == true
+
+  test "no conflicts means valid":
+    var cm = newClusterManager()
+    let tx = makeTxId(1)
+    discard cm.addTransaction(tx, 1000, 100, @[])
+
+    let improves = cm.checkRbfImprovesDiagram(
+      @[],                 # no conflicts
+      500,                 # any fee
+      100,
+      @[]
+    )
+
+    check improves == true
+
+  test "replacement of unknown tx succeeds":
+    var cm = newClusterManager()
+    let unknownTx = makeTxId(999)  # Not in mempool
+
+    let improves = cm.checkRbfImprovesDiagram(
+      @[unknownTx],
+      1000,
+      100,
+      @[]
+    )
+
+    check improves == true
