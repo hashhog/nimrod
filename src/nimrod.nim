@@ -448,13 +448,13 @@ proc startNode*(config: NimrodConfig) {.async.} =
 
   # 5. Initialize peer manager
   info "initializing peer manager"
-  state.peerManager = newPeerManager(params, config.maxConnections div 16, config.maxConnections - config.maxConnections div 16)
+  state.peerManager = newPeerManager(params, maxOut = config.maxConnections div 16, maxIn = config.maxConnections - config.maxConnections div 16)
   state.peerManager.updateHeight(state.chainState.bestHeight)
   state.peerManager.setMessageCallback(messageCallback(state))
 
   # 6. Initialize sync manager
   info "initializing sync manager"
-  state.syncManager = newSyncManager(state.peerManager, state.chainState.db, params)
+  state.syncManager = newSyncManager(state.peerManager, state.chainState.db, params, state.chainState)
   state.syncManager.chainTip = state.chainState.bestBlockHash
   state.syncManager.chainTipHeight = state.chainState.bestHeight
 

@@ -1,5 +1,18 @@
 ## secp256k1 elliptic curve operations
 ## FFI bindings to libsecp256k1 via importc
+##
+## Hardware Acceleration:
+## libsecp256k1 should be built with assembly optimizations enabled.
+## On x86_64, this uses optimized field/scalar arithmetic.
+## Configure with: ./configure --enable-module-recovery --enable-module-schnorrsig
+## Build with: make CFLAGS="-O3 -march=native"
+##
+## Verify optimizations are enabled:
+##   strings /usr/lib/libsecp256k1.so | grep -i "asm\|simd"
+##
+## Performance targets:
+## - ECDSA verify: ~50,000 ops/sec on modern x86_64
+## - Schnorr verify: ~45,000 ops/sec on modern x86_64
 
 import std/[os]
 
@@ -26,6 +39,18 @@ type
     data*: array[64, byte]
 
   Secp256k1Error* = object of CatchableError
+
+  # ElligatorSwift types for BIP-324
+  EllSwiftPubKey* = array[64, byte]
+
+  # Function pointer type for ECDH hash function
+  Secp256k1EllswiftXdhHashFunction* = proc(
+    output: ptr byte,
+    x32: ptr byte,
+    ellA64: ptr byte,
+    ellB64: ptr byte,
+    data: pointer
+  ): cint {.cdecl.}
   PrivateKey* = array[32, byte]
   PublicKey* = array[33, byte]  # Compressed
   UncompressedPublicKey* = array[65, byte]
@@ -111,6 +136,28 @@ when defined(useSystemSecp256k1):
     msg: ptr byte,
     msgLen: csize_t,
     pubkey: ptr Secp256k1XonlyPubkey
+  ): cint {.importc, cdecl.}
+
+  # ElligatorSwift FFI bindings (BIP-324)
+  # The hash function for BIP-324 compatible ECDH
+  var secp256k1_ellswift_xdh_hash_function_bip324* {.importc.}: Secp256k1EllswiftXdhHashFunction
+
+  proc secp256k1_ellswift_create(
+    ctx: Secp256k1Context,
+    ell64: ptr byte,
+    seckey32: ptr byte,
+    auxrnd32: ptr byte
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_ellswift_xdh(
+    ctx: Secp256k1Context,
+    output: ptr byte,
+    ellA64: ptr byte,
+    ellB64: ptr byte,
+    seckey32: ptr byte,
+    party: cint,
+    hashfp: Secp256k1EllswiftXdhHashFunction,
+    data: pointer
   ): cint {.importc, cdecl.}
 
   var globalContext: Secp256k1Context
@@ -231,6 +278,62 @@ when defined(useSystemSecp256k1):
       getContext(), addr sig[0], addr msgData[0], csize_t(msg.len), addr xonlyPk
     ) == 1
 
+  # ==========================================================================
+  # ElligatorSwift (BIP-324)
+  # ==========================================================================
+
+  proc ellswiftCreate*(privateKey: PrivateKey, auxRand: openArray[byte] = []): EllSwiftPubKey =
+    ## Create a 64-byte ElligatorSwift public key from a private key
+    ## auxRand is optional 32 bytes of randomness for encoding variety
+    var pk = privateKey
+    var auxPtr: ptr byte = nil
+    var auxData: array[32, byte]
+
+    if auxRand.len >= 32:
+      for i in 0..<32:
+        auxData[i] = auxRand[i]
+      auxPtr = addr auxData[0]
+
+    if secp256k1_ellswift_create(
+      getContext(), addr result[0], addr pk[0], auxPtr
+    ) != 1:
+      raise newException(Secp256k1Error, "failed to create ElligatorSwift public key")
+
+  proc computeBIP324ECDHSecret*(
+    privateKey: PrivateKey,
+    ourPubKey: EllSwiftPubKey,
+    theirPubKey: EllSwiftPubKey,
+    initiator: bool
+  ): array[32, byte] =
+    ## Compute BIP-324 ECDH shared secret
+    ## initiator is true if we initiated the connection (we are party A)
+    var pk = privateKey
+    var ourPk = ourPubKey
+    var theirPk = theirPubKey
+
+    # Determine party order: initiator is party A, responder is party B
+    # ell_a64 is always initiator's key, ell_b64 is responder's key
+    var ellA: ptr byte
+    var ellB: ptr byte
+    var party: cint
+
+    if initiator:
+      ellA = addr ourPk[0]
+      ellB = addr theirPk[0]
+      party = 0  # We are party A
+    else:
+      ellA = addr theirPk[0]
+      ellB = addr ourPk[0]
+      party = 1  # We are party B
+
+    if secp256k1_ellswift_xdh(
+      getContext(), addr result[0],
+      ellA, ellB,
+      addr pk[0], party,
+      secp256k1_ellswift_xdh_hash_function_bip324, nil
+    ) != 1:
+      raise newException(Secp256k1Error, "failed to compute BIP-324 ECDH secret")
+
   # High-level CryptoEngine wrapper
   type
     CryptoEngine* = object
@@ -300,6 +403,49 @@ when defined(useSystemSecp256k1):
       e.ctx, addr signature[0], addr msgData[0], csize_t(32), addr xonlyPk
     ) == 1
 
+  # ==========================================================================
+  # Benchmarking
+  # ==========================================================================
+
+  import std/[monotimes, times]
+
+  proc benchEcdsaVerify*(iterations: int): float64 =
+    ## Benchmark ECDSA verification throughput in ops/sec
+    ## Uses pre-generated test vectors for consistent timing
+
+    # Test vector: known good signature
+    let privkey: PrivateKey = [
+      0x01'u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+      0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+      0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+      0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20
+    ]
+
+    let msgHash: array[32, byte] = [
+      0xaa'u8, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+      0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+      0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+      0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99
+    ]
+
+    let pubkey = derivePublicKey(privkey)
+    let signature = sign(privkey, msgHash)
+
+    let start = getMonoTime()
+
+    var verified = 0
+    for _ in 0..<iterations:
+      if verify(pubkey, msgHash, signature):
+        inc verified
+
+    let elapsed = (getMonoTime() - start).inMicroseconds
+    let seconds = float64(elapsed) / 1_000_000.0
+
+    # Ensure all verified (sanity check)
+    assert verified == iterations, "Verification failed unexpectedly"
+
+    result = float64(iterations) / seconds
+
 else:
   # Stub implementations when libsecp256k1 not available
   proc initSecp256k1*() =
@@ -348,4 +494,16 @@ else:
     raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
 
   proc verifySchnorr*(e: CryptoEngine, sig: array[64, byte], msg, pubkey: array[32, byte]): bool =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  # ElligatorSwift stubs
+  proc ellswiftCreate*(privateKey: PrivateKey, auxRand: openArray[byte] = []): EllSwiftPubKey =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc computeBIP324ECDHSecret*(
+    privateKey: PrivateKey,
+    ourPubKey: EllSwiftPubKey,
+    theirPubKey: EllSwiftPubKey,
+    initiator: bool
+  ): array[32, byte] =
     raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")

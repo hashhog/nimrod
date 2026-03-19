@@ -354,6 +354,13 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
         pm.outboundNetGroups.incl(ng)
 
       info "connected to peer", peer = $peer, height = peer.startHeight, connType = $connType
+
+      # Start message loop for outbound peer (same as inbound)
+      if pm.onMessage != nil:
+        asyncSpawn peer.messageLoop(pm.onMessage)
+      else:
+        asyncSpawn peer.messageLoop(nil)
+
       return true
     except CatchableError as e:
       error "handshake failed", peer = $peer, error = e.msg

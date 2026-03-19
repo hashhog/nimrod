@@ -58,6 +58,9 @@ import ./test_feefilter
 import ./test_cluster
 import ./test_p2a
 import ./test_rest
+import ./test_zmq
+import ./test_notification
+import ./test_regtest
 
 when isMainModule:
   echo "Running all tests..."

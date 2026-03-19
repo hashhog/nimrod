@@ -6,9 +6,13 @@ import ../primitives/[types, serialize]
 import ../crypto/[hashing, secp256k1]
 import ../storage/chainstate
 import ../script/interpreter
+import ../perf/sig_cache
 import ./params
 
 export params
+export sig_cache
+
+var globalSigCache* = newSigCache(50_000)
 
 type
   ValidationError* = enum
@@ -1081,6 +1085,12 @@ proc validateBlock*(
 
   ok()
 
+proc scriptFlagsToUint32(flags: set[ScriptFlags]): uint32 =
+  ## Convert script flags set to a uint32 for use as cache key
+  result = 0
+  for f in flags:
+    result = result or (1u32 shl uint32(ord(f)))
+
 # Script verification for a block
 proc verifyScripts*(
   blk: Block,
@@ -1093,6 +1103,7 @@ proc verifyScripts*(
   ## This is typically called after validateBlock passes
 
   let flags = getBlockScriptFlags(height, params)
+  let flagsUint = scriptFlagsToUint32(flags)
 
   # Track intra-block UTXOs for script verification
   var intraBlockUtxos = initTable[string, UtxoEntry]()
@@ -1110,8 +1121,13 @@ proc verifyScripts*(
   # Verify scripts for non-coinbase transactions
   for i in 1 ..< blk.txs.len:
     let tx = blk.txs[i]
+    let txidBytes = array[32, byte](tx.txid())
 
     for inputIdx, inp in tx.inputs:
+      # Check signature cache before expensive verification
+      if globalSigCache.lookup(txidBytes, uint32(inputIdx), flagsUint):
+        continue
+
       # Look up the UTXO being spent
       let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
       var utxoOpt: Option[UtxoEntry]
@@ -1143,6 +1159,9 @@ proc verifyScripts*(
 
       if not verified:
         return voidErr(veScriptVerifyFailed)
+
+      # Cache successful verification
+      globalSigCache.insert(txidBytes, uint32(inputIdx), flagsUint)
 
     # Remove spent UTXOs
     for inp in tx.inputs:

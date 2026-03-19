@@ -5,6 +5,9 @@
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 import ./compact_blocks
+import ./addr
+export addr
+import std/options
 
 const
   MaxMessagePayload* = 33_554_432  # 32 MiB
@@ -36,14 +39,7 @@ type
     invType*: InvType
     hash*: array[32, byte]
 
-  NetAddress* = object
-    services*: uint64
-    ip*: array[16, byte]  # IPv6 or IPv4-mapped
-    port*: uint16
-
-  TimestampedAddr* = object
-    timestamp*: uint32
-    address*: NetAddress
+  # NetAddress and TimestampedAddr are defined in addr.nim (imported + exported above)
 
   VersionMsg* = object
     version*: uint32
@@ -75,12 +71,41 @@ type
     announce*: bool
     version*: uint64
 
+  ## SendPackages message for package relay negotiation (BIP 331)
+  ## Indicates peer supports package relay
+  SendPackagesMsg* = object
+    version*: uint32  ## Package relay protocol version
+
+  ## BIP330 sendtxrcncl - signal transaction reconciliation support
+  SendTxRcnclMsg* = object
+    version*: uint32   ## Reconciliation protocol version (currently 1)
+    salt*: uint64      ## Local salt for short ID computation
+
+  ## BIP330 reqrecon - request reconciliation sketch from peer
+  ReqReconMsg* = object
+    setSize*: uint16      ## Our local set size estimate
+    q*: uint16            ## Parameter for sketch capacity (capacity = setSize + q)
+
+  ## BIP330 sketch - reconciliation sketch message
+  SketchMsg* = object
+    sketchData*: seq[byte]  ## Serialized minisketch data
+
+  ## BIP330 reconcildiff - request missing short IDs
+  ReconcilDiffMsg* = object
+    success*: bool                ## True if sketch decoding succeeded
+    shortIds*: seq[uint32]        ## Short IDs we need (decoded from sketch)
+
+  ## BIP330 reqsketchext - request extended sketch (larger capacity)
+  ReqSketchExtMsg* = object
+    discard  ## Empty message
+
   MessageKind* = enum
     mkVersion
     mkVerack
     mkPing
     mkPong
     mkAddr
+    mkAddrV2
     mkInv
     mkGetData
     mkNotFound
@@ -99,12 +124,19 @@ type
     mkCmpctBlock
     mkGetBlockTxn
     mkBlockTxn
+    mkSendPackages
+    # BIP330 Erlay messages
+    mkSendTxRcncl
+    mkReqRecon
+    mkSketch
+    mkReconcilDiff
+    mkReqSketchExt
 
   P2PMessage* = object
     case kind*: MessageKind
     of mkVersion:
       version*: VersionMsg
-    of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2:
+    of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2, mkSendPackages, mkReqSketchExt:
       discard
     of mkPing:
       pingNonce*: uint64
@@ -112,6 +144,8 @@ type
       pongNonce*: uint64
     of mkAddr:
       addresses*: seq[TimestampedAddr]
+    of mkAddrV2:
+      addressesV2*: seq[TimestampedAddrV2]
     of mkInv:
       invItems*: seq[InvVector]
     of mkGetData:
@@ -140,6 +174,15 @@ type
       getBlockTxn*: BlockTxnRequest
     of mkBlockTxn:
       blockTxn*: BlockTxnResponse
+    # BIP330 Erlay messages
+    of mkSendTxRcncl:
+      sendTxRcncl*: SendTxRcnclMsg
+    of mkReqRecon:
+      reqRecon*: ReqReconMsg
+    of mkSketch:
+      sketch*: SketchMsg
+    of mkReconcilDiff:
+      reconcilDiff*: ReconcilDiffMsg
 
 # Command name conversion
 
@@ -320,7 +363,7 @@ proc serializePayload*(msg: P2PMessage): seq[byte] =
   case msg.kind
   of mkVersion:
     w.writeVersionMsg(msg.version)
-  of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2:
+  of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2, mkSendPackages:
     discard  # Empty payload
   of mkPing:
     w.writeUint64LE(msg.pingNonce)
@@ -330,6 +373,10 @@ proc serializePayload*(msg: P2PMessage): seq[byte] =
     w.writeCompactSize(uint64(msg.addresses.len))
     for taddr in msg.addresses:
       w.writeTimestampedAddr(taddr)
+  of mkAddrV2:
+    w.writeCompactSize(uint64(msg.addressesV2.len))
+    for taddr in msg.addressesV2:
+      w.writeTimestampedAddrV2(taddr)
   of mkInv:
     w.writeCompactSize(uint64(msg.invItems.len))
     for inv in msg.invItems:
@@ -364,6 +411,23 @@ proc serializePayload*(msg: P2PMessage): seq[byte] =
     w.writeBlockTxnRequest(msg.getBlockTxn)
   of mkBlockTxn:
     w.writeBlockTxnResponse(msg.blockTxn)
+  # BIP330 Erlay messages
+  of mkSendTxRcncl:
+    w.writeUint32LE(msg.sendTxRcncl.version)
+    w.writeUint64LE(msg.sendTxRcncl.salt)
+  of mkReqRecon:
+    w.writeUint16LE(msg.reqRecon.setSize)
+    w.writeUint16LE(msg.reqRecon.q)
+  of mkSketch:
+    w.writeCompactSize(uint64(msg.sketch.sketchData.len))
+    w.writeBytes(msg.sketch.sketchData)
+  of mkReconcilDiff:
+    w.writeUint8(if msg.reconcilDiff.success: 1 else: 0)
+    w.writeCompactSize(uint64(msg.reconcilDiff.shortIds.len))
+    for shortId in msg.reconcilDiff.shortIds:
+      w.writeUint32LE(shortId)
+  of mkReqSketchExt:
+    discard  # Empty message
 
   result = w.data
 
@@ -374,6 +438,7 @@ proc messageKindToCommand*(kind: MessageKind): string =
   of mkPing: "ping"
   of mkPong: "pong"
   of mkAddr: "addr"
+  of mkAddrV2: "addrv2"
   of mkInv: "inv"
   of mkGetData: "getdata"
   of mkNotFound: "notfound"
@@ -392,6 +457,13 @@ proc messageKindToCommand*(kind: MessageKind): string =
   of mkCmpctBlock: "cmpctblock"
   of mkGetBlockTxn: "getblocktxn"
   of mkBlockTxn: "blocktxn"
+  of mkSendPackages: "sendpackages"
+  # BIP330 Erlay
+  of mkSendTxRcncl: "sendtxrcncl"
+  of mkReqRecon: "reqrecon"
+  of mkSketch: "sketch"
+  of mkReconcilDiff: "reconcildiff"
+  of mkReqSketchExt: "reqsketchext"
 
 proc commandToMessageKind*(cmd: string): MessageKind =
   case cmd
@@ -400,6 +472,7 @@ proc commandToMessageKind*(cmd: string): MessageKind =
   of "ping": mkPing
   of "pong": mkPong
   of "addr": mkAddr
+  of "addrv2": mkAddrV2
   of "inv": mkInv
   of "getdata": mkGetData
   of "notfound": mkNotFound
@@ -418,6 +491,13 @@ proc commandToMessageKind*(cmd: string): MessageKind =
   of "cmpctblock": mkCmpctBlock
   of "getblocktxn": mkGetBlockTxn
   of "blocktxn": mkBlockTxn
+  of "sendpackages": mkSendPackages
+  # BIP330 Erlay
+  of "sendtxrcncl": mkSendTxRcncl
+  of "reqrecon": mkReqRecon
+  of "sketch": mkSketch
+  of "reconcildiff": mkReconcilDiff
+  of "reqsketchext": mkReqSketchExt
   else:
     raise newException(SerializationError, "unknown command: " & cmd)
 
@@ -495,6 +575,15 @@ proc deserializePayload*(cmd: string, payload: seq[byte]): P2PMessage =
     for i in 0 ..< int(count):
       addresses.add(r.readTimestampedAddr())
     result = P2PMessage(kind: mkAddr, addresses: addresses)
+  of "addrv2":
+    var addressesV2: seq[TimestampedAddrV2]
+    let count = r.readCompactSize()
+    for i in 0 ..< int(count):
+      let addrOpt = r.readTimestampedAddrV2()
+      if addrOpt.isSome:
+        addressesV2.add(addrOpt.get())
+      # Unknown network types are silently skipped
+    result = P2PMessage(kind: mkAddrV2, addressesV2: addressesV2)
   of "inv":
     var invItems: seq[InvVector]
     let count = r.readCompactSize()
@@ -543,6 +632,39 @@ proc deserializePayload*(cmd: string, payload: seq[byte]): P2PMessage =
     result = P2PMessage(kind: mkGetBlockTxn, getBlockTxn: r.readBlockTxnRequest())
   of "blocktxn":
     result = P2PMessage(kind: mkBlockTxn, blockTxn: r.readBlockTxnResponse())
+  of "sendpackages":
+    result = P2PMessage(kind: mkSendPackages)
+  # BIP330 Erlay
+  of "sendtxrcncl":
+    result = P2PMessage(kind: mkSendTxRcncl, sendTxRcncl: SendTxRcnclMsg(
+      version: r.readUint32LE(),
+      salt: r.readUint64LE()
+    ))
+  of "reqrecon":
+    result = P2PMessage(kind: mkReqRecon, reqRecon: ReqReconMsg(
+      setSize: r.readUint16LE(),
+      q: r.readUint16LE()
+    ))
+  of "sketch":
+    let dataLen = r.readCompactSize()
+    var sketchData = newSeq[byte](dataLen)
+    if dataLen > 0:
+      let bytes = r.readBytes(int(dataLen))
+      for i in 0 ..< int(dataLen):
+        sketchData[i] = bytes[i]
+    result = P2PMessage(kind: mkSketch, sketch: SketchMsg(sketchData: sketchData))
+  of "reconcildiff":
+    let success = r.readUint8() != 0
+    let count = r.readCompactSize()
+    var shortIds: seq[uint32]
+    for i in 0 ..< int(count):
+      shortIds.add(r.readUint32LE())
+    result = P2PMessage(kind: mkReconcilDiff, reconcilDiff: ReconcilDiffMsg(
+      success: success,
+      shortIds: shortIds
+    ))
+  of "reqsketchext":
+    result = P2PMessage(kind: mkReqSketchExt)
   else:
     raise newException(SerializationError, "unknown command: " & cmd)
 
@@ -618,6 +740,12 @@ proc newWtxidRelay*(): P2PMessage =
 proc newSendAddrV2*(): P2PMessage =
   P2PMessage(kind: mkSendAddrV2)
 
+proc newAddr*(addresses: seq[TimestampedAddr]): P2PMessage =
+  P2PMessage(kind: mkAddr, addresses: addresses)
+
+proc newAddrV2*(addresses: seq[TimestampedAddrV2]): P2PMessage =
+  P2PMessage(kind: mkAddrV2, addressesV2: addresses)
+
 proc newBlockMsg*(blk: Block): P2PMessage =
   P2PMessage(kind: mkBlock, blk: blk)
 
@@ -638,3 +766,38 @@ proc newBlockTxnMsg*(blockHash: BlockHash, txns: seq[Transaction]): P2PMessage =
     blockHash: blockHash,
     transactions: txns
   ))
+
+proc newSendPackages*(): P2PMessage =
+  ## Signal support for package relay (BIP 331)
+  P2PMessage(kind: mkSendPackages)
+
+# BIP330 Erlay message constructors
+
+proc newSendTxRcncl*(version: uint32, salt: uint64): P2PMessage =
+  ## Signal transaction reconciliation support (BIP 330)
+  P2PMessage(kind: mkSendTxRcncl, sendTxRcncl: SendTxRcnclMsg(
+    version: version,
+    salt: salt
+  ))
+
+proc newReqRecon*(setSize: uint16, q: uint16): P2PMessage =
+  ## Request reconciliation sketch from peer
+  P2PMessage(kind: mkReqRecon, reqRecon: ReqReconMsg(
+    setSize: setSize,
+    q: q
+  ))
+
+proc newSketch*(sketchData: seq[byte]): P2PMessage =
+  ## Send reconciliation sketch
+  P2PMessage(kind: mkSketch, sketch: SketchMsg(sketchData: sketchData))
+
+proc newReconcilDiff*(success: bool, shortIds: seq[uint32]): P2PMessage =
+  ## Send reconciliation difference (missing short IDs)
+  P2PMessage(kind: mkReconcilDiff, reconcilDiff: ReconcilDiffMsg(
+    success: success,
+    shortIds: shortIds
+  ))
+
+proc newReqSketchExt*(): P2PMessage =
+  ## Request extended sketch (larger capacity)
+  P2PMessage(kind: mkReqSketchExt)

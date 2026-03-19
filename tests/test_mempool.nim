@@ -1212,6 +1212,496 @@ suite "Mempool package_limit combined tests":
 
     cs.close()
 
+# ============================================================================
+# BIP125 Full RBF Tests
+# ============================================================================
+
+suite "Mempool RBF constants":
+  test "RBF constants are correct":
+    check MaxReplacementCandidates == 100
+    check DefaultIncrementalRelayFee == 1.0  # 1 sat/vbyte
+
+suite "Mempool RBF conflict detection":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "findConflicts detects spending same input":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Create a UTXO outpoint
+    var utxoTxid: array[32, byte]
+    utxoTxid[0] = 0xAA
+    let outpoint = OutPoint(txid: TxId(utxoTxid), vout: 0)
+
+    # Add existing tx that spends the outpoint
+    var existingTxid: array[32, byte]
+    existingTxid[0] = 0x01
+    let existingTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(existingTxid)] = MempoolEntry(
+      tx: existingTx, txid: TxId(existingTxid), fee: Satoshi(100),
+      weight: 400, feeRate: 1.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+    mp.spentBy[outpoint] = TxId(existingTxid)
+
+    # Create new tx that also spends the same outpoint
+    let newTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let conflicts = mp.findConflicts(newTx)
+    check len(conflicts) == 1
+    check TxId(existingTxid) in conflicts
+
+    cs.close()
+
+  test "findConflicts returns empty for non-conflicting tx":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # No existing transactions
+    var utxoTxid: array[32, byte]
+    utxoTxid[0] = 0xAA
+    let outpoint = OutPoint(txid: TxId(utxoTxid), vout: 0)
+
+    let newTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let conflicts = mp.findConflicts(newTx)
+    check len(conflicts) == 0
+
+    cs.close()
+
+suite "Mempool RBF rules validation":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "reject replacement with insufficient fee":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Add existing tx with 1000 sat fee
+    var existingTxid: array[32, byte]
+    existingTxid[0] = 0x01
+    var utxoTxid: array[32, byte]
+    utxoTxid[0] = 0xAA
+    let outpoint = OutPoint(txid: TxId(utxoTxid), vout: 0)
+
+    let existingTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(existingTxid)] = MempoolEntry(
+      tx: existingTx, txid: TxId(existingTxid), fee: Satoshi(1000),
+      weight: 400, feeRate: 10.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(1000), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+    mp.spentBy[outpoint] = TxId(existingTxid)
+
+    let conflicts = initHashSet[TxId]() + [TxId(existingTxid)]
+
+    # Try to replace with lower fee (500 sat < 1000 sat)
+    let newTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let result = mp.checkRbfRules(newTx, Satoshi(500), 100, conflicts)
+    check not result.isOk
+    check "insufficient fee" in result.error
+
+    cs.close()
+
+  test "reject replacement with insufficient fee for bandwidth":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Add existing tx with 1000 sat fee
+    var existingTxid: array[32, byte]
+    existingTxid[0] = 0x01
+    var utxoTxid: array[32, byte]
+    utxoTxid[0] = 0xAA
+    let outpoint = OutPoint(txid: TxId(utxoTxid), vout: 0)
+
+    let existingTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(existingTxid)] = MempoolEntry(
+      tx: existingTx, txid: TxId(existingTxid), fee: Satoshi(1000),
+      weight: 400, feeRate: 10.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(1000), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+    mp.spentBy[outpoint] = TxId(existingTxid)
+
+    let conflicts = initHashSet[TxId]() + [TxId(existingTxid)]
+
+    # New tx: 1001 sat fee (higher) but vsize 100 bytes
+    # Additional fee = 1001 - 1000 = 1 sat
+    # Required = 1.0 sat/vbyte * 100 vbytes = 100 sats
+    # 1 < 100, so should fail
+    let newTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let result = mp.checkRbfRules(newTx, Satoshi(1001), 100, conflicts)
+    check not result.isOk
+    check "not enough additional fees" in result.error
+
+    cs.close()
+
+  test "accept valid replacement":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Add existing tx with 1000 sat fee
+    var existingTxid: array[32, byte]
+    existingTxid[0] = 0x01
+    var utxoTxid: array[32, byte]
+    utxoTxid[0] = 0xAA
+    let outpoint = OutPoint(txid: TxId(utxoTxid), vout: 0)
+
+    let existingTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(existingTxid)] = MempoolEntry(
+      tx: existingTx, txid: TxId(existingTxid), fee: Satoshi(1000),
+      weight: 400, feeRate: 10.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(1000), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+    mp.spentBy[outpoint] = TxId(existingTxid)
+
+    let conflicts = initHashSet[TxId]() + [TxId(existingTxid)]
+
+    # New tx: 2000 sat fee, 100 vbytes
+    # Additional fee = 2000 - 1000 = 1000 sat
+    # Required = 1.0 * 100 = 100 sats
+    # 1000 >= 100, passes
+    # Fee rate = 2000/100 = 20 sat/vbyte > 10, passes
+    let newTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let result = mp.checkRbfRules(newTx, Satoshi(2000), 100, conflicts)
+    check result.isOk
+    check TxId(existingTxid) in result.value
+
+    cs.close()
+
+  test "reject replacement when evicting too many transactions":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Create parent tx
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0x01
+    var utxoTxid: array[32, byte]
+    utxoTxid[0] = 0xAA
+    let parentOutpoint = OutPoint(txid: TxId(utxoTxid), vout: 0)
+
+    let parentTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: parentOutpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(10000), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 400, feeRate: 1.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+    mp.spentBy[parentOutpoint] = TxId(parentTxid)
+
+    # Create 100 child transactions (total 101 including parent = exceeds limit of 100)
+    for i in 1 .. 100:
+      var childTxid: array[32, byte]
+      childTxid[0] = byte(i + 1)
+      childTxid[1] = byte(i shr 8)
+
+      let childTx = Transaction(
+        version: 1,
+        inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0), scriptSig: @[], sequence: 0)],
+        outputs: @[TxOut(value: Satoshi(100), scriptPubKey: @[])],
+        witnesses: @[],
+        lockTime: 0
+      )
+
+      mp.entries[TxId(childTxid)] = MempoolEntry(
+        tx: childTx, txid: TxId(childTxid), fee: Satoshi(100),
+        weight: 400, feeRate: 1.0, timeAdded: getTime(),
+        height: 100, ancestorFee: Satoshi(200), ancestorWeight: 800,
+        ancestorCount: 2, ancestorSize: 200
+      )
+
+    let conflicts = initHashSet[TxId]() + [TxId(parentTxid)]
+
+    let newTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: parentOutpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    # Total evictions = 1 (parent) + 100 (children) = 101 > 100 limit
+    let result = mp.checkRbfRules(newTx, Satoshi(100000), 100, conflicts)
+    check not result.isOk
+    check "too many potential replacements" in result.error
+
+    cs.close()
+
+  test "reject replacement spending output from conflict":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Add existing tx
+    var existingTxid: array[32, byte]
+    existingTxid[0] = 0x01
+    var utxoTxid: array[32, byte]
+    utxoTxid[0] = 0xAA
+    let outpoint = OutPoint(txid: TxId(utxoTxid), vout: 0)
+
+    let existingTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(existingTxid)] = MempoolEntry(
+      tx: existingTx, txid: TxId(existingTxid), fee: Satoshi(100),
+      weight: 400, feeRate: 1.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+    mp.spentBy[outpoint] = TxId(existingTxid)
+
+    let conflicts = initHashSet[TxId]() + [TxId(existingTxid)]
+
+    # New tx spends from the conflict (not allowed - would be invalid after eviction)
+    let newTx = Transaction(
+      version: 1,
+      inputs: @[
+        TxIn(prevOut: outpoint, scriptSig: @[], sequence: 0),
+        TxIn(prevOut: OutPoint(txid: TxId(existingTxid), vout: 0), scriptSig: @[], sequence: 0)
+      ],
+      outputs: @[TxOut(value: Satoshi(1700), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let result = mp.checkRbfRules(newTx, Satoshi(2000), 150, conflicts)
+    check not result.isOk
+    check "spends output from conflicting" in result.error
+
+    cs.close()
+
+suite "Mempool RBF bip125-replaceable":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "all mempool txs are replaceable with full RBF":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Add a tx with non-signaling sequence (0xFFFFFFFF)
+    var txid1: array[32, byte]
+    txid1[0] = 0x01
+    let tx1 = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],
+        sequence: 0xFFFFFFFF'u32  # Non-signaling
+      )],
+      outputs: @[],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(txid1)] = MempoolEntry(
+      tx: tx1, txid: TxId(txid1), fee: Satoshi(100),
+      weight: 400, feeRate: 1.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+
+    # With Full RBF, even non-signaling txs are replaceable
+    check mp.isBip125Replaceable(TxId(txid1))
+
+    cs.close()
+
+  test "non-existent tx is not replaceable":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    var fakeTxid: array[32, byte]
+    fakeTxid[0] = 0xFF
+    check not mp.isBip125Replaceable(TxId(fakeTxid))
+
+    cs.close()
+
+suite "Mempool RBF conflict removal":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "removeConflicts removes transaction and descendants":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Create parent and child
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0x01
+    var childTxid: array[32, byte]
+    childTxid[0] = 0x02
+
+    let parentTx = Transaction(
+      version: 1,
+      inputs: @[],
+      outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let childTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0), scriptSig: @[], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 400, feeRate: 1.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+    mp.entries[TxId(childTxid)] = MempoolEntry(
+      tx: childTx, txid: TxId(childTxid), fee: Satoshi(100),
+      weight: 400, feeRate: 1.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(200), ancestorWeight: 800,
+      ancestorCount: 2, ancestorSize: 200
+    )
+
+    check mp.count == 2
+
+    # Get all conflicts (parent + child)
+    let conflicts = initHashSet[TxId]() + [TxId(parentTxid)]
+    let allConflicts = mp.getAllConflictsWithDescendants(conflicts)
+
+    check len(allConflicts) == 2
+    check TxId(parentTxid) in allConflicts
+    check TxId(childTxid) in allConflicts
+
+    # Remove them
+    mp.removeConflicts(allConflicts)
+
+    check mp.count == 0
+
+    cs.close()
+
+  test "calculateConflictFees sums correctly":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Add 3 transactions
+    for i in 1 .. 3:
+      var txid: array[32, byte]
+      txid[0] = byte(i)
+      let tx = Transaction(version: 1, inputs: @[], outputs: @[], witnesses: @[], lockTime: 0)
+
+      mp.entries[TxId(txid)] = MempoolEntry(
+        tx: tx, txid: TxId(txid), fee: Satoshi(i * 100),  # 100, 200, 300 sats
+        weight: i * 400, feeRate: 1.0, timeAdded: getTime(),
+        height: 100, ancestorFee: Satoshi(i * 100), ancestorWeight: i * 400,
+        ancestorCount: 1, ancestorSize: i * 100
+      )
+
+    var conflicts = initHashSet[TxId]()
+    for i in 1 .. 3:
+      var txid: array[32, byte]
+      txid[0] = byte(i)
+      conflicts.incl(TxId(txid))
+
+    let (totalFee, totalVsize) = mp.calculateConflictFees(conflicts)
+    check int64(totalFee) == 600  # 100 + 200 + 300
+    check totalVsize == 600  # 100 + 200 + 300 (each weight/4 rounded up)
+
+    cs.close()
+
 when isMainModule:
   # Run all tests
   discard
