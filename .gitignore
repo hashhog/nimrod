@@ -38,3 +38,5 @@ tests/debug_sigop
 # Storage test artifacts
 src/storage/chainstate
 src/storage/db
+
+.claude/skills/

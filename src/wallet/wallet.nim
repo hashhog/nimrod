@@ -9,9 +9,11 @@ import ../consensus/params
 import ../storage/chainstate
 import ./coinselection
 import ./crypter
+import ./db_sqlite
 
 export address.AddressType, address.Address
 export coinselection
+export db_sqlite.WalletDb, db_sqlite.StoredKey, db_sqlite.StoredUtxo
 
 type
   WalletError* = object of CatchableError
@@ -81,6 +83,9 @@ const HARDENED* = 0x80000000'u32
 
 # Coinbase maturity - outputs can only be spent after this many confirmations
 const CoinbaseMaturity* = 100
+
+# Forward declarations
+proc addAccount*(wallet: var Wallet, purpose: uint32 = 84, accountIndex: uint32 = 0, gap: int = 20)
 
 # =============================================================================
 # BIP39: Mnemonic Generation and Seed Derivation
@@ -373,6 +378,77 @@ proc newWalletFromSeed*(seed: array[64, byte],
   result.utxos = initTable[OutPoint, WalletUtxo]()
   result.params = params
   result.mainnet = params.network == Mainnet
+
+proc newWallet*(mnemonic: string, params: ConsensusParams,
+                mainnet: bool, chainState: ChainState): Wallet =
+  ## Create a new wallet from mnemonic with explicit parameters
+  if not validateMnemonic(mnemonic):
+    raise newException(WalletError, "invalid mnemonic")
+
+  new(result)
+  result.seed = mnemonicToSeed(mnemonic)
+  result.masterKey = masterKeyFromSeed(result.seed)
+  result.accounts = @[]
+  result.utxos = initTable[OutPoint, WalletUtxo]()
+  result.params = params
+  result.mainnet = mainnet
+  result.chainState = chainState
+  result.labels = initTable[string, string]()
+
+  # Create default BIP84 (native segwit) account
+  result.addAccount(84, 0, 20)
+
+proc newWalletFromDb*(db: WalletDb, params: ConsensusParams,
+                       mainnet: bool, chainState: ChainState): Wallet =
+  ## Load a wallet from an existing database
+  ## The wallet is reconstructed from stored keys and UTXOs
+  new(result)
+  result.accounts = @[]
+  result.utxos = initTable[OutPoint, WalletUtxo]()
+  result.params = params
+  result.mainnet = mainnet
+  result.chainState = chainState
+  result.labels = initTable[string, string]()
+
+  # Load encryption info if present
+  let encInfo = db.getEncryption()
+  if encInfo.isSome:
+    let (encSeed, salt, rounds) = encInfo.get()
+    result.isEncrypted = true
+    result.isLocked = true
+    result.encryptedSeed = encSeed
+    result.encryptionSalt = salt
+    result.encryptionRounds = rounds
+  else:
+    result.isEncrypted = false
+    result.isLocked = false
+
+  # Load UTXOs
+  for stored in db.getUnspentUtxos():
+    var outpoint: OutPoint
+    outpoint.txid = TxId(stored.txid)
+    outpoint.vout = stored.vout
+
+    var output: TxOut
+    output.value = Satoshi(stored.value)
+    output.scriptPubKey = stored.scriptPubKey
+
+    let wutxo = WalletUtxo(
+      outpoint: outpoint,
+      output: output,
+      height: stored.height,
+      keyPath: stored.keyPath,
+      isInternal: stored.isInternal,
+      isCoinbase: stored.isCoinbase
+    )
+    result.utxos[outpoint] = wutxo
+
+  # Load labels
+  for (address, label) in db.getAllLabels():
+    result.labels[address] = label
+
+  # Note: Keys are not loaded - they will be re-derived when needed
+  # after the wallet is unlocked (for encrypted wallets) or on first use
 
 proc derivePath(wallet: Wallet, purpose, coinType, account, chain, index: uint32): DerivedKey =
   ## Derive a key at the specified BIP44/49/84/86 path

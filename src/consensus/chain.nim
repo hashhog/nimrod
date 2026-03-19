@@ -279,3 +279,299 @@ proc isBlockOnCheckpointChain*(state: CheckpointState,
         return false
 
   true
+
+# ============================================================================
+# Chain Management (invalidateblock / reconsiderblock / preciousblock)
+# ============================================================================
+# Reference: Bitcoin Core validation.cpp InvalidateBlock, ReconsiderBlock, PreciousBlock
+
+import std/deques
+import ../storage/chainstate
+
+type
+  ChainManagementError* = enum
+    cmeOk = "ok"
+    cmeBlockNotFound = "block not found"
+    cmeCannotInvalidateGenesis = "cannot invalidate genesis block"
+    cmeUndoDataMissing = "undo data missing for disconnect"
+    cmeDisconnectFailed = "failed to disconnect block"
+    cmeReconnectFailed = "failed to reconnect block"
+
+  ChainManagementResult* = object
+    case isOk*: bool
+    of true:
+      discard
+    of false:
+      error*: ChainManagementError
+
+proc chainMgmtOk*(): ChainManagementResult =
+  ChainManagementResult(isOk: true)
+
+proc chainMgmtErr*(e: ChainManagementError): ChainManagementResult =
+  ChainManagementResult(isOk: false, error: e)
+
+proc setBlockFailureFlags*(
+  cs: var ChainState,
+  invalidBlock: BlockIndex
+) =
+  ## Mark all descendants of invalidBlock as BLOCK_FAILED_CHILD
+  ## Reference: Bitcoin Core's SetBlockFailureFlags
+  ##
+  ## Uses BFS to find all descendants and mark them
+
+  var queue = initDeque[BlockHash]()
+  var visited = initTable[string, bool]()
+
+  # Start with all blocks at height > invalidBlock.height
+  # We need to check if they descend from invalidBlock
+  for h in (invalidBlock.height + 1) .. cs.bestHeight:
+    let hashOpt = cs.db.getBlockHashByHeight(h)
+    if hashOpt.isSome:
+      queue.addLast(hashOpt.get())
+
+  while queue.len > 0:
+    let currentHash = queue.popFirst()
+    let hashStr = $array[32, byte](currentHash)
+
+    if hashStr in visited:
+      continue
+    visited[hashStr] = true
+
+    let idxOpt = cs.db.getBlockIndex(currentHash)
+    if idxOpt.isNone:
+      continue
+
+    var idx = idxOpt.get()
+
+    # Check if this block descends from invalidBlock
+    # A block descends from invalidBlock if:
+    # 1. Its prevHash is invalidBlock's hash, OR
+    # 2. Its prevHash is a descendant of invalidBlock
+    var isDescendant = false
+    if idx.prevHash == invalidBlock.hash:
+      isDescendant = true
+    else:
+      # Check if prevHash is already marked as failed
+      let prevIdxOpt = cs.db.getBlockIndex(idx.prevHash)
+      if prevIdxOpt.isSome:
+        let prevIdx = prevIdxOpt.get()
+        if prevIdx.failureFlags.hasFlag(BLOCK_FAILED_VALID) or
+           prevIdx.failureFlags.hasFlag(BLOCK_FAILED_CHILD):
+          isDescendant = true
+
+    if isDescendant:
+      # Mark as BLOCK_FAILED_CHILD
+      idx.failureFlags.setFlag(BLOCK_FAILED_CHILD)
+      cs.db.putBlockIndex(idx)
+
+proc resetBlockFailureFlags*(
+  cs: var ChainState,
+  pindex: BlockIndex
+) =
+  ## Clear failure flags from a block and all its ancestors/descendants
+  ## Reference: Bitcoin Core's ResetBlockFailureFlags
+  ##
+  ## Note: This function directly clears the flag from the block itself,
+  ## plus walks ancestors and descendants to clear their flags too.
+
+  let targetHeight = pindex.height
+
+  # First, always clear the flags from the target block itself
+  var targetIdx = pindex
+  if targetIdx.failureFlags.isFailed():
+    targetIdx.failureFlags.clearFlag(BLOCK_FAILED_VALID)
+    targetIdx.failureFlags.clearFlag(BLOCK_FAILED_CHILD)
+    cs.db.putBlockIndex(targetIdx)
+
+  # Walk ancestors (blocks that pindex descends from) and clear their flags
+  var current = pindex
+  while current.height > 0:
+    let prevOpt = cs.db.getBlockIndex(current.prevHash)
+    if prevOpt.isNone:
+      break
+    var ancestor = prevOpt.get()
+    if ancestor.failureFlags.isFailed():
+      ancestor.failureFlags.clearFlag(BLOCK_FAILED_VALID)
+      ancestor.failureFlags.clearFlag(BLOCK_FAILED_CHILD)
+      cs.db.putBlockIndex(ancestor)
+    current = ancestor
+
+  # Walk descendants (blocks at greater heights that descend from pindex)
+  # We need to iterate through all blocks at heights > pindex.height and check
+  # if they descend from pindex
+  #
+  # Note: In the current implementation, we only track blocks on the main chain
+  # via getBlockHashByHeight. Blocks not on the main chain would need separate
+  # tracking. For simplicity, we iterate by hash from the active chain.
+  for h in (targetHeight + 1) .. cs.bestHeight:
+    let hashOpt = cs.db.getBlockHashByHeight(h)
+    if hashOpt.isNone:
+      continue
+
+    let idxOpt = cs.db.getBlockIndex(hashOpt.get())
+    if idxOpt.isNone:
+      continue
+
+    var idx = idxOpt.get()
+
+    # Skip blocks without failure flags
+    if not idx.failureFlags.isFailed():
+      continue
+
+    # Check if this block descends from pindex
+    var desc = idx
+    while desc.height > targetHeight:
+      let prevOpt = cs.db.getBlockIndex(desc.prevHash)
+      if prevOpt.isNone:
+        break
+      desc = prevOpt.get()
+
+    if desc.hash == pindex.hash:
+      idx.failureFlags.clearFlag(BLOCK_FAILED_VALID)
+      idx.failureFlags.clearFlag(BLOCK_FAILED_CHILD)
+      cs.db.putBlockIndex(idx)
+
+proc invalidateBlock*(
+  cs: var ChainState,
+  blockHash: BlockHash
+): ChainManagementResult =
+  ## Mark a block and all its descendants as invalid
+  ## If the block is on the active chain, disconnect it and all descendants
+  ## Reference: Bitcoin Core's InvalidateBlock
+  ##
+  ## Returns error if:
+  ## - Block is the genesis block (height 0)
+  ## - Block not found
+  ## - Undo data missing for active chain blocks
+
+  # Look up the block index
+  let idxOpt = cs.db.getBlockIndex(blockHash)
+  if idxOpt.isNone:
+    return chainMgmtErr(cmeBlockNotFound)
+
+  var idx = idxOpt.get()
+
+  # Cannot invalidate genesis block
+  if idx.height == 0:
+    return chainMgmtErr(cmeCannotInvalidateGenesis)
+
+  # Check if this block is on the active chain
+  let activeHashAtHeight = cs.db.getBlockHashByHeight(idx.height)
+  let isOnActiveChain = activeHashAtHeight.isSome and activeHashAtHeight.get() == blockHash
+
+  if isOnActiveChain:
+    # Disconnect blocks from tip back to (and including) this block
+    while cs.bestHeight >= idx.height:
+      let tipHashOpt = cs.db.getBlockHashByHeight(cs.bestHeight)
+      if tipHashOpt.isNone:
+        break
+
+      let tipBlkOpt = cs.db.getBlock(tipHashOpt.get())
+      if tipBlkOpt.isNone:
+        return chainMgmtErr(cmeUndoDataMissing)
+
+      let tipBlk = tipBlkOpt.get()
+      let disconnectResult = cs.disconnectBlock(tipBlk)
+      if not disconnectResult.isOk:
+        return chainMgmtErr(cmeDisconnectFailed)
+
+      # Mark disconnected block as BLOCK_FAILED_VALID
+      var tipIdx = cs.db.getBlockIndex(tipHashOpt.get()).get()
+      tipIdx.failureFlags.setFlag(BLOCK_FAILED_VALID)
+      cs.db.putBlockIndex(tipIdx)
+
+  else:
+    # Block is not on active chain, just mark it as invalid
+    idx.failureFlags.setFlag(BLOCK_FAILED_VALID)
+    cs.db.putBlockIndex(idx)
+
+  # Mark all descendants as BLOCK_FAILED_CHILD
+  # Re-fetch the index in case it was updated during disconnection
+  let updatedIdxOpt = cs.db.getBlockIndex(blockHash)
+  if updatedIdxOpt.isSome:
+    cs.setBlockFailureFlags(updatedIdxOpt.get())
+
+  chainMgmtOk()
+
+proc reconsiderBlock*(
+  cs: var ChainState,
+  blockHash: BlockHash
+): ChainManagementResult =
+  ## Remove invalidity status from a block and all related blocks
+  ## This undoes the effect of invalidateblock
+  ## Reference: Bitcoin Core's ReconsiderBlock
+  ##
+  ## Note: This does NOT automatically reconnect the block to the chain.
+  ## Use activateBestChain or similar after reconsiderBlock to potentially
+  ## switch to the reconsidered chain if it has more work.
+
+  # Look up the block index
+  let idxOpt = cs.db.getBlockIndex(blockHash)
+  if idxOpt.isNone:
+    return chainMgmtErr(cmeBlockNotFound)
+
+  let idx = idxOpt.get()
+
+  # Clear failure flags from this block and all ancestors/descendants
+  cs.resetBlockFailureFlags(idx)
+
+  chainMgmtOk()
+
+proc preciousBlock*(
+  cs: var ChainState,
+  blockHash: BlockHash
+): ChainManagementResult =
+  ## Mark a block as "precious" - prefer this chain in case of equal work
+  ## Reference: Bitcoin Core's PreciousBlock
+  ##
+  ## Precious blocks get a lower (more negative) sequenceId, which causes
+  ## them to be preferred over other blocks with equal chainwork.
+  ##
+  ## This is used when a node operator wants to manually prefer one chain
+  ## over another without invalidating the competing chain.
+
+  # Look up the block index
+  let idxOpt = cs.db.getBlockIndex(blockHash)
+  if idxOpt.isNone:
+    return chainMgmtErr(cmeBlockNotFound)
+
+  var idx = idxOpt.get()
+
+  # Check if this block has at least as much work as the current tip
+  let tipWorkComparison = compareWork256(idx.totalWork, cs.totalWork)
+  if tipWorkComparison < 0:
+    # Block has less work than current tip, nothing to do
+    return chainMgmtOk()
+
+  # Assign a negative sequence ID to mark as precious
+  # Lower (more negative) values are more precious
+  # We use a simple decrementing counter approach
+  var minSeqId: int32 = 0
+  for h in 0'i32 .. cs.bestHeight:
+    let hashOpt = cs.db.getBlockHashByHeight(h)
+    if hashOpt.isSome:
+      let existingIdx = cs.db.getBlockIndex(hashOpt.get())
+      if existingIdx.isSome and existingIdx.get().sequenceId < minSeqId:
+        minSeqId = existingIdx.get().sequenceId
+
+  # Set this block's sequence ID to one less than the minimum
+  idx.sequenceId = minSeqId - 1
+  cs.db.putBlockIndex(idx)
+
+  chainMgmtOk()
+
+proc getBlockFailureStatus*(cs: ChainState, blockHash: BlockHash): Option[BlockFailureFlags] =
+  ## Get the failure flags for a block
+  let idxOpt = cs.db.getBlockIndex(blockHash)
+  if idxOpt.isSome:
+    some(idxOpt.get().failureFlags)
+  else:
+    none(BlockFailureFlags)
+
+proc isBlockInvalid*(cs: ChainState, blockHash: BlockHash): bool =
+  ## Check if a block is marked as invalid
+  let flagsOpt = cs.getBlockFailureStatus(blockHash)
+  if flagsOpt.isSome:
+    flagsOpt.get().isFailed()
+  else:
+    false

@@ -10,6 +10,7 @@ import chronicles
 import ../primitives/[types, serialize]
 import ../consensus/params
 import ./messages
+import ./bip324
 
 export chronicles
 
@@ -20,6 +21,9 @@ const
   MinProtocolVersion* = 70015'u32  # Minimum for witness support
   ScorePreHandshakeMessage* = 10'u32  # Misbehavior for pre-handshake messages
   ScoreDuplicateVersion* = 1'u32      # Misbehavior for duplicate version
+
+  # BIP-324 V2 transport constants
+  V2HandshakeTimeoutSec* = 30  # Timeout for V2 key exchange
 
   # Stale peer detection constants (Bitcoin Core net_processing.cpp)
   ChainSyncTimeoutSec* = 20 * 60      # 20 minutes - timeout for peer to catch up to our chain
@@ -43,6 +47,10 @@ type
   PeerDirection* = enum
     pdInbound
     pdOutbound
+
+  TransportProtocol* = enum
+    tpV1         # Legacy unencrypted transport
+    tpV2         # BIP-324 encrypted transport
 
   PeerCallback* = proc(peer: Peer, msg: P2PMessage): Future[void] {.async.}
 
@@ -77,6 +85,7 @@ type
     feeFilterRate*: uint64
     sendHeaders*: bool
     wtxidRelay*: bool
+    wantsAddrV2*: bool           # Peer signaled ADDRv2 support (BIP155)
     # Handshake state tracking (Bitcoin Core: pfrom.nVersion != 0, fSuccessfullyConnected)
     handshakeComplete*: bool     # True after both VERSION and VERACK exchanged
     versionReceived*: bool       # True after receiving VERSION
@@ -324,6 +333,11 @@ proc sendSendCmpct*(peer: Peer, announce: bool = false, version: uint64 = 2) {.a
 proc sendFeeFilter*(peer: Peer, feeRate: uint64) {.async.} =
   await peer.sendMessage(newFeeFilter(feeRate))
 
+proc sendSendAddrV2*(peer: Peer) {.async.} =
+  ## Signal ADDRv2 support to peer (BIP155)
+  ## Must be sent between VERSION and VERACK
+  await peer.sendMessage(newSendAddrV2())
+
 proc performHandshake*(peer: Peer, ourHeight: int32,
                        checkSelfConnect: SelfConnectChecker = nil) {.async.} =
   ## Perform version handshake with peer
@@ -369,19 +383,48 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     info "received version", peer = $peer, version = peer.version,
          userAgent = peer.userAgent, height = peer.startHeight
 
+    # BIP155: Send sendaddrv2 BEFORE verack (protocol version 70016+)
+    if peer.version >= 70016:
+      await peer.sendSendAddrV2()
+      await peer.sendWtxidRelay()
+
     # Send verack
     await peer.sendVerack()
 
-    # Wait for their verack
-    let recvVerackFut = peer.readMessage()
-    if not await recvVerackFut.withTimeout(ctimer.seconds(HandshakeTimeoutSec)):
-      raise newException(PeerError, "handshake timeout waiting for verack")
+    # Wait for their verack (consuming pre-verack feature messages)
+    # Remote peer may send wtxidrelay, sendaddrv2, sendcmpct, etc. before verack
+    block waitForVerack:
+      for attempt in 0 ..< 20:  # Safety limit to avoid infinite loop
+        let recvFut = peer.readMessage()
+        if not await recvFut.withTimeout(ctimer.seconds(HandshakeTimeoutSec)):
+          raise newException(PeerError, "handshake timeout waiting for verack")
 
-    let verackMsg = recvVerackFut.value()
-    if verackMsg.kind != mkVerack:
-      raise newException(PeerError, "expected verack message")
+        let msg = recvFut.value()
+        case msg.kind
+        of mkVerack:
+          peer.verackReceived = true
+          break waitForVerack
+        of mkWtxidRelay:
+          peer.wtxidRelay = true
+          trace "peer supports wtxidrelay (pre-verack)", peer = $peer
+        of mkSendAddrV2:
+          peer.wantsAddrV2 = true
+          trace "peer supports addrv2 (pre-verack)", peer = $peer
+        of mkSendCmpct:
+          trace "peer supports compact blocks (pre-verack)", peer = $peer
+        of mkSendHeaders:
+          peer.sendHeaders = true
+          trace "peer prefers headers (pre-verack)", peer = $peer
+        of mkFeeFilter:
+          peer.feeFilterRate = msg.feeRate
+          trace "peer feefilter (pre-verack)", peer = $peer
+        of mkSendTxRcncl:
+          trace "peer supports tx reconciliation (pre-verack)", peer = $peer
+        else:
+          raise newException(PeerError, "unexpected message during handshake: " & $msg.kind)
 
-    peer.verackReceived = true
+    if not peer.verackReceived:
+      raise newException(PeerError, "did not receive verack during handshake")
 
   else:
     # Inbound: wait for version first
@@ -417,24 +460,50 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     # Send our version
     await peer.sendVersion(ourHeight)
 
+    # BIP155: Send sendaddrv2 BEFORE verack (protocol version 70016+)
+    if peer.version >= 70016:
+      await peer.sendSendAddrV2()
+      await peer.sendWtxidRelay()
+
     # Send verack
     await peer.sendVerack()
 
-    # Wait for their verack
-    let recvVerackFut = peer.readMessage()
-    if not await recvVerackFut.withTimeout(ctimer.seconds(HandshakeTimeoutSec)):
-      raise newException(PeerError, "handshake timeout waiting for verack")
+    # Wait for their verack (consuming pre-verack feature messages)
+    block waitForVerackInbound:
+      for attempt in 0 ..< 20:
+        let recvFut = peer.readMessage()
+        if not await recvFut.withTimeout(ctimer.seconds(HandshakeTimeoutSec)):
+          raise newException(PeerError, "handshake timeout waiting for verack")
 
-    let verackMsg = recvVerackFut.value()
-    if verackMsg.kind != mkVerack:
-      raise newException(PeerError, "expected verack message")
+        let msg = recvFut.value()
+        case msg.kind
+        of mkVerack:
+          peer.verackReceived = true
+          break waitForVerackInbound
+        of mkWtxidRelay:
+          peer.wtxidRelay = true
+          trace "peer supports wtxidrelay (pre-verack)", peer = $peer
+        of mkSendAddrV2:
+          peer.wantsAddrV2 = true
+          trace "peer supports addrv2 (pre-verack)", peer = $peer
+        of mkSendCmpct:
+          trace "peer supports compact blocks (pre-verack)", peer = $peer
+        of mkSendHeaders:
+          peer.sendHeaders = true
+          trace "peer prefers headers (pre-verack)", peer = $peer
+        of mkFeeFilter:
+          peer.feeFilterRate = msg.feeRate
+          trace "peer feefilter (pre-verack)", peer = $peer
+        of mkSendTxRcncl:
+          trace "peer supports tx reconciliation (pre-verack)", peer = $peer
+        else:
+          raise newException(PeerError, "unexpected message during handshake: " & $msg.kind)
 
-    peer.verackReceived = true
+    if not peer.verackReceived:
+      raise newException(PeerError, "did not receive verack during handshake")
 
-  # Send feature negotiation messages
-  # These should be sent after verack but before other messages
-  if peer.version >= 70016:
-    await peer.sendWtxidRelay()
+  # Send feature negotiation messages (after verack)
+  # Note: sendaddrv2 and wtxidrelay are already sent before verack
   await peer.sendSendHeaders()
   await peer.sendSendCmpct()
 
@@ -480,6 +549,9 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
 
   of mkAddr:
     trace "received addr", peer = $peer, count = msg.addresses.len
+
+  of mkAddrV2:
+    trace "received addrv2", peer = $peer, count = msg.addressesV2.len
 
   of mkInv:
     trace "received inv", peer = $peer, count = msg.invItems.len
@@ -529,7 +601,35 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     trace "peer supports wtxidrelay", peer = $peer
 
   of mkSendAddrV2:
+    peer.wantsAddrV2 = true
     trace "peer supports addrv2", peer = $peer
+
+  of mkCmpctBlock:
+    trace "received compact block", peer = $peer
+
+  of mkGetBlockTxn:
+    discard  # TODO: respond with blocktxn
+
+  of mkBlockTxn:
+    trace "received blocktxn", peer = $peer
+
+  of mkSendPackages:
+    trace "peer supports packages", peer = $peer
+
+  of mkSendTxRcncl:
+    trace "peer supports tx reconciliation", peer = $peer
+
+  of mkReqRecon:
+    discard  # TODO: handle reconciliation request
+
+  of mkSketch:
+    discard  # TODO: handle sketch
+
+  of mkReconcilDiff:
+    discard  # TODO: handle reconciliation diff
+
+  of mkReqSketchExt:
+    discard  # TODO: handle sketch extension request
 
 # Pre-handshake message validation types and forward declarations
 type

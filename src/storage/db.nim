@@ -191,7 +191,7 @@ proc defaultDbConfig*(): DatabaseConfig =
     writeBufferSize: WriteBufferSize,
     maxWriteBuffers: MaxWriteBufferNumber,
     bloomFilterBits: BloomFilterBits,
-    useCompression: true,
+    useCompression: false,
     syncWrites: false
   )
 
@@ -239,13 +239,13 @@ proc createCfOptions(config: DatabaseConfig, cf: ColumnFamily,
     if config.useCompression:
       rocksdb_options_set_compression(result.opts, cint(ord(ctLz4)))
   of cfBlocks:
-    # Snappy for blocks - good ratio for large data
+    # LZ4 for blocks - fast compression
     if config.useCompression:
-      rocksdb_options_set_compression(result.opts, cint(ord(ctSnappy)))
+      rocksdb_options_set_compression(result.opts, cint(ord(ctLz4)))
   else:
-    # Snappy for other CFs
+    # LZ4 for other CFs
     if config.useCompression:
-      rocksdb_options_set_compression(result.opts, cint(ord(ctSnappy)))
+      rocksdb_options_set_compression(result.opts, cint(ord(ctLz4)))
 
   # Block-based table options with bloom filter and cache
   result.tableOpts = rocksdb_block_based_options_create()

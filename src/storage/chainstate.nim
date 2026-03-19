@@ -22,6 +22,35 @@ type
     bsValidated     ## Block fully validated
     bsInvalid       ## Block validation failed
 
+  ## Block failure flags for invalidateblock/reconsiderblock
+  ## These are stored separately from BlockStatus to allow combinations
+  BlockFailureFlags* = distinct uint8
+
+const
+  BLOCK_FAILED_VALID* = BlockFailureFlags(32)    ## Block failed validation (invalidateblock)
+  BLOCK_FAILED_CHILD* = BlockFailureFlags(64)    ## Descendant of a failed block
+  BLOCK_NO_FAILURE* = BlockFailureFlags(0)       ## No failure flags set
+
+proc `or`*(a, b: BlockFailureFlags): BlockFailureFlags {.borrow.}
+proc `and`*(a, b: BlockFailureFlags): BlockFailureFlags {.borrow.}
+proc `not`*(a: BlockFailureFlags): BlockFailureFlags {.borrow.}
+proc `==`*(a, b: BlockFailureFlags): bool {.borrow.}
+proc `!=`*(a, b: BlockFailureFlags): bool = not (a == b)
+
+proc hasFlag*(flags: BlockFailureFlags, flag: BlockFailureFlags): bool =
+  (uint8(flags) and uint8(flag)) != 0
+
+proc setFlag*(flags: var BlockFailureFlags, flag: BlockFailureFlags) =
+  flags = BlockFailureFlags(uint8(flags) or uint8(flag))
+
+proc clearFlag*(flags: var BlockFailureFlags, flag: BlockFailureFlags) =
+  flags = BlockFailureFlags(uint8(flags) and (not uint8(flag)))
+
+proc isFailed*(flags: BlockFailureFlags): bool =
+  ## Check if block has any failure flag set
+  uint8(flags) != 0
+
+type
   BlockIndex* = object
     hash*: BlockHash
     height*: int32
@@ -30,6 +59,8 @@ type
     header*: BlockHeader
     totalWork*: array[32, byte]  ## Cumulative chain work
     undoPos*: FlatFilePos        ## Position of undo data in rev*.dat files
+    failureFlags*: BlockFailureFlags  ## Failure flags for invalidateblock/reconsiderblock
+    sequenceId*: int32           ## For preciousblock: lower = more precious
 
   UtxoEntry* = object
     output*: TxOut
@@ -109,6 +140,9 @@ proc serializeBlockIndex(idx: BlockIndex): seq[byte] =
   # Serialize undo file position
   w.writeInt32LE(idx.undoPos.fileNum)
   w.writeInt32LE(idx.undoPos.pos)
+  # Serialize failure flags and sequence ID (new in phase 51)
+  w.writeUint8(uint8(idx.failureFlags))
+  w.writeInt32LE(idx.sequenceId)
   w.data
 
 proc deserializeBlockIndex(data: seq[byte]): BlockIndex =
@@ -126,6 +160,13 @@ proc deserializeBlockIndex(data: seq[byte]): BlockIndex =
   else:
     # Legacy format without undo position
     result.undoPos = FlatFilePos(fileNum: -1, pos: -1)
+  # Deserialize failure flags and sequence ID (with backward compatibility)
+  if r.remaining() >= 5:
+    result.failureFlags = BlockFailureFlags(r.readUint8())
+    result.sequenceId = r.readInt32LE()
+  else:
+    result.failureFlags = BLOCK_NO_FAILURE
+    result.sequenceId = 0
 
 # Serialization for UtxoEntry
 
