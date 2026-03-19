@@ -48,6 +48,7 @@ type
     headerChain*: HeaderChain
     peerManager*: PeerManager
     chainDb*: ChainDb
+    chainState*: ChainState  ## Full chain state for block connection
     params*: ConsensusParams
     syncPeer*: Peer
     # Block download state
@@ -390,12 +391,14 @@ proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
 # =============================================================================
 
 proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
-                     params: ConsensusParams): SyncManager =
+                     params: ConsensusParams,
+                     chainState: ChainState = nil): SyncManager =
   result = SyncManager(
     state: ssIdle,
     headerChain: initHeaderChain(),
     peerManager: pm,
     chainDb: chainDb,
+    chainState: chainState,
     params: params,
     syncPeer: nil,
     blockQueue: initDeque[BlockHash](),
@@ -889,7 +892,13 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
     return false
 
   # Apply block to chainstate
-  sm.chainDb.applyBlock(blk, expectedHeight)
+  if sm.chainState != nil:
+    let connectResult = sm.chainState.connectBlock(blk, expectedHeight)
+    if not connectResult.isOk:
+      warn "failed to connect block to chainstate", error = $connectResult.error
+      return false
+  else:
+    sm.chainDb.applyBlock(blk, expectedHeight)
 
   # Update chain tip (NOT header tip - they're tracked separately)
   sm.chainTip = hash
@@ -1203,7 +1212,14 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
       continue
 
     # Apply block to chainstate
-    sm.chainDb.applyBlock(blk, height)
+    if sm.chainState != nil:
+      let connectResult = sm.chainState.connectBlock(blk, height)
+      if not connectResult.isOk:
+        warn "failed to connect block during IBD", height = height, error = $connectResult.error
+        dl.receivedBlocks.del(height)
+        continue
+    else:
+      sm.chainDb.applyBlock(blk, height)
 
     # Update chain tip
     let headerBytes = serialize(blk.header)
