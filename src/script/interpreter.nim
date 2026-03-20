@@ -45,6 +45,7 @@ type
     seSigPushOnly = "scriptSig must be push-only"
     seMinimalIf = "OP_IF/NOTIF argument must be minimal"
     seTapscriptMinimalIf = "tapscript OP_IF/NOTIF argument must be exactly 0 or 1"
+    seDiscourageUpgradableNops = "discourage upgradable NOPs"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -63,6 +64,7 @@ type
     sfSigPushOnly      # scriptSig must be push-only (policy only)
     sfWitnessPubkeyType  # BIP141: witness pubkeys must be compressed
     sfMinimalIf        # Require minimal encoding for OP_IF/NOTIF (policy for witness v0)
+    sfDiscourageUpgradableNops  # Discourage use of unused NOPs
 
   SigVersion* = enum
     sigBase = 0        # Legacy scripts
@@ -792,6 +794,31 @@ type
     tapleafHash*: array[32, byte]
     codesepPos*: uint32
 
+# CheckMinimalPush: verify that a push opcode uses the minimal encoding
+proc checkMinimalPush(data: seq[byte], opcode: uint8): bool =
+  ## Returns true if the push is minimally encoded
+  let dataLen = data.len
+  if dataLen == 0:
+    # Could have used OP_0
+    return opcode == OP_0
+  elif dataLen == 1 and data[0] >= 1 and data[0] <= 16:
+    # Could have used OP_1 .. OP_16
+    return opcode == OP_1 + (data[0] - 1)
+  elif dataLen == 1 and data[0] == 0x81:
+    # Could have used OP_1NEGATE
+    return opcode == OP_1NEGATE
+  elif dataLen <= 75:
+    # Could have used a direct push (opcode == dataLen)
+    return opcode == uint8(dataLen)
+  elif dataLen <= 255:
+    # Must use OP_PUSHDATA1
+    return opcode == OP_PUSHDATA1
+  elif dataLen <= 65535:
+    # Must use OP_PUSHDATA2
+    return opcode == OP_PUSHDATA2
+  else:
+    true
+
 # Core evaluation function
 proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
            ctx: SigCheckContext): ScriptError =
@@ -827,7 +854,12 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       if executing:
         if pushLen > MaxScriptElementSize:
           return sePushSize
-        interp.push(script[pc ..< pc + pushLen].toSeq)
+        let pushData = script[pc ..< pc + pushLen].toSeq
+        # MINIMALDATA: check that pushes use the smallest possible opcode
+        if sfMinimalData in interp.flags:
+          if not checkMinimalPush(pushData, opcode):
+            return seMinimalData
+        interp.push(pushData)
       pc += pushLen
       continue
 
@@ -841,10 +873,12 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       if executing:
         if pushLen > MaxScriptElementSize:
           return sePushSize
+        let pushData = script[pc ..< pc + pushLen].toSeq
         # Check minimal push encoding
-        if sfMinimalData in interp.flags and pushLen <= 75:
-          return seMinimalData
-        interp.push(script[pc ..< pc + pushLen].toSeq)
+        if sfMinimalData in interp.flags:
+          if not checkMinimalPush(pushData, OP_PUSHDATA1):
+            return seMinimalData
+        interp.push(pushData)
       pc += pushLen
       continue
 
@@ -858,9 +892,11 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       if executing:
         if pushLen > MaxScriptElementSize:
           return sePushSize
-        if sfMinimalData in interp.flags and pushLen <= 255:
-          return seMinimalData
-        interp.push(script[pc ..< pc + pushLen].toSeq)
+        let pushData = script[pc ..< pc + pushLen].toSeq
+        if sfMinimalData in interp.flags:
+          if not checkMinimalPush(pushData, OP_PUSHDATA2):
+            return seMinimalData
+        interp.push(pushData)
       pc += pushLen
       continue
 
@@ -875,9 +911,11 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       if executing:
         if pushLen > MaxScriptElementSize:
           return sePushSize
-        if sfMinimalData in interp.flags and pushLen <= 65535:
-          return seMinimalData
-        interp.push(script[pc ..< pc + pushLen].toSeq)
+        let pushData = script[pc ..< pc + pushLen].toSeq
+        if sfMinimalData in interp.flags:
+          if not checkMinimalPush(pushData, OP_PUSHDATA4):
+            return seMinimalData
+        interp.push(pushData)
       pc += pushLen
       continue
 
@@ -917,7 +955,8 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
     of OP_NOP1, OP_NOP4..OP_NOP10:
       # NOP for soft-fork upgrades
-      discard
+      if sfDiscourageUpgradableNops in interp.flags:
+        return seDiscourageUpgradableNops
 
     of OP_IF, OP_NOTIF:
       if interp.stack.len < 1:
@@ -1530,7 +1569,8 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
     of OP_CHECKLOCKTIMEVERIFY:
       if sfCheckLockTimeVerify notin interp.flags:
         # Treat as NOP if flag not set
-        discard
+        if sfDiscourageUpgradableNops in interp.flags:
+          return seDiscourageUpgradableNops
       else:
         if interp.stack.len < 1:
           return seInvalidStack
@@ -1558,7 +1598,8 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
     of OP_CHECKSEQUENCEVERIFY:
       if sfCheckSequenceVerify notin interp.flags:
         # Treat as NOP if flag not set
-        discard
+        if sfDiscourageUpgradableNops in interp.flags:
+          return seDiscourageUpgradableNops
       else:
         if interp.stack.len < 1:
           return seInvalidStack
@@ -1689,6 +1730,11 @@ proc verifyScript*(
     codesepPos: 0xFFFFFFFF'u32
   )
 
+  # SIG_PUSHONLY: scriptSig must be push-only when flag is set
+  if sfSigPushOnly in flags:
+    if not isPushOnly(scriptSig):
+      return false
+
   # Execute scriptSig
   if scriptSig.len > 0:
     let err = interp.eval(scriptSig, ctx)
@@ -1697,6 +1743,9 @@ proc verifyScript*(
 
   # Copy stack for P2SH
   let stackCopy = interp.stack
+
+  # Clear altstack between scriptSig and scriptPubKey execution
+  interp.altStack = @[]
 
   # Execute scriptPubKey
   let err = interp.eval(scriptPubKey, ctx)
@@ -1795,6 +1844,11 @@ proc verifyScriptWithError*(
     codesepPos: 0xFFFFFFFF'u32
   )
 
+  # SIG_PUSHONLY: scriptSig must be push-only when flag is set
+  if sfSigPushOnly in flags:
+    if not isPushOnly(scriptSig):
+      return seSigPushOnly
+
   # Execute scriptSig
   if scriptSig.len > 0:
     let err = interp.eval(scriptSig, ctx)
@@ -1803,6 +1857,9 @@ proc verifyScriptWithError*(
 
   # Copy stack for P2SH
   let stackCopy = interp.stack
+
+  # Clear altstack between scriptSig and scriptPubKey execution
+  interp.altStack = @[]
 
   # Execute scriptPubKey
   let err = interp.eval(scriptPubKey, ctx)
