@@ -15,7 +15,7 @@ import ../src/primitives/types
 import ../src/script/interpreter
 
 const
-  vectorPath = "/home/max/hashhog/ouroboros/bitcoin/src/test/data/script_tests.json"
+  vectorPath = "/home/max/hashhog/bitcoin/src/test/data/script_tests.json"
 
 # ---------------------------------------------------------------------------
 # Opcode name -> byte value mapping
@@ -247,7 +247,8 @@ proc parseFlags(s: string): set[ScriptFlags] =
     of "NULLFAIL": result.incl(sfNullFail)
     of "TAPROOT": result.incl(sfTaproot)
     of "MINIMALIF": result.incl(sfMinimalIf)
-    of "DISCOURAGE_UPGRADABLE_NOPS", "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM",
+    of "DISCOURAGE_UPGRADABLE_NOPS": result.incl(sfDiscourageUpgradableNops)
+    of "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM",
        "DISCOURAGE_OP_SUCCESS", "CONST_SCRIPTCODE",
        "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION":
       # May not have dedicated flags; skip
