@@ -12,6 +12,7 @@
 
 import std/[json, strutils, sequtils, tables, os]
 import ../src/primitives/types
+import ../src/primitives/serialize  # txid computation for crediting/spending tx
 import ../src/script/interpreter
 
 const
@@ -257,20 +258,45 @@ proc parseFlags(s: string): set[ScriptFlags] =
       discard
 
 # ---------------------------------------------------------------------------
-# Dummy transaction
+# Crediting and spending transactions (matches Bitcoin Core test approach)
 # ---------------------------------------------------------------------------
 
-proc makeDummyTx(scriptSig, scriptPubKey: seq[byte]): Transaction =
+proc makeCreditingTx(scriptPubKey: seq[byte]): Transaction =
+  ## Build the "crediting transaction" that funds the output being tested.
+  ## Bitcoin Core: version 1, locktime 0, one input (null prevout,
+  ## scriptSig = OP_0 OP_0, sequence 0xFFFFFFFF), one output
+  ## (scriptPubKey = test's scriptPubKey, value = 0).
   var nullTxId: TxId
   result = Transaction(
     version: 1,
     inputs: @[TxIn(
-      prevOut: OutPoint(txid: nullTxId, vout: 0),
-      scriptSig: scriptSig,
+      prevOut: OutPoint(txid: nullTxId, vout: 0xFFFFFFFF'u32),
+      scriptSig: @[0x00'u8, 0x00'u8],  # OP_0 OP_0
       sequence: 0xFFFFFFFF'u32
     )],
     outputs: @[TxOut(
       value: Satoshi(0),
+      scriptPubKey: scriptPubKey
+    )],
+    witnesses: @[],
+    lockTime: 0
+  )
+
+proc makeSpendingTx(creditTx: Transaction, scriptSig: seq[byte]): Transaction =
+  ## Build the "spending transaction" that spends the crediting tx output.
+  ## Bitcoin Core: version 1, locktime 0, one input (prevout = hash of
+  ## crediting tx : 0, scriptSig = test's scriptSig, sequence 0xFFFFFFFF),
+  ## one output (scriptPubKey = empty, value = creditTx output value).
+  let creditTxId = txid(creditTx)
+  result = Transaction(
+    version: 1,
+    inputs: @[TxIn(
+      prevOut: OutPoint(txid: creditTxId, vout: 0),
+      scriptSig: scriptSig,
+      sequence: 0xFFFFFFFF'u32
+    )],
+    outputs: @[TxOut(
+      value: creditTx.outputs[0].value,
       scriptPubKey: @[]
     )],
     witnesses: @[],
@@ -337,10 +363,18 @@ proc main() =
                         getCurrentExceptionMsg() & " (asmStr: " & scriptPubKeyAsm & ")")
       continue
 
-    let flags = parseFlags(flagsStr)
-    let tx = makeDummyTx(scriptSig, scriptPubKey)
+    var flags = parseFlags(flagsStr)
 
-    let err = verifyScriptWithError(scriptSig, scriptPubKey, tx, 0,
+    # Bitcoin Core: CLEANSTACK implies P2SH and WITNESS
+    if sfCleanStack in flags:
+      flags.incl(sfP2SH)
+      flags.incl(sfWitness)
+
+    # Build crediting and spending transactions (matches Bitcoin Core)
+    let creditTx = makeCreditingTx(scriptPubKey)
+    let spendTx = makeSpendingTx(creditTx, scriptSig)
+
+    let err = verifyScriptWithError(scriptSig, scriptPubKey, spendTx, 0,
                                      amount = Satoshi(0), flags = flags)
 
     let expectOk = expected == "OK"
@@ -362,7 +396,7 @@ proc main() =
        " failed, " & $skipped & " skipped, " & $parseErrors & " parse errors"
 
   if failed > 0:
-    stderr.writeLine("NOTE: some failures expected due to dummy tx (no real sig verification)")
+    stderr.writeLine("NOTE: " & $failed & " failures remain")
 
 when isMainModule:
   main()
