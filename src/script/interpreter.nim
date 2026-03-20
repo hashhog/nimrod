@@ -374,6 +374,99 @@ proc isCompressedPubkey*(pubkey: seq[byte]): bool =
   else:
     return false
 
+# Check if pubkey is compressed or uncompressed (valid standard encoding)
+proc isCompressedOrUncompressedPubkey*(pubkey: seq[byte]): bool =
+  ## STRICTENC check: pubkeys must be either compressed (33 bytes, 02/03 prefix)
+  ## or uncompressed (65 bytes, 04 prefix). Hybrid keys (06/07) are rejected.
+  if pubkey.len < 33:
+    return false
+  if pubkey[0] == 0x04:
+    return pubkey.len == 65
+  elif pubkey[0] == 0x02 or pubkey[0] == 0x03:
+    return pubkey.len == 33
+  else:
+    return false
+
+# BIP66 strict DER signature encoding check (consensus-critical)
+proc isValidSignatureEncoding*(sig: seq[byte]): bool =
+  ## Check if signature (including hashtype byte) is valid strict DER.
+  ## This is the consensus-critical check from BIP66.
+  ## Format: 0x30 [total-length] 0x02 [R-length] [R] 0x02 [S-length] [S] [sighash]
+  if sig.len < 9: return false
+  if sig.len > 73: return false
+  if sig[0] != 0x30: return false
+  if int(sig[1]) != sig.len - 3: return false
+
+  let lenR = int(sig[3])
+  if 5 + lenR >= sig.len: return false
+
+  let lenS = int(sig[5 + lenR])
+  if lenR + lenS + 7 != sig.len: return false
+
+  # R must be an integer
+  if sig[2] != 0x02: return false
+  if lenR == 0: return false
+  # R must not be negative
+  if (sig[4] and 0x80) != 0: return false
+  # R must not be excessively padded
+  if lenR > 1 and sig[4] == 0x00 and (sig[5] and 0x80) == 0: return false
+
+  # S must be an integer
+  if sig[lenR + 4] != 0x02: return false
+  if lenS == 0: return false
+  # S must not be negative
+  if (sig[lenR + 6] and 0x80) != 0: return false
+  # S must not be excessively padded
+  if lenS > 1 and sig[lenR + 6] == 0x00 and (sig[lenR + 7] and 0x80) == 0: return false
+
+  true
+
+# Check if signature has a defined hashtype
+proc isDefinedHashtypeSignature*(sig: seq[byte]): bool =
+  ## STRICTENC check: the hashtype byte must be a recognized value.
+  if sig.len == 0:
+    return false
+  let nHashType = sig[sig.len - 1] and (not 0x80'u8)  # strip ANYONECANPAY
+  if nHashType < 1 or nHashType > 3:  # SIGHASH_ALL=1, SIGHASH_NONE=2, SIGHASH_SINGLE=3
+    return false
+  true
+
+# Combined signature encoding check matching Bitcoin Core's CheckSignatureEncoding
+proc checkSignatureEncoding*(sig: seq[byte], flags: set[ScriptFlags]): ScriptError =
+  ## Validate signature encoding based on active flags.
+  ## Empty signatures always pass (they provide a compact invalid sig for CHECK(MULTI)SIG).
+  if sig.len == 0:
+    return seOk
+
+  if (sfDERSig in flags or sfLowS in flags or sfStrictEnc in flags) and
+     not isValidSignatureEncoding(sig):
+    return seInvalidSig  # SIG_DER
+
+  if sfLowS in flags:
+    # isValidSignatureEncoding already passed above, so sig is valid DER
+    # Check low-S: strip hashtype byte and check
+    let sigWithoutHashType = sig[0 ..< sig.len - 1]
+    if not isLowS(sigWithoutHashType):
+      return seInvalidSig  # SIG_HIGH_S (reusing seInvalidSig)
+
+  if sfStrictEnc in flags and not isDefinedHashtypeSignature(sig):
+    return seSigHashType
+
+  seOk
+
+# Combined pubkey encoding check matching Bitcoin Core's CheckPubKeyEncoding
+proc checkPubKeyEncoding*(pubkey: seq[byte], flags: set[ScriptFlags],
+                          sigVersion: SigVersion): ScriptError =
+  ## Validate pubkey encoding based on active flags.
+  if sfStrictEnc in flags and not isCompressedOrUncompressedPubkey(pubkey):
+    return seInvalidPubkey  # PUBKEYTYPE
+
+  if sfWitnessPubkeyType in flags and sigVersion == sigWitnessV0 and
+     not isCompressedPubkey(pubkey):
+    return seWitnessPubkeyType
+
+  seOk
+
 # Check if opcode counts toward op limit
 proc countsTowardOpLimit(opcode: uint8): bool =
   opcode > OP_16
@@ -851,9 +944,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       let pushLen = int(opcode)
       if pc + pushLen > scriptLen:
         return seInvalidStack
+      # Push size check is unconditional (even in non-executed branches)
+      if pushLen > MaxScriptElementSize:
+        return sePushSize
       if executing:
-        if pushLen > MaxScriptElementSize:
-          return sePushSize
         let pushData = script[pc ..< pc + pushLen].toSeq
         # MINIMALDATA: check that pushes use the smallest possible opcode
         if sfMinimalData in interp.flags:
@@ -870,9 +964,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       pc += 1
       if pc + pushLen > scriptLen:
         return seInvalidStack
+      # Push size check is unconditional (even in non-executed branches)
+      if pushLen > MaxScriptElementSize:
+        return sePushSize
       if executing:
-        if pushLen > MaxScriptElementSize:
-          return sePushSize
         let pushData = script[pc ..< pc + pushLen].toSeq
         # Check minimal push encoding
         if sfMinimalData in interp.flags:
@@ -889,9 +984,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       pc += 2
       if pc + pushLen > scriptLen:
         return seInvalidStack
+      # Push size check is unconditional (even in non-executed branches)
+      if pushLen > MaxScriptElementSize:
+        return sePushSize
       if executing:
-        if pushLen > MaxScriptElementSize:
-          return sePushSize
         let pushData = script[pc ..< pc + pushLen].toSeq
         if sfMinimalData in interp.flags:
           if not checkMinimalPush(pushData, OP_PUSHDATA2):
@@ -908,9 +1004,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       pc += 4
       if pc + pushLen > scriptLen:
         return seInvalidStack
+      # Push size check is unconditional (even in non-executed branches)
+      if pushLen > MaxScriptElementSize:
+        return sePushSize
       if executing:
-        if pushLen > MaxScriptElementSize:
-          return sePushSize
         let pushData = script[pc ..< pc + pushLen].toSeq
         if sfMinimalData in interp.flags:
           if not checkMinimalPush(pushData, OP_PUSHDATA4):
@@ -1384,6 +1481,16 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
       var success = false
 
+      # Encoding checks (DERSIG, STRICTENC, LOW_S) - done before verification,
+      # even if pubkey is empty (Bitcoin Core checks sig encoding regardless)
+      if ctx.sigVersion == sigBase or ctx.sigVersion == sigWitnessV0:
+        let sigErr = checkSignatureEncoding(sig, interp.flags)
+        if sigErr != seOk:
+          return sigErr
+        let pkErr = checkPubKeyEncoding(pubkey, interp.flags, ctx.sigVersion)
+        if pkErr != seOk:
+          return pkErr
+
       if sig.len > 0 and pubkey.len > 0:
         case ctx.sigVersion
         of sigBase:
@@ -1397,14 +1504,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             scriptCode = findAndDelete(scriptCode, sig)
 
             let sighash = computeSighashLegacy(ctx.tx, ctx.inputIndex, scriptCode, hashType)
-            success = verifyDer(pubkey, sighash, sigWithoutHashType)
+            success = verifyDerLax(pubkey, sighash, sigWithoutHashType)
 
         of sigWitnessV0:
           # SegWit v0 signature check
-          # BIP141 WITNESS_PUBKEYTYPE: pubkeys must be compressed in witness v0
-          if sfWitnessPubkeyType in interp.flags and not isCompressedPubkey(pubkey):
-            return seWitnessPubkeyType
-
           if sig.len >= 1:
             let hashType = uint32(sig[sig.len - 1])
             let sigWithoutHashType = sig[0 ..< sig.len - 1]
@@ -1416,7 +1519,7 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             scriptCode.add([OP_EQUALVERIFY, OP_CHECKSIG])
 
             let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, scriptCode, ctx.amount, hashType)
-            success = verifyDer(pubkey, sighash, sigWithoutHashType)
+            success = verifyDerLax(pubkey, sighash, sigWithoutHashType)
 
         of sigTaproot, sigTapscript:
           # Taproot Schnorr signature check (BIP340)
@@ -1515,6 +1618,15 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
         let sig = sigs[iSig]
         let pubkey = pubkeys[iPubkey]
 
+        # Encoding checks done per-pair (matching Bitcoin Core's loop behavior)
+        if ctx.sigVersion == sigBase or ctx.sigVersion == sigWitnessV0:
+          let sigErr = checkSignatureEncoding(sig, interp.flags)
+          if sigErr != seOk:
+            return sigErr
+          let pkErr = checkPubKeyEncoding(pubkey, interp.flags, ctx.sigVersion)
+          if pkErr != seOk:
+            return pkErr
+
         var verified = false
         if sig.len > 0 and pubkey.len > 0:
           case ctx.sigVersion
@@ -1527,19 +1639,15 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
               for s in sigs:
                 scriptCode = findAndDelete(scriptCode, s)
               let sighash = computeSighashLegacy(ctx.tx, ctx.inputIndex, scriptCode, hashType)
-              verified = verifyDer(pubkey, sighash, sigWithoutHashType)
+              verified = verifyDerLax(pubkey, sighash, sigWithoutHashType)
 
           of sigWitnessV0:
-            # BIP141 WITNESS_PUBKEYTYPE: pubkeys must be compressed in witness v0
-            if sfWitnessPubkeyType in interp.flags and not isCompressedPubkey(pubkey):
-              return seWitnessPubkeyType
-
             if sig.len >= 1:
               let hashType = uint32(sig[sig.len - 1])
               let sigWithoutHashType = sig[0 ..< sig.len - 1]
               # For P2WSH, use the witness script as scriptCode
               let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, script, ctx.amount, hashType)
-              verified = verifyDer(pubkey, sighash, sigWithoutHashType)
+              verified = verifyDerLax(pubkey, sighash, sigWithoutHashType)
 
           else:
             # Tapscript doesn't use CHECKMULTISIG
@@ -1744,8 +1852,9 @@ proc verifyScript*(
   # Copy stack for P2SH
   let stackCopy = interp.stack
 
-  # Clear altstack between scriptSig and scriptPubKey execution
+  # Clear altstack and opcount between scriptSig and scriptPubKey execution
   interp.altStack = @[]
+  interp.opCount = 0
 
   # Execute scriptPubKey
   let err = interp.eval(scriptPubKey, ctx)
@@ -1858,8 +1967,10 @@ proc verifyScriptWithError*(
   # Copy stack for P2SH
   let stackCopy = interp.stack
 
-  # Clear altstack between scriptSig and scriptPubKey execution
+  # Clear altstack and opcount between scriptSig and scriptPubKey execution
+  # (Bitcoin Core resets opcount per-script via separate EvalScript calls)
   interp.altStack = @[]
+  interp.opCount = 0
 
   # Execute scriptPubKey
   let err = interp.eval(scriptPubKey, ctx)
