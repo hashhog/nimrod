@@ -124,6 +124,12 @@ when defined(useSystemSecp256k1):
     inputLen: csize_t
   ): cint {.importc, cdecl.}
 
+  proc secp256k1_ecdsa_signature_normalize(
+    ctx: Secp256k1Context,
+    sigout: ptr Secp256k1EcdsaSignature,
+    sigin: ptr Secp256k1EcdsaSignature
+  ): cint {.importc, cdecl.}
+
   proc secp256k1_xonly_pubkey_parse(
     ctx: Secp256k1Context,
     pubkey: ptr Secp256k1XonlyPubkey,
@@ -252,6 +258,195 @@ when defined(useSystemSecp256k1):
 
     var msg = msgHash
     result = secp256k1_ecdsa_verify(getContext(), addr sig, addr msg[0], addr pubkey) == 1
+
+  proc ecdsaSignatureParseDerLax*(
+    sig: var Secp256k1EcdsaSignature,
+    input: openArray[byte]
+  ): bool =
+    ## Lax DER signature parser matching Bitcoin Core's ecdsa_signature_parse_der_lax.
+    ## Accepts non-standard DER encodings that strict parsing would reject.
+    ## This is used for consensus-compatible signature verification.
+    if input.len == 0:
+      return false
+
+    var pos = 0
+    let inputLen = input.len
+
+    # Initialize sig with a correctly-parsed but invalid signature
+    var tmpsig: array[64, byte]
+    discard secp256k1_ecdsa_signature_parse_compact(getContext(), addr sig, addr tmpsig[0])
+
+    # Sequence tag byte
+    if pos == inputLen or input[pos] != 0x30:
+      return false
+    inc pos
+
+    # Sequence length bytes
+    if pos == inputLen:
+      return false
+    var lenbyte = int(input[pos])
+    inc pos
+    if (lenbyte and 0x80) != 0:
+      lenbyte -= 0x80
+      if lenbyte > inputLen - pos:
+        return false
+      pos += lenbyte
+
+    # Integer tag byte for R
+    if pos == inputLen or input[pos] != 0x02:
+      return false
+    inc pos
+
+    # Integer length for R
+    if pos == inputLen:
+      return false
+    lenbyte = int(input[pos])
+    inc pos
+    var rlen: int
+    if (lenbyte and 0x80) != 0:
+      lenbyte -= 0x80
+      if lenbyte > inputLen - pos:
+        return false
+      while lenbyte > 0 and input[pos] == 0:
+        inc pos
+        dec lenbyte
+      if lenbyte >= 4:
+        return false
+      rlen = 0
+      while lenbyte > 0:
+        rlen = (rlen shl 8) + int(input[pos])
+        inc pos
+        dec lenbyte
+    else:
+      rlen = lenbyte
+
+    if rlen > inputLen - pos:
+      return false
+    var rpos = pos
+    pos += rlen
+
+    # Integer tag byte for S
+    if pos == inputLen or input[pos] != 0x02:
+      return false
+    inc pos
+
+    # Integer length for S
+    if pos == inputLen:
+      return false
+    lenbyte = int(input[pos])
+    inc pos
+    var slen: int
+    if (lenbyte and 0x80) != 0:
+      lenbyte -= 0x80
+      if lenbyte > inputLen - pos:
+        return false
+      while lenbyte > 0 and input[pos] == 0:
+        inc pos
+        dec lenbyte
+      if lenbyte >= 4:
+        return false
+      slen = 0
+      while lenbyte > 0:
+        slen = (slen shl 8) + int(input[pos])
+        inc pos
+        dec lenbyte
+    else:
+      slen = lenbyte
+
+    if slen > inputLen - pos:
+      return false
+    var spos = pos
+
+    # Reset tmpsig
+    for i in 0 ..< 64:
+      tmpsig[i] = 0
+
+    # Ignore leading zeroes in R
+    while rlen > 0 and input[rpos] == 0:
+      dec rlen
+      inc rpos
+    # Copy R value
+    var overflow = false
+    if rlen > 32:
+      overflow = true
+    else:
+      for i in 0 ..< rlen:
+        tmpsig[32 - rlen + i] = input[rpos + i]
+
+    # Ignore leading zeroes in S
+    while slen > 0 and input[spos] == 0:
+      dec slen
+      inc spos
+    # Copy S value
+    if slen > 32:
+      overflow = true
+    else:
+      for i in 0 ..< slen:
+        tmpsig[64 - slen + i] = input[spos + i]
+
+    if not overflow:
+      overflow = secp256k1_ecdsa_signature_parse_compact(
+        getContext(), addr sig, addr tmpsig[0]
+      ) != 1
+    if overflow:
+      for i in 0 ..< 64:
+        tmpsig[i] = 0
+      discard secp256k1_ecdsa_signature_parse_compact(
+        getContext(), addr sig, addr tmpsig[0]
+      )
+
+    true
+
+  proc verifyDerLax*(
+    publicKey: openArray[byte],
+    msgHash: array[32, byte],
+    derSignature: openArray[byte]
+  ): bool =
+    ## Verify ECDSA signature with lax DER parsing and S normalization.
+    ## This matches Bitcoin Core's CPubKey::Verify behavior:
+    ## 1. Parse with lax DER parser (accepts non-standard encodings)
+    ## 2. Normalize S to lower half of curve order
+    ## 3. Verify with libsecp256k1
+    if publicKey.len == 0 or derSignature.len == 0:
+      return false
+
+    var pubkey: Secp256k1Pubkey
+    var pk = newSeq[byte](publicKey.len)
+    for i, b in publicKey:
+      pk[i] = b
+    if secp256k1_ec_pubkey_parse(
+      getContext(), addr pubkey, addr pk[0], csize_t(publicKey.len)
+    ) != 1:
+      return false
+
+    var sig: Secp256k1EcdsaSignature
+    var sigData = newSeq[byte](derSignature.len)
+    for i, b in derSignature:
+      sigData[i] = b
+    if not ecdsaSignatureParseDerLax(sig, sigData):
+      return false
+
+    # Normalize S to lower half (Bitcoin Core does this unconditionally)
+    discard secp256k1_ecdsa_signature_normalize(getContext(), addr sig, addr sig)
+
+    var msg = msgHash
+    result = secp256k1_ecdsa_verify(getContext(), addr sig, addr msg[0], addr pubkey) == 1
+
+  proc isLowS*(derSignature: openArray[byte]): bool =
+    ## Check if the S value in a DER signature is in the lower half of the curve order.
+    ## Used for LOW_S flag enforcement.
+    if derSignature.len == 0:
+      return false
+    var sig: Secp256k1EcdsaSignature
+    var sigData = newSeq[byte](derSignature.len)
+    for i, b in derSignature:
+      sigData[i] = b
+    if secp256k1_ecdsa_signature_parse_der(
+      getContext(), addr sig, addr sigData[0], csize_t(derSignature.len)
+    ) != 1:
+      return false
+    # normalize returns 1 if sig was NOT normalized (i.e. S was high)
+    result = secp256k1_ecdsa_signature_normalize(getContext(), nil, addr sig) != 1
 
   proc verifySchnorr*(
     pubkey: XonlyPubkey,
@@ -470,6 +665,16 @@ else:
     msgHash: array[32, byte],
     derSignature: openArray[byte]
   ): bool =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc verifyDerLax*(
+    publicKey: openArray[byte],
+    msgHash: array[32, byte],
+    derSignature: openArray[byte]
+  ): bool =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc isLowS*(derSignature: openArray[byte]): bool =
     raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
 
   proc verifySchnorr*(
