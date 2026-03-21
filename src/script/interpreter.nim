@@ -46,6 +46,9 @@ type
     seMinimalIf = "OP_IF/NOTIF argument must be minimal"
     seTapscriptMinimalIf = "tapscript OP_IF/NOTIF argument must be exactly 0 or 1"
     seDiscourageUpgradableNops = "discourage upgradable NOPs"
+    seWitnessUnexpected = "unexpected witness data"
+    seWitnessProgramWrongLength = "witness program wrong length"
+    seDiscourageUpgradableWitnessProgram = "discourage upgradable witness program"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -65,6 +68,7 @@ type
     sfWitnessPubkeyType  # BIP141: witness pubkeys must be compressed
     sfMinimalIf        # Require minimal encoding for OP_IF/NOTIF (policy for witness v0)
     sfDiscourageUpgradableNops  # Discourage use of unused NOPs
+    sfDiscourageUpgradableWitnessProgram  # Discourage unknown witness versions
 
   SigVersion* = enum
     sigBase = 0        # Legacy scripts
@@ -1507,16 +1511,25 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             success = verifyDerLax(pubkey, sighash, sigWithoutHashType)
 
         of sigWitnessV0:
-          # SegWit v0 signature check
+          # SegWit v0 signature check (BIP143)
           if sig.len >= 1:
             let hashType = uint32(sig[sig.len - 1])
             let sigWithoutHashType = sig[0 ..< sig.len - 1]
 
             # For P2WPKH, scriptCode is OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG
-            let pubkeyHash = hash160(pubkey)
-            var scriptCode: seq[byte] = @[OP_DUP, OP_HASH160, 0x14'u8]
-            scriptCode.add(pubkeyHash)
-            scriptCode.add([OP_EQUALVERIFY, OP_CHECKSIG])
+            # For P2WSH, scriptCode is the witness script being executed (passed as `script`)
+            var scriptCode: seq[byte]
+            if ctx.scriptPubKey.isP2WPKH() or
+               (ctx.scriptPubKey.isP2SH() and script.len == 25 and
+                script[0] == OP_DUP and script[1] == OP_HASH160):
+              # P2WPKH: reconstruct from pubkey
+              let pubkeyHash = hash160(pubkey)
+              scriptCode = @[OP_DUP, OP_HASH160, 0x14'u8]
+              scriptCode.add(pubkeyHash)
+              scriptCode.add([OP_EQUALVERIFY, OP_CHECKSIG])
+            else:
+              # P2WSH: use the witness script being executed
+              scriptCode = @script
 
             let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, scriptCode, ctx.amount, hashType)
             success = verifyDerLax(pubkey, sighash, sigWithoutHashType)
@@ -2026,6 +2039,13 @@ proc verifyScriptWithError*(
         witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags
       )
 
+  # BIP141: if WITNESS flag is set and script is NOT a witness program,
+  # the witness must be empty
+  if sfWitness in flags:
+    let (isWit, _, _) = isWitnessProgram(scriptPubKey)
+    if not isWit and witness.len > 0:
+      return seWitnessUnexpected
+
   # Clean stack check
   if sfCleanStack in flags:
     if interp.stack.len != 1:
@@ -2295,8 +2315,11 @@ proc verifyWitnessProgram*(
       return castToBool(interp.peek())
 
   else:
-    # Unknown witness version - succeed for forward compatibility
-    # (but only if DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM is not set)
+    # Unknown witness version
+    if sfDiscourageUpgradableWitnessProgram in flags:
+      return false
+    if witness.len == 0:
+      return false
     return true
 
 proc verifyWitnessProgramWithError*(
@@ -2482,7 +2505,12 @@ proc verifyWitnessProgramWithError*(
       return seOk
 
   else:
-    # Unknown witness version - succeed for forward compatibility
+    # Unknown witness version
+    if sfDiscourageUpgradableWitnessProgram in flags:
+      return seDiscourageUpgradableWitnessProgram
+    # Succeed for forward compatibility if flag not set
+    if witness.len == 0:
+      return seWitnessProgramMismatch
     return seOk
 
 # Backward compatibility: simple execute without full tx context
