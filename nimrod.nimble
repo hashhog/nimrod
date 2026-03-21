@@ -4,6 +4,7 @@ author        = "nimrod-dev"
 description   = "A Bitcoin full node in Nim"
 license       = "MIT"
 srcDir        = "src"
+binDir        = "bin"
 bin           = @["nimrod"]
 
 # Dependencies
