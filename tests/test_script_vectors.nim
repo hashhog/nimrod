@@ -249,8 +249,9 @@ proc parseFlags(s: string): set[ScriptFlags] =
     of "TAPROOT": result.incl(sfTaproot)
     of "MINIMALIF": result.incl(sfMinimalIf)
     of "DISCOURAGE_UPGRADABLE_NOPS": result.incl(sfDiscourageUpgradableNops)
-    of "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM",
-       "DISCOURAGE_OP_SUCCESS", "CONST_SCRIPTCODE",
+    of "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM":
+      result.incl(sfDiscourageUpgradableWitnessProgram)
+    of "DISCOURAGE_OP_SUCCESS", "CONST_SCRIPTCODE",
        "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION":
       # May not have dedicated flags; skip
       discard
@@ -261,11 +262,11 @@ proc parseFlags(s: string): set[ScriptFlags] =
 # Crediting and spending transactions (matches Bitcoin Core test approach)
 # ---------------------------------------------------------------------------
 
-proc makeCreditingTx(scriptPubKey: seq[byte]): Transaction =
+proc makeCreditingTx(scriptPubKey: seq[byte], amount: Satoshi = Satoshi(0)): Transaction =
   ## Build the "crediting transaction" that funds the output being tested.
   ## Bitcoin Core: version 1, locktime 0, one input (null prevout,
   ## scriptSig = OP_0 OP_0, sequence 0xFFFFFFFF), one output
-  ## (scriptPubKey = test's scriptPubKey, value = 0).
+  ## (scriptPubKey = test's scriptPubKey, value = amount).
   var nullTxId: TxId
   result = Transaction(
     version: 1,
@@ -275,14 +276,15 @@ proc makeCreditingTx(scriptPubKey: seq[byte]): Transaction =
       sequence: 0xFFFFFFFF'u32
     )],
     outputs: @[TxOut(
-      value: Satoshi(0),
+      value: amount,
       scriptPubKey: scriptPubKey
     )],
     witnesses: @[],
     lockTime: 0
   )
 
-proc makeSpendingTx(creditTx: Transaction, scriptSig: seq[byte]): Transaction =
+proc makeSpendingTx(creditTx: Transaction, scriptSig: seq[byte],
+                     witness: seq[seq[byte]] = @[]): Transaction =
   ## Build the "spending transaction" that spends the crediting tx output.
   ## Bitcoin Core: version 1, locktime 0, one input (prevout = hash of
   ## crediting tx : 0, scriptSig = test's scriptSig, sequence 0xFFFFFFFF),
@@ -299,7 +301,7 @@ proc makeSpendingTx(creditTx: Transaction, scriptSig: seq[byte]): Transaction =
       value: creditTx.outputs[0].value,
       scriptPubKey: @[]
     )],
-    witnesses: @[],
+    witnesses: if witness.len > 0: @[witness] else: @[],
     lockTime: 0
   )
 
@@ -315,6 +317,7 @@ proc main() =
   var failed = 0
   var skipped = 0
   var parseErrors = 0
+  var witnessTests = 0
   var i = 0
 
   for entry in vectors:
@@ -328,20 +331,82 @@ proc main() =
       inc skipped
       continue
 
-    # Skip witness tests (first element is an array)
+    var scriptSigAsm: string
+    var scriptPubKeyAsm: string
+    var flagsStr: string
+    var expected: string
+    var comment: string
+    var witness: seq[seq[byte]]
+    var amount: Satoshi = Satoshi(0)
+    var isWitnessTest = false
+
+    # Witness test vectors: first element is an array.
+    # Format: [[witness_item1, witness_item2, ..., amount_btc], scriptSig, scriptPubKey, flags, expected]
+    # The amount is the LAST element of the witness array (a number, not a hex string).
     if entry[0].kind == JArray:
-      inc skipped
-      continue
+      if entry.len < 5:
+        inc skipped
+        continue
 
-    if entry.len < 4:
-      inc skipped
-      continue
+      isWitnessTest = true
+      inc witnessTests
 
-    let scriptSigAsm = entry[0].getStr("")
-    let scriptPubKeyAsm = entry[1].getStr("")
-    let flagsStr = entry[2].getStr("")
-    let expected = entry[3].getStr("")
-    let comment = if entry.len >= 5: entry[4].getStr("") else: ""
+      # Parse witness stack: all elements except the last (which is the amount)
+      let witnessArr = entry[0]
+      witness = @[]
+      if witnessArr.len < 1:
+        inc skipped
+        continue
+
+      # Last element of witness array is the amount in BTC
+      let amountVal = witnessArr[witnessArr.len - 1]
+      if amountVal.kind == JFloat:
+        amount = Satoshi(int64(amountVal.getFloat() * 100_000_000.0 + 0.5))
+      elif amountVal.kind == JInt:
+        amount = Satoshi(amountVal.getBiggestInt() * 100_000_000)
+      else:
+        amount = Satoshi(0)
+
+      # All elements before the last are witness stack items (hex strings)
+      var hasTaprootPlaceholder = false
+      for wi in 0 ..< witnessArr.len - 1:
+        let hexStr = witnessArr[wi].getStr("")
+        if hexStr.len == 0:
+          witness.add(@[])
+        elif hexStr.startsWith("#") or hexStr.contains("#SCRIPT#") or
+             hexStr.contains("#CONTROLBLOCK#"):
+          # Taproot test placeholders (#SCRIPT#, #CONTROLBLOCK#, etc.)
+          hasTaprootPlaceholder = true
+          break
+        else:
+          witness.add(parseHex(hexStr))
+
+      if hasTaprootPlaceholder:
+        inc skipped
+        continue
+
+      scriptSigAsm = entry[1].getStr("")
+      scriptPubKeyAsm = entry[2].getStr("")
+
+      # Skip vectors with #TAPROOTOUTPUT# placeholders in scriptPubKey
+      if scriptPubKeyAsm.contains("#TAPROOTOUTPUT#"):
+        inc skipped
+        continue
+
+      flagsStr = entry[3].getStr("")
+      expected = entry[4].getStr("")
+      comment = if entry.len >= 6: entry[5].getStr("") else: ""
+    else:
+      # Non-witness test
+      if entry.len < 4:
+        inc skipped
+        continue
+
+      scriptSigAsm = entry[0].getStr("")
+      scriptPubKeyAsm = entry[1].getStr("")
+      flagsStr = entry[2].getStr("")
+      expected = entry[3].getStr("")
+      comment = if entry.len >= 5: entry[4].getStr("") else: ""
 
     var scriptSig: seq[byte]
     try:
@@ -371,11 +436,12 @@ proc main() =
       flags.incl(sfWitness)
 
     # Build crediting and spending transactions (matches Bitcoin Core)
-    let creditTx = makeCreditingTx(scriptPubKey)
-    let spendTx = makeSpendingTx(creditTx, scriptSig)
+    let creditTx = makeCreditingTx(scriptPubKey, amount)
+    let spendTx = makeSpendingTx(creditTx, scriptSig, witness)
 
     let err = verifyScriptWithError(scriptSig, scriptPubKey, spendTx, 0,
-                                     amount = Satoshi(0), flags = flags)
+                                     amount = amount, flags = flags,
+                                     witness = witness)
 
     let expectOk = expected == "OK"
     let gotOk = err == seOk
@@ -385,15 +451,17 @@ proc main() =
     else:
       inc failed
       if failed <= 50:
+        let witLabel = if isWitnessTest: " [WITNESS]" else: ""
         stderr.writeLine("FAIL test " & $i & ": expected=" & expected &
                         " got=" & $err &
                         " sigAsm=" & scriptSigAsm &
                         " pubkeyAsm=" & scriptPubKeyAsm &
                         " flags=" & flagsStr &
-                        " comment=" & comment)
+                        " comment=" & comment & witLabel)
 
   echo "script_tests.json results: " & $passed & " passed, " & $failed &
-       " failed, " & $skipped & " skipped, " & $parseErrors & " parse errors"
+       " failed, " & $skipped & " skipped, " & $parseErrors & " parse errors" &
+       " (" & $witnessTests & " witness tests included)"
 
   if failed > 0:
     stderr.writeLine("NOTE: " & $failed & " failures remain")
