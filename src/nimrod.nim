@@ -155,7 +155,7 @@ Commands:
 
 Options:
   -d, --datadir=DIR      Data directory (default: ~/.nimrod)
-  -n, --network=NET      Network: mainnet, testnet3, regtest (default: mainnet)
+  -n, --network=NET      Network: mainnet, testnet3, testnet4, regtest (default: mainnet)
   --testnet              Use testnet3
   --regtest              Use regtest
   --rpcport=PORT         RPC port (default: 8332)
@@ -198,6 +198,10 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           result.config.network = "testnet3"
           if result.config.rpcPort == 8332: result.config.rpcPort = 18332
           if result.config.p2pPort == 8333: result.config.p2pPort = 18333
+        of "testnet4":
+          result.config.network = "testnet4"
+          if result.config.rpcPort == 8332: result.config.rpcPort = 48332
+          if result.config.p2pPort == 8333: result.config.p2pPort = 48333
         of "regtest":
           result.config.network = "regtest"
           if result.config.rpcPort == 8332: result.config.rpcPort = 18443
@@ -297,6 +301,7 @@ proc getConsensusParams(config: NimrodConfig): ConsensusParams =
   case config.network.toLowerAscii
   of "mainnet", "main": mainnetParams()
   of "testnet", "testnet3", "test": testnet3Params()
+  of "testnet4": testnet4Params()
   of "regtest": regtestParams()
   else:
     echo "Unknown network: " & config.network
