@@ -73,3 +73,6 @@ src/storage/chainstate
 src/storage/db
 
 .claude/skills/
+
+anchors.dat
+banlist.json
