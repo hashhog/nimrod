@@ -49,6 +49,8 @@ type
     seWitnessUnexpected = "unexpected witness data"
     seWitnessProgramWrongLength = "witness program wrong length"
     seDiscourageUpgradableWitnessProgram = "discourage upgradable witness program"
+    seTapscriptEmptyPubkey = "tapscript empty pubkey"
+    seTapscriptCheckmultisig = "OP_CHECKMULTISIG(VERIFY) is not available in tapscript"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -1495,6 +1497,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
         if pkErr != seOk:
           return pkErr
 
+      # BIP342: In tapscript, OP_CHECKSIG with empty pubkey (0 bytes) is an error
+      if ctx.sigVersion == sigTapscript and pubkey.len == 0:
+        return seTapscriptEmptyPubkey
+
       if sig.len > 0 and pubkey.len > 0:
         case ctx.sigVersion
         of sigBase:
@@ -1535,8 +1541,11 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             success = verifyDerLax(pubkey, sighash, sigWithoutHashType)
 
         of sigTaproot, sigTapscript:
+          # BIP342: unknown pubkey types (not 0 bytes, not 32 bytes) succeed
+          if ctx.sigVersion == sigTapscript and pubkey.len != 0 and pubkey.len != 32:
+            success = true
           # Taproot Schnorr signature check (BIP340)
-          if pubkey.len == 32 and (sig.len == 64 or sig.len == 65):
+          elif pubkey.len == 32 and (sig.len == 64 or sig.len == 65):
             var hashType: uint8 = SIGHASH_DEFAULT
             var sigBytes: array[64, byte]
 
@@ -1580,6 +1589,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
         interp.push(if success: @[1'u8] else: @[])
 
     of OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY:
+      # BIP342: OP_CHECKMULTISIG is disabled in tapscript
+      if ctx.sigVersion == sigTapscript:
+        return seTapscriptCheckmultisig
+
       # CHECKMULTISIG has the famous off-by-one bug
       if interp.stack.len < 1:
         return seInvalidStack

@@ -136,6 +136,26 @@ when defined(useSystemSecp256k1):
     input32: ptr byte
   ): cint {.importc, cdecl.}
 
+  proc secp256k1_xonly_pubkey_serialize(
+    ctx: Secp256k1Context,
+    output32: ptr byte,
+    pubkey: ptr Secp256k1XonlyPubkey
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_xonly_pubkey_tweak_add(
+    ctx: Secp256k1Context,
+    output_pubkey: ptr Secp256k1Pubkey,
+    internal_pubkey: ptr Secp256k1XonlyPubkey,
+    tweak32: ptr byte
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_xonly_pubkey_from_pubkey(
+    ctx: Secp256k1Context,
+    xonly_pubkey: ptr Secp256k1XonlyPubkey,
+    pk_parity: ptr cint,
+    pubkey: ptr Secp256k1Pubkey
+  ): cint {.importc, cdecl.}
+
   proc secp256k1_schnorrsig_verify(
     ctx: Secp256k1Context,
     sig64: ptr byte,
@@ -472,6 +492,40 @@ when defined(useSystemSecp256k1):
     result = secp256k1_schnorrsig_verify(
       getContext(), addr sig[0], addr msgData[0], csize_t(msg.len), addr xonlyPk
     ) == 1
+
+  proc tweakXonlyPubkey*(
+    internalPk: array[32, byte],
+    tweak: array[32, byte]
+  ): (array[32, byte], int) =
+    ## Tweak an x-only pubkey: output_key = internal_key + tweak * G
+    ## Returns (output_x_only_key, parity).
+    ## Raises on failure.
+    var xonlyPk: Secp256k1XonlyPubkey
+    var pk = internalPk
+    if secp256k1_xonly_pubkey_parse(getContext(), addr xonlyPk, addr pk[0]) != 1:
+      raise newException(Secp256k1Error, "failed to parse x-only pubkey for tweak")
+
+    var tweakBytes = tweak
+    var outPubkey: Secp256k1Pubkey
+    if secp256k1_xonly_pubkey_tweak_add(
+      getContext(), addr outPubkey, addr xonlyPk, addr tweakBytes[0]
+    ) != 1:
+      raise newException(Secp256k1Error, "failed to tweak x-only pubkey")
+
+    var outXonly: Secp256k1XonlyPubkey
+    var parity: cint = 0
+    if secp256k1_xonly_pubkey_from_pubkey(
+      getContext(), addr outXonly, addr parity, addr outPubkey
+    ) != 1:
+      raise newException(Secp256k1Error, "failed to extract x-only from tweaked pubkey")
+
+    var outputKey: array[32, byte]
+    if secp256k1_xonly_pubkey_serialize(
+      getContext(), addr outputKey[0], addr outXonly
+    ) != 1:
+      raise newException(Secp256k1Error, "failed to serialize tweaked x-only pubkey")
+
+    result = (outputKey, int(parity))
 
   # ==========================================================================
   # ElligatorSwift (BIP-324)
