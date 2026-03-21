@@ -31,6 +31,7 @@ type
 
   HeaderChain* = object
     headers*: seq[BlockHeader]
+    hashes*: seq[BlockHash]        ## Index -> hash mapping
     byHash*: Table[BlockHash, int]  ## Hash -> index mapping
     tip*: BlockHash
     tipHeight*: int32
@@ -240,6 +241,7 @@ proc initHeaderChain*(genesisHeader: BlockHeader, genesisHash: BlockHash): Heade
   ## Initialize header chain with genesis block
   result = initHeaderChain()
   result.headers.add(genesisHeader)
+  result.hashes.add(genesisHash)
   result.byHash[genesisHash] = 0
   result.tip = genesisHash
   result.tipHeight = 0
@@ -261,10 +263,8 @@ proc getHeaderByHeight*(hc: HeaderChain, height: int32): Option[BlockHeader] =
     none(BlockHeader)
 
 proc getHashByHeight*(hc: HeaderChain, height: int32): Option[BlockHash] =
-  let headerOpt = hc.getHeaderByHeight(height)
-  if headerOpt.isSome:
-    let h = serialize(headerOpt.get())
-    some(BlockHash(doubleSha256(h)))
+  if height >= 0 and height < int32(hc.hashes.len):
+    some(hc.hashes[height])
   else:
     none(BlockHash)
 
@@ -279,9 +279,13 @@ proc validateHeaderPoW*(header: BlockHeader): bool =
   hashMeetsTarget(hash, header.bits)
 
 proc validateHeaderChainLink*(header: BlockHeader, prevHeader: BlockHeader): bool =
-  ## Check that header links correctly to previous header
+  ## Check that header links correctly to previous header (recomputes hash)
   let prevBytes = serialize(prevHeader)
   let prevHash = BlockHash(doubleSha256(prevBytes))
+  header.prevBlock == prevHash
+
+proc validateHeaderChainLinkByHash*(header: BlockHeader, prevHash: BlockHash): bool =
+  ## Check that header links correctly to previous header using stored hash
   header.prevBlock == prevHash
 
 proc getMedianTimePastFromChain*(hc: HeaderChain, height: int32): uint32 =
@@ -363,11 +367,11 @@ proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
 
   # Check chain linkage for non-genesis
   if height > 0:
-    if height - 1 >= int32(hc.headers.len):
+    if height - 1 >= int32(hc.hashes.len):
       return (false, "previous header not found")
 
-    let prevHeader = hc.headers[height - 1]
-    if not validateHeaderChainLink(header, prevHeader):
+    let prevHash = hc.hashes[height - 1]
+    if not validateHeaderChainLinkByHash(header, prevHash):
       return (false, "header does not link to previous")
 
     # Check MTP
@@ -419,8 +423,9 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
   # Initialize with genesis if chain is empty
   if chainDb.bestHeight < 0:
     let genesis = buildGenesisBlock(params)
-    let genesisBytes = serialize(genesis.header)
-    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+    # Use the canonical genesis hash from params (buildGenesisBlock may not
+    # produce a byte-identical coinbase for all networks)
+    let genesisHash = params.genesisBlockHash
     result.headerChain = initHeaderChain(genesis.header, genesisHash)
     result.headerTip = genesisHash
     result.headerTipHeight = 0
@@ -436,8 +441,7 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     # TODO: Load header chain from database
     # For now, start fresh and re-sync headers
     let genesis = buildGenesisBlock(params)
-    let genesisBytes = serialize(genesis.header)
-    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+    let genesisHash = params.genesisBlockHash
     result.headerChain = initHeaderChain(genesis.header, genesisHash)
 
 proc selectSyncPeer*(sm: SyncManager): Peer =
@@ -475,11 +479,12 @@ proc buildBlockLocator*(sm: SyncManager): seq[array[32, byte]] =
 proc getPeerId*(peer: Peer): int64 =
   ## Generate a stable peer ID from address and port
   ## Used for tracking per-peer header sync state
-  var h: int64 = 0
+  ## Uses unsigned arithmetic to avoid overflow on long address strings
+  var h: uint64 = 0
   for c in peer.address:
-    h = h * 31 + int64(ord(c))
-  h = h * 31 + int64(peer.port)
-  h
+    h = h * 31 + uint64(ord(c))
+  h = h * 31 + uint64(peer.port)
+  cast[int64](h)
 
 proc getAntiDoSWorkThreshold*(sm: SyncManager): UInt256 =
   ## Calculate the minimum chain work to accept headers without anti-DoS protection
@@ -815,6 +820,7 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
     # Add header to chain
     let idx = sm.headerChain.headers.len
     sm.headerChain.headers.add(header)
+    sm.headerChain.hashes.add(hash)
     sm.headerChain.byHash[hash] = idx
 
     # Update chain work
@@ -1028,6 +1034,7 @@ proc processHeaders*(sync: BlockSync, headers: seq[BlockHeader]): int =
     # Add to chain
     let idx = sync.headerChain.headers.len
     sync.headerChain.headers.add(header)
+    sync.headerChain.hashes.add(hash)
     sync.headerChain.byHash[hash] = idx
 
     let headerWork = calculateWork(header.bits)
