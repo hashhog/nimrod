@@ -14,9 +14,74 @@ import std/[json, strutils, sequtils, tables, os]
 import ../src/primitives/types
 import ../src/primitives/serialize  # txid computation for crediting/spending tx
 import ../src/script/interpreter
+import ../src/crypto/hashing
+import ../src/crypto/secp256k1
 
 const
   vectorPath = "/home/max/hashhog/bitcoin/src/test/data/script_tests.json"
+
+  # BIP341 internal key: generator point x-coordinate (x-only)
+  TAPROOT_INTERNAL_KEY: array[32, byte] = [
+    0x79'u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC,
+    0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B, 0x07,
+    0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9,
+    0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98
+  ]
+
+# ---------------------------------------------------------------------------
+# Taproot placeholder helpers
+# ---------------------------------------------------------------------------
+
+proc writeCompactSize(result: var seq[byte], n: int) =
+  ## Write Bitcoin compact size encoding
+  if n < 0xFD:
+    result.add(byte(n))
+  elif n <= 0xFFFF:
+    result.add(0xFD'u8)
+    result.add(byte(n and 0xFF))
+    result.add(byte((n shr 8) and 0xFF))
+  elif n <= 0xFFFFFFFF:
+    result.add(0xFE'u8)
+    result.add(byte(n and 0xFF))
+    result.add(byte((n shr 8) and 0xFF))
+    result.add(byte((n shr 16) and 0xFF))
+    result.add(byte((n shr 24) and 0xFF))
+
+proc computeTapleafHash(leafScript: seq[byte]): array[32, byte] =
+  ## Compute TapLeaf hash: tagged_hash("TapLeaf", 0xC0 || compact_size(script_len) || script)
+  var leafData: seq[byte]
+  leafData.add(0xC0'u8)  # leaf version
+  leafData.writeCompactSize(leafScript.len)
+  leafData.add(leafScript)
+  taggedHash("TapLeaf", leafData)
+
+proc computeTaprootOutput(leafScript: seq[byte]): (seq[byte], seq[byte]) =
+  ## Given a leaf script, compute the taproot output key and control block.
+  ## Returns (scriptPubKey, controlBlock).
+  ## Uses TAPROOT_INTERNAL_KEY as the internal key, single leaf tree.
+  let tapleafHash = computeTapleafHash(leafScript)
+
+  # Merkle root = tapleaf hash (single leaf)
+  var tweakData: seq[byte]
+  tweakData.add(TAPROOT_INTERNAL_KEY)
+  tweakData.add(tapleafHash)
+  let tweak = taggedHash("TapTweak", tweakData)
+
+  # Compute output key = internal_key + tweak * G
+  let (outputKey, parity) = tweakXonlyPubkey(TAPROOT_INTERNAL_KEY, tweak)
+
+  # scriptPubKey = OP_1 <32-byte output_key>
+  var spk: seq[byte]
+  spk.add(0x51'u8)  # OP_1
+  spk.add(0x20'u8)  # push 32 bytes
+  spk.add(@outputKey)
+
+  # Control block = (0xC0 | output_key_parity) || internal_key_x_only
+  var cb: seq[byte]
+  cb.add(byte(0xC0'u8 or byte(parity)))
+  cb.add(@TAPROOT_INTERNAL_KEY)
+
+  (spk, cb)
 
 # ---------------------------------------------------------------------------
 # Opcode name -> byte value mapping
@@ -339,6 +404,8 @@ proc main() =
     var witness: seq[seq[byte]]
     var amount: Satoshi = Satoshi(0)
     var isWitnessTest = false
+    var scriptSig: seq[byte]
+    var scriptPubKey: seq[byte]
 
     # Witness test vectors: first element is an array.
     # Format: [[witness_item1, witness_item2, ..., amount_btc], scriptSig, scriptPubKey, flags, expected]
@@ -368,34 +435,97 @@ proc main() =
         amount = Satoshi(0)
 
       # All elements before the last are witness stack items (hex strings)
+      # Detect taproot placeholders and resolve them
       var hasTaprootPlaceholder = false
+      var taprootScriptAsm = ""
       for wi in 0 ..< witnessArr.len - 1:
         let hexStr = witnessArr[wi].getStr("")
-        if hexStr.len == 0:
-          witness.add(@[])
-        elif hexStr.startsWith("#") or hexStr.contains("#SCRIPT#") or
-             hexStr.contains("#CONTROLBLOCK#"):
-          # Taproot test placeholders (#SCRIPT#, #CONTROLBLOCK#, etc.)
+        if hexStr.contains("#SCRIPT#") or hexStr.contains("#CONTROLBLOCK#") or
+           hexStr == "#CONTROLBLOCK#":
           hasTaprootPlaceholder = true
-          break
+          if hexStr.startsWith("#SCRIPT#"):
+            # Format: "#SCRIPT# <asm>" - extract the ASM after the prefix
+            taprootScriptAsm = hexStr[8..^1].strip()
+        elif hexStr.len == 0:
+          witness.add(@[])
         else:
           witness.add(parseHex(hexStr))
 
-      if hasTaprootPlaceholder:
-        inc skipped
-        continue
-
       scriptSigAsm = entry[1].getStr("")
       scriptPubKeyAsm = entry[2].getStr("")
-
-      # Skip vectors with #TAPROOTOUTPUT# placeholders in scriptPubKey
-      if scriptPubKeyAsm.contains("#TAPROOTOUTPUT#"):
-        inc skipped
-        continue
-
       flagsStr = entry[3].getStr("")
       expected = entry[4].getStr("")
       comment = if entry.len >= 6: entry[5].getStr("") else: ""
+
+      if hasTaprootPlaceholder:
+        # Resolve taproot placeholders
+        if taprootScriptAsm.len == 0:
+          inc skipped
+          continue
+
+        var leafScript: seq[byte]
+        try:
+          leafScript = parseScriptAsm(taprootScriptAsm)
+        except:
+          inc parseErrors
+          continue
+
+        let (spk, controlBlock) = computeTaprootOutput(leafScript)
+
+        # Rebuild witness: original hex items, then script, then control block
+        # The witness array items before the placeholders are already in `witness`
+        # Now add the script and control block
+        witness.add(leafScript)
+        witness.add(controlBlock)
+
+        # Replace #TAPROOTOUTPUT# in scriptPubKey with actual output
+        if scriptPubKeyAsm.contains("#TAPROOTOUTPUT#"):
+          # scriptPubKey is the raw bytes from spk
+          scriptPubKeyAsm = ""
+          scriptPubKey = spk
+        else:
+          try:
+            scriptPubKey = parseScriptAsm(scriptPubKeyAsm)
+          except:
+            inc parseErrors
+            continue
+
+        # Parse scriptSig
+        try:
+          scriptSig = parseScriptAsm(scriptSigAsm)
+        except:
+          inc parseErrors
+          continue
+
+        var flags = parseFlags(flagsStr)
+        if sfCleanStack in flags:
+          flags.incl(sfP2SH)
+          flags.incl(sfWitness)
+
+        let creditTx = makeCreditingTx(scriptPubKey, amount)
+        let spendTx = makeSpendingTx(creditTx, scriptSig, witness)
+
+        let err = verifyScriptWithError(scriptSig, scriptPubKey, spendTx, 0,
+                                         amount = amount, flags = flags,
+                                         witness = witness)
+
+        let expectOk = expected == "OK"
+        let gotOk = err == seOk
+
+        if expectOk == gotOk:
+          inc passed
+        else:
+          inc failed
+          if failed <= 50:
+            stderr.writeLine("FAIL test " & $i & ": expected=" & expected &
+                            " got=" & $err &
+                            " comment=" & comment & " [TAPROOT]")
+        continue
+
+      # Non-taproot witness: handle #TAPROOTOUTPUT# in scriptPubKey (shouldn't happen here)
+      if scriptPubKeyAsm.contains("#TAPROOTOUTPUT#"):
+        inc skipped
+        continue
     else:
       # Non-witness test
       if entry.len < 4:
@@ -408,7 +538,6 @@ proc main() =
       expected = entry[3].getStr("")
       comment = if entry.len >= 5: entry[4].getStr("") else: ""
 
-    var scriptSig: seq[byte]
     try:
       scriptSig = parseScriptAsm(scriptSigAsm)
     except:
@@ -418,7 +547,6 @@ proc main() =
                         getCurrentExceptionMsg() & " (asmStr: " & scriptSigAsm & ")")
       continue
 
-    var scriptPubKey: seq[byte]
     try:
       scriptPubKey = parseScriptAsm(scriptPubKeyAsm)
     except:
