@@ -15,7 +15,7 @@ const LibRocksDb* = "librocksdb.so"
 
 # Performance tuning constants
 const
-  BlockCacheSize* = 512 * 1024 * 1024'u64       # 512MB block cache
+  BlockCacheSize* = 256 * 1024 * 1024'u64       # 256MB block cache
   WriteBufferSize* = 64 * 1024 * 1024'u64       # 64MB write buffer
   MaxWriteBufferNumber* = 4                      # 4 write buffers max
   BloomFilterBits* = 10                          # 10-bit bloom filter
@@ -103,6 +103,7 @@ proc rocksdb_open_column_families*(opts: RocksDbOptionsPtr, name: cstring,
     column_family_handles: ptr RocksDbColumnFamilyHandle,
     errptr: ptr cstring): RocksDbPtr
 proc rocksdb_close*(db: RocksDbPtr)
+proc rocksdb_cancel_all_background_work*(db: RocksDbPtr, wait: uint8)
 
 # Basic CRUD
 proc rocksdb_put*(db: RocksDbPtr, writeOpts: RocksDbWriteOptionsPtr,
@@ -169,7 +170,7 @@ type
     readOpts: RocksDbReadOptionsPtr
     blockCache: RocksDbCachePtr
     bloomFilter: RocksDbFilterPolicyPtr
-    tableOpts: RocksDbBlockBasedOptionsPtr
+    cfTableOpts: array[ColumnFamily, RocksDbBlockBasedOptionsPtr]
 
   WriteBatch* = ref object
     batch: RocksDbWriteBatchPtr
@@ -310,8 +311,8 @@ proc openDatabase*(path: string, config: DatabaseConfig = defaultDbConfig()): Da
     cfOpts[cf] = opts
     cfTableOpts[cf] = tableOpts
 
-  # Store table opts reference for cleanup
-  result.tableOpts = cfTableOpts[cfDefault]
+  # Store all table opts references for cleanup
+  result.cfTableOpts = cfTableOpts
 
   # Open with column families
   result.db = rocksdb_open_column_families(
@@ -334,24 +335,43 @@ proc close*(db: Database) =
   if db == nil:
     return
 
+  # Step 1: Cancel all background compaction/flush work and wait for completion.
+  # Background threads hold references to column families; destroying CF handles
+  # while compaction is running triggers the ColumnFamilySet 'last_ref' assertion.
+  if db.db != nil:
+    rocksdb_cancel_all_background_work(db.db, 1)  # wait=1: block until done
+
+  # Step 2: Destroy column family handles (must happen before rocksdb_close)
   for cf in ColumnFamily:
     if db.cfHandles[cf] != nil:
       rocksdb_column_family_handle_destroy(db.cfHandles[cf])
+      db.cfHandles[cf] = nil
 
-  if db.readOpts != nil:
-    rocksdb_readoptions_destroy(db.readOpts)
-  if db.writeOpts != nil:
-    rocksdb_writeoptions_destroy(db.writeOpts)
-  if db.dbOpts != nil:
-    rocksdb_options_destroy(db.dbOpts)
-  if db.tableOpts != nil:
-    rocksdb_block_based_options_destroy(db.tableOpts)
-  if db.blockCache != nil:
-    rocksdb_cache_destroy(db.blockCache)
-  if db.bloomFilter != nil:
-    rocksdb_filterpolicy_destroy(db.bloomFilter)
+  # Step 3: Close the database (must happen before destroying options/cache/filter)
   if db.db != nil:
     rocksdb_close(db.db)
+    db.db = nil
+
+  # Step 4: Destroy options and shared resources (after DB is closed)
+  if db.readOpts != nil:
+    rocksdb_readoptions_destroy(db.readOpts)
+    db.readOpts = nil
+  if db.writeOpts != nil:
+    rocksdb_writeoptions_destroy(db.writeOpts)
+    db.writeOpts = nil
+  if db.dbOpts != nil:
+    rocksdb_options_destroy(db.dbOpts)
+    db.dbOpts = nil
+  for cf in ColumnFamily:
+    if db.cfTableOpts[cf] != nil:
+      rocksdb_block_based_options_destroy(db.cfTableOpts[cf])
+      db.cfTableOpts[cf] = nil
+  if db.blockCache != nil:
+    rocksdb_cache_destroy(db.blockCache)
+    db.blockCache = nil
+  if db.bloomFilter != nil:
+    rocksdb_filterpolicy_destroy(db.bloomFilter)
+    db.bloomFilter = nil
 
 proc get*(db: Database, cf: ColumnFamily, key: openArray[byte]): Option[seq[byte]] =
   var

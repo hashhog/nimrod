@@ -13,7 +13,7 @@ import ./peermanager
 import ./messages
 import ./headerssync
 import ../primitives/[types, serialize, uint256]
-import ../consensus/[params, validation]
+import ../consensus/[params, pow, validation]
 import ../storage/chainstate
 import ../crypto/hashing
 
@@ -328,8 +328,16 @@ proc validateDifficultyRetarget*(header: BlockHeader, hc: HeaderChain,
 
   # Check if this is a retarget boundary
   if height mod int32(params.difficultyAdjustmentInterval) != 0:
-    # Not a retarget block - difficulty should stay the same
-    # (except for testnet special rules which we ignore for now)
+    # Not a retarget block
+    if params.powAllowMinDifficultyBlocks:
+      # Testnet special rules: min-difficulty blocks are allowed when timestamp
+      # is more than 2*targetSpacing after the previous block. Also, difficulty
+      # can revert to the last non-min-difficulty block's value.
+      # Use permittedDifficultyTransition which already handles this correctly.
+      let powParams = toPowParams(params)
+      return permittedDifficultyTransition(powParams, int32(height),
+                                           prevHeader.bits, header.bits)
+    # Mainnet/Signet: difficulty must stay the same
     return header.bits == prevHeader.bits
 
   # This is a retarget block - calculate expected difficulty
@@ -353,7 +361,9 @@ proc validateDifficultyRetarget*(header: BlockHeader, hc: HeaderChain,
     actualTimespan = maxTimespan
 
   # Calculate new target
-  let expectedBits = calculateNextTarget(prevHeader.bits, actualTimespan, params)
+  # BIP94 (testnet4): use the first block's bits to prevent time-warp attack
+  let bitsForCalc = if params.enforceBIP94: firstHeader.bits else: prevHeader.bits
+  let expectedBits = calculateNextTarget(bitsForCalc, actualTimespan, params)
 
   header.bits == expectedBits
 
@@ -437,6 +447,12 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     result.chainTipHeight = chainDb.bestHeight
     result.headerTip = chainDb.bestBlockHash
     result.headerTipHeight = chainDb.bestHeight
+
+    # At genesis height, use the canonical hash from params to avoid mismatch
+    # between buildGenesisBlock's computed hash and the well-known genesis hash
+    if chainDb.bestHeight == 0:
+      result.chainTip = params.genesisBlockHash
+      result.headerTip = params.genesisBlockHash
 
     # TODO: Load header chain from database
     # For now, start fresh and re-sync headers
@@ -886,9 +902,13 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
   let expectedHeight = sm.chainTipHeight + 1
 
   if expectedHeight > 0:
-    if blk.header.prevBlock != sm.chainTip:
+    # For height 1, compare against canonical genesis hash to handle
+    # buildGenesisBlock producing a different hash than the well-known one
+    let expectedPrev = if expectedHeight == 1: sm.params.genesisBlockHash
+                       else: sm.chainTip
+    if blk.header.prevBlock != expectedPrev:
       warn "block does not connect to chain",
-           expected = $sm.chainTip, got = $blk.header.prevBlock
+           expected = $expectedPrev, got = $blk.header.prevBlock
       return false
 
   # Validate block
