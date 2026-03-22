@@ -936,7 +936,8 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
 
   sm.lastSyncTime = getTime()
 
-  info "processed block", height = expectedHeight, hash = $hash
+  if expectedHeight mod 1000 == 0 or expectedHeight == sm.headerTipHeight:
+    info "processed block", height = expectedHeight, hash = $hash
   true
 
 proc isSynced*(sm: SyncManager): bool =
@@ -1001,8 +1002,9 @@ proc syncLoop*(sm: SyncManager) {.async.} =
         sm.state = ssIdle
       await sleepAsync(5000)
 
-    # Timeout handling
-    if getTime() - sm.lastSyncTime > initDuration(seconds = SyncTimeoutSeconds):
+    # Timeout handling (skip when already synced — no activity expected)
+    if sm.state != ssSynced and
+       getTime() - sm.lastSyncTime > initDuration(seconds = SyncTimeoutSeconds):
       warn "sync timeout, resetting", state = $sm.state
 
       # Switch to different peer if available
