@@ -15,7 +15,7 @@ import ./headerssync
 import ../primitives/[types, serialize, uint256]
 import ../consensus/[params, pow, validation]
 import ../storage/chainstate
-import ../crypto/hashing
+import ../crypto/[hashing, secp256k1]
 
 # Use std/times for Time and Duration (not chronos/timer)
 type
@@ -916,6 +916,24 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
   if not checkResult.isOk:
     warn "invalid block", error = $checkResult.error
     return false
+
+  # Script verification (skip if below assume-valid height)
+  let skipScripts = sm.params.assumeValidHeight > 0 and
+                    expectedHeight <= sm.params.assumeValidHeight
+  if not skipScripts and sm.chainState != nil:
+    try:
+      {.gcsafe.}:
+        let cs = sm.chainState
+        let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] =
+          cs.getUtxo(op)
+        let crypto = newCryptoEngine()
+        let scriptResult = verifyScripts(blk, utxoLookup, expectedHeight, crypto, sm.params)
+        if not scriptResult.isOk:
+          warn "script verification failed", height = expectedHeight, error = $scriptResult.error
+          return false
+    except Exception as e:
+      warn "script verification error", height = expectedHeight, error = e.msg
+      return false
 
   # Apply block to chainstate
   if sm.chainState != nil:

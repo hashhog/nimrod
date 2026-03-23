@@ -66,6 +66,7 @@ type
     # Checkpoint verification (anti-DoS and fork protection)
     minimumChainWork*: array[32, byte]  # Minimum cumulative PoW required
     assumeValidBlockHash*: BlockHash    # Skip script verification before this block
+    assumeValidHeight*: int32           # Height of the assume-valid block
     checkpoints*: seq[Checkpoint]       # Known block hashes at specific heights
     # assumeUTXO snapshot data
     assumeutxoData*: seq[AssumeutxoData]  # Valid snapshot parameters
@@ -312,6 +313,7 @@ proc testnet4Params*(): ConsensusParams =
   result.assumeValidBlockHash = BlockHash(hexToBytes32(
     "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"  # 123613
   ))
+  result.assumeValidHeight = 123613
   # Testnet4 has no historical checkpoints (fresh network)
   result.checkpoints = @[]
   # No assumeUTXO snapshots defined for testnet4 yet
