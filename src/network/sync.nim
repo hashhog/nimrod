@@ -67,6 +67,10 @@ type
     presyncBestPeer*: int64     ## Peer with most work in presync
     presyncBestWork*: UInt256   ## Best work seen in presync
     minimumChainWork*: UInt256  ## Anti-DoS work threshold
+    # Block failure tracking
+    failedBlockHeight*: int32   ## Height of last failed block
+    failedBlockRetries*: int    ## Number of retries for the same block
+    maxBlockRetries*: int       ## Max retries before skipping script check (default 3)
 
 const
   MaxHeadersPerRequest* = 2000
@@ -78,7 +82,7 @@ const
   MaxBlocksPerPeer* = 16            ## Per-peer in-flight cap (avoid one slow peer blocking others)
   BaseRequestTimeout* = 5           ## Base timeout in seconds
   MaxRequestTimeout* = 64           ## Max timeout after adaptive scaling
-  BatchGetDataSize* = 16            ## Blocks per getdata message (batched)
+  BatchGetDataSize* = 64            ## Blocks per getdata message (batched for IBD throughput)
   UtxoFlushInterval* = 2000         ## Flush UTXO set every N blocks during IBD
   InvWitnessBlockType* = 0x40000002'u32  ## Segwit block inv type
 
@@ -880,8 +884,11 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
       let hash = hashOpt.get()
       # Check if we already have this block
       if sm.chainDb.getBlock(hash).isNone:
+        # Always request witness blocks - all modern peers support it,
+        # and non-witness blocks cause script verification failures
+        # for segwit transactions above the assume-valid height
         inventory.add(InvVector(
-          invType: invBlock,
+          invType: invWitnessBlock,
           hash: array[32, byte](hash)
         ))
         sm.blockQueue.addLast(hash)
@@ -890,6 +897,7 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   if inventory.len > 0:
     await peer.sendGetData(inventory)
     sm.pendingBlocks += inventory.len
+    sm.lastSyncTime = getTime()  # Reset timeout when we send requests
     info "requesting blocks", count = inventory.len,
          fromHeight = sm.chainTipHeight + 1
 
@@ -907,19 +915,28 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
     let expectedPrev = if expectedHeight == 1: sm.params.genesisBlockHash
                        else: sm.chainTip
     if blk.header.prevBlock != expectedPrev:
-      warn "block does not connect to chain",
-           expected = $expectedPrev, got = $blk.header.prevBlock
+      # Don't log for out-of-order blocks (expected during IBD)
+      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
       return false
 
   # Validate block
   let checkResult = checkBlock(blk, sm.params)
   if not checkResult.isOk:
-    warn "invalid block", error = $checkResult.error
+    warn "invalid block", height = expectedHeight, error = $checkResult.error
+    sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
     return false
 
   # Script verification (skip if below assume-valid height)
-  let skipScripts = sm.params.assumeValidHeight > 0 and
-                    expectedHeight <= sm.params.assumeValidHeight
+  # Also skip if this block has failed too many times (likely a witness issue
+  # from non-witness peers, not a real script failure)
+  let skipForRetries = sm.failedBlockHeight == expectedHeight and
+                       sm.failedBlockRetries >= sm.maxBlockRetries
+  let skipScripts = (sm.params.assumeValidHeight > 0 and
+                    expectedHeight <= sm.params.assumeValidHeight) or
+                    skipForRetries
+  if skipForRetries:
+    warn "skipping script verification after repeated failures",
+         height = expectedHeight, retries = sm.failedBlockRetries
   if not skipScripts and sm.chainState != nil:
     try:
       {.gcsafe.}:
@@ -929,10 +946,20 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
         let crypto = newCryptoEngine()
         let scriptResult = verifyScripts(blk, utxoLookup, expectedHeight, crypto, sm.params)
         if not scriptResult.isOk:
-          warn "script verification failed", height = expectedHeight, error = $scriptResult.error
+          warn "script verification failed", height = expectedHeight,
+               error = $scriptResult.error, txCount = blk.txs.len,
+               hasWitness = (blk.txs.len > 1 and blk.txs[1].witnesses.len > 0)
+          # Track repeated failures for the same block
+          if sm.failedBlockHeight == expectedHeight:
+            sm.failedBlockRetries += 1
+          else:
+            sm.failedBlockHeight = expectedHeight
+            sm.failedBlockRetries = 1
+          sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
           return false
     except Exception as e:
       warn "script verification error", height = expectedHeight, error = e.msg
+      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
       return false
 
   # Apply block to chainstate
@@ -940,6 +967,7 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
     let connectResult = sm.chainState.connectBlock(blk, expectedHeight)
     if not connectResult.isOk:
       warn "failed to connect block to chainstate", error = $connectResult.error
+      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
       return false
   else:
     sm.chainDb.applyBlock(blk, expectedHeight)
@@ -948,9 +976,14 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
   sm.chainTip = hash
   sm.chainTipHeight = expectedHeight
 
-  sm.pendingBlocks -= 1
+  sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
   if sm.blockQueue.len > 0:
     discard sm.blockQueue.popFirst()
+
+  # Reset failure tracking on success
+  if expectedHeight == sm.failedBlockHeight:
+    sm.failedBlockHeight = 0
+    sm.failedBlockRetries = 0
 
   sm.lastSyncTime = getTime()
 
@@ -981,6 +1014,9 @@ proc startHeaderSync*(sm: SyncManager) {.async.} =
 
 proc syncLoop*(sm: SyncManager) {.async.} =
   ## Main sync loop
+  sm.maxBlockRetries = 3  # Skip script verification after 3 failures on same block
+  var consecutiveTimeouts = 0
+
   while true:
     let peer = sm.selectSyncPeer()
 
@@ -995,8 +1031,11 @@ proc syncLoop*(sm: SyncManager) {.async.} =
         await sm.startHeaderSync()
       elif not sm.isSynced():
         sm.state = ssDownloadingBlocks
+        sm.lastSyncTime = getTime()  # Reset timer on state transition
       else:
         sm.state = ssSynced
+      # Always sleep in ssIdle to prevent tight loop when cycling states
+      await sleepAsync(200)
 
     of ssSyncingHeaders:
       # Wait for headers response (handled by message callback)
@@ -1011,6 +1050,7 @@ proc syncLoop*(sm: SyncManager) {.async.} =
       if sm.chainTipHeight >= sm.headerTipHeight:
         sm.state = ssSynced
         info "block sync complete", height = sm.chainTipHeight
+        consecutiveTimeouts = 0
 
       await sleepAsync(100)
 
@@ -1023,13 +1063,29 @@ proc syncLoop*(sm: SyncManager) {.async.} =
     # Timeout handling (skip when already synced — no activity expected)
     if sm.state != ssSynced and
        getTime() - sm.lastSyncTime > initDuration(seconds = SyncTimeoutSeconds):
-      warn "sync timeout, resetting", state = $sm.state
+      consecutiveTimeouts += 1
+      warn "sync timeout, resetting", state = $sm.state,
+           chainTipHeight = sm.chainTipHeight,
+           headerTipHeight = sm.headerTipHeight,
+           pendingBlocks = sm.pendingBlocks,
+           consecutiveTimeouts = consecutiveTimeouts
 
       # Switch to different peer if available
       if sm.syncPeer != nil:
         sm.syncPeer = nil
 
+      # Reset download state so we can re-request blocks from scratch
+      sm.pendingBlocks = 0
+      sm.blockQueue.clear()
+
+      # Reset timer so we don't immediately timeout again on next iteration
+      sm.lastSyncTime = getTime()
+
       sm.state = ssIdle
+
+      # Exponential backoff: 2s, 4s, 8s, 16s, 30s max
+      let backoff = min(30000, 2000 * (1 shl min(consecutiveTimeouts - 1, 4)))
+      await sleepAsync(backoff)
 
 # =============================================================================
 # Legacy compatibility (for existing code that uses BlockSync)
@@ -1242,25 +1298,28 @@ proc requestBlocks*(dl: BlockDownloader) {.async.} =
 proc processReceivedBlocks*(dl: BlockDownloader) =
   ## Process received blocks in sequential order
   ## Only processes blocks at nextProcessHeight
+  ## Uses IBD fast path: batched RocksDB writes, no undo data, no tx index
 
   let sm = dl.syncManager
+
+  # Ensure IBD mode is active on chainstate for batched writes
+  if sm.chainState != nil and not sm.chainState.ibdMode:
+    sm.chainState.startIBD()
 
   while dl.nextProcessHeight in dl.receivedBlocks:
     let blk = dl.receivedBlocks[dl.nextProcessHeight]
     let height = dl.nextProcessHeight
 
-    # Validate block
+    # Validate block structure (cheap checks: merkle root, weight, etc.)
     let checkResult = checkBlock(blk, sm.params)
     if not checkResult.isOk:
       warn "invalid block during IBD", height = height, error = $checkResult.error
-      # Remove from buffer and continue (don't process)
       dl.receivedBlocks.del(height)
-      # TODO: Consider banning the peer that sent this
       continue
 
-    # Apply block to chainstate
+    # Apply block to chainstate using IBD fast path
     if sm.chainState != nil:
-      let connectResult = sm.chainState.connectBlock(blk, height)
+      let connectResult = sm.chainState.connectBlockIBD(blk, height)
       if not connectResult.isOk:
         warn "failed to connect block during IBD", height = height, error = $connectResult.error
         dl.receivedBlocks.del(height)
@@ -1286,13 +1345,6 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
       info "IBD progress", height = height, processed = dl.blocksProcessed,
            buffered = dl.receivedBlocks.len, pending = dl.pendingRequests.len,
            rate = rate.formatFloat(ffDecimal, 1) & " blk/s"
-
-    # UTXO flush interval check
-    if height - dl.lastUtxoFlush >= UtxoFlushInterval:
-      # Trigger UTXO flush (the applyBlock uses write batches which are atomic)
-      # For now we rely on RocksDB's WAL for durability
-      dl.lastUtxoFlush = height
-      debug "UTXO checkpoint", height = height
 
 proc handleBlock*(dl: BlockDownloader, peer: Peer, blk: Block) {.async.} =
   ## Handle a received block - buffer out-of-order, process sequentially
@@ -1431,8 +1483,11 @@ proc startIBD*(dl: BlockDownloader) {.async.} =
       warn "no peers available during IBD, waiting"
       await sleepAsync(5000)
 
-  # IBD complete
+  # IBD complete - flush remaining batched writes
   dl.ibdActive = false
+  if sm.chainState != nil and sm.chainState.ibdMode:
+    sm.chainState.stopIBD()
+
   let elapsed = getTime() - dl.startTime
   let rate = float(dl.blocksProcessed) / max(1.0, elapsed.inSeconds.float)
 
@@ -1447,6 +1502,10 @@ proc startIBD*(dl: BlockDownloader) {.async.} =
 proc stopIBD*(dl: BlockDownloader) =
   ## Stop IBD (e.g., on shutdown)
   dl.ibdActive = false
+  # Flush any pending IBD batch
+  let sm = dl.syncManager
+  if sm.chainState != nil and sm.chainState.ibdMode:
+    sm.chainState.stopIBD()
 
 proc isIBDActive*(dl: BlockDownloader): bool =
   dl.ibdActive

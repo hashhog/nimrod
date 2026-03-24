@@ -1836,7 +1836,9 @@ proc verifyWitnessProgram*(
   tx: Transaction,
   inputIndex: int,
   amount: Satoshi,
-  flags: set[ScriptFlags]
+  flags: set[ScriptFlags],
+  allAmounts: seq[Satoshi] = @[],
+  allScriptPubKeys: seq[seq[byte]] = @[]
 ): bool
 
 proc verifyScript*(
@@ -1846,11 +1848,21 @@ proc verifyScript*(
   inputIndex: int,
   amount: Satoshi = Satoshi(0),
   flags: set[ScriptFlags] = {},
-  witness: seq[seq[byte]] = @[]
+  witness: seq[seq[byte]] = @[],
+  allAmounts: seq[Satoshi] = @[],
+  allScriptPubKeys: seq[seq[byte]] = @[]
 ): bool =
   ## Verify a transaction input
+  ## allAmounts/allScriptPubKeys: for BIP341 taproot sighash, ALL input amounts
+  ## and prevout scriptPubKeys are needed. If empty, falls back to single amount.
 
   var interp = newInterpreter(flags)
+
+  # Use provided full arrays, or fall back to single-element arrays
+  let ctxAmounts = if allAmounts.len == tx.inputs.len: allAmounts
+                   else: @[amount]
+  let ctxScriptPubKeys = if allScriptPubKeys.len == tx.inputs.len: allScriptPubKeys
+                         else: @[scriptPubKey]
 
   # Create signature check context
   var ctx = SigCheckContext(
@@ -1859,8 +1871,8 @@ proc verifyScript*(
     amount: amount,
     scriptPubKey: scriptPubKey,
     sigVersion: sigBase,
-    amounts: @[amount],
-    scriptPubKeys: @[scriptPubKey],
+    amounts: ctxAmounts,
+    scriptPubKeys: ctxScriptPubKeys,
     codesepPos: 0xFFFFFFFF'u32
   )
 
@@ -1899,7 +1911,8 @@ proc verifyScript*(
       return false
 
     return verifyWitnessProgram(
-      witness, witnessVersion, witnessProgram, tx, inputIndex, amount, flags
+      witness, witnessVersion, witnessProgram, tx, inputIndex, amount, flags,
+      ctxAmounts, ctxScriptPubKeys
     )
 
   # P2SH handling
@@ -1933,7 +1946,8 @@ proc verifyScript*(
 
     if sfWitness in flags and isP2shWitness:
       return verifyWitnessProgram(
-        witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags
+        witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags,
+        ctxAmounts, ctxScriptPubKeys
       )
 
   # Clean stack check
@@ -1951,7 +1965,9 @@ proc verifyWitnessProgramWithError*(
   tx: Transaction,
   inputIndex: int,
   amount: Satoshi,
-  flags: set[ScriptFlags]
+  flags: set[ScriptFlags],
+  allAmounts: seq[Satoshi] = @[],
+  allScriptPubKeys: seq[seq[byte]] = @[]
 ): ScriptError
 
 proc verifyScriptWithError*(
@@ -1961,11 +1977,19 @@ proc verifyScriptWithError*(
   inputIndex: int,
   amount: Satoshi = Satoshi(0),
   flags: set[ScriptFlags] = {},
-  witness: seq[seq[byte]] = @[]
+  witness: seq[seq[byte]] = @[],
+  allAmounts: seq[Satoshi] = @[],
+  allScriptPubKeys: seq[seq[byte]] = @[]
 ): ScriptError =
   ## Verify a transaction input, returning the specific error on failure
 
   var interp = newInterpreter(flags)
+
+  # Use provided full arrays, or fall back to single-element arrays
+  let ctxAmounts = if allAmounts.len == tx.inputs.len: allAmounts
+                   else: @[amount]
+  let ctxScriptPubKeys = if allScriptPubKeys.len == tx.inputs.len: allScriptPubKeys
+                         else: @[scriptPubKey]
 
   # Create signature check context
   var ctx = SigCheckContext(
@@ -1974,8 +1998,8 @@ proc verifyScriptWithError*(
     amount: amount,
     scriptPubKey: scriptPubKey,
     sigVersion: sigBase,
-    amounts: @[amount],
-    scriptPubKeys: @[scriptPubKey],
+    amounts: ctxAmounts,
+    scriptPubKeys: ctxScriptPubKeys,
     codesepPos: 0xFFFFFFFF'u32
   )
 
@@ -2015,7 +2039,8 @@ proc verifyScriptWithError*(
       return seWitnessMalleated
 
     return verifyWitnessProgramWithError(
-      witness, witnessVersion, witnessProgram, tx, inputIndex, amount, flags
+      witness, witnessVersion, witnessProgram, tx, inputIndex, amount, flags,
+      ctxAmounts, ctxScriptPubKeys
     )
 
   # P2SH handling
@@ -2049,7 +2074,8 @@ proc verifyScriptWithError*(
 
     if sfWitness in flags and isP2shWitness:
       return verifyWitnessProgramWithError(
-        witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags
+        witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags,
+        ctxAmounts, ctxScriptPubKeys
       )
 
   # BIP141: if WITNESS flag is set and script is NOT a witness program,
@@ -2073,9 +2099,12 @@ proc verifyWitnessProgram*(
   tx: Transaction,
   inputIndex: int,
   amount: Satoshi,
-  flags: set[ScriptFlags]
+  flags: set[ScriptFlags],
+  allAmounts: seq[Satoshi] = @[],
+  allScriptPubKeys: seq[seq[byte]] = @[]
 ): bool =
   ## Verify a witness program
+  ## allAmounts/allScriptPubKeys: for BIP341 taproot, ALL input prevout data
 
   if version == 0:
     # SegWit v0
@@ -2197,18 +2226,24 @@ proc verifyWitnessProgram*(
         sigBytes[i] = sig[i]
 
       # Get all input amounts and scriptPubKeys for taproot sighash
-      var amounts: seq[Satoshi]
-      var scriptPubKeys: seq[seq[byte]]
-      for i, inp in tx.inputs:
-        if i == inputIndex:
-          amounts.add(amount)
-          scriptPubKeys.add(@[OP_1, 0x20'u8] & program)
-        else:
-          amounts.add(Satoshi(0))  # Would need actual amounts
-          scriptPubKeys.add(@[])   # Would need actual scriptPubKeys
+      # Use provided arrays if available, otherwise fall back to single-input
+      var taprootAmounts: seq[Satoshi]
+      var taprootScriptPubKeys: seq[seq[byte]]
+      if allAmounts.len == tx.inputs.len and allScriptPubKeys.len == tx.inputs.len:
+        taprootAmounts = allAmounts
+        taprootScriptPubKeys = allScriptPubKeys
+      else:
+        # Fallback for single-input txs or when full data not available
+        for i, inp in tx.inputs:
+          if i == inputIndex:
+            taprootAmounts.add(amount)
+            taprootScriptPubKeys.add(@[OP_1, 0x20'u8] & program)
+          else:
+            taprootAmounts.add(Satoshi(0))
+            taprootScriptPubKeys.add(@[])
 
       let sighash = computeSighashTaproot(
-        tx, inputIndex, amounts, scriptPubKeys, hashType, 0, annex
+        tx, inputIndex, taprootAmounts, taprootScriptPubKeys, hashType, 0, annex
       )
 
       var xonlyPk: array[32, byte]
@@ -2292,16 +2327,20 @@ proc verifyWitnessProgram*(
       for i in 0 ..< witnessStack.len - 2:
         interp.push(witnessStack[i])
 
-      # Get all input amounts and scriptPubKeys
-      var amounts: seq[Satoshi]
-      var scriptPubKeys: seq[seq[byte]]
-      for i, inp in tx.inputs:
-        if i == inputIndex:
-          amounts.add(amount)
-          scriptPubKeys.add(@[OP_1, 0x20'u8] & program)
-        else:
-          amounts.add(Satoshi(0))
-          scriptPubKeys.add(@[])
+      # Get all input amounts and scriptPubKeys for taproot sighash
+      var tapAmounts: seq[Satoshi]
+      var tapScriptPubKeys: seq[seq[byte]]
+      if allAmounts.len == tx.inputs.len and allScriptPubKeys.len == tx.inputs.len:
+        tapAmounts = allAmounts
+        tapScriptPubKeys = allScriptPubKeys
+      else:
+        for i, inp in tx.inputs:
+          if i == inputIndex:
+            tapAmounts.add(amount)
+            tapScriptPubKeys.add(@[OP_1, 0x20'u8] & program)
+          else:
+            tapAmounts.add(Satoshi(0))
+            tapScriptPubKeys.add(@[])
 
       var ctx = SigCheckContext(
         tx: tx,
@@ -2309,8 +2348,8 @@ proc verifyWitnessProgram*(
         amount: amount,
         scriptPubKey: @[OP_1, 0x20'u8] & program,
         sigVersion: sigTapscript,
-        amounts: amounts,
-        scriptPubKeys: scriptPubKeys,
+        amounts: tapAmounts,
+        scriptPubKeys: tapScriptPubKeys,
         annex: annex,
         tapleafHash: tapleafHash,
         codesepPos: 0xFFFFFFFF'u32
@@ -2342,7 +2381,9 @@ proc verifyWitnessProgramWithError*(
   tx: Transaction,
   inputIndex: int,
   amount: Satoshi,
-  flags: set[ScriptFlags]
+  flags: set[ScriptFlags],
+  allAmounts: seq[Satoshi] = @[],
+  allScriptPubKeys: seq[seq[byte]] = @[]
 ): ScriptError =
   ## Verify a witness program, returning the specific error on failure
 
@@ -2446,7 +2487,8 @@ proc verifyWitnessProgramWithError*(
 
     if witnessStack.len == 1:
       # Key path spend - delegate to bool version for signature check
-      if verifyWitnessProgram(witness, version, program, tx, inputIndex, amount, flags):
+      if verifyWitnessProgram(witness, version, program, tx, inputIndex, amount, flags,
+                              allAmounts, allScriptPubKeys):
         return seOk
       else:
         return seTaprootError
@@ -2481,15 +2523,20 @@ proc verifyWitnessProgramWithError*(
       for i in 0 ..< witnessStack.len - 2:
         interp.push(witnessStack[i])
 
-      var amounts: seq[Satoshi]
-      var scriptPubKeys: seq[seq[byte]]
-      for i, inp in tx.inputs:
-        if i == inputIndex:
-          amounts.add(amount)
-          scriptPubKeys.add(@[OP_1, 0x20'u8] & program)
-        else:
-          amounts.add(Satoshi(0))
-          scriptPubKeys.add(@[])
+      # Get all input amounts and scriptPubKeys for taproot sighash
+      var tapAmts: seq[Satoshi]
+      var tapSpks: seq[seq[byte]]
+      if allAmounts.len == tx.inputs.len and allScriptPubKeys.len == tx.inputs.len:
+        tapAmts = allAmounts
+        tapSpks = allScriptPubKeys
+      else:
+        for i, inp in tx.inputs:
+          if i == inputIndex:
+            tapAmts.add(amount)
+            tapSpks.add(@[OP_1, 0x20'u8] & program)
+          else:
+            tapAmts.add(Satoshi(0))
+            tapSpks.add(@[])
 
       var ctx = SigCheckContext(
         tx: tx,
@@ -2497,8 +2544,8 @@ proc verifyWitnessProgramWithError*(
         amount: amount,
         scriptPubKey: @[OP_1, 0x20'u8] & program,
         sigVersion: sigTapscript,
-        amounts: amounts,
-        scriptPubKeys: scriptPubKeys,
+        amounts: tapAmts,
+        scriptPubKeys: tapSpks,
         annex: annex,
         tapleafHash: tapleafHash,
         codesepPos: 0xFFFFFFFF'u32
