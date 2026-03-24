@@ -89,6 +89,12 @@ type
     cacheSize*: int
     maxCacheSize*: int  ## Flush at 50000
     undoMgr*: UndoFileManager  ## Manages flat file undo storage
+    # IBD batching state
+    ibdBatch*: WriteBatch        ## Persistent write batch for IBD
+    ibdBatchBlocks*: int         ## Blocks accumulated in current batch
+    ibdMode*: bool               ## True during initial block download
+    # Pending UTXO deletes tracked during IBD (cache key -> true)
+    ibdDeletedUtxos*: Table[string, bool]
 
   ## Result type for chainstate operations
   ChainStateResult*[T] = object
@@ -396,7 +402,11 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     utxoCache: initTable[OutPoint, UtxoEntry](),
     cacheSize: 0,
     maxCacheSize: DefaultMaxCacheSize,
-    undoMgr: newUndoFileManager(dbPath / "blocks")
+    undoMgr: newUndoFileManager(dbPath / "blocks"),
+    ibdBatch: nil,
+    ibdBatchBlocks: 0,
+    ibdMode: false,
+    ibdDeletedUtxos: initTable[string, bool]()
   )
 
   # Load total work from DB if available
@@ -412,6 +422,13 @@ proc close*(cs: var ChainState) =
 
 proc getUtxo*(cs: ChainState, op: OutPoint): Option[UtxoEntry] =
   ## Get UTXO entry, checking cache first
+  ## During IBD, also checks deletion tracking
+  # During IBD, check if this UTXO was deleted in the current unflushed batch
+  if cs.ibdMode:
+    let ck = outpointKey(op)
+    if ck in cs.ibdDeletedUtxos:
+      return none(UtxoEntry)
+
   # Check local cache first
   if op in cs.utxoCache:
     return some(cs.utxoCache[op])
@@ -632,6 +649,152 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
     cs.flushCache()
 
   ok()
+
+# IBD batch flush interval (flush every N blocks)
+const IbdBatchFlushInterval* = 2000
+
+proc startIBD*(cs: var ChainState) =
+  ## Enter IBD mode: enable write batching for performance
+  cs.ibdMode = true
+  cs.ibdBatch = cs.db.db.newWriteBatch()
+  cs.ibdBatchBlocks = 0
+  cs.ibdDeletedUtxos = initTable[string, bool]()
+  # Increase cache size during IBD to reduce DB lookups
+  cs.maxCacheSize = 200_000
+  # Disable WAL for faster writes (data is durable via periodic batch flushes)
+  cs.db.db.disableWAL()
+
+proc flushIBDBatch*(cs: var ChainState) =
+  ## Flush accumulated IBD write batch to RocksDB
+  if cs.ibdBatch != nil and cs.ibdBatchBlocks > 0:
+    # Write best block pointer into the batch so it's atomic
+    cs.ibdBatch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](cs.bestBlockHash)))
+    var w = BinaryWriter()
+    w.writeInt32LE(cs.bestHeight)
+    cs.ibdBatch.put(cfMeta, metaKey("height"), w.data)
+    cs.ibdBatch.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
+
+    # Also flush cached UTXOs into the batch
+    for op, entry in cs.utxoCache:
+      let key = utxoKey(array[32, byte](op.txid), op.vout)
+      cs.ibdBatch.put(cfUtxo, key, serializeUtxoEntry(entry))
+
+    # Commit the entire batch atomically
+    cs.db.db.write(cs.ibdBatch)
+
+    # Reset batch
+    cs.ibdBatch.clear()
+    cs.ibdBatchBlocks = 0
+    cs.ibdDeletedUtxos.clear()
+
+    # Update ChainDb in-memory state
+    cs.db.bestBlockHash = cs.bestBlockHash
+    cs.db.bestHeight = cs.bestHeight
+
+proc stopIBD*(cs: var ChainState) =
+  ## Exit IBD mode: flush remaining batch and switch to per-block writes
+  if cs.ibdBatch != nil:
+    cs.flushIBDBatch()
+    cs.ibdBatch.destroy()
+    cs.ibdBatch = nil
+  cs.ibdMode = false
+  cs.maxCacheSize = DefaultMaxCacheSize
+  # Re-enable WAL for normal operation
+  cs.db.db.enableWAL()
+
+proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainStateResult[void] =
+  ## Fast-path block connection for IBD
+  ## Skips: undo data, tx index, full block storage, per-block RocksDB flush
+  ## Accumulates UTXO changes in memory + write batch, flushes every IbdBatchFlushInterval blocks
+
+  let headerBytes = serialize(blk.header)
+  let blockHash = BlockHash(doubleSha256(headerBytes))
+
+  # Process each transaction - UTXO updates only
+  for txIdx, tx in blk.txs:
+    let txId = tx.txid()
+
+    # Spend inputs (skip coinbase)
+    if txIdx > 0:
+      for input in tx.inputs:
+        let utxoOpt = cs.getUtxo(input.prevOut)
+        if utxoOpt.isNone:
+          # Also check ibdDeletedUtxos - if already deleted, it's a double-spend
+          return err("missing input: " & $input.prevOut.txid)
+
+        let entry = utxoOpt.get()
+
+        # Check coinbase maturity
+        if entry.isCoinbase:
+          let age = height - entry.height
+          if age < int32(cs.params.coinbaseMaturity):
+            return err("immature coinbase spend at height " & $height &
+                      ", coinbase height " & $entry.height &
+                      ", age " & $age & " < " & $cs.params.coinbaseMaturity)
+
+        # Delete from batch and cache
+        let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
+        cs.ibdBatch.delete(cfUtxo, key)
+        cs.deleteUtxoCache(input.prevOut)
+        # Track deletion so we don't serve stale data from DB
+        cs.ibdDeletedUtxos[outpointKey(input.prevOut)] = true
+
+    # Create outputs - add to cache (will be flushed in batch)
+    for voutIdx, output in tx.outputs:
+      let entry = UtxoEntry(
+        output: output,
+        height: height,
+        isCoinbase: txIdx == 0
+      )
+      let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
+      cs.putUtxoCache(outpoint, entry)
+      # Remove from deleted tracking if re-created
+      let ck = outpointKey(outpoint)
+      if ck in cs.ibdDeletedUtxos:
+        cs.ibdDeletedUtxos.del(ck)
+
+  # Calculate and add work
+  let blockWork = calculateBlockWork(blk.header.bits)
+  addWork(cs.totalWork, blockWork)
+
+  # Store block index entry (lightweight - needed for chain tracking)
+  let idx = BlockIndex(
+    hash: blockHash,
+    height: height,
+    status: bsValidated,
+    prevHash: blk.header.prevBlock,
+    header: blk.header,
+    totalWork: cs.totalWork,
+    undoPos: FlatFilePos(fileNum: -1, pos: -1)
+  )
+  cs.ibdBatch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
+  cs.ibdBatch.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](blockHash)))
+
+  # Update in-memory state
+  cs.bestBlockHash = blockHash
+  cs.bestHeight = height
+
+  cs.ibdBatchBlocks += 1
+
+  # Flush batch every N blocks
+  if cs.ibdBatchBlocks >= IbdBatchFlushInterval:
+    cs.flushIBDBatch()
+
+  ok()
+
+proc getUtxoIBD*(cs: ChainState, op: OutPoint): Option[UtxoEntry] =
+  ## Get UTXO during IBD - checks deletions tracking
+  # Check if deleted in current batch
+  let ck = outpointKey(op)
+  if ck in cs.ibdDeletedUtxos:
+    return none(UtxoEntry)
+
+  # Check local cache first
+  if op in cs.utxoCache:
+    return some(cs.utxoCache[op])
+
+  # Fall back to database
+  cs.db.getUtxo(op)
 
 # Disconnect a block from the chain
 
