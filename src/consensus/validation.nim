@@ -1123,30 +1123,42 @@ proc verifyScripts*(
     let tx = blk.txs[i]
     let txidBytes = array[32, byte](tx.txid())
 
-    for inputIdx, inp in tx.inputs:
-      # Check signature cache before expensive verification
-      if globalSigCache.lookup(txidBytes, uint32(inputIdx), flagsUint):
-        continue
-
-      # Look up the UTXO being spent
+    # Pre-collect ALL input UTXOs for this tx (needed for BIP341 taproot sighash)
+    var allAmounts: seq[Satoshi] = @[]
+    var allScriptPubKeys: seq[seq[byte]] = @[]
+    var allUtxos: seq[UtxoEntry] = @[]
+    var utxosMissing = false
+    for inp in tx.inputs:
       let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
       var utxoOpt: Option[UtxoEntry]
       if key in intraBlockUtxos:
         utxoOpt = some(intraBlockUtxos[key])
       else:
         utxoOpt = utxos(inp.prevOut)
-
       if utxoOpt.isNone:
-        return voidErr(veInputsMissing)
+        utxosMissing = true
+        break
+      let u = utxoOpt.get()
+      allUtxos.add(u)
+      allAmounts.add(u.output.value)
+      allScriptPubKeys.add(u.output.scriptPubKey)
 
-      let utxo = utxoOpt.get()
+    if utxosMissing:
+      return voidErr(veInputsMissing)
+
+    for inputIdx, inp in tx.inputs:
+      # Check signature cache before expensive verification
+      if globalSigCache.lookup(txidBytes, uint32(inputIdx), flagsUint):
+        continue
+
+      let utxo = allUtxos[inputIdx]
 
       # Get witness data for this input
       var witness: seq[seq[byte]] = @[]
       if inputIdx < tx.witnesses.len:
         witness = tx.witnesses[inputIdx]
 
-      # Verify the script
+      # Verify the script (pass all amounts/scriptPubKeys for taproot sighash)
       let verified = verifyScript(
         inp.scriptSig,
         utxo.output.scriptPubKey,
@@ -1154,7 +1166,9 @@ proc verifyScripts*(
         inputIdx,
         utxo.output.value,
         flags,
-        witness
+        witness,
+        allAmounts,
+        allScriptPubKeys
       )
 
       if not verified:

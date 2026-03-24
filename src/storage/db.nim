@@ -15,7 +15,7 @@ const LibRocksDb* = "librocksdb.so"
 
 # Performance tuning constants
 const
-  BlockCacheSize* = 256 * 1024 * 1024'u64       # 256MB block cache
+  BlockCacheSize* = 512 * 1024 * 1024'u64       # 512MB block cache
   WriteBufferSize* = 64 * 1024 * 1024'u64       # 64MB write buffer
   MaxWriteBufferNumber* = 4                      # 4 write buffers max
   BloomFilterBits* = 10                          # 10-bit bloom filter
@@ -486,6 +486,17 @@ proc clear*(batch: WriteBatch) =
 proc destroy*(batch: WriteBatch) =
   if batch.batch != nil:
     rocksdb_writebatch_destroy(batch.batch)
+
+proc disableWAL*(db: Database) =
+  ## Disable Write-Ahead Log for faster writes during IBD
+  ## Data is still durable via periodic flushes
+  if db.writeOpts != nil:
+    rocksdb_writeoptions_disable_WAL(db.writeOpts, 1)
+
+proc enableWAL*(db: Database) =
+  ## Re-enable Write-Ahead Log after IBD
+  if db.writeOpts != nil:
+    rocksdb_writeoptions_disable_WAL(db.writeOpts, 0)
 
 # Key construction helpers (big-endian for ordered iteration)
 
