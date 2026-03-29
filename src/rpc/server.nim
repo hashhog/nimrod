@@ -3837,6 +3837,10 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
       if inHeaders:
         let line = await transp.readLine()
 
+        if line.len == 0 and transp.atEof():
+          # Connection closed by remote — stop processing
+          break
+
         if line.len == 0:
           # End of headers
           inHeaders = false
@@ -3845,6 +3849,7 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
           if not rpc.checkAuth(authHeader):
             let response = "HTTP/1.1 401 Unauthorized\r\n" &
                           "WWW-Authenticate: Basic realm=\"nimrod\"\r\n" &
+                          "Connection: close\r\n" &
                           "Content-Length: 0\r\n" &
                           "\r\n"
             discard await transp.write(response)
@@ -3866,9 +3871,12 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
 
             let httpResponse = "HTTP/1.1 200 OK\r\n" &
                               "Content-Type: application/json\r\n" &
+                              "Connection: close\r\n" &
                               "Content-Length: " & $respResult.len & "\r\n" &
                               "\r\n" & respResult
             discard await transp.write(httpResponse)
+            # Connection: close — finish after each request
+            break
 
           # Reset for next request (keep-alive)
           inHeaders = true
