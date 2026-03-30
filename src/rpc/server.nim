@@ -33,6 +33,7 @@ type
     params*: ConsensusParams
     authUser*: string
     authPass*: string
+    cookiePassword*: string              ## Password for __cookie__ auth (auto-generated)
     running*: bool
     crypto*: CryptoEngine
     blockFileManager*: BlockFileManager  ## Optional: for pruning support
@@ -86,7 +87,8 @@ proc newRpcServer*(
   feeEstimator: FeeEstimator,
   params: ConsensusParams,
   authUser: string = "",
-  authPass: string = ""
+  authPass: string = "",
+  cookiePassword: string = ""
 ): RpcServer =
   RpcServer(
     port: port,
@@ -97,6 +99,7 @@ proc newRpcServer*(
     params: params,
     authUser: authUser,
     authPass: authPass,
+    cookiePassword: cookiePassword,
     running: false,
     crypto: newCryptoEngine()
   )
@@ -1777,6 +1780,13 @@ proc handleGenerateToDescriptor(rpc: RpcServer, params: JsonNode): JsonNode =
   var mp = rpc.mempool
 
   let hashes = generateToDescriptor(cs, mp, rpc.params, nblocks, descriptorStr, maxTries)
+
+  # Broadcast new blocks to peers
+  if rpc.peerManager != nil:
+    for hash in hashes:
+      let blkOpt = rpc.chainState.db.getBlock(hash)
+      if blkOpt.isSome:
+        asyncSpawn rpc.peerManager.broadcastBlock(blkOpt.get())
 
   # Convert to JSON array of hex strings
   var result = newJArray()
@@ -3809,19 +3819,36 @@ proc handleRequest(rpc: RpcServer, body: string): string =
   return makeErrorResponse(newJNull(), RpcParseError, "Top-level object parse error")
 
 proc checkAuth(rpc: RpcServer, authHeader: string): bool =
-  ## Verify HTTP Basic auth credentials
-  if rpc.authUser == "" and rpc.authPass == "":
-    return true  # No auth configured
+  ## Verify HTTP Basic auth credentials.
+  ## Accepts either --rpcuser/--rpcpassword credentials or the auto-generated
+  ## __cookie__:<hex> cookie credential (matching Bitcoin Core behaviour).
+  let hasUserPass = rpc.authUser != "" and rpc.authPass != ""
+  let hasCookie   = rpc.cookiePassword != ""
+
+  if not hasUserPass and not hasCookie:
+    return true  # No auth configured — open access
 
   if not authHeader.startsWith("Basic "):
     return false
 
   try:
     let decoded = decode(authHeader[6 .. ^1])
-    let parts = decoded.split(':')
-    if parts.len != 2:
+    # split on first ':' only — passwords may contain colons
+    let colonIdx = decoded.find(':')
+    if colonIdx < 0:
       return false
-    return parts[0] == rpc.authUser and parts[1] == rpc.authPass
+    let user = decoded[0 ..< colonIdx]
+    let pass = decoded[colonIdx + 1 .. ^1]
+
+    # Cookie auth: username must be exactly "__cookie__"
+    if user == "__cookie__" and hasCookie:
+      return pass == rpc.cookiePassword
+
+    # Regular user/password auth
+    if hasUserPass:
+      return user == rpc.authUser and pass == rpc.authPass
+
+    return false
   except CatchableError:
     return false
 
@@ -3859,6 +3886,11 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
           if contentLength > 0:
             let bodyData = await transp.read(contentLength)
             let body = cast[string](bodyData)
+
+            # Yield to the event loop before the synchronous chain-state read so
+            # that other pending futures (peer I/O, sync loop heartbeats) are not
+            # starved during heavy RPC calls like getblock or gettxoutsetinfo.
+            await sleepAsync(milliseconds(0))
 
             var respResult: string
             {.gcsafe.}:
