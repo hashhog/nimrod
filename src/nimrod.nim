@@ -1,7 +1,7 @@
 ## nimrod - Bitcoin full node in Nim
 ## Unified CLI with subcommands for node operation, RPC interaction, and wallet management
 
-import std/[parseopt, os, strutils, json, posix, net, base64]
+import std/[parseopt, os, strutils, json, posix, net, base64, sysrand]
 import chronos
 import chronicles
 
@@ -379,10 +379,15 @@ proc setupSignalHandlers*() =
         info "flushing UTXO cache"
         globalNodeState.chainState.flushCache()
 
-      # Stop RPC server
+      # Stop RPC server and remove cookie file
       if globalNodeState.rpcServer != nil:
         info "stopping RPC server"
         globalNodeState.rpcServer.stop()
+        let cookiePath = globalNodeState.config.dataDir /
+                         globalNodeState.config.network / ".cookie"
+        if fileExists(cookiePath):
+          removeFile(cookiePath)
+          info "removed RPC cookie file", path = cookiePath
 
       # Disconnect peers
       if globalNodeState.peerManager != nil:
@@ -400,6 +405,25 @@ proc setupSignalHandlers*() =
 
   signal(SIGINT, sigHandler)
   signal(SIGTERM, sigHandler)
+
+proc generateCookieFile*(dataDir: string): string =
+  ## Generate a 32-byte random cookie, write "__cookie__:<hex>" to
+  ## {dataDir}/.cookie with mode 0o600, and return the hex password.
+  ## Mirrors Bitcoin Core's GenerateAuthCookie() in httpserver.cpp.
+  var rawBytes: array[32, byte]
+  if not urandom(rawBytes):
+    raise newException(IOError, "failed to read random bytes from system RNG")
+
+  var hexPass = ""
+  for b in rawBytes:
+    hexPass.add(toHex(int(b), 2).toLowerAscii())
+
+  let cookiePath = dataDir / ".cookie"
+  let cookieContent = "__cookie__:" & hexPass
+  writeFile(cookiePath, cookieContent)
+  setFilePermissions(cookiePath, {fpUserRead, fpUserWrite})
+
+  hexPass
 
 proc startNode*(config: NimrodConfig) {.async.} =
   ## Start the node
@@ -481,6 +505,13 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # 7. Start RPC server
   if config.rpcEnabled:
     info "starting RPC server", port = config.rpcPort
+
+    # Generate cookie auth — always written so that local tooling can connect
+    # even when --rpcuser/--rpcpassword are not set.
+    let cookiePass = generateCookieFile(networkDir)
+    let cookiePath = networkDir / ".cookie"
+    info "wrote RPC cookie file", path = cookiePath
+
     state.rpcServer = newRpcServer(
       config.rpcPort,
       state.chainState,
@@ -489,7 +520,8 @@ proc startNode*(config: NimrodConfig) {.async.} =
       state.feeEstimator,
       params,
       config.rpcUser,
-      config.rpcPassword
+      config.rpcPassword,
+      cookiePass
     )
     asyncSpawn state.rpcServer.start()
 
