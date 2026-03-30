@@ -71,6 +71,9 @@ type
     failedBlockHeight*: int32   ## Height of last failed block
     failedBlockRetries*: int    ## Number of retries for the same block
     maxBlockRetries*: int       ## Max retries before skipping script check (default 3)
+    # Out-of-order block buffer (blocks received ahead of chainTip)
+    receivedBlocks*: Table[int32, Block]  ## height -> block buffer
+    requestedHashes*: HashSet[BlockHash]  ## hashes currently in-flight
 
 const
   MaxHeadersPerRequest* = 2000
@@ -272,6 +275,13 @@ proc getHashByHeight*(hc: HeaderChain, height: int32): Option[BlockHash] =
   else:
     none(BlockHash)
 
+proc getHeight*(hc: HeaderChain, hash: BlockHash): Option[int32] =
+  ## Look up the height of a block by its hash
+  if hash in hc.byHash:
+    some(int32(hc.byHash[hash]))
+  else:
+    none(int32)
+
 # =============================================================================
 # Header validation
 # =============================================================================
@@ -431,7 +441,9 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     headersPresyncStats: initTable[int64, HeadersPresyncStats](),
     presyncBestPeer: -1,
     presyncBestWork: initUInt256(),
-    minimumChainWork: initUInt256()  # Will be set from chainstate
+    minimumChainWork: initUInt256(),  # Will be set from chainstate
+    receivedBlocks: initTable[int32, Block](),
+    requestedHashes: initHashSet[BlockHash]()
   )
 
   # Initialize with genesis if chain is empty
@@ -882,7 +894,11 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     let hashOpt = sm.headerChain.getHashByHeight(height)
     if hashOpt.isSome:
       let hash = hashOpt.get()
-      # Check if we already have this block
+      # Skip blocks already buffered out-of-order or already in-flight
+      if height in sm.receivedBlocks or hash in sm.requestedHashes:
+        height += 1
+        continue
+      # Check if we already have this block in the database
       if sm.chainDb.getBlock(hash).isNone:
         # Always request witness blocks - all modern peers support it,
         # and non-witness blocks cause script verification failures
@@ -891,52 +907,54 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
           invType: invWitnessBlock,
           hash: array[32, byte](hash)
         ))
+        sm.requestedHashes.incl(hash)
         sm.blockQueue.addLast(hash)
     height += 1
 
   if inventory.len > 0:
-    await peer.sendGetData(inventory)
+    try:
+      await peer.sendGetData(inventory)
+    except CatchableError as e:
+      warn "failed to send getdata", peer = $peer, error = e.msg
+      # Remove from in-flight tracking on send failure
+      for inv in inventory:
+        sm.requestedHashes.excl(BlockHash(inv.hash))
+      return
     sm.pendingBlocks += inventory.len
     sm.lastSyncTime = getTime()  # Reset timeout when we send requests
     info "requesting blocks", count = inventory.len,
          fromHeight = sm.chainTipHeight + 1
 
-proc processBlock*(sm: SyncManager, blk: Block): bool =
-  ## Process a received block, returns true if valid
+proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
+  ## Validate and apply a single block at the given height.
+  ## Returns true if the block was successfully applied.
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
 
   # Check this block connects to our chain
-  let expectedHeight = sm.chainTipHeight + 1
-
-  if expectedHeight > 0:
-    # For height 1, compare against canonical genesis hash to handle
-    # buildGenesisBlock producing a different hash than the well-known one
-    let expectedPrev = if expectedHeight == 1: sm.params.genesisBlockHash
+  if height > 0:
+    let expectedPrev = if height == 1: sm.params.genesisBlockHash
                        else: sm.chainTip
     if blk.header.prevBlock != expectedPrev:
-      # Don't log for out-of-order blocks (expected during IBD)
-      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+      warn "block does not connect", height = height,
+           expected = $expectedPrev, got = $blk.header.prevBlock
       return false
 
   # Validate block
   let checkResult = checkBlock(blk, sm.params)
   if not checkResult.isOk:
-    warn "invalid block", height = expectedHeight, error = $checkResult.error
-    sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    warn "invalid block", height = height, error = $checkResult.error
     return false
 
   # Script verification (skip if below assume-valid height)
-  # Also skip if this block has failed too many times (likely a witness issue
-  # from non-witness peers, not a real script failure)
-  let skipForRetries = sm.failedBlockHeight == expectedHeight and
+  let skipForRetries = sm.failedBlockHeight == height and
                        sm.failedBlockRetries >= sm.maxBlockRetries
   let skipScripts = (sm.params.assumeValidHeight > 0 and
-                    expectedHeight <= sm.params.assumeValidHeight) or
+                    height <= sm.params.assumeValidHeight) or
                     skipForRetries
   if skipForRetries:
     warn "skipping script verification after repeated failures",
-         height = expectedHeight, retries = sm.failedBlockRetries
+         height = height, retries = sm.failedBlockRetries
   if not skipScripts and sm.chainState != nil:
     try:
       {.gcsafe.}:
@@ -944,52 +962,103 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
         let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] =
           cs.getUtxo(op)
         let crypto = newCryptoEngine()
-        let scriptResult = verifyScripts(blk, utxoLookup, expectedHeight, crypto, sm.params)
+        let scriptResult = verifyScripts(blk, utxoLookup, height, crypto, sm.params)
         if not scriptResult.isOk:
-          warn "script verification failed", height = expectedHeight,
+          warn "script verification failed", height = height,
                error = $scriptResult.error, txCount = blk.txs.len,
                hasWitness = (blk.txs.len > 1 and blk.txs[1].witnesses.len > 0)
-          # Track repeated failures for the same block
-          if sm.failedBlockHeight == expectedHeight:
+          if sm.failedBlockHeight == height:
             sm.failedBlockRetries += 1
           else:
-            sm.failedBlockHeight = expectedHeight
+            sm.failedBlockHeight = height
             sm.failedBlockRetries = 1
-          sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
           return false
     except Exception as e:
-      warn "script verification error", height = expectedHeight, error = e.msg
-      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+      warn "script verification error", height = height, error = e.msg
       return false
 
   # Apply block to chainstate
   if sm.chainState != nil:
-    let connectResult = sm.chainState.connectBlock(blk, expectedHeight)
+    let connectResult = sm.chainState.connectBlock(blk, height)
     if not connectResult.isOk:
       warn "failed to connect block to chainstate", error = $connectResult.error
-      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
       return false
   else:
-    sm.chainDb.applyBlock(blk, expectedHeight)
+    sm.chainDb.applyBlock(blk, height)
 
   # Update chain tip (NOT header tip - they're tracked separately)
   sm.chainTip = hash
-  sm.chainTipHeight = expectedHeight
+  sm.chainTipHeight = height
 
-  sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
   if sm.blockQueue.len > 0:
     discard sm.blockQueue.popFirst()
 
   # Reset failure tracking on success
-  if expectedHeight == sm.failedBlockHeight:
+  if height == sm.failedBlockHeight:
     sm.failedBlockHeight = 0
     sm.failedBlockRetries = 0
 
-  sm.lastSyncTime = getTime()
+  if height mod 1000 == 0 or height == sm.headerTipHeight:
+    info "processed block", height = height, hash = $hash
 
-  if expectedHeight mod 1000 == 0 or expectedHeight == sm.headerTipHeight:
-    info "processed block", height = expectedHeight, hash = $hash
   true
+
+proc drainBlockBuffer(sm: SyncManager) =
+  ## Process buffered out-of-order blocks sequentially starting from chainTip+1
+  while true:
+    let nextHeight = sm.chainTipHeight + 1
+    if nextHeight notin sm.receivedBlocks:
+      break
+    let blk = sm.receivedBlocks[nextHeight]
+    sm.receivedBlocks.del(nextHeight)
+    sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    if not sm.applyBlock(blk, nextHeight):
+      warn "failed to apply buffered block", height = nextHeight
+      break
+
+proc processBlock*(sm: SyncManager, blk: Block): bool =
+  ## Process a received block, returns true if valid
+  ## Buffers out-of-order blocks and processes sequentially
+  let headerBytes = serialize(blk.header)
+  let hash = BlockHash(doubleSha256(headerBytes))
+
+  # Remove from in-flight tracking
+  sm.requestedHashes.excl(hash)
+
+  # Determine what height this block belongs to by looking up its hash
+  # in the header chain
+  let heightOpt = sm.headerChain.getHeight(hash)
+
+  if heightOpt.isNone:
+    # Unknown block - not in our header chain
+    sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    return false
+
+  let blockHeight = heightOpt.get()
+  let expectedHeight = sm.chainTipHeight + 1
+
+  if blockHeight == expectedHeight:
+    # Block connects directly - apply it
+    if not sm.applyBlock(blk, expectedHeight):
+      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+      return false
+    sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    sm.lastSyncTime = getTime()  # Reset timeout on progress
+    # Drain any buffered blocks that now connect
+    sm.drainBlockBuffer()
+    return true
+  elif blockHeight > expectedHeight and blockHeight <= sm.headerTipHeight:
+    # Out-of-order block - buffer it for later processing
+    sm.receivedBlocks[int32(blockHeight)] = blk
+    trace "buffered out-of-order block", height = blockHeight,
+          expectedHeight = expectedHeight, buffered = sm.receivedBlocks.len
+    # Don't decrement pendingBlocks here - it will be decremented when
+    # the block is actually processed from the buffer in drainBlockBuffer
+    return true  # Successfully received, just not yet applied
+  else:
+    # Block is behind our chain tip or too far ahead - discard
+    sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    return false
 
 proc isSynced*(sm: SyncManager): bool =
   ## Check if we're fully synchronized
@@ -1042,6 +1111,34 @@ proc syncLoop*(sm: SyncManager) {.async.} =
       await sleepAsync(100)
 
     of ssDownloadingBlocks:
+      # Verify chain tip matches header chain before requesting blocks.
+      # If there was a reorg, our stored chain tip may be on a stale fork.
+      block chainTipCheck:
+        let headerHashOpt = sm.headerChain.getHashByHeight(sm.chainTipHeight)
+        if headerHashOpt.isSome and headerHashOpt.get() != sm.chainTip:
+          # Chain tip mismatch - roll back to common ancestor
+          while sm.chainTipHeight > 0:
+            let hashOpt = sm.headerChain.getHashByHeight(sm.chainTipHeight)
+            if hashOpt.isSome and hashOpt.get() == sm.chainTip:
+              break
+            if hashOpt.isNone:
+              break
+            warn "chain tip mismatch, rolling back",
+                 height = sm.chainTipHeight,
+                 storedTip = $sm.chainTip,
+                 headerChainHash = $hashOpt.get()
+            sm.chainTipHeight -= 1
+            let prevHashOpt = sm.headerChain.getHashByHeight(sm.chainTipHeight)
+            if prevHashOpt.isSome:
+              sm.chainTip = prevHashOpt.get()
+            else:
+              break
+          info "rolled back to common ancestor",
+               height = sm.chainTipHeight, tip = $sm.chainTip
+          if sm.chainState != nil:
+            sm.chainState.bestHeight = sm.chainTipHeight
+            sm.chainState.bestBlockHash = sm.chainTip
+
       # Request blocks if needed
       if sm.pendingBlocks < MaxBlocksInFlight div 2 and
          sm.chainTipHeight < sm.headerTipHeight:
@@ -1077,6 +1174,8 @@ proc syncLoop*(sm: SyncManager) {.async.} =
       # Reset download state so we can re-request blocks from scratch
       sm.pendingBlocks = 0
       sm.blockQueue.clear()
+      sm.requestedHashes.clear()
+      sm.receivedBlocks.clear()
 
       # Reset timer so we don't immediately timeout again on next iteration
       sm.lastSyncTime = getTime()
