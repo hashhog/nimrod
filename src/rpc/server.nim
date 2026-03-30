@@ -3890,7 +3890,7 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
             # Yield to the event loop before the synchronous chain-state read so
             # that other pending futures (peer I/O, sync loop heartbeats) are not
             # starved during heavy RPC calls like getblock or gettxoutsetinfo.
-            await sleepAsync(milliseconds(0))
+            await sleepAsync(0)
 
             var respResult: string
             {.gcsafe.}:
