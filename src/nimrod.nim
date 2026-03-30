@@ -331,12 +331,27 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
       asyncSpawn state.peerManager.broadcastTx(msg.tx)
 
   of mkInv:
-    # Handle inventory announcements
-    discard
+    # Request blocks we don't have
+    var blockInvs: seq[InvVector]
+    for item in msg.invItems:
+      if item.invType == invBlock or item.invType == invWitnessBlock:
+        # Request as witness block for segwit support
+        blockInvs.add(InvVector(invType: invWitnessBlock, hash: item.hash))
+    if blockInvs.len > 0:
+      asyncSpawn peer.sendGetData(blockInvs)
 
   of mkGetData:
-    # Handle data requests
-    discard
+    # Handle data requests - serve blocks to peers
+    for item in msg.getData:
+      if item.invType == invBlock or item.invType == invWitnessBlock:
+        let blockOpt = state.chainState.db.getBlock(BlockHash(item.hash))
+        if blockOpt.isSome:
+          let blkMsg = newBlockMsg(blockOpt.get())
+          try:
+            await peer.sendMessage(blkMsg)
+            debug "served block to peer", peer = $peer
+          except CatchableError as e:
+            debug "failed to serve block", peer = $peer, error = e.msg
 
   of mkPing:
     # Respond with pong
