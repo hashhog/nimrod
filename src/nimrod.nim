@@ -468,7 +468,7 @@ proc startNode*(config: NimrodConfig) {.async.} =
 
   # 5. Initialize peer manager
   info "initializing peer manager"
-  state.peerManager = newPeerManager(params, maxOut = config.maxConnections div 16, maxIn = config.maxConnections - config.maxConnections div 16)
+  state.peerManager = newPeerManager(params, maxOut = config.maxConnections div 16, maxIn = config.maxConnections - config.maxConnections div 16, dataDir = networkDir)
   state.peerManager.updateHeight(state.chainState.bestHeight)
   state.peerManager.setMessageCallback(messageCallback(state))
 
