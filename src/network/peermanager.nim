@@ -177,9 +177,8 @@ proc newPeerManager*(params: ConsensusParams,
       ("91.203.5.166", 18333'u16)
     ]
   of Regtest:
-    result.fallbackPeers = @[
-      ("127.0.0.1", 18444'u16)
-    ]
+    # Regtest has no seeds or fallback peers - connections are manual only
+    discard
   of Testnet4:
     result.seedNodes = @[
       ("seed.testnet4.bitcoin.sprovoost.nl", 48333'u16),
@@ -427,6 +426,11 @@ proc startOutboundConnections*(pm: PeerManager) {.async.} =
        maxFullRelay = pm.maxOutboundFullRelay,
        maxBlockRelay = pm.maxOutboundBlockRelay
 
+  # Regtest: no automatic outbound connections (manual/addnode only)
+  if pm.params.network == Regtest:
+    info "regtest mode: skipping automatic outbound connections"
+    return
+
   # First, try to connect to anchor peers
   await pm.connectToAnchors()
 
@@ -589,7 +593,7 @@ proc startListener*(pm: PeerManager, bindAddr: string, port: uint16) {.async.} =
   pm.listener = createStreamServer(
     ta,
     inboundConnectionCallback,
-    {},
+    {ServerFlags.ReuseAddr},
     udata = cast[pointer](pm)
   )
   pm.listener.start()
