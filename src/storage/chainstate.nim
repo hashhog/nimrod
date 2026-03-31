@@ -388,7 +388,14 @@ proc updateBestBlock*(cdb: ChainDb, hash: BlockHash, height: int32) =
 # ChainState - High-level UTXO set manager with cache and reorg support
 # ============================================================================
 
-const DefaultMaxCacheSize* = 50000
+const
+  DefaultMaxCacheSize* = 50000
+  ## Maximum memory budget for UTXO cache (256 MiB)
+  MaxCacheBytes* = 256 * 1024 * 1024
+  ## Eviction target: evict clean entries down to this (128 MiB)
+  EvictTargetBytes* = MaxCacheBytes div 2
+  ## Estimated bytes per cache entry (OutPoint key ~60 bytes + UtxoEntry ~80 bytes + Table overhead ~32 bytes)
+  EstimatedEntryBytes* = 172
 
 proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
   ## Create a new ChainState with given path and consensus params
@@ -664,6 +671,28 @@ proc startIBD*(cs: var ChainState) =
   # Disable WAL for faster writes (data is durable via periodic batch flushes)
   cs.db.db.disableWAL()
 
+proc evictCleanEntries*(cs: var ChainState) =
+  ## Evict clean (already flushed) entries from the UTXO cache when memory
+  ## exceeds MaxCacheBytes. Evicts down to EvictTargetBytes.
+  ## During IBD the cache grows unbounded because flushIBDBatch writes entries
+  ## to RocksDB but never removes them from memory. This bounds RSS.
+  let cacheBytes = cs.cacheSize * EstimatedEntryBytes
+  if cacheBytes <= MaxCacheBytes:
+    return
+
+  var toRemove: seq[OutPoint] = @[]
+  var currentBytes = cacheBytes
+
+  for op, entry in cs.utxoCache:
+    if currentBytes <= EvictTargetBytes:
+      break
+    toRemove.add(op)
+    currentBytes -= EstimatedEntryBytes
+
+  for op in toRemove:
+    cs.utxoCache.del(op)
+    dec cs.cacheSize
+
 proc flushIBDBatch*(cs: var ChainState) =
   ## Flush accumulated IBD write batch to RocksDB
   if cs.ibdBatch != nil and cs.ibdBatchBlocks > 0:
@@ -690,6 +719,10 @@ proc flushIBDBatch*(cs: var ChainState) =
     # Update ChainDb in-memory state
     cs.db.bestBlockHash = cs.bestBlockHash
     cs.db.bestHeight = cs.bestHeight
+
+    # Evict clean entries to bound memory during IBD
+    # All cache entries are now "clean" (persisted to RocksDB)
+    cs.evictCleanEntries()
 
 proc stopIBD*(cs: var ChainState) =
   ## Exit IBD mode: flush remaining batch and switch to per-block writes
