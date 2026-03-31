@@ -1152,8 +1152,15 @@ proc syncLoop*(sm: SyncManager) {.async.} =
       await sleepAsync(100)
 
     of ssSynced:
-      # Check for new blocks periodically
-      if peer.startHeight > sm.headerChain.tipHeight:
+      # Periodically request new headers to discover blocks mined since
+      # we reached tip.  peer.startHeight is stale (set at connect time),
+      # so we can't rely on it to detect new blocks.  Instead, send
+      # getheaders every 5s — if there are new blocks, the peer responds
+      # with headers and we transition back to ssIdle → download.
+      await sm.startHeaderSync()
+      # If new headers arrived, the handler updates headerTipHeight.
+      # Check if we need to download blocks.
+      if sm.headerTipHeight > sm.chainTipHeight:
         sm.state = ssIdle
       await sleepAsync(5000)
 
