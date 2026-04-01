@@ -2196,7 +2196,9 @@ proc verifyWitnessProgram*(
   elif version == 1 and sfTaproot in flags:
     # Taproot (SegWit v1)
     if program.len != 32:
-      return false
+      # Non-32-byte v1 programs (including P2A anchors) succeed unconditionally
+      # per BIP 341 for forward compatibility
+      return true
 
     if witness.len == 0:
       return false
