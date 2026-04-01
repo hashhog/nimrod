@@ -923,7 +923,8 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
            ctx: SigCheckContext): ScriptError =
   ## Execute script and return error code
 
-  if script.len > MaxScriptSize:
+  # BIP 342: tapscript removes the 10,000-byte script size limit
+  if ctx.sigVersion != sigTapscript and script.len > MaxScriptSize:
     return seScriptSize
 
   var pc = 0
@@ -933,8 +934,8 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
     let opcode = script[pc]
     pc += 1
 
-    # Count non-push opcodes
-    if opcode.countsTowardOpLimit:
+    # Count non-push opcodes (BIP 342: tapscript replaces this with sigops budget)
+    if ctx.sigVersion != sigTapscript and opcode.countsTowardOpLimit:
       interp.opCount += 1
       if interp.opCount > MaxOpsPerScript:
         return seOpCount
