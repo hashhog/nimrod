@@ -946,15 +946,9 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
     warn "invalid block", height = height, error = $checkResult.error
     return false
 
-  # Script verification (skip if below assume-valid height)
-  let skipForRetries = sm.failedBlockHeight == height and
-                       sm.failedBlockRetries >= sm.maxBlockRetries
-  let skipScripts = (sm.params.assumeValidHeight > 0 and
-                    height <= sm.params.assumeValidHeight) or
-                    skipForRetries
-  if skipForRetries:
-    warn "skipping script verification after repeated failures",
-         height = height, retries = sm.failedBlockRetries
+  # Script verification (skip only if below assume-valid height)
+  let skipScripts = sm.params.assumeValidHeight > 0 and
+                    height <= sm.params.assumeValidHeight
   if not skipScripts and sm.chainState != nil:
     try:
       {.gcsafe.}:
