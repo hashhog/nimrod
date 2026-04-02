@@ -13,12 +13,13 @@ export options
 
 const LibRocksDb* = "librocksdb.so"
 
-# Performance tuning constants
+# Performance tuning constants — keep total RocksDB memory under ~512 MiB
 const
-  BlockCacheSize* = 512 * 1024 * 1024'u64       # 512MB block cache
-  WriteBufferSize* = 64 * 1024 * 1024'u64       # 64MB write buffer
-  MaxWriteBufferNumber* = 4                      # 4 write buffers max
+  BlockCacheSize* = 128 * 1024 * 1024'u64       # 128 MiB shared block cache
+  WriteBufferSize* = 16 * 1024 * 1024'u64       # 16 MiB write buffer
+  MaxWriteBufferNumber* = 2                      # 2 write buffers max
   BloomFilterBits* = 10                          # 10-bit bloom filter
+  MaxOpenFiles* = 256                            # Limit file descriptors
   MaxBackgroundJobs* = 4                         # Background compaction jobs
 
 type
@@ -66,6 +67,8 @@ proc rocksdb_options_set_level0_slowdown_writes_trigger*(opts: RocksDbOptionsPtr
 proc rocksdb_options_set_level0_stop_writes_trigger*(opts: RocksDbOptionsPtr, num: cint)
 proc rocksdb_options_set_target_file_size_base*(opts: RocksDbOptionsPtr, size: uint64)
 proc rocksdb_options_set_max_bytes_for_level_base*(opts: RocksDbOptionsPtr, size: uint64)
+proc rocksdb_options_set_max_open_files*(opts: RocksDbOptionsPtr, num: cint)
+proc rocksdb_options_set_allow_mmap_reads*(opts: RocksDbOptionsPtr, v: uint8)
 proc rocksdb_options_set_block_based_table_factory*(opts: RocksDbOptionsPtr, tableOpts: RocksDbBlockBasedOptionsPtr)
 
 # Block-based table options
@@ -281,9 +284,11 @@ proc openDatabase*(path: string, config: DatabaseConfig = defaultDbConfig()): Da
   rocksdb_options_set_create_if_missing(result.dbOpts, 1)
   rocksdb_options_set_create_missing_column_families(result.dbOpts, 1)
 
-  let threads = min(countProcessors(), 8)
+  let threads = min(countProcessors(), 4)
   rocksdb_options_increase_parallelism(result.dbOpts, cint(threads))
   rocksdb_options_optimize_level_style_compaction(result.dbOpts, config.writeBufferSize)
+  rocksdb_options_set_max_open_files(result.dbOpts, cint(MaxOpenFiles))
+  rocksdb_options_set_allow_mmap_reads(result.dbOpts, 0)  # Disable mmap to prevent RSS inflation
 
   # Write options
   result.writeOpts = rocksdb_writeoptions_create()

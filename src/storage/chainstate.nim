@@ -76,7 +76,6 @@ type
     db*: Database
     bestBlockHash*: BlockHash
     bestHeight*: int32
-    utxoCache*: Table[string, UtxoEntry]  ## In-memory cache for hot UTXOs
 
   ## ChainState wraps ChainDb with cache management and consensus params
   ChainState* = ref object
@@ -235,8 +234,7 @@ proc openChainDb*(path: string): ChainDb =
   result = ChainDb(
     db: openDatabase(path),
     bestBlockHash: BlockHash(default(array[32, byte])),
-    bestHeight: -1,
-    utxoCache: initTable[string, UtxoEntry]()
+    bestHeight: -1
   )
 
   # Load best block from meta
@@ -307,31 +305,20 @@ proc putUtxo*(cdb: ChainDb, outpoint: OutPoint, entry: UtxoEntry) =
   ## Add or update UTXO
   let key = utxoKey(array[32, byte](outpoint.txid), outpoint.vout)
   cdb.db.put(cfUtxo, key, serializeUtxoEntry(entry))
-  cdb.utxoCache[outpointKey(outpoint)] = entry
 
 proc getUtxo*(cdb: ChainDb, outpoint: OutPoint): Option[UtxoEntry] =
-  ## Get UTXO entry
-  let cacheKey = outpointKey(outpoint)
-
-  # Check cache first
-  if cacheKey in cdb.utxoCache:
-    return some(cdb.utxoCache[cacheKey])
-
-  # Check database
+  ## Get UTXO entry directly from database (no caching at this layer;
+  ## ChainState.utxoCache provides bounded caching above).
   let key = utxoKey(array[32, byte](outpoint.txid), outpoint.vout)
   let data = cdb.db.get(cfUtxo, key)
   if data.isSome:
-    let entry = deserializeUtxoEntry(data.get())
-    cdb.utxoCache[cacheKey] = entry
-    return some(entry)
-
+    return some(deserializeUtxoEntry(data.get()))
   none(UtxoEntry)
 
 proc deleteUtxo*(cdb: ChainDb, outpoint: OutPoint) =
   ## Remove UTXO
   let key = utxoKey(array[32, byte](outpoint.txid), outpoint.vout)
   cdb.db.delete(cfUtxo, key)
-  cdb.utxoCache.del(outpointKey(outpoint))
 
 proc hasUtxo*(cdb: ChainDb, outpoint: OutPoint): bool =
   cdb.getUtxo(outpoint).isSome
@@ -390,9 +377,9 @@ proc updateBestBlock*(cdb: ChainDb, hash: BlockHash, height: int32) =
 
 const
   DefaultMaxCacheSize* = 50000
-  ## Maximum memory budget for UTXO cache (256 MiB)
-  MaxCacheBytes* = 256 * 1024 * 1024
-  ## Eviction target: evict clean entries down to this (128 MiB)
+  ## Maximum memory budget for UTXO cache (2 GiB)
+  MaxCacheBytes* = 2 * 1024 * 1024 * 1024
+  ## Eviction target: evict down to half the max (1 GiB)
   EvictTargetBytes* = MaxCacheBytes div 2
   ## Estimated bytes per cache entry (OutPoint key ~60 bytes + UtxoEntry ~80 bytes + Table overhead ~32 bytes)
   EstimatedEntryBytes* = 172
@@ -1026,7 +1013,7 @@ proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
       for input in tx.inputs:
         let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
         batch.delete(cfUtxo, key)
-        cdb.utxoCache.del(outpointKey(input.prevOut))
+        discard  # Cache removed — ChainState layer handles caching
 
     # Create outputs
     for voutIdx, output in tx.outputs:
@@ -1039,7 +1026,7 @@ proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
       batch.put(cfUtxo, key, serializeUtxoEntry(entry))
 
       let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
-      cdb.utxoCache[outpointKey(outpoint)] = entry
+      discard  # Cache removed — ChainState layer handles caching
 
     # Index transaction
     let loc = TxLocation(blockHash: blockHash, txIndex: uint32(txIdx))
@@ -1089,7 +1076,7 @@ proc disconnectBlock*(cdb: ChainDb, blk: Block, height: int32) =
       let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
       batch.delete(cfUtxo, key)
       let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
-      cdb.utxoCache.del(outpointKey(outpoint))
+      discard  # Cache removed
 
     # Remove tx index entry
     batch.delete(cfTxIndex, txIndexKey(array[32, byte](txId)))
