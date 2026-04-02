@@ -290,15 +290,27 @@ proc getMtpForHeight*(utxos: ChainDb, height: int32): uint32 =
   getMedianTimePast(headers)
 
 # Get script flags for block validation
-proc getBlockScriptFlags*(height: int32, params: ConsensusParams): set[ScriptFlags] =
+## Bitcoin Core script_flag_exceptions: blocks that violate current rules.
+## BIP16 exception block (mainnet): this block contains a P2SH-violating tx
+## that was mined before P2SH enforcement. Bitcoin Core uses SCRIPT_VERIFY_NONE.
+const BIP16_EXCEPTION_HASH* = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+
+## Taproot exception block (mainnet): uses P2SH+WITNESS only (no TAPROOT).
+const TAPROOT_EXCEPTION_HASH* = "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
+
+proc getBlockScriptFlags*(height: int32, params: ConsensusParams,
+                          blockHash: string = ""): set[ScriptFlags] =
   ## Get consensus-only script verification flags for a block at given height
   ## CRITICAL: Only use consensus flags, not policy flags
 
-  result = {}
+  # Check script_flag_exceptions first (matching Bitcoin Core)
+  if blockHash == BIP16_EXCEPTION_HASH:
+    return {}  # SCRIPT_VERIFY_NONE for this block
 
-  # P2SH (BIP16) - always active on mainnet
-  if height >= 1:  # Active from genesis effectively
-    result.incl(sfP2SH)
+  result = {sfP2SH, sfWitness, sfTaproot}
+
+  if blockHash == TAPROOT_EXCEPTION_HASH:
+    result = {sfP2SH, sfWitness}
 
   # DERSIG (BIP66)
   if height >= int32(params.bip66Height):
@@ -312,16 +324,11 @@ proc getBlockScriptFlags*(height: int32, params: ConsensusParams): set[ScriptFla
   if height >= int32(params.csvHeight):
     result.incl(sfCheckSequenceVerify)
 
-  # SegWit (BIP141/143/147) and BIP146 NULLFAIL
+  # SegWit (BIP141/143/147) and BIP146 NULLFAIL — activated with SegWit
   if height >= int32(params.segwitHeight):
-    result.incl(sfWitness)
     result.incl(sfNullDummy)
     result.incl(sfNullFail)
     result.incl(sfWitnessPubkeyType)  # BIP141: witness pubkeys must be compressed
-
-  # Taproot (BIP341/342)
-  if height >= int32(params.taprootHeight):
-    result.incl(sfTaproot)
 
 # ============================================================================
 # BIP68 Sequence Lock Functions
@@ -1102,7 +1109,10 @@ proc verifyScripts*(
   ## Verify all scripts in a block
   ## This is typically called after validateBlock passes
 
-  let flags = getBlockScriptFlags(height, params)
+  # Compute block hash for script_flag_exceptions check
+  let headerBytes = serialize(blk.header)
+  let blockHash = $BlockHash(doubleSha256(headerBytes))
+  let flags = getBlockScriptFlags(height, params, blockHash)
   let flagsUint = scriptFlagsToUint32(flags)
 
   # Track intra-block UTXOs for script verification
