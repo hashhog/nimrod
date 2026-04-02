@@ -196,9 +196,10 @@ proc writeBlockUndo*(
   const MaxUndoFileSize = 2_000_000_000'i64  # ~2 GB, well under int32 max
   block:
     let curPath = ufm.undoFilePath(ufm.currentFile)
-    let curSize = int64(getFileSize(curPath))
-    if curSize > MaxUndoFileSize:
-      ufm.currentFile += 1
+    if fileExists(curPath):
+      let curSize = int64(getFileSize(curPath))
+      if curSize > MaxUndoFileSize:
+        ufm.currentFile += 1
 
   # Open or create the undo file
   let fs = ufm.openUndoFile(ufm.currentFile, forWrite = true)
