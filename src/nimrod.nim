@@ -314,7 +314,14 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     await state.syncManager.handleHeaders(peer, msg.headers)
 
   of mkBlock:
-    discard state.syncManager.processBlock(msg.blk)
+    try:
+      discard state.syncManager.processBlock(msg.blk)
+    except Defect as e:
+      # Log but don't crash — the block will be retried
+      let ht = state.syncManager.chainTipHeight
+      echo "DEFECT in processBlock (chainTip=", ht, "): ", e.msg
+      when compileOption("stackTrace"):
+        echo getStackTrace(e)
 
   of mkTx:
     var accepted = false

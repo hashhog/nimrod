@@ -29,7 +29,7 @@ type
   ## Position within a flat file
   FlatFilePos* = object
     fileNum*: int32       ## File number (rev00000.dat = 0)
-    pos*: int32           ## Position within file (after header)
+    pos*: int32           ## Position within file (serialized as int32 for compat)
 
   ## Manages flat file storage for undo data
   UndoFileManager* = ref object
@@ -75,7 +75,7 @@ proc serializeSpentOutput*(w: var BinaryWriter, spent: SpentOutput) =
 proc deserializeSpentOutput*(r: var BinaryReader): SpentOutput =
   ## Deserialize a spent output from Bitcoin Core compatible format
   let code = r.readCompactSize()
-  result.height = int32(code shr 1)
+  result.height = cast[int32](code shr 1)
   result.isCoinbase = (code and 1) == 1
 
   # Read version dummy if height > 0 (compatibility)
@@ -190,6 +190,15 @@ proc writeBlockUndo*(
 
   let undoData = serializeBlockUndo(blockUndo)
   let undoSize = uint32(undoData.len)
+
+  # Rotate undo file if current one exceeds ~2 GiB
+  # (FlatFilePos.pos is int32, max ~2 GiB)
+  const MaxUndoFileSize = 2_000_000_000'i64  # ~2 GB, well under int32 max
+  block:
+    let curPath = ufm.undoFilePath(ufm.currentFile)
+    let curSize = int64(getFileSize(curPath))
+    if curSize > MaxUndoFileSize:
+      ufm.currentFile += 1
 
   # Open or create the undo file
   let fs = ufm.openUndoFile(ufm.currentFile, forWrite = true)
