@@ -79,7 +79,7 @@ proc deserializeCoin*(data: seq[byte]): Coin =
   ## Deserialize coin from RocksDB storage
   var r = BinaryReader(data: data, pos: 0)
   let code = r.readCompactSize()
-  result.height = int32(code shr 1)
+  result.height = cast[int32](code shr 1)
   result.isCoinbase = (code and 1) != 0
   result.txOut = r.readTxOut()
 

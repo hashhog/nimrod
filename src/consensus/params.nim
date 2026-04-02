@@ -143,6 +143,9 @@ proc mainnetParams*(): ConsensusParams =
   result.powTargetTimespan = 1_209_600  # 14 days
   result.powTargetSpacing = 600  # 10 minutes
   result.difficultyAdjustmentInterval = 2016
+  # Skip script verification below this height during IBD
+  # (Bitcoin Core's default assume-valid block at height 840000)
+  result.assumeValidHeight = 840_000
   # PoW rules: mainnet does normal retargeting
   result.powAllowMinDifficultyBlocks = false
   result.powNoRetargeting = false
