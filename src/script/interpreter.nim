@@ -1510,8 +1510,13 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             let hashType = uint32(sig[sig.len - 1])
             let sigWithoutHashType = sig[0 ..< sig.len - 1]
 
+            # scriptCode starts after last OP_CODESEPARATOR (matching Bitcoin Core pbegincodehash)
+            var scriptCode: seq[byte]
+            if interp.codesepPos != 0xFFFFFFFF'u32 and int(interp.codesepPos) <= script.len:
+              scriptCode = script[int(interp.codesepPos) ..< script.len]
+            else:
+              scriptCode = @script
             # FindAndDelete - only for legacy
-            var scriptCode = @script
             scriptCode = findAndDelete(scriptCode, sig)
 
             let sighash = computeSighashLegacy(ctx.tx, ctx.inputIndex, scriptCode, hashType)
@@ -1661,7 +1666,12 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             if sig.len >= 1:
               let hashType = uint32(sig[sig.len - 1])
               let sigWithoutHashType = sig[0 ..< sig.len - 1]
-              var scriptCode = @script
+              # scriptCode starts after last OP_CODESEPARATOR
+              var scriptCode: seq[byte]
+              if interp.codesepPos != 0xFFFFFFFF'u32 and int(interp.codesepPos) <= script.len:
+                scriptCode = script[int(interp.codesepPos) ..< script.len]
+              else:
+                scriptCode = @script
               # FindAndDelete all signatures (only for legacy)
               for s in sigs:
                 scriptCode = findAndDelete(scriptCode, s)
