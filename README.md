@@ -75,6 +75,7 @@ It leverages Nim's Python-like syntax with C-level performance.
 - [x] Feerate diagram RBF validation (diagram construction, interpolation, strict improvement comparison)
 - [x] Pay-to-Anchor (P2A) script detection (BIP-TBD: OP_1 <0x4e73> anyone-can-spend for CPFP fee bumping)
 - [x] REST API (read-only endpoints: block, headers, tx, getutxos, mempool in JSON/binary/hex formats)
+- [x] Mainnet sync (in progress, past SegWit activation at 534K)
 
 ## Quick start
 
