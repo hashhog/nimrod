@@ -77,7 +77,7 @@ type
 
 const
   MaxHeadersPerRequest* = 2000
-  MaxBlocksInFlight* = 16
+  MaxBlocksInFlight* = 128
   SyncTimeoutSeconds* = 60
 
   # Block download constants
@@ -86,7 +86,7 @@ const
   BaseRequestTimeout* = 5           ## Base timeout in seconds
   MaxRequestTimeout* = 64           ## Max timeout after adaptive scaling
   BatchGetDataSize* = 64            ## Blocks per getdata message (batched for IBD throughput)
-  UtxoFlushInterval* = 2000         ## Flush UTXO set every N blocks during IBD
+  UtxoFlushInterval* = 500          ## Flush UTXO set every N blocks during IBD
   InvWitnessBlockType* = 0x40000002'u32  ## Segwit block inv type
 
 type
@@ -884,6 +884,7 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
 
 proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   ## Request blocks for validated headers
+  ## During IBD, distributes requests across multiple peers for parallel download
   var inventory: seq[InvVector]
 
   # Find blocks we need (headers we have but blocks we don't)
@@ -899,10 +900,9 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
         height += 1
         continue
       # Check if we already have this block in the database
-      if sm.chainDb.getBlock(hash).isNone:
-        # Always request witness blocks - all modern peers support it,
-        # and non-witness blocks cause script verification failures
-        # for segwit transactions above the assume-valid height
+      # Skip DB lookup during IBD - we know we don't have blocks above chain tip
+      if sm.chainState != nil and sm.chainState.ibdMode or
+         sm.chainDb.getBlock(hash).isNone:
         inventory.add(InvVector(
           invType: invWitnessBlock,
           hash: array[32, byte](hash)
@@ -911,17 +911,46 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
         sm.blockQueue.addLast(hash)
     height += 1
 
-  if inventory.len > 0:
+  if inventory.len == 0:
+    return
+
+  # During IBD, distribute block requests across all available peers
+  # to maximize download throughput (parallel download from multiple peers)
+  let peers = sm.peerManager.getReadyPeers()
+  if peers.len > 1 and sm.chainState != nil and sm.chainState.ibdMode:
+    let blocksPerPeer = max(1, inventory.len div peers.len)
+    var idx = 0
+    var totalSent = 0
+    for i, p in peers:
+      if idx >= inventory.len:
+        break
+      let endIdx = if i == peers.len - 1: inventory.len
+                   else: min(idx + blocksPerPeer, inventory.len)
+      let batch = inventory[idx ..< endIdx]
+      if batch.len > 0:
+        try:
+          await p.sendGetData(batch)
+          totalSent += batch.len
+        except CatchableError as e:
+          warn "failed to send getdata to peer", peer = $p, error = e.msg
+          for inv in batch:
+            sm.requestedHashes.excl(BlockHash(inv.hash))
+      idx = endIdx
+    sm.pendingBlocks += totalSent
+    sm.lastSyncTime = getTime()
+    info "requesting blocks", count = totalSent, peers = peers.len,
+         fromHeight = sm.chainTipHeight + 1
+  else:
+    # Single-peer fallback
     try:
       await peer.sendGetData(inventory)
     except CatchableError as e:
       warn "failed to send getdata", peer = $peer, error = e.msg
-      # Remove from in-flight tracking on send failure
       for inv in inventory:
         sm.requestedHashes.excl(BlockHash(inv.hash))
       return
     sm.pendingBlocks += inventory.len
-    sm.lastSyncTime = getTime()  # Reset timeout when we send requests
+    sm.lastSyncTime = getTime()
     info "requesting blocks", count = inventory.len,
          fromHeight = sm.chainTipHeight + 1
 
@@ -972,8 +1001,26 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
       return false
 
   # Apply block to chainstate
+  # Use IBD fast path when catching up (skips undo data, batches writes)
   if sm.chainState != nil:
-    let connectResult = sm.chainState.connectBlock(blk, height)
+    let blocksRemaining = sm.headerTipHeight - height
+    let isIBD = blocksRemaining > 1000
+
+    # Enter IBD mode if catching up and not already in IBD
+    if isIBD and not sm.chainState.ibdMode:
+      sm.chainState.startIBD()
+      info "entering IBD mode for block sync", height = height,
+           remaining = blocksRemaining
+
+    # Exit IBD mode when nearly caught up
+    if not isIBD and sm.chainState.ibdMode:
+      sm.chainState.stopIBD()
+      info "exiting IBD mode, switching to normal sync", height = height
+
+    let connectResult = if sm.chainState.ibdMode:
+                          sm.chainState.connectBlockIBD(blk, height)
+                        else:
+                          sm.chainState.connectBlock(blk, height)
     if not connectResult.isOk:
       warn "failed to connect block to chainstate", error = $connectResult.error
       return false
