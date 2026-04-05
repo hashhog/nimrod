@@ -1,18 +1,18 @@
 ## nimrod - Bitcoin full node in Nim
 ## Unified CLI with subcommands for node operation, RPC interaction, and wallet management
 
-import std/[parseopt, os, strutils, json, posix, net, base64, sysrand]
+import std/[parseopt, os, strutils, json, posix, net, base64, sysrand, tables, monotimes, times]
 import chronos
 import chronicles
 
 import ./primitives/[types, serialize]
-import ./consensus/params
+import ./consensus/[params, validation]
 import ./storage/[db, chainstate]
 import ./network/[peer, peermanager, sync, messages]
 import ./mempool/mempool
 import ./mining/fees
 import ./rpc/server
-import ./crypto/secp256k1
+import ./crypto/[secp256k1, hashing]
 
 const NimrodVersion* = "0.1.0"
 
@@ -41,6 +41,7 @@ type
     rpcPassword*: string
     bindAddr*: string
     pruneTarget*: uint64  ## Prune target in MiB (0 = disabled, 1 = manual only)
+    importBlocks*: string ## Path to blk*.dat directory, or "-" for framed stdin
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -253,6 +254,8 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
         except ValueError:
           echo "Invalid prune value: " & p.val
           quit(1)
+      of "import-blocks", "importblocks":
+        result.config.importBlocks = p.val
       of "help", "h":
         showHelp()
         quit(0)
@@ -431,6 +434,289 @@ proc generateCookieFile*(dataDir: string): string =
   setFilePermissions(cookiePath, {fpUserRead, fpUserWrite})
 
   hexPass
+
+proc runBlockImport*(config: NimrodConfig) =
+  ## Import blocks from blk*.dat files or framed stdin.
+  ## blk*.dat format: [4B magic LE][4B size LE][size bytes raw block] repeated
+  ## stdin framed:    [4B height LE][4B size LE][size bytes raw block] repeated
+  let params = getConsensusParams(config)
+  let networkDir = config.dataDir / config.network
+  if not dirExists(networkDir):
+    createDir(networkDir)
+
+  echo "nimrod block import mode"
+  echo "Network: " & config.network
+
+  # Open chainstate
+  var cs = newChainState(networkDir / "chainstate", params)
+
+  # Initialize genesis if needed
+  if cs.bestHeight < 0:
+    let genesis = buildGenesisBlock(params)
+    let connectResult = cs.connectBlock(genesis, 0)
+    if not connectResult.isOk:
+      echo "Failed to connect genesis block: " & $connectResult.error
+      quit(1)
+
+  let startHeight = cs.bestHeight
+  echo "Chain tip at height " & $startHeight
+
+  cs.startIBD()
+
+  if config.importBlocks == "-":
+    # Read framed format from stdin
+    echo "Reading blocks from stdin (framed format)..."
+    var imported = 0
+    let importStart = getMonoTime()
+    var batchStart = getMonoTime()
+
+    while true:
+      # Read frame header: [4B height LE][4B size LE]
+      var frameHeader: array[8, byte]
+      let headerRead = stdin.readBuffer(addr frameHeader[0], 8)
+      if headerRead < 8:
+        echo "End of stdin stream."
+        break
+
+      let frameHeight = int32(
+        uint32(frameHeader[0]) or
+        (uint32(frameHeader[1]) shl 8) or
+        (uint32(frameHeader[2]) shl 16) or
+        (uint32(frameHeader[3]) shl 24)
+      )
+      let frameSize = int(
+        uint32(frameHeader[4]) or
+        (uint32(frameHeader[5]) shl 8) or
+        (uint32(frameHeader[6]) shl 16) or
+        (uint32(frameHeader[7]) shl 24)
+      )
+
+      if frameSize <= 0 or frameSize > 4_000_000:
+        echo "Invalid frame size " & $frameSize & " at height " & $frameHeight
+        break
+
+      # Skip blocks we already have
+      if frameHeight <= startHeight:
+        var skipBuf = newSeq[byte](frameSize)
+        let skipped = stdin.readBuffer(addr skipBuf[0], frameSize)
+        if skipped < frameSize:
+          break
+        continue
+
+      # Read block data
+      var blockData = newSeq[byte](frameSize)
+      let bytesRead = stdin.readBuffer(addr blockData[0], frameSize)
+      if bytesRead < frameSize:
+        echo "Truncated block data at height " & $frameHeight
+        break
+
+      let blk = deserializeBlock(blockData)
+
+      # Validate
+      let checkResult = checkBlock(blk, params)
+      if not checkResult.isOk:
+        echo "Block validation failed at height " & $frameHeight & ": " & $checkResult.error
+        break
+
+      # Connect
+      let connectResult = cs.connectBlockIBD(blk, frameHeight)
+      if not connectResult.isOk:
+        echo "Block connect failed at height " & $frameHeight & ": " & $connectResult.error
+        break
+
+      imported += 1
+
+      if imported mod 1000 == 0:
+        let elapsed = (getMonoTime() - batchStart).inMilliseconds.float / 1000.0
+        let bps = 1000.0 / elapsed
+        let totalElapsed = (getMonoTime() - importStart).inMilliseconds.float / 1000.0
+        echo "Import progress: height " & $frameHeight &
+             " (" & $imported & " blocks, " &
+             $(int(bps)) & " blocks/sec, " &
+             $(int(bps * 60.0)) & " blocks/min, " &
+             "elapsed " & $(int(totalElapsed)) & "s)"
+        batchStart = getMonoTime()
+
+    let totalElapsed = (getMonoTime() - importStart).inMilliseconds.float / 1000.0
+    if imported > 0:
+      let bps = float(imported) / totalElapsed
+      echo "Import complete: " & $imported & " blocks in " &
+           $(int(totalElapsed)) & "s (" &
+           $(int(bps)) & " blocks/sec, " &
+           $(int(bps * 60.0)) & " blocks/min)"
+
+  else:
+    # Read from blk*.dat directory
+    let blocksDir = config.importBlocks
+    let expectedMagic = params.networkMagic
+
+    echo "Scanning blk*.dat files in " & blocksDir & " ..."
+
+    # Detect XOR obfuscation key (Bitcoin Core 28.0+)
+    var xorKey: array[8, byte]
+    block:
+      let firstFile = blocksDir / "blk00000.dat"
+      if fileExists(firstFile):
+        let f = open(firstFile)
+        var hdr: array[16, byte]
+        let n = f.readBuffer(addr hdr[0], 16)
+        f.close()
+        if n == 16:
+          if hdr[0] != expectedMagic[0] or hdr[1] != expectedMagic[1] or
+             hdr[2] != expectedMagic[2] or hdr[3] != expectedMagic[3]:
+            # Derive key[0..4] from magic
+            for i in 0..3:
+              xorKey[i] = hdr[i] xor expectedMagic[i]
+            # Derive key[4..8] from offset 12..16 (prevhash[0..4] = 0 for genesis)
+            for i in 0..3:
+              xorKey[4 + i] = hdr[12 + i]
+            echo "Detected XOR obfuscation key: " &
+                 xorKey[0].toHex & xorKey[1].toHex & xorKey[2].toHex & xorKey[3].toHex &
+                 xorKey[4].toHex & xorKey[5].toHex & xorKey[6].toHex & xorKey[7].toHex
+
+    proc xorDeobfuscate(data: var openArray[byte], fileOffset: int64, key: array[8, byte]) =
+      if key == default(array[8, byte]):
+        return
+      for i in 0 ..< data.len:
+        data[i] = data[i] xor key[int((fileOffset + int64(i)) mod 8)]
+
+    # Build hash -> (fileNum, offset, size) index
+    var index = initTable[BlockHash, tuple[fileNum: int, offset: int64, size: int]]()
+    var fileNum = 0
+
+    while true:
+      let filePath = blocksDir / "blk" & align($fileNum, 5, '0') & ".dat"
+      if not fileExists(filePath):
+        break
+
+      let fileData = readFile(filePath)
+      let fileLen = fileData.len
+      var pos = 0
+      var blocksInFile = 0
+
+      while pos + 8 <= fileLen:
+        # Read and deobfuscate header
+        var hdr: array[8, byte]
+        copyMem(addr hdr[0], unsafeAddr fileData[pos], 8)
+        xorDeobfuscate(hdr, int64(pos), xorKey)
+
+        # Check zero padding
+        if hdr[0] == 0 and hdr[1] == 0 and hdr[2] == 0 and hdr[3] == 0:
+          break
+
+        # Check magic
+        if hdr[0] != expectedMagic[0] or hdr[1] != expectedMagic[1] or
+           hdr[2] != expectedMagic[2] or hdr[3] != expectedMagic[3]:
+          echo "Bad magic at blk" & align($fileNum, 5, '0') & ".dat offset " & $pos
+          break
+
+        let size = int(
+          uint32(hdr[4]) or
+          (uint32(hdr[5]) shl 8) or
+          (uint32(hdr[6]) shl 16) or
+          (uint32(hdr[7]) shl 24)
+        )
+
+        if size <= 0 or size > 4_000_000:
+          echo "Invalid block size " & $size & " at offset " & $pos
+          break
+
+        let blockOffset = pos + 8
+
+        # Read and deobfuscate 80-byte header to get hash
+        var headerBytes = newSeq[byte](80)
+        copyMem(addr headerBytes[0], unsafeAddr fileData[blockOffset], 80)
+        xorDeobfuscate(headerBytes, int64(blockOffset), xorKey)
+        let header = deserializeBlockHeader(headerBytes)
+        let headerSer = serialize(header)
+        let hash = BlockHash(doubleSha256(headerSer))
+
+        index[hash] = (fileNum: fileNum, offset: int64(blockOffset), size: size)
+
+        blocksInFile += 1
+        pos = blockOffset + size
+
+      echo "Scanned blk" & align($fileNum, 5, '0') & ".dat: " &
+           $blocksInFile & " blocks (total: " & $index.len & ")"
+      fileNum += 1
+
+    if fileNum == 0:
+      echo "No blk*.dat files found in " & blocksDir
+      quit(1)
+
+    echo "Block index built: " & $index.len & " blocks from " & $fileNum & " files"
+
+    # Process blocks in height order
+    var height = startHeight + 1
+    var imported = 0
+    let importStart = getMonoTime()
+    var batchStart = getMonoTime()
+
+    # Cache for file data
+    var cachedFileNum = -1
+    var cachedFileData: string
+
+    while true:
+      let hashOpt = cs.db.getBlockHashByHeight(height)
+      if hashOpt.isNone:
+        echo "No header at height " & $height & ". Imported " & $imported & " blocks."
+        break
+
+      let hash = hashOpt.get()
+      if hash notin index:
+        echo "Block at height " & $height & " not found in blk files. Stopping."
+        break
+
+      let loc = index[hash]
+
+      # Read and deobfuscate block data
+      if loc.fileNum != cachedFileNum:
+        let filePath = blocksDir / "blk" & align($loc.fileNum, 5, '0') & ".dat"
+        cachedFileData = readFile(filePath)
+        cachedFileNum = loc.fileNum
+
+      var blockData = newSeq[byte](loc.size)
+      copyMem(addr blockData[0], unsafeAddr cachedFileData[loc.offset], loc.size)
+      xorDeobfuscate(blockData, loc.offset, xorKey)
+
+      let blk = deserializeBlock(blockData)
+
+      # Validate
+      let checkResult = checkBlock(blk, params)
+      if not checkResult.isOk:
+        echo "Block validation failed at height " & $height & ": " & $checkResult.error
+        break
+
+      # Connect
+      let connectResult = cs.connectBlockIBD(blk, height)
+      if not connectResult.isOk:
+        echo "Block connect failed at height " & $height & ": " & $connectResult.error
+        break
+
+      imported += 1
+      height += 1
+
+      if imported mod 1000 == 0:
+        let elapsed = (getMonoTime() - batchStart).inMilliseconds.float / 1000.0
+        let bps = 1000.0 / elapsed
+        let totalElapsed = (getMonoTime() - importStart).inMilliseconds.float / 1000.0
+        echo "Import progress: height " & $(height - 1) &
+             " (" & $imported & " blocks, " &
+             $(int(bps)) & " blocks/sec, " &
+             $(int(bps * 60.0)) & " blocks/min, " &
+             "elapsed " & $(int(totalElapsed)) & "s)"
+        batchStart = getMonoTime()
+
+    let totalElapsed = (getMonoTime() - importStart).inMilliseconds.float / 1000.0
+    if imported > 0:
+      let bps = float(imported) / totalElapsed
+      echo "Import complete: " & $imported & " blocks in " &
+           $(int(totalElapsed)) & "s (" &
+           $(int(bps)) & " blocks/sec, " &
+           $(int(bps * 60.0)) & " blocks/min)"
+
+  cs.stopIBD()
+  echo "Import finished. Tip at height " & $cs.bestHeight
 
 proc startNode*(config: NimrodConfig) {.async.} =
   ## Start the node
@@ -701,6 +987,11 @@ proc runCommand(cmd: Command, config: NimrodConfig, args: seq[string]) {.async.}
 
 proc main() =
   let (cmd, config, args) = parseArgs()
+
+  # Check for --import-blocks before normal startup
+  if config.importBlocks.len > 0:
+    runBlockImport(config)
+    return
 
   case cmd
   of cmdStart:

@@ -9,6 +9,7 @@ import ./undo
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 import ../consensus/params
+import chronicles
 
 export db.ColumnFamily
 export undo.BlockUndo, undo.TxUndo, undo.SpentOutput, undo.FlatFilePos
@@ -377,9 +378,9 @@ proc updateBestBlock*(cdb: ChainDb, hash: BlockHash, height: int32) =
 
 const
   DefaultMaxCacheSize* = 50000
-  ## Maximum memory budget for UTXO cache (2 GiB)
-  MaxCacheBytes* = 2 * 1024 * 1024 * 1024
-  ## Eviction target: evict down to half the max (1 GiB)
+  ## Maximum memory budget for UTXO cache (450 MiB — matches Bitcoin Core default)
+  MaxCacheBytes* = 450 * 1024 * 1024
+  ## Eviction target: evict down to half the max (~225 MiB)
   EvictTargetBytes* = MaxCacheBytes div 2
   ## Estimated bytes per cache entry (OutPoint key ~60 bytes + UtxoEntry ~80 bytes + Table overhead ~32 bytes)
   EstimatedEntryBytes* = 172
@@ -645,7 +646,7 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   ok()
 
 # IBD batch flush interval (flush every N blocks)
-const IbdBatchFlushInterval* = 2000
+const IbdBatchFlushInterval* = 500
 
 proc startIBD*(cs: var ChainState) =
   ## Enter IBD mode: enable write batching for performance
@@ -707,9 +708,15 @@ proc flushIBDBatch*(cs: var ChainState) =
     cs.db.bestBlockHash = cs.bestBlockHash
     cs.db.bestHeight = cs.bestHeight
 
-    # Evict clean entries to bound memory during IBD
-    # All cache entries are now "clean" (persisted to RocksDB)
-    cs.evictCleanEntries()
+    # Clear the entire UTXO cache after flush — all entries are now persisted
+    # to RocksDB. Keeping them around wastes memory during IBD since the
+    # working set moves forward (subsequent blocks rarely reference old UTXOs).
+    # This bounds RSS to O(batch_interval * block_size) instead of O(chain_size).
+    let evictedEntries = cs.cacheSize
+    cs.utxoCache.clear()
+    cs.cacheSize = 0
+    info "flushed IBD batch", height = cs.bestHeight, evicted = evictedEntries,
+         batchBlocks = IbdBatchFlushInterval
 
 proc stopIBD*(cs: var ChainState) =
   ## Exit IBD mode: flush remaining batch and switch to per-block writes
