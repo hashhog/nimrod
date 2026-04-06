@@ -13,11 +13,11 @@ export options
 
 const LibRocksDb* = "librocksdb.so"
 
-# Performance tuning constants — keep total RocksDB memory under ~512 MiB
+# Performance tuning constants
 const
-  BlockCacheSize* = 128 * 1024 * 1024'u64       # 128 MiB shared block cache
-  WriteBufferSize* = 16 * 1024 * 1024'u64       # 16 MiB write buffer
-  MaxWriteBufferNumber* = 2                      # 2 write buffers max
+  BlockCacheSize* = 512 * 1024 * 1024'u64       # 512 MiB shared block cache
+  WriteBufferSize* = 64 * 1024 * 1024'u64       # 64 MiB write buffer
+  MaxWriteBufferNumber* = 3                      # 3 write buffers max
   BloomFilterBits* = 10                          # 10-bit bloom filter
   MaxOpenFiles* = 256                            # Limit file descriptors
   MaxBackgroundJobs* = 4                         # Background compaction jobs
