@@ -1662,25 +1662,38 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     # Connect to chainstate
     var cs = rpc.chainState
     let height = cs.bestHeight + 1
-    let connectResult = cs.connectBlock(blk, height)
+
+    # Use IBD fast path when far from tip (>1000 blocks behind assume-valid)
+    let useIBD = cs.params.assumeValidHeight > 0 and
+                 height < cs.params.assumeValidHeight - 1000
+    if useIBD and not cs.ibdMode:
+      cs.startIBD()
+    elif not useIBD and cs.ibdMode:
+      cs.stopIBD()
+
+    let connectResult = if cs.ibdMode:
+                          cs.connectBlockIBD(blk, height)
+                        else:
+                          cs.connectBlock(blk, height)
 
     if not connectResult.isOk:
       return %(connectResult.error)
 
-    # Remove confirmed transactions from mempool
-    var mp = rpc.mempool
-    mp.removeForBlock(blk)
+    if not cs.ibdMode:
+      # Remove confirmed transactions from mempool
+      var mp = rpc.mempool
+      mp.removeForBlock(blk)
 
-    # Update fee estimator
-    if rpc.feeEstimator != nil:
-      var confirmedTxids: seq[TxId]
-      for tx in blk.txs:
-        confirmedTxids.add(tx.txid())
-      rpc.feeEstimator.processBlock(height, confirmedTxids)
+      # Update fee estimator
+      if rpc.feeEstimator != nil:
+        var confirmedTxids: seq[TxId]
+        for tx in blk.txs:
+          confirmedTxids.add(tx.txid())
+        rpc.feeEstimator.processBlock(height, confirmedTxids)
 
-    # Broadcast to peers
-    if rpc.peerManager != nil:
-      asyncSpawn rpc.peerManager.broadcastBlock(blk)
+      # Broadcast to peers
+      if rpc.peerManager != nil:
+        asyncSpawn rpc.peerManager.broadcastBlock(blk)
 
     newJNull()  # Success
   except CatchableError as e:
