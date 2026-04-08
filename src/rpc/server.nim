@@ -1654,48 +1654,103 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     let blockBytes = hexToBytes(blockHex)
     let blk = deserializeBlock(blockBytes)
 
-    # Validate the block
+    # Full block validation (PoW, merkle root, transaction structure)
+    # Reference: Bitcoin Core ProcessNewBlock -> CheckBlock
     let checkResult = checkBlock(blk, rpc.params)
     if not checkResult.isOk:
       return %($checkResult.error)
 
-    # Connect to chainstate
+    # Check prevhash connects to a known block
+    # Reference: Bitcoin Core AcceptBlockHeader -> check prev block exists
     var cs = rpc.chainState
-    let height = cs.bestHeight + 1
+    let prevHash = blk.header.prevBlock
 
-    # Use IBD fast path when far from tip (>1000 blocks behind assume-valid)
-    let useIBD = cs.params.assumeValidHeight > 0 and
-                 height < cs.params.assumeValidHeight - 1000
-    if useIBD and not cs.ibdMode:
-      cs.startIBD()
-    elif not useIBD and cs.ibdMode:
-      cs.stopIBD()
+    if prevHash == cs.bestBlockHash:
+      # Block extends the current best chain — connect it
+      let height = cs.bestHeight + 1
 
-    let connectResult = if cs.ibdMode:
-                          cs.connectBlockIBD(blk, height)
-                        else:
-                          cs.connectBlock(blk, height)
+      # Use IBD fast path when far from tip (>1000 blocks behind assume-valid)
+      let useIBD = cs.params.assumeValidHeight > 0 and
+                   height < cs.params.assumeValidHeight - 1000
+      if useIBD and not cs.ibdMode:
+        cs.startIBD()
+      elif not useIBD and cs.ibdMode:
+        cs.stopIBD()
 
-    if not connectResult.isOk:
-      return %(connectResult.error)
+      let connectResult = if cs.ibdMode:
+                            cs.connectBlockIBD(blk, height)
+                          else:
+                            cs.connectBlock(blk, height)
 
-    if not cs.ibdMode:
-      # Remove confirmed transactions from mempool
-      var mp = rpc.mempool
-      mp.removeForBlock(blk)
+      if not connectResult.isOk:
+        return %(connectResult.error)
 
-      # Update fee estimator
-      if rpc.feeEstimator != nil:
-        var confirmedTxids: seq[TxId]
-        for tx in blk.txs:
-          confirmedTxids.add(tx.txid())
-        rpc.feeEstimator.processBlock(height, confirmedTxids)
+      if not cs.ibdMode:
+        # Remove confirmed transactions from mempool
+        var mp = rpc.mempool
+        mp.removeForBlock(blk)
 
-      # Broadcast to peers
-      if rpc.peerManager != nil:
-        asyncSpawn rpc.peerManager.broadcastBlock(blk)
+        # Update fee estimator
+        if rpc.feeEstimator != nil:
+          var confirmedTxids: seq[TxId]
+          for tx in blk.txs:
+            confirmedTxids.add(tx.txid())
+          rpc.feeEstimator.processBlock(height, confirmedTxids)
 
-    newJNull()  # Success
+        # Broadcast to peers
+        if rpc.peerManager != nil:
+          asyncSpawn rpc.peerManager.broadcastBlock(blk)
+
+      newJNull()  # Success
+
+    else:
+      # prevhash does not match current tip — check if it's a known block
+      let prevIdxOpt = cs.db.getBlockIndex(prevHash)
+      if prevIdxOpt.isNone:
+        return %"prev-blk-not-found"
+
+      # Known parent but not extending tip — only accept if more total work
+      # Calculate what the new chain's total work would be
+      let prevIdx = prevIdxOpt.get()
+      let headerBytes = serialize(blk.header)
+      let blockHash = doubleSha256(headerBytes)
+
+      # Compute work for this block from its nBits target
+      let target = compactToTarget(blk.header.bits)
+      var highestBit = 0
+      for i in countdown(31, 0):
+        if target[i] != 0:
+          highestBit = i * 8
+          var b = target[i]
+          while b != 0:
+            inc highestBit
+            b = b shr 1
+          break
+
+      var blockWork: array[32, byte]
+      if highestBit > 0 and highestBit < 256:
+        let workBit = 256 - highestBit
+        let bytePos = workBit div 8
+        let bitPos = workBit mod 8
+        if bytePos < 32:
+          blockWork[bytePos] = byte(1 shl bitPos)
+
+      # newTotalWork = prevIdx.totalWork + blockWork
+      var newTotalWork = prevIdx.totalWork
+      var carry: uint32 = 0
+      for i in 0 ..< 32:
+        let sum = uint32(newTotalWork[i]) + uint32(blockWork[i]) + carry
+        newTotalWork[i] = byte(sum and 0xff)
+        carry = sum shr 8
+
+      # Only switch if new chain has strictly more work
+      if compareWork256(newTotalWork, cs.totalWork) <= 0:
+        return %"inconclusive-not-best-prevblk"
+
+      # New chain has more work — would need reorg. For submitblock, reject
+      # blocks that require complex reorgs; P2P sync handles those.
+      return %"inconclusive-not-best-prevblk"
+
   except CatchableError as e:
     %(e.msg)
 

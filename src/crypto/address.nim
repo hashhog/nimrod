@@ -14,6 +14,7 @@ const
   # Human-readable parts for Bech32
   MainnetHRP* = "bc"
   TestnetHRP* = "tb"
+  RegtestHRP* = "bcrt"
 
 type
   AddressType* = enum
@@ -93,7 +94,7 @@ proc decodeAddress*(s: string): Address =
 
   # Try Bech32/Bech32m first (starts with bc1 or tb1)
   let lower = s.toLowerAscii()
-  if lower.startsWith("bc1") or lower.startsWith("tb1"):
+  if lower.startsWith("bc1") or lower.startsWith("tb1") or lower.startsWith("bcrt1"):
     try:
       let (_, data, enc) = bech32Decode(s)
 
