@@ -1571,6 +1571,13 @@ proc handleStaleRequests*(dl: BlockDownloader) {.async.} =
       debug "increased peer timeout due to stall", peer = key,
             newTimeout = peerState.currentTimeout
 
+  # Score misbehavior for stalling block downloads (+50)
+  for hash, request in dl.pendingRequests:
+    let pk = peerKey(request.peer)
+    if pk in stalePeers:
+      dl.syncManager.peerManager.misbehavingPeer(request.peer, ScoreBlockDownloadStall, "block download stalling")
+      break  # One score per peer is enough
+
   # Re-queue stale requests for reassignment
   for hash in staleRequests:
     let request = dl.pendingRequests[hash]
