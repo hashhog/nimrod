@@ -1,0 +1,13 @@
+services:
+  nimrod:
+    build: .
+    container_name: nimrod
+    restart: unless-stopped
+    volumes:
+      - nimrod-data:/data
+    ports:
+      - "8333:8333"
+      - "8332:8332"
+
+volumes:
+  nimrod-data:
