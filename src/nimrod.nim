@@ -42,6 +42,7 @@ type
     bindAddr*: string
     pruneTarget*: uint64  ## Prune target in MiB (0 = disabled, 1 = manual only)
     importBlocks*: string ## Path to blk*.dat directory, or "-" for framed stdin
+    metricsPort*: uint16  ## Prometheus metrics port (0 = disabled)
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -71,7 +72,8 @@ proc defaultConfig*(): NimrodConfig =
     rpcUser: "",
     rpcPassword: "",
     bindAddr: "0.0.0.0",
-    pruneTarget: 0  # Pruning disabled by default
+    pruneTarget: 0,  # Pruning disabled by default
+    metricsPort: 9332
   )
 
 proc loadConfigFile*(config: var NimrodConfig) =
@@ -234,6 +236,11 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
         result.config.bindAddr = p.val
       of "norpc":
         result.config.rpcEnabled = false
+      of "metricsport":
+        try: result.config.metricsPort = uint16(parseInt(p.val))
+        except ValueError:
+          echo "Invalid metrics port: " & p.val
+          quit(1)
       of "testnet":
         result.config.network = "testnet3"
         if result.config.rpcPort == 8332: result.config.rpcPort = 18332
@@ -756,6 +763,55 @@ proc runBlockImport*(config: NimrodConfig) =
   cs.stopIBD()
   echo "Import finished. Tip at height " & $cs.bestHeight
 
+proc metricsHandler(state: NodeState, transp: StreamTransport) {.async.} =
+  ## Handle a single Prometheus metrics request
+  try:
+    # Read HTTP request (just consume it)
+    var buf = newString(4096)
+    discard await transp.readOnce(addr buf[0], 4096)
+
+    let height = state.chainState.bestHeight
+    let peers = state.peerManager.connectedPeerCount()
+    let mempoolCount = state.mempool.count()
+
+    let body = "# HELP bitcoin_blocks_total Current block height\n" &
+               "# TYPE bitcoin_blocks_total gauge\n" &
+               "bitcoin_blocks_total " & $height & "\n" &
+               "# HELP bitcoin_peers_connected Number of connected peers\n" &
+               "# TYPE bitcoin_peers_connected gauge\n" &
+               "bitcoin_peers_connected " & $peers & "\n" &
+               "# HELP bitcoin_mempool_size Mempool transaction count\n" &
+               "# TYPE bitcoin_mempool_size gauge\n" &
+               "bitcoin_mempool_size " & $mempoolCount & "\n"
+
+    let response = "HTTP/1.1 200 OK\r\n" &
+                   "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n" &
+                   "Content-Length: " & $body.len & "\r\n" &
+                   "Connection: close\r\n\r\n" & body
+
+    discard await transp.write(response)
+  except CatchableError:
+    discard
+
+  await transp.closeWait()
+
+proc startMetricsServer(state: NodeState, port: uint16) {.async.} =
+  ## Start Prometheus metrics HTTP server
+  let ta = initTAddress("0.0.0.0", Port(port))
+  let server = createStreamServer(ta, flags = {ReuseAddr})
+
+  info "Prometheus metrics server started", port = port
+
+  while state.running:
+    try:
+      let transp = await server.accept()
+      asyncSpawn metricsHandler(state, transp)
+    except CatchableError as e:
+      if state.running:
+        error "Metrics server error", error = e.msg
+
+  server.close()
+
 proc startNode*(config: NimrodConfig) {.async.} =
   ## Start the node
   ## Init order: db -> chainstate -> mempool -> peermanager -> sync -> fee estimator -> RPC -> P2P
@@ -858,6 +914,11 @@ proc startNode*(config: NimrodConfig) {.async.} =
       cookiePass
     )
     asyncSpawn state.rpcServer.start()
+
+  # 7b. Start Prometheus metrics server
+  if config.metricsPort > 0:
+    info "starting metrics server", port = config.metricsPort
+    asyncSpawn startMetricsServer(state, config.metricsPort)
 
   # 8. Start P2P listener
   info "starting P2P listener", port = config.p2pPort, bindAddr = config.bindAddr

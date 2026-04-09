@@ -1,0 +1,42 @@
+# Nimrod - Bitcoin Full Node (Nim)
+# Example configuration file
+# Copy to your data directory and modify as needed.
+
+[network]
+# Network: mainnet, testnet3, regtest
+network = "mainnet"
+
+[storage]
+# Data directory
+datadir = "~/.nimrod"
+# Prune target in MiB (0 = disabled, 1 = manual only)
+prune = 0
+
+[rpc]
+# RPC port
+rpcport = 8332
+# Enable RPC server
+rpc_enabled = true
+# RPC authentication
+rpcuser = ""
+rpcpassword = ""
+# RPC bind address
+bind_addr = "0.0.0.0"
+
+[p2p]
+# P2P listen port
+port = 8333
+# Maximum peer connections
+maxconnections = 125
+
+[mempool]
+# (Uses Bitcoin Core defaults internally)
+
+[logging]
+# Log level: trace, debug, info, warn, error
+loglevel = "info"
+
+[metrics]
+# Prometheus metrics endpoint
+# enabled = true
+# port = 9332
