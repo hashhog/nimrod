@@ -535,18 +535,26 @@ proc handlePreciousBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 # Mempool RPCs
 proc handleGetMempoolInfo(rpc: RpcServer): JsonNode =
   let minFee = rpc.mempool.minFeeRate / 100000000.0  # Convert sat/vbyte to BTC/kB
+  # Calculate total fees
+  var totalFeeSat: int64 = 0
+  for _, entry in rpc.mempool.entries:
+    totalFeeSat += int64(entry.fee)
   %*{
     "loaded": true,
     "size": rpc.mempool.count,
     "bytes": rpc.mempool.size,
     "usage": rpc.mempool.size,
+    "total_fee": float64(totalFeeSat) / 100000000.0,
     "maxmempool": rpc.mempool.maxSize,
     "mempoolminfee": minFee,
-    "minrelaytxfee": minFee
+    "minrelaytxfee": minFee,
+    "incrementalrelayfee": 0.00001,
+    "unbroadcastcount": 0,
+    "fullrbf": true
   }
 
 proc handleGetRawMempool(rpc: RpcServer, params: JsonNode): JsonNode =
-  let verbose = if params.len >= 1: params[1].getBool() else: false
+  let verbose = if params.len >= 1: params[0].getBool() else: false
 
   if verbose:
     var entries = newJObject()
@@ -1961,11 +1969,15 @@ proc handleEstimateSmartFee(rpc: RpcServer, params: JsonNode): JsonNode =
   if confTarget < 1 or confTarget > 1008:
     raise newRpcError(RpcInvalidParams, "conf_target out of range (1-1008)")
 
-  var feeRate: float64
+  var feeRate: float64 = 0.0
   if rpc.feeEstimator != nil:
     feeRate = rpc.feeEstimator.estimateFee(confTarget)
-  else:
-    feeRate = FallbackFeeRate
+
+  if feeRate <= 0:
+    return %*{
+      "errors": ["Insufficient data or no feerate found"],
+      "blocks": confTarget
+    }
 
   # Convert sat/vbyte to BTC/kB
   let feeBtcPerKb = feeRate * 1000.0 / 100000000.0
