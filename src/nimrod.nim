@@ -1,7 +1,7 @@
 ## nimrod - Bitcoin full node in Nim
 ## Unified CLI with subcommands for node operation, RPC interaction, and wallet management
 
-import std/[parseopt, os, strutils, json, posix, net, base64, sysrand, tables, monotimes, times]
+import std/[parseopt, os, strutils, json, posix, net, base64, sysrand, tables, monotimes, times, sets]
 import chronos
 import chronicles
 
@@ -54,6 +54,7 @@ type
     rpcServer*: RpcServer
     crypto*: CryptoEngine
     running*: bool
+    recentlyRejected*: HashSet[TxId]  ## Recently-rejected tx filter, cleared on new block
 
 # Global for signal handling
 var globalNodeState*: NodeState = nil
@@ -317,17 +318,25 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     await state.syncManager.handleHeaders(peer, msg.headers)
 
   of mkBlock:
+    var blockAccepted = false
     try:
-      discard state.syncManager.processBlock(msg.blk)
+      blockAccepted = state.syncManager.processBlock(msg.blk)
     except Defect as e:
       # Log but don't crash — the block will be retried
       let ht = state.syncManager.chainTipHeight
       echo "DEFECT in processBlock (chainTip=", ht, "): ", e.msg
       when compileOption("stackTrace"):
         echo getStackTrace(e)
+    if blockAccepted:
+      # Remove confirmed transactions from mempool
+      {.gcsafe.}:
+        state.mempool.removeForBlock(msg.blk)
+      # Clear recently-rejected filter -- rejection reasons may no longer apply
+      state.recentlyRejected.clear()
 
   of mkTx:
     var accepted = false
+    let txid = msg.tx.txid()
     {.gcsafe.}:
       try:
         let txResult = state.mempool.acceptTransaction(msg.tx, state.crypto)
@@ -339,19 +348,31 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     if accepted:
       # Relay to peers
       asyncSpawn state.peerManager.broadcastTx(msg.tx)
+    else:
+      # Track rejection to avoid re-requesting
+      if state.recentlyRejected.len < 50_000:
+        state.recentlyRejected.incl(txid)
 
   of mkInv:
     # Request blocks we don't have
     var blockInvs: seq[InvVector]
+    var txInvs: seq[InvVector]
     for item in msg.invItems:
       if item.invType == invBlock or item.invType == invWitnessBlock:
         # Request as witness block for segwit support
         blockInvs.add(InvVector(invType: invWitnessBlock, hash: item.hash))
+      elif item.invType == invTx or item.invType == invWitnessTx:
+        # Request unknown transactions
+        let txid = TxId(item.hash)
+        if not state.mempool.contains(txid) and txid notin state.recentlyRejected:
+          txInvs.add(InvVector(invType: invWitnessTx, hash: item.hash))
     if blockInvs.len > 0:
       asyncSpawn peer.sendGetData(blockInvs)
+    if txInvs.len > 0:
+      asyncSpawn peer.sendGetData(txInvs)
 
   of mkGetData:
-    # Handle data requests - serve blocks to peers
+    # Handle data requests - serve blocks and transactions to peers
     for item in msg.getData:
       if item.invType == invBlock or item.invType == invWitnessBlock:
         let blockOpt = state.chainState.db.getBlock(BlockHash(item.hash))
@@ -362,6 +383,16 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
             debug "served block to peer", peer = $peer
           except CatchableError as e:
             debug "failed to serve block", peer = $peer, error = e.msg
+      elif item.invType == invTx or item.invType == invWitnessTx:
+        let txid = TxId(item.hash)
+        let entryOpt = state.mempool.get(txid)
+        if entryOpt.isSome:
+          let txMsg = newTxMsg(entryOpt.get().tx)
+          try:
+            await peer.sendMessage(txMsg)
+            debug "served tx to peer", peer = $peer
+          except CatchableError as e:
+            debug "failed to serve tx", peer = $peer, error = e.msg
 
   of mkPing:
     # Respond with pong
@@ -398,6 +429,13 @@ proc setupSignalHandlers*() =
         if fileExists(cookiePath):
           removeFile(cookiePath)
           info "removed RPC cookie file", path = cookiePath
+
+      # Save fee estimates
+      if globalNodeState.feeEstimator != nil:
+        let feePath = globalNodeState.config.dataDir /
+                      globalNodeState.config.network / "fee_estimates.json"
+        info "saving fee estimates", path = feePath
+        globalNodeState.feeEstimator.saveFeeEstimates(feePath)
 
       # Disconnect peers
       if globalNodeState.peerManager != nil:
@@ -749,7 +787,8 @@ proc startNode*(config: NimrodConfig) {.async.} =
   var state = NodeState(
     config: config,
     params: params,
-    running: true
+    running: true,
+    recentlyRejected: initHashSet[TxId]()
   )
   {.gcsafe.}:
     globalNodeState = state
@@ -782,6 +821,8 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # 4. Initialize fee estimator
   info "initializing fee estimator"
   state.feeEstimator = newFeeEstimator()
+  let feeEstimatesPath = networkDir / "fee_estimates.json"
+  state.feeEstimator.loadFeeEstimates(feeEstimatesPath)
 
   # 5. Initialize peer manager
   info "initializing peer manager"
