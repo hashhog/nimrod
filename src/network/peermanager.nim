@@ -19,6 +19,7 @@ import ./banman
 import ./netgroup
 import ./eviction
 import ./anchors
+import ./addr
 import ../consensus/params
 import ../primitives/[types, serialize]
 import ../crypto/hashing
@@ -355,10 +356,17 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
       info "connected to peer", peer = $peer, height = peer.startHeight, connType = $connType
 
       # Start message loop for outbound peer (same as inbound)
-      if pm.onMessage != nil:
-        asyncSpawn peer.messageLoop(pm.onMessage)
-      else:
-        asyncSpawn peer.messageLoop(nil)
+      # Wrap callback to handle addr/addrv2/getaddr/feefilter internally
+      let wrappedCb = proc(p: Peer, msg: P2PMessage) {.async.} =
+        pm.handleAddrInternal(p, msg)
+        if pm.onMessage != nil:
+          await pm.onMessage(p, msg)
+      asyncSpawn peer.messageLoop(wrappedCb)
+
+      # BIP133: Send initial feefilter after handshake
+      # 100 sat/vbyte = 100,000 sat/kvB to discourage tx relay during sync
+      let feeMsg = newFeeFilter(100_000'u64)
+      asyncSpawn peer.sendMessage(feeMsg)
 
       return true
     except CatchableError as e:
@@ -565,10 +573,16 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
 
     info "inbound handshake complete", peer = $peer, height = peer.startHeight
 
-    if pm.onMessage != nil:
-      asyncSpawn peer.messageLoop(pm.onMessage)
-    else:
-      asyncSpawn peer.messageLoop(nil)
+    # Wrap callback to handle addr/addrv2/getaddr/feefilter internally
+    let wrappedCb = proc(p: Peer, msg: P2PMessage) {.async.} =
+      pm.handleAddrInternal(p, msg)
+      if pm.onMessage != nil:
+        await pm.onMessage(p, msg)
+    asyncSpawn peer.messageLoop(wrappedCb)
+
+    # BIP133: Send initial feefilter after handshake
+    let feeMsg = newFeeFilter(100_000'u64)
+    asyncSpawn peer.sendMessage(feeMsg)
   except CatchableError as e:
     error "inbound handshake failed", peer = $peer, error = e.msg
     await peer.disconnect()
@@ -825,6 +839,82 @@ proc addKnownAddress*(pm: PeerManager, address: NetAddress) =
 
 proc getKnownAddresses*(pm: PeerManager): seq[NetAddress] =
   pm.knownAddresses
+
+proc relayAddresses(pm: PeerManager, source: Peer) =
+  ## Relay addresses to up to 2 random peers (not back to source)
+  var candidates: seq[Peer]
+  for _, p in pm.peers:
+    if p != source and p.isConnected() and not p.closing:
+      candidates.add(p)
+  if candidates.len == 0:
+    return
+  shuffle(candidates)
+  let n = min(2, candidates.len)
+  let addrCount = min(10, pm.knownAddresses.len)
+  if addrCount > 0:
+    var timestamped: seq[TimestampedAddr]
+    for i in 0..<addrCount:
+      let a = pm.knownAddresses[i]
+      timestamped.add(TimestampedAddr(
+        timestamp: uint32(epochTime().int),
+        address: a
+      ))
+    let msg = newAddr(timestamped)
+    for i in 0..<n:
+      asyncSpawn candidates[i].sendMessage(msg)
+
+proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage) =
+  ## Process addr/addrv2/getaddr/feefilter messages internally.
+  case msg.kind
+  of mkAddr:
+    # Add addresses to known list (max 1000 per message)
+    let count = min(msg.addresses.len, 1000)
+    for i in 0..<count:
+      let na = msg.addresses[i].address
+      var found = false
+      for ka in pm.knownAddresses:
+        if ka.ip == na.ip and ka.port == na.port:
+          found = true
+          break
+      if not found:
+        pm.knownAddresses.add(na)
+    # Relay to up to 2 random peers (not back to source)
+    if msg.addresses.len <= 1000 and msg.addresses.len > 0:
+      pm.relayAddresses(peer)
+  of mkAddrV2:
+    # Add addrv2 addresses (extract IPv4/IPv6 only for now)
+    let count = min(msg.addressesV2.len, 1000)
+    for i in 0..<count:
+      let ta = msg.addressesV2[i]
+      let legacy = toLegacyTimestampedAddr(ta)
+      if legacy.isSome:
+        let la = legacy.get()
+        var found = false
+        for ka in pm.knownAddresses:
+          if ka.ip == la.address.ip and ka.port == la.address.port:
+            found = true
+            break
+        if not found:
+          pm.knownAddresses.add(la.address)
+    if msg.addressesV2.len <= 1000 and msg.addressesV2.len > 0:
+      pm.relayAddresses(peer)
+  of mkGetAddr:
+    # Respond with up to 1000 known addresses
+    let count = min(pm.knownAddresses.len, 1000)
+    if count > 0:
+      var addrs: seq[TimestampedAddr]
+      for i in 0..<count:
+        addrs.add(TimestampedAddr(
+          timestamp: uint32(epochTime().int),
+          address: pm.knownAddresses[i]
+        ))
+      let response = newAddr(addrs)
+      asyncSpawn peer.sendMessage(response)
+  of mkFeeFilter:
+    # Already handled in peer.handleMessage
+    discard
+  else:
+    discard
 
 proc setMessageCallback*(pm: PeerManager, callback: PeerCallback) =
   pm.onMessage = callback
