@@ -1,7 +1,7 @@
 ## Fee estimation using histogram-based confirmation tracking
 ## Tracks transactions across fee-rate buckets and measures confirmation times
 
-import std/[tables, math]
+import std/[tables, math, json, os]
 import ../primitives/types
 
 const
@@ -207,3 +207,71 @@ proc clear*(fe: FeeEstimator) =
   fe.trackedTxs.clear()
   for i in 0..<NumBuckets:
     fe.bucketStats[i] = default(BucketStats)
+
+proc saveFeeEstimates*(fe: FeeEstimator, path: string) =
+  ## Save fee estimator bucket statistics to a JSON file.
+  ## Only persists bucket stats, not tracked transactions (those are ephemeral).
+  var bucketsArr = newJArray()
+  for i in 0..<NumBuckets:
+    let stats = fe.bucketStats[i]
+    var confirmedArr = newJArray()
+    for j in 0..<MaxTargetBlocks:
+      confirmedArr.add(%stats.totalConfirmed[j])
+    let bucket = %*{
+      "totalSeen": stats.totalSeen,
+      "avgFeeRate": stats.avgFeeRate,
+      "feeRateSum": stats.feeRateSum,
+      "totalConfirmed": confirmedArr
+    }
+    bucketsArr.add(bucket)
+
+  let state = %*{
+    "version": 1,
+    "numBuckets": NumBuckets,
+    "buckets": bucketsArr
+  }
+
+  let tmpPath = path & ".tmp"
+  try:
+    writeFile(tmpPath, $state)
+    moveFile(tmpPath, path)
+  except CatchableError:
+    discard
+
+proc loadFeeEstimates*(fe: FeeEstimator, path: string) =
+  ## Load fee estimator bucket statistics from a JSON file.
+  ## Silently returns if file doesn't exist or is invalid.
+  if not fileExists(path):
+    return
+
+  try:
+    let contents = readFile(path)
+    let state = parseJson(contents)
+
+    if state.kind != JObject:
+      return
+
+    let bucketsNode = state{"buckets"}
+    if bucketsNode.isNil or bucketsNode.kind != JArray:
+      return
+
+    if bucketsNode.len != NumBuckets:
+      return
+
+    for i in 0..<NumBuckets:
+      let bucket = bucketsNode[i]
+      if bucket.kind != JObject:
+        continue
+
+      fe.bucketStats[i].totalSeen = bucket{"totalSeen"}.getFloat()
+      fe.bucketStats[i].avgFeeRate = bucket{"avgFeeRate"}.getFloat()
+      fe.bucketStats[i].feeRateSum = bucket{"feeRateSum"}.getFloat()
+
+      let confirmedNode = bucket{"totalConfirmed"}
+      if confirmedNode.isNil or confirmedNode.kind != JArray:
+        continue
+
+      for j in 0..<min(confirmedNode.len, MaxTargetBlocks):
+        fe.bucketStats[i].totalConfirmed[j] = confirmedNode[j].getFloat()
+  except CatchableError:
+    discard
