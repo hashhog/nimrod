@@ -96,6 +96,7 @@ type
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
 proc tryEvictInbound(pm: PeerManager): Option[string]
 proc runStalePeerChecks*(pm: PeerManager) {.async.}
+proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage)
 
 proc peerKey(host: string, port: uint16): string =
   host & ":" & $port
@@ -358,7 +359,11 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
       # Start message loop for outbound peer (same as inbound)
       # Wrap callback to handle addr/addrv2/getaddr/feefilter internally
       let wrappedCb = proc(p: Peer, msg: P2PMessage) {.async.} =
-        pm.handleAddrInternal(p, msg)
+        {.gcsafe.}:
+          try:
+            pm.handleAddrInternal(p, msg)
+          except Exception:
+            discard
         if pm.onMessage != nil:
           await pm.onMessage(p, msg)
       asyncSpawn peer.messageLoop(wrappedCb)
@@ -575,7 +580,11 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
 
     # Wrap callback to handle addr/addrv2/getaddr/feefilter internally
     let wrappedCb = proc(p: Peer, msg: P2PMessage) {.async.} =
-      pm.handleAddrInternal(p, msg)
+      {.gcsafe.}:
+        try:
+          pm.handleAddrInternal(p, msg)
+        except Exception:
+          discard
       if pm.onMessage != nil:
         await pm.onMessage(p, msg)
     asyncSpawn peer.messageLoop(wrappedCb)
