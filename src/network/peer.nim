@@ -2,14 +2,14 @@
 ## TCP connection with message framing, version handshake, and ping/pong
 ## Uses chronos for async networking
 
-import std/[strformat, random]
+import std/[strformat, random, hashes, tables]
 import std/times as stdtimes
 import chronos
 import chronos/timer as ctimer
 import chronicles
 import ../primitives/[types, serialize]
 import ../consensus/params
-import ../crypto/hashing
+from ../crypto/hashing import doubleSha256
 import ../mempool/mempool as mempool_mod
 import ./messages
 import ./compact_blocks
