@@ -10,6 +10,7 @@ import chronicles
 import ../primitives/[types, serialize]
 import ../consensus/params
 import ./messages
+import ./compact_blocks
 import ./bip324
 
 export chronicles
@@ -114,6 +115,10 @@ type
     syncStarted*: bool                 # Whether we've started syncing from this peer
     chainSyncState*: ChainSyncState    # Chain sync timeout state
     blocksInFlight*: int               # Number of blocks we're downloading from this peer
+    # BIP 152 compact block relay
+    compactBlockState*: CompactBlockState  # Compact block relay state
+    peerCmpctVersion*: uint64              # Compact block version peer supports (0 = none)
+    peerHighBandwidth*: bool               # Peer wants high-bandwidth mode
 
   PeerError* = object of CatchableError
 
@@ -144,6 +149,10 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     verackSent: false,
     localNonce: uint64(rand(high(int))),  # Generate unique nonce for self-connection detection
     remoteNonce: 0,
+    # BIP 152 compact blocks
+    compactBlockState: newCompactBlockState(),
+    peerCmpctVersion: 0,
+    peerHighBandwidth: false,
     # Stale peer tracking
     connectedTime: now,
     lastBlockTime: now,              # Initialize to now, not epoch
@@ -589,8 +598,18 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     trace "peer prefers headers", peer = $peer
 
   of mkSendCmpct:
-    trace "peer supports compact blocks", peer = $peer,
-          version = msg.sendCmpct.version
+    # BIP 152: Handle sendcmpct negotiation
+    let version = msg.sendCmpct.version
+    let announce = msg.sendCmpct.announce
+    if version >= 1 and version <= 2:
+      peer.peerCmpctVersion = version
+      peer.peerHighBandwidth = announce
+      peer.compactBlockState.handleSendCmpct(announce, version)
+      info "peer supports compact blocks", peer = $peer,
+           version = version, highBandwidth = announce
+    else:
+      trace "peer sent unsupported compact block version", peer = $peer,
+            version = version
 
   of mkFeeFilter:
     peer.feeFilterRate = msg.feeRate
@@ -605,13 +624,73 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     trace "peer supports addrv2", peer = $peer
 
   of mkCmpctBlock:
-    trace "received compact block", peer = $peer
+    # BIP 152: Handle incoming compact block
+    # Without a full mempool integration, fall back to requesting all transactions
+    # via getblocktxn. The compact block is still parsed and validated.
+    let cb = msg.cmpctBlock
+    let headerData = serialize(cb.header)
+    let blockHash = BlockHash(doubleSha256(headerData))
+    info "received compact block", peer = $peer,
+         hash = $blockHash,
+         shortIds = cb.shortIds.len,
+         prefilled = cb.prefilledTxns.len
+
+    # Initialize the partially downloaded block
+    let (pdb, status) = initPartiallyDownloadedBlock(cb)
+    if status != rsOk:
+      warn "invalid compact block", peer = $peer, status = $status
+    else:
+      # Store the partial block
+      peer.compactBlockState.pendingPartials[blockHash] = pdb
+      peer.compactBlockState.blocksReceived += 1
+
+      # Without mempool, request ALL missing transactions
+      let missing = pdb.getMissingTxIndexes()
+      if missing.len > 0:
+        info "requesting missing txns for compact block", peer = $peer,
+             hash = $blockHash, missing = missing.len
+        let req = createBlockTxnRequest(blockHash, missing)
+        await peer.sendMessage(newGetBlockTxnMsg(blockHash, missing))
+        peer.compactBlockState.txnsRequested += missing.len
+      else:
+        # All transactions were prefilled (unlikely but possible)
+        let (blk, rStatus) = pdb.reconstructBlock()
+        if rStatus == rsOk:
+          info "compact block fully prefilled, reconstructed", peer = $peer,
+               hash = $blockHash
+          peer.compactBlockState.successfulReconstructions += 1
 
   of mkGetBlockTxn:
-    discard  # TODO: respond with blocktxn
+    # BIP 152: Peer requests missing transactions for a compact block
+    # We respond with the requested transactions if we have the block
+    let req = msg.getBlockTxn
+    info "received getblocktxn", peer = $peer,
+         hash = $req.blockHash,
+         indexes = req.indexes.len
+    # Note: Actual block lookup requires chain integration.
+    # For now, log the request. The higher-level sync code should register
+    # a callback to handle this by looking up the block and sending blocktxn.
 
   of mkBlockTxn:
-    trace "received blocktxn", peer = $peer
+    # BIP 152: Response with missing transactions for a compact block
+    let resp = msg.blockTxn
+    info "received blocktxn", peer = $peer,
+         hash = $resp.blockHash,
+         txns = resp.transactions.len
+
+    if peer.compactBlockState.hasPending(resp.blockHash):
+      let (blk, status) = peer.compactBlockState.completeBlock(
+        resp.blockHash, resp.transactions)
+      if status == rsOk:
+        info "compact block reconstructed", peer = $peer,
+             hash = $resp.blockHash,
+             txCount = blk.txs.len
+      else:
+        warn "compact block reconstruction failed", peer = $peer,
+             hash = $resp.blockHash, status = $status
+    else:
+      trace "unexpected blocktxn (no pending compact block)", peer = $peer,
+            hash = $resp.blockHash
 
   of mkSendPackages:
     trace "peer supports packages", peer = $peer
@@ -713,6 +792,9 @@ const
   ScoreInvalidHeaders* = 100'u32        # Instant ban (invalid PoW/structure)
   ScoreInvalidCompactBlock* = 100'u32   # Instant ban
   ScoreOversizedMessage* = 20'u32
+  ScoreHeadersDontConnect* = 20'u32   # Headers that don't connect to our chain
+  ScoreBlockDownloadStall* = 50'u32   # Stalling block download
+  ScoreUnrequestedData* = 5'u32       # Sending unrequested data
 
 proc misbehaving*(peer: var Peer, howmuch: uint32, message: string) =
   ## Add misbehavior points to a peer. At 100 points, peer is flagged for disconnect.
