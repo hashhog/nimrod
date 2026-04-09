@@ -9,6 +9,8 @@ import chronos/timer as ctimer
 import chronicles
 import ../primitives/[types, serialize]
 import ../consensus/params
+import ../crypto/hashing
+import ../mempool/mempool as mempool_mod
 import ./messages
 import ./compact_blocks
 import ./bip324
@@ -119,6 +121,8 @@ type
     compactBlockState*: CompactBlockState  # Compact block relay state
     peerCmpctVersion*: uint64              # Compact block version peer supports (0 = none)
     peerHighBandwidth*: bool               # Peer wants high-bandwidth mode
+    # Mempool reference for compact block reconstruction
+    mempool*: mempool_mod.Mempool          # May be nil during IBD
 
   PeerError* = object of CatchableError
 
@@ -624,9 +628,7 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     trace "peer supports addrv2", peer = $peer
 
   of mkCmpctBlock:
-    # BIP 152: Handle incoming compact block
-    # Without a full mempool integration, fall back to requesting all transactions
-    # via getblocktxn. The compact block is still parsed and validated.
+    # BIP 152: Reconstruct block from compact block + mempool
     let cb = msg.cmpctBlock
     let headerData = serialize(cb.header)
     let blockHash = BlockHash(doubleSha256(headerData))
@@ -636,29 +638,47 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
          prefilled = cb.prefilledTxns.len
 
     # Initialize the partially downloaded block
-    let (pdb, status) = initPartiallyDownloadedBlock(cb)
+    var (pdb, status) = initPartiallyDownloadedBlock(cb)
     if status != rsOk:
       warn "invalid compact block", peer = $peer, status = $status
     else:
-      # Store the partial block
-      peer.compactBlockState.pendingPartials[blockHash] = pdb
       peer.compactBlockState.blocksReceived += 1
 
-      # Without mempool, request ALL missing transactions
-      let missing = pdb.getMissingTxIndexes()
-      if missing.len > 0:
-        info "requesting missing txns for compact block", peer = $peer,
-             hash = $blockHash, missing = missing.len
-        let req = createBlockTxnRequest(blockHash, missing)
-        await peer.sendMessage(newGetBlockTxnMsg(blockHash, missing))
-        peer.compactBlockState.txnsRequested += missing.len
-      else:
-        # All transactions were prefilled (unlikely but possible)
+      # Fill from mempool if available
+      if peer.mempool != nil:
+        pdb.fillFromMempool(peer.mempool)
+
+      if pdb.isComplete():
+        # Fully reconstructed from mempool + prefilled
         let (blk, rStatus) = pdb.reconstructBlock()
         if rStatus == rsOk:
-          info "compact block fully prefilled, reconstructed", peer = $peer,
-               hash = $blockHash
+          info "compact block reconstructed from mempool", peer = $peer,
+               hash = $blockHash,
+               prefilled = pdb.prefilledCount,
+               mempoolHits = pdb.mempoolCount
           peer.compactBlockState.successfulReconstructions += 1
+        else:
+          warn "compact block reconstruction failed", peer = $peer,
+               hash = $blockHash
+          peer.compactBlockState.failedReconstructions += 1
+      else:
+        # Still missing some transactions
+        let missing = pdb.getMissingTxIndexes()
+        let totalTx = cb.blockTxCount()
+        let missPct = if totalTx > 0: missing.len.float / totalTx.float * 100.0 else: 100.0
+        if missPct > 50.0:
+          # Too many missing — don't bother with getblocktxn, request full block
+          info "compact block too many missing txns, skipping", peer = $peer,
+               hash = $blockHash, missingPct = missPct
+          peer.compactBlockState.failedReconstructions += 1
+        else:
+          info "requesting missing txns for compact block", peer = $peer,
+               hash = $blockHash, missing = missing.len,
+               mempoolHits = pdb.mempoolCount
+          # Store partial and send getblocktxn
+          peer.compactBlockState.pendingPartials[blockHash] = pdb
+          await peer.sendMessage(newGetBlockTxnMsg(blockHash, missing))
+          peer.compactBlockState.txnsRequested += missing.len
 
   of mkGetBlockTxn:
     # BIP 152: Peer requests missing transactions for a compact block
