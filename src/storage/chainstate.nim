@@ -706,6 +706,12 @@ proc flushIBDBatch*(cs: var ChainState) =
     # Commit the entire batch atomically
     cs.db.db.write(cs.ibdBatch)
 
+    # Force all memtables to SST files. WAL is disabled during IBD, so
+    # memtable data is volatile — without this flush a crash can lose all
+    # UTXO/metadata updates since the last RocksDB-initiated memtable
+    # compaction, corrupting the chainstate across column families.
+    cs.db.db.flushAllColumnFamilies()
+
     # Reset batch
     cs.ibdBatch.clear()
     cs.ibdBatchBlocks = 0

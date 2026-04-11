@@ -457,3 +457,4 @@ suite "ChainState cache management":
       check bestBlock.isSome
 
       cs.close()
+## IBD durability tests moved to test_ibd_durability.nim
