@@ -368,6 +368,8 @@ proc flushTrickle(state: PeerRelayState) {.async.} =
 
     offset = batchEnd
 
+proc maybeSendFeefilter*(rm: RelayManager, state: PeerRelayState) {.async.}
+
 proc trickleLoop(rm: RelayManager) {.async.} =
   ## Main loop that checks peers and flushes trickling queues
   ## Also sends feefilter messages on schedule

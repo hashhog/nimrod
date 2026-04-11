@@ -48,7 +48,7 @@ suite "Regtest block mining":
     tempDir = createTempDir("nimrod_test_", "_regtest")
     params = regtestParams()
     chainState = newChainState(tempDir, params)
-    mempool = newMempool()
+    mempool = newMempool(chainState, params)
 
     # Initialize with genesis block if needed
     if chainState.bestHeight < 0:
@@ -120,10 +120,10 @@ suite "Generate RPC address parsing":
 
     # bcrt1 prefix is used for regtest bech32 addresses
     # Using a testnet address format for parsing test
-    let addr = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+    let addrStr = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
 
     try:
-      let parsed = decodeAddress(addr)
+      let parsed = decodeAddress(addrStr)
       check parsed.kind == P2WPKH
     except AddressError:
       # Expected if address validation is strict
@@ -131,10 +131,10 @@ suite "Generate RPC address parsing":
 
   test "generateToAddress parses legacy P2PKH address":
     # Testnet P2PKH address (starts with m or n)
-    let addr = "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"
+    let addrStr2 = "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"
 
     try:
-      let parsed = decodeAddress(addr)
+      let parsed = decodeAddress(addrStr2)
       check parsed.kind == P2PKH
     except AddressError:
       # May fail if network mismatch
@@ -150,7 +150,7 @@ suite "Generate block with transactions":
     tempDir = createTempDir("nimrod_test_", "_generateblock")
     params = regtestParams()
     chainState = newChainState(tempDir, params)
-    mempool = newMempool()
+    mempool = newMempool(chainState, params)
 
     # Initialize with genesis
     if chainState.bestHeight < 0:
@@ -228,7 +228,7 @@ suite "Coinbase maturity":
     tempDir = createTempDir("nimrod_test_", "_maturity")
     params = regtestParams()
     chainState = newChainState(tempDir, params)
-    mempool = newMempool()
+    mempool = newMempool(chainState, params)
 
     # Start with genesis
     if chainState.bestHeight < 0:

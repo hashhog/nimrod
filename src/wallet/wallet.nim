@@ -508,14 +508,15 @@ proc addAccount*(wallet: var Wallet, purpose: uint32 = 84, accountIndex: uint32 
 
 proc ensureGap(wallet: var Wallet, account: var Account, isInternal: bool) =
   ## Ensure there are enough unused addresses ahead of the next index
-  let keys = if isInternal: account.internalKeys else: account.externalKeys
   let nextIdx = if isInternal: account.nextInternal else: account.nextExternal
   let chain: uint32 = if isInternal: 1 else: 0
 
-  while keys.len < nextIdx + account.gap:
+  # Use the actual account fields (not a local copy) to check length
+  while (if isInternal: account.internalKeys.len else: account.externalKeys.len) < nextIdx + account.gap:
+    let currentLen = if isInternal: account.internalKeys.len else: account.externalKeys.len
     let newKey = wallet.derivePath(
       account.purpose, account.coinType, account.accountIndex,
-      chain, uint32(keys.len)
+      chain, uint32(currentLen)
     )
     if isInternal:
       account.internalKeys.add(newKey)

@@ -67,7 +67,7 @@ suite "MuHash3072":
     h.insert(@[40'u8, 50, 60])
 
     let serialized = serializeMuHash(h)
-    let deserialized = deserializeMuHash(serialized)
+    var deserialized = deserializeMuHash(serialized)
 
     check h.finalize() == deserialized.finalize()
 
@@ -90,8 +90,8 @@ suite "CoinStatsIndex":
     check disabledIdx.lookUpStats(0).isNone
 
   test "getBogoSize calculation":
-    check getBogoSize(@[]) == 32 + 4 + 4 + 1 + 8 + 0 + 1
-    check getBogoSize(@[1'u8, 2, 3]) == 32 + 4 + 4 + 1 + 8 + 3 + 1
+    check getBogoSize(@[]) == 50'u64  # 32 + 4 + 4 + 1 + 8 + 0 + 1
+    check getBogoSize(@[1'u8, 2, 3]) == 53'u64  # 32 + 4 + 4 + 1 + 8 + 3 + 1
 
   test "isUnspendable detection":
     check isUnspendable(@[]) == true  # Empty
@@ -148,7 +148,7 @@ suite "CoinStatsIndex":
       header: BlockHeader(version: 1),
       txs: @[Transaction(
         version: 1,
-        inputs: @[TxIn(prevOut: OutPoint(), scriptSig: @[], sequence: 0xffffffff)],
+        inputs: @[TxIn(prevOut: OutPoint(), scriptSig: @[], sequence: 0xffffffff'u32)],
         outputs: @[
           TxOut(value: Satoshi(5000000000), scriptPubKey: @[0x76'u8, 0xa9]),
           TxOut(value: Satoshi(2500000000), scriptPubKey: @[0x00'u8, 0x14])
@@ -193,7 +193,7 @@ suite "CoinStatsIndex":
       header: BlockHeader(version: 1),
       txs: @[Transaction(
         version: 1,
-        inputs: @[TxIn(prevOut: OutPoint(), scriptSig: @[], sequence: 0xffffffff)],
+        inputs: @[TxIn(prevOut: OutPoint(), scriptSig: @[], sequence: 0xffffffff'u32)],
         outputs: @[
           TxOut(value: Satoshi(4900000000), scriptPubKey: @[0x76'u8, 0xa9]),
           TxOut(value: Satoshi(100000000), scriptPubKey: @[0x6a'u8, 0x04])  # OP_RETURN
