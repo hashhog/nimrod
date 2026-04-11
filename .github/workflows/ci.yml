@@ -17,6 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jiro4989/setup-nim-action@v2
+      - run: sudo apt-get update && sudo apt-get install -y librocksdb-dev
       - run: nimble setup -y
       - run: nimble build -d:release -y
 
@@ -26,6 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jiro4989/setup-nim-action@v2
+      - run: sudo apt-get update && sudo apt-get install -y librocksdb-dev
       - run: nimble setup -y
       - run: nimble test -y
 

@@ -2,7 +2,7 @@
 ## Tests fee filter quantization, peer filtering, and incremental relay fee
 
 import unittest2
-import std/[random, math, tables]
+import std/[random, math, tables, strutils]
 import chronos
 import ../src/network/relay
 import ../src/network/peer

@@ -180,9 +180,11 @@ suite "RPC block hash format":
     # Mainnet genesis block hash (as displayed)
     let genesisHashDisplay = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
 
-    # Internal format is reversed
+    # Internal format is reversed (byte-swapped)
+    # Display "000000000019d668..." -> internal ends with "68d619000000000000"
+    # The leading zeros in display format become trailing zeros in internal format
     let internalHex = reverseHex(genesisHashDisplay)
-    check internalHex.endsWith("000000000019d668")
+    check internalHex.endsWith("68d6190000000000")  # reversed bytes of leading "000000000019d668"
 
 suite "RPC consensus params":
   test "mainnet params for RPC":

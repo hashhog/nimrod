@@ -944,7 +944,11 @@ proc compileImpl(node: MsNode, ctx: MsContext, verify: bool): seq[byte] =
 
     # Otherwise add explicit VERIFY
     result.add(subScript)
-    if not verify:  # Only add VERIFY if not already in verify mode
+    # Only add OP_VERIFY if not already in verify mode AND subScript doesn't
+    # already end with a *VERIFY opcode (which happens when sub compiled with verify=true)
+    let alreadyVerified = subScript.len > 0 and subScript[^1] in [
+      OP_CHECKSIGVERIFY, OP_EQUALVERIFY, OP_NUMEQUALVERIFY, OP_CHECKMULTISIGVERIFY]
+    if not verify and not alreadyVerified:
       result.add(OP_VERIFY)
 
   of MsWrapJ:
