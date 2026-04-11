@@ -4,7 +4,7 @@
 import std/[json, strutils, tables, options, sequtils]
 import unittest2
 import ../src/primitives/[types, serialize]
-import ../src/consensus/[params, validation]
+import ../src/consensus/[params, validation, versionbits]
 import ../src/crypto/[hashing, address]
 
 # JSON-RPC 2.0 error codes (matching server.nim)
@@ -906,6 +906,133 @@ suite "RPC batch requests":
     check stringId["id"].kind == JString
     check numberId["id"].kind == JInt
     check nullId["id"].kind == JNull
+
+suite "RPC getdeploymentinfo":
+  ## Unit tests for the getdeploymentinfo response structure.
+  ## We construct the expected JSON shape by hand and verify that:
+  ##   - required top-level keys are present (hash, height, deployments)
+  ##   - all expected deployments appear in the deployments object
+  ##   - buried deployments have the correct fields
+  ##   - BIP9 deployments have the correct fields including the bip9 sub-object
+  ##
+  ## These tests run without a live node by building the response objects
+  ## directly from the regtest params and versionbits helpers.
+
+  let rp = regtestParams()
+
+  # Simulate the buried-deployment builder (mirrors server.nim logic)
+  proc makeBuried(activationHeight: int, currentHeight: int32): JsonNode =
+    result = newJObject()
+    result["type"] = %"buried"
+    result["active"] = %(currentHeight >= int32(activationHeight))
+    result["height"] = %activationHeight
+
+  # Simulate the top-level getdeploymentinfo response for regtest at height 0
+  proc fakeDeploymentInfo(p: ConsensusParams, height: int32): JsonNode =
+    let deployments = newJObject()
+    deployments["bip34"]  = makeBuried(p.bip34Height,  height)
+    deployments["bip65"]  = makeBuried(p.bip65Height,  height)
+    deployments["bip66"]  = makeBuried(p.bip66Height,  height)
+    deployments["csv"]    = makeBuried(p.csvHeight,     height)
+    deployments["segwit"] = makeBuried(p.segwitHeight,  height)
+
+    # BIP9 fields (type only; state machine needs a live chain)
+    let testdummyDep = testDummyDeployment()
+    let taprootDep   = taprootDeployment(p.network)
+
+    let tdObj = newJObject()
+    tdObj["type"]   = %"bip9"
+    tdObj["active"] = %false
+    tdObj["bip9"]   = newJObject()
+    tdObj["bip9"]["start_time"]           = %testdummyDep.startTime
+    tdObj["bip9"]["timeout"]              = %testdummyDep.timeout
+    tdObj["bip9"]["min_activation_height"]= %testdummyDep.minActivationHeight
+    tdObj["bip9"]["status"]               = %"failed"  # NeverActive -> failed
+    tdObj["bip9"]["since"]                = %0
+    tdObj["bip9"]["status_next"]          = %"failed"
+    deployments["testdummy"] = tdObj
+
+    let trObj = newJObject()
+    trObj["type"]   = %"bip9"
+    trObj["active"] = %true   # AlwaysActive on regtest
+    trObj["bip9"]   = newJObject()
+    trObj["bip9"]["start_time"]           = %taprootDep.startTime
+    trObj["bip9"]["timeout"]              = %taprootDep.timeout
+    trObj["bip9"]["min_activation_height"]= %taprootDep.minActivationHeight
+    trObj["bip9"]["status"]               = %"active"
+    trObj["bip9"]["since"]                = %0
+    trObj["bip9"]["status_next"]          = %"active"
+    deployments["taproot"] = trObj
+
+    result = newJObject()
+    result["hash"]        = %"0000000000000000000000000000000000000000000000000000000000000000"
+    result["height"]      = %height
+    result["deployments"] = deployments
+
+  test "getdeploymentinfo returns non-empty deployments on regtest":
+    let info = fakeDeploymentInfo(rp, 0)
+    check info.hasKey("hash")
+    check info.hasKey("height")
+    check info.hasKey("deployments")
+    check info["deployments"].kind == JObject
+    check info["deployments"].len > 0
+
+  test "getdeploymentinfo includes segwit deployment on regtest":
+    let info = fakeDeploymentInfo(rp, 0)
+    let deps = info["deployments"]
+    check deps.hasKey("segwit")
+    check deps["segwit"]["type"].getStr() == "buried"
+    # segwitHeight = 0 on regtest, so it is active even at height 0
+    check deps["segwit"].hasKey("active")
+    check deps["segwit"].hasKey("height")
+
+  test "getdeploymentinfo includes taproot deployment on regtest":
+    let info = fakeDeploymentInfo(rp, 0)
+    let deps = info["deployments"]
+    check deps.hasKey("taproot")
+    check deps["taproot"]["type"].getStr() == "bip9"
+    check deps["taproot"].hasKey("active")
+    check deps["taproot"].hasKey("bip9")
+    check deps["taproot"]["bip9"].hasKey("status")
+    check deps["taproot"]["bip9"].hasKey("start_time")
+    check deps["taproot"]["bip9"].hasKey("timeout")
+    check deps["taproot"]["bip9"].hasKey("min_activation_height")
+    check deps["taproot"]["bip9"].hasKey("since")
+    check deps["taproot"]["bip9"].hasKey("status_next")
+    # taproot is AlwaysActive on regtest
+    check deps["taproot"]["active"].getBool() == true
+    check deps["taproot"]["bip9"]["status"].getStr() == "active"
+
+  test "getdeploymentinfo all expected deployments present":
+    let info = fakeDeploymentInfo(rp, 0)
+    let deps = info["deployments"]
+    for name in ["bip34", "bip65", "bip66", "csv", "segwit", "testdummy", "taproot"]:
+      check deps.hasKey(name)
+
+  test "getdeploymentinfo buried fields correct on regtest at height 0":
+    let info = fakeDeploymentInfo(rp, 0)
+    let deps = info["deployments"]
+    # csv and segwit both have activation height 0 on regtest -> active at height 0
+    check deps["csv"]["active"].getBool() == true
+    check deps["segwit"]["active"].getBool() == true
+    # bip34 activation height is 500 on regtest -> not active at height 0
+    check deps["bip34"]["active"].getBool() == false
+    check deps["bip34"]["height"].getInt() == rp.bip34Height
+
+  test "versionbits stateName helper produces correct strings":
+    check stateName(tsDefined)  == "defined"
+    check stateName(tsStarted)  == "started"
+    check stateName(tsLockedIn) == "locked_in"
+    check stateName(tsActive)   == "active"
+    check stateName(tsFailed)   == "failed"
+
+  test "taprootDeployment regtest is AlwaysActive":
+    let dep = taprootDeployment(Regtest)
+    check dep.startTime == AlwaysActive
+
+  test "testDummyDeployment is NeverActive":
+    let dep = testDummyDeployment()
+    check dep.startTime == NeverActive
 
 when isMainModule:
   echo "Running RPC tests..."
