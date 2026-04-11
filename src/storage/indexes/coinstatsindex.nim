@@ -236,11 +236,11 @@ method customAppend*(idx: CoinStatsIndex, blockInfo: BlockInfo): bool =
 
   let blk = blockInfo.data.get()
   let blockSubsidy = getBlockSubsidy(blockInfo.height, idx.params)
-  idx.totalSubsidy += blockSubsidy
+  idx.totalSubsidy += int64(blockSubsidy)
 
   # Genesis block special handling
   if blockInfo.height == 0:
-    idx.totalUnspendablesGenesisBlock += blockSubsidy
+    idx.totalUnspendablesGenesisBlock += int64(blockSubsidy)
   else:
     # Verify previous block hash
     if idx.currentBlockHash != blockInfo.prevHash:

@@ -393,9 +393,7 @@ proc close*(db: Database) =
   if db.blockCache != nil:
     rocksdb_cache_destroy(db.blockCache)
     db.blockCache = nil
-  if db.bloomFilter != nil:
-    rocksdb_filterpolicy_destroy(db.bloomFilter)
-    db.bloomFilter = nil
+  # Note: bloomFilter is owned by cfTableOpts after set_filter_policy; do NOT destroy separately
 
 proc get*(db: Database, cf: ColumnFamily, key: openArray[byte]): Option[seq[byte]] =
   var

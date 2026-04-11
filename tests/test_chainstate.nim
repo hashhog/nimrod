@@ -75,9 +75,25 @@ proc makeTestBlock(prevHash: BlockHash, height: int32, txs: seq[Transaction]): B
     txs: txs
   )
 
-proc makeSimpleBlock(prevHash: BlockHash, height: int32): Block =
-  ## Create a simple block with just a coinbase
-  let coinbase = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true)
+proc makeSimpleBlock(prevHash: BlockHash, height: int32, extra: uint32 = 0): Block =
+  ## Create a simple block with just a coinbase (height+extra in scriptSig for unique txid)
+  ## Use 'extra' to distinguish alternative fork blocks at the same height
+  let heightBytes = @[byte(height and 0xff), byte((height shr 8) and 0xff), byte((height shr 16) and 0xff), byte((height shr 24) and 0xff)]
+  let extraBytes = @[byte(extra and 0xff), byte((extra shr 8) and 0xff), byte((extra shr 16) and 0xff), byte((extra shr 24) and 0xff)]
+  let coinbase = Transaction(
+    version: 1,
+    inputs: @[TxIn(
+      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0xFFFFFFFF'u32),
+      scriptSig: @[byte(0x04)] & heightBytes & @[byte(0x04)] & extraBytes,
+      sequence: 0xFFFFFFFF'u32
+    )],
+    outputs: @[TxOut(
+      value: Satoshi(5000000000),
+      scriptPubKey: @[byte(0x51)]  # OP_1
+    )],
+    witnesses: @[],
+    lockTime: 0
+  )
   makeTestBlock(prevHash, height, @[coinbase])
 
 proc getBlockHash(blk: Block): BlockHash =
@@ -204,7 +220,9 @@ suite "ChainState coinbase maturity":
 
     # Now we can spend the genesis coinbase
     let spendTx = makeTestTransaction(coinbaseTxid, 0, 4999000000, false)
-    let coinbase = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true)
+    # Unique coinbase for block 100 (include height in scriptSig to avoid txid collision)
+    let heightBytes100 = @[byte(100 and 0xff), byte((100 shr 8) and 0xff), byte(0), byte(0)]
+    let coinbase = Transaction(version: 1, inputs: @[TxIn(prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0xFFFFFFFF'u32), scriptSig: @[byte(0x04)] & heightBytes100, sequence: 0xFFFFFFFF'u32)], outputs: @[TxOut(value: Satoshi(5000000000), scriptPubKey: @[byte(0x51)])], witnesses: @[], lockTime: 0)
     let goodBlock = makeTestBlock(prevHash, 100, @[coinbase, spendTx])
 
     let goodResult = cs.connectBlock(goodBlock, 100)
@@ -313,13 +331,14 @@ suite "ChainState 2-block reorg":
     check cs.getUtxo(OutPoint(txid: coinbase2A, vout: 0)).isSome
 
     # Create alternative chain B: blocks 1B, 2B, 3B (longer chain)
-    let block1B = makeSimpleBlock(genesisHash, 1)
+    # Use extra=1 to ensure chain B coinbases have different txids than chain A
+    let block1B = makeSimpleBlock(genesisHash, 1, extra = 1)
     let block1BHash = getBlockHash(block1B)
 
-    let block2B = makeSimpleBlock(block1BHash, 2)
+    let block2B = makeSimpleBlock(block1BHash, 2, extra = 1)
     let block2BHash = getBlockHash(block2B)
 
-    let block3B = makeSimpleBlock(block2BHash, 3)
+    let block3B = makeSimpleBlock(block2BHash, 3, extra = 1)
 
     # Note: block1B and block2B have different hashes than 1A/2A because
     # they were created separately (different nonce/timestamp)

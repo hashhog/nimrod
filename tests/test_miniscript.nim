@@ -90,31 +90,38 @@ suite "miniscript parsing":
     check node.right.kind == MsPkK
 
   test "parse and_b":
-    let node = parseMiniscript("and_b(pk_k(" & TestKey1Hex & "),s:pk_k(" & TestKey2Hex & "))")
+    # and_b requires X:B and Y:W; use c:pk_k for B, s:c:pk_k for W
+    let node = parseMiniscript("and_b(c:pk_k(" & TestKey1Hex & "),s:c:pk_k(" & TestKey2Hex & "))")
     check node.kind == MsAndB
 
   test "parse or_b":
-    let node = parseMiniscript("or_b(pk_k(" & TestKey1Hex & "),s:pk_k(" & TestKey2Hex & "))")
+    # or_b requires X:Bd and Y:Wd; use c:pk_k for Bd, s:c:pk_k for Wd
+    let node = parseMiniscript("or_b(c:pk_k(" & TestKey1Hex & "),s:c:pk_k(" & TestKey2Hex & "))")
     check node.kind == MsOrB
 
   test "parse or_c":
-    let node = parseMiniscript("or_c(pk_k(" & TestKey1Hex & "),v:pk_k(" & TestKey2Hex & "))")
+    # or_c requires X:Bdu and Y:V; use c:pk_k for Bdu, v:c:pk_k for V
+    let node = parseMiniscript("or_c(c:pk_k(" & TestKey1Hex & "),v:c:pk_k(" & TestKey2Hex & "))")
     check node.kind == MsOrC
 
   test "parse or_d":
-    let node = parseMiniscript("or_d(pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))")
+    # or_d requires X:Bdu and Y:B; use c:pk_k for both
+    let node = parseMiniscript("or_d(c:pk_k(" & TestKey1Hex & "),c:pk_k(" & TestKey2Hex & "))")
     check node.kind == MsOrD
 
   test "parse or_i":
-    let node = parseMiniscript("or_i(pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))")
+    # or_i requires both X and Y to be B or V; use c:pk_k (type B)
+    let node = parseMiniscript("or_i(c:pk_k(" & TestKey1Hex & "),c:pk_k(" & TestKey2Hex & "))")
     check node.kind == MsOrI
 
   test "parse andor":
-    let node = parseMiniscript("andor(pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "),pk_k(" & TestKey3Hex & "))")
+    # andor requires X:Bdu; use c:pk_k for all args
+    let node = parseMiniscript("andor(c:pk_k(" & TestKey1Hex & "),c:pk_k(" & TestKey2Hex & "),c:pk_k(" & TestKey3Hex & "))")
     check node.kind == MsAndOr
 
   test "parse thresh":
-    let node = parseMiniscript("thresh(2,pk_k(" & TestKey1Hex & "),s:pk_k(" & TestKey2Hex & "),s:pk_k(" & TestKey3Hex & "))")
+    # thresh requires all args to be Bdu; c:pk_k gives Bdu type
+    let node = parseMiniscript("thresh(2,c:pk_k(" & TestKey1Hex & "),c:pk_k(" & TestKey2Hex & "),c:pk_k(" & TestKey3Hex & "))")
     check node.kind == MsThresh
     check node.threshold == 2
     check node.subs.len == 3
@@ -126,29 +133,33 @@ suite "miniscript parsing":
     check node.keys.len == 3
 
   test "parse syntactic sugar l: and u:":
-    let nodeL = parseMiniscript("l:pk_k(" & TestKey1Hex & ")")
+    # l:X expands to or_i(just_0, X) — X must be B type; use c:pk_k
+    let nodeL = parseMiniscript("l:c:pk_k(" & TestKey1Hex & ")")
     check nodeL.kind == MsOrI
     check nodeL.left.kind == MsJust0
-    check nodeL.right.kind == MsPkK
+    check nodeL.right.kind == MsWrapC
 
-    let nodeU = parseMiniscript("u:pk_k(" & TestKey1Hex & ")")
+    # u:X expands to or_i(X, just_0) — X must be B type; use c:pk_k
+    let nodeU = parseMiniscript("u:c:pk_k(" & TestKey1Hex & ")")
     check nodeU.kind == MsOrI
-    check nodeU.left.kind == MsPkK
+    check nodeU.left.kind == MsWrapC
     check nodeU.right.kind == MsJust0
 
   test "parse syntactic sugar t:":
-    let nodeT = parseMiniscript("t:pk_k(" & TestKey1Hex & ")")
+    # t:X expands to and_v(X, just_1) — X must be V type; use v:c:pk_k
+    let nodeT = parseMiniscript("t:v:c:pk_k(" & TestKey1Hex & ")")
     check nodeT.kind == MsAndV
-    check nodeT.left.kind == MsPkK
+    check nodeT.left.kind == MsWrapV
     check nodeT.right.kind == MsJust1
 
   test "parse complex nested expression":
-    let ms = "andor(pk_k(" & TestKey1Hex & "),or_i(pk_k(" & TestKey2Hex & "),older(1000)),pk_k(" & TestKey3Hex & "))"
+    # andor requires X:Bdu; use c:pk_k for B type args
+    let ms = "andor(c:pk_k(" & TestKey1Hex & "),or_i(c:pk_k(" & TestKey2Hex & "),older(1000)),c:pk_k(" & TestKey3Hex & "))"
     let node = parseMiniscript(ms)
     check node.kind == MsAndOr
-    check node.x.kind == MsPkK
+    check node.x.kind == MsWrapC
     check node.y.kind == MsOrI
-    check node.z.kind == MsPkK
+    check node.z.kind == MsWrapC
 
   test "invalid miniscript raises error":
     expect(MiniscriptError):
@@ -182,13 +193,15 @@ suite "miniscript type system":
     check node.msType.hasU
     check node.msType.hasS
 
-  test "v:pk_k has type V":
-    let node = parseMiniscript("v:pk_k(" & TestKey1Hex & ")")
+  test "v:c:pk_k has type V":
+    # v: requires B type; c:pk_k converts K->B, then v: converts B->V
+    let node = parseMiniscript("v:c:pk_k(" & TestKey1Hex & ")")
     check node.msType.base == MsTypeV
     check node.msType.hasF
 
-  test "a:pk_k has type W":
-    let node = parseMiniscript("a:pk_k(" & TestKey1Hex & ")")
+  test "a:c:pk_k has type W":
+    # a: requires B type; c:pk_k converts K->B, then a: converts B->W
+    let node = parseMiniscript("a:c:pk_k(" & TestKey1Hex & ")")
     check node.msType.base == MsTypeW
 
   test "older has type B":
@@ -199,11 +212,14 @@ suite "miniscript type system":
     check node.msType.hasM
 
   test "and_v type propagation":
-    let node = parseMiniscript("and_v(v:pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))")
+    # and_v(X,Y) where X:V and Y:K → result is K
+    # v:c:pk_k is V type, pk_k is K type
+    let node = parseMiniscript("and_v(v:c:pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))")
     check node.msType.base == MsTypeK
 
   test "and_b requires B and W":
-    let node = parseMiniscript("and_b(pk_k(" & TestKey1Hex & "),s:pk_k(" & TestKey2Hex & "))")
+    # and_b(X,Y) where X:B and Y:W → result is B
+    let node = parseMiniscript("and_b(c:pk_k(" & TestKey1Hex & "),s:c:pk_k(" & TestKey2Hex & "))")
     check node.msType.base == MsTypeB
     check node.msType.hasU
 
@@ -259,13 +275,15 @@ suite "miniscript compilation":
     check OP_SIZE in script
 
   test "compile and_v":
-    let node = parseMiniscript("and_v(v:pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))")
+    # and_v requires first arg V type; v:c:pk_k is V
+    let node = parseMiniscript("and_v(v:c:pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))")
     let script = compile(node)
     # Should have two pubkeys
     check script.len > 68  # Two 34-byte key pushes plus opcodes
 
   test "compile or_i":
-    let node = parseMiniscript("or_i(pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))")
+    # or_i requires B or V types; use c:pk_k (type B)
+    let node = parseMiniscript("or_i(c:pk_k(" & TestKey1Hex & "),c:pk_k(" & TestKey2Hex & "))")
     let script = compile(node)
     check OP_IF in script
     check OP_ELSE in script
@@ -278,7 +296,8 @@ suite "miniscript compilation":
     check script[0] == 0x52  # OP_2
 
   test "compile thresh":
-    let node = parseMiniscript("thresh(2,pk_k(" & TestKey1Hex & "),s:pk_k(" & TestKey2Hex & "),s:pk_k(" & TestKey3Hex & "))")
+    # thresh requires all args to be Bdu; c:pk_k gives Bdu type
+    let node = parseMiniscript("thresh(2,c:pk_k(" & TestKey1Hex & "),c:pk_k(" & TestKey2Hex & "),c:pk_k(" & TestKey3Hex & "))")
     let script = compile(node)
     check OP_ADD in script
     check OP_EQUAL in script
@@ -288,7 +307,8 @@ suite "miniscript compilation":
     let script = compile(node)
     # Should use OP_CHECKSIGVERIFY instead of OP_CHECKSIG OP_VERIFY
     check OP_CHECKSIGVERIFY in script
-    check OP_CHECKSIG notin script
+    # The last byte should be OP_CHECKSIGVERIFY (the pubkey may coincidentally contain 0xAC bytes)
+    check script[^1] == OP_CHECKSIGVERIFY
 
 # =============================================================================
 # Satisfaction Tests
@@ -317,7 +337,8 @@ suite "miniscript satisfaction":
     check res.dissat.available == AvailYes
 
   test "satisfy or_i chooses available branch":
-    let node = parseMiniscript("or_i(pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))")
+    # or_i requires B or V types; use c:pk_k (type B)
+    let node = parseMiniscript("or_i(c:pk_k(" & TestKey1Hex & "),c:pk_k(" & TestKey2Hex & "))")
 
     var sigCtx = SigningContext.new()
     sigCtx.availableKeys = initTable[PublicKey, seq[byte]]()
@@ -436,7 +457,8 @@ suite "miniscript analysis":
     check keys.len == 2
 
   test "requiredKeys for or_i":
-    let node = parseMiniscript("or_i(pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))")
+    # or_i requires B or V types; use c:pk_k (type B)
+    let node = parseMiniscript("or_i(c:pk_k(" & TestKey1Hex & "),c:pk_k(" & TestKey2Hex & "))")
     let keys = requiredKeys(node)
     check keys.len == 2
 
@@ -474,7 +496,8 @@ suite "miniscript roundtrip":
     check result == original
 
   test "parse and toString for complex expression":
-    let original = "and_v(v:pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))"
+    # and_v requires first arg V type; v:c:pk_k is V
+    let original = "and_v(v:c:pk_k(" & TestKey1Hex & "),pk_k(" & TestKey2Hex & "))"
     let node = parseMiniscript(original)
     let result = toString(node)
     check result == original

@@ -307,10 +307,8 @@ proc getBlockScriptFlags*(height: int32, params: ConsensusParams,
   if blockHash == BIP16_EXCEPTION_HASH:
     return {}  # SCRIPT_VERIFY_NONE for this block
 
-  result = {sfP2SH, sfWitness, sfTaproot}
-
-  if blockHash == TAPROOT_EXCEPTION_HASH:
-    result = {sfP2SH, sfWitness}
+  # P2SH active from BIP16 (mainnet: 170060, but treat as always-on for simplicity)
+  result = {sfP2SH}
 
   # DERSIG (BIP66)
   if height >= int32(params.bip66Height):
@@ -324,11 +322,16 @@ proc getBlockScriptFlags*(height: int32, params: ConsensusParams,
   if height >= int32(params.csvHeight):
     result.incl(sfCheckSequenceVerify)
 
-  # SegWit (BIP141/143/147) and BIP146 NULLFAIL — activated with SegWit
+  # SegWit (BIP141/143/147) — activated at segwitHeight
   if height >= int32(params.segwitHeight):
+    result.incl(sfWitness)
     result.incl(sfNullDummy)
     result.incl(sfNullFail)
     result.incl(sfWitnessPubkeyType)  # BIP141: witness pubkeys must be compressed
+
+  # Taproot (BIP340/341/342) — activated at taprootHeight
+  if blockHash != TAPROOT_EXCEPTION_HASH and height >= int32(params.taprootHeight):
+    result.incl(sfTaproot)
 
 # ============================================================================
 # BIP68 Sequence Lock Functions

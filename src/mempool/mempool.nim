@@ -1204,7 +1204,7 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
   var totalWeight = 0
   var weights: seq[int]
   for tx in txns:
-    let weight = package.calculateTransactionWeight(tx)
+    let weight = validation.calculateTransactionWeight(tx)
     weights.add(weight)
     totalWeight += weight
     totalVsize += (weight + 3) div 4

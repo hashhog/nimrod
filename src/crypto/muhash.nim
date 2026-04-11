@@ -90,122 +90,222 @@ proc toBytes*(n: Num3072): array[ByteSize, byte] =
       result[i * 8 + j] = byte((n.limbs[i] shr (j * 8)) and 0xff)
 
 # ============================================================================
-# Modular multiplication using schoolbook algorithm with reduction
+# 128-bit integer support for multiplication
 # ============================================================================
+
+type uint128* = object
+  lo*, hi*: uint64
+
+# ============================================================================
+# Modular multiplication using schoolbook algorithm with reduction
+# Closely follows Bitcoin Core's muhash.cpp Multiply implementation.
+# ============================================================================
+
+proc mul64(a, b: uint64): uint128 {.inline.} =
+  ## 64x64 -> 128-bit multiply using 32-bit halves.
+  ## Reference: Hacker's Delight §8-2 "Unsigned multiply high"
+  let a0 = a and 0xFFFFFFFF'u64
+  let a1 = a shr 32
+  let b0 = b and 0xFFFFFFFF'u64
+  let b1 = b shr 32
+
+  let w0 = a0 * b0                           # ≤ 64 bits
+  let t  = a1 * b0 + (w0 shr 32)            # ≤ 64 bits (see proof below)
+  var w1 = (t and 0xFFFFFFFF'u64) + a0 * b1 # ≤ 64 bits (no overflow)
+  let w2 = t shr 32
+
+  result.lo = (w1 shl 32) or (w0 and 0xFFFFFFFF'u64)
+  result.hi = a1 * b1 + w2 + (w1 shr 32)
+  # Proof of no overflow: w1 ≤ (2^32-1) + (2^32-1)^2 < 2^64 (no overflow in +=)
+  # hi ≤ (2^32-1)^2 + (2^32-1) + (2^64-1)/2^32 < 2^64
+
+## [c0,c1,c2] += a * b  (matches Bitcoin Core's muladd3)
+proc muladd3(c0, c1, c2: var uint64, a, b: uint64) {.inline.} =
+  let t = mul64(a, b)
+  let tl = t.lo
+  var th = t.hi
+
+  c0 += tl
+  if c0 < tl: th += 1
+  c1 += th
+  if c1 < th: c2 += 1
+
+## [c0,c1,c2] += n * [d0,d1,d2]  (matches Bitcoin Core's mulnadd3)
+proc mulnadd3(c0, c1, c2: var uint64, d0, d1, d2: var uint64, n: uint64) {.inline.} =
+  var t = mul64(d0, n)
+  t.lo += c0
+  if t.lo < c0: t.hi += 1
+  c0 = t.lo
+  var t2 = t.hi + c1
+  let carry = if t2 < t.hi: 1'u64 else: 0'u64
+  t = mul64(d1, n)
+  t2 += t.lo
+  let carry2 = if t2 < t.lo: 1'u64 else: 0'u64
+  c1 = t2
+  c2 = t.hi + d2 * n + carry + carry2 + c2
+
+## [c0,c1] *= n  (matches Bitcoin Core's muln2)
+proc muln2(c0, c1: var uint64, n: uint64) {.inline.} =
+  let t = mul64(c0, n)
+  c0 = t.lo
+  let carry = t.hi
+  let t2 = mul64(c1, n)
+  c1 = t2.lo + carry
+  # t2.hi is discarded (should be 0 for valid inputs)
+
+## Extract lowest limb of [c0,c1,c2] into n, shift left by 1 limb
+## (matches Bitcoin Core's extract3)
+proc extract3(c0, c1, c2: var uint64, n: var uint64) {.inline.} =
+  n = c0
+  c0 = c1
+  c1 = c2
+  c2 = 0
+
+## Add limb a to [c0,c1], extract lowest limb into n
+## (matches Bitcoin Core's addnextract2)
+proc addnextract2(c0, c1: var uint64, a: uint64, n: var uint64) {.inline.} =
+  var c2: uint64 = 0
+  c0 += a
+  if c0 < a:
+    c1 += 1
+    if c1 == 0: c2 = 1
+  n = c0
+  c0 = c1
+  c1 = c2
 
 proc multiply*(a: var Num3072, b: Num3072) =
   ## Multiply a by b modulo (2^3072 - MaxPrimeDiff)
-  ## Uses schoolbook multiplication with delayed reduction
-  var tmp: array[Limbs, uint64]
-  var c0, c1, c2: uint64
+  ## Directly mirrors Bitcoin Core's Num3072::Multiply.
+  var c0, c1, c2: uint64 = 0
+  var tmp: Num3072
 
-  # Compute limbs 0..N-2 of a*b into tmp, including one reduction
+  # Compute limbs 0..N-2 of a*b into tmp, including one reduction.
   for j in 0 ..< Limbs - 1:
-    c0 = 0; c1 = 0; c2 = 0
-
-    # High part (will be multiplied by MaxPrimeDiff for reduction)
     var d0, d1, d2: uint64 = 0
-    for i in j + 1 ..< Limbs:
-      # d += a.limbs[i] * b.limbs[Limbs + j - i]
-      let bIdx = Limbs + j - i
-      if bIdx < Limbs:
-        let product = a.limbs[i].uint128 * b.limbs[bIdx].uint128
-        let lo = uint64(product and 0xFFFFFFFFFFFFFFFF'u128)
-        let hi = uint64(product shr 64)
-        d0 += lo
-        if d0 < lo: d1 += 1
-        d1 += hi
-        if d1 < hi: d2 += 1
-
+    # High part: sum a[i] * b[N+j-i] for i = j+1..N-1
+    # (first term uses mul, rest use muladd3)
+    muladd3(d0, d1, d2, a.limbs[1 + j], b.limbs[Limbs + j - (1 + j)])
+    for i in 2 + j ..< Limbs:
+      muladd3(d0, d1, d2, a.limbs[i], b.limbs[Limbs + j - i])
     # c += d * MaxPrimeDiff
-    let dProd = d0.uint128 * MaxPrimeDiff
-    c0 += uint64(dProd and 0xFFFFFFFFFFFFFFFF'u128)
-    if c0 < uint64(dProd and 0xFFFFFFFFFFFFFFFF'u128): c1 += 1
-    c1 += uint64(dProd shr 64)
-    # Additional carries from d1, d2 * MaxPrimeDiff
-    let d1Prod = d1.uint128 * MaxPrimeDiff
-    c1 += uint64(d1Prod and 0xFFFFFFFFFFFFFFFF'u128)
-    c2 += uint64(d1Prod shr 64)
-    c2 += d2 * MaxPrimeDiff
-
-    # Low part
+    mulnadd3(c0, c1, c2, d0, d1, d2, MaxPrimeDiff)
+    # Low part: sum a[i] * b[j-i] for i = 0..j
     for i in 0 .. j:
-      let product = a.limbs[i].uint128 * b.limbs[j - i].uint128
-      let lo = uint64(product and 0xFFFFFFFFFFFFFFFF'u128)
-      let hi = uint64(product shr 64)
-      c0 += lo
-      if c0 < lo: c1 += 1
-      c1 += hi
-      if c1 < hi: c2 += 1
+      muladd3(c0, c1, c2, a.limbs[i], b.limbs[j - i])
+    extract3(c0, c1, c2, tmp.limbs[j])
 
-    tmp[j] = c0
-    c0 = c1
-    c1 = c2
-    c2 = 0
-
-  # Compute limb N-1 of a*b into tmp
-  c0 = 0; c1 = 0; c2 = 0
+  # Compute limb N-1 of a*b into tmp.
   for i in 0 ..< Limbs:
-    let product = a.limbs[i].uint128 * b.limbs[Limbs - 1 - i].uint128
-    let lo = uint64(product and 0xFFFFFFFFFFFFFFFF'u128)
-    let hi = uint64(product shr 64)
-    c0 += lo
-    if c0 < lo: c1 += 1
-    c1 += hi
-    if c1 < hi: c2 += 1
-  tmp[Limbs - 1] = c0
+    muladd3(c0, c1, c2, a.limbs[i], b.limbs[Limbs - 1 - i])
+  extract3(c0, c1, c2, tmp.limbs[Limbs - 1])
 
-  # Second reduction: c0,c1 = overflow, multiply by MaxPrimeDiff and add
-  c0 = c1
-  c1 = c2
-  let cProd = c0.uint128 * MaxPrimeDiff
-  var carry: uint64 = uint64(cProd and 0xFFFFFFFFFFFFFFFF'u128)
-  var carryHi: uint64 = uint64(cProd shr 64)
-
+  # Second reduction: c = (c0,c1) * MaxPrimeDiff, add back into result.
+  muln2(c0, c1, MaxPrimeDiff)
   for j in 0 ..< Limbs:
-    let sum = tmp[j] + carry
-    carry = if sum < tmp[j]: 1'u64 else: 0'u64
-    a.limbs[j] = sum
-    if j == 0:
-      carry += carryHi
+    addnextract2(c0, c1, tmp.limbs[j], a.limbs[j])
 
-  # Final reductions if needed
-  if a.isOverflow():
-    a.fullReduce()
-  if carry > 0:
-    a.fullReduce()
-
-# Simplified multiply for correctness (slower but more reliable)
-proc multiplySimple*(a: var Num3072, b: Num3072) =
-  ## Simplified multiplication using BigInt-style schoolbook
-  # For now, use the existing implementation
-  # A full correct implementation would need proper 128-bit multiply handling
-  a.multiply(b)
+  # Final reductions if needed (c0 will be 0 or 1 after the loop).
+  if a.isOverflow(): a.fullReduce()
+  if c0 != 0: a.fullReduce()
 
 # ============================================================================
 # Modular inverse using extended Euclidean algorithm
 # ============================================================================
 
 proc getInverse*(a: Num3072): Num3072 =
-  ## Compute modular inverse using Fermat's little theorem
-  ## a^(-1) = a^(p-2) mod p where p = 2^3072 - MaxPrimeDiff
+  ## Compute modular inverse using Fermat's little theorem:
+  ## a^(-1) = a^(p-2) mod p, where p = 2^3072 - MaxPrimeDiff
   ##
-  ## This is a simplified implementation - a production version would use
-  ## the safegcd algorithm from Bitcoin Core for efficiency.
+  ## The exponent is p-2 = 2^3072 - MaxPrimeDiff - 2 = 2^3072 - 1103719
+  ## In binary: 3072 bits, mostly 1s with the low 20 bits representing ~(1103719)
+  ## = 11111...1111_0001111101001111111111001001 (low bits inverted from 1103719+2)
   ##
-  ## For now, we'll use a basic approach suitable for testing.
+  ## Uses square-and-multiply (right-to-left bit scan of exponent).
+  ##
+  ## Note: MaxPrimeDiff = 1103717, so p-2 = 2^3072 - 1103719
+  ## 1103719 in binary = 0x10DC67 = 0001_0000_1101_1100_0110_0111
+  ## p-2 bits: bits 3071..20 are all 1, bits 19..0 are NOT(low 20 bits of 1103719)
+  ## Actually: p = 2^3072 - 1103717, p-2 = 2^3072 - 1103719
+  ## The binary representation of p-2 in 3072 bits:
+  ##   bits 3071..20 are all 1 (because 2^3072 minus a small number)
+  ##   bits 19..0: 2^20 - 1103719 + 2^3072 ... let's compute directly
 
-  # For initial implementation, return identity if a is 1
   if a.isOne():
     result.setToOne()
     return
 
-  # Placeholder: proper inverse computation requires extended GCD or
-  # Fermat's little theorem with efficient modular exponentiation
-  # This is complex to implement correctly in Nim without 128-bit support
+  # Build p-2 as an array of uint64 limbs (little-endian)
+  # p = 2^3072 - 1103717
+  # p-2 = 2^3072 - 1103719
+  # In 3072-bit number: all limbs are 0xFFFFFFFFFFFFFFFF except limb[0]
+  # limb[0] = 0xFFFFFFFFFFFFFFFF - 1103719 + 1 = 0xFFFFFFFFFFEF23C8
+  # Actually: 2^64 - 1103719 = 18446744073708447897 = 0xFFFFFFFFFFEF23D9
+  # Wait: 1103719 = 0x10DC67, so 0xFFFFFFFFFFFFFFFF - 0x10DC67 + 1 = 0xFFFFFFFFFFEF2399
+  # Let me compute: 0x10DC67 = 1*16^5 + 0*16^4 + D*16^3 + C*16^2 + 6*16 + 7
+  #               = 1048576 + 0 + 53248 + 3072 + 96 + 7 = 1104999?
+  # 1103719 decimal: 1103719 / 16 = 68982r7, 68982/16 = 4311r6, 4311/16 = 269r7
+  # 269/16 = 16r13(D), 16/16 = 1r0, so 1103719 = 0x10D767? Let me be precise:
+  # 1103719 = 1048576 + 55143 = 1048576 + 32768 + 22375 = ...
+  # Just compute: 1103719 in hex:
+  # 1103719 mod 16 = 7, 1103719 div 16 = 68982
+  # 68982 mod 16 = 6, div = 4311
+  # 4311 mod 16 = 7 (4311=269*16+7), div = 269
+  # 269 mod 16 = 13 (D), div = 16
+  # 16 mod 16 = 0, div = 1
+  # 1 mod 16 = 1
+  # So 1103719 = 0x10D767
+  # limb[0] of p-2 = 2^64 - 1103719 = 0xFFFFFFFFFFFFFFFF - 0x10D767 + 1 = 0xFFFFFFFFFFFEF299
+  # Wait: FFFFFFFFFFFFFFFF - 10D767 = FFFFFFFFFFF F2898
+  # Let me just hardcode: 2^64 = 18446744073709551616
+  # 18446744073709551616 - 1103719 = 18446744073708447897
+  # In hex: let me compute 1103719 = 0x10D767
+  # 0xFFFFFFFFFFFFFFFF = 18446744073709551615
+  # 18446744073709551615 - 1103719 + 1 = 18446744073708447897
+  # 18446744073708447897 in hex: FFFFFFFFFFFE F... let me skip and compute differently
 
-  # For testing purposes, we'll track division via denominator
-  result = a
+  # Simpler: use square-and-multiply with the exponent as a byte array
+  # p-2 = 2^3072 - 1103719
+  # Build the exponent byte array (little-endian): 384 bytes
+  # All bytes are 0xFF except the first few
+  # 1103719 in bytes (little-endian): [0x67, 0xD7, 0x10, 0, 0, ...]
+  # p-2 = complement: first byte = 0xFF - 0x67 = 0x98 + carry...
+  # Two's complement of 1103719 in 384 bytes = 384-byte subtraction
+  # 2^3072 - 1103719 = subtract 1103719 from 2^3072
+  # = all 0xFF bytes (which is 2^3072-1) minus (1103719-1) = minus 1103718
+  # 1103718 = 0x10D766
+  # So exp = 0xFF...FF XOR 0x10D766 (with the first 3 bytes being ~0x10D766)
+  # byte0 = 0xFF ^ 0x66 = 0x99? No: ~0x66 = 0x99, ~0x6 AND ...
+  # Simpler yet: 2^3072 - 1103719 = (2^3072 - 1) - 1103718 = all-ones minus 1103718
+  # 1103718 = 0x10D766
+  # all-ones minus 1103718: byte0=0xFF-0x66=0x99, byte1=0xFF-0xD7=0x28, byte2=0xFF-0x10=0xEF,
+  #   byte3=0xFF, ..., byte383=0xFF
+  # But borrow: this is NOT simple XOR. It's arithmetic subtraction.
+  # Let me just verify: 0xFFFFFFFFFFFFFFFF - 0x10D766 = 0xFFFFFFFFFFEF2899
+  # And 2^3072 - 1103719: limb[0] = 0xFFFFFFFFFFFFFFFF - 1103718 = 0xFFFFFFFFFFEF2899
+  # 1103718 = 0x10D766: 0x10D766 = 1*2^20 + 0*2^16 + 13*2^12 + 7*2^8 + 6*2^4 + 6
+  # = 1048576 + 53248 + 1792 + 96 + 6 = 1103718 ✓
+  # 0xFFFFFFFFFFFFFFFF - 0x10D766 = 0xFFFFFFFFFFEF2899
+
+  var exp: array[Limbs, uint64]
+  for i in 0 ..< Limbs:
+    exp[i] = 0xFFFFFFFFFFFFFFFF'u64
+  exp[0] = 0xFFFFFFFFFFEF2899'u64  # 2^64 - 1103718 - 1 = 2^64 - 1103719
+
+  # Square-and-multiply (left-to-right, starting from highest bit)
+  result.setToOne()
+  var base = a
+
+  # Scan from bit 3071 down to bit 0
+  for limbIdx in countdown(Limbs - 1, 0):
+    for bitIdx in countdown(63, 0):
+      # Square
+      result.multiply(result)
+      if result.isOverflow(): result.fullReduce()
+      # Multiply by base if bit is set
+      let bit = (exp[limbIdx] shr uint64(bitIdx)) and 1'u64
+      if bit == 1:
+        result.multiply(base)
+        if result.isOverflow(): result.fullReduce()
 
 proc divide*(a: var Num3072, b: Num3072) =
   ## Divide a by b modulo prime
@@ -257,7 +357,10 @@ proc toNum3072(data: openArray[byte]): Num3072 =
     pos += 32
     counter += 1
 
-  fromBytes(expanded)
+  result = fromBytes(expanded)
+  # Reduce modulo p if >= p
+  if result.isOverflow():
+    result.fullReduce()
 
 proc insert*(h: var MuHash3072, data: openArray[byte]) =
   ## Insert element into set (multiply numerator)
@@ -346,47 +449,3 @@ proc deserializeMuHash*(data: seq[byte]): MuHash3072 =
   result.numerator = fromBytes(numBytes)
   result.denominator = fromBytes(denomBytes)
 
-# 128-bit integer support for multiplication
-type uint128* = object
-  lo*, hi*: uint64
-
-proc `*`*(a, b: uint64): uint128 =
-  ## 64x64 -> 128-bit multiply
-  let aLo = a and 0xFFFFFFFF'u64
-  let aHi = a shr 32
-  let bLo = b and 0xFFFFFFFF'u64
-  let bHi = b shr 32
-
-  let p0 = aLo * bLo
-  let p1 = aLo * bHi
-  let p2 = aHi * bLo
-  let p3 = aHi * bHi
-
-  let mid = p1 + (p0 shr 32)
-  let midCarry = if mid < p1: 1'u64 else: 0'u64
-
-  let mid2 = mid + p2
-  let midCarry2 = if mid2 < mid: 1'u64 else: 0'u64
-
-  result.lo = (mid2 shl 32) or (p0 and 0xFFFFFFFF'u64)
-  result.hi = p3 + (mid2 shr 32) + midCarry + midCarry2
-
-proc `and`*(a: uint128, b: uint128): uint128 =
-  result.lo = a.lo and b.lo
-  result.hi = a.hi and b.hi
-
-proc `shr`*(a: uint128, b: int): uint128 =
-  if b >= 128:
-    result.lo = 0; result.hi = 0
-  elif b >= 64:
-    result.lo = a.hi shr (b - 64)
-    result.hi = 0
-  elif b > 0:
-    result.lo = (a.lo shr b) or (a.hi shl (64 - b))
-    result.hi = a.hi shr b
-  else:
-    result = a
-
-converter toUint128*(v: uint64): uint128 =
-  result.lo = v
-  result.hi = 0

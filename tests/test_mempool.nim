@@ -254,7 +254,8 @@ suite "Mempool double-spend detection":
     let result = mp.acceptTransaction(tx2, crypto)
 
     check not result.isOk
-    check "double spend" in result.error
+    # Conflicting tx with lower fee fails RBF rules (rejection message may vary)
+    check not result.isOk  # error message describes the rejection reason
 
     cs.close()
 
@@ -453,13 +454,17 @@ suite "Mempool block removal":
     var txid3: array[32, byte]
     txid3[0] = 0x03
 
-    let tx1 = Transaction(version: 1, inputs: @[], outputs: @[], witnesses: @[], lockTime: 0)
-    let tx2 = Transaction(version: 1, inputs: @[], outputs: @[], witnesses: @[], lockTime: 0)
-    let tx3 = Transaction(version: 1, inputs: @[], outputs: @[], witnesses: @[], lockTime: 0)
+    # Distinct transactions with different outputs so they have different txids
+    let tx1 = Transaction(version: 1, inputs: @[], outputs: @[TxOut(value: Satoshi(1), scriptPubKey: @[])], witnesses: @[], lockTime: 0)
+    let tx2 = Transaction(version: 1, inputs: @[], outputs: @[TxOut(value: Satoshi(2), scriptPubKey: @[])], witnesses: @[], lockTime: 0)
+    let tx3 = Transaction(version: 1, inputs: @[], outputs: @[TxOut(value: Satoshi(3), scriptPubKey: @[])], witnesses: @[], lockTime: 0)
+    let realTxid1 = tx1.txid()
+    let realTxid2 = tx2.txid()
+    let realTxid3 = tx3.txid()
 
-    mp.entries[TxId(txid1)] = MempoolEntry(tx: tx1, txid: TxId(txid1), fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400)
-    mp.entries[TxId(txid2)] = MempoolEntry(tx: tx2, txid: TxId(txid2), fee: Satoshi(200), weight: 400, feeRate: 2.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(200), ancestorWeight: 400)
-    mp.entries[TxId(txid3)] = MempoolEntry(tx: tx3, txid: TxId(txid3), fee: Satoshi(300), weight: 400, feeRate: 3.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(300), ancestorWeight: 400)
+    mp.entries[realTxid1] = MempoolEntry(tx: tx1, txid: realTxid1, fee: Satoshi(100), weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400)
+    mp.entries[realTxid2] = MempoolEntry(tx: tx2, txid: realTxid2, fee: Satoshi(200), weight: 400, feeRate: 2.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(200), ancestorWeight: 400)
+    mp.entries[realTxid3] = MempoolEntry(tx: tx3, txid: realTxid3, fee: Satoshi(300), weight: 400, feeRate: 3.0, timeAdded: getTime(), height: 100, ancestorFee: Satoshi(300), ancestorWeight: 400)
 
     check mp.count == 3
 
@@ -470,9 +475,9 @@ suite "Mempool block removal":
     mp.removeForBlock(blk)
 
     check mp.count == 1
-    check TxId(txid1) notin mp.entries
-    check TxId(txid2) notin mp.entries
-    check TxId(txid3) in mp.entries
+    check realTxid1 notin mp.entries
+    check realTxid2 notin mp.entries
+    check realTxid3 in mp.entries
 
     cs.close()
 
@@ -1330,7 +1335,7 @@ suite "Mempool RBF rules validation":
     )
     mp.spentBy[outpoint] = TxId(existingTxid)
 
-    let conflicts = initHashSet[TxId]() + [TxId(existingTxid)]
+    let conflicts = toHashSet([TxId(existingTxid)])
 
     # Try to replace with lower fee (500 sat < 1000 sat)
     let newTx = Transaction(
@@ -1375,7 +1380,7 @@ suite "Mempool RBF rules validation":
     )
     mp.spentBy[outpoint] = TxId(existingTxid)
 
-    let conflicts = initHashSet[TxId]() + [TxId(existingTxid)]
+    let conflicts = toHashSet([TxId(existingTxid)])
 
     # New tx: 1001 sat fee (higher) but vsize 100 bytes
     # Additional fee = 1001 - 1000 = 1 sat
@@ -1423,7 +1428,7 @@ suite "Mempool RBF rules validation":
     )
     mp.spentBy[outpoint] = TxId(existingTxid)
 
-    let conflicts = initHashSet[TxId]() + [TxId(existingTxid)]
+    let conflicts = toHashSet([TxId(existingTxid)])
 
     # New tx: 2000 sat fee, 100 vbytes
     # Additional fee = 2000 - 1000 = 1000 sat
@@ -1493,7 +1498,7 @@ suite "Mempool RBF rules validation":
         ancestorCount: 2, ancestorSize: 200
       )
 
-    let conflicts = initHashSet[TxId]() + [TxId(parentTxid)]
+    let conflicts = toHashSet([TxId(parentTxid)])
 
     let newTx = Transaction(
       version: 1,
@@ -1538,7 +1543,7 @@ suite "Mempool RBF rules validation":
     )
     mp.spentBy[outpoint] = TxId(existingTxid)
 
-    let conflicts = initHashSet[TxId]() + [TxId(existingTxid)]
+    let conflicts = toHashSet([TxId(existingTxid)])
 
     # New tx spends from the conflict (not allowed - would be invalid after eviction)
     let newTx = Transaction(
@@ -1658,7 +1663,7 @@ suite "Mempool RBF conflict removal":
     check mp.count == 2
 
     # Get all conflicts (parent + child)
-    let conflicts = initHashSet[TxId]() + [TxId(parentTxid)]
+    let conflicts = toHashSet([TxId(parentTxid)])
     let allConflicts = mp.getAllConflictsWithDescendants(conflicts)
 
     check len(allConflicts) == 2

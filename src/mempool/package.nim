@@ -5,6 +5,7 @@
 import std/[tables, algorithm, options, sets]
 import ../primitives/[types, serialize]
 import ../crypto/hashing
+import ../consensus/validation
 
 type
   PackageError* = object of CatchableError
@@ -264,12 +265,6 @@ proc getPackageHash*(txns: seq[Transaction]): array[32, byte] =
     for b in array[32, byte](w):
       data.add(b)
   doubleSha256(data)
-
-proc calculateTransactionWeight*(tx: Transaction): int =
-  ## Calculate transaction weight in weight units
-  let fullSize = serialize(tx, includeWitness = true).len
-  let baseSize = serializeLegacy(tx).len
-  (baseSize * 3) + fullSize
 
 proc calculateTransactionVsize*(tx: Transaction): int =
   ## Calculate transaction virtual size in vbytes

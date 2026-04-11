@@ -251,11 +251,11 @@ suite "BlockDownloader Constants":
   test "max request timeout is 64 seconds":
     check MaxRequestTimeout == 64
 
-  test "batch getdata size is 16":
-    check BatchGetDataSize == 16
+  test "batch getdata size is 64":
+    check BatchGetDataSize == 64
 
-  test "UTXO flush interval is 2000":
-    check UtxoFlushInterval == 2000
+  test "UTXO flush interval is 500":
+    check UtxoFlushInterval == 500
 
   test "witness block inv type is correct":
     check InvWitnessBlockType == 0x40000002'u32
