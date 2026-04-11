@@ -138,3 +138,47 @@ suite "ChainState IBD durability":
       check utxo.get().height == flushPoint
 
       cs.db.db.closeUnsafe()
+
+  test "crash at block 3500 with flush_interval=2000 loses at most 2000 blocks":
+    ## Process 5000 blocks with flush_interval=2000. Simulate a crash at
+    ## block 3500 (midway between disk flushes at 2000 and 4000). On
+    ## recovery, cfMeta must be within 2000 blocks of the crash height.
+    const CrashHeight = 3500'i32
+    const TotalBlocks = 5000'i32
+
+    block:
+      var cs = newChainState(TestDbPath, regtestParams())
+      cs.ibdDiskFlushInterval = int(IbdBatchFlushInterval)  # 2000
+
+      let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+      discard cs.connectBlock(genesis, 0)
+      cs.startIBD()
+
+      var prevHash = getBlockHash(genesis)
+      for h in 1'i32 .. CrashHeight:
+        let blk = makeSimpleBlock(prevHash, h)
+        let res = cs.connectBlockIBD(blk, h)
+        check res.isOk
+        prevHash = getBlockHash(blk)
+
+      check cs.bestHeight == CrashHeight
+
+      # Simulate crash: abrupt close, no stopIBD, no graceful flush.
+      cs.db.db.closeUnsafe()
+
+    # Reopen and verify durability invariant
+    block:
+      var cs = newChainState(TestDbPath, regtestParams())
+
+      # The disk flush at block 2000 should have persisted. The batch write
+      # at block 2000 also went to memtable but may or may not survive.
+      # The key invariant: recovered height must be >= CrashHeight - flushInterval
+      check cs.bestHeight >= CrashHeight - int32(IbdBatchFlushInterval)
+      # And it cannot be higher than the crash point
+      check cs.bestHeight <= CrashHeight
+
+      # The block index at the recovered height must be present
+      let hashAtBest = cs.db.getBlockHashByHeight(cs.bestHeight)
+      check hashAtBest.isSome
+
+      cs.db.db.closeUnsafe()

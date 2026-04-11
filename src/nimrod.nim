@@ -43,6 +43,7 @@ type
     pruneTarget*: uint64  ## Prune target in MiB (0 = disabled, 1 = manual only)
     importBlocks*: string ## Path to blk*.dat directory, or "-" for framed stdin
     metricsPort*: uint16  ## Prometheus metrics port (0 = disabled)
+    ibdFlushInterval*: int ## Disk flush interval during IBD (0 = use default 2000)
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -73,7 +74,8 @@ proc defaultConfig*(): NimrodConfig =
     rpcPassword: "",
     bindAddr: "0.0.0.0",
     pruneTarget: 0,  # Pruning disabled by default
-    metricsPort: 9332
+    metricsPort: 9332,
+    ibdFlushInterval: 0  # 0 = use default (IbdBatchFlushInterval = 2000)
   )
 
 proc loadConfigFile*(config: var NimrodConfig) =
@@ -171,6 +173,7 @@ Options:
   --bind=ADDR            P2P bind address (default: 0.0.0.0)
   --norpc                Disable RPC server
   --prune=SIZE_MB        Enable pruning to keep SIZE_MB of blocks (min: 550)
+  --ibd-flush-interval=N Force memtables to disk every N blocks during IBD (default: 2000, max: 5000)
   -h, --help             Show this help
   -v, --version          Show version
 
@@ -264,6 +267,16 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           quit(1)
       of "import-blocks", "importblocks":
         result.config.importBlocks = p.val
+      of "ibd-flush-interval":
+        try:
+          let v = parseInt(p.val)
+          if v < 0 or v > 5000:
+            echo "ibd-flush-interval must be 0-5000 (0 = default 2000)"
+            quit(1)
+          result.config.ibdFlushInterval = v
+        except ValueError:
+          echo "Invalid ibd-flush-interval: " & p.val
+          quit(1)
       of "help", "h":
         showHelp()
         quit(0)
@@ -494,6 +507,8 @@ proc runBlockImport*(config: NimrodConfig) =
 
   # Open chainstate
   var cs = newChainState(networkDir / "chainstate", params)
+  if config.ibdFlushInterval > 0:
+    cs.ibdDiskFlushInterval = config.ibdFlushInterval
 
   # Initialize genesis if needed
   if cs.bestHeight < 0:
@@ -856,6 +871,8 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # 2. Open database and chainstate
   info "opening database", path = networkDir / "chainstate"
   state.chainState = newChainState(networkDir / "chainstate", params)
+  if config.ibdFlushInterval > 0:
+    state.chainState.ibdDiskFlushInterval = config.ibdFlushInterval
 
   # Check for genesis block
   if state.chainState.bestHeight < 0:

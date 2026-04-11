@@ -95,6 +95,12 @@ type
     ibdMode*: bool               ## True during initial block download
     # Pending UTXO deletes tracked during IBD (cache key -> true)
     ibdDeletedUtxos*: Table[string, bool]
+    # Disk flush state — tracks blocks since last forced memtable→SST flush.
+    # Separate from ibdBatchBlocks so that stopIBD/startIBD oscillations
+    # (from P2P sync and RPC feeder running concurrently) don't trigger
+    # expensive column-family flushes on every state transition.
+    ibdBlocksSinceLastDiskFlush*: int
+    ibdDiskFlushInterval*: int   ## Configurable via --ibd-flush-interval (default 2000)
 
   ## Result type for chainstate operations
   ChainStateResult*[T] = object
@@ -382,6 +388,8 @@ const
   MaxCacheBytes* = 2_147_483_648
   ## Eviction target: evict down to half the max (~225 MiB)
   EvictTargetBytes* = MaxCacheBytes div 2
+  ## IBD batch flush interval: write batch to memtable every N blocks
+  IbdBatchFlushInterval* = 2000
   ## Estimated bytes per cache entry (OutPoint key ~60 bytes + UtxoEntry ~80 bytes + Table overhead ~32 bytes)
   EstimatedEntryBytes* = 172
 
@@ -401,7 +409,9 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     ibdBatch: nil,
     ibdBatchBlocks: 0,
     ibdMode: false,
-    ibdDeletedUtxos: initTable[string, bool]()
+    ibdDeletedUtxos: initTable[string, bool](),
+    ibdBlocksSinceLastDiskFlush: 0,
+    ibdDiskFlushInterval: IbdBatchFlushInterval  # default: flush to disk every 2000 blocks
   )
 
   # Load total work from DB if available
@@ -652,9 +662,6 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
 
   ok()
 
-# IBD batch flush interval (flush every N blocks)
-const IbdBatchFlushInterval* = 2000
-
 proc startIBD*(cs: var ChainState) =
   ## Enter IBD mode: enable write batching for performance
   cs.ibdMode = true
@@ -706,12 +713,6 @@ proc flushIBDBatch*(cs: var ChainState) =
     # Commit the entire batch atomically
     cs.db.db.write(cs.ibdBatch)
 
-    # Force all memtables to SST files. WAL is disabled during IBD, so
-    # memtable data is volatile — without this flush a crash can lose all
-    # UTXO/metadata updates since the last RocksDB-initiated memtable
-    # compaction, corrupting the chainstate across column families.
-    cs.db.db.flushAllColumnFamilies()
-
     # Reset batch
     cs.ibdBatch.clear()
     cs.ibdBatchBlocks = 0
@@ -731,10 +732,23 @@ proc flushIBDBatch*(cs: var ChainState) =
     info "flushed IBD batch", height = cs.bestHeight, evicted = evictedEntries,
          batchBlocks = IbdBatchFlushInterval
 
+proc flushToDiskIfNeeded*(cs: var ChainState, force: bool = false) =
+  ## Force all memtables to SST files if enough blocks have accumulated
+  ## since the last disk flush, or unconditionally if force=true.
+  ## WAL is disabled during IBD, so memtable data is volatile. This call
+  ## is the ONLY mechanism that makes chainstate durable during IBD.
+  if force or cs.ibdBlocksSinceLastDiskFlush >= cs.ibdDiskFlushInterval:
+    cs.db.db.flushAllColumnFamilies()
+    info "flushed memtables to SST", height = cs.bestHeight,
+         blocksSinceFlush = cs.ibdBlocksSinceLastDiskFlush
+    cs.ibdBlocksSinceLastDiskFlush = 0
+
 proc stopIBD*(cs: var ChainState) =
   ## Exit IBD mode: flush remaining batch and switch to per-block writes
   if cs.ibdBatch != nil:
     cs.flushIBDBatch()
+    # Force memtables to SST so all data is durable before leaving IBD
+    cs.flushToDiskIfNeeded(force = true)
     cs.ibdBatch.destroy()
     cs.ibdBatch = nil
   cs.ibdMode = false
@@ -826,10 +840,14 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
   cs.bestHeight = height
 
   cs.ibdBatchBlocks += 1
+  cs.ibdBlocksSinceLastDiskFlush += 1
 
-  # Flush batch every N blocks
+  # Flush batch every N blocks (write batch → memtable, fast)
   if cs.ibdBatchBlocks >= IbdBatchFlushInterval:
     cs.flushIBDBatch()
+
+  # Periodically force memtables to SST (memtable → disk, slower but durable)
+  cs.flushToDiskIfNeeded()
 
   ok()
 
