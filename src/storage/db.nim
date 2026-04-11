@@ -151,6 +151,13 @@ proc rocksdb_writebatch_delete_cf*(batch: RocksDbWriteBatchPtr,
 proc rocksdb_write*(db: RocksDbPtr, writeOpts: RocksDbWriteOptionsPtr,
     batch: RocksDbWriteBatchPtr, errptr: ptr cstring)
 
+# Flush options (force memtable -> SST)
+proc rocksdb_flushoptions_create*(): pointer
+proc rocksdb_flushoptions_destroy*(opts: pointer)
+proc rocksdb_flushoptions_set_wait*(opts: pointer, v: uint8)
+proc rocksdb_flush_cf*(db: RocksDbPtr, flushOpts: pointer,
+    cf: RocksDbColumnFamilyHandle, errptr: ptr cstring)
+
 # Memory management
 proc rocksdb_free*(p: pointer)
 {.pop.}
@@ -336,6 +343,18 @@ proc openDatabase*(path: string, config: DatabaseConfig = defaultDbConfig()): Da
     if cfOpts[cf] != result.dbOpts:
       rocksdb_options_destroy(cfOpts[cf])
 
+proc closeUnsafe*(db: Database) =
+  ## Close only the RocksDB handle without destroying options/cache/filter.
+  ## Used in crash-simulation tests where we want to abandon the DB abruptly.
+  if db != nil and db.db != nil:
+    rocksdb_cancel_all_background_work(db.db, 1)
+    for cf in ColumnFamily:
+      if db.cfHandles[cf] != nil:
+        rocksdb_column_family_handle_destroy(db.cfHandles[cf])
+        db.cfHandles[cf] = nil
+    rocksdb_close(db.db)
+    db.db = nil
+
 proc close*(db: Database) =
   if db == nil:
     return
@@ -502,6 +521,20 @@ proc enableWAL*(db: Database) =
   ## Re-enable Write-Ahead Log after IBD
   if db.writeOpts != nil:
     rocksdb_writeoptions_disable_WAL(db.writeOpts, 0)
+
+proc flushAllColumnFamilies*(db: Database) =
+  ## Force all column-family memtables to SST files on disk.
+  ## Must be called after IBD batch writes (where WAL is disabled) to
+  ## ensure durability — without this, a crash loses all memtable data.
+  let flushOpts = rocksdb_flushoptions_create()
+  rocksdb_flushoptions_set_wait(flushOpts, 1)  # block until flush completes
+  defer: rocksdb_flushoptions_destroy(flushOpts)
+
+  for cf in ColumnFamily:
+    if db.cfHandles[cf] != nil:
+      var err: cstring = nil
+      rocksdb_flush_cf(db.db, flushOpts, db.cfHandles[cf], addr err)
+      checkError(err)
 
 # Key construction helpers (big-endian for ordered iteration)
 
