@@ -9,6 +9,7 @@ import ./undo
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 import ../consensus/params
+import ../consensus/assumevalid
 import chronicles
 
 export db.ColumnFamily
@@ -544,6 +545,26 @@ proc generateBlockUndo*(cs: ChainState, blk: Block): BlockUndo =
 
 # Connect a block to the chain
 
+proc buildAssumeValidContext(cs: ChainState, blockHash: BlockHash,
+                              height: int32): AssumeValidContext =
+  ## Build an AssumeValidContext from ChainState for a block being connected.
+  ## The best-header is approximated by the current chain tip (cs.totalWork).
+  ## During IBD the chain tip IS the best-validated block, which is a safe
+  ## lower bound for the chainwork check.
+  result = AssumeValidContext(
+    blockHash: blockHash,
+    blockHeight: height,
+    assumeValidHeight: cs.params.assumeValidHeight,
+    # Best header: use chain tip height and accumulated work.
+    # This is conservative — if anything, it under-counts chainwork.
+    bestHeaderHeight: cs.bestHeight,
+    bestHeaderChainWork: cs.totalWork
+  )
+  result.activeHashAtBlockHeight = cs.db.getBlockHashByHeight(height)
+  if cs.params.assumeValidHeight > 0:
+    result.activeHashAtAssumeValidHeight =
+      cs.db.getBlockHashByHeight(cs.params.assumeValidHeight)
+
 proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateResult[void] =
   ## Connect a block: spend inputs, create outputs, update state
   ## Returns error if any input is missing or immature coinbase
@@ -588,8 +609,12 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
         if entry.isCoinbase:
           let age = height - entry.height
           if age < int32(cs.params.coinbaseMaturity):
-            if cs.params.assumeValidHeight > 0 and
-               height <= cs.params.assumeValidHeight:
+            # Use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
+            # The maturity bypass only applies when the block is on the
+            # assumed-valid chain (ancestor check) — NOT a plain height check.
+            let avCtx = buildAssumeValidContext(cs, blockHash, height)
+            let skipReason = shouldSkipScripts(avCtx, cs.params)
+            if skipReason == ssrSkip:
               warn "immature coinbase below assume-valid (allowing)",
                    height = height, coinbaseHeight = entry.height,
                    age = age, prevTxid = $input.prevOut.txid,
@@ -782,12 +807,12 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
         if entry.isCoinbase:
           let age = height - entry.height
           if age < int32(cs.params.coinbaseMaturity):
-            # Below assume-valid height, blocks are trusted (scripts are
-            # already skipped).  Log the anomaly but don't reject the block
-            # -- this guards against false positives from stale UTXO flags
-            # while still enforcing maturity above assume-valid.
-            if cs.params.assumeValidHeight > 0 and
-               height <= cs.params.assumeValidHeight:
+            # Use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
+            # Only bypass maturity enforcement when the block is on the
+            # assumed-valid chain (ancestor check) — NOT a plain height check.
+            let avCtx = buildAssumeValidContext(cs, blockHash, height)
+            let skipReason = shouldSkipScripts(avCtx, cs.params)
+            if skipReason == ssrSkip:
               warn "immature coinbase below assume-valid (allowing)",
                    height = height, coinbaseHeight = entry.height,
                    age = age, prevTxid = $input.prevOut.txid,
