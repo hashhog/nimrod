@@ -12,6 +12,7 @@ import ./network/[peer, peermanager, sync, messages]
 import ./mempool/mempool
 import ./mining/fees
 import ./rpc/server
+import ./rpc/rpc_thread
 import ./crypto/[secp256k1, hashing]
 
 const NimrodVersion* = "0.1.0"
@@ -949,7 +950,10 @@ proc startNode*(config: NimrodConfig) {.async.} =
       config.rpcPassword,
       cookiePass
     )
-    asyncSpawn state.rpcServer.start()
+    # Run RPC on a dedicated OS thread with its own chronos event loop so that
+    # CPU-heavy block validation on the main thread does not block RPC accept
+    # or response. See src/rpc/rpc_thread.nim for rationale and known v1 caveats.
+    discard startRpcThread(state.rpcServer)
 
   # 7b. Start Prometheus metrics server
   if config.metricsPort > 0:
