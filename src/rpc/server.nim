@@ -164,8 +164,87 @@ proc targetToDifficulty(target: array[32, byte]): float64 =
   let maxTarget = 26959535291011309493156476344723991336010898738574164086137773096960.0
   maxTarget / targetVal
 
+# ============================================================================
+# Shared deployment-state helper
+# Both getblockchaininfo (.softforks) and getdeploymentinfo (.deployments)
+# must read from the same source of truth.  This proc is the single point of
+# truth; neither handler may embed its own deployment logic.
+# Reference: Bitcoin Core rpc/blockchain.cpp SoftForkDescPushBack /
+#            DeploymentInfo helpers called by both RPCs.
+# ============================================================================
+
+proc buildDeployments*(rpc: RpcServer, targetHash: BlockHash, targetHeight: int32): JsonNode =
+  ## Build canonical deployment state for both getblockchaininfo.softforks and
+  ## getdeploymentinfo.deployments.  Returns a JSON object keyed by fork id.
+  ##
+  ## Buried deployments: active = (targetHeight >= activationHeight)
+  ## BIP9  deployments: state is derived by running the BIP9 state machine
+  ##                    against the live chain (chainState.db), not from any
+  ##                    hard-coded table.
+
+  # ----- buried deployments -------------------------------------------------
+  proc buriedDeployment(activationHeight: int, currentHeight: int32): JsonNode =
+    result = newJObject()
+    result["type"] = %"buried"
+    result["active"] = %(currentHeight >= int32(activationHeight))
+    result["height"] = %activationHeight
+
+  result = newJObject()
+  result["bip34"]  = buriedDeployment(rpc.params.bip34Height,  targetHeight)
+  result["bip65"]  = buriedDeployment(rpc.params.bip65Height,  targetHeight)
+  result["bip66"]  = buriedDeployment(rpc.params.bip66Height,  targetHeight)
+  result["csv"]    = buriedDeployment(rpc.params.csvHeight,    targetHeight)
+  result["segwit"] = buriedDeployment(rpc.params.segwitHeight, targetHeight)
+
+  # ----- BIP9 deployments ---------------------------------------------------
+  # State is computed live from chainState.db + the versionbits state machine.
+  let cs = rpc.chainState
+
+  let getBlockIndexFn = proc(h: BlockHash): Option[BlockIndex] =
+    cs.db.getBlockIndex(h)
+
+  let getMtpFn = proc(h: BlockHash): int64 =
+    getMtpForBlock(h, getBlockIndexFn)
+
+  proc bip9Deployment(dep: BIP9Deployment, depIdx: int): JsonNode =
+    var stateCache = initTable[BlockHash, ThresholdState]()
+
+    # State is for the block *following* targetHash (prevHash = targetHash)
+    let state     = getStateFor(dep, targetHash, getBlockIndexFn, getMtpFn, stateCache)
+    let sinceHeight = getStateSinceHeight(dep, targetHash, getBlockIndexFn, getMtpFn, stateCache)
+
+    let bip9Obj = newJObject()
+    if state == tsStarted or state == tsLockedIn:
+      bip9Obj["bit"] = %dep.bit
+    bip9Obj["start_time"]            = %dep.startTime
+    bip9Obj["timeout"]               = %dep.timeout
+    bip9Obj["min_activation_height"] = %dep.minActivationHeight
+    bip9Obj["status"]                = %stateName(state)
+    bip9Obj["since"]                 = %sinceHeight
+
+    let nextState = case state
+      of tsDefined:
+        let mtp = getMtpFn(targetHash)
+        if mtp >= dep.startTime: stateName(tsStarted) else: stateName(tsDefined)
+      of tsStarted:  stateName(tsLockedIn)
+      of tsLockedIn: stateName(tsActive)
+      of tsActive:   stateName(tsActive)
+      of tsFailed:   stateName(tsFailed)
+    bip9Obj["status_next"] = %nextState
+
+    result = newJObject()
+    result["type"]   = %"bip9"
+    result["active"] = %(state == tsActive)
+    result["bip9"]   = bip9Obj
+
+  let testdummy = testDummyDeployment()
+  let taproot   = taprootDeployment(rpc.params.network)
+
+  result["testdummy"] = bip9Deployment(testdummy, 0)
+  result["taproot"]   = bip9Deployment(taproot,   1)
+
 # Blockchain RPCs
-proc handleGetBlockchainInfo(rpc: RpcServer): JsonNode =
+proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   ## Return an object containing various state info regarding blockchain processing
   ## Reference: Bitcoin Core rpc/blockchain.cpp getblockchaininfo
 
@@ -238,6 +317,14 @@ proc handleGetBlockchainInfo(rpc: RpcServer): JsonNode =
   # Add prune_target_size if pruning is enabled
   if rpc.blockFileManager != nil and rpc.blockFileManager.isPruneMode:
     response["prune_target_size"] = %rpc.blockFileManager.getPruneTarget()
+
+  # Add softforks — same data source as getdeploymentinfo via buildDeployments.
+  # Bitcoin Core emits "softforks" keyed by id; each entry has "type" and
+  # "active" at minimum, plus "height" (buried) or "bip9" sub-object (BIP9).
+  response["softforks"] = rpc.buildDeployments(
+    rpc.chainState.bestBlockHash,
+    rpc.chainState.bestHeight
+  )
 
   response
 
@@ -415,12 +502,16 @@ proc handleGetChainTips(rpc: RpcServer): JsonNode =
     "status": "active"
   }]
 
-proc handleGetDeploymentInfo(rpc: RpcServer, params: JsonNode): JsonNode =
+proc handleGetDeploymentInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Return deployment info for soft forks at a given block (or chain tip).
   ## Reference: Bitcoin Core rpc/blockchain.cpp getdeploymentinfo
   ##
   ## Optional argument:
   ##   1. blockhash (string) - query at this block; defaults to chain tip
+  ##
+  ## Deployment data comes exclusively from buildDeployments — the same
+  ## helper used by getblockchaininfo.softforks — so the two RPCs are always
+  ## in agreement on deployment state.
 
   # Resolve the target block hash
   var targetHash: BlockHash
@@ -441,82 +532,10 @@ proc handleGetDeploymentInfo(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let hashDisplay = reverseHex(toHex(array[32, byte](targetHash)))
 
-  # -------------------------------------------------------------------------
-  # Buried deployments
-  # A buried deployment is active when the chain has passed its activation
-  # height.  We report active = (targetHeight >= activationHeight).
-  # -------------------------------------------------------------------------
-  proc buriedDeployment(activationHeight: int, currentHeight: int32): JsonNode =
-    result = newJObject()
-    result["type"] = %"buried"
-    result["active"] = %(currentHeight >= int32(activationHeight))
-    result["height"] = %activationHeight
-
-  let deployments = newJObject()
-  deployments["bip34"] = buriedDeployment(rpc.params.bip34Height, targetHeight)
-  deployments["bip65"] = buriedDeployment(rpc.params.bip65Height, targetHeight)
-  deployments["bip66"] = buriedDeployment(rpc.params.bip66Height, targetHeight)
-  deployments["csv"]   = buriedDeployment(rpc.params.csvHeight,   targetHeight)
-  deployments["segwit"]= buriedDeployment(rpc.params.segwitHeight, targetHeight)
-
-  # -------------------------------------------------------------------------
-  # BIP9 deployments: testdummy and taproot
-  # We run the BIP9 state machine using the versionbits module.
-  # -------------------------------------------------------------------------
-
-  # Build helper closures that access the chain database
-  let cs = rpc.chainState
-
-  let getBlockIndexFn = proc(h: BlockHash): Option[BlockIndex] =
-    cs.db.getBlockIndex(h)
-
-  let getMtpFn = proc(h: BlockHash): int64 =
-    getMtpForBlock(h, getBlockIndexFn)
-
-  proc bip9Deployment(dep: BIP9Deployment, depIdx: int): JsonNode =
-    var stateCache = initTable[BlockHash, ThresholdState]()
-
-    # State is computed for the block *after* targetHash (i.e. prevHash = targetHash)
-    let state = getStateFor(dep, targetHash, getBlockIndexFn, getMtpFn, stateCache)
-    let sinceHeight = getStateSinceHeight(dep, targetHash, getBlockIndexFn, getMtpFn, stateCache)
-
-    # Build bip9 sub-object
-    let bip9Obj = newJObject()
-    if state == tsStarted or state == tsLockedIn:
-      bip9Obj["bit"] = %dep.bit
-    bip9Obj["start_time"] = %dep.startTime
-    bip9Obj["timeout"] = %dep.timeout
-    bip9Obj["min_activation_height"] = %dep.minActivationHeight
-    bip9Obj["status"] = %stateName(state)
-    bip9Obj["since"] = %sinceHeight
-
-    # Determine next-state string (simplified: same as current for terminal states)
-    let nextState = case state
-      of tsDefined:
-        let mtp = getMtpFn(targetHash)
-        if mtp >= dep.startTime: stateName(tsStarted) else: stateName(tsDefined)
-      of tsStarted: stateName(tsLockedIn)   # optimistic; real next depends on signalling
-      of tsLockedIn: stateName(tsActive)
-      of tsActive: stateName(tsActive)
-      of tsFailed: stateName(tsFailed)
-    bip9Obj["status_next"] = %nextState
-
-    # Build outer object
-    result = newJObject()
-    result["type"] = %"bip9"
-    result["active"] = %(state == tsActive)
-    result["bip9"] = bip9Obj
-
-  let testdummy = testDummyDeployment()
-  let taproot = taprootDeployment(rpc.params.network)
-
-  deployments["testdummy"] = bip9Deployment(testdummy, 0)
-  deployments["taproot"]   = bip9Deployment(taproot,   1)
-
   result = newJObject()
-  result["hash"] = %hashDisplay
-  result["height"] = %targetHeight
-  result["deployments"] = deployments
+  result["hash"]        = %hashDisplay
+  result["height"]      = %targetHeight
+  result["deployments"] = rpc.buildDeployments(targetHash, targetHeight)
 
 # Chain Management RPCs
 proc handleInvalidateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
