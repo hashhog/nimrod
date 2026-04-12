@@ -65,6 +65,17 @@ tests/test_stale_peer
 tests/test_txindex
 tests/test_utxo_cache
 tests/test_zmq
+tests/test_assumevalid
+tests/test_banman
+tests/test_bip174
+tests/test_coinstatsindex
+tests/test_feefilter
+tests/test_headerssync
+tests/test_ibd_durability
+tests/test_regtest
+tests/test_softforks_bridge
+tests/test_versionbits
+tests/bench_flush
 src/mempool/cluster
 src/rpc/rest
 
