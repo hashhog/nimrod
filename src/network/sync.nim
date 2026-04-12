@@ -13,7 +13,7 @@ import ./peermanager
 import ./messages
 import ./headerssync
 import ../primitives/[types, serialize, uint256]
-import ../consensus/[params, pow, validation]
+import ../consensus/[params, pow, validation, assumevalid]
 import ../storage/chainstate
 import ../crypto/[hashing, secp256k1]
 
@@ -975,9 +975,22 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
     warn "invalid block", height = height, error = $checkResult.error
     return false
 
-  # Script verification (skip only if below assume-valid height)
-  let skipScripts = sm.params.assumeValidHeight > 0 and
-                    height <= sm.params.assumeValidHeight
+  # Script verification: use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
+  # Re-evaluated per block — NOT a persistent latch.
+  var avCtx = AssumeValidContext(
+    blockHash: hash,
+    blockHeight: height,
+    assumeValidHeight: sm.params.assumeValidHeight,
+    bestHeaderHeight: sm.headerTipHeight,
+    bestHeaderChainWork: sm.headerChain.totalWork
+  )
+  if sm.chainDb != nil:
+    avCtx.activeHashAtBlockHeight = sm.chainDb.getBlockHashByHeight(height)
+    if sm.params.assumeValidHeight > 0:
+      avCtx.activeHashAtAssumeValidHeight =
+        sm.chainDb.getBlockHashByHeight(sm.params.assumeValidHeight)
+  let skipReason = shouldSkipScripts(avCtx, sm.params)
+  let skipScripts = skipReason == ssrSkip
   if not skipScripts and sm.chainState != nil:
     try:
       {.gcsafe.}:

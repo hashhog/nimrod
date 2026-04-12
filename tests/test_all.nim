@@ -62,6 +62,8 @@ import ./test_zmq
 import ./test_notification
 import ./test_regtest
 import ./test_softforks_bridge
+import ./test_assumevalid
+import ./test_checkpoint
 
 when isMainModule:
   echo "Running all tests..."
