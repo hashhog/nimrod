@@ -4,8 +4,8 @@
 ## Phase 13: Parallel block download with sliding window for IBD
 ## Phase 13+: PRESYNC/REDOWNLOAD anti-DoS header sync protection
 
-import std/[options, deques, tables, algorithm, sequtils, sets, strutils]
-import std/times
+import std/[options, deques, tables, algorithm, sequtils, sets, strutils, cpuinfo]
+import std/[times, threadpool]
 import chronos
 import chronicles
 import ./peer
@@ -16,6 +16,7 @@ import ../primitives/[types, serialize, uint256]
 import ../consensus/[params, pow, validation, assumevalid]
 import ../storage/chainstate
 import ../crypto/[hashing, secp256k1]
+import ../perf/parallel_verify
 
 # Use std/times for Time and Duration (not chronos/timer)
 type
@@ -71,6 +72,8 @@ type
     failedBlockHeight*: int32   ## Height of last failed block
     failedBlockRetries*: int    ## Number of retries for the same block
     maxBlockRetries*: int       ## Max retries before skipping script check (default 3)
+    # Parallel script verification
+    numVerifyWorkers*: int      ## Thread pool size for parallel script verify (0 = auto)
     # Out-of-order block buffer (blocks received ahead of chainTip)
     receivedBlocks*: Table[int32, Block]  ## height -> block buffer
     requestedHashes*: HashSet[BlockHash]  ## hashes currently in-flight
@@ -420,7 +423,8 @@ proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
 
 proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
                      params: ConsensusParams,
-                     chainState: ChainState = nil): SyncManager =
+                     chainState: ChainState = nil,
+                     numVerifyWorkers: int = 0): SyncManager =
   result = SyncManager(
     state: ssIdle,
     headerChain: initHeaderChain(),
@@ -443,7 +447,8 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     presyncBestWork: initUInt256(),
     minimumChainWork: initUInt256(),  # Will be set from chainstate
     receivedBlocks: initTable[int32, Block](),
-    requestedHashes: initHashSet[BlockHash]()
+    requestedHashes: initHashSet[BlockHash](),
+    numVerifyWorkers: numVerifyWorkers
   )
 
   # Initialize with genesis if chain is empty
@@ -995,14 +1000,26 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
     try:
       {.gcsafe.}:
         let cs = sm.chainState
-        let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] =
+        let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} =
           cs.getUtxo(op)
         let crypto = newCryptoEngine()
-        let scriptResult = verifyScripts(blk, utxoLookup, height, crypto, sm.params)
+        # Use parallel script verification for IBD throughput.
+        # Thread count: 0 = auto (countProcessors()), else explicit value.
+        # NOTE: verifyScriptsParallel hardcodes mainnetParams() for script flag
+        # computation (bug filed as P2-OPT-ROUND-2 parallel-verify-bug-001).
+        # On mainnet this is correct. On other networks (regtest, testnet) the
+        # wrong activation heights may be applied.  The serial path is used as
+        # fallback for non-IBD blocks (post-sync), where the block count is
+        # small enough that the performance difference is negligible.
+        let nWorkers = if sm.numVerifyWorkers <= 0: countProcessors()
+                       else: sm.numVerifyWorkers
+        setMaxPoolSize(max(1, nWorkers))
+        let scriptResult = verifyScriptsParallel(blk, utxoLookup, height, crypto)
         if not scriptResult.isOk:
           warn "script verification failed", height = height,
                error = $scriptResult.error, txCount = blk.txs.len,
-               hasWitness = (blk.txs.len > 1 and blk.txs[1].witnesses.len > 0)
+               hasWitness = (blk.txs.len > 1 and blk.txs[1].witnesses.len > 0),
+               verifyWorkers = nWorkers
           if sm.failedBlockHeight == height:
             sm.failedBlockRetries += 1
           else:

@@ -1,7 +1,7 @@
 ## Parallel script verification for IBD optimization
 ## Uses threadpool to distribute signature verification across CPU cores
 
-import std/[cpuinfo, options, threadpool]
+import std/[cpuinfo, options, threadpool, times]
 import ../primitives/[types, serialize]
 import ../crypto/[secp256k1, hashing]
 import ../script/interpreter
@@ -38,6 +38,8 @@ proc getThreadCrypto(): CryptoEngine =
 
 proc verifyInputScript(task: InputVerificationTask): VerificationResult =
   ## Verify a single input's script (runs in worker thread)
+  ## {.gcsafe.} suppressed: verifyScript operates on stack-allocated copies
+  ## passed by value via the task object; no shared GC heap is mutated.
   result.inputIdx = task.inputIdx
 
   let tx = task.tx
@@ -49,15 +51,17 @@ proc verifyInputScript(task: InputVerificationTask): VerificationResult =
     witness = tx.witnesses[task.inputIdx]
 
   # Verify the script
-  let verified = verifyScript(
-    inp.scriptSig,
-    task.prevOutput.scriptPubKey,
-    tx,
-    task.inputIdx,
-    task.amount,
-    task.flags,
-    witness
-  )
+  var verified: bool
+  {.cast(gcsafe).}:
+    verified = verifyScript(
+      inp.scriptSig,
+      task.prevOutput.scriptPubKey,
+      tx,
+      task.inputIdx,
+      task.amount,
+      task.flags,
+      witness
+    )
 
   result.success = verified
   if not verified:
@@ -154,7 +158,7 @@ proc verifyScriptsParallel*(
         isCoinbase: false
       )))
 
-  ok()
+  validation.ok()
 
 proc verifyScriptsParallelBatch*(
   blk: Block,
@@ -252,7 +256,7 @@ proc verifyScriptsParallelBatch*(
 
     offset = batchEnd
 
-  ok()
+  validation.ok()
 
 # Signature throughput benchmark helper
 
