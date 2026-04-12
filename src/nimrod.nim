@@ -44,6 +44,7 @@ type
     importBlocks*: string ## Path to blk*.dat directory, or "-" for framed stdin
     metricsPort*: uint16  ## Prometheus metrics port (0 = disabled)
     ibdFlushInterval*: int ## Disk flush interval during IBD (0 = use default 2000)
+    numVerifyWorkers*: int ## Script verify thread count for parallel IBD (0 = auto = CPU count)
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -75,7 +76,8 @@ proc defaultConfig*(): NimrodConfig =
     bindAddr: "0.0.0.0",
     pruneTarget: 0,  # Pruning disabled by default
     metricsPort: 9332,
-    ibdFlushInterval: 0  # 0 = use default (IbdBatchFlushInterval = 2000)
+    ibdFlushInterval: 0,  # 0 = use default (IbdBatchFlushInterval = 2000)
+    numVerifyWorkers: 0   # 0 = auto (CPU count via countProcessors())
   )
 
 proc loadConfigFile*(config: var NimrodConfig) =
@@ -136,6 +138,12 @@ proc loadConfigFile*(config: var NimrodConfig) =
         if pruneMiB > 0:
           config.pruneTarget = uint64(pruneMiB)
       except ValueError: discard
+    of "verifythreads", "verify-threads":
+      try:
+        let v = parseInt(value)
+        if v >= 0 and v <= 256:
+          config.numVerifyWorkers = v
+      except ValueError: discard
     else:
       discard
 
@@ -174,6 +182,7 @@ Options:
   --norpc                Disable RPC server
   --prune=SIZE_MB        Enable pruning to keep SIZE_MB of blocks (min: 550)
   --ibd-flush-interval=N Force memtables to disk every N blocks during IBD (default: 2000, max: 5000)
+  --verify-threads=N     Script verify thread count for parallel IBD (default: 0 = auto/CPU count)
   -h, --help             Show this help
   -v, --version          Show version
 
@@ -276,6 +285,16 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           result.config.ibdFlushInterval = v
         except ValueError:
           echo "Invalid ibd-flush-interval: " & p.val
+          quit(1)
+      of "verify-threads":
+        try:
+          let v = parseInt(p.val)
+          if v < 0 or v > 256:
+            echo "verify-threads must be 0-256 (0 = auto/CPU count)"
+            quit(1)
+          result.config.numVerifyWorkers = v
+        except ValueError:
+          echo "Invalid verify-threads: " & p.val
           quit(1)
       of "help", "h":
         showHelp()
@@ -905,7 +924,7 @@ proc startNode*(config: NimrodConfig) {.async.} =
 
   # 6. Initialize sync manager
   info "initializing sync manager"
-  state.syncManager = newSyncManager(state.peerManager, state.chainState.db, params, state.chainState)
+  state.syncManager = newSyncManager(state.peerManager, state.chainState.db, params, state.chainState, config.numVerifyWorkers)
   state.syncManager.chainTip = state.chainState.bestBlockHash
   state.syncManager.chainTipHeight = state.chainState.bestHeight
 
