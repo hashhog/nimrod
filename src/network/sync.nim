@@ -1003,23 +1003,19 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
         let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} =
           cs.getUtxo(op)
         let crypto = newCryptoEngine()
-        # Use parallel script verification for IBD throughput.
-        # Thread count: 0 = auto (countProcessors()), else explicit value.
-        # NOTE: verifyScriptsParallel hardcodes mainnetParams() for script flag
-        # computation (bug filed as P2-OPT-ROUND-2 parallel-verify-bug-001).
-        # On mainnet this is correct. On other networks (regtest, testnet) the
-        # wrong activation heights may be applied.  The serial path is used as
-        # fallback for non-IBD blocks (post-sync), where the block count is
-        # small enough that the performance difference is negligible.
-        let nWorkers = if sm.numVerifyWorkers <= 0: countProcessors()
-                       else: sm.numVerifyWorkers
-        setMaxPoolSize(max(1, nWorkers))
-        let scriptResult = verifyScriptsParallel(blk, utxoLookup, height, crypto)
+        # Serial script verification.  The parallel verifier
+        # (verifyScriptsParallel in src/perf/parallel_verify.nim) was wired here
+        # in b751f80 but was reverted because it fails deterministically at
+        # mainnet block 821384.  Likely cause: hardcoded mainnetParams() in the
+        # verifier computes script flags without height-aware BIP activation,
+        # producing mismatched flags vs the serial path.  Tracked as P2-OPT-
+        # ROUND-2 parallel-verify-bug-001.  The parallel_verify.nim module is
+        # retained for a future P2-OPT-ROUND-3 pass that re-wires it correctly.
+        let scriptResult = verifyScripts(blk, utxoLookup, height, crypto, sm.params)
         if not scriptResult.isOk:
           warn "script verification failed", height = height,
                error = $scriptResult.error, txCount = blk.txs.len,
-               hasWitness = (blk.txs.len > 1 and blk.txs[1].witnesses.len > 0),
-               verifyWorkers = nWorkers
+               hasWitness = (blk.txs.len > 1 and blk.txs[1].witnesses.len > 0)
           if sm.failedBlockHeight == height:
             sm.failedBlockRetries += 1
           else:
