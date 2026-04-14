@@ -982,6 +982,16 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
 
   # Script verification: use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
   # Re-evaluated per block — NOT a persistent latch.
+  #
+  # The ancestor-check MUST query the block INDEX (sm.headerChain), not the
+  # active chain (sm.chainDb.getBlockHashByHeight).  Bitcoin Core's
+  # GetAncestor() walks the block-index pindex pointers; it does not require
+  # the ancestor to be on the active chain.  During IBD we have header-synced
+  # past assumeValidHeight long before the active chain reaches it, so using
+  # the chainDb active-chain map would leave activeHashAtAssumeValidHeight
+  # empty, trip ssrHashNotInIndex, and force script verification to run when
+  # the spec says it should be skipped.  See overnight-2026-04-13/
+  # NIMROD-MISSING-INPUT-DIAG.md for the stall analysis at mainnet 850846.
   var avCtx = AssumeValidContext(
     blockHash: hash,
     blockHeight: height,
@@ -989,11 +999,10 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
     bestHeaderHeight: sm.headerTipHeight,
     bestHeaderChainWork: sm.headerChain.totalWork
   )
-  if sm.chainDb != nil:
-    avCtx.activeHashAtBlockHeight = sm.chainDb.getBlockHashByHeight(height)
-    if sm.params.assumeValidHeight > 0:
-      avCtx.activeHashAtAssumeValidHeight =
-        sm.chainDb.getBlockHashByHeight(sm.params.assumeValidHeight)
+  avCtx.activeHashAtBlockHeight = sm.headerChain.getHashByHeight(height)
+  if sm.params.assumeValidHeight > 0:
+    avCtx.activeHashAtAssumeValidHeight =
+      sm.headerChain.getHashByHeight(sm.params.assumeValidHeight)
   let skipReason = shouldSkipScripts(avCtx, sm.params)
   let skipScripts = skipReason == ssrSkip
   if not skipScripts and sm.chainState != nil:
