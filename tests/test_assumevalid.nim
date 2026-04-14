@@ -242,3 +242,120 @@ suite "assumevalid ancestor-check semantics":
   test "fleet hashes: regtest assumevalid is zero":
     let params = regtestParams()
     check params.assumeValidBlockHash == BlockHash(default(array[32, byte]))
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Regression: mainnet 850846 IBD stall.  The bug was that the call sites
+  # populated activeHashAt* from the ACTIVE CHAIN (chainDb.getBlockHashByHeight)
+  # which is empty above the current chain tip during IBD.  shouldSkipScripts
+  # then tripped ssrHashNotInIndex / ssrNotAncestorOfAssumeValid and scripts
+  # ran (and failed) for blocks the spec says should skip.
+  #
+  # The fix: callers populate activeHashAt* from the BLOCK INDEX (header
+  # chain), which is populated well past assumeValidHeight during IBD.  These
+  # tests exercise the context as the fixed sync.nim call site now builds it.
+  # ────────────────────────────────────────────────────────────────────────
+
+  test "regression-850846a: below assumeValid, active chain empty, headers full => skip":
+    # IBD scenario: we are at chain tip 850846, headers extend to 944962.
+    # assumeValidHeight=938343.  The ACTIVE-chain lookup at 938343 would be
+    # none; the BLOCK-INDEX (header chain) lookup returns the real hash.
+    let params = mainnetParams()
+    let blockHash = BlockHash(hexToBytes32(
+      "0000000000000000000a5cbf111111111111111111111111111111111111abcd"))
+    let ctx = AssumeValidContext(
+      blockHash: blockHash,
+      blockHeight: 850_846'i32,
+      assumeValidHeight: params.assumeValidHeight,
+      # Populated from header chain (block index), not active chain:
+      activeHashAtBlockHeight: some(blockHash),
+      activeHashAtAssumeValidHeight: some(params.assumeValidBlockHash),
+      bestHeaderHeight: 944_962'i32,
+      bestHeaderChainWork: hexToBytes32(
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    )
+    check shouldSkipScripts(ctx, params) == ssrSkip
+
+  test "regression-850846b: below assumeValid, caller uses active-chain => ssrHashNotInIndex":
+    # Documents the OLD buggy behaviour: if a caller still populates the
+    # context from the active chain and the active chain has not reached
+    # assumeValidHeight yet, shouldSkipScripts correctly refuses to skip.
+    # This locks in the contract that callers MUST use block-index lookups
+    # during IBD.  If this starts returning ssrSkip, the field semantics
+    # have changed and sync.nim's callsite comment needs updating.
+    let params = mainnetParams()
+    let blockHash = BlockHash(hexToBytes32(
+      "0000000000000000000a5cbf111111111111111111111111111111111111abcd"))
+    let ctx = AssumeValidContext(
+      blockHash: blockHash,
+      blockHeight: 850_846'i32,
+      assumeValidHeight: params.assumeValidHeight,
+      # Simulate a caller that WRONGLY used the active chain during IBD:
+      activeHashAtBlockHeight: some(blockHash),
+      activeHashAtAssumeValidHeight: none(BlockHash),
+      bestHeaderHeight: 944_962'i32,
+      bestHeaderChainWork: hexToBytes32(
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    )
+    check shouldSkipScripts(ctx, params) == ssrHashNotInIndex
+
+  test "regression-850846c: above assumeValid => ssrNotAncestorOfAssumeValid":
+    # Height above assumeValidHeight is never an ancestor.
+    let params = mainnetParams()
+    let blockHeight = params.assumeValidHeight + 1'i32
+    let blockHash = BlockHash(hexToBytes32(
+      "0000000000000000000a5cbf222222222222222222222222222222222222abcd"))
+    let ctx = AssumeValidContext(
+      blockHash: blockHash,
+      blockHeight: blockHeight,
+      assumeValidHeight: params.assumeValidHeight,
+      activeHashAtBlockHeight: some(blockHash),
+      activeHashAtAssumeValidHeight: some(params.assumeValidBlockHash),
+      bestHeaderHeight: blockHeight + 10_000'i32,
+      bestHeaderChainWork: hexToBytes32(
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    )
+    check shouldSkipScripts(ctx, params) == ssrNotAncestorOfAssumeValid
+
+  test "regression-850846d: exactly at assumeValidHeight=938343 with matching hash => skip":
+    # At the assumevalid height itself, the block hash must equal the
+    # hardcoded assumeValidBlockHash for the skip to fire.
+    let params = mainnetParams()
+    let ctx = AssumeValidContext(
+      blockHash: params.assumeValidBlockHash,
+      blockHeight: params.assumeValidHeight,
+      assumeValidHeight: params.assumeValidHeight,
+      activeHashAtBlockHeight: some(params.assumeValidBlockHash),
+      activeHashAtAssumeValidHeight: some(params.assumeValidBlockHash),
+      bestHeaderHeight: params.assumeValidHeight + 10_000'i32,
+      bestHeaderChainWork: hexToBytes32(
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    )
+    check shouldSkipScripts(ctx, params) == ssrSkip
+
+  test "regression-850846e: exactly at assumeValidHeight=938343 with WRONG hash => verify":
+    # Same height but a different block (e.g. an orphan at 938343) — must not skip.
+    let params = mainnetParams()
+    let wrongHash = BlockHash(hexToBytes32(
+      "0000000000000000000a5cbf333333333333333333333333333333333333abcd"))
+    let ctx = AssumeValidContext(
+      blockHash: wrongHash,
+      blockHeight: params.assumeValidHeight,
+      assumeValidHeight: params.assumeValidHeight,
+      activeHashAtBlockHeight: some(wrongHash),
+      activeHashAtAssumeValidHeight: some(params.assumeValidBlockHash),
+      bestHeaderHeight: params.assumeValidHeight + 10_000'i32,
+      bestHeaderChainWork: hexToBytes32(
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    )
+    # activeHashAtAssumeValidHeight == assumeValidBlockHash, but block hash
+    # at its height doesn't match itself via the active-index lookup.  Here
+    # we simulate a fork: the block IS at height 938343 but is not the
+    # assumevalid block.  activeHashAtBlockHeight returns the block's own
+    # hash (it's in the fork branch of the index), so the
+    # "activeHashAtBlockHeight == ctx.blockHash" check passes, but then
+    # the activeHashAtAssumeValidHeight is from a different chain.  To
+    # simulate this properly, set activeHashAtAssumeValidHeight to wrongHash
+    # (what the fork's index would say at 938343).
+    var forkCtx = ctx
+    forkCtx.activeHashAtAssumeValidHeight = some(wrongHash)
+    check shouldSkipScripts(forkCtx, params) == ssrNotAncestorOfAssumeValid

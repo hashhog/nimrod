@@ -62,14 +62,21 @@ type AssumeValidContext* = object
   blockHash*: BlockHash
   ## Height of the block being connected.
   blockHeight*: int32
-  ## Hash reported by the active chain at blockHeight (getBlockHashByHeight).
-  ## If none, the block is not yet on the active chain — scripts must verify.
+  ## Hash recorded in the block INDEX at blockHeight (header chain / pindex).
+  ## NOT the active chain — Bitcoin Core's GetAncestor walks block-index
+  ## pointers and does not require the ancestor to be on the active chain,
+  ## which is essential during IBD where headers reach assumeValidHeight
+  ## long before the active chain does.  If none, the header chain has not
+  ## covered this height and we cannot confirm the ancestor relation.
   activeHashAtBlockHeight*: Option[BlockHash]
   ## Height of the assumevalid block (from params.assumeValidHeight,
   ## or obtained from the block index when the hash is found).
   assumeValidHeight*: int32
-  ## Hash at assumeValidHeight on the active chain (getBlockHashByHeight).
-  ## If none, we haven't seen that part of the chain — scripts must verify.
+  ## Hash recorded in the block INDEX at assumeValidHeight.  Again, this is
+  ## a header-chain / pindex lookup, NOT an active-chain lookup.  If none,
+  ## we have not header-synced to assumeValidHeight yet — scripts must
+  ## verify.  If some but != params.assumeValidBlockHash, we are on a fork
+  ## that does not include the hardcoded assumevalid hash.
   activeHashAtAssumeValidHeight*: Option[BlockHash]
   ## Best-header chain tip height.
   bestHeaderHeight*: int32
