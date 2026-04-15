@@ -102,6 +102,9 @@ type
     # expensive column-family flushes on every state transition.
     ibdBlocksSinceLastDiskFlush*: int
     ibdDiskFlushInterval*: int   ## Configurable via --ibd-flush-interval (default 2000)
+    # In-memory height->hash for blocks not yet flushed to RocksDB during IBD.
+    # getBlockHashByHeight reads from RocksDB; this map covers the unflushed window.
+    ibdHeightToHash*: Table[int32, BlockHash]
 
   ## Result type for chainstate operations
   ChainStateResult*[T] = object
@@ -307,6 +310,15 @@ proc getBlockByHeight*(cdb: ChainDb, height: int32): Option[Block] =
     return cdb.getBlock(hashOpt.get())
   none(Block)
 
+proc getBlockHashByHeight*(cs: ChainState, height: int32): Option[BlockHash] =
+  ## Get block hash at given height, checking the IBD in-memory map first.
+  ## During IBD, blocks are batched and only written to RocksDB every 2000
+  ## blocks. This proc covers the unflushed window so that getblockhash is
+  ## never "out of range" for heights that are already connected.
+  if cs.ibdMode and height in cs.ibdHeightToHash:
+    return some(cs.ibdHeightToHash[height])
+  cs.db.getBlockHashByHeight(height)
+
 # UTXO operations (ChainDb - low level)
 
 proc putUtxo*(cdb: ChainDb, outpoint: OutPoint, entry: UtxoEntry) =
@@ -412,7 +424,8 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     ibdMode: false,
     ibdDeletedUtxos: initTable[string, bool](),
     ibdBlocksSinceLastDiskFlush: 0,
-    ibdDiskFlushInterval: IbdBatchFlushInterval  # default: flush to disk every 2000 blocks
+    ibdDiskFlushInterval: IbdBatchFlushInterval,  # default: flush to disk every 2000 blocks
+    ibdHeightToHash: initTable[int32, BlockHash]()
   )
 
   # Load total work from DB if available
@@ -742,6 +755,8 @@ proc flushIBDBatch*(cs: var ChainState) =
     cs.ibdBatch.clear()
     cs.ibdBatchBlocks = 0
     cs.ibdDeletedUtxos.clear()
+    # Height->hash entries are now in RocksDB; clear the in-memory shadow.
+    cs.ibdHeightToHash.clear()
 
     # Update ChainDb in-memory state
     cs.db.bestBlockHash = cs.bestBlockHash
@@ -859,6 +874,10 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
   )
   cs.ibdBatch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
   cs.ibdBatch.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](blockHash)))
+
+  # Track in the in-memory map so getBlockHashByHeight can serve this height
+  # before the batch is flushed to RocksDB (which happens every 2000 blocks).
+  cs.ibdHeightToHash[height] = blockHash
 
   # Update in-memory state
   cs.bestBlockHash = blockHash
