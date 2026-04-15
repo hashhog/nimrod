@@ -339,7 +339,9 @@ proc handleGetBlockHash(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing height parameter")
 
   let height = params[0].getInt()
-  let hashOpt = rpc.chainState.db.getBlockHashByHeight(int32(height))
+  # Use ChainState.getBlockHashByHeight which also checks the IBD in-memory map,
+  # covering heights not yet flushed to RocksDB (up to 2000 blocks).
+  let hashOpt = rpc.chainState.getBlockHashByHeight(int32(height))
   if hashOpt.isNone:
     raise newRpcError(RpcInvalidParams, "block height out of range")
 
