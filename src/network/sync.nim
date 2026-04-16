@@ -80,7 +80,7 @@ type
 
 const
   MaxHeadersPerRequest* = 2000
-  MaxBlocksInFlight* = 128
+  MaxBlocksInFlight* = 512
   SyncTimeoutSeconds* = 60
 
   # Block download constants
