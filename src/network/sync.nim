@@ -1128,6 +1128,11 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
     sm.receivedBlocks[int32(blockHeight)] = blk
     trace "buffered out-of-order block", height = blockHeight,
           expectedHeight = expectedHeight, buffered = sm.receivedBlocks.len
+    # Reset sync timer: a valid block arrived, so we ARE making progress even if
+    # it can't connect yet.  Without this reset the 60-second timeout fires
+    # whenever blocks arrive out-of-order (the normal case with 9 parallel peers),
+    # burning 30s of backoff per timeout and throttling throughput at 900k+.
+    sm.lastSyncTime = getTime()
     # Don't decrement pendingBlocks here - it will be decremented when
     # the block is actually processed from the buffer in drainBlockBuffer
     return true  # Successfully received, just not yet applied
