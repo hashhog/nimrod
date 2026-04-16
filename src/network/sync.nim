@@ -1166,6 +1166,7 @@ proc syncLoop*(sm: SyncManager) {.async.} =
   ## Main sync loop
   sm.maxBlockRetries = 3  # Skip script verification after 3 failures on same block
   var consecutiveTimeouts = 0
+  var lastTimeoutHeight = sm.chainTipHeight  # Track height at last timeout to detect progress
 
   while true:
     let peer = sm.selectSyncPeer()
@@ -1248,6 +1249,12 @@ proc syncLoop*(sm: SyncManager) {.async.} =
     # Timeout handling (skip when already synced — no activity expected)
     if sm.state != ssSynced and
        getTime() - sm.lastSyncTime > initDuration(seconds = SyncTimeoutSeconds):
+      # If the chain tip advanced since the last timeout, we are making real
+      # progress — the timeout is hitting a stalled peer, not a true sync stall.
+      # Reset the counter so backoff stays at 2s instead of compounding toward 30s.
+      if sm.chainTipHeight > lastTimeoutHeight:
+        consecutiveTimeouts = 0
+      lastTimeoutHeight = sm.chainTipHeight
       consecutiveTimeouts += 1
       warn "sync timeout, resetting", state = $sm.state,
            chainTipHeight = sm.chainTipHeight,
