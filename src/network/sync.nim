@@ -1039,7 +1039,12 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
   # Use IBD fast path when catching up (skips undo data, batches writes)
   if sm.chainState != nil:
     let blocksRemaining = sm.headerTipHeight - height
-    let isIBD = blocksRemaining > 1000
+    # Use IBD fast path whenever more than a handful of blocks behind.
+    # The old threshold of 1000 caused normal-sync (inv-based, ~1000 blk/hr)
+    # to handle mid-size catch-up scenarios (e.g., after restart with gap
+    # < 1000) instead of the much faster IBD batch mode (~2000-5000 blk/hr).
+    # See wave31-2026-04-16/CAMLCOIN-NIMROD-GRADUATION.md Bug #3.
+    let isIBD = blocksRemaining > 10
 
     # Enter IBD mode if catching up and not already in IBD
     if isIBD and not sm.chainState.ibdMode:
