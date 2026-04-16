@@ -455,6 +455,12 @@ proc setupSignalHandlers*() =
     if globalNodeState != nil:
       globalNodeState.running = false
 
+      # If in IBD mode, flush the write batch before closing (WAL is disabled
+      # during IBD so unflushed blocks are not durable until stopIBD is called)
+      if globalNodeState.chainState != nil and globalNodeState.chainState.ibdMode:
+        info "flushing IBD batch before shutdown"
+        globalNodeState.chainState.stopIBD()
+
       # Flush UTXO cache
       if globalNodeState.chainState != nil:
         info "flushing UTXO cache"
