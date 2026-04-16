@@ -144,8 +144,8 @@ proc mainnetParams*(): ConsensusParams =
   result.powTargetSpacing = 600  # 10 minutes
   result.difficultyAdjustmentInterval = 2016
   # Skip script verification below this height during IBD
-  # (Bitcoin Core's default assume-valid block at height 938343)
-  result.assumeValidHeight = 938_343
+  # Updated W29: 944000 verified by 7-node consensus diff + hotbuns clean 944853 passage
+  result.assumeValidHeight = 944_000
   # PoW rules: mainnet does normal retargeting
   result.powAllowMinDifficultyBlocks = false
   result.powNoRetargeting = false
@@ -164,7 +164,7 @@ proc mainnetParams*(): ConsensusParams =
   )
   # defaultAssumeValid: block hash up to which scripts are assumed valid
   result.assumeValidBlockHash = BlockHash(hexToBytes32(
-    "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"  # 938343
+    "00000000000000000000d3fe741f903e19e548e7639ac89bc4461a0a84ed3bfd"  # 944000
   ))
   # Well-known mainnet checkpoints (height -> hash)
   # These prevent long-range attacks by rejecting forks below these heights
