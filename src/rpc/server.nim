@@ -334,6 +334,41 @@ proc handleGetBlockCount(rpc: RpcServer): JsonNode =
 proc handleGetBestBlockHash(rpc: RpcServer): JsonNode =
   %reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash)))
 
+proc handleGetSyncState(rpc: RpcServer): JsonNode =
+  ## hashhog W70: uniform fleet-wide sync-state report.
+  ## Spec: meta-repo `spec/getsyncstate.md`.
+  let tipHeight = rpc.chainState.bestHeight
+  let tipHash = reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash)))
+  let isIbd = tipHeight < 100
+  let numPeers = if rpc.peerManager != nil:
+    rpc.peerManager.connectedPeerCount().uint32
+  else:
+    0'u32
+  let progress = if tipHeight < 100:
+    float64(tipHeight) / 100.0
+  else:
+    1.0
+  let chainName = case rpc.params.network
+    of Mainnet: "main"
+    of Testnet3: "test"
+    of Testnet4: "testnet4"
+    of Regtest: "regtest"
+    of Signet: "signet"
+  %*{
+    "tip_height": tipHeight,
+    "tip_hash": tipHash,
+    "best_header_height": tipHeight,
+    "best_header_hash": tipHash,
+    "initial_block_download": isIbd,
+    "num_peers": numPeers,
+    "verification_progress": progress,
+    "blocks_in_flight": newJNull(),
+    "blocks_pending_connect": newJNull(),
+    "last_block_received_time": newJNull(),
+    "chain": chainName,
+    "protocol_version": 70016,
+  }
+
 proc handleGetBlockHash(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing height parameter")
@@ -3754,6 +3789,8 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
     rpc.handleGetBlockCount()
   of "getbestblockhash":
     rpc.handleGetBestBlockHash()
+  of "getsyncstate":
+    rpc.handleGetSyncState()
   of "getblockhash":
     rpc.handleGetBlockHash(params)
   of "getblockheader":
