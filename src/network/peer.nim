@@ -85,6 +85,7 @@ type
     bytesSent*: uint64
     bytesRecv*: uint64
     relay*: bool                 # Relay flag from version message
+    timeOffset*: int64           # peer_version_timestamp - our_time_at_receipt (seconds)
     # Network params
     params*: ConsensusParams
     networkMagic*: array[4, byte]
@@ -397,6 +398,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     peer.userAgent = versionData.userAgent
     peer.startHeight = versionData.startHeight
     peer.relay = versionData.relay
+    peer.timeOffset = versionData.timestamp - getTime().toUnix()
     peer.versionReceived = true
     peer.remoteNonce = versionData.nonce
 
@@ -472,6 +474,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     peer.userAgent = versionData.userAgent
     peer.startHeight = versionData.startHeight
     peer.relay = versionData.relay
+    peer.timeOffset = versionData.timestamp - getTime().toUnix()
     peer.versionReceived = true
     peer.remoteNonce = versionData.nonce
 
@@ -555,6 +558,7 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     peer.userAgent = msg.version.userAgent
     peer.startHeight = msg.version.startHeight
     peer.relay = msg.version.relay
+    peer.timeOffset = msg.version.timestamp - getTime().toUnix()
     info "received version", peer = $peer, version = msg.version.version,
          height = msg.version.startHeight
     await peer.sendVerack()
