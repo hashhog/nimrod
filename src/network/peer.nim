@@ -81,6 +81,10 @@ type
     lastPing*: stdtimes.Time
     pingNonce*: uint64
     latencyMs*: int
+    # Per-peer I/O counters (for getpeerinfo)
+    bytesSent*: uint64
+    bytesRecv*: uint64
+    relay*: bool                 # Relay flag from version message
     # Network params
     params*: ConsensusParams
     networkMagic*: array[4, byte]
@@ -230,6 +234,7 @@ proc sendMessage*(peer: Peer, msg: P2PMessage) {.async.} =
   if written != data.len:
     raise newException(PeerError, "failed to send complete message")
 
+  peer.bytesSent += uint64(data.len)
   trace "sent message", peer = $peer, kind = msg.kind, size = data.len - 24
 
 proc readMessage*(peer: Peer): Future[P2PMessage] {.async.} =
@@ -274,6 +279,7 @@ proc readMessage*(peer: Peer): Future[P2PMessage] {.async.} =
 
   # Remove processed message from buffer
   peer.recvBuffer = peer.recvBuffer[totalSize .. ^1]
+  peer.bytesRecv += uint64(totalSize)
   peer.lastSeen = stdtimes.getTime()
 
   let command = bytesToCommand(header.command)
@@ -390,6 +396,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     peer.services = versionData.services
     peer.userAgent = versionData.userAgent
     peer.startHeight = versionData.startHeight
+    peer.relay = versionData.relay
     peer.versionReceived = true
     peer.remoteNonce = versionData.nonce
 
@@ -464,6 +471,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     peer.services = versionData.services
     peer.userAgent = versionData.userAgent
     peer.startHeight = versionData.startHeight
+    peer.relay = versionData.relay
     peer.versionReceived = true
     peer.remoteNonce = versionData.nonce
 
@@ -546,6 +554,7 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     peer.services = msg.version.services
     peer.userAgent = msg.version.userAgent
     peer.startHeight = msg.version.startHeight
+    peer.relay = msg.version.relay
     info "received version", peer = $peer, version = msg.version.version,
          height = msg.version.startHeight
     await peer.sendVerack()
