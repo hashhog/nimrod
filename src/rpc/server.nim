@@ -1678,7 +1678,7 @@ proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
         "bytessent": peer.bytesSent,
         "bytesrecv": peer.bytesRecv,
         "conntime": connTime,
-        "timeoffset": 0,
+        "timeoffset": peer.timeOffset,
         "pingtime": pingTime,
         "minping": pingTime,
         "version": peer.version,
