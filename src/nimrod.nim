@@ -407,9 +407,9 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
         if not state.mempool.contains(txid) and txid notin state.recentlyRejected:
           txInvs.add(InvVector(invType: invWitnessTx, hash: item.hash))
     if blockInvs.len > 0:
-      asyncSpawn peer.sendGetData(blockInvs)
+      asyncSpawn spawnSafe(peer.sendGetData(blockInvs))
     if txInvs.len > 0:
-      asyncSpawn peer.sendGetData(txInvs)
+      asyncSpawn spawnSafe(peer.sendGetData(txInvs))
 
   of mkGetData:
     # Handle data requests - serve blocks and transactions to peers
