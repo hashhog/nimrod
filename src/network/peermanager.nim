@@ -371,7 +371,7 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
       # BIP133: Send initial feefilter after handshake
       # 100 sat/vbyte = 100,000 sat/kvB to discourage tx relay during sync
       let feeMsg = newFeeFilter(100_000'u64)
-      asyncSpawn peer.sendMessage(feeMsg)
+      asyncSpawn spawnSafe(peer.sendMessage(feeMsg))
 
       return true
     except CatchableError as e:
@@ -591,7 +591,7 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
 
     # BIP133: Send initial feefilter after handshake
     let feeMsg = newFeeFilter(100_000'u64)
-    asyncSpawn peer.sendMessage(feeMsg)
+    asyncSpawn spawnSafe(peer.sendMessage(feeMsg))
   except CatchableError as e:
     error "inbound handshake failed", peer = $peer, error = e.msg
     await peer.disconnect()
@@ -870,7 +870,7 @@ proc relayAddresses(pm: PeerManager, source: Peer) =
       ))
     let msg = newAddr(timestamped)
     for i in 0..<n:
-      asyncSpawn candidates[i].sendMessage(msg)
+      asyncSpawn spawnSafe(candidates[i].sendMessage(msg))
 
 proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage) =
   ## Process addr/addrv2/getaddr/feefilter messages internally.

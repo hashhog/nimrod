@@ -226,17 +226,49 @@ proc disconnect*(peer: Peer, reason: string = "") {.async.} =
     info "disconnected from peer", peer = $peer
 
 proc sendMessage*(peer: Peer, msg: P2PMessage) {.async.} =
-  ## Send a P2P message to the peer
+  ## Send a P2P message to the peer.
+  ##
+  ## Raises only PeerError on failure. Chronos transport errors
+  ## (TransportUseClosedError, TransportIncompleteError, OSError on a
+  ## torn-down socket) are caught and re-raised as PeerError so callers
+  ## have a single catch type, and so spawned writers (asyncSpawn at the
+  ## inv handler in nimrod.nim and the addr broadcast in peermanager.nim)
+  ## don't promote a transport race into a process-killing FutureDefect.
+  ## Reference: 2026-04-25 nimrod crash post-tip when peer
+  ## 139.162.155.229 closed mid-getdata-write.
   if not peer.isConnected():
     raise newException(PeerError, "not connected")
 
   let data = serializeMessage(peer.networkMagic, msg)
-  let written = await peer.transport.write(data)
+
+  var written: int
+  try:
+    written = await peer.transport.write(data)
+  except CatchableError as e:
+    raise newException(PeerError, "transport write failed: " & e.msg)
+
   if written != data.len:
     raise newException(PeerError, "failed to send complete message")
 
   peer.bytesSent += uint64(data.len)
   trace "sent message", peer = $peer, kind = msg.kind, size = data.len - 24
+
+proc spawnSafe*(fut: Future[void]) {.async.} =
+  ## Wrapper for asyncSpawn'd peer operations. Awaits the inner future
+  ## and swallows any CatchableError so a transport/peer error does not
+  ## escape an unhandled async future and crash the runtime with a
+  ## FutureDefect. Pair with `asyncSpawn`:
+  ##
+  ##   asyncSpawn spawnSafe(peer.sendGetData(invs))
+  ##
+  ## The inner peer-op is expected to log its own context (sendMessage
+  ## logs "sent message" on success); on failure we log at debug level
+  ## since the message-loop catch path will see and report the
+  ## subsequent disconnect.
+  try:
+    await fut
+  except CatchableError as e:
+    debug "spawned peer op failed", error = e.msg
 
 proc readMessage*(peer: Peer): Future[P2PMessage] {.async.} =
   ## Read a complete message from the peer
