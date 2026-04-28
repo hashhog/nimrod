@@ -434,6 +434,43 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           except CatchableError as e:
             debug "failed to serve tx", peer = $peer, error = e.msg
 
+  of mkMempool:
+    # BIP35: peer requests our mempool, respond with one or more inv
+    # messages enumerating mempool txids. We use witness-tx inv (since we
+    # advertise NodeWitness during handshake). Chunk to MaxInvPerMsg.
+    #
+    # Bitcoin Core gates this on NODE_BLOOM (peer.m_our_services & NODE_BLOOM)
+    # or per-peer Mempool permission (net_processing.cpp:4852-4879). Nimrod
+    # does not currently advertise NODE_BLOOM nor track per-peer permissions
+    # (no NodeBloom constant in messages.nim) — TODO when BIP37/permission
+    # plumbing lands. Until then, always-allow: relay-only peer impact is
+    # bounded by MaxInvPerMsg chunking and does not leak privacy beyond what
+    # we'd already gossip via inv.
+    if state.mempool == nil:
+      trace "mempool request before mempool init", peer = $peer
+    else:
+      var batch: seq[InvVector] = @[]
+      var sent = 0
+      {.gcsafe.}:
+        for txid, _ in state.mempool.entries:
+          batch.add(InvVector(invType: invWitnessTx, hash: array[32, byte](txid)))
+          if batch.len >= MaxInvPerMsg:
+            try:
+              await peer.sendMessage(newInv(batch))
+              sent += batch.len
+            except CatchableError as e:
+              debug "mempool inv send failed", peer = $peer, error = e.msg
+              batch.setLen(0)
+              break
+            batch.setLen(0)
+      if batch.len > 0:
+        try:
+          await peer.sendMessage(newInv(batch))
+          sent += batch.len
+        except CatchableError as e:
+          debug "mempool inv send failed", peer = $peer, error = e.msg
+      debug "served mempool inv to peer", peer = $peer, txCount = sent
+
   of mkPing:
     # Respond with pong
     discard

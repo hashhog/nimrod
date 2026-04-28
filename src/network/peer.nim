@@ -635,6 +635,12 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
   of mkGetData:
     discard  # TODO: respond with block/tx
 
+  of mkMempool:
+    # BIP35: real handler lives in nimrod.handleMessage which has access
+    # to NodeState.mempool. This trace is the peer-loop's record; the
+    # PeerCallback in nimrod.nim performs the inv flush.
+    trace "received mempool", peer = $peer
+
   of mkNotFound:
     trace "received notfound", peer = $peer, count = msg.notFound.len
 

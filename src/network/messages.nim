@@ -125,6 +125,7 @@ type
     mkGetBlockTxn
     mkBlockTxn
     mkSendPackages
+    mkMempool
     # BIP330 Erlay messages
     mkSendTxRcncl
     mkReqRecon
@@ -136,7 +137,7 @@ type
     case kind*: MessageKind
     of mkVersion:
       version*: VersionMsg
-    of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2, mkSendPackages, mkReqSketchExt:
+    of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2, mkSendPackages, mkReqSketchExt, mkMempool:
       discard
     of mkPing:
       pingNonce*: uint64
@@ -363,7 +364,7 @@ proc serializePayload*(msg: P2PMessage): seq[byte] =
   case msg.kind
   of mkVersion:
     w.writeVersionMsg(msg.version)
-  of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2, mkSendPackages:
+  of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2, mkSendPackages, mkMempool:
     discard  # Empty payload
   of mkPing:
     w.writeUint64LE(msg.pingNonce)
@@ -458,6 +459,7 @@ proc messageKindToCommand*(kind: MessageKind): string =
   of mkGetBlockTxn: "getblocktxn"
   of mkBlockTxn: "blocktxn"
   of mkSendPackages: "sendpackages"
+  of mkMempool: "mempool"
   # BIP330 Erlay
   of mkSendTxRcncl: "sendtxrcncl"
   of mkReqRecon: "reqrecon"
@@ -492,6 +494,7 @@ proc commandToMessageKind*(cmd: string): MessageKind =
   of "getblocktxn": mkGetBlockTxn
   of "blocktxn": mkBlockTxn
   of "sendpackages": mkSendPackages
+  of "mempool": mkMempool
   # BIP330 Erlay
   of "sendtxrcncl": mkSendTxRcncl
   of "reqrecon": mkReqRecon
@@ -634,6 +637,9 @@ proc deserializePayload*(cmd: string, payload: seq[byte]): P2PMessage =
     result = P2PMessage(kind: mkBlockTxn, blockTxn: r.readBlockTxnResponse())
   of "sendpackages":
     result = P2PMessage(kind: mkSendPackages)
+  of "mempool":
+    # BIP35: empty body, peer is requesting our mempool inv
+    result = P2PMessage(kind: mkMempool)
   # BIP330 Erlay
   of "sendtxrcncl":
     result = P2PMessage(kind: mkSendTxRcncl, sendTxRcncl: SendTxRcnclMsg(
@@ -736,6 +742,13 @@ proc newFeeFilter*(feeRate: uint64): P2PMessage =
 
 proc newWtxidRelay*(): P2PMessage =
   P2PMessage(kind: mkWtxidRelay)
+
+proc newMempoolReq*(): P2PMessage =
+  ## BIP35 mempool request (empty body). The handler is on the *server*
+  ## side: when we receive this we send back inv messages enumerating
+  ## our mempool. We never originate this currently, but expose the
+  ## constructor for tests and future symmetry.
+  P2PMessage(kind: mkMempool)
 
 proc newSendAddrV2*(): P2PMessage =
   P2PMessage(kind: mkSendAddrV2)
