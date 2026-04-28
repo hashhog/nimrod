@@ -193,6 +193,16 @@ suite "empty payload messages":
     let decoded = deserializePayload("sendaddrv2", payload)
     check decoded.kind == mkSendAddrV2
 
+  test "mempool round-trip (BIP35)":
+    let msg = newMempoolReq()
+    let payload = serializePayload(msg)
+    check payload.len == 0
+    let decoded = deserializePayload("mempool", payload)
+    check decoded.kind == mkMempool
+    # Command name round-trip
+    check messageKindToCommand(mkMempool) == "mempool"
+    check commandToMessageKind("mempool") == mkMempool
+
 suite "ping/pong":
   test "ping round-trip":
     let msg = newPing(0xDEADBEEFCAFEBABE'u64)
