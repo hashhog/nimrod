@@ -265,6 +265,73 @@ suite "BIP-324 cipher session roundtrip":
     check decoded.command == "xenophobia"
     check bytesToHex(decoded.payload) == bytesToHex(payload)
 
+  test "v2 message envelope long-form for version (BIP-324 spec)":
+    # Regression for the nimrod→haskoin TCP-reject bug:
+    # `version` was previously mapped to short-ID 0x00 (the long-form
+    # indicator) with no command-name bytes, which broke strict
+    # decoders.  Per BIP-324 spec + Bitcoin Core net.cpp:919-954,
+    # `version` MUST be sent via the long form: `0x00 || cmd[12] ||
+    # payload`, with cmd = "version" + 5 NULs.
+    let payload = @[byte(0xc0), byte(0xff), byte(0xee)]
+    let encoded = encodeV2Message("version", payload)
+    check encoded.len == 1 + 12 + payload.len
+    check encoded[0] == 0x00'u8
+    # Verify the 12-byte command field: "version" ASCII + 5 NULs.
+    check encoded[1] == byte('v')
+    check encoded[2] == byte('e')
+    check encoded[3] == byte('r')
+    check encoded[4] == byte('s')
+    check encoded[5] == byte('i')
+    check encoded[6] == byte('o')
+    check encoded[7] == byte('n')
+    for i in 8..12:
+      check encoded[i] == 0x00'u8
+    let decoded = decodeV2Message(encoded)
+    check decoded.command == "version"
+    check bytesToHex(decoded.payload) == bytesToHex(payload)
+
+  test "v2 message envelope long-form for reserved-band commands":
+    # The other 5 commands BIP-324 reserves via long-form (verack,
+    # getaddr, wtxidrelay, sendaddrv2, sendheaders).  Same wire layout
+    # as `version` — the encoder MUST NOT emit a short-ID in 0x1d..0x22.
+    let payload = @[byte(0xab), byte(0xcd)]
+    for cmd in ["verack", "getaddr", "wtxidrelay",
+                "sendaddrv2", "sendheaders"]:
+      let encoded = encodeV2Message(cmd, payload)
+      check encoded.len == 1 + 12 + payload.len
+      check encoded[0] == 0x00'u8
+      # Command ASCII bytes appear at offsets 1..cmd.len.
+      for i in 0..<cmd.len:
+        check encoded[1 + i] == byte(cmd[i])
+      # Remaining cmd-name slots NUL-padded.
+      for i in cmd.len..<12:
+        check encoded[1 + i] == 0x00'u8
+      let decoded = decodeV2Message(encoded)
+      check decoded.command == cmd
+      check bytesToHex(decoded.payload) == bytesToHex(payload)
+
+  test "v2 message envelope decodes de-facto extended short IDs":
+    # Cross-impl interop: blockbrew/beamchain/ouroboros emit short-IDs
+    # 0x1d..0x22 for version etc. (haskoin/Network.hs:5527-5535).
+    # nimrod encodes via long form (above) but accepts these on input.
+    let payload = @[byte(0x11), byte(0x22)]
+    let cases = {
+      0x1d'u8: "wtxidrelay",
+      0x1e'u8: "sendaddrv2",
+      0x1f'u8: "sendheaders",
+      0x20'u8: "version",
+      0x21'u8: "verack",
+      0x22'u8: "getaddr",
+    }
+    for (id, cmd) in cases:
+      var wire = newSeq[byte](1 + payload.len)
+      wire[0] = id
+      for i, b in payload:
+        wire[1 + i] = b
+      let decoded = decodeV2Message(wire)
+      check decoded.command == cmd
+      check bytesToHex(decoded.payload) == bytesToHex(payload)
+
 # ============================================================================
 # Outbound BIP-324 v2 (initiator) — env-var gate, fallback cache, end-to-end
 # ============================================================================
