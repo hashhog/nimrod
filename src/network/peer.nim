@@ -2,7 +2,7 @@
 ## TCP connection with message framing, version handshake, and ping/pong
 ## Uses chronos for async networking
 
-import std/[strformat, random, hashes, tables]
+import std/[strformat, random, hashes, tables, os, strutils]
 import std/times as stdtimes
 import chronos
 import chronos/timer as ctimer
@@ -77,6 +77,11 @@ type
     # decrypt through `v2Cipher`; the v1 24-byte header is skipped.
     transportProto*: TransportProtocol
     v2Cipher*: BIP324Cipher
+    # BIP-324 outbound: when true, performHandshake skips the v2 probe
+    # even if `bip324V2OutboundEnabled()` returns true.  PeerManager sets
+    # this when the address is in the v1-only fallback set, so we don't
+    # waste a connection retrying v2 on a known v1-only peer.
+    v2OutboundDisabled*: bool
     # Peer info from version message
     version*: uint32
     services*: uint64
@@ -694,6 +699,196 @@ proc performV2HandshakeResponder*(peer: Peer) {.async.} =
   peer.transportProto = tpV2
   info "BIP-324 v2 handshake complete (responder)", peer = $peer
 
+proc bip324V2OutboundEnabled*(): bool =
+  ## Gate for the BIP-324 v2 outbound probe.  Default OFF — opt-in via
+  ## `NIMROD_BIP324_V2_OUTBOUND=1` (or "true").  Anything else (unset,
+  ## "0", "false") keeps outbound v1-only, matching the pre-W90 behaviour.
+  ## We're conservative on outbound because (a) sending v2 garbage on a
+  ## fresh socket is destructive on a v1-only peer (we can't reuse the
+  ## socket on fallback), and (b) cross-impl interop has only been
+  ## verified for the inbound responder side so far.  Mirrors clearbit's
+  ## CLEARBIT_BIP324_V2 env var (peer.zig:653) but DEFAULTS OFF.
+  let v = getEnv("NIMROD_BIP324_V2_OUTBOUND", "")
+  if v.len == 0:
+    return false
+  let lv = v.toLowerAscii()
+  lv == "1" or lv == "true" or lv == "yes" or lv == "on"
+
+proc performV2HandshakeInitiator*(peer: Peer) {.async.} =
+  ## Drive the BIP-324 v2 handshake in INITIATOR mode on a freshly
+  ## connected outbound socket.  Symmetric counterpart of
+  ## `performV2HandshakeResponder`: this side sends the 64-byte
+  ## ElligatorSwift pubkey + garbage FIRST, then reads the peer's
+  ## pubkey, garbage, garbage_terminator, and version-packet (consuming
+  ## any decoys that precede it).  On exit, `peer.transportProto = tpV2`
+  ## and `peer.v2Cipher` is initialised + has consumed both our and
+  ## their version-packets, so subsequent sendMessage / readMessage
+  ## calls run AEAD-encrypted.
+  ##
+  ## Wire layout (initiator side, per BIP-324 §"Wire format" and
+  ## bitcoin-core/src/net.cpp V2Transport):
+  ##
+  ##     ->  64 bytes ElligatorSwift pubkey || sent_garbage (0..32)
+  ##     ->  send_garbage_terminator (16) || version-packet
+  ##         (AAD = our_garbage; subsequent AAD empty)
+  ##     <-  64 bytes ElligatorSwift pubkey || recv_garbage (0..MAX_GARBAGE_LEN)
+  ##     <-  recv_garbage_terminator (16) || decoy*+version-packet
+  ##         (first AEAD AAD = recv_garbage; subsequent AAD empty)
+  ##
+  ## Reference: clearbit/src/peer.zig::performV2Handshake (initiator
+  ## branch via V2Transport state machine), this file's
+  ## `performV2HandshakeResponder` (byte-equivalent under the role swap).
+  ## Caller is responsible for bounding the future via
+  ## `withTimeout(V2HandshakeTimeoutSec)`.
+  doAssert peer.direction == pdOutbound,
+    "performV2HandshakeInitiator must run on an outbound peer"
+  doAssert peer.recvBuffer.len == 0,
+    "initiator handshake expects an empty recvBuffer (fresh socket)"
+
+  # 1. Build our cipher in initiator mode.  We pass a placeholder for
+  #    theirPubKey first to generate our keys; ECDH+HKDF must wait until
+  #    we receive the peer's pubkey, so we re-initialise after step 3.
+  #    Instead of placeholder/re-init, follow the responder's pattern:
+  #    construct the cipher (which also creates our pubkey), send pubkey
+  #    + garbage, THEN receive their pubkey and call initialize().
+  peer.v2Cipher = newBIP324Cipher()
+
+  # 2. Generate small random garbage (0..32 bytes) and send our 64-byte
+  #    ElligatorSwift pubkey + garbage in one write.  Per BIP-324, the
+  #    initiator's garbage upper bound is MaxGarbageLen, but a small
+  #    bound keeps wire-overhead low while still exercising the
+  #    AAD-binding path.
+  randomize()
+  let ourGarbageLen = rand(32)
+  var ourGarbage = newSeq[byte](ourGarbageLen)
+  for i in 0 ..< ourGarbageLen:
+    ourGarbage[i] = byte(rand(255))
+
+  let ourPubKey = peer.v2Cipher.getOurPubKey()
+  var keyAndGarbage = newSeq[byte](EllSwiftPubKeySize + ourGarbageLen)
+  for i in 0 ..< EllSwiftPubKeySize:
+    keyAndGarbage[i] = ourPubKey[i]
+  for i in 0 ..< ourGarbageLen:
+    keyAndGarbage[EllSwiftPubKeySize + i] = ourGarbage[i]
+  try:
+    let written = await peer.transport.write(keyAndGarbage)
+    if written != keyAndGarbage.len:
+      raise newException(PeerError, "v2 short write of pubkey+garbage")
+  except CatchableError as e:
+    raise newException(PeerError, "v2 transport write failed (pubkey): " & e.msg)
+  peer.bytesSent += uint64(keyAndGarbage.len)
+
+  # 3. Read the peer's 64-byte ElligatorSwift pubkey.  BEFORE we read,
+  #    paranoid v1-magic check: if the peer ignored our garbage and
+  #    sent back a v1 VERSION header, treat that as a v2-failure
+  #    signal (don't attempt to decrypt).  We can detect this because
+  #    a v1 VERSION header starts with the network magic, while the
+  #    peer's ellswift pubkey is uniformly random (false-positive rate
+  #    2^-128).
+  await peer.fillRecvBuffer(V1PrefixLen)
+  let prefix = peer.recvBuffer[0 ..< V1PrefixLen]
+  if checkV1MagicBytes(prefix, peer.networkMagic):
+    raise newException(PeerError,
+      "v2 outbound: peer responded with v1 VERSION (no v2 support)")
+
+  await peer.fillRecvBuffer(EllSwiftPubKeySize)
+  let theirPubKeyBytes = peer.takeFromRecvBuffer(EllSwiftPubKeySize)
+  var theirPubKey: EllSwiftPubKey
+  for i in 0 ..< EllSwiftPubKeySize:
+    theirPubKey[i] = theirPubKeyBytes[i]
+
+  # 4. ECDH + HKDF derives the send/recv key pairs and the garbage
+  #    terminators.  initiator=true ensures we use initiator_L /
+  #    initiator_P for sending and responder_L / responder_P for
+  #    receiving, matching the BIP-324 role table.
+  peer.v2Cipher.initialize(theirPubKey, initiator = true,
+                           magic = peer.networkMagic)
+
+  # 5. Send our garbage terminator + version packet.  AAD on the
+  #    version packet binds the garbage we just sent; the peer will
+  #    fail decryption if a MITM mutated our garbage.
+  let sendTerm = peer.v2Cipher.getSendGarbageTerminator()
+  let versionPacket = peer.v2Cipher.encrypt(@[], aad = ourGarbage)
+  var termAndVer = newSeq[byte](GarbageTerminatorLen + versionPacket.len)
+  for i in 0 ..< GarbageTerminatorLen:
+    termAndVer[i] = sendTerm[i]
+  for i in 0 ..< versionPacket.len:
+    termAndVer[GarbageTerminatorLen + i] = versionPacket[i]
+  try:
+    let written = await peer.transport.write(termAndVer)
+    if written != termAndVer.len:
+      raise newException(PeerError, "v2 short write of term+version")
+  except CatchableError as e:
+    raise newException(PeerError, "v2 transport write failed (term): " & e.msg)
+  peer.bytesSent += uint64(termAndVer.len)
+
+  # 6. Scan incoming bytes for the recv_garbage_terminator.  Bounded
+  #    at MaxGarbageLen + 16 — absence of the terminator within that
+  #    window is a protocol violation.  Same byte-by-byte slide model
+  #    as the responder (matches Core net.cpp:1297
+  #    ProcessReceivedGarbageBytes).
+  let recvTerm = peer.v2Cipher.getRecvGarbageTerminator()
+  await peer.fillRecvBuffer(GarbageTerminatorLen)
+  var window = peer.takeFromRecvBuffer(GarbageTerminatorLen)
+  var recvGarbage: seq[byte] = @[]
+  block findTerm:
+    while true:
+      var match = true
+      for i in 0 ..< GarbageTerminatorLen:
+        if window[window.len - GarbageTerminatorLen + i] != recvTerm[i]:
+          match = false
+          break
+      if match:
+        if window.len > GarbageTerminatorLen:
+          recvGarbage = window[0 ..< (window.len - GarbageTerminatorLen)]
+        break findTerm
+      if window.len >= MaxGarbageLen + GarbageTerminatorLen:
+        raise newException(PeerError,
+          "v2 recv_garbage_terminator not seen within " & $MaxGarbageLen & " bytes")
+      await peer.fillRecvBuffer(1)
+      let nextByte = peer.takeFromRecvBuffer(1)
+      window.add(nextByte[0])
+
+  # 7. Drain incoming AEAD packets until we receive a non-decoy (the
+  #    peer's version-packet).  First decryption uses AAD = recv_garbage;
+  #    all subsequent AAD = empty, even if the first was a decoy
+  #    (matches Core net.cpp:1243 ClearShrink(m_recv_aad)).
+  var nextAad: seq[byte] = recvGarbage
+  let decoyBound = 1024
+  for _ in 0 ..< decoyBound:
+    await peer.fillRecvBuffer(LengthLen)
+    let encLen = peer.takeFromRecvBuffer(LengthLen)
+    var contentsLen: uint32
+    try:
+      contentsLen = peer.v2Cipher.decryptLength(encLen)
+    except BIP324Error as e:
+      raise newException(PeerError, "v2 length decrypt failed: " & e.msg)
+    if contentsLen.int > MaxMessagePayload:
+      raise newException(PeerError,
+        "v2 version-phase packet too large: " & $contentsLen)
+
+    let aeadLen = HeaderLen + contentsLen.int + AEADExpansion
+    await peer.fillRecvBuffer(aeadLen)
+    let aeadPayload = peer.takeFromRecvBuffer(aeadLen)
+    var ignore: bool
+    try:
+      let dec = peer.v2Cipher.decrypt(aeadPayload, aad = nextAad)
+      ignore = dec.ignore
+    except BIP324Error as e:
+      raise newException(PeerError,
+        "v2 version-phase payload decrypt failed: " & e.msg)
+    nextAad = @[]
+    peer.bytesRecv += uint64(LengthLen + aeadLen)
+    if not ignore:
+      break
+  if nextAad.len != 0:
+    raise newException(PeerError,
+      "v2 version-packet not observed within decoy bound")
+
+  # 8. Cipher handshake complete; flip to v2 transport.
+  peer.transportProto = tpV2
+  info "BIP-324 v2 handshake complete (initiator)", peer = $peer
+
 proc performHandshake*(peer: Peer, ourHeight: int32,
                        checkSelfConnect: SelfConnectChecker = nil) {.async.} =
   ## Perform version handshake with peer
@@ -739,7 +934,31 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
         raise v2Fut.error
 
   if peer.direction == pdOutbound:
-    # Send our version first
+    # BIP-324 v2 outbound probe.  Gated behind NIMROD_BIP324_V2_OUTBOUND
+    # (default OFF — see `bip324V2OutboundEnabled` for rationale).  When
+    # enabled, drive the initiator handshake on the fresh socket BEFORE
+    # sending v1 VERSION.  On any failure (timeout, v1-magic detected,
+    # decrypt error) the caller (peermanager) is expected to disconnect,
+    # mark the address v1-only, and reconnect via the v1 path on a fresh
+    # socket — the v2 garbage already on the wire is destructive on a
+    # v1-only peer so we cannot reuse this socket.
+    #
+    # We only attempt v2 when transportProto is still tpV1 (i.e. caller
+    # has not pre-flipped us via some out-of-band mechanism) and the
+    # peermanager hasn't flagged this address v1-only.
+    if peer.transportProto == tpV1 and not peer.v2OutboundDisabled and
+       bip324V2OutboundEnabled():
+      let v2Fut = peer.performV2HandshakeInitiator()
+      if not await v2Fut.withTimeout(ctimer.seconds(V2HandshakeTimeoutSec)):
+        # Cancel the inflight handshake before raising so chronos doesn't
+        # later see a leaked future on the closed socket.
+        await v2Fut.cancelAndWait()
+        raise newException(PeerError, "v2 outbound handshake timeout")
+      if v2Fut.failed:
+        raise v2Fut.error
+
+    # Send our version (v1 unencrypted, OR v2 AEAD-encrypted if the
+    # initiator probe above flipped transportProto = tpV2).
     await peer.sendVersion(ourHeight)
 
     # Wait for their version

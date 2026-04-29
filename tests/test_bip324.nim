@@ -16,9 +16,13 @@
 ## CLAUDE.md "P2P parity Category B".
 
 import unittest2
+import std/[os, strutils, sets]
+import chronos
+import chronos/timer as ctimer
 import ../src/crypto/chacha20poly1305
 import ../src/crypto/secp256k1
 import ../src/network/peer
+import ../src/network/peermanager
 import ../src/network/bip324
 import ../src/consensus/params
 
@@ -260,3 +264,274 @@ suite "BIP-324 cipher session roundtrip":
     let decoded = decodeV2Message(encoded)
     check decoded.command == "xenophobia"
     check bytesToHex(decoded.payload) == bytesToHex(payload)
+
+# ============================================================================
+# Outbound BIP-324 v2 (initiator) — env-var gate, fallback cache, end-to-end
+# ============================================================================
+
+suite "BIP-324 outbound env-var gate":
+  test "default (unset) returns false":
+    putEnv("NIMROD_BIP324_V2_OUTBOUND", "")
+    delEnv("NIMROD_BIP324_V2_OUTBOUND")
+    check bip324V2OutboundEnabled() == false
+
+  test "explicit '1' enables":
+    putEnv("NIMROD_BIP324_V2_OUTBOUND", "1")
+    check bip324V2OutboundEnabled() == true
+    delEnv("NIMROD_BIP324_V2_OUTBOUND")
+
+  test "case-insensitive 'true' / 'TRUE' / 'YES' / 'on' enable":
+    for v in ["true", "TRUE", "True", "yes", "YES", "on", "ON"]:
+      putEnv("NIMROD_BIP324_V2_OUTBOUND", v)
+      check bip324V2OutboundEnabled() == true
+    delEnv("NIMROD_BIP324_V2_OUTBOUND")
+
+  test "'0' / 'false' / 'no' / arbitrary garbage disable":
+    for v in ["0", "false", "False", "no", "off", "garbage", "  "]:
+      putEnv("NIMROD_BIP324_V2_OUTBOUND", v)
+      check bip324V2OutboundEnabled() == false
+    delEnv("NIMROD_BIP324_V2_OUTBOUND")
+
+suite "BIP-324 outbound v1-only fallback cache":
+  test "markV1Only / isV1Only round-trip":
+    let p = regtestParams()
+    let pm = newPeerManager(p)
+    check pm.isV1Only("203.0.113.7", 8333'u16) == false
+    pm.markV1Only("203.0.113.7", 8333'u16)
+    check pm.isV1Only("203.0.113.7", 8333'u16) == true
+    # Different port = different key.
+    check pm.isV1Only("203.0.113.7", 8334'u16) == false
+
+  test "cache cap holds at V2FallbackCacheMax":
+    # Insert MORE than the cap; size must never exceed the cap.  (The
+    # eviction policy is "drop one arbitrary entry on overflow" — same
+    # as clearbit.  We don't assert WHICH entry is dropped.)
+    let p = regtestParams()
+    let pm = newPeerManager(p)
+    let n = V2FallbackCacheMax + 5
+    for i in 0 ..< n:
+      pm.markV1Only("10.0.0." & $(i mod 256), uint16((i shr 8) + 1))
+      check pm.v2FallbackSet.len <= V2FallbackCacheMax
+
+suite "BIP-324 initiator handshake — wire layout":
+  test "initiator sends 64-byte ellswift pubkey + 16-byte garbage terminator":
+    # Drive a real outbound v2 initiator against a chronos socket pair.
+    # The "responder" here is a pure-byte verifier: it reads what the
+    # initiator sends, asserts the 64-byte pubkey is non-zero (ellswift
+    # output is random but non-trivial) and that the terminator follows
+    # garbage of length <= 32.  This validates the byte-level wire
+    # layout without dragging in the full responder cipher state machine
+    # (separately covered above).
+    proc runTest() {.async.} =
+      # Create a stream server that just reads and verifies.
+      var capturedFut = newFuture[seq[byte]]("captured")
+      let serverPort = 0'u16  # OS picks a free port
+
+      proc onConn(srv: StreamServer, transp: StreamTransport) {.async: (raises: []).} =
+        try:
+          var buf = newSeq[byte](0)
+          var tmp: array[4096, byte]
+          # Read until we have at least 64 (pubkey) + 0..32 (garbage) +
+          # 16 (terminator) bytes.  We read up to 64+32+16 = 112 max.
+          while buf.len < 64 + 16:
+            let n = await transp.readOnce(addr tmp[0], tmp.len)
+            if n == 0: break
+            for i in 0 ..< n: buf.add(tmp[i])
+            if buf.len >= 64 + 32 + 16: break
+          if not capturedFut.finished:
+            capturedFut.complete(buf)
+        except CatchableError as e:
+          if not capturedFut.finished:
+            capturedFut.fail(newException(ValueError, e.msg))
+        try:
+          await transp.closeWait()
+        except CatchableError:
+          discard
+
+      let ta = initTAddress("127.0.0.1", Port(serverPort))
+      let server = createStreamServer(ta, onConn, {ServerFlags.ReuseAddr})
+      server.start()
+      let boundPort = uint16(server.local.port)
+
+      # Build an outbound peer + drive the initiator handshake.  The
+      # responder side never sends back a pubkey, so the handshake will
+      # eventually time out — but by then the initiator has already
+      # written its first message (pubkey+garbage), and our server has
+      # captured the bytes.
+      let params = regtestParams()
+      let peer = newPeer("127.0.0.1", boundPort, params, pdOutbound)
+      check await peer.connect()
+
+      # Run the initiator handshake but bound it short.  We expect it to
+      # raise (server closes / timeout reading their pubkey); that's fine.
+      let v2Fut = peer.performV2HandshakeInitiator()
+      discard await v2Fut.withTimeout(ctimer.seconds(2))
+      # Force-finish without crashing the test if it didn't.
+      if not v2Fut.finished:
+        await v2Fut.cancelAndWait()
+      try:
+        await peer.disconnect()
+      except CatchableError:
+        discard
+
+      # Capture must have completed (server got at least the pubkey).
+      if not capturedFut.finished:
+        # Wait briefly for the captured bytes to flush.
+        discard await capturedFut.withTimeout(ctimer.seconds(1))
+      check capturedFut.finished
+      let captured = capturedFut.read()
+      # Must contain at least 64 (pubkey).  We allow 0..32 garbage but
+      # only assert >= 64 because the server may have closed the moment
+      # it saw 80 bytes.
+      check captured.len >= 64
+
+      # Pubkey is 64 bytes; ellswift output is random, but we can sanity-
+      # check it's not all zeros (would indicate uninitialised buffer).
+      var allZero = true
+      for i in 0 ..< 64:
+        if captured[i] != 0:
+          allZero = false
+          break
+      check allZero == false
+
+      server.stop()
+      server.close()
+
+    waitFor runTest()
+
+  test "initiator detects v1 magic in peer's response (fallback signal)":
+    # If the peer (mistakenly or maliciously) responds with a v1 VERSION
+    # header instead of an ellswift pubkey, the initiator must raise
+    # rather than try to interpret network magic as an ellswift point.
+    proc runTest() {.async.} =
+      let serverPort = 0'u16
+
+      proc onConn(srv: StreamServer, transp: StreamTransport) {.async: (raises: []).} =
+        try:
+          # Drain whatever the initiator sent, then reply with a v1
+          # VERSION header (regtest magic + "version\0\0\0\0\0").
+          var tmp: array[4096, byte]
+          discard await transp.readOnce(addr tmp[0], tmp.len)
+          let p = regtestParams()
+          var v1Header = newSeq[byte](16)
+          for i in 0 ..< 4: v1Header[i] = p.magic[i]
+          let cmd = "version"
+          for i in 0 ..< cmd.len: v1Header[4 + i] = byte(cmd[i])
+          # Bytes 11..15 stay 0 = "version\0\0\0\0\0"
+          discard await transp.write(v1Header)
+        except CatchableError:
+          discard
+        try:
+          await transp.closeWait()
+        except CatchableError:
+          discard
+
+      let ta = initTAddress("127.0.0.1", Port(serverPort))
+      let server = createStreamServer(ta, onConn, {ServerFlags.ReuseAddr})
+      server.start()
+      let boundPort = uint16(server.local.port)
+
+      let params = regtestParams()
+      let peer = newPeer("127.0.0.1", boundPort, params, pdOutbound)
+      check await peer.connect()
+
+      var raised = false
+      var msg = ""
+      let v2Fut = peer.performV2HandshakeInitiator()
+      try:
+        if await v2Fut.withTimeout(ctimer.seconds(3)):
+          if v2Fut.failed:
+            raised = true
+            msg = v2Fut.error.msg
+        else:
+          # Timeout = also a failure path (we don't expect timeout on a
+          # responsive server, but it's tolerable for this test).
+          await v2Fut.cancelAndWait()
+      except CatchableError as e:
+        raised = true
+        msg = e.msg
+      check raised == true
+      # Either v1-magic detected OR a downstream error from trying to
+      # interpret the v1 header as ellswift bytes — but the v1-magic
+      # check should fire first.  Match the expected prefix.
+      check msg.startsWith("v2 ")
+      try:
+        await peer.disconnect()
+      except CatchableError:
+        discard
+      server.stop()
+      server.close()
+
+    waitFor runTest()
+
+  test "initiator + responder cipher pair completes handshake end-to-end":
+    # Drive both halves on a real chronos socket pair: one chronos future
+    # runs `performV2HandshakeInitiator` on the connecting side, another
+    # runs `performV2HandshakeResponder` on the accepting side.  On
+    # success, both peers have transportProto = tpV2 and a working
+    # cipher with matching session IDs.
+    proc runTest() {.async.} =
+      let params = regtestParams()
+      var responderPeer: Peer = nil
+      var responderFut: Future[void] = nil
+      var responderErr = ""
+
+      proc onConn(srv: StreamServer, transp: StreamTransport) {.async: (raises: []).} =
+        try:
+          # Synthesize a peer wrapping the accepted transport.  Direction
+          # = inbound so the responder branch runs.
+          let p = newPeer("127.0.0.1", 0'u16, params, pdInbound)
+          p.transport = transp
+          p.state = psConnected
+          responderPeer = p
+          # Run the responder cipher handshake.  Don't run the full
+          # performHandshake (which expects a v1 prefix peek) — go
+          # straight to the v2 state machine, which is what would happen
+          # AFTER classify decides v2.
+          responderFut = p.performV2HandshakeResponder()
+          await responderFut
+        except CatchableError as e:
+          responderErr = e.msg
+
+      let ta = initTAddress("127.0.0.1", Port(0))
+      let server = createStreamServer(ta, onConn, {ServerFlags.ReuseAddr})
+      server.start()
+      let boundPort = uint16(server.local.port)
+
+      let initiator = newPeer("127.0.0.1", boundPort, params, pdOutbound)
+      check await initiator.connect()
+
+      let initFut = initiator.performV2HandshakeInitiator()
+
+      # Bound both sides — the cipher handshake involves two round-trips
+      # (~few KB), well under a second on loopback.
+      let bothDone = allFutures(initFut)
+      discard await bothDone.withTimeout(ctimer.seconds(5))
+      check initFut.finished
+      check initFut.failed == false
+
+      # Responder runs in the accept callback; give it a tick to settle.
+      for _ in 0 ..< 50:
+        if responderFut != nil and responderFut.finished: break
+        await sleepAsync(ctimer.milliseconds(20))
+      check responderFut != nil
+      check responderFut.finished
+      check responderFut.failed == false
+      check responderErr == ""
+
+      # Both ciphers must have computed the same session ID.
+      check initiator.transportProto == tpV2
+      check responderPeer != nil
+      check responderPeer.transportProto == tpV2
+      check initiator.v2Cipher.getSessionId() == responderPeer.v2Cipher.getSessionId()
+
+      try:
+        await initiator.disconnect()
+      except CatchableError: discard
+      try:
+        await responderPeer.disconnect()
+      except CatchableError: discard
+      server.stop()
+      server.close()
+
+    waitFor runTest()

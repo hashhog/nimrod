@@ -68,6 +68,7 @@ tests/test_zmq
 tests/test_assumevalid
 tests/test_banman
 tests/test_bip174
+tests/test_bip324
 tests/test_coinstatsindex
 tests/test_feefilter
 tests/test_headerssync
