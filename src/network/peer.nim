@@ -71,6 +71,12 @@ type
     transport*: StreamTransport
     state*: PeerState
     direction*: PeerDirection
+    # BIP-324 v2 transport state.  `transportProto = tpV1` until inbound
+    # peer-classification (or, in the future, an outbound probe) decides
+    # the wire is v2.  When `tpV2`, sendMessage/readMessage encrypt and
+    # decrypt through `v2Cipher`; the v1 24-byte header is skipped.
+    transportProto*: TransportProtocol
+    v2Cipher*: BIP324Cipher
     # Peer info from version message
     version*: uint32
     services*: uint64
@@ -144,6 +150,7 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     port: port,
     state: psDisconnected,
     direction: direction,
+    transportProto: tpV1,
     params: params,
     networkMagic: params.magic,
     recvBuffer: @[],
@@ -225,20 +232,26 @@ proc disconnect*(peer: Peer, reason: string = "") {.async.} =
   else:
     info "disconnected from peer", peer = $peer
 
-proc sendMessage*(peer: Peer, msg: P2PMessage) {.async.} =
-  ## Send a P2P message to the peer.
-  ##
-  ## Raises only PeerError on failure. Chronos transport errors
-  ## (TransportUseClosedError, TransportIncompleteError, OSError on a
-  ## torn-down socket) are caught and re-raised as PeerError so callers
-  ## have a single catch type, and so spawned writers (asyncSpawn at the
-  ## inv handler in nimrod.nim and the addr broadcast in peermanager.nim)
-  ## don't promote a transport race into a process-killing FutureDefect.
-  ## Reference: 2026-04-25 nimrod crash post-tip when peer
-  ## 139.162.155.229 closed mid-getdata-write.
-  if not peer.isConnected():
-    raise newException(PeerError, "not connected")
+proc fillRecvBuffer(peer: Peer, n: int): Future[void] {.async.} =
+  ## Read from the socket until peer.recvBuffer has at least n bytes.
+  ## Used by the v2 handshake (which can't yet decrypt v1-style packets)
+  ## and as a primitive for peeking the first 16 bytes in classify.
+  while peer.recvBuffer.len < n:
+    var buf: array[4096, byte]
+    let bytesRead = await peer.transport.readOnce(addr buf[0], buf.len)
+    if bytesRead == 0:
+      raise newException(PeerError, "connection closed")
+    peer.recvBuffer.add(buf[0 ..< bytesRead])
 
+proc takeFromRecvBuffer(peer: Peer, n: int): seq[byte] =
+  ## Remove and return the first n bytes from peer.recvBuffer.  Caller
+  ## must ensure the buffer is large enough (use `fillRecvBuffer` first).
+  doAssert peer.recvBuffer.len >= n
+  result = peer.recvBuffer[0 ..< n]
+  peer.recvBuffer = peer.recvBuffer[n .. ^1]
+
+proc sendMessageV1(peer: Peer, msg: P2PMessage) {.async.} =
+  ## Internal: send a message via v1 (legacy unencrypted) transport.
   let data = serializeMessage(peer.networkMagic, msg)
 
   var written: int
@@ -251,7 +264,64 @@ proc sendMessage*(peer: Peer, msg: P2PMessage) {.async.} =
     raise newException(PeerError, "failed to send complete message")
 
   peer.bytesSent += uint64(data.len)
-  trace "sent message", peer = $peer, kind = msg.kind, size = data.len - 24
+  trace "sent message (v1)", peer = $peer, kind = msg.kind, size = data.len - 24
+
+proc sendMessageV2(peer: Peer, msg: P2PMessage) {.async.} =
+  ## Internal: send a message via BIP-324 v2 (encrypted) transport.
+  ## Wire format (after the cipher handshake): encrypted_length (3 bytes)
+  ## || ciphertext (header_byte + content_bytes + 16-byte AEAD tag).
+  ## AAD is empty in the application phase (handshake AAD has been
+  ## consumed by the version-packet exchange).
+  if not peer.v2Cipher.isInitialized:
+    raise newException(PeerError, "v2 cipher not initialized")
+
+  let command = messageKindToCommand(msg.kind)
+  let payload = serializePayload(msg)
+  let contents = encodeV2Message(command, payload)
+
+  var packet: seq[byte]
+  try:
+    packet = peer.v2Cipher.encrypt(contents)
+  except BIP324Error as e:
+    raise newException(PeerError, "v2 encrypt failed: " & e.msg)
+
+  var written: int
+  try:
+    written = await peer.transport.write(packet)
+  except CatchableError as e:
+    raise newException(PeerError, "transport write failed: " & e.msg)
+
+  if written != packet.len:
+    raise newException(PeerError, "failed to send complete v2 packet")
+
+  peer.bytesSent += uint64(packet.len)
+  trace "sent message (v2)", peer = $peer, kind = msg.kind,
+        size = contents.len, packetSize = packet.len
+
+proc sendMessage*(peer: Peer, msg: P2PMessage) {.async.} =
+  ## Send a P2P message to the peer.
+  ##
+  ## Raises only PeerError on failure. Chronos transport errors
+  ## (TransportUseClosedError, TransportIncompleteError, OSError on a
+  ## torn-down socket) are caught and re-raised as PeerError so callers
+  ## have a single catch type, and so spawned writers (asyncSpawn at the
+  ## inv handler in nimrod.nim and the addr broadcast in peermanager.nim)
+  ## don't promote a transport race into a process-killing FutureDefect.
+  ## Reference: 2026-04-25 nimrod crash post-tip when peer
+  ## 139.162.155.229 closed mid-getdata-write.
+  ##
+  ## Routes to the v1 or v2 path depending on `peer.transportProto`.
+  ## After the BIP-324 handshake has installed v2 keys (see
+  ## `performV2HandshakeResponder`), `transportProto = tpV2` and the
+  ## packet is AEAD-encrypted; otherwise the v1 24-byte-header envelope
+  ## is used.
+  if not peer.isConnected():
+    raise newException(PeerError, "not connected")
+
+  if peer.transportProto == tpV2:
+    await peer.sendMessageV2(msg)
+  else:
+    await peer.sendMessageV1(msg)
 
 proc spawnSafe*(fut: Future[void]) {.async.} =
   ## Wrapper for asyncSpawn'd peer operations. Awaits the inner future
@@ -270,12 +340,9 @@ proc spawnSafe*(fut: Future[void]) {.async.} =
   except CatchableError as e:
     debug "spawned peer op failed", error = e.msg
 
-proc readMessage*(peer: Peer): Future[P2PMessage] {.async.} =
-  ## Read a complete message from the peer
-  ## Reads 24-byte header, validates magic, reads payload, verifies checksum
-  if peer.transport == nil or peer.transport.closed:
-    raise newException(PeerError, "not connected")
-
+proc readMessageV1(peer: Peer): Future[P2PMessage] {.async.} =
+  ## Internal: read a v1 (legacy) message from the peer.
+  ## Reads 24-byte header, validates magic, reads payload, verifies checksum.
   # Read header (24 bytes)
   while peer.recvBuffer.len < 24:
     var buf: array[4096, byte]
@@ -316,9 +383,80 @@ proc readMessage*(peer: Peer): Future[P2PMessage] {.async.} =
   peer.lastSeen = stdtimes.getTime()
 
   let command = bytesToCommand(header.command)
-  trace "received message", peer = $peer, command = command, size = payload.len
+  trace "received message (v1)", peer = $peer, command = command, size = payload.len
 
   return deserializePayload(command, @payload)
+
+proc readMessageV2(peer: Peer): Future[P2PMessage] {.async.} =
+  ## Internal: read a v2 (BIP-324 AEAD) packet, decrypt it, and return
+  ## the decoded P2PMessage.  Skips decoy packets transparently per
+  ## BIP-324 (header byte's IGNORE bit).  AAD is empty in the
+  ## application phase.
+  if not peer.v2Cipher.isInitialized:
+    raise newException(PeerError, "v2 cipher not initialized")
+
+  while true:
+    # Encrypted length (3 bytes) — decryptLength advances the length
+    # cipher's keystream by 3.  Must be called exactly once per packet.
+    await peer.fillRecvBuffer(LengthLen)
+    let encLen = peer.takeFromRecvBuffer(LengthLen)
+    var contentsLen: uint32
+    try:
+      contentsLen = peer.v2Cipher.decryptLength(encLen)
+    except BIP324Error as e:
+      raise newException(PeerError, "v2 length decrypt failed: " & e.msg)
+
+    if contentsLen.int > MaxMessagePayload:
+      raise newException(PeerError, "v2 message too large: " & $contentsLen)
+
+    let aeadLen = HeaderLen + contentsLen.int + AEADExpansion
+    await peer.fillRecvBuffer(aeadLen)
+    let aeadPayload = peer.takeFromRecvBuffer(aeadLen)
+    var contents: seq[byte]
+    var ignore: bool
+    try:
+      let dec = peer.v2Cipher.decrypt(aeadPayload)
+      contents = dec.contents
+      ignore = dec.ignore
+    except BIP324Error as e:
+      raise newException(PeerError, "v2 payload decrypt failed: " & e.msg)
+
+    peer.bytesRecv += uint64(LengthLen + aeadLen)
+    peer.lastSeen = stdtimes.getTime()
+
+    if ignore:
+      # Decoy — keep reading until we see a real message.
+      trace "v2 decoy packet, skipping", peer = $peer, size = contents.len
+      continue
+
+    # Decode the v2 message envelope (short ID or long-form).
+    var command: string
+    var payload: seq[byte]
+    try:
+      let dec = decodeV2Message(contents)
+      command = dec.command
+      payload = dec.payload
+    except BIP324Error as e:
+      raise newException(PeerError, "v2 decode failed: " & e.msg)
+
+    if payload.len > MaxMessagePayload:
+      raise newException(PeerError, "v2 payload too large: " & $payload.len)
+
+    trace "received message (v2)", peer = $peer, command = command, size = payload.len
+    return deserializePayload(command, payload)
+
+proc readMessage*(peer: Peer): Future[P2PMessage] {.async.} =
+  ## Read a complete message from the peer.
+  ## Routes to the v1 or v2 path depending on `peer.transportProto`
+  ## (set during inbound classification — see
+  ## `performV2HandshakeResponder`).
+  if peer.transport == nil or peer.transport.closed:
+    raise newException(PeerError, "not connected")
+
+  if peer.transportProto == tpV2:
+    return await peer.readMessageV2()
+  else:
+    return await peer.readMessageV1()
 
 proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
   ## Send version message
@@ -390,6 +528,172 @@ proc sendSendAddrV2*(peer: Peer) {.async.} =
   ## Must be sent between VERSION and VERACK
   await peer.sendMessage(newSendAddrV2())
 
+proc classifyInboundV2*(prefix: openArray[byte], magic: array[4, byte]): bool =
+  ## Inbound classification helper for BIP-324: returns `true` if the
+  ## first 16 bytes look like a v1 VERSION header (network magic +
+  ## "version\0\0\0\0\0"), in which case the caller should run the v1
+  ## handshake.  Returns `false` if the bytes do NOT match — the peer is
+  ## almost certainly initiating BIP-324 v2 (the 64-byte ellswift pubkey
+  ## is uniformly random, so the false-positive rate against the v1
+  ## header is 2^-128).
+  ##
+  ## Pure function so it's trivially unit-testable; the live path passes
+  ## a peeked copy of recvBuffer's first 16 bytes.
+  checkV1MagicBytes(prefix, magic)
+
+proc performV2HandshakeResponder*(peer: Peer) {.async.} =
+  ## Drive the BIP-324 v2 handshake in RESPONDER mode after inbound
+  ## classification has flagged the wire as v2.  On entry, the first
+  ## bytes of the peer's 64-byte ElligatorSwift pubkey are sitting in
+  ## `peer.recvBuffer` (placed there by the classify-peek that decided
+  ## to take the v2 path); we may also have a few bytes of their
+  ## "garbage" tail.  On exit, `peer.transportProto = tpV2` and
+  ## `peer.v2Cipher` is initialised + has consumed both our and their
+  ## version-packets, so all subsequent sendMessage / readMessage calls
+  ## are AEAD-encrypted.
+  ##
+  ## Wire layout (responder side, per BIP-324 §"Wire format" and
+  ## bitcoin-core/src/net.cpp V2Transport state machine):
+  ##
+  ##     <-  64 bytes ElligatorSwift pubkey || sent_garbage (0..MAX)
+  ##     ->  64 bytes ElligatorSwift pubkey || our_garbage  (0..32)
+  ##     ->  send_garbage_terminator (16) || version-packet (AAD = our_garbage)
+  ##     <-  recv_garbage_terminator (16) || decoy*+version-packet
+  ##         (first AEAD AAD = recv_garbage; all subsequent AAD = empty)
+  ##
+  ## Reference: clearbit/src/peer.zig::performV2Handshake (responder
+  ## branch) and ouroboros/src/ouroboros/peer.py::_negotiate_v2 (the
+  ## initiator-side analogue is byte-equivalent under the responder/
+  ## initiator role swap).
+
+  # 1. Read peer's 64-byte ElligatorSwift pubkey.  Some bytes are
+  #    already buffered from the classify-peek; fillRecvBuffer extends
+  #    the buffer until we have all 64.
+  await peer.fillRecvBuffer(EllSwiftPubKeySize)
+  let theirPubKeyBytes = peer.takeFromRecvBuffer(EllSwiftPubKeySize)
+  var theirPubKey: EllSwiftPubKey
+  for i in 0 ..< EllSwiftPubKeySize:
+    theirPubKey[i] = theirPubKeyBytes[i]
+
+  # 2. Construct our cipher in responder mode.  ECDH + HKDF derives the
+  #    send/recv key pairs and the garbage terminators.
+  peer.v2Cipher = newBIP324Cipher()
+  peer.v2Cipher.initialize(theirPubKey, initiator = false, magic = peer.networkMagic)
+
+  # 3. Send our 64-byte pubkey + small random garbage in one write.
+  #    BIP-324 allows 0..4095 bytes of garbage; small bound (0..32)
+  #    keeps wire-overhead low while still exercising the AAD-binding
+  #    path of the version packet.
+  randomize()
+  let ourGarbageLen = rand(32)
+  var ourGarbage = newSeq[byte](ourGarbageLen)
+  for i in 0 ..< ourGarbageLen:
+    ourGarbage[i] = byte(rand(255))
+
+  let ourPubKey = peer.v2Cipher.getOurPubKey()
+  var keyAndGarbage = newSeq[byte](EllSwiftPubKeySize + ourGarbageLen)
+  for i in 0 ..< EllSwiftPubKeySize:
+    keyAndGarbage[i] = ourPubKey[i]
+  for i in 0 ..< ourGarbageLen:
+    keyAndGarbage[EllSwiftPubKeySize + i] = ourGarbage[i]
+  try:
+    let written = await peer.transport.write(keyAndGarbage)
+    if written != keyAndGarbage.len:
+      raise newException(PeerError, "v2 short write of pubkey+garbage")
+  except CatchableError as e:
+    raise newException(PeerError, "v2 transport write failed (pubkey): " & e.msg)
+  peer.bytesSent += uint64(keyAndGarbage.len)
+
+  # 4. Send our garbage terminator + version packet.  AAD on the
+  #    version packet binds the garbage we just sent (so an MITM that
+  #    truncates / mutates the garbage will fail decryption on the
+  #    peer side).
+  let sendTerm = peer.v2Cipher.getSendGarbageTerminator()
+  let versionPacket = peer.v2Cipher.encrypt(@[], aad = ourGarbage)
+  var termAndVer = newSeq[byte](GarbageTerminatorLen + versionPacket.len)
+  for i in 0 ..< GarbageTerminatorLen:
+    termAndVer[i] = sendTerm[i]
+  for i in 0 ..< versionPacket.len:
+    termAndVer[GarbageTerminatorLen + i] = versionPacket[i]
+  try:
+    let written = await peer.transport.write(termAndVer)
+    if written != termAndVer.len:
+      raise newException(PeerError, "v2 short write of term+version")
+  except CatchableError as e:
+    raise newException(PeerError, "v2 transport write failed (term): " & e.msg)
+  peer.bytesSent += uint64(termAndVer.len)
+
+  # 5. Scan incoming bytes for the recv_garbage_terminator.  The peer
+  #    may have sent up to MAX_GARBAGE_LEN (4095) bytes of garbage
+  #    before the terminator.  We bound the scan at MaxGarbageLen + 16
+  #    and treat absence of the terminator within that window as a
+  #    protocol violation.  Match Core's "byte-by-byte slide" model
+  #    (net.cpp:1297 ProcessReceivedGarbageBytes) — the terminator may
+  #    start at any offset.
+  let recvTerm = peer.v2Cipher.getRecvGarbageTerminator()
+  await peer.fillRecvBuffer(GarbageTerminatorLen)
+  var window = peer.takeFromRecvBuffer(GarbageTerminatorLen)
+  var recvGarbage: seq[byte] = @[]
+  block findTerm:
+    while true:
+      var match = true
+      for i in 0 ..< GarbageTerminatorLen:
+        if window[window.len - GarbageTerminatorLen + i] != recvTerm[i]:
+          match = false
+          break
+      if match:
+        # Bytes before the terminator are the peer's garbage.
+        if window.len > GarbageTerminatorLen:
+          recvGarbage = window[0 ..< (window.len - GarbageTerminatorLen)]
+        break findTerm
+      if window.len >= MaxGarbageLen + GarbageTerminatorLen:
+        raise newException(PeerError,
+          "v2 recv_garbage_terminator not seen within " & $MaxGarbageLen & " bytes")
+      await peer.fillRecvBuffer(1)
+      let nextByte = peer.takeFromRecvBuffer(1)
+      window.add(nextByte[0])
+
+  # 6. Drain incoming AEAD packets until we receive a non-decoy
+  #    (the peer's version-packet).  The first decryption uses
+  #    AAD = recv_garbage; all subsequent decryptions use empty AAD,
+  #    even if the first one was a decoy (matches Core
+  #    net.cpp:1243 ClearShrink(m_recv_aad)).
+  var nextAad: seq[byte] = recvGarbage
+  let decoyBound = 1024
+  for _ in 0 ..< decoyBound:
+    await peer.fillRecvBuffer(LengthLen)
+    let encLen = peer.takeFromRecvBuffer(LengthLen)
+    var contentsLen: uint32
+    try:
+      contentsLen = peer.v2Cipher.decryptLength(encLen)
+    except BIP324Error as e:
+      raise newException(PeerError, "v2 length decrypt failed: " & e.msg)
+    if contentsLen.int > MaxMessagePayload:
+      raise newException(PeerError, "v2 version-phase packet too large: " & $contentsLen)
+
+    let aeadLen = HeaderLen + contentsLen.int + AEADExpansion
+    await peer.fillRecvBuffer(aeadLen)
+    let aeadPayload = peer.takeFromRecvBuffer(aeadLen)
+    var ignore: bool
+    try:
+      let dec = peer.v2Cipher.decrypt(aeadPayload, aad = nextAad)
+      ignore = dec.ignore
+    except BIP324Error as e:
+      raise newException(PeerError, "v2 version-phase payload decrypt failed: " & e.msg)
+    # AAD is consumed by the first decrypt regardless of decoy flag.
+    nextAad = @[]
+    peer.bytesRecv += uint64(LengthLen + aeadLen)
+    if not ignore:
+      break
+  if nextAad.len != 0:
+    # We never observed a non-decoy version-packet within the bound.
+    raise newException(PeerError, "v2 version-packet not observed within decoy bound")
+
+  # 7. Cipher handshake complete; switch the peer to v2 transport so
+  #    subsequent sendMessage / readMessage call the AEAD path.
+  peer.transportProto = tpV2
+  info "BIP-324 v2 handshake complete (responder)", peer = $peer
+
 proc performHandshake*(peer: Peer, ourHeight: int32,
                        checkSelfConnect: SelfConnectChecker = nil) {.async.} =
   ## Perform version handshake with peer
@@ -402,9 +706,37 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
   ## - Self-connection detection via nonce
   ## - 60 second handshake timeout
   ##
-  ## Reference: Bitcoin Core net_processing.cpp ProcessMessage()
+  ## Inbound (BIP-324):
+  ## - Peeks the first 16 bytes of recvBuffer.
+  ## - If the bytes look like a v1 VERSION header (magic + "version\0..."),
+  ##   the v1 path runs as before.
+  ## - Otherwise the peer is initiating v2; we drive
+  ##   `performV2HandshakeResponder` BEFORE the application v1 envelope
+  ##   loop, so the version/verack exchange runs over the encrypted
+  ##   transport.  See `performV2HandshakeResponder` doc.
+  ##
+  ## Reference: Bitcoin Core net_processing.cpp ProcessMessage(),
+  ## net.cpp V2Transport state machine, BIP-324.
 
   peer.handshakeStartTime = stdtimes.getTime()
+
+  # Inbound classification: peek 16 bytes, decide v1 vs v2.
+  if peer.direction == pdInbound and peer.transportProto == tpV1:
+    try:
+      await peer.fillRecvBuffer(V1PrefixLen)
+    except PeerError as e:
+      raise newException(PeerError, "v2 classify peek failed: " & e.msg)
+    let prefix = peer.recvBuffer[0 ..< V1PrefixLen]
+    if not classifyInboundV2(prefix, peer.networkMagic):
+      # Peer initiated BIP-324 v2.  Drive the responder handshake; on
+      # success transportProto is flipped to tpV2 and the v1 fall-
+      # through below now reads encrypted version/verack frames.
+      let v2Fut = peer.performV2HandshakeResponder()
+      if not await v2Fut.withTimeout(ctimer.seconds(V2HandshakeTimeoutSec)):
+        raise newException(PeerError, "v2 handshake timeout")
+      # Surface the inner failure if any.
+      if v2Fut.failed:
+        raise v2Fut.error
 
   if peer.direction == pdOutbound:
     # Send our version first
