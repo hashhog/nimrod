@@ -35,6 +35,10 @@ const
   DefaultMaxOutboundBlockRelay* = 2
   DefaultMaxInbound* = 117
   NetgroupKey* = 0x6c0edd8036ef4036'u64  # SHA256("netgroup")[0:8]
+  # BIP-324: cap the v1-only address cache.  Mirrors clearbit's
+  # V2_FALLBACK_CACHE_MAX = 4096.  Bounded so a churn-y network doesn't
+  # leak memory; eviction is a single-pop on insert when full.
+  V2FallbackCacheMax* = 4096
 
 type
   PeerCallback* = proc(peer: Peer, msg: P2PMessage): Future[void] {.async.}
@@ -91,6 +95,13 @@ type
     tryNewOutboundPeer*: bool               # Whether to try connecting to an extra peer
     initialSyncFinished*: bool              # Whether initial block download is complete
     blockStallingTimeout*: chronos.Duration # Adaptive timeout for block stalling
+    # BIP-324 outbound v2 fallback cache.  Addresses (host:port) that have
+    # failed v2 negotiation get inserted; future outbound attempts to the
+    # same address skip the v2 probe and go straight to v1.  Bounded by
+    # `V2FallbackCacheMax` (FIFO-ish eviction — Nim's HashSet iteration
+    # order is implementation-defined).  Mirrors clearbit's
+    # `v2_fallback_set` (peer.zig:1759).
+    v2FallbackSet*: HashSet[string]
 
 # Forward declarations
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
@@ -103,6 +114,25 @@ proc peerKey(host: string, port: uint16): string =
 
 proc peerKey(peer: Peer): string =
   peerKey(peer.address, peer.port)
+
+proc markV1Only*(pm: PeerManager, address: string, port: uint16) =
+  ## BIP-324: mark `address:port` as v1-only.  Subsequent outbound
+  ## attempts will skip the v2 probe and go straight to v1.  Bounded by
+  ## `V2FallbackCacheMax`; on overflow, drop one arbitrary entry (Nim's
+  ## HashSet iteration order is implementation-defined — same as
+  ## clearbit's behaviour).
+  let key = peerKey(address, port)
+  if pm.v2FallbackSet.len >= V2FallbackCacheMax:
+    # Pop one arbitrary element.
+    for k in pm.v2FallbackSet:
+      pm.v2FallbackSet.excl(k)
+      break
+  pm.v2FallbackSet.incl(key)
+
+proc isV1Only*(pm: PeerManager, address: string, port: uint16): bool =
+  ## BIP-324: returns true if `address:port` previously failed v2
+  ## negotiation and should skip the v2 probe.
+  peerKey(address, port) in pm.v2FallbackSet
 
 proc newPeerManager*(params: ConsensusParams,
                      maxOutFullRelay: int = DefaultMaxOutboundFullRelay,
@@ -136,7 +166,8 @@ proc newPeerManager*(params: ConsensusParams,
     lastExtraPeerCheckTime: now,
     tryNewOutboundPeer: false,
     initialSyncFinished: false,
-    blockStallingTimeout: chronos.seconds(BlockStallingTimeoutDefaultSec)
+    blockStallingTimeout: chronos.seconds(BlockStallingTimeoutDefaultSec),
+    v2FallbackSet: initHashSet[string]()
   )
 
   # Load existing ban list and anchors
@@ -328,6 +359,13 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
       return false
 
   let peer = newPeer(address, port, pm.params, pdOutbound)
+  # BIP-324: if this address has previously failed a v2 probe, skip v2
+  # this round — the peer is already known to be v1-only.  Mirrors
+  # clearbit's `try_v2 = v2_enabled and !self.isV1Only(address)` gate
+  # (peer.zig:1868).  performHandshake reads this field on the outbound
+  # branch.
+  if pm.isV1Only(address, port):
+    peer.v2OutboundDisabled = true
   pm.peers[key] = peer
 
   if await peer.connect():
@@ -375,6 +413,18 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
 
       return true
     except CatchableError as e:
+      # BIP-324 fallback bookkeeping: if the failure is in the v2 outbound
+      # path, mark the address v1-only so the next reconnect (driven by
+      # `mainLoop`'s ReconnectInterval) skips the v2 probe and goes
+      # straight to v1.  We can't retry inline because the v2 garbage on
+      # the wire is destructive on a v1 peer — the socket is poisoned.
+      # We detect by error-message prefix; the v2 paths in peer.nim raise
+      # PeerError with "v2 ..." messages, never anything ambiguous with
+      # v1.  Mirrors clearbit's `markV1Only` call (peer.zig:1899).
+      if e.msg.startsWith("v2 ") and bip324V2OutboundEnabled():
+        debug "BIP-324 v2 outbound failed, marking v1-only",
+              peer = $peer, error = e.msg
+        pm.markV1Only(address, port)
       error "handshake failed", peer = $peer, error = e.msg
       await peer.disconnect()
       pm.peers.del(key)
