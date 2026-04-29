@@ -28,6 +28,7 @@ import ./test_maturity
 import ./test_encrypt
 import ./test_label
 import ./test_rpc
+import ./test_rpc_thread_lifetime
 import ./test_perf
 import ./test_sequence_lock
 import ./test_bip68

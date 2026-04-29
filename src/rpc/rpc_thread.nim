@@ -41,7 +41,14 @@ proc rpcThreadMain(rpc: RpcServer) {.thread.} =
 
 proc startRpcThread*(rpc: RpcServer): RpcThreadHandle =
   ## Create and start a dedicated thread for the RPC server.
-  ## Returns a handle; the caller should keep it alive for the lifetime
-  ## of the process.
+  ##
+  ## CALLER MUST keep the returned handle alive for the lifetime of the
+  ## process — store it on a long-lived ref (e.g. `NodeState.rpcThread`).
+  ## Discarding the handle frees the inner `Thread[RpcServer]` storage that
+  ## `pthread_create` was given as `addr(t)`.  The new pthread then races
+  ## against `=destroy` reading `t.dataFn` / `t.data` from freed (and
+  ## possibly reused) memory, which manifests as a SIGSEGV ("Attempt to
+  ## read from nil?") deterministically on regtest startup and flakily on
+  ## testnet/mainnet depending on scheduling.
   result = RpcThreadHandle()
   createThread(result.thread, rpcThreadMain, rpc)
