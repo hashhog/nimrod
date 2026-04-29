@@ -448,14 +448,18 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     # messages enumerating mempool txids. We use witness-tx inv (since we
     # advertise NodeWitness during handshake). Chunk to MaxInvPerMsg.
     #
-    # Bitcoin Core gates this on NODE_BLOOM (peer.m_our_services & NODE_BLOOM)
-    # or per-peer Mempool permission (net_processing.cpp:4852-4879). Nimrod
-    # does not currently advertise NODE_BLOOM nor track per-peer permissions
-    # (no NodeBloom constant in messages.nim) — TODO when BIP37/permission
-    # plumbing lands. Until then, always-allow: relay-only peer impact is
-    # bounded by MaxInvPerMsg chunking and does not leak privacy beyond what
-    # we'd already gossip via inv.
-    if state.mempool == nil:
+    # Bitcoin Core gate (net_processing.cpp:4852-4863):
+    #   if (!(peer.m_our_services & NODE_BLOOM) &&
+    #       !pfrom.HasPermission(NetPermissionFlags::Mempool))
+    #     -> drop, disconnect (unless NoBan).
+    # Nimrod has no per-peer permission system, so we mirror only the
+    # service-bit half: serve `mempool` iff WE advertised NODE_BLOOM in
+    # our version (i.e. NIMROD_PEER_BLOOM_FILTERS is on).  Reading the
+    # local advertisement flag rather than peer.services keeps the gate
+    # symmetric with what we told the peer at handshake.
+    if not peerBloomFiltersEnabled():
+      debug "ignoring mempool request: NODE_BLOOM not advertised", peer = $peer
+    elif state.mempool == nil:
       trace "mempool request before mempool init", peer = $peer
     else:
       var batch: seq[InvVector] = @[]
