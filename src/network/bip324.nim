@@ -57,8 +57,24 @@ type
 
   BIP324Error* = object of CatchableError
 
-# Short message type IDs (BIP-324 table)
-# Maps 12-byte ASCII command strings to single-byte IDs
+# Short message type IDs (BIP-324 table — canonical, IDs 0x01..0x1c)
+# Maps 12-byte ASCII command strings to single-byte IDs.
+#
+# This table mirrors Bitcoin Core's `V2_MESSAGE_IDS` (net.cpp:919-954) and
+# clearbit's `V2_MESSAGE_IDS` (v2_transport.zig:133-163).  Index 0 is the
+# long-form indicator (0x00 + 12-byte cmd-name).  Indices 0x1d..0x20 are
+# explicitly reserved by BIP-324 ("for future use") and MUST NOT be used
+# for application messages on the wire — `version`, `verack`, `getaddr`,
+# `wtxidrelay`, `sendaddrv2`, `sendheaders` are all sent via the long
+# (12-byte) form.
+#
+# Pre-fix bug: `version` was mapped to 0x00 here, which made
+# `encodeV2Message("version", payload)` emit `[0x00, payload...]` with NO
+# 12-byte command-name field — a malformed long-form frame.  Strict
+# decoders (e.g. haskoin) read `payload[0..11]` as the command name,
+# rejected the connection with "Unknown short message ID", and the
+# nimrod→haskoin pair was `no-conn` in the BIP-324 interop matrix
+# (wave-bip324-interop-rerun-2026-04-29/MATRIX.md).
 const shortMsgTypes* = {
   "addr":          0x01'u8,
   "block":         0x02'u8,
@@ -88,15 +104,28 @@ const shortMsgTypes* = {
   "getcfcheckpt":  0x1a'u8,
   "cfcheckpt":     0x1b'u8,
   "addrv2":        0x1c'u8,
-  "wtxidrelay":    0x1d'u8,
-  "sendaddrv2":    0x1e'u8,
-  "sendheaders":   0x1f'u8,
-  "version":       0x00'u8,  # Special: VERSION must be 0x00
-  "verack":        0x21'u8,
-  "getaddr":       0x22'u8,
+  # 0x1d..0x20 reserved by BIP-324; do NOT add encoder mappings.
+  # `version`, `verack`, `getaddr`, `wtxidrelay`, `sendaddrv2`,
+  # `sendheaders` are encoded via the long (12-byte) form.
 }.toTable
 
-# Reverse mapping for decoding
+# De-facto extended decoder mapping for short IDs that several hashhog
+# impls (blockbrew, beamchain, ouroboros) emit on the wire even though
+# BIP-324 marks 0x1d-0x22 as "reserved for future use".  We accept these
+# on input only — the nimrod encoder always uses the canonical long form
+# for these messages so outbound traffic stays spec-compliant for strict
+# v2 peers (e.g. haskoin pre-extended-decoder).  Mirrors haskoin's
+# `v2ExtendedDecodeIds` (Network.hs:5527-5535).
+const extendedDecodeIds* = {
+  0x1d'u8: "wtxidrelay",
+  0x1e'u8: "sendaddrv2",
+  0x1f'u8: "sendheaders",
+  0x20'u8: "version",
+  0x21'u8: "verack",
+  0x22'u8: "getaddr",
+}.toTable
+
+# Reverse mapping for decoding (canonical 0x01..0x1c only).
 let shortMsgTypesReverse* = block:
   var m = initTable[byte, string]()
   for k, v in shortMsgTypes:
@@ -345,6 +374,17 @@ proc decodeV2Message*(content: openArray[byte]):
   {.gcsafe.}:
     if firstByte in shortMsgTypesReverse:
       let command = shortMsgTypesReverse[firstByte]
+      var payload = newSeq[byte](content.len - 1)
+      for i in 0..<payload.len:
+        payload[i] = content[1 + i]
+      return (command, payload)
+
+    # De-facto extended IDs (0x1d..0x22) — accept on input for cross-impl
+    # interop with blockbrew/beamchain/ouroboros which emit these instead
+    # of the canonical long form for `version` etc.  See
+    # `extendedDecodeIds` doc-comment above.
+    if firstByte in extendedDecodeIds:
+      let command = extendedDecodeIds[firstByte]
       var payload = newSeq[byte](content.len - 1)
       for i in 0..<payload.len:
         payload[i] = content[1 + i]
