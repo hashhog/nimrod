@@ -37,12 +37,39 @@ type
     chacha20: ChaCha20
 
   FSChaCha20* = object
-    ## Forward-secure ChaCha20 for BIP-324 length encryption
-    ## Rekeys every rekeyInterval messages
-    chacha20: ChaCha20
+    ## Forward-secure ChaCha20 for BIP-324 length encryption.
+    ## Rekeys every rekeyInterval calls.
+    ##
+    ## Per BIP-324 / Bitcoin Core (`crypto/chacha20.cpp::FSChaCha20`), the
+    ## keystream is CONTINUOUS within a rekey epoch: each crypt() call
+    ## consumes the next N bytes of a single ChaCha20 keystream initialised
+    ## at the start of the epoch.  The nonce within an epoch is
+    ## `[0,0,0,0] || LE64(rekey_counter)` (constant within the epoch); the
+    ## ChaCha20 block counter advances per 64-byte block consumed.  After
+    ## rekeyInterval crypt() calls, the next 32 keystream bytes become the
+    ## new key, rekey_counter increments, and the keystream restarts at
+    ## block 0 with the new (incremented) nonce.
+    ##
+    ## A previous implementation reset the block counter to 0 on every
+    ## crypt() call (via seek96(packetCounter, rekeyCounter)).  That made
+    ## packet N's first byte the FIRST byte of a fresh keystream rather
+    ## than the (N*3)th byte of the continuous epoch keystream — diverging
+    ## from Core/ouroboros after packet 1.  Mainnet peers accepted our
+    ## first encrypted length but rejected the second, EOF-ing the
+    ## connection right after our app-layer VERSION send.  See clearbit
+    ## commit cb04a1f (W90) for the same bug + fix.
+    key: array[ChaCha20KeySize, byte]
     rekeyInterval: uint32
     packetCounter: uint32
     rekeyCounter: uint64
+    # Cached 64-byte keystream block; bytes are consumed from the front.
+    # When `keystreamUsed >= 64`, draw the next ChaCha20 block under the
+    # current epoch nonce + blockCounter.
+    keystreamBuf: array[ChaCha20BlockSize, byte]
+    keystreamUsed: int
+    # ChaCha20 block counter.  Advances per 64-byte block consumed within
+    # the current rekey epoch; resets to 0 on rekey.
+    blockCounter: uint32
 
   FSChaCha20Poly1305* = object
     ## Forward-secure ChaCha20-Poly1305 AEAD for BIP-324
@@ -470,34 +497,76 @@ proc keystream*(a: var AEADChaCha20Poly1305, nonce: array[12, byte],
 
 proc initFSChaCha20*(key: openArray[byte], rekeyInterval: uint32): FSChaCha20 =
   ## Initialize forward-secure ChaCha20
-  result.chacha20 = initChaCha20(key)
+  assert key.len == ChaCha20KeySize
+  for i in 0..<ChaCha20KeySize:
+    result.key[i] = key[i]
   result.rekeyInterval = rekeyInterval
   result.packetCounter = 0
   result.rekeyCounter = 0
+  # Start "empty" so the next crypt() generates a fresh block at counter 0.
+  result.keystreamUsed = ChaCha20BlockSize
+  result.blockCounter = 0
+
+proc epochNonce(f: FSChaCha20): array[12, byte] =
+  ## Per-epoch nonce: `[0,0,0,0] || LE64(rekey_counter)`.  Constant within
+  ## an epoch; only `rekey_counter` changes (and only on rekey).
+  var rc = f.rekeyCounter
+  littleEndian64(addr result[4], addr rc)
+
+proc drawKeystream(f: var FSChaCha20, output: var openArray[byte]) =
+  ## Pull `output.len` bytes of keystream into `output`, refilling the
+  ## 64-byte cache and advancing `blockCounter` as needed.  Does NOT
+  ## advance `packetCounter` — call `nextPacket` separately to mark the
+  ## end of a logical crypt() call.
+  var pos = 0
+  while pos < output.len:
+    if f.keystreamUsed >= ChaCha20BlockSize:
+      # Generate the next ChaCha20 block under the epoch nonce.
+      var c = initChaCha20(f.key)
+      let nonce = f.epochNonce()
+      c.seek(nonce, f.blockCounter)
+      var blk: array[ChaCha20BlockSize, byte]
+      c.keystream(blk)
+      for i in 0..<ChaCha20BlockSize:
+        f.keystreamBuf[i] = blk[i]
+      f.blockCounter += 1
+      f.keystreamUsed = 0
+    let avail = ChaCha20BlockSize - f.keystreamUsed
+    let want = output.len - pos
+    let take = if avail < want: avail else: want
+    for i in 0..<take:
+      output[pos + i] = f.keystreamBuf[f.keystreamUsed + i]
+    f.keystreamUsed += take
+    pos += take
 
 proc nextPacket(f: var FSChaCha20) =
-  ## Advance to next packet, rekeying if needed
+  ## Advance the packet counter; rekey if we hit the interval.
   inc f.packetCounter
   if f.packetCounter == f.rekeyInterval:
-    # Generate new key from keystream
-    var nonce: array[12, byte]
-    littleEndian32(addr nonce[0], unsafeAddr f.rekeyInterval)  # 0xFFFFFFFF trick from Core
-    var counter = 0xFFFFFFFF'u32
-    littleEndian32(addr nonce[0], addr counter)
-    littleEndian64(addr nonce[4], addr f.rekeyCounter)
+    # Draw 32 keystream bytes for the new key under the CURRENT epoch
+    # (Core's FSChaCha20::Crypt: `m_chacha20.Keystream(new_key)` runs
+    # against the same stateful stream, then SetKey + Seek({0, ++rekey})).
+    var newKey: array[ChaCha20KeySize, byte]
+    f.drawKeystream(newKey)
 
-    f.chacha20.seek(nonce, 0)
-    var newKey: array[64, byte]
-    f.chacha20.keystream(newKey)
-
-    f.chacha20.setKey(newKey[0..<32])
+    for i in 0..<ChaCha20KeySize:
+      f.key[i] = newKey[i]
     f.packetCounter = 0
     inc f.rekeyCounter
+    # Reset stream state so the next crypt() starts at block 0 under the
+    # new epoch nonce (rekey_counter has been bumped).
+    f.keystreamUsed = ChaCha20BlockSize
+    f.blockCounter = 0
 
 proc crypt*(f: var FSChaCha20, input: openArray[byte], output: var openArray[byte]) =
-  ## Encrypt/decrypt with forward secrecy
-  f.chacha20.seek96(f.packetCounter, f.rekeyCounter)
-  f.chacha20.crypt(input, output)
+  ## Encrypt/decrypt one chunk with forward secrecy.  Consumes
+  ## `input.len` bytes of the continuous epoch keystream and XORs them
+  ## with `input` into `output`.
+  assert input.len == output.len
+  var ks = newSeq[byte](input.len)
+  f.drawKeystream(ks)
+  for i in 0..<input.len:
+    output[i] = input[i] xor ks[i]
   f.nextPacket()
 
 # ==========================================================================
