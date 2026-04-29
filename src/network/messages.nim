@@ -16,6 +16,7 @@ const
   ProtocolVersion* = 70016'u32
   UserAgent* = "/nimrod:0.1.0/"
   NodeNetwork* = 1'u64
+  NodeBloom* = 4'u64           ## BIP-111 / BIP-35: served bloom filters + mempool
   NodeWitness* = 8'u64
   NodeNetworkLimited* = 1024'u64
 
