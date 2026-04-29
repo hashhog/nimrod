@@ -56,6 +56,15 @@ type
     syncManager*: SyncManager
     feeEstimator*: FeeEstimator
     rpcServer*: RpcServer
+    rpcThread*: RpcThreadHandle  ## Owns the lifetime of the RPC OS thread.
+                                 ## MUST be held by NodeState — discarding the
+                                 ## handle frees its `Thread[RpcServer]` core
+                                 ## while the pthread is still reading from
+                                 ## `addr(t)`, causing an unattributed SIGSEGV
+                                 ## on regtest startup (and a flaky one on
+                                 ## testnet/mainnet) because the new pthread
+                                 ## races with the destructor that fires when
+                                 ## the temporary handle is dropped.
     crypto*: CryptoEngine
     running*: bool
     recentlyRejected*: HashSet[TxId]  ## Recently-rejected tx filter, cleared on new block
@@ -996,7 +1005,15 @@ proc startNode*(config: NimrodConfig) {.async.} =
     # Run RPC on a dedicated OS thread with its own chronos event loop so that
     # CPU-heavy block validation on the main thread does not block RPC accept
     # or response. See src/rpc/rpc_thread.nim for rationale and known v1 caveats.
-    discard startRpcThread(state.rpcServer)
+    #
+    # IMPORTANT: keep the handle alive on `state` for the process lifetime.
+    # Discarding the result frees the underlying `Thread[RpcServer]` storage
+    # while the freshly-spawned pthread is still reading from `addr(t)`,
+    # which manifests as a SIGSEGV ("Attempt to read from nil") on startup
+    # (deterministic on regtest, flaky on testnet/mainnet depending on how
+    # quickly the new pthread is scheduled).  Holding the handle on
+    # `NodeState` keeps it pinned for the lifetime of the node.
+    state.rpcThread = startRpcThread(state.rpcServer)
 
   # 7b. Start Prometheus metrics server
   if config.metricsPort > 0:
