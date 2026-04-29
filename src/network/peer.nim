@@ -1182,34 +1182,48 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     peer.handlePong(msg.pongNonce)
 
   of mkAddr:
+    # Dispatched to PeerManager.handleAddrInternal (peermanager.nim:925).
     trace "received addr", peer = $peer, count = msg.addresses.len
 
   of mkAddrV2:
+    # Dispatched to PeerManager.handleAddrInternal.
     trace "received addrv2", peer = $peer, count = msg.addressesV2.len
 
   of mkInv:
+    # Dispatched to NodeState.handleMessage (nimrod.nim mkInv branch).
     trace "received inv", peer = $peer, count = msg.invItems.len
 
   of mkHeaders:
+    # Dispatched to NodeState.handleMessage which calls SyncManager.handleHeaders.
     trace "received headers", peer = $peer, count = msg.headers.len
 
   of mkBlock:
+    # Dispatched to NodeState.handleMessage which calls SyncManager.processBlock.
     trace "received block", peer = $peer
 
   of mkTx:
+    # Dispatched to NodeState.handleMessage which calls Mempool.acceptTransaction.
     trace "received tx", peer = $peer
 
   of mkGetAddr:
-    discard  # TODO: respond with addr
+    # Served by PeerManager.handleAddrInternal (peermanager.nim:960-971);
+    # responds with `addr` of up to MaxGetAddrCount cached peer addresses.
+    trace "received getaddr", peer = $peer
 
   of mkGetHeaders:
-    discard  # TODO: respond with headers
+    # Served by NodeState.handleMessage (nimrod.nim mkGetHeaders branch);
+    # responds with up to MaxHeadersPerMsg (2000) headers.
+    trace "received getheaders", peer = $peer
 
   of mkGetBlocks:
-    discard  # TODO: respond with inv
+    # Served by NodeState.handleMessage (nimrod.nim mkGetBlocks branch);
+    # responds with `inv` of up to MaxGetBlocksInvCount (500) block hashes.
+    trace "received getblocks", peer = $peer
 
   of mkGetData:
-    discard  # TODO: respond with block/tx
+    # Served by NodeState.handleMessage (nimrod.nim mkGetData branch);
+    # responds with `block` / `tx` per item, `notfound` for unknowns.
+    trace "received getdata", peer = $peer, count = msg.getData.len
 
   of mkMempool:
     # BIP35: real handler lives in nimrod.handleMessage which has access

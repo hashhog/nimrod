@@ -13,6 +13,9 @@ const
   MaxMessagePayload* = 33_554_432  # 32 MiB
   MaxHeadersPerMsg* = 2000
   MaxInvPerMsg* = 50_000
+  MaxLocatorSz* = 101              # BIP0152: max getheaders/getblocks locator entries
+  MaxGetBlocksInvCount* = 500      # net_processing.cpp:4217 nLimit
+  MaxGetAddrCount* = 1000          # Cap for getaddr response (matches Bitcoin Core)
   ProtocolVersion* = 70016'u32
   UserAgent* = "/nimrod:0.1.0/"
   NodeNetwork* = 1'u64
@@ -728,6 +731,12 @@ proc newInv*(items: seq[InvVector]): P2PMessage =
 
 proc newGetData*(items: seq[InvVector]): P2PMessage =
   P2PMessage(kind: mkGetData, getData: items)
+
+proc newNotFound*(items: seq[InvVector]): P2PMessage =
+  ## NOTFOUND response: peer asked us for getdata items we don't have.
+  ## Bitcoin Core sends this for any inv we can't serve so the peer can
+  ## try another node instead of timing out.
+  P2PMessage(kind: mkNotFound, notFound: items)
 
 proc newHeaders*(headers: seq[BlockHeader]): P2PMessage =
   P2PMessage(kind: mkHeaders, headers: headers)

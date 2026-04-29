@@ -1,7 +1,7 @@
 ## nimrod - Bitcoin full node in Nim
 ## Unified CLI with subcommands for node operation, RPC interaction, and wallet management
 
-import std/[parseopt, os, strutils, json, posix, net, base64, sysrand, tables, monotimes, times, sets]
+import std/[parseopt, os, strutils, json, posix, net, base64, sysrand, tables, monotimes, times, sets, options]
 import chronos
 import chronicles
 
@@ -360,6 +360,62 @@ proc getConsensusParams(config: NimrodConfig): ConsensusParams =
     echo "Unknown network: " & config.network
     quit(1)
 
+proc findLocatorFork(state: NodeState,
+                     locatorHashes: seq[array[32, byte]]): int32 =
+  ## Find the height of the latest block from `locatorHashes` that is in our
+  ## active chain. Mirrors Bitcoin Core's Chainstate::FindForkInGlobalIndex
+  ## (validation.cpp:120) -- the locator is sorted descending by height, so
+  ## return as soon as we find one we know about. Returns 0 (genesis) if none
+  ## of the locator hashes are in our chain. Returns -1 only if our chain is
+  ## empty (no genesis loaded).
+  if state.chainState.bestHeight < 0:
+    return -1
+  for h in locatorHashes:
+    let bh = BlockHash(h)
+    # Prefer the in-memory header chain (covers headers ahead of the block tip)
+    if state.syncManager != nil:
+      let heightOpt = state.syncManager.headerChain.getHeight(bh)
+      if heightOpt.isSome:
+        # Confirm the hash is still on our active header chain at that height.
+        let onChainOpt = state.syncManager.headerChain.getHashByHeight(heightOpt.get())
+        if onChainOpt.isSome and onChainOpt.get() == bh:
+          return heightOpt.get()
+    # Fall back to the persisted block index (for hashes pruned from memory).
+    let idxOpt = state.chainState.db.getBlockIndex(bh)
+    if idxOpt.isSome:
+      let idx = idxOpt.get()
+      let canonOpt = state.chainState.db.getBlockHashByHeight(idx.height)
+      if canonOpt.isSome and canonOpt.get() == bh:
+        return idx.height
+  # No common ancestor found -- start from genesis.
+  return 0
+
+proc activeChainHashAtHeight(state: NodeState, height: int32): Option[BlockHash] =
+  ## Return the active-chain block hash at the given height, preferring the
+  ## in-memory header chain (which is consistent during IBD before flush).
+  if height < 0:
+    return none(BlockHash)
+  if state.syncManager != nil:
+    let h = state.syncManager.headerChain.getHashByHeight(height)
+    if h.isSome:
+      return h
+  state.chainState.getBlockHashByHeight(height)
+
+proc activeChainHeaderAtHeight(state: NodeState, height: int32): Option[BlockHeader] =
+  ## Active-chain header lookup. Header-chain first, then disk-backed block.
+  if height < 0:
+    return none(BlockHeader)
+  if state.syncManager != nil:
+    let h = state.syncManager.headerChain.getHeaderByHeight(height)
+    if h.isSome:
+      return h
+  let hashOpt = state.chainState.getBlockHashByHeight(height)
+  if hashOpt.isSome:
+    let blkOpt = state.chainState.db.getBlock(hashOpt.get())
+    if blkOpt.isSome:
+      return some(blkOpt.get().header)
+  none(BlockHeader)
+
 proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
   ## Handle incoming P2P messages
   case msg.kind
@@ -421,7 +477,14 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
       asyncSpawn spawnSafe(peer.sendGetData(txInvs))
 
   of mkGetData:
-    # Handle data requests - serve blocks and transactions to peers
+    # Handle data requests - serve blocks and transactions to peers.
+    # Reference: bitcoin-core/src/net_processing.cpp ProcessGetData
+    # (msg_type == NetMsgType::GETDATA, line 4128). Items we cannot satisfy
+    # are aggregated into a single NOTFOUND so the peer can move on instead
+    # of timing out.
+    var notFound: seq[InvVector] = @[]
+    var servedBlocks = 0
+    var servedTxs = 0
     for item in msg.getData:
       if item.invType == invBlock or item.invType == invWitnessBlock:
         let blockOpt = state.chainState.db.getBlock(BlockHash(item.hash))
@@ -429,19 +492,144 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           let blkMsg = newBlockMsg(blockOpt.get())
           try:
             await peer.sendMessage(blkMsg)
-            debug "served block to peer", peer = $peer
+            servedBlocks.inc
           except CatchableError as e:
             debug "failed to serve block", peer = $peer, error = e.msg
+        else:
+          notFound.add(item)
       elif item.invType == invTx or item.invType == invWitnessTx:
         let txid = TxId(item.hash)
-        let entryOpt = state.mempool.get(txid)
+        let entryOpt = if state.mempool != nil: state.mempool.get(txid)
+                      else: none(MempoolEntry)
         if entryOpt.isSome:
           let txMsg = newTxMsg(entryOpt.get().tx)
           try:
             await peer.sendMessage(txMsg)
-            debug "served tx to peer", peer = $peer
+            servedTxs.inc
           except CatchableError as e:
             debug "failed to serve tx", peer = $peer, error = e.msg
+        else:
+          notFound.add(item)
+      else:
+        # Unknown / unsupported inv type (compact-block, filtered-block, ...)
+        notFound.add(item)
+    if servedBlocks > 0 or servedTxs > 0:
+      debug "served getdata", peer = $peer,
+            blocks = servedBlocks, txs = servedTxs,
+            notFound = notFound.len
+    if notFound.len > 0:
+      try:
+        await peer.sendMessage(newNotFound(notFound))
+      except CatchableError as e:
+        debug "failed to send notfound", peer = $peer, error = e.msg
+
+  of mkGetHeaders:
+    # Serve headers to peers. Reference: bitcoin-core/src/net_processing.cpp
+    # NetMsgType::GETHEADERS (line 4306). Locator is descending by height;
+    # we reply with up to MaxHeadersPerMsg (2000) headers starting from the
+    # block AFTER the latest known common ancestor.
+    let req = msg.getHeaders
+    if req.locatorHashes.len > MaxLocatorSz:
+      warn "getheaders locator oversized", peer = $peer,
+           size = req.locatorHashes.len
+      return
+    if state.chainState.bestHeight < 0:
+      # Chain not initialised; reply with empty headers so the peer doesn't
+      # treat us as unresponsive.
+      try:
+        await peer.sendMessage(newHeaders(@[]))
+      except CatchableError:
+        discard
+      return
+
+    var startHeight: int32
+    let zeroHash = array[32, byte](default(array[32, byte]))
+    if req.locatorHashes.len == 0:
+      # Null locator: peer is asking for headers up to (and including) the
+      # hashStop block.
+      let bh = BlockHash(req.hashStop)
+      var idxHeight: int32 = -1
+      if state.syncManager != nil:
+        let hOpt = state.syncManager.headerChain.getHeight(bh)
+        if hOpt.isSome:
+          idxHeight = hOpt.get()
+      if idxHeight < 0:
+        let idxOpt = state.chainState.db.getBlockIndex(bh)
+        if idxOpt.isSome:
+          idxHeight = idxOpt.get().height
+      if idxHeight < 0:
+        # Don't know the stop hash; nothing to do.
+        return
+      startHeight = idxHeight
+    else:
+      startHeight = findLocatorFork(state, req.locatorHashes) + 1
+
+    var headers: seq[BlockHeader] = @[]
+    var height = startHeight
+    let stopHash = req.hashStop
+    let stopIsNull = stopHash == zeroHash
+    while headers.len < MaxHeadersPerMsg:
+      let hdrOpt = activeChainHeaderAtHeight(state, height)
+      if hdrOpt.isNone:
+        break
+      headers.add(hdrOpt.get())
+      let hashOpt = activeChainHashAtHeight(state, height)
+      if not stopIsNull and hashOpt.isSome and
+         array[32, byte](hashOpt.get()) == stopHash:
+        break
+      height.inc
+    try:
+      await peer.sendMessage(newHeaders(headers))
+      debug "served getheaders", peer = $peer,
+            startHeight = startHeight, count = headers.len
+    except CatchableError as e:
+      debug "failed to send headers", peer = $peer, error = e.msg
+
+  of mkGetBlocks:
+    # Serve block-hash inv to peers. Reference: net_processing.cpp
+    # NetMsgType::GETBLOCKS (line 4179). Up to 500 hashes starting at the
+    # block AFTER the latest known common ancestor, stopping at hashStop.
+    let req = msg.getBlocks
+    if req.locatorHashes.len > MaxLocatorSz:
+      warn "getblocks locator oversized", peer = $peer,
+           size = req.locatorHashes.len
+      return
+    if state.chainState.bestHeight < 0:
+      return
+
+    let startHeight = findLocatorFork(state, req.locatorHashes) + 1
+    var invItems: seq[InvVector] = @[]
+    var height = startHeight
+    let stopHash = req.hashStop
+    let zeroHash = array[32, byte](default(array[32, byte]))
+    let stopIsNull = stopHash == zeroHash
+    let limit = MaxGetBlocksInvCount
+    # Don't advertise blocks we don't actually have on disk yet (the header
+    # chain may be ahead of the block tip during IBD).
+    let maxServedHeight = state.chainState.bestHeight
+    while invItems.len < limit and height <= maxServedHeight:
+      let hashOpt = activeChainHashAtHeight(state, height)
+      if hashOpt.isNone:
+        break
+      let bh = hashOpt.get()
+      invItems.add(InvVector(invType: invBlock, hash: array[32, byte](bh)))
+      if not stopIsNull and array[32, byte](bh) == stopHash:
+        break
+      height.inc
+    if invItems.len > 0:
+      try:
+        await peer.sendMessage(newInv(invItems))
+        debug "served getblocks", peer = $peer,
+              startHeight = startHeight, count = invItems.len
+      except CatchableError as e:
+        debug "failed to send getblocks inv", peer = $peer, error = e.msg
+
+  of mkGetAddr:
+    # GetAddr is also handled in PeerManager.handleAddrInternal so the
+    # response goes out before any user-level callback fires. This branch
+    # is a defensive no-op so the dispatcher doesn't fall through to the
+    # `else` and hit the unhandled-message log.
+    discard
 
   of mkMempool:
     # BIP35: peer requests our mempool, respond with one or more inv
