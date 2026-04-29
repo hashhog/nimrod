@@ -203,6 +203,21 @@ suite "empty payload messages":
     check messageKindToCommand(mkMempool) == "mempool"
     check commandToMessageKind("mempool") == mkMempool
 
+  test "service flag values match BIP-protocol bits":
+    # NODE_NETWORK = (1 << 0), NODE_BLOOM = (1 << 2),
+    # NODE_WITNESS = (1 << 3), NODE_NETWORK_LIMITED = (1 << 10)
+    # See bitcoin-core/src/protocol.h. NODE_BLOOM (BIP-111) gates BIP-35
+    # `mempool` per net_processing.cpp:4852-4863.
+    check NodeNetwork == 1'u64
+    check NodeBloom == 4'u64
+    check NodeWitness == 8'u64
+    check NodeNetworkLimited == 1024'u64
+    # Bits are independent — composing them must round-trip.
+    let combined = NodeNetwork or NodeBloom or NodeWitness
+    check (combined and NodeBloom) == NodeBloom
+    check (combined and NodeWitness) == NodeWitness
+    check (NodeNetwork and NodeBloom) == 0'u64
+
 suite "ping/pong":
   test "ping round-trip":
     let msg = newPing(0xDEADBEEFCAFEBABE'u64)

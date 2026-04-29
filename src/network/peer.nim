@@ -463,14 +463,39 @@ proc readMessage*(peer: Peer): Future[P2PMessage] {.async.} =
   else:
     return await peer.readMessageV1()
 
+proc peerBloomFiltersEnabled*(): bool =
+  ## Gate for advertising NODE_BLOOM (service bit 1<<2) and for accepting
+  ## inbound BIP-35 `mempool` messages.  Mirrors Bitcoin Core's
+  ## `-peerbloomfilters` knob (`DEFAULT_PEERBLOOMFILTERS = false`,
+  ## net_processing.h:44): default OFF, opt-in via
+  ## `NIMROD_PEER_BLOOM_FILTERS=1` (or "true"/"yes"/"on").
+  ##
+  ## Nimrod doesn't actually serve BIP-37 bloom filters — but the bit
+  ## ALSO governs BIP-35 `mempool` per net_processing.cpp:4852-4863, and
+  ## that flow we DO support.  Operators who want to expose mempool inv
+  ## to peers flip this on.
+  let v = getEnv("NIMROD_PEER_BLOOM_FILTERS", "")
+  if v.len == 0:
+    return false
+  let lv = v.toLowerAscii()
+  lv == "1" or lv == "true" or lv == "yes" or lv == "on"
+
 proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
   ## Send version message
+  # Match Bitcoin Core's NODE_BLOOM gating (BIP-35/BIP-111): advertise the
+  # bit only when the operator has explicitly opted in via
+  # NIMROD_PEER_BLOOM_FILTERS.  The same flag gates inbound `mempool`
+  # message handling in nimrod.nim, so the two stay in sync — peers learn
+  # whether we'll honour `mempool` purely from the version services bits.
+  var ourServices = NodeNetwork or NodeWitness
+  if peerBloomFiltersEnabled():
+    ourServices = ourServices or NodeBloom
   let msg = newVersionMsg(
     version = ProtocolVersion,
-    services = NodeNetwork or NodeWitness,
+    services = ourServices,
     timestamp = stdtimes.getTime().toUnix(),
     addrRecv = NetAddress(services: NodeNetwork, port: peer.port),
-    addrFrom = NetAddress(services: NodeNetwork or NodeWitness, port: peer.params.p2pPort),
+    addrFrom = NetAddress(services: ourServices, port: peer.params.p2pPort),
     nonce = peer.localNonce,  # Use our unique nonce for self-connection detection
     userAgent = UserAgent,
     startHeight = ourHeight,

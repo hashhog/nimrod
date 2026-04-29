@@ -1,8 +1,10 @@
 ## Tests for peer connection module
 ## Unit tests for peer creation, IPv4 mapping, and state management
 
+import std/os
 import unittest2
 import ../src/network/peer
+import ../src/network/messages
 import ../src/consensus/params
 
 suite "peer creation":
@@ -148,6 +150,34 @@ suite "peer feature flags":
     let peer = newPeer("127.0.0.1", 18444, params)
 
     check peer.feeFilterRate == 0
+
+suite "NODE_BLOOM advertisement gate (BIP-35)":
+  # Mirrors bitcoin-core/src/net_processing.cpp:4852-4863:
+  #   if (!(peer.m_our_services & NODE_BLOOM) && !HasPermission(Mempool))
+  #     drop + disconnect (unless NoBan).
+  # We have no per-peer permission system, so the local advertisement
+  # flag IS the gate.  Default (no env var) must be OFF, matching
+  # DEFAULT_PEERBLOOMFILTERS = false in net_processing.h:44.
+  test "default (env unset) is OFF":
+    delEnv("NIMROD_PEER_BLOOM_FILTERS")
+    check peerBloomFiltersEnabled() == false
+
+  test "explicit '0' is OFF":
+    putEnv("NIMROD_PEER_BLOOM_FILTERS", "0")
+    check peerBloomFiltersEnabled() == false
+    delEnv("NIMROD_PEER_BLOOM_FILTERS")
+
+  test "'false' / 'no' / 'off' are OFF":
+    for v in ["false", "no", "off", "garbage", ""]:
+      putEnv("NIMROD_PEER_BLOOM_FILTERS", v)
+      check peerBloomFiltersEnabled() == false
+    delEnv("NIMROD_PEER_BLOOM_FILTERS")
+
+  test "'1' / 'true' / 'yes' / 'on' are ON":
+    for v in ["1", "true", "yes", "on", "TRUE", "On"]:
+      putEnv("NIMROD_PEER_BLOOM_FILTERS", v)
+      check peerBloomFiltersEnabled() == true
+    delEnv("NIMROD_PEER_BLOOM_FILTERS")
 
 when isMainModule:
   echo "Running peer tests..."
