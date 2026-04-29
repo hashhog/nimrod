@@ -14,6 +14,9 @@ import ../crypto/[secp256k1, hkdf, chacha20poly1305]
 import ../consensus/params
 
 export secp256k1.EllSwiftPubKey
+# Re-export AEADExpansion so callers in peer.nim can size v2 packets via
+# `import ./bip324` alone.
+export chacha20poly1305.AEADExpansion
 
 const
   # BIP-324 constants
@@ -157,8 +160,17 @@ proc initialize*(c: var BIP324Cipher, theirPubKey: EllSwiftPubKey,
     c.privateKey, c.ourPubKey, theirPubKey, initiator
   )
 
-  # Build salt: "bitcoin_v2_shared_secret" + magic bytes
-  let salt = "bitcoin_v2_shared_secret" & cast[string](magic)
+  # Build salt: "bitcoin_v2_shared_secret" + magic bytes.  Building via
+  # an explicit char append is necessary because `cast[string]` on a
+  # fixed-size byte array reinterprets the array's stack memory as a
+  # Nim string header (length prefix + ptr), reading garbage that
+  # crashes the HKDF call when the bytes happen to look like a non-nil
+  # but invalid string ptr.
+  var salt = "bitcoin_v2_shared_secret"
+  salt.add(char(magic[0]))
+  salt.add(char(magic[1]))
+  salt.add(char(magic[2]))
+  salt.add(char(magic[3]))
 
   # Initialize HKDF with the shared secret
   let hkdf = newHkdfSha256L32(ecdhSecret, salt)
@@ -270,28 +282,38 @@ proc decrypt*(c: var BIP324Cipher, encryptedPayload: openArray[byte],
 # Message encoding/decoding helpers
 # ==========================================================================
 
-proc encodeV2Message*(command: string, payload: openArray[byte]): seq[byte] =
-  ## Encode a message for v2 transport
-  ## Returns: message_type_id (1 byte) + payload
-  ##         OR: 0x00 + command (12 bytes) + payload (for unknown commands)
-  if command in shortMsgTypes:
-    let id = shortMsgTypes[command]
-    result = newSeq[byte](1 + payload.len)
-    result[0] = id
-    for i, b in payload:
-      result[1 + i] = b
-  else:
-    # Long-form encoding: 0x00 + 12-byte command + payload
-    result = newSeq[byte](1 + 12 + payload.len)
-    result[0] = 0x00
-    for i in 0..<min(command.len, 12):
-      result[1 + i] = byte(command[i])
-    for i in 0..<payload.len:
-      result[13 + i] = payload[i]
+proc encodeV2Message*(command: string, payload: openArray[byte]): seq[byte] {.gcsafe.} =
+  ## Encode a message for v2 transport.
+  ## Returns: `message_type_id (1 byte) || payload`
+  ##  OR     `0x00 || command (12 bytes) || payload` for unknown commands.
+  ##
+  ## See `decodeV2Message` for the gcsafe rationale.
+  {.gcsafe.}:
+    if command in shortMsgTypes:
+      let id = shortMsgTypes[command]
+      result = newSeq[byte](1 + payload.len)
+      result[0] = id
+      for i, b in payload:
+        result[1 + i] = b
+      return
 
-proc decodeV2Message*(content: openArray[byte]): tuple[command: string, payload: seq[byte]] =
-  ## Decode a message from v2 transport
-  ## Returns (command_string, payload)
+  # Long-form encoding: 0x00 + 12-byte command + payload
+  result = newSeq[byte](1 + 12 + payload.len)
+  result[0] = 0x00
+  for i in 0..<min(command.len, 12):
+    result[1 + i] = byte(command[i])
+  for i in 0..<payload.len:
+    result[13 + i] = payload[i]
+
+proc decodeV2Message*(content: openArray[byte]):
+    tuple[command: string, payload: seq[byte]] {.gcsafe.} =
+  ## Decode a message from v2 transport.
+  ## Returns (command_string, payload).
+  ##
+  ## `{.gcsafe.}`: the module-level `shortMsgTypesReverse` table is
+  ## initialised once at module load and never mutated, so reads are
+  ## safe across threads.  We tell the compiler explicitly because
+  ## global `let` Tables otherwise propagate gcsafety taint.
   if content.len == 0:
     raise newException(BIP324Error, "empty message content")
 
@@ -320,12 +342,13 @@ proc decodeV2Message*(content: openArray[byte]): tuple[command: string, payload:
     return (command, payload)
 
   # Short-form encoding
-  if firstByte in shortMsgTypesReverse:
-    let command = shortMsgTypesReverse[firstByte]
-    var payload = newSeq[byte](content.len - 1)
-    for i in 0..<payload.len:
-      payload[i] = content[1 + i]
-    return (command, payload)
+  {.gcsafe.}:
+    if firstByte in shortMsgTypesReverse:
+      let command = shortMsgTypesReverse[firstByte]
+      var payload = newSeq[byte](content.len - 1)
+      for i in 0..<payload.len:
+        payload[i] = content[1 + i]
+      return (command, payload)
 
   raise newException(BIP324Error, "unknown message type ID: 0x" & $firstByte.toHex(2))
 

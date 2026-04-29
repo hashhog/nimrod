@@ -65,6 +65,7 @@ import ./test_softforks_bridge
 import ./test_assumevalid
 import ./test_checkpoint
 import ./test_parallel_verify_ibd
+import ./test_bip324
 
 when isMainModule:
   echo "Running all tests..."
