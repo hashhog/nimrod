@@ -14,6 +14,7 @@ import ./mining/fees
 import ./rpc/server
 import ./rpc/rpc_thread
 import ./crypto/[secp256k1, hashing]
+import ./util/ops
 
 const NimrodVersion* = "0.1.0"
 
@@ -46,6 +47,22 @@ type
     metricsPort*: uint16  ## Prometheus metrics port (0 = disabled)
     ibdFlushInterval*: int ## Disk flush interval during IBD (0 = use default 2000)
     numVerifyWorkers*: int ## Script verify thread count for parallel IBD (0 = auto = CPU count)
+    # ---- Operational flags (Bitcoin Core parity) ----
+    daemon*: bool         ## --daemon: detach via fork+setsid; suppresses console.
+    pidFile*: string      ## --pid=<path>: PID file (default <datadir>/nimrod.pid)
+    confFile*: string     ## --conf=<path>: explicit config file (overrides default
+                          ## <datadir>/nimrod.conf)
+    debugCategories*: string ## --debug=<cat,...>: chronicles topics to enable
+    printToConsole*: bool ## --printtoconsole: keep stdout/stderr live even with
+                          ## --daemon. Without this and with --daemon, logs go
+                          ## to <datadir>/<network>/debug.log.
+    logFile*: string      ## --debuglogfile=<path>: explicit log destination.
+                          ## Empty == derive from datadir (or stdout if console).
+    readyFd*: int         ## --ready-fd=<N>: write '\n' to FD N once startup
+                          ## reaches the main loop. -1 = disabled.
+    reindex*: bool        ## --reindex: wipe chainstate before start (HONEST
+                          ## PROGRESS — does NOT re-scan blk*.dat; we drop
+                          ## chainstate so the next start triggers fresh IBD).
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -87,12 +104,25 @@ proc defaultConfig*(): NimrodConfig =
     pruneTarget: 0,  # Pruning disabled by default
     metricsPort: 9332,
     ibdFlushInterval: 0,  # 0 = use default (IbdBatchFlushInterval = 2000)
-    numVerifyWorkers: 0   # 0 = auto (CPU count via countProcessors())
+    numVerifyWorkers: 0,  # 0 = auto (CPU count via countProcessors())
+    daemon: false,
+    pidFile: "",          # derived from dataDir if empty
+    confFile: "",         # default <dataDir>/nimrod.conf
+    debugCategories: "",
+    printToConsole: false,
+    logFile: "",
+    readyFd: -1,
+    reindex: false
   )
 
 proc loadConfigFile*(config: var NimrodConfig) =
-  ## Load configuration from dataDir/nimrod.conf
-  let confPath = config.dataDir / "nimrod.conf"
+  ## Load configuration from `config.confFile` if set, else from
+  ## `<dataDir>/nimrod.conf`.  Silent no-op if the file doesn't exist
+  ## (matches Bitcoin Core behaviour for `-conf=`).
+  let confPath = if config.confFile.len > 0:
+                   config.confFile
+                 else:
+                   config.dataDir / "nimrod.conf"
   if not fileExists(confPath):
     return
 
@@ -154,6 +184,22 @@ proc loadConfigFile*(config: var NimrodConfig) =
         if v >= 0 and v <= 256:
           config.numVerifyWorkers = v
       except ValueError: discard
+    of "daemon":
+      config.daemon = value.toLowerAscii() in ["1", "true", "yes"]
+    of "pid":
+      config.pidFile = value
+    of "debug":
+      # Allow comma-separated multi-category specs in the config file too.
+      if config.debugCategories.len == 0:
+        config.debugCategories = value
+      else:
+        config.debugCategories &= "," & value
+    of "printtoconsole":
+      config.printToConsole = value.toLowerAscii() in ["1", "true", "yes"]
+    of "debuglogfile":
+      config.logFile = value
+    of "reindex":
+      config.reindex = value.toLowerAscii() in ["1", "true", "yes"]
     else:
       discard
 
@@ -193,10 +239,22 @@ Options:
   --prune=SIZE_MB        Enable pruning to keep SIZE_MB of blocks (min: 550)
   --ibd-flush-interval=N Force memtables to disk every N blocks during IBD (default: 2000, max: 5000)
   --verify-threads=N     Script verify thread count for parallel IBD (default: 0 = auto/CPU count)
+
+Operational:
+  --daemon               Detach via fork+setsid (Bitcoin Core -daemon)
+  --pid=PATH             PID file (default: <datadir>/nimrod.pid)
+  --conf=PATH            Config file path (default: <datadir>/nimrod.conf)
+  --debug=CAT[,CAT...]   Enable debug categories (net,p2p,sync,rpc,...; "all" enables all)
+  --printtoconsole       Keep stdout/stderr live even with --daemon
+  --debuglogfile=PATH    Log file path (default: <datadir>/<network>/debug.log under --daemon)
+  --ready-fd=N           Write '\\n' to FD N when startup is complete (supervision)
+  --reindex              Wipe chainstate before start (re-download from peers)
+
   -h, --help             Show this help
   -v, --version          Show version
 
-Config file: $datadir/nimrod.conf (key=value format)
+Config file: <datadir>/nimrod.conf or path passed via --conf (key=value format)
+SIGHUP: reopens the configured log file (rotation-friendly).
 """
 
 proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] =
@@ -306,6 +364,43 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
         except ValueError:
           echo "Invalid verify-threads: " & p.val
           quit(1)
+      of "daemon":
+        # Accept --daemon and --daemon=0/1.
+        if p.val.len == 0:
+          result.config.daemon = true
+        else:
+          result.config.daemon = p.val.toLowerAscii() in ["1", "true", "yes"]
+      of "pid":
+        result.config.pidFile = p.val
+      of "conf":
+        result.config.confFile = p.val
+      of "debug":
+        if result.config.debugCategories.len == 0:
+          result.config.debugCategories = p.val
+        else:
+          result.config.debugCategories &= "," & p.val
+      of "printtoconsole":
+        if p.val.len == 0:
+          result.config.printToConsole = true
+        else:
+          result.config.printToConsole = p.val.toLowerAscii() in ["1", "true", "yes"]
+      of "debuglogfile":
+        result.config.logFile = p.val
+      of "ready-fd", "readyfd":
+        try:
+          let fd = parseInt(p.val)
+          if fd < 0:
+            echo "ready-fd must be a non-negative file descriptor"
+            quit(1)
+          result.config.readyFd = fd
+        except ValueError:
+          echo "Invalid ready-fd: " & p.val
+          quit(1)
+      of "reindex":
+        if p.val.len == 0:
+          result.config.reindex = true
+        else:
+          result.config.reindex = p.val.toLowerAscii() in ["1", "true", "yes"]
       of "help", "h":
         showHelp()
         quit(0)
@@ -753,9 +848,20 @@ proc messageCallback(state: NodeState): peer.PeerCallback =
   return callback
 
 proc setupSignalHandlers*() =
-  ## Setup SIGINT/SIGTERM handlers for graceful shutdown
+  ## Setup SIGINT/SIGTERM handlers for graceful shutdown, plus SIGHUP for
+  ## log-file reopen (rotation-friendly; matches Bitcoin Core's
+  ## `OpenDebugLog` reopen-on-rotate behaviour).
+  proc sigHupHandler(sig: cint) {.noconv.} =
+    # Best-effort log reopen; never modifies node state. Safe for signal
+    # context because reopenLog uses only POSIX open/dup2/close.
+    reopenLog()
+
   proc sigHandler(sig: cint) {.noconv.} =
     echo "\nReceived signal " & $sig & ", shutting down..."
+
+    # Always remove the PID file we wrote on launch — even if globalNodeState
+    # is nil (early-startup crash path).
+    removePidFile()
 
     if globalNodeState != nil:
       globalNodeState.running = false
@@ -811,6 +917,7 @@ proc setupSignalHandlers*() =
 
   signal(SIGINT, sigHandler)
   signal(SIGTERM, sigHandler)
+  signal(SIGHUP, sigHupHandler)
 
 proc generateCookieFile*(dataDir: string): string =
   ## Generate a 32-byte random cookie, write "__cookie__:<hex>" to
@@ -1471,18 +1578,130 @@ proc runCommand(cmd: Command, config: NimrodConfig, args: seq[string]) {.async.}
   of cmdStart, cmdHelp, cmdVersion:
     discard  # Handled elsewhere
 
+proc applyReindex(config: NimrodConfig) =
+  ## --reindex (HONEST PROGRESS): wipe the chainstate dir so that the next
+  ## startup re-runs IBD from genesis. This is intentionally NARROWER than
+  ## Bitcoin Core's full -reindex which also re-scans `blk*.dat`. Nimrod
+  ## doesn't store undisturbed block files separately during normal sync —
+  ## the chainstate IS the canonical store — so wiping chainstate is the
+  ## meaningful operation we can perform without inventing a new on-disk
+  ## format. Documented as such in --help.
+  let networkDir = config.dataDir / config.network
+  let chainstateDir = networkDir / "chainstate"
+  if dirExists(chainstateDir):
+    echo "[--reindex] removing " & chainstateDir
+    try:
+      removeDir(chainstateDir)
+    except OSError as e:
+      echo "[--reindex] WARNING: failed to remove chainstate: " & e.msg
+      quit(1)
+  # Clear stray files that would otherwise drift from a fresh chainstate.
+  for stale in ["fee_estimates.json", "mempool.dat"]:
+    let p = networkDir / stale
+    if fileExists(p):
+      try: removeFile(p)
+      except OSError: discard
+  echo "[--reindex] chainstate cleared; node will resync from genesis"
+
+proc operationalSetup(config: var NimrodConfig) =
+  ## Apply daemonization, log redirection, PID-file, debug-topic and ready-FD
+  ## wiring.  Modifies `config` in-place to fill defaults (e.g. derived PID
+  ## path).  Called from `main()` between argument parsing and node start.
+  ## Order matters:
+  ##   1) reindex wipe — must happen before chainstate is opened by startNode.
+  ##   2) daemonize    — must happen before any long-lived FDs are opened.
+  ##   3) log redirect — must happen after daemonize so the new stdio is set.
+  ##   4) PID file     — must happen after daemonize so we record the daemon
+  ##                     PID, not the parent's.
+  ##   5) debug cats   — runtime-only, order doesn't matter.
+  ##   6) ready FD     — happens after the main loop is running (in startNode).
+
+  # Make sure dataDir exists so derived paths (PID, log) work even before
+  # startNode runs.
+  if not dirExists(config.dataDir):
+    createDir(config.dataDir)
+  let networkDir = config.dataDir / config.network
+  if not dirExists(networkDir):
+    createDir(networkDir)
+
+  # 1) reindex
+  if config.reindex:
+    applyReindex(config)
+
+  # Resolve default PID and log paths once (so the daemon path uses the
+  # same file the parent advertised).
+  if config.pidFile.len == 0:
+    config.pidFile = config.dataDir / "nimrod.pid"
+
+  let derivedLogPath =
+    if config.logFile.len > 0: config.logFile
+    elif config.daemon and not config.printToConsole:
+      networkDir / "debug.log"
+    else: ""
+
+  # 2) daemonize
+  if config.daemon:
+    # Pass derived log path so the daemon's stdio go directly to the log
+    # file (or /dev/null if --printtoconsole was set without --debuglogfile,
+    # which is unusual but legal).
+    let stdoutPath = if config.printToConsole: "" else: derivedLogPath
+    let stderrPath = stdoutPath
+    daemonize(stdoutPath, stderrPath)
+    # After daemonize, the parent has exited. We are the daemon.
+
+  # 3) log redirect (foreground case + when daemonize already routed but we
+  #    still want to track the path for SIGHUP reopen)
+  if derivedLogPath.len > 0:
+    # daemonize already dup2'd these FDs, but we still need to register the
+    # path with the SIGHUP handler.
+    if not config.daemon:
+      # Foreground: actually open the file now.
+      redirectLogToFile(derivedLogPath)
+    else:
+      # Daemon: stdio is already pointing at the log file via dup2, but
+      # SIGHUP reopen needs the path.
+      discard currentLogPath()  # touch lock-init
+      redirectLogToFile(derivedLogPath)
+
+  # 4) PID file
+  try:
+    writePidFile(config.pidFile)
+  except OSError as e:
+    echo "WARNING: failed to write PID file " & config.pidFile & ": " & e.msg
+
+  # 5) debug categories
+  if config.debugCategories.len > 0:
+    let cats = parseDebugCategories(config.debugCategories)
+    applyDebugCategories(cats)
+
 proc main() =
-  let (cmd, config, args) = parseArgs()
+  var (cmd, config, args) = parseArgs()
 
   # Check for --import-blocks before normal startup
   if config.importBlocks.len > 0:
+    # Honour reindex wipe even on import path so a stale chainstate
+    # doesn't poison the import.
+    if config.reindex:
+      applyReindex(config)
     runBlockImport(config)
     return
 
   case cmd
   of cmdStart:
+    operationalSetup(config)
     setupSignalHandlers()
-    waitFor startNode(config)
+    # Signal readiness AFTER the initial setup but BEFORE the long-lived
+    # event loop.  We can't easily wait for "first connect" without a
+    # bigger refactor, so this is "the daemon is past startup and about to
+    # enter the main loop" — sufficient for systemd-style supervision.
+    if config.readyFd >= 0:
+      signalReadyFd(config.readyFd)
+    try:
+      waitFor startNode(config)
+    finally:
+      # Belt-and-braces: ensure PID file is removed even on unhandled error
+      # paths that don't go through the SIGINT/SIGTERM handler.
+      removePidFile()
 
   of cmdHelp:
     showHelp()

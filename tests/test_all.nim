@@ -71,6 +71,7 @@ import ./test_bip324
 import ./test_standard
 import ./test_bip331
 import ./test_mempool_persist
+import ./test_ops
 
 when isMainModule:
   echo "Running all tests..."
