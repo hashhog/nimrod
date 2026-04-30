@@ -1256,9 +1256,21 @@ proc metricsHandler(state: NodeState, transp: StreamTransport) {.async.} =
   await transp.closeWait()
 
 proc startMetricsServer(state: NodeState, port: uint16) {.async.} =
-  ## Start Prometheus metrics HTTP server
+  ## Start Prometheus metrics HTTP server.
+  ## Bind failures (e.g. EADDRINUSE) MUST NOT crash the node — degrade
+  ## to "metrics disabled" and let the node keep serving RPC + P2P.
+  ## The previous behaviour let TransportOsError escape to asyncSpawn,
+  ## which raised FutureDefect on the chronos event loop and killed the
+  ## process (regression caught by tools/smoke-harness.sh when port 9332
+  ## was already held by another fleet node — e.g. mainnet blockbrew).
   let ta = initTAddress("0.0.0.0", Port(port))
-  let server = createStreamServer(ta, flags = {ReuseAddr})
+  var server: StreamServer
+  try:
+    server = createStreamServer(ta, flags = {ReuseAddr})
+  except CatchableError as e:
+    error "metrics server bind failed; metrics disabled",
+          port = port, error = e.msg
+    return
 
   info "Prometheus metrics server started", port = port
 
