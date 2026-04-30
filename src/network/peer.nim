@@ -105,6 +105,8 @@ type
     sendHeaders*: bool
     wtxidRelay*: bool
     wantsAddrV2*: bool           # Peer signaled ADDRv2 support (BIP155)
+    sendsPackages*: bool         # Peer sent BIP-331 sendpackages
+    pkgRelayVersion*: uint32     # BIP-331 protocol version (0 if not negotiated)
     # Handshake state tracking (Bitcoin Core: pfrom.nVersion != 0, fSuccessfullyConnected)
     handshakeComplete*: bool     # True after both VERSION and VERACK exchanged
     versionReceived*: bool       # True after receiving VERSION
@@ -1354,7 +1356,26 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
             hash = $resp.blockHash
 
   of mkSendPackages:
-    trace "peer supports packages", peer = $peer
+    # BIP-331: peer signals package-relay support. Per the BIP, sendpackages
+    # carries no version field on the wire (versioning is done out-of-band
+    # via service bits / future extensions). Just record the flag so we can
+    # respond to inv/getpkgtxns that depend on this.
+    peer.sendsPackages = true
+    peer.pkgRelayVersion = 1
+    info "peer supports package relay (BIP-331)", peer = $peer
+
+  of mkGetPkgTxns:
+    # Real handler must look up the package keyed by child wtxid in the
+    # mempool. Dispatched to NodeState.handleMessage (callback path) which
+    # has access to the mempool. This trace is the peer-loop's record.
+    trace "received getpkgtxns", peer = $peer,
+          childWtxid = msg.getPkgTxns.childWtxid
+
+  of mkPkgTxns:
+    # Real handler must validate + accept each tx via mempool.acceptPackage.
+    # Dispatched to NodeState.handleMessage (callback path).
+    trace "received pkgtxns", peer = $peer,
+          txCount = msg.pkgTxns.transactions.len
 
   of mkSendTxRcncl:
     trace "peer supports tx reconciliation", peer = $peer

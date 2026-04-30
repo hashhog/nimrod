@@ -1,7 +1,7 @@
 ## nimrod - Bitcoin full node in Nim
 ## Unified CLI with subcommands for node operation, RPC interaction, and wallet management
 
-import std/[parseopt, os, strutils, json, posix, net, base64, sysrand, tables, monotimes, times, sets, options]
+import std/[parseopt, os, strutils, json, posix, net, base64, sysrand, tables, monotimes, times, sets, options, algorithm]
 import chronos
 import chronicles
 
@@ -675,6 +675,73 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
   of mkPing:
     # Respond with pong
     discard
+
+  of mkGetPkgTxns:
+    # BIP-331: peer wants the ancestor package whose child has the supplied
+    # wtxid. Look the child up in our mempool, walk its ancestors, and reply
+    # with `pkgtxns` (parents first, child last, capped at MaxPkgTxnsCount).
+    if state.mempool == nil:
+      trace "getpkgtxns before mempool init", peer = $peer
+    else:
+      var childTxid: TxId
+      var childFound = false
+      let target = msg.getPkgTxns.childWtxid
+      {.gcsafe.}:
+        for txid, entry in state.mempool.entries:
+          if array[32, byte](entry.tx.wtxid()) == target:
+            childTxid = txid
+            childFound = true
+            break
+      if not childFound:
+        trace "getpkgtxns: child wtxid not in mempool",
+              peer = $peer, wtxid = target
+      else:
+        # Build parents-first topo order: ancestors from calculateAncestors
+        # are unordered, so we sort by ancestorCount as a coarse proxy.
+        var pkgTxs: seq[Transaction]
+        var ancestorIds: seq[TxId]
+        {.gcsafe.}:
+          let ancestors = state.mempool.calculateAncestors(
+            state.mempool.entries[childTxid].tx)
+          for aid in ancestors:
+            if aid != childTxid:
+              ancestorIds.add(aid)
+        # Sort ancestors so lowest ancestorCount comes first (i.e. roots).
+        ancestorIds.sort(proc(a, b: TxId): int =
+          let ea = state.mempool.entries[a]
+          let eb = state.mempool.entries[b]
+          cmp(ea.ancestorCount, eb.ancestorCount))
+        for aid in ancestorIds:
+          pkgTxs.add(state.mempool.entries[aid].tx)
+          if pkgTxs.len >= MaxPkgTxnsCount - 1:
+            break
+        pkgTxs.add(state.mempool.entries[childTxid].tx)
+        try:
+          await peer.sendMessage(newPkgTxns(pkgTxs))
+          debug "served pkgtxns", peer = $peer,
+                child = childTxid, txCount = pkgTxs.len
+        except CatchableError as e:
+          debug "pkgtxns send failed", peer = $peer, error = e.msg
+
+  of mkPkgTxns:
+    # BIP-331: peer delivered an ancestor package. Try to accept each tx in
+    # order (parents first); skip-don't-fail on individual errors.
+    if state.mempool == nil:
+      trace "pkgtxns before mempool init", peer = $peer
+    else:
+      var accepted = 0
+      for tx in msg.pkgTxns.transactions:
+        {.gcsafe.}:
+          try:
+            let r = state.mempool.acceptTransaction(tx, state.crypto)
+            if r.isOk: inc accepted
+          except CatchableError:
+            discard
+          except Exception:
+            discard
+      debug "processed pkgtxns",
+            peer = $peer, total = msg.pkgTxns.transactions.len,
+            accepted = accepted
 
   else:
     discard

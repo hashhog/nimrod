@@ -16,6 +16,7 @@ const
   MaxLocatorSz* = 101              # BIP0152: max getheaders/getblocks locator entries
   MaxGetBlocksInvCount* = 500      # net_processing.cpp:4217 nLimit
   MaxGetAddrCount* = 1000          # Cap for getaddr response (matches Bitcoin Core)
+  MaxPkgTxnsCount* = 25            # BIP-331: max txs per pkgtxns (== mempool ancestor limit)
   ProtocolVersion* = 70016'u32
   UserAgent* = "/nimrod:0.1.0/"
   NodeNetwork* = 1'u64
@@ -80,6 +81,17 @@ type
   SendPackagesMsg* = object
     version*: uint32  ## Package relay protocol version
 
+  ## BIP-331 ``getpkgtxns`` — request a package by announcing the child wtxid.
+  ## Wire format: 32-byte child witness txid (raw, no compactsize).
+  GetPkgTxnsMsg* = object
+    childWtxid*: array[32, byte]
+
+  ## BIP-331 ``pkgtxns`` — deliver the child's full ancestor package.
+  ## Wire format: compactsize tx_count followed by tx_count CTransaction
+  ## records (with witness). Limited to MaxPkgTxnsCount transactions.
+  PkgTxnsMsg* = object
+    transactions*: seq[Transaction]
+
   ## BIP330 sendtxrcncl - signal transaction reconciliation support
   SendTxRcnclMsg* = object
     version*: uint32   ## Reconciliation protocol version (currently 1)
@@ -130,6 +142,9 @@ type
     mkBlockTxn
     mkSendPackages
     mkMempool
+    # BIP-331 package relay messages
+    mkGetPkgTxns
+    mkPkgTxns
     # BIP330 Erlay messages
     mkSendTxRcncl
     mkReqRecon
@@ -179,6 +194,11 @@ type
       getBlockTxn*: BlockTxnRequest
     of mkBlockTxn:
       blockTxn*: BlockTxnResponse
+    # BIP-331 package relay
+    of mkGetPkgTxns:
+      getPkgTxns*: GetPkgTxnsMsg
+    of mkPkgTxns:
+      pkgTxns*: PkgTxnsMsg
     # BIP330 Erlay messages
     of mkSendTxRcncl:
       sendTxRcncl*: SendTxRcnclMsg
@@ -416,6 +436,15 @@ proc serializePayload*(msg: P2PMessage): seq[byte] =
     w.writeBlockTxnRequest(msg.getBlockTxn)
   of mkBlockTxn:
     w.writeBlockTxnResponse(msg.blockTxn)
+  # BIP-331 package relay
+  of mkGetPkgTxns:
+    # Wire: raw 32-byte wtxid (no compactsize)
+    w.writeBytes(msg.getPkgTxns.childWtxid)
+  of mkPkgTxns:
+    # Wire: compactsize tx_count + tx_count CTransaction(with witness)
+    w.writeCompactSize(uint64(msg.pkgTxns.transactions.len))
+    for tx in msg.pkgTxns.transactions:
+      w.writeTransaction(tx)
   # BIP330 Erlay messages
   of mkSendTxRcncl:
     w.writeUint32LE(msg.sendTxRcncl.version)
@@ -464,6 +493,9 @@ proc messageKindToCommand*(kind: MessageKind): string =
   of mkBlockTxn: "blocktxn"
   of mkSendPackages: "sendpackages"
   of mkMempool: "mempool"
+  # BIP-331
+  of mkGetPkgTxns: "getpkgtxns"
+  of mkPkgTxns: "pkgtxns"
   # BIP330 Erlay
   of mkSendTxRcncl: "sendtxrcncl"
   of mkReqRecon: "reqrecon"
@@ -499,6 +531,9 @@ proc commandToMessageKind*(cmd: string): MessageKind =
   of "blocktxn": mkBlockTxn
   of "sendpackages": mkSendPackages
   of "mempool": mkMempool
+  # BIP-331
+  of "getpkgtxns": mkGetPkgTxns
+  of "pkgtxns": mkPkgTxns
   # BIP330 Erlay
   of "sendtxrcncl": mkSendTxRcncl
   of "reqrecon": mkReqRecon
@@ -641,6 +676,23 @@ proc deserializePayload*(cmd: string, payload: seq[byte]): P2PMessage =
     result = P2PMessage(kind: mkBlockTxn, blockTxn: r.readBlockTxnResponse())
   of "sendpackages":
     result = P2PMessage(kind: mkSendPackages)
+  of "getpkgtxns":
+    # BIP-331: 32-byte wtxid, no length prefix.
+    let wtxidBytes = r.readBytes(32)
+    var w: array[32, byte]
+    for i in 0 ..< 32: w[i] = wtxidBytes[i]
+    result = P2PMessage(kind: mkGetPkgTxns,
+                        getPkgTxns: GetPkgTxnsMsg(childWtxid: w))
+  of "pkgtxns":
+    let txCount = r.readCompactSize()
+    if txCount > MaxPkgTxnsCount.uint64:
+      raise newException(SerializationError,
+        "pkgtxns: tx count " & $txCount & " exceeds max " & $MaxPkgTxnsCount)
+    var txs: seq[Transaction]
+    for _ in 0 ..< int(txCount):
+      txs.add(r.readTransaction())
+    result = P2PMessage(kind: mkPkgTxns,
+                        pkgTxns: PkgTxnsMsg(transactions: txs))
   of "mempool":
     # BIP35: empty body, peer is requesting our mempool inv
     result = P2PMessage(kind: mkMempool)
@@ -793,6 +845,16 @@ proc newBlockTxnMsg*(blockHash: BlockHash, txns: seq[Transaction]): P2PMessage =
 proc newSendPackages*(): P2PMessage =
   ## Signal support for package relay (BIP 331)
   P2PMessage(kind: mkSendPackages)
+
+proc newGetPkgTxns*(childWtxid: array[32, byte]): P2PMessage =
+  ## BIP-331: request the ancestor package whose child has wtxid `childWtxid`.
+  P2PMessage(kind: mkGetPkgTxns,
+             getPkgTxns: GetPkgTxnsMsg(childWtxid: childWtxid))
+
+proc newPkgTxns*(transactions: seq[Transaction]): P2PMessage =
+  ## BIP-331: deliver the ancestor package (parents first, child last).
+  P2PMessage(kind: mkPkgTxns,
+             pkgTxns: PkgTxnsMsg(transactions: transactions))
 
 # BIP330 Erlay message constructors
 
