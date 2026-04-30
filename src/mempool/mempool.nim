@@ -8,7 +8,8 @@ import ../storage/chainstate
 import ../crypto/secp256k1
 import ../script/interpreter
 import ./package
-export package
+import ./standard
+export package, standard
 
 type
   MempoolError* = object of CatchableError
@@ -510,7 +511,7 @@ proc evictEphemeralDustParents*(mp: Mempool, txid: TxId) =
       mp.removeTransaction(parentTxid)
 
 # Calculate transaction weight
-proc calculateWeight(tx: Transaction): int =
+proc calculateWeight*(tx: Transaction): int =
   let fullSize = serialize(tx, includeWitness = true).len
   let baseSize = serializeLegacy(tx).len
   # Weight = baseSize * 3 + fullSize (BIP141)
@@ -727,6 +728,16 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
   let weight = calculateWeight(tx)
   if weight > MaxStandardTxWeight:
     return err(TxId, "transaction weight " & $weight & " exceeds max " & $MaxStandardTxWeight)
+
+  # Standardness check (Bitcoin Core IsStandardTx, policy/policy.cpp).
+  # Coinbase is excluded — it is rejected upstream by checkTransaction()
+  # (no inputs from a real tx is impossible here, but be explicit).
+  if tx.inputs.len > 0 and not (tx.inputs.len == 1 and
+       array[32, byte](tx.inputs[0].prevOut.txid) == default(array[32, byte]) and
+       tx.inputs[0].prevOut.vout == 0xFFFFFFFF'u32):
+    let stdRes = isStandardTx(tx)
+    if not stdRes.ok:
+      return err(TxId, "non-standard tx (" & stdRes.reason & ")")
 
   # Check for conflicts with mempool transactions (Full RBF)
   let conflicts = mp.findConflicts(tx)
