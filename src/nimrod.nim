@@ -9,7 +9,7 @@ import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
 import ./storage/[db, chainstate]
 import ./network/[peer, peermanager, sync, messages]
-import ./mempool/mempool
+import ./mempool/[mempool, persist]
 import ./mining/fees
 import ./rpc/server
 import ./rpc/rpc_thread
@@ -788,6 +788,13 @@ proc setupSignalHandlers*() =
         info "saving fee estimates", path = feePath
         globalNodeState.feeEstimator.saveFeeEstimates(feePath)
 
+      # Dump mempool to mempool.dat (Bitcoin Core compatible).
+      if globalNodeState.mempool != nil:
+        let mempoolPath = globalNodeState.config.dataDir /
+                          globalNodeState.config.network / CurrentMempoolDumpFile
+        info "saving mempool", path = mempoolPath
+        discard dumpMempool(globalNodeState.mempool, mempoolPath)
+
       # Disconnect peers
       if globalNodeState.peerManager != nil:
         info "disconnecting peers"
@@ -1221,6 +1228,24 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # 3. Initialize mempool
   info "initializing mempool"
   state.mempool = newMempool(state.chainState, params)
+
+  # 3a. Restore mempool from prior shutdown dump (mempool.dat). Best-effort:
+  # any tx that fails to re-accept is dropped silently, matching Core.
+  block restoreMempool:
+    let mempoolDumpPath = networkDir / CurrentMempoolDumpFile
+    if fileExists(mempoolDumpPath):
+      {.gcsafe.}:
+        try:
+          let r = loadMempool(state.mempool, mempoolDumpPath, state.crypto)
+          if r.isSome:
+            let counts = r.get()
+            info "mempool.dat loaded",
+                 succeeded = counts.succeeded, failed = counts.failed,
+                 expired = counts.expired, alreadyThere = counts.alreadyThere
+        except CatchableError as e:
+          warn "loadMempool raised, continuing", error = e.msg
+        except Exception as e:
+          warn "loadMempool raised (non-Catchable), continuing", error = e.msg
 
   # 4. Initialize fee estimator
   info "initializing fee estimator"

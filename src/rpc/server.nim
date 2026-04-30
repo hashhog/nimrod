@@ -9,7 +9,7 @@ import jsony
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation, chain, versionbits]
 import ../storage/[chainstate, blockstore]
-import ../mempool/[mempool, package]
+import ../mempool/[mempool, package, persist]
 import ../crypto/[hashing, secp256k1, address]
 import ../network/[peer, peermanager, banman]
 import ../mining/[fees, blocktemplate]
@@ -792,6 +792,48 @@ proc handleGetMempoolEntry(rpc: RpcServer, params: JsonNode): JsonNode =
     "spentby": [],  # TODO: calculate spenders
     "bip125-replaceable": true,
     "unbroadcast": false
+  }
+
+proc handleDumpMempool(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Dumps the mempool to mempool.dat in the data directory.
+  ## Bitcoin Core compatible (rpc/mempool.cpp dumpmempool).
+  ##
+  ## Optional second positional param is a target filename. We resolve it
+  ## relative to the rpc-server-known data directory; if omitted, default
+  ## to <network-datadir>/mempool.dat. The path is also returned.
+  if rpc.mempool == nil:
+    raise newRpcError(RpcInternalError, "Mempool unavailable")
+  # We don't track the data directory on RpcServer directly, so accept a
+  # filename param (matches Core's optional first arg) or fall back to
+  # the cwd. nimrod typically launches with cwd = data dir, so this is OK
+  # for now; the server-side persistent dump is wired in the shutdown path.
+  var path = CurrentMempoolDumpFile
+  if params.len >= 1 and params[0].kind == JString:
+    path = params[0].getStr()
+
+  let ok = dumpMempool(rpc.mempool, path)
+  if not ok:
+    raise newRpcError(RpcInternalError, "dumpmempool failed (see node log)")
+  %*{ "filename": path }
+
+proc handleLoadMempool(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Loads mempool.dat into the running mempool. Bitcoin Core compatible.
+  if rpc.mempool == nil:
+    raise newRpcError(RpcInternalError, "Mempool unavailable")
+  var path = CurrentMempoolDumpFile
+  if params.len >= 1 and params[0].kind == JString:
+    path = params[0].getStr()
+
+  let r = loadMempool(rpc.mempool, path, rpc.crypto)
+  if r.isNone:
+    raise newRpcError(RpcInternalError,
+      "loadmempool: " & path & " not found or unreadable")
+  let counts = r.get()
+  %*{
+    "succeeded":    counts.succeeded,
+    "failed":       counts.failed,
+    "expired":      counts.expired,
+    "alreadythere": counts.alreadyThere
   }
 
 # Raw transaction RPCs
@@ -3829,6 +3871,13 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
     rpc.handleGetRawMempool(params)
   of "getmempoolentry":
     rpc.handleGetMempoolEntry(params)
+  of "dumpmempool":
+    rpc.handleDumpMempool(params)
+  of "loadmempool":
+    rpc.handleLoadMempool(params)
+  of "savemempool":
+    # Bitcoin Core alias for dumpmempool. Keep parity.
+    rpc.handleDumpMempool(params)
 
   # Raw transactions
   of "getrawtransaction":

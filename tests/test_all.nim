@@ -68,6 +68,9 @@ import ./test_assumevalid
 import ./test_checkpoint
 import ./test_parallel_verify_ibd
 import ./test_bip324
+import ./test_standard
+import ./test_bip331
+import ./test_mempool_persist
 
 when isMainModule:
   echo "Running all tests..."
