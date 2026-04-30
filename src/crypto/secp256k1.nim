@@ -38,6 +38,10 @@ type
     ## X-only public key for Schnorr signatures (BIP340)
     data*: array[64, byte]
 
+  Secp256k1RecoverableSignature* = object
+    ## Recoverable ECDSA signature (64-byte sig + recovery id)
+    data*: array[65, byte]
+
   Secp256k1Error* = object of CatchableError
 
   # ElligatorSwift types for BIP-324
@@ -162,6 +166,37 @@ when defined(useSystemSecp256k1):
     msg: ptr byte,
     msgLen: csize_t,
     pubkey: ptr Secp256k1XonlyPubkey
+  ): cint {.importc, cdecl.}
+
+  # Recoverable ECDSA bindings (--enable-module-recovery)
+  proc secp256k1_ecdsa_sign_recoverable(
+    ctx: Secp256k1Context,
+    sig: ptr Secp256k1RecoverableSignature,
+    msg32: ptr byte,
+    seckey: ptr byte,
+    noncefp: pointer,
+    ndata: pointer
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_ecdsa_recoverable_signature_serialize_compact(
+    ctx: Secp256k1Context,
+    output64: ptr byte,
+    recid: ptr cint,
+    sig: ptr Secp256k1RecoverableSignature
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_ecdsa_recoverable_signature_parse_compact(
+    ctx: Secp256k1Context,
+    sig: ptr Secp256k1RecoverableSignature,
+    input64: ptr byte,
+    recid: cint
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_ecdsa_recover(
+    ctx: Secp256k1Context,
+    pubkey: ptr Secp256k1Pubkey,
+    sig: ptr Secp256k1RecoverableSignature,
+    msg32: ptr byte
   ): cint {.importc, cdecl.}
 
   # ElligatorSwift FFI bindings (BIP-324)
@@ -493,6 +528,63 @@ when defined(useSystemSecp256k1):
       getContext(), addr sig[0], addr msgData[0], csize_t(msg.len), addr xonlyPk
     ) == 1
 
+  proc signCompactRecoverable*(
+    privateKey: PrivateKey, msgHash: array[32, byte]
+  ): tuple[sig: array[64, byte], recid: int] =
+    ## Sign a 32-byte message hash with a recoverable ECDSA signature.
+    ## Returns (compact 64-byte sig, recovery id 0..3).
+    ## Mirrors Bitcoin Core's CKey::SignCompact (sans header byte).
+    var rsig: Secp256k1RecoverableSignature
+    var pk = privateKey
+    var msg = msgHash
+    if secp256k1_ecdsa_sign_recoverable(
+      getContext(), addr rsig, addr msg[0], addr pk[0], nil, nil
+    ) != 1:
+      raise newException(Secp256k1Error, "failed to sign recoverable")
+
+    var recid: cint = -1
+    if secp256k1_ecdsa_recoverable_signature_serialize_compact(
+      getContext(), addr result.sig[0], addr recid, addr rsig
+    ) != 1:
+      raise newException(Secp256k1Error, "failed to serialize recoverable signature")
+    result.recid = int(recid)
+
+  proc recoverCompactPubkey*(
+    msgHash: array[32, byte], sig64: array[64, byte], recid: int, compressed: bool
+  ): seq[byte] =
+    ## Recover a public key from a compact recoverable signature.
+    ## Returns serialized pubkey (33 bytes if compressed, 65 if uncompressed),
+    ## or empty seq on failure.
+    ## Mirrors Bitcoin Core's CPubKey::RecoverCompact.
+    if recid < 0 or recid > 3:
+      return @[]
+    var rsig: Secp256k1RecoverableSignature
+    var sigBytes = sig64
+    if secp256k1_ecdsa_recoverable_signature_parse_compact(
+      getContext(), addr rsig, addr sigBytes[0], cint(recid)
+    ) != 1:
+      return @[]
+
+    var pubkey: Secp256k1Pubkey
+    var msg = msgHash
+    if secp256k1_ecdsa_recover(
+      getContext(), addr pubkey, addr rsig, addr msg[0]
+    ) != 1:
+      return @[]
+
+    let flags: cuint =
+      if compressed: SECP256K1_EC_COMPRESSED
+      else: 2'u32  # SECP256K1_EC_UNCOMPRESSED
+    var outputLen: csize_t = if compressed: 33 else: 65
+    result = newSeq[byte](int(outputLen))
+    if secp256k1_ec_pubkey_serialize(
+      getContext(), addr result[0], addr outputLen,
+      addr pubkey, flags
+    ) != 1:
+      return @[]
+    if int(outputLen) != result.len:
+      result.setLen(int(outputLen))
+
   proc tweakXonlyPubkey*(
     internalPk: array[32, byte],
     tweak: array[32, byte]
@@ -736,6 +828,16 @@ else:
     msg: openArray[byte],
     signature: SchnorrSignature
   ): bool =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc signCompactRecoverable*(
+    privateKey: PrivateKey, msgHash: array[32, byte]
+  ): tuple[sig: array[64, byte], recid: int] =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc recoverCompactPubkey*(
+    msgHash: array[32, byte], sig64: array[64, byte], recid: int, compressed: bool
+  ): seq[byte] =
     raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
 
   # Stub CryptoEngine
