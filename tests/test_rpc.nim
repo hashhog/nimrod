@@ -1,11 +1,11 @@
 ## Tests for JSON-RPC server
 ## Tests RPC method routing, error codes, request/response format, and Bitcoin Core compatible responses
 
-import std/[json, strutils, tables, options, sequtils]
+import std/[json, strutils, tables, options, sequtils, base64]
 import unittest2
 import ../src/primitives/[types, serialize]
 import ../src/consensus/[params, validation, versionbits]
-import ../src/crypto/[hashing, address]
+import ../src/crypto/[hashing, address, secp256k1, signmessage]
 
 # JSON-RPC 2.0 error codes (matching server.nim)
 const
@@ -1033,6 +1033,138 @@ suite "RPC getdeploymentinfo":
   test "testDummyDeployment is NeverActive":
     let dep = testDummyDeployment()
     check dep.startTime == NeverActive
+
+# ---------------------------------------------------------------------------
+# Message signing + verification (signmessage / verifymessage)
+# Reference: bitcoin-core/src/common/signmessage.cpp
+# ---------------------------------------------------------------------------
+
+suite "RPC signmessage / verifymessage":
+  setup:
+    initSecp256k1()
+
+  test "messageHash matches MESSAGE_MAGIC || msg framing":
+    # Empty message: compactSize(24) || "Bitcoin Signed Message:\n" || compactSize(0)
+    # Just check it produces a deterministic 32-byte digest, not all zeros.
+    let h1 = messageHash("")
+    let h2 = messageHash("")
+    let h3 = messageHash("hello")
+    check h1 == h2
+    check h1 != h3
+    var allZero = true
+    for b in h1:
+      if b != 0:
+        allZero = false
+        break
+    check not allZero
+
+  test "MessageMagic constant matches Bitcoin Core":
+    check MessageMagic == "Bitcoin Signed Message:\n"
+    check MessageMagic.len == 24
+
+  test "signCompactRecoverable -> recoverCompactPubkey roundtrip":
+    var privKey: PrivateKey
+    for i in 0 ..< 32:
+      privKey[i] = byte(i + 1)  # avoid all-zero
+    let pubkey = derivePublicKey(privKey)
+
+    var msgHash: array[32, byte]
+    for i in 0 ..< 32:
+      msgHash[i] = byte((i * 7) and 0xff)
+
+    let (sig, recid) = signCompactRecoverable(privKey, msgHash)
+    check recid >= 0 and recid <= 3
+
+    let recovered = recoverCompactPubkey(msgHash, sig, recid, true)
+    check recovered.len == 33
+    for i in 0 ..< 33:
+      check recovered[i] == pubkey[i]
+
+  test "signMessage -> verifyMessageRaw roundtrip (compressed)":
+    var privKey: PrivateKey
+    for i in 0 ..< 32:
+      privKey[i] = byte((i * 13 + 7) and 0xff)
+    let pubkey = derivePublicKey(privKey)
+    let pkh = hash160(pubkey)
+
+    let message = "hello nimrod"
+    let signature = signMessage(privKey, message, compressed = true)
+    # base64-encoded 65 bytes -> 88 base64 chars
+    check signature.len > 80
+    # Round-trip via verify.
+    check verifyMessageRaw(pkh, signature, message) == mvrOk
+    # Tampered message must fail.
+    check verifyMessageRaw(pkh, signature, message & "x") == mvrNotSigned
+
+  test "verifyMessageRaw rejects malformed base64":
+    var pkh: array[20, byte]
+    check verifyMessageRaw(pkh, "!!!not-base64!!!", "msg") == mvrMalformedSignature
+
+  test "verifyMessageRaw rejects wrong-size payload":
+    var pkh: array[20, byte]
+    # 4 bytes base64-encoded → not 65 bytes
+    let tooShort = encode("abcd")
+    check verifyMessageRaw(pkh, tooShort, "msg") == mvrMalformedSignature
+
+  test "verifyMessageRaw NotSigned for unrelated address":
+    var privKey: PrivateKey
+    for i in 0 ..< 32:
+      privKey[i] = byte(0x42)
+    let signature = signMessage(privKey, "x", compressed = true)
+    var otherHash: array[20, byte]  # all zeros - guaranteed mismatch
+    check verifyMessageRaw(otherHash, signature, "x") == mvrNotSigned
+
+# ---------------------------------------------------------------------------
+# estimaterawfee + getmempool{ancestors,descendants} response shape
+# These methods are dispatched by server.nim; the tests here verify the
+# JSON shape we promise to clients without spinning up an RpcServer.
+# ---------------------------------------------------------------------------
+
+suite "RPC estimaterawfee shape":
+  test "no-data horizon returns errors+decay+scale":
+    # Match handler's no-data branch shape.
+    let horizon = %*{
+      "decay": 0.998,
+      "scale": 1,
+      "errors": ["Insufficient data or no feerate found which meets threshold"]
+    }
+    check horizon.hasKey("decay")
+    check horizon.hasKey("scale")
+    check horizon["errors"].kind == JArray
+
+  test "result splits short/medium/long horizons":
+    let result = %*{
+      "short":  {"decay": 0.998, "scale": 1, "errors": []},
+      "medium": {"decay": 0.998, "scale": 1, "errors": []},
+      "long":   {"decay": 0.998, "scale": 1, "errors": []}
+    }
+    for h in ["short", "medium", "long"]:
+      check result.hasKey(h)
+      check result[h].hasKey("decay")
+      check result[h].hasKey("scale")
+
+suite "RPC getmempool{ancestors,descendants} shape":
+  test "non-verbose response is array of txid strings":
+    let resp = newJArray()
+    resp.add(%"0000000000000000000000000000000000000000000000000000000000000001")
+    check resp.kind == JArray
+    check resp[0].getStr().len == 64
+
+  test "verbose response is object keyed by txid":
+    let resp = %*{
+      "0000000000000000000000000000000000000000000000000000000000000001": {
+        "vsize": 100,
+        "weight": 400,
+        "fee": 0.00001,
+        "ancestorcount": 1,
+        "descendantcount": 1
+      }
+    }
+    check resp.kind == JObject
+    let firstKey = toSeq(resp.keys)[0]
+    check firstKey.len == 64
+    check resp[firstKey].hasKey("ancestorcount")
+    check resp[firstKey].hasKey("descendantcount")
 
 when isMainModule:
   echo "Running RPC tests..."

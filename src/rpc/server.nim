@@ -10,7 +10,7 @@ import ../primitives/[types, serialize]
 import ../consensus/[params, validation, chain, versionbits]
 import ../storage/[chainstate, blockstore]
 import ../mempool/[mempool, package, persist]
-import ../crypto/[hashing, secp256k1, address]
+import ../crypto/[hashing, secp256k1, address, signmessage]
 import ../network/[peer, peermanager, banman]
 import ../mining/[fees, blocktemplate]
 import ../wallet/wallet
@@ -793,6 +793,105 @@ proc handleGetMempoolEntry(rpc: RpcServer, params: JsonNode): JsonNode =
     "bip125-replaceable": true,
     "unbroadcast": false
   }
+
+proc parseTxidParam(hexStr: string): TxId =
+  ## Decode a 64-char display-format hex txid into the internal LE representation.
+  if hexStr.len != 64:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid txid")
+  var bytes: array[32, byte]
+  let reversed = reverseHex(hexStr)
+  for i in 0 ..< 32:
+    bytes[i] = byte(parseHexInt(reversed[i*2 .. i*2+1]))
+  TxId(bytes)
+
+proc mempoolEntryJson(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNode =
+  ## Verbose getmempool{ancestors,descendants} entry, mirrors getmempoolentry.
+  let vsize = (entry.weight + 3) div 4
+  %*{
+    "vsize": vsize,
+    "weight": entry.weight,
+    "fee": float64(int64(entry.fee)) / 100000000.0,
+    "modifiedfee": float64(int64(entry.fee)) / 100000000.0,
+    "time": entry.timeAdded.toUnix(),
+    "height": entry.height,
+    "descendantcount": 1,
+    "descendantsize": vsize,
+    "descendantfees": int64(entry.fee),
+    "ancestorcount": entry.ancestorCount,
+    "ancestorsize": entry.ancestorSize,
+    "ancestorfees": int64(entry.ancestorFee),
+    "wtxid": reverseHex(toHex(array[32, byte](entry.tx.wtxid()))),
+    "fees": {
+      "base": float64(int64(entry.fee)) / 100000000.0,
+      "modified": float64(int64(entry.fee)) / 100000000.0,
+      "ancestor": float64(int64(entry.ancestorFee)) / 100000000.0,
+      "descendant": float64(int64(entry.fee)) / 100000000.0
+    },
+    "depends": [],
+    "spentby": [],
+    "bip125-replaceable": true,
+    "unbroadcast": false
+  }
+
+proc handleGetMempoolAncestors(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getmempoolancestors txid [verbose=false]
+  ## If txid is in the mempool, returns all in-mempool ancestors.
+  ## Reference: bitcoin-core/src/rpc/mempool.cpp getmempoolancestors
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing txid parameter")
+
+  let txid = parseTxidParam(params[0].getStr())
+  let verbose = params.len >= 2 and params[1].kind == JBool and params[1].getBool()
+
+  let entryOpt = rpc.mempool.get(txid)
+  if entryOpt.isNone:
+    raise newRpcError(RpcInvalidAddressOrKey, "Transaction not in mempool")
+
+  let entry = entryOpt.get()
+  let ancestors = rpc.mempool.calculateAncestors(entry.tx)
+
+  if not verbose:
+    var arr = newJArray()
+    for a in ancestors:
+      arr.add(%reverseHex(toHex(array[32, byte](a))))
+    return arr
+  else:
+    var obj = newJObject()
+    for a in ancestors:
+      let aOpt = rpc.mempool.get(a)
+      if aOpt.isSome:
+        obj[reverseHex(toHex(array[32, byte](a)))] =
+          mempoolEntryJson(rpc, a, aOpt.get())
+    return obj
+
+proc handleGetMempoolDescendants(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getmempooldescendants txid [verbose=false]
+  ## If txid is in the mempool, returns all in-mempool descendants.
+  ## Reference: bitcoin-core/src/rpc/mempool.cpp getmempooldescendants
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing txid parameter")
+
+  let txid = parseTxidParam(params[0].getStr())
+  let verbose = params.len >= 2 and params[1].kind == JBool and params[1].getBool()
+
+  if rpc.mempool.get(txid).isNone:
+    raise newRpcError(RpcInvalidAddressOrKey, "Transaction not in mempool")
+
+  let descendants = rpc.mempool.calculateDescendants(txid)
+
+  if not verbose:
+    var arr = newJArray()
+    for d in descendants:
+      arr.add(%reverseHex(toHex(array[32, byte](d))))
+    return arr
+  else:
+    var obj = newJObject()
+    for d in descendants:
+      let dOpt = rpc.mempool.get(d)
+      if dOpt.isSome:
+        obj[reverseHex(toHex(array[32, byte](d)))] =
+          mempoolEntryJson(rpc, d, dOpt.get())
+    return obj
 
 proc handleDumpMempool(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Dumps the mempool to mempool.dat in the data directory.
@@ -2188,6 +2287,111 @@ proc handleEstimateSmartFee(rpc: RpcServer, params: JsonNode): JsonNode =
     "blocks": confTarget
   }
 
+proc handleEstimateRawFee(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## estimaterawfee conf_target [threshold]
+  ## Returns raw fee-estimator state per horizon.
+  ##
+  ## Reference: bitcoin-core/src/rpc/fees.cpp estimaterawfee.
+  ## nimrod's FeeEstimator is a single-horizon histogram and does not split
+  ## confirmations into short/medium/long like Core's CBlockPolicyEstimator;
+  ## we expose the available bucket data under each horizon name with
+  ## consistent shape so clients that just check `<horizon>.feerate` work.
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing conf_target parameter")
+
+  let confTarget = params[0].getInt()
+  if confTarget < 1 or confTarget > 1008:
+    raise newRpcError(RpcInvalidParams, "conf_target out of range (1-1008)")
+
+  var threshold = 0.95
+  if params.len >= 2:
+    case params[1].kind
+    of JInt:    threshold = float64(params[1].getInt())
+    of JFloat:  threshold = params[1].getFloat()
+    of JNull:   discard
+    else:
+      raise newRpcError(RpcInvalidParams, "threshold must be a number")
+  if threshold < 0 or threshold > 1:
+    raise newRpcError(RpcInvalidParams, "Invalid threshold")
+
+  proc horizonResult(rpc: RpcServer, target: int, decay: float64,
+                     scale: int): JsonNode =
+    if rpc.feeEstimator == nil:
+      return %*{
+        "decay": decay,
+        "scale": scale,
+        "errors": ["fee estimator unavailable"]
+      }
+    let feeRate = rpc.feeEstimator.estimateFee(target)
+    if feeRate <= 0.0:
+      return %*{
+        "decay": decay,
+        "scale": scale,
+        "errors": ["Insufficient data or no feerate found which meets threshold"]
+      }
+    let feeBtcPerKb = feeRate * 1000.0 / 100000000.0
+    # Walk buckets until we cross the threshold to populate "pass"/"fail"
+    # using whatever totals our histogram tracks.
+    var passStart = 0.0
+    var passEnd = 0.0
+    var passWithin = 0.0
+    var passConfirmed = 0.0
+    var failStart = -1.0
+    var failEnd = 0.0
+    var failWithin = 0.0
+    var failConfirmed = 0.0
+    var prevRate = 0.0
+    for i in 0 ..< NumBuckets:
+      let stats = rpc.feeEstimator.getBucketStats(i)
+      if stats.totalSeen <= 0:
+        prevRate = FeeRateBuckets[i]
+        continue
+      let rate = rpc.feeEstimator.getConfirmationRate(i, target)
+      let bucketEnd = FeeRateBuckets[i]
+      if rate >= threshold:
+        passStart = prevRate
+        passEnd = bucketEnd
+        passWithin = stats.totalSeen * rate
+        passConfirmed = stats.totalSeen * rate
+        break
+      else:
+        failStart = prevRate
+        failEnd = bucketEnd
+        failWithin = stats.totalSeen * rate
+        failConfirmed = stats.totalSeen * rate
+      prevRate = bucketEnd
+    var horizon = %*{
+      "feerate": feeBtcPerKb,
+      "decay": decay,
+      "scale": scale,
+      "pass": {
+        "startrange": passStart,
+        "endrange": passEnd,
+        "withintarget": passWithin,
+        "totalconfirmed": passConfirmed,
+        "inmempool": float64(rpc.feeEstimator.getTrackedCount()),
+        "leftmempool": 0.0
+      }
+    }
+    if failStart >= 0.0:
+      horizon["fail"] = %*{
+        "startrange": failStart,
+        "endrange": failEnd,
+        "withintarget": failWithin,
+        "totalconfirmed": failConfirmed,
+        "inmempool": 0.0,
+        "leftmempool": 0.0
+      }
+    horizon
+
+  # Match Core's three-horizon shape so clients can index by name.
+  # nimrod's estimator uses a single decay factor, surfaced uniformly.
+  result = %*{
+    "short":  horizonResult(rpc, confTarget, DecayFactor, 1),
+    "medium": horizonResult(rpc, confTarget, DecayFactor, 1),
+    "long":   horizonResult(rpc, confTarget, DecayFactor, 1)
+  }
+
 # Address validation RPC
 # Ban management RPCs
 proc handleListBanned(rpc: RpcServer): JsonNode =
@@ -2249,6 +2453,87 @@ proc handleClearBanned(rpc: RpcServer): JsonNode =
   if rpc.peerManager != nil:
     rpc.peerManager.clearBanned()
   newJNull()
+
+# Message signing / verification RPCs
+# Reference: Bitcoin Core src/rpc/signmessage.cpp + src/wallet/rpc/signmessage.cpp
+proc getTargetWallet(rpc: RpcServer): Wallet {.gcsafe.}
+
+proc handleSignMessage(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## signmessage "address" "message"
+  ## Sign a message with the private key of an address.
+  ## Address must refer to a P2PKH key in a loaded wallet.
+  ## Reference: bitcoin-core/src/wallet/rpc/signmessage.cpp signmessage
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams,
+      "signmessage requires 2 parameters: address, message")
+
+  let addrStr = params[0].getStr()
+  let message = params[1].getStr()
+
+  var parsedAddr: Address
+  try:
+    parsedAddr = decodeAddress(addrStr)
+  except AddressError:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid address")
+
+  if parsedAddr.kind != P2PKH:
+    # Bitcoin Core uses RPC_TYPE_ERROR (-3) here. We don't have a constant
+    # for that yet, but RpcInvalidAddressOrKey communicates the same intent
+    # to clients that just check the message string.
+    raise newRpcError(RpcInvalidAddressOrKey, "Address does not refer to key")
+
+  let wallet = rpc.getTargetWallet()
+  if wallet.isLocked:
+    raise newRpcError(RpcMiscError,
+      "Error: Please enter the wallet passphrase with walletpassphrase first.")
+
+  let keyOpt = wallet.findKeyForAddress(parsedAddr)
+  if keyOpt.isNone:
+    raise newRpcError(RpcInvalidAddressOrKey,
+      "Private key not available")
+
+  let key = keyOpt.get()
+  # nimrod-derived P2PKH addresses always use the compressed pubkey (see
+  # wallet.derivePath BIP44 branch), so set the compressed flag accordingly.
+  try:
+    let signature = signMessage(key.extKey.key, message, compressed = true)
+    return %signature
+  except Secp256k1Error as e:
+    raise newRpcError(RpcInvalidAddressOrKey, "Sign failed: " & e.msg)
+
+proc handleVerifyMessage(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## verifymessage "address" "signature" "message"
+  ## Verify a base64 ECDSA-recoverable signature against a P2PKH address.
+  ## Reference: bitcoin-core/src/rpc/signmessage.cpp verifymessage
+  if params.len < 3:
+    raise newRpcError(RpcInvalidParams,
+      "verifymessage requires 3 parameters: address, signature, message")
+
+  let addrStr = params[0].getStr()
+  let signature = params[1].getStr()
+  let message = params[2].getStr()
+
+  var parsedAddr: Address
+  try:
+    parsedAddr = decodeAddress(addrStr)
+  except AddressError:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid address")
+
+  if parsedAddr.kind != P2PKH:
+    raise newRpcError(RpcInvalidAddressOrKey, "Address does not refer to key")
+
+  let res = verifyMessageRaw(parsedAddr.pubkeyHash, signature, message)
+  case res
+  of mvrMalformedSignature:
+    raise newRpcError(RpcInvalidAddressOrKey, "Malformed base64 encoding")
+  of mvrInvalidAddress:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid address")
+  of mvrAddressNoKey:
+    raise newRpcError(RpcInvalidAddressOrKey, "Address does not refer to key")
+  of mvrPubkeyNotRecovered, mvrNotSigned:
+    return %false
+  of mvrOk:
+    return %true
 
 proc handleValidateAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1:
@@ -3871,6 +4156,10 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
     rpc.handleGetRawMempool(params)
   of "getmempoolentry":
     rpc.handleGetMempoolEntry(params)
+  of "getmempoolancestors":
+    rpc.handleGetMempoolAncestors(params)
+  of "getmempooldescendants":
+    rpc.handleGetMempoolDescendants(params)
   of "dumpmempool":
     rpc.handleDumpMempool(params)
   of "loadmempool":
@@ -3928,6 +4217,14 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
   # Fee estimation
   of "estimatesmartfee":
     rpc.handleEstimateSmartFee(params)
+  of "estimaterawfee":
+    rpc.handleEstimateRawFee(params)
+
+  # Message signing
+  of "signmessage":
+    rpc.handleSignMessage(params)
+  of "verifymessage":
+    rpc.handleVerifyMessage(params)
 
   # Utility
   of "validateaddress":
