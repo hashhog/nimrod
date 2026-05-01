@@ -488,9 +488,25 @@ proc createSnapshot*(
   ## doesn't expose iteration FFI yet, so we currently dump the in-memory
   ## utxoCache. This still produces a Core-byte-compatible file for any
   ## coins that *are* in the cache, which is sufficient for round-trip tests.
+  ##
+  ## Genesis coinbase is intentionally excluded: Bitcoin Core treats the
+  ## genesis block's coinbase output as un-spendable and never adds it to
+  ## the UTXO set (see bitcoin-core/src/validation.cpp:2337-2343 — Core
+  ## special-cases the genesis block to skip ConnectBlock entirely). nimrod
+  ## DOES connect the genesis block via connectBlock(genesis, 0), so the
+  ## coin lives in our cache; we filter it out here to match Core's dump.
+
+  # Compute the genesis coinbase txid (= merkle root of the single-tx genesis
+  # block). We compare against this to identify the unspendable genesis coin.
+  let genesisBlk = buildGenesisBlock(params)
+  let genesisCoinbaseTxid = genesisBlk.txs[0].txid()
 
   var coins: seq[SnapshotCoin] = @[]
   for op, entry in cs.utxoCache:
+    # Skip the genesis coinbase output — Core never has this in its UTXO set.
+    if entry.height == 0 and entry.isCoinbase and
+       op.txid == genesisCoinbaseTxid:
+      continue
     coins.add(SnapshotCoin(
       outpoint: op,
       output: entry.output,
@@ -555,13 +571,22 @@ proc validateSnapshotMetadata*(
     params: ConsensusParams,
     assumeutxoData: seq[AssumeutxoData]
 ): tuple[valid: bool, data: Option[AssumeutxoData], error: string] =
+  ## Core-strict whitelist check (bitcoin-core/src/validation.cpp:5775-5780).
+  ## The snapshot's base blockhash must match one of the hardcoded
+  ## assumeutxo entries; otherwise the load is refused with the exact
+  ## Core-format error message.
   if meta.networkMagic != params.networkMagic:
     return (false, none(AssumeutxoData), "network magic mismatch")
   for d in assumeutxoData:
     if d.blockhash == meta.baseBlockhash:
       return (true, some(d), "")
+  # Blockhash not in the assumeutxo whitelist. Core reports the snapshot's
+  # block height; we don't have that locally for an unknown blockhash, so we
+  # report 0 to signal "not recognized". The error format matches Core
+  # verbatim so downstream tooling can pattern-match it.
   return (false, none(AssumeutxoData),
-          "unknown snapshot block hash - not in assumeutxo list")
+          "Assumeutxo height in snapshot metadata not recognized (0) - " &
+          "refusing to load snapshot")
 
 proc loadSnapshot*(
     path: string,

@@ -358,6 +358,86 @@ suite "snapshot dump via ChainState":
     check coin.get().isCoinbase == entry.isCoinbase
     rd.close()
 
+  test "createSnapshot excludes the genesis coinbase (regtest empty dump)":
+    # Bitcoin Core never adds the genesis coinbase to the UTXO set
+    # (validation.cpp:2337-2343 special-cases the genesis block to skip
+    # connection). nimrod's connectBlock(genesis, 0) DOES insert it, so
+    # createSnapshot must filter it out for byte-compat with Core.
+    #
+    # On a fresh regtest chain (only the genesis block connected), the dump
+    # must be exactly 51 bytes (header only) with coins_count=0 — matching
+    # Core's `dumptxoutset` on a fresh regtest chainstate.
+    let testDir = getTempDir() / "nimrod_snapshot_genesis_excl"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+
+    # Connect the regtest genesis block (mirrors nimrod startup at
+    # src/nimrod.nim:972-973). After this, the genesis coinbase output is
+    # in the cache; it must NOT end up in the snapshot.
+    let genesis = buildGenesisBlock(regtest)
+    let r = cs.connectBlock(genesis, 0)
+    check r.isOk
+
+    let outPath = testDir / "regtest-fresh.dat"
+    let res = createSnapshot(cs, outPath, regtest)
+    check res.coinsWritten == 0
+
+    # Header is exactly 51 bytes (5 magic + 2 version + 4 magic + 32 hash + 8 count).
+    check fileExists(outPath)
+    check getFileSize(outPath) == 51
+
+    # The on-disk file must parse cleanly with coinsCount=0 and no body.
+    let rd = openSnapshotForRead(outPath)
+    check rd.metadata.coinsCount == 0
+    check rd.metadata.baseBlockhash == regtest.genesisBlockHash
+    check rd.readCoin().isNone
+    rd.close()
+
+  test "createSnapshot keeps a non-genesis coinbase (sanity check)":
+    # The exclusion must be SPECIFIC to (genesis-coinbase-txid, height=0,
+    # isCoinbase=true). A coinbase from any other block at any other height
+    # must still be dumped.
+    let testDir = getTempDir() / "nimrod_snapshot_nongenesis_cb"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    var cs = newChainState(dbDir, regtestParams())
+    defer: cs.close()
+
+    # Inject a height=1 coinbase coin (not genesis) — must survive the dump.
+    let cbTxid = TxId(mkHashWith([0xC0'u8, 0x1B, 0xCA, 0x5E]))
+    let op = OutPoint(txid: cbTxid, vout: 0)
+    let entry = UtxoEntry(
+      output: TxOut(value: Satoshi(50_00000000),
+                    scriptPubKey: @[0x51'u8]),
+      height: 1, isCoinbase: true
+    )
+    cs.putUtxoCache(op, entry)
+    cs.bestBlockHash = BlockHash(mkHashWith([0xAA'u8, 0xBB]))
+    cs.bestHeight = 1
+
+    let outPath = testDir / "h1-cb.dat"
+    let res = createSnapshot(cs, outPath, regtestParams())
+    check res.coinsWritten == 1
+    let rd = openSnapshotForRead(outPath)
+    check rd.metadata.coinsCount == 1
+    let coin = rd.readCoin()
+    check coin.isSome
+    check coin.get().outpoint == op
+    check coin.get().isCoinbase == true
+    check coin.get().height == 1
+    rd.close()
+
 # ----------------------------------------------------------------------------
 # assumeutxo wiring on ConsensusParams
 # ----------------------------------------------------------------------------
@@ -406,7 +486,9 @@ suite "assumeutxo data":
     check v.valid == false
     check v.error == "network magic mismatch"
 
-  test "metadata validation rejects unknown blockhash":
+  test "metadata validation rejects unknown blockhash with Core-strict error":
+    # bitcoin-core/src/validation.cpp:5775-5780 — refuses to load a snapshot
+    # whose blockhash isn't in the hardcoded assumeutxo list.
     let p = mainnetParams()
     let meta = SnapshotMetadata(
       version: SnapshotVersion,
@@ -416,7 +498,71 @@ suite "assumeutxo data":
     )
     let v = validateSnapshotMetadata(meta, p, p.assumeutxoData)
     check v.valid == false
-    check "unknown snapshot block hash" in v.error
+    check v.error ==
+      "Assumeutxo height in snapshot metadata not recognized (0) - " &
+      "refusing to load snapshot"
+
+  test "loadtxoutset rejects regtest-genesis snapshot (whitelist enforced)":
+    # Build a snapshot file whose baseBlockhash is the regtest genesis (not in
+    # any assumeutxo list — regtest has empty assumeutxoData). Core-strict
+    # behaviour: refuse with the recognized error string.
+    let testDir = getTempDir() / "nimrod_snapshot_whitelist"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+    let snapPath = testDir / "regtest-genesis.dat"
+
+    var cs = newChainState(dbDir, regtestParams())
+    defer: cs.close()
+    let regtest = regtestParams()
+
+    # Hand-craft a 51-byte header with regtest genesis blockhash + count=0.
+    var w = BinaryWriter()
+    let meta = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: regtest.networkMagic,
+      baseBlockhash: regtest.genesisBlockHash,
+      coinsCount: 0
+    )
+    w.writeSnapshotMetadata(meta)
+    let f = open(snapPath, fmWrite)
+    discard f.writeBytes(w.data, 0, w.data.len)
+    f.close()
+
+    # loadSnapshot should reject because regtest has empty assumeutxoData
+    # (so any hash, including the genesis, is "not recognized").
+    let res = loadSnapshot(snapPath, cs, regtest, regtest.assumeutxoData)
+    check res.success == false
+    check res.error ==
+      "Assumeutxo height in snapshot metadata not recognized (0) - " &
+      "refusing to load snapshot"
+
+    # Also ensure mainnet rejects a regtest-genesis blockhash (not in the
+    # mainnet whitelist either, even though mainnet has 4 valid entries).
+    let mainnet = mainnetParams()
+    var w2 = BinaryWriter()
+    let meta2 = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: mainnet.networkMagic,
+      baseBlockhash: regtest.genesisBlockHash,
+      coinsCount: 0
+    )
+    w2.writeSnapshotMetadata(meta2)
+    let snap2 = testDir / "regtest-on-mainnet.dat"
+    let f2 = open(snap2, fmWrite)
+    discard f2.writeBytes(w2.data, 0, w2.data.len)
+    f2.close()
+    let dbDir2 = testDir / "cs2"
+    createDir(dbDir2)
+    var cs2 = newChainState(dbDir2, mainnet)
+    defer: cs2.close()
+    let res2 = loadSnapshot(snap2, cs2, mainnet, mainnet.assumeutxoData)
+    check res2.success == false
+    check res2.error ==
+      "Assumeutxo height in snapshot metadata not recognized (0) - " &
+      "refusing to load snapshot"
 
   test "non-mainnet networks have empty assumeutxo data":
     check testnet3Params().assumeutxoData.len == 0
