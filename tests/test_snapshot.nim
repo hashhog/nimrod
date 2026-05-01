@@ -2,7 +2,7 @@
 ## Covers VARINT, CompressAmount/Script, per-coin layout, file round-trip,
 ## metadata validation, and assumeutxo data wiring.
 
-import std/[os, options, tables, unittest, strutils]
+import std/[os, options, tables, unittest, strutils, json]
 import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing
 import ../src/crypto/muhash
@@ -881,3 +881,285 @@ suite "snapshot strict gate uses SHA256d (HASH_SERIALIZED)":
     for k in countdown(31, 0):
       muHex.add(toHex(muDigest[k].int, 2).toLowerAscii)
     check (", got " & muHex) notin res.error
+
+# ----------------------------------------------------------------------------
+# dumptxoutset rollback mode (Bitcoin Core rpc/blockchain.cpp:3074)
+#
+# Mirrors Core's three-mode RPC: "" / "latest" -> dump current tip;
+# "rollback" without options -> pick the highest assumeutxo entry <= tip;
+# rollback=<height|hash> -> roll back to that exact block.
+#
+# Implementation re-uses nimrod's existing `disconnectBlock` and `connectBlock`
+# reorg primitives in `src/storage/chainstate.nim`. The rollback dance:
+#   1. collect (hash, height, Block) tuples from tip down to target+1
+#   2. disconnectBlock each in order
+#   3. createSnapshot at the rolled-back state
+#   4. connectBlock each saved block back in reverse order
+# Errors at any stage attempt best-effort recovery to the original tip.
+# ----------------------------------------------------------------------------
+
+import ../src/rpc/server
+import ../src/mempool/mempool
+import ../src/mining/fees
+import ../src/network/peermanager
+
+suite "dumptxoutset rollback":
+
+  proc buildSimpleChain(cs: var ChainState, params: ConsensusParams,
+                        targetHeight: int32): seq[BlockHash] =
+    ## Build a simple chain: regtest genesis + N coinbase-only blocks.
+    ## Returns hashes in ascending-height order (genesis at index 0).
+    let genesis = buildGenesisBlock(params)
+    let r = cs.connectBlock(genesis, 0)
+    doAssert r.isOk
+    let genHeader = serialize(genesis.header)
+    let genHash = BlockHash(doubleSha256(genHeader))
+    result = @[genHash]
+
+    var prevHash = genHash
+    var height: int32 = 1
+    while height <= targetHeight:
+      # Bare coinbase tx: no inputs to spend, no merkle work.
+      var scriptSig: seq[byte]
+      if height <= 0x7F:
+        scriptSig = @[byte(0x01), byte(height)]
+      else:
+        scriptSig = @[byte(0x02), byte(height and 0xFF),
+                                  byte((height shr 8) and 0xFF)]
+      let coinbase = Transaction(
+        version: 1,
+        inputs: @[TxIn(
+          prevOut: OutPoint(txid: TxId(default(array[32, byte])),
+                            vout: 0xFFFFFFFF'u32),
+          scriptSig: scriptSig,
+          sequence: 0xFFFFFFFF'u32
+        )],
+        outputs: @[TxOut(
+          value: Satoshi(50_00000000),
+          scriptPubKey: @[byte(0x51)]  # OP_TRUE
+        )],
+        witnesses: @[],
+        lockTime: 0
+      )
+      let txHash = array[32, byte](coinbase.txid())
+      let blk = Block(
+        header: BlockHeader(
+          version: 1,
+          prevBlock: prevHash,
+          merkleRoot: txHash,
+          timestamp: uint32(1296688602 + height * 600),
+          bits: 0x207fffff'u32,
+          nonce: uint32(height)
+        ),
+        txs: @[coinbase]
+      )
+      let cr = cs.connectBlock(blk, height)
+      doAssert cr.isOk, cr.error
+      let bh = BlockHash(doubleSha256(serialize(blk.header)))
+      result.add(bh)
+      prevHash = bh
+      inc height
+
+  proc mkRpc(cs: ChainState, params: ConsensusParams): RpcServer =
+    let mp = newMempool(cs, params)
+    let fe = newFeeEstimator()
+    newRpcServer(
+      port = 18443'u16,
+      chainState = cs,
+      mempool = mp,
+      peerManager = nil,
+      feeEstimator = fe,
+      params = params
+    )
+
+  test "default (no type) dumps current tip without rollback":
+    let testDir = getTempDir() / "nimrod_dumptxo_default"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    let hashes = buildSimpleChain(cs, regtest, 3)
+    check cs.bestHeight == 3
+    let preTip = cs.bestBlockHash
+
+    let rpc = mkRpc(cs, regtest)
+    let outPath = testDir / "out.dat"
+    let res = rpc.handleDumpTxOutSet(%*[outPath])
+    check res["base_height"].getInt() == 3
+    check fileExists(outPath)
+    # Tip is unchanged.
+    check cs.bestHeight == 3
+    check cs.bestBlockHash == preTip
+    check hashes.len == 4  # silence unused-warning
+
+  test "type=latest is equivalent to default":
+    let testDir = getTempDir() / "nimrod_dumptxo_latest"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard buildSimpleChain(cs, regtest, 2)
+
+    let rpc = mkRpc(cs, regtest)
+    let outPath = testDir / "out.dat"
+    let res = rpc.handleDumpTxOutSet(%*[outPath, "latest"])
+    check res["base_height"].getInt() == 2
+    check cs.bestHeight == 2
+
+  test "rollback=<height> rolls back, dumps, then re-applies to original tip":
+    let testDir = getTempDir() / "nimrod_dumptxo_rollback_height"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    let hashes = buildSimpleChain(cs, regtest, 4)
+    check cs.bestHeight == 4
+    let originalTip = cs.bestBlockHash
+
+    let rpc = mkRpc(cs, regtest)
+    let outPath = testDir / "rb2.dat"
+    # Rollback to height 2.
+    let res = rpc.handleDumpTxOutSet(
+      %*[outPath, "", {"rollback": %2}]
+    )
+    check res["base_height"].getInt() == 2
+    # Snapshot's base_hash should be the height-2 block hash (display order).
+    let want2 = block:
+      var s = ""
+      let arr = array[32, byte](hashes[2])
+      for k in countdown(31, 0):
+        s.add(toHex(arr[k].int, 2).toLowerAscii)
+      s
+    check res["base_hash"].getStr() == want2
+    # Chain has been re-applied back to the original tip.
+    check cs.bestHeight == 4
+    check cs.bestBlockHash == originalTip
+
+  test "rollback=<hash> resolves block by hash and rolls back":
+    let testDir = getTempDir() / "nimrod_dumptxo_rollback_hash"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    let hashes = buildSimpleChain(cs, regtest, 3)
+    check cs.bestHeight == 3
+    let originalTip = cs.bestBlockHash
+
+    # Pass the hex of hashes[1] (display-reversed).
+    var hashHex = ""
+    let arr1 = array[32, byte](hashes[1])
+    for k in countdown(31, 0):
+      hashHex.add(toHex(arr1[k].int, 2).toLowerAscii)
+
+    let rpc = mkRpc(cs, regtest)
+    let outPath = testDir / "rb-hash.dat"
+    let res = rpc.handleDumpTxOutSet(
+      %*[outPath, "rollback", {"rollback": %hashHex}]
+    )
+    check res["base_height"].getInt() == 1
+    check cs.bestHeight == 3
+    check cs.bestBlockHash == originalTip
+
+  test "rollback above tip is rejected":
+    let testDir = getTempDir() / "nimrod_dumptxo_rb_above"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard buildSimpleChain(cs, regtest, 2)
+
+    let rpc = mkRpc(cs, regtest)
+    let outPath = testDir / "wont-be-written.dat"
+    expect RpcError:
+      discard rpc.handleDumpTxOutSet(
+        %*[outPath, "", {"rollback": %999}]
+      )
+    check not fileExists(outPath)
+    # Tip is unchanged.
+    check cs.bestHeight == 2
+
+  test "type=rollback with no entries (regtest) raises misc error":
+    # Regtest has empty assumeutxoData, so `type=rollback` with no explicit
+    # height has nothing to pick.
+    let testDir = getTempDir() / "nimrod_dumptxo_rb_no_entries"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard buildSimpleChain(cs, regtest, 2)
+
+    let rpc = mkRpc(cs, regtest)
+    let outPath = testDir / "out.dat"
+    expect RpcError:
+      discard rpc.handleDumpTxOutSet(%*[outPath, "rollback"])
+    check not fileExists(outPath)
+
+  test "conflicting type and rollback option is rejected":
+    let testDir = getTempDir() / "nimrod_dumptxo_conflict"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard buildSimpleChain(cs, regtest, 2)
+
+    let rpc = mkRpc(cs, regtest)
+    let outPath = testDir / "out.dat"
+    expect RpcError:
+      discard rpc.handleDumpTxOutSet(
+        %*[outPath, "latest", {"rollback": %1}]
+      )
+    check not fileExists(outPath)
+
+  test "invalid type string is rejected":
+    let testDir = getTempDir() / "nimrod_dumptxo_invalid_type"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard buildSimpleChain(cs, regtest, 1)
+
+    let rpc = mkRpc(cs, regtest)
+    let outPath = testDir / "out.dat"
+    expect RpcError:
+      discard rpc.handleDumpTxOutSet(%*[outPath, "garbage"])
+    check not fileExists(outPath)
