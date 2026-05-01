@@ -2637,20 +2637,59 @@ proc handlePruneBlockchain(rpc: RpcServer, params: JsonNode): JsonNode =
 # assumeUTXO / Snapshot RPCs
 # ============================================================================
 
-proc handleDumpTxOutSet(rpc: RpcServer, params: JsonNode): JsonNode =
+proc resolveRollbackTargetHeight(
+    rpc: RpcServer, rollbackVal: JsonNode
+): int32 =
+  ## Resolve the `rollback` named-arg (height int or block-hash hex) to an
+  ## active-chain height. Mirrors Core's ParseHashOrHeight.
+  if rollbackVal.kind == JInt:
+    let h = rollbackVal.getInt()
+    if h < 0 or h > rpc.chainState.bestHeight.int:
+      raise newRpcError(RpcInvalidParams,
+        "Target block height " & $h & " is out of range")
+    return int32(h)
+  elif rollbackVal.kind == JString:
+    let hashHex = rollbackVal.getStr()
+    if hashHex.len != 64:
+      raise newRpcError(RpcInvalidAddressOrKey, "Invalid block hash")
+    let blockHash = parseBlockHash(hashHex)
+    let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
+    if idxOpt.isNone:
+      raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+    let idx = idxOpt.get()
+    # Must be on the active chain.
+    let activeAt = rpc.chainState.db.getBlockHashByHeight(idx.height)
+    if activeAt.isNone or activeAt.get() != blockHash:
+      raise newRpcError(RpcInvalidParams,
+        "Block is not in the main chain")
+    return idx.height
+  else:
+    raise newRpcError(RpcInvalidParams,
+      "rollback must be a height (int) or block hash (string)")
+
+proc handleDumpTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Dump the UTXO set to a file
   ## Reference: Bitcoin Core rpc/blockchain.cpp dumptxoutset
   ##
   ## Arguments:
   ## 1. path (string, required) - Path to the output file
+  ## 2. type (string, optional) - "" | "latest" | "rollback"
+  ## 3. options (object, optional) - { "rollback": <height|hash> }
+  ##
+  ## When "rollback" is selected (with or without an explicit height/hash),
+  ## the node temporarily disconnects blocks from the tip back to the target,
+  ## writes the snapshot, then re-applies the saved blocks back to the
+  ## original tip. Mirrors Bitcoin Core's TemporaryRollback dance in
+  ## rpc/blockchain.cpp::dumptxoutset.
   ##
   ## Returns:
   ## {
-  ##   "coins_written": n,      (numeric) Number of coins written
-  ##   "base_hash": "...",      (string) Block hash at which snapshot was taken
-  ##   "base_height": n,        (numeric) Block height at which snapshot was taken
-  ##   "path": "...",           (string) Full path to the output file
-  ##   "txoutset_hash": "..."   (string) SHA256d hash of the serialized UTXO set
+  ##   "coins_written": n,
+  ##   "base_hash": "...",
+  ##   "base_height": n,
+  ##   "path": "...",
+  ##   "txoutset_hash": "...",
+  ##   "nchaintx": n            (only when target matches an assumeutxo entry)
   ## }
 
   if params.len < 1:
@@ -2664,21 +2703,141 @@ proc handleDumpTxOutSet(rpc: RpcServer, params: JsonNode): JsonNode =
   if fileExists(path):
     raise newRpcError(RpcMiscError, "path already exists: " & path)
 
-  let res =
-    try:
-      createSnapshot(rpc.chainState, path, rpc.chainState.params)
-    except SnapshotError as e:
-      raise newRpcError(RpcInternalError, "snapshot write failed: " & e.msg)
-    except IOError as e:
-      raise newRpcError(RpcInternalError, "snapshot I/O error: " & e.msg)
+  # Parse arg 2 (type) and arg 3 (options{rollback}). All optional.
+  let snapshotType =
+    if params.len >= 2 and params[1].kind == JString: params[1].getStr()
+    else: ""
+  let optionsObj =
+    if params.len >= 3 and params[2].kind == JObject: params[2]
+    else: newJObject()
+
+  let originalTipHeight = rpc.chainState.bestHeight
+  var targetHeight: int32 = originalTipHeight
+
+  if optionsObj.hasKey("rollback"):
+    if snapshotType.len > 0 and snapshotType != "rollback":
+      raise newRpcError(RpcInvalidParams,
+        "Invalid snapshot type \"" & snapshotType &
+        "\" specified with rollback option")
+    targetHeight = resolveRollbackTargetHeight(rpc, optionsObj["rollback"])
+  elif snapshotType == "rollback":
+    # Pick the highest assumeutxo entry <= current tip.
+    var best: int32 = -1
+    for entry in rpc.chainState.params.assumeutxoData:
+      if entry.height <= originalTipHeight and entry.height > best:
+        best = entry.height
+    if best < 0:
+      raise newRpcError(RpcMiscError,
+        "No assumeutxo snapshot entry available at or below current tip " &
+        $originalTipHeight)
+    targetHeight = best
+  elif snapshotType == "latest" or snapshotType == "":
+    targetHeight = originalTipHeight
+  else:
+    raise newRpcError(RpcInvalidParams,
+      "Invalid snapshot type \"" & snapshotType &
+      "\" specified. Please specify \"rollback\" or \"latest\"")
+
+  if targetHeight > originalTipHeight:
+    raise newRpcError(RpcInvalidParams,
+      "Target height above current tip")
+
+  # Walk the active chain from the current tip down to (but not including)
+  # targetHeight, collecting full Block payloads in disconnect order. We need
+  # to capture these BEFORE disconnect since disconnectBlock removes the
+  # height->hash mapping (chainstate.nim:949).
+  var disconnectOrder: seq[(BlockHash, int32, Block)] = @[]
+  if targetHeight < originalTipHeight:
+    var h = originalTipHeight
+    while h > targetHeight:
+      let hashOpt = rpc.chainState.db.getBlockHashByHeight(h)
+      if hashOpt.isNone:
+        raise newRpcError(RpcInternalError,
+          "no block at height " & $h & " during rollback collection")
+      let blkOpt = rpc.chainState.db.getBlock(hashOpt.get())
+      if blkOpt.isNone:
+        raise newRpcError(RpcInternalError,
+          "missing block data for " & $hashOpt.get() &
+          " — pruned datadir cannot rollback")
+      disconnectOrder.add((hashOpt.get(), h, blkOpt.get()))
+      dec h
+
+  # Re-apply order is reverse of disconnect order (low height first).
+  proc reapplyAll(rpc: RpcServer,
+                  ordered: seq[(BlockHash, int32, Block)]): bool =
+    for i in countdown(ordered.high, 0):
+      let (_, height, blk) = ordered[i]
+      let cr = rpc.chainState.connectBlock(blk, height)
+      if not cr.isOk:
+        error "dumptxoutset: failed to re-apply block during rollback recovery",
+          height = height, error = cr.error
+        return false
+    true
+
+  # Disconnect down to targetHeight. Track how far we got so partial failure
+  # can be reverted.
+  var disconnectedCount = 0
+  for i in 0 ..< disconnectOrder.len:
+    let (_, h, blk) = disconnectOrder[i]
+    let dr = rpc.chainState.disconnectBlock(blk)
+    if not dr.isOk:
+      # Best-effort: re-apply what we already disconnected.
+      let already = disconnectOrder[0 ..< disconnectedCount]
+      discard reapplyAll(rpc, already)
+      raise newRpcError(RpcMiscError,
+        "rollback disconnect failed at height " & $h & ": " & dr.error)
+    inc disconnectedCount
+
+  if rpc.chainState.bestHeight != targetHeight:
+    # Try to recover before bailing out.
+    discard reapplyAll(rpc, disconnectOrder)
+    raise newRpcError(RpcMiscError,
+      "Could not roll back to requested height: ended at " &
+      $rpc.chainState.bestHeight & ", wanted " & $targetHeight)
+
+  # Write the snapshot at the rolled-back state.
+  var dumpRes: tuple[coinsWritten: uint64, baseHash: BlockHash,
+                     baseHeight: int32, txoutsetHash: array[32, byte]]
+  var dumpErr = ""
+  try:
+    dumpRes = createSnapshot(rpc.chainState, path, rpc.chainState.params)
+  except SnapshotError as e:
+    dumpErr = "snapshot write failed: " & e.msg
+  except IOError as e:
+    dumpErr = "snapshot I/O error: " & e.msg
+
+  # Always attempt to re-apply blocks back to the original tip.
+  let reapplyOk = reapplyAll(rpc, disconnectOrder)
+
+  if dumpErr.len > 0:
+    raise newRpcError(RpcInternalError, dumpErr)
+  if not reapplyOk:
+    # Snapshot was written but we couldn't restore the chain. Surface that.
+    raise newRpcError(RpcInternalError,
+      "snapshot written to " & path &
+      " but failed to re-apply rolled-back blocks; chainstate at height " &
+      $rpc.chainState.bestHeight & " (was " & $originalTipHeight & ")")
+
+  # If the dump base height matches a known assumeutxo entry, surface
+  # nchaintx (Core does the same).
+  var nchaintx: uint64 = 0
+  var haveNChainTx = false
+  for entry in rpc.chainState.params.assumeutxoData:
+    if entry.height == dumpRes.baseHeight and
+       entry.blockhash == dumpRes.baseHash:
+      nchaintx = entry.chainTxCount
+      haveNChainTx = true
+      break
 
   result = %*{
-    "coins_written": res.coinsWritten,
-    "base_hash": reverseHex(toHex(array[32, byte](res.baseHash))),
-    "base_height": res.baseHeight,
+    "coins_written": dumpRes.coinsWritten,
+    "base_hash": reverseHex(toHex(array[32, byte](dumpRes.baseHash))),
+    "base_height": dumpRes.baseHeight,
     "path": path,
-    "txoutset_hash": reverseHex(toHex(res.txoutsetHash))
+    "txoutset_hash": reverseHex(toHex(dumpRes.txoutsetHash))
   }
+  if haveNChainTx:
+    result["nchaintx"] = %nchaintx
 
 proc handleLoadTxOutSet(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Load a UTXO snapshot from a file
