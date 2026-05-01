@@ -31,6 +31,7 @@ import std/[options, tables, os, algorithm]
 import chronos
 import ../primitives/[types, serialize]
 import ../crypto/hashing
+import ../crypto/muhash
 import ../consensus/params
 import ./db
 import ./chainstate
@@ -535,9 +536,13 @@ proc createSnapshot*(
   let sf = openSnapshotForWrite(path, meta)
   defer: sf.close()
 
-  # Walk by txid groups. We also accumulate the same byte stream into a
-  # writer so the caller gets a SHA256d "txoutset hash" over the body.
-  var bodyWriter = BinaryWriter()
+  # Walk by txid groups, writing the snapshot file AND accumulating each
+  # coin into a MuHash3072 for the `txoutset_hash` (hash_serialized) commitment.
+  #
+  # The MuHash is per-coin over `TxOutSer` (kernel/coinstats.cpp:46), NOT
+  # over the snapshot file body. This is the same value Core stores in
+  # AssumeutxoData::hash_serialized and checks at validation.cpp:5912.
+  var muhash = newMuHash3072()
   var i = 0
   while i < coins.len:
     var j = i + 1
@@ -547,20 +552,21 @@ proc createSnapshot*(
     for k in 0 ..< (j - i):
       group[k] = coins[i + k]
     sf.writeTxidGroup(group[0].outpoint.txid, group)
-    # Mirror the bytes for hashing.
-    bodyWriter.writeTxId(group[0].outpoint.txid)
-    bodyWriter.writeCompactSize(uint64(group.len))
     for c in group:
-      bodyWriter.writeCoinBody(c)
+      let coinBytes = serializeCoinForHash(
+        c.outpoint, int64(c.output.value), c.output.scriptPubKey,
+        c.height, c.isCoinbase
+      )
+      muhash.insert(coinBytes)
     i = j
 
-  let bodyHash = if bodyWriter.data.len > 0: doubleSha256(bodyWriter.data)
-                 else: default(array[32, byte])
+  let txoutsetHash = if coins.len > 0: muhash.finalize()
+                     else: default(array[32, byte])
 
   result = (coinsWritten: coinsCount,
             baseHash: cs.bestBlockHash,
             baseHeight: cs.bestHeight,
-            txoutsetHash: bodyHash)
+            txoutsetHash: txoutsetHash)
 
 # ============================================================================
 # Snapshot loading (loadtxoutset)
@@ -613,6 +619,10 @@ proc loadSnapshot*(
   let assumeData = validation.data.get()
 
   var coinsLoaded: uint64 = 0
+  # Accumulate every loaded coin into a MuHash3072 so we can verify the
+  # snapshot's `hash_serialized` commitment (validation.cpp:5912-5914).
+  # We must NOT mark the chain tip valid until this matches au_data.
+  var muhash = newMuHash3072()
   while true:
     let coinOpt = sf.readCoin()
     if coinOpt.isNone:
@@ -625,12 +635,41 @@ proc loadSnapshot*(
     )
     targetCs.putUtxoCache(coin.outpoint, entry)
     targetCs.db.putUtxo(coin.outpoint, entry)
+    let coinBytes = serializeCoinForHash(
+      coin.outpoint, int64(coin.output.value), coin.output.scriptPubKey,
+      coin.height, coin.isCoinbase
+    )
+    muhash.insert(coinBytes)
     inc coinsLoaded
 
   if coinsLoaded != sf.metadata.coinsCount:
     return (false, coinsLoaded,
             "coin count mismatch: expected " & $sf.metadata.coinsCount &
             ", got " & $coinsLoaded)
+
+  # Strict assumeutxo content-hash check, matching Bitcoin Core verbatim
+  # (`bitcoin-core/src/validation.cpp:5912-5914`):
+  #
+  #   if (AssumeutxoHash{maybe_stats->hashSerialized} != au_data.hash_serialized) {
+  #       return util::Error{Untranslated(strprintf("Bad snapshot content hash: expected %s, got %s",
+  #           au_data.hash_serialized.ToString(), maybe_stats->hashSerialized.ToString()))};
+  #   }
+  #
+  # Both sides are uint256 in Core; their `ToString()` is the byte-reversed
+  # hex display. We replicate that display so error messages copy/paste 1:1
+  # against Core's RPC output and assumeutxoData literals.
+  let computedHash = muhash.finalize()
+  if computedHash != assumeData.hashSerialized:
+    proc dispHex(b: array[32, byte]): string =
+      const hexDigits = "0123456789abcdef"
+      result = newStringOfCap(64)
+      for k in countdown(31, 0):
+        result.add(hexDigits[int(b[k] shr 4)])
+        result.add(hexDigits[int(b[k] and 0x0F)])
+    return (false, coinsLoaded,
+            "Bad snapshot content hash: expected " &
+            dispHex(assumeData.hashSerialized) & ", got " &
+            dispHex(computedHash))
 
   targetCs.bestBlockHash = sf.metadata.baseBlockhash
   targetCs.bestHeight = assumeData.height
@@ -673,24 +712,27 @@ proc activateSnapshot*(
 # ============================================================================
 
 proc computeUtxoSetHashFromCoins*(coins: seq[SnapshotCoin]): array[32, byte] =
-  ## Hash a sorted list of coins using the same per-coin layout we write to
-  ## disk. This is NOT identical to Core's hash_serialized_3 (which uses a
-  ## different muhash-based scheme); it gives a reproducible digest of the
-  ## snapshot body for round-trip integrity checks.
+  ## Compute Core's `hash_serialized_3` over a list of coins using MuHash3072.
+  ##
+  ## This matches:
+  ##   - `bitcoin-core/src/kernel/coinstats.cpp::ApplyCoinHash` (per-coin
+  ##     MuHash3072 over `TxOutSer`)
+  ##   - `bitcoin-core/src/kernel/coinstats.cpp::ComputeUTXOStats` with
+  ##     `CoinStatsHashType::HASH_SERIALIZED`
+  ##   - the `hashSerialized` commitment stored in `AssumeutxoData`
+  ##
+  ## Order-independent (MuHash is a multiset hash), so callers don't need
+  ## to sort the input.
   if coins.len == 0:
     return default(array[32, byte])
-  var w = BinaryWriter()
-  var i = 0
-  while i < coins.len:
-    var j = i + 1
-    while j < coins.len and coins[j].outpoint.txid == coins[i].outpoint.txid:
-      inc j
-    w.writeTxId(coins[i].outpoint.txid)
-    w.writeCompactSize(uint64(j - i))
-    for k in i ..< j:
-      w.writeCoinBody(coins[k])
-    i = j
-  doubleSha256(w.data)
+  var muhash = newMuHash3072()
+  for c in coins:
+    let coinBytes = serializeCoinForHash(
+      c.outpoint, int64(c.output.value), c.output.scriptPubKey,
+      c.height, c.isCoinbase
+    )
+    muhash.insert(coinBytes)
+  muhash.finalize()
 
 proc validateSnapshot*(
     snapshotCs: SnapshotChainState,

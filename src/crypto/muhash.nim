@@ -12,8 +12,8 @@
 ## Reference: Bitcoin Core /src/crypto/muhash.cpp
 ## Reference: https://cseweb.ucsd.edu/~mihir/papers/inchash.pdf
 
-import std/[options]
 import ./hashing
+import ./chacha20poly1305
 import ../primitives/[types, serialize]
 
 const
@@ -332,35 +332,24 @@ proc newMuHash3072*(): MuHash3072 =
   result.numerator.setToOne()
   result.denominator.setToOne()
 
-proc toNum3072(data: openArray[byte]): Num3072 =
-  ## Convert arbitrary data to Num3072 via hashing
-  ## Uses SHA256 -> ChaCha20 expansion to get 384 bytes
+proc toNum3072*(data: openArray[byte]): Num3072 =
+  ## Convert arbitrary data to a Num3072.
   ##
-  ## Simplified: use multiple SHA256 rounds to fill 384 bytes
-  let hash1 = sha256Single(data)
-
+  ## Bitcoin Core path (crypto/muhash.cpp::MuHash3072::ToNum3072):
+  ##   1. h = SHA256(data)
+  ##   2. expand 384 bytes of ChaCha20 keystream with key=h, zero nonce,
+  ##      block-counter starting at 0
+  ##   3. interpret the 384 bytes as a Num3072 (LE limbs)
+  ##
+  ## Nimrod's `initChaCha20` already initializes nonce=0 and block-counter=0
+  ## (chacha20poly1305.nim:138-144), matching Core's `ChaCha20Aligned{key}`.
+  let key = sha256Single(data)
+  var c = initChaCha20(key)
   var expanded: array[ByteSize, byte]
-  var pos = 0
-  var counter = 0'u32
-
-  while pos < ByteSize:
-    # Hash: SHA256(original_hash || counter)
-    var toHash: seq[byte] = @hash1
-    toHash.add(byte(counter and 0xff))
-    toHash.add(byte((counter shr 8) and 0xff))
-    toHash.add(byte((counter shr 16) and 0xff))
-    toHash.add(byte((counter shr 24) and 0xff))
-
-    let chunk = sha256Single(toHash)
-    for i in 0 ..< min(32, ByteSize - pos):
-      expanded[pos + i] = chunk[i]
-    pos += 32
-    counter += 1
-
+  c.keystream(expanded)
   result = fromBytes(expanded)
-  # Reduce modulo p if >= p
-  if result.isOverflow():
-    result.fullReduce()
+  # Note: matches Core which constructs Num3072 directly from the 384 bytes
+  # without any modulus reduction here. Multiply() handles overflow.
 
 proc insert*(h: var MuHash3072, data: openArray[byte]) =
   ## Insert element into set (multiply numerator)
@@ -398,20 +387,24 @@ proc finalize*(h: var MuHash3072): array[32, byte] =
 proc serializeCoinForHash*(outpoint: OutPoint, value: int64,
                            scriptPubKey: seq[byte], height: int32,
                            isCoinbase: bool): seq[byte] =
-  ## Serialize a UTXO for MuHash insertion/removal
-  ## Format matches Bitcoin Core's TxOutSer
+  ## Serialize a UTXO for MuHash insertion/removal.
+  ##
+  ## Layout matches Bitcoin Core's TxOutSer
+  ## (`bitcoin-core/src/kernel/coinstats.cpp:46-51`):
+  ##
+  ##   ss << outpoint;                                          // 32 + 4 LE
+  ##   ss << uint32((coin.nHeight << 1) + coin.fCoinBase);      // 4 LE
+  ##   ss << coin.out;                                          // value(8 LE) + scriptPubKey(varbytes)
+  ##
+  ## **Warning**: be very careful when changing this — assumeutxo and UTXO
+  ## snapshot validation commitments rely on this exact byte layout.
   var w = BinaryWriter()
-
-  # Outpoint
   w.writeTxId(outpoint.txid)
   w.writeUint32LE(outpoint.vout)
-
-  # Coin data
-  w.writeInt32LE(height)
-  w.writeUint8(if isCoinbase: 1'u8 else: 0'u8)
+  let code = (uint32(height) shl 1) or (if isCoinbase: 1'u32 else: 0'u32)
+  w.writeUint32LE(code)
   w.writeInt64LE(value)
   w.writeVarBytes(scriptPubKey)
-
   w.data
 
 proc applyCoinHash*(h: var MuHash3072, outpoint: OutPoint, value: int64,
