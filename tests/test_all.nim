@@ -51,6 +51,7 @@ import ./test_gcs
 import ./test_txindex
 import ./test_blockfilter
 import ./test_coinstatsindex
+import ./test_muhash_vectors
 import ./test_compact_blocks
 import ./test_psbt
 import ./test_bip174

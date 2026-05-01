@@ -605,3 +605,119 @@ suite "snapshot misc":
     let (cur, tgt) = bgv.getProgress()
     check cur == 0
     check tgt == 100
+
+# ----------------------------------------------------------------------------
+# MuHash3072 wiring: dump + strict load
+# ----------------------------------------------------------------------------
+
+suite "snapshot MuHash3072 commitment":
+  test "createSnapshot returns a non-default txoutsetHash for non-empty dumps":
+    # The MuHash3072 of any non-empty UTXO set is a deterministic 32-byte
+    # SHA256 of a 384-byte modular product, never default(array[32, byte]).
+    let testDir = getTempDir() / "nimrod_muhash_dump"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    var cs = newChainState(dbDir, mainnetParams())
+    defer: cs.close()
+
+    let txid = TxId(mkHashWith([0x12'u8, 0x34, 0x56, 0x78]))
+    cs.putUtxoCache(
+      OutPoint(txid: txid, vout: 0),
+      UtxoEntry(
+        output: TxOut(value: Satoshi(1_00000000),
+                      scriptPubKey: @[0x00'u8, 0x14] & newSeq[byte](20)),
+        height: 700000, isCoinbase: false
+      ))
+    cs.bestBlockHash = BlockHash(mkHashWith([0xAA'u8]))
+    cs.bestHeight = 700000
+
+    let outPath = testDir / "h.dat"
+    let res = createSnapshot(cs, outPath, mainnetParams())
+    check res.coinsWritten == 1
+    check res.txoutsetHash != default(array[32, byte])
+
+    # Order independence: the same coin set yields the same txoutsetHash
+    # regardless of iteration order. We can't directly perturb iteration
+    # order on Tables, but we can verify determinism: same input, same hash.
+    let res2 = createSnapshot(cs, testDir / "h2.dat", mainnetParams())
+    check res2.txoutsetHash == res.txoutsetHash
+
+  test "loadSnapshot rejects with Core-format Bad-content-hash error":
+    # End-to-end: write a snapshot whose baseBlockhash IS in mainnet's
+    # assumeutxo whitelist, but whose UTXO content does NOT match the
+    # whitelisted hash_serialized. The strict check at validation.cpp:5912
+    # must fail with the exact "Bad snapshot content hash: expected X, got Y"
+    # error format Core emits.
+    let testDir = getTempDir() / "nimrod_muhash_strict"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let mainnet = mainnetParams()
+    var cs = newChainState(dbDir, mainnet)
+    defer: cs.close()
+
+    # Hand-craft a snapshot file with a single fake coin and the 840k
+    # whitelisted blockhash. The MuHash will not match the real Core
+    # hashSerialized, so loadSnapshot must refuse.
+    let snapPath = testDir / "fake-840k.dat"
+    let txid = TxId(mkHashWith([0xDE'u8, 0xAD, 0xBE, 0xEF]))
+    let coin = SnapshotCoin(
+      outpoint: OutPoint(txid: txid, vout: 0),
+      output: TxOut(value: Satoshi(5_00000000),
+                    scriptPubKey: @[0x76'u8, 0xA9, 0x14] &
+                                  newSeq[byte](20) & @[0x88'u8, 0xAC]),
+      height: 100000, isCoinbase: false
+    )
+    let meta = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: mainnet.networkMagic,
+      baseBlockhash: mainnet.assumeutxoData[0].blockhash,  # 840k
+      coinsCount: 1
+    )
+    let sf = openSnapshotForWrite(snapPath, meta)
+    sf.writeTxidGroup(coin.outpoint.txid, @[coin])
+    sf.close()
+
+    let res = loadSnapshot(snapPath, cs, mainnet, mainnet.assumeutxoData)
+    check res.success == false
+    # Error must start with the Core-verbatim prefix.
+    check res.error.startsWith("Bad snapshot content hash: expected ")
+    # Must include the expected hash (840k entry, byte-reversed display).
+    let expectedDisplay = block:
+      let b = mainnet.assumeutxoData[0].hashSerialized
+      var s = ""
+      for k in countdown(31, 0):
+        s.add(toHex(b[k].int, 2).toLowerAscii)
+      s
+    check expectedDisplay in res.error
+    check ", got " in res.error
+
+  test "createSnapshot empty UTXO set yields default-zero txoutsetHash":
+    # Honest progress: when there are no coins, we return all-zero rather
+    # than the empty-MuHash digest, because Core never produces a snapshot
+    # over an empty UTXO set in practice. Keeping this test pinned here
+    # documents the choice for future PRs.
+    let testDir = getTempDir() / "nimrod_muhash_empty"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    var cs = newChainState(dbDir, regtestParams())
+    defer: cs.close()
+    let genesis = buildGenesisBlock(regtestParams())
+    let r = cs.connectBlock(genesis, 0)
+    check r.isOk
+
+    let outPath = testDir / "empty.dat"
+    let res = createSnapshot(cs, outPath, regtestParams())
+    check res.coinsWritten == 0
+    check res.txoutsetHash == default(array[32, byte])
