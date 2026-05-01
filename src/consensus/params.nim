@@ -183,17 +183,48 @@ proc mainnetParams*(): ConsensusParams =
     (279000'u32, BlockHash(hexToBytes32("0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40"))),
     (295000'u32, BlockHash(hexToBytes32("00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983")))
   ]
-  # assumeUTXO snapshot data (from Bitcoin Core chainparams.cpp)
-  # These are hardcoded valid snapshots that can be loaded for fast sync
+  # assumeUTXO snapshot data — verbatim from Bitcoin Core
+  # bitcoin-core/src/kernel/chainparams.cpp::CMainParams::m_assumeutxo_data
+  # (commit pinned by the bitcoin-core/ submodule). All four mainnet entries.
   result.assumeutxoData = @[
     AssumeutxoData(
       height: 840000'i32,
       hashSerialized: hexToBytes32(
-        "51c8d11d7a1e6ab521e5c6d0c32c05b0e2c56a2a5d9a5b7c8d9e0f1a2b3c4d5e"  # Placeholder
+        "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"
       ),
-      chainTxCount: 990228936,
+      chainTxCount: 991032194'u64,
       blockhash: BlockHash(hexToBytes32(
         "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
+      ))
+    ),
+    AssumeutxoData(
+      height: 880000'i32,
+      hashSerialized: hexToBytes32(
+        "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9"
+      ),
+      chainTxCount: 1145604538'u64,
+      blockhash: BlockHash(hexToBytes32(
+        "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"
+      ))
+    ),
+    AssumeutxoData(
+      height: 910000'i32,
+      hashSerialized: hexToBytes32(
+        "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"
+      ),
+      chainTxCount: 1226586151'u64,
+      blockhash: BlockHash(hexToBytes32(
+        "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"
+      ))
+    ),
+    AssumeutxoData(
+      height: 935000'i32,
+      hashSerialized: hexToBytes32(
+        "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"
+      ),
+      chainTxCount: 1305397408'u64,
+      blockhash: BlockHash(hexToBytes32(
+        "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"
       ))
     )
   ]

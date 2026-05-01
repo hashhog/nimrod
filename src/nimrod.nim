@@ -7,7 +7,7 @@ import chronicles
 
 import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
-import ./storage/[db, chainstate]
+import ./storage/[db, chainstate, snapshot]
 import ./network/[peer, peermanager, sync, messages]
 import ./mempool/[mempool, persist]
 import ./mining/fees
@@ -63,6 +63,10 @@ type
     reindex*: bool        ## --reindex: wipe chainstate before start (HONEST
                           ## PROGRESS — does NOT re-scan blk*.dat; we drop
                           ## chainstate so the next start triggers fresh IBD).
+    loadSnapshot*: string ## --load-snapshot=<path>: load a Bitcoin Core
+                          ## byte-compatible UTXO snapshot before entering
+                          ## the main loop (assumeUTXO fast-sync). Must
+                          ## point to a fresh, network-matching snapshot.
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -112,7 +116,8 @@ proc defaultConfig*(): NimrodConfig =
     printToConsole: false,
     logFile: "",
     readyFd: -1,
-    reindex: false
+    reindex: false,
+    loadSnapshot: ""
   )
 
 proc loadConfigFile*(config: var NimrodConfig) =
@@ -249,6 +254,8 @@ Operational:
   --debuglogfile=PATH    Log file path (default: <datadir>/<network>/debug.log under --daemon)
   --ready-fd=N           Write '\\n' to FD N when startup is complete (supervision)
   --reindex              Wipe chainstate before start (re-download from peers)
+  --load-snapshot=PATH   Load a Bitcoin Core byte-compatible UTXO snapshot
+                         (assumeUTXO) into chainstate before entering main loop
 
   -h, --help             Show this help
   -v, --version          Show version
@@ -401,6 +408,11 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           result.config.reindex = true
         else:
           result.config.reindex = p.val.toLowerAscii() in ["1", "true", "yes"]
+      of "load-snapshot", "loadsnapshot":
+        if p.val.len == 0:
+          echo "Invalid --load-snapshot: missing path"
+          quit(1)
+        result.config.loadSnapshot = p.val
       of "help", "h":
         showHelp()
         quit(0)
@@ -1343,6 +1355,29 @@ proc startNode*(config: NimrodConfig) {.async.} =
   info "chainstate loaded",
     height = state.chainState.bestHeight,
     bestBlock = $state.chainState.bestBlockHash
+
+  # Optional one-shot UTXO snapshot load (assumeUTXO). Only meaningful on a
+  # near-empty chainstate; loading on top of an existing tip would corrupt the
+  # UTXO set. We refuse if the chain has already advanced past genesis.
+  if config.loadSnapshot.len > 0:
+    if state.chainState.bestHeight > 0:
+      warn "ignoring --load-snapshot on populated chainstate",
+        height = state.chainState.bestHeight
+    else:
+      info "loading UTXO snapshot", path = config.loadSnapshot
+      let r = loadSnapshot(
+        config.loadSnapshot,
+        state.chainState,
+        params,
+        params.assumeutxoData
+      )
+      if not r.success:
+        error "snapshot load failed", error = r.error
+        quit(1)
+      info "snapshot loaded",
+        coins = r.coinsLoaded,
+        height = state.chainState.bestHeight,
+        bestBlock = $state.chainState.bestBlockHash
 
   # 3. Initialize mempool
   info "initializing mempool"
