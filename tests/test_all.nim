@@ -73,6 +73,7 @@ import ./test_standard
 import ./test_bip331
 import ./test_mempool_persist
 import ./test_ops
+import ./test_snapshot
 
 when isMainModule:
   echo "Running all tests..."

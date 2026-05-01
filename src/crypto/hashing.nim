@@ -24,6 +24,35 @@ proc doubleSha256*(data: openArray[byte]): array[32, byte] =
   ## Alias for sha256d
   sha256d(data)
 
+# ----------------------------------------------------------------------------
+# Streaming double-SHA256 (Bitcoin Core's `HashWriter`)
+#
+# `bitcoin-core/src/hash.h::HashWriter::GetHash` accumulates bytes through a
+# single `CSHA256` context, then on finalization runs `SHA256(SHA256(stream))`.
+# Used by `CoinStatsHashType::HASH_SERIALIZED` (`coinstats.cpp:161-163`),
+# which is what `loadtxoutset` checks the snapshot's UTXO content against
+# (`validation.cpp:5901-5915`). MuHash3072 is a different code path
+# (`gettxoutsetinfo hash_type=muhash`), NOT the assumeutxo strict gate.
+# ----------------------------------------------------------------------------
+
+type
+  HashWriter* = object
+    ctx: sha256
+
+proc initHashWriter*(): HashWriter =
+  result.ctx.init()
+
+proc update*(hw: var HashWriter, data: openArray[byte]) =
+  ## Feed bytes into the streaming SHA-256 context.
+  hw.ctx.update(data)
+
+proc finalizeHash*(hw: var HashWriter): array[32, byte] =
+  ## Finalize as SHA256d (matches Core's `HashWriter::GetHash`):
+  ##   first  = SHA256(stream)
+  ##   result = SHA256(first)
+  let first = hw.ctx.finish().data
+  result = sha256Single(first)
+
 proc ripemd160*(data: openArray[byte]): array[20, byte] =
   var ctx: ripemd160
   ctx.init()

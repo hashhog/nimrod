@@ -5,6 +5,7 @@
 import std/[os, options, tables, unittest, strutils]
 import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing
+import ../src/crypto/muhash
 import ../src/consensus/params
 import ../src/storage/[chainstate, snapshot]
 
@@ -607,13 +608,15 @@ suite "snapshot misc":
     check tgt == 100
 
 # ----------------------------------------------------------------------------
-# MuHash3072 wiring: dump + strict load
+# Snapshot content-hash commitment: dump + strict load
+# (HASH_SERIALIZED = SHA256d via HashWriter — see strict-gate suite below
+# for the contract pinning the hash function.)
 # ----------------------------------------------------------------------------
 
-suite "snapshot MuHash3072 commitment":
+suite "snapshot content-hash commitment":
   test "createSnapshot returns a non-default txoutsetHash for non-empty dumps":
-    # The MuHash3072 of any non-empty UTXO set is a deterministic 32-byte
-    # SHA256 of a 384-byte modular product, never default(array[32, byte]).
+    # SHA256d over any non-empty TxOutSer byte stream is deterministic and
+    # vanishingly unlikely to collide with default(array[32, byte]).
     let testDir = getTempDir() / "nimrod_muhash_dump"
     createDir(testDir)
     defer:
@@ -664,8 +667,8 @@ suite "snapshot MuHash3072 commitment":
     defer: cs.close()
 
     # Hand-craft a snapshot file with a single fake coin and the 840k
-    # whitelisted blockhash. The MuHash will not match the real Core
-    # hashSerialized, so loadSnapshot must refuse.
+    # whitelisted blockhash. The SHA256d-over-TxOutSer digest will not match
+    # the real Core hashSerialized, so loadSnapshot must refuse.
     let snapPath = testDir / "fake-840k.dat"
     let txid = TxId(mkHashWith([0xDE'u8, 0xAD, 0xBE, 0xEF]))
     let coin = SnapshotCoin(
@@ -701,9 +704,9 @@ suite "snapshot MuHash3072 commitment":
 
   test "createSnapshot empty UTXO set yields default-zero txoutsetHash":
     # Honest progress: when there are no coins, we return all-zero rather
-    # than the empty-MuHash digest, because Core never produces a snapshot
-    # over an empty UTXO set in practice. Keeping this test pinned here
-    # documents the choice for future PRs.
+    # than the SHA256d-of-empty digest, because Core never produces a
+    # snapshot over an empty UTXO set in practice. Keeping this test pinned
+    # here documents the choice for future PRs.
     let testDir = getTempDir() / "nimrod_muhash_empty"
     createDir(testDir)
     defer:
@@ -721,3 +724,160 @@ suite "snapshot MuHash3072 commitment":
     let res = createSnapshot(cs, outPath, regtestParams())
     check res.coinsWritten == 0
     check res.txoutsetHash == default(array[32, byte])
+
+# ----------------------------------------------------------------------------
+# Strict-gate hash function pinning
+#
+# Per `bitcoin-core/src/validation.cpp:5901-5915` and
+# `bitcoin-core/src/kernel/coinstats.cpp:161-163`, the `loadtxoutset` strict
+# gate compares against `CoinStatsHashType::HASH_SERIALIZED` =
+# `HashWriter::GetHash()` over canonical-order TxOutSer bytes — i.e. SHA256d.
+# MuHash3072 (`hash_type=muhash`) is a separate code path and MUST NOT be
+# wired to assumeutxo. These tests pin that contract: the strict gate must
+# never silently fall back to MuHash, and `computeUtxoSetHashFromCoins` must
+# return a SHA256d digest that matches the createSnapshot commitment.
+# ----------------------------------------------------------------------------
+
+suite "snapshot strict gate uses SHA256d (HASH_SERIALIZED)":
+  test "computeUtxoSetHashFromCoins matches sha256d(concat(TxOutSer)) and NOT MuHash":
+    # Build two distinct coins, hand-compute the canonical TxOutSer byte stream,
+    # and check that `computeUtxoSetHashFromCoins` equals SHA256d(stream).
+    let txid1 = TxId(mkHashWith([0x11'u8]))
+    let txid2 = TxId(mkHashWith([0x22'u8]))
+    let coin1 = SnapshotCoin(
+      outpoint: OutPoint(txid: txid1, vout: 0),
+      output: TxOut(value: Satoshi(50_00000000),
+                    scriptPubKey: @[0x76'u8, 0xA9, 0x14] &
+                                  newSeq[byte](20) & @[0x88'u8, 0xAC]),
+      height: 200000, isCoinbase: true
+    )
+    let coin2 = SnapshotCoin(
+      outpoint: OutPoint(txid: txid2, vout: 3),
+      output: TxOut(value: Satoshi(123_456789),
+                    scriptPubKey: @[0x51'u8]),
+      height: 250000, isCoinbase: false
+    )
+    let computed = computeUtxoSetHashFromCoins(@[coin1, coin2])
+
+    var stream: seq[byte] = @[]
+    for c in [coin1, coin2]:
+      stream.add(serializeCoinForHash(
+        c.outpoint, int64(c.output.value), c.output.scriptPubKey,
+        c.height, c.isCoinbase))
+    let expected = sha256d(stream)
+    check computed == expected
+
+    # And it must NOT equal the MuHash3072 of the same coins. (MuHash applies
+    # `SHA256(numerator/denominator)` to a 384-byte modular product — it is
+    # deterministically different from SHA256d over the raw byte stream for
+    # any non-trivial input set.)
+    var muhash = newMuHash3072()
+    for c in [coin1, coin2]:
+      muhash.insert(serializeCoinForHash(
+        c.outpoint, int64(c.output.value), c.output.scriptPubKey,
+        c.height, c.isCoinbase))
+    let muhashDigest = muhash.finalize()
+    check computed != muhashDigest
+
+  test "createSnapshot txoutsetHash matches sha256d over canonical stream":
+    # End-to-end: dump a single coin into a snapshot file. The recorded
+    # `txoutsetHash` must equal the SHA256d of that coin's TxOutSer bytes,
+    # NOT the MuHash3072 digest.
+    let testDir = getTempDir() / "nimrod_strict_gate_sha256d"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    var cs = newChainState(dbDir, mainnetParams())
+    defer: cs.close()
+
+    let txid = TxId(mkHashWith([0xAB'u8, 0xCD]))
+    let outpoint = OutPoint(txid: txid, vout: 0)
+    let value = Satoshi(7_00000000)
+    let scriptPubKey = @[0x00'u8, 0x14] & newSeq[byte](20)  # P2WPKH-shaped
+    let height: int32 = 700000
+    let isCoinbase = false
+
+    cs.putUtxoCache(
+      outpoint,
+      UtxoEntry(output: TxOut(value: value, scriptPubKey: scriptPubKey),
+                height: height, isCoinbase: isCoinbase))
+    cs.bestBlockHash = BlockHash(mkHashWith([0xCC'u8]))
+    cs.bestHeight = height
+
+    let outPath = testDir / "single.dat"
+    let res = createSnapshot(cs, outPath, mainnetParams())
+    check res.coinsWritten == 1
+
+    let coinBytes = serializeCoinForHash(
+      outpoint, int64(value), scriptPubKey, height, isCoinbase)
+    let expected = sha256d(coinBytes)
+    check res.txoutsetHash == expected
+
+    # Sanity: must NOT equal the MuHash3072 of the same coin.
+    var muhash = newMuHash3072()
+    muhash.insert(coinBytes)
+    check res.txoutsetHash != muhash.finalize()
+
+  test "loadSnapshot strict gate rejects with SHA256d-derived 'got' value":
+    # Hand-build a fake snapshot whose baseBlockhash is whitelisted (840k)
+    # but whose coin contents do not match the real Core hash_serialized.
+    # The error message must include the SHA256d of our fake coin's TxOutSer
+    # bytes as the "got" value, byte-reversed for display.
+    let testDir = getTempDir() / "nimrod_strict_gate_reject"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let mainnet = mainnetParams()
+    var cs = newChainState(dbDir, mainnet)
+    defer: cs.close()
+
+    let txid = TxId(mkHashWith([0xFE'u8, 0xED, 0xFA, 0xCE]))
+    let outpoint = OutPoint(txid: txid, vout: 0)
+    let value = Satoshi(1)
+    let scriptPubKey = @[0x51'u8]
+    let height: int32 = 800000
+    let isCoinbase = false
+    let coin = SnapshotCoin(
+      outpoint: outpoint,
+      output: TxOut(value: value, scriptPubKey: scriptPubKey),
+      height: height, isCoinbase: isCoinbase
+    )
+    let meta = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: mainnet.networkMagic,
+      baseBlockhash: mainnet.assumeutxoData[0].blockhash,  # 840k
+      coinsCount: 1
+    )
+    let snapPath = testDir / "fake.dat"
+    let sf = openSnapshotForWrite(snapPath, meta)
+    sf.writeTxidGroup(coin.outpoint.txid, @[coin])
+    sf.close()
+
+    let res = loadSnapshot(snapPath, cs, mainnet, mainnet.assumeutxoData)
+    check res.success == false
+    check res.error.startsWith("Bad snapshot content hash: expected ")
+
+    # Compute the expected SHA256d ourselves and check the byte-reversed hex
+    # appears as the "got" half of the message.
+    let coinBytes = serializeCoinForHash(
+      outpoint, int64(value), scriptPubKey, height, isCoinbase)
+    let actualDigest = sha256d(coinBytes)
+    var gotHex = ""
+    for k in countdown(31, 0):
+      gotHex.add(toHex(actualDigest[k].int, 2).toLowerAscii)
+    check (", got " & gotHex) in res.error
+
+    # And the MuHash3072 hex of the same coin must NOT appear as "got".
+    var muhash = newMuHash3072()
+    muhash.insert(coinBytes)
+    let muDigest = muhash.finalize()
+    var muHex = ""
+    for k in countdown(31, 0):
+      muHex.add(toHex(muDigest[k].int, 2).toLowerAscii)
+    check (", got " & muHex) notin res.error
