@@ -8,7 +8,7 @@ import chronicles
 import jsony
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation, chain, versionbits]
-import ../storage/[chainstate, blockstore]
+import ../storage/[chainstate, blockstore, snapshot]
 import ../mempool/[mempool, package, persist]
 import ../crypto/[hashing, secp256k1, address, signmessage]
 import ../network/[peer, peermanager, banman]
@@ -2660,8 +2660,25 @@ proc handleDumpTxOutSet(rpc: RpcServer, params: JsonNode): JsonNode =
   if path == "":
     raise newRpcError(RpcInvalidParams, "path cannot be empty")
 
-  # dumptxoutset not implemented (requires snapshot module)
-  raise newRpcError(RpcInternalError, "dumptxoutset not implemented")
+  # Refuse to overwrite an existing file (matches Core's "path already exists").
+  if fileExists(path):
+    raise newRpcError(RpcMiscError, "path already exists: " & path)
+
+  let res =
+    try:
+      createSnapshot(rpc.chainState, path, rpc.chainState.params)
+    except SnapshotError as e:
+      raise newRpcError(RpcInternalError, "snapshot write failed: " & e.msg)
+    except IOError as e:
+      raise newRpcError(RpcInternalError, "snapshot I/O error: " & e.msg)
+
+  result = %*{
+    "coins_written": res.coinsWritten,
+    "base_hash": reverseHex(toHex(array[32, byte](res.baseHash))),
+    "base_height": res.baseHeight,
+    "path": path,
+    "txoutset_hash": reverseHex(toHex(res.txoutsetHash))
+  }
 
 proc handleLoadTxOutSet(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Load a UTXO snapshot from a file
@@ -2688,8 +2705,18 @@ proc handleLoadTxOutSet(rpc: RpcServer, params: JsonNode): JsonNode =
   if path == "":
     raise newRpcError(RpcInvalidParams, "path cannot be empty")
 
-  # loadtxoutset not implemented (requires snapshot module)
-  raise newRpcError(RpcInternalError, "loadtxoutset not implemented")
+  let res = loadSnapshot(
+    path, rpc.chainState, rpc.chainState.params, rpc.chainState.params.assumeutxoData
+  )
+  if not res.success:
+    raise newRpcError(RpcMiscError, "loadtxoutset failed: " & res.error)
+
+  result = %*{
+    "coins_loaded": res.coinsLoaded,
+    "tip_hash": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
+    "base_height": rpc.chainState.bestHeight,
+    "path": path
+  }
 
 proc handleGetTxOutSetInfo(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Return statistics about the UTXO set
