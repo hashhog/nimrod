@@ -32,6 +32,7 @@ import chronos
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 import ../crypto/muhash
+import ../crypto/secp256k1 as snapshot_secp
 import ../consensus/params
 import ./db
 import ./chainstate
@@ -191,10 +192,13 @@ proc decompressAmount*(x: uint64): uint64 =
 # Otherwise:
 #   VARINT(script.len + 6) followed by raw script bytes.
 #
-# This implementation is "honest progress": we recognize P2PKH and P2SH (which
-# don't require a secp256k1 pubkey-validity check) and fall back to the generic
-# raw-script path for everything else, including P2PK. Decoder handles all 6
-# special cases on the read path so we can still load Core-produced snapshots.
+# Encoder: recognizes P2PKH, P2SH, and compressed P2PK (tags 0x00..0x03). For
+# uncompressed P2PK we leave the script alone (generic fallback) because
+# tryCompressScript would need a secp256k1 round-trip just to encode the tag.
+# Decoder: handles all 6 special cases. Tags 0x04/0x05 invoke libsecp256k1 to
+# recover the full y-coordinate via secp256k1_ec_pubkey_parse +
+# secp256k1_ec_pubkey_serialize(SECP256K1_EC_UNCOMPRESSED) — matches Bitcoin
+# Core's `compressor.cpp::DecompressScript` for nSize 0x04/0x05.
 
 const
   OpDup = 0x76'u8
@@ -266,12 +270,27 @@ proc decompressSpecialScript(tag: uint64, payload: openArray[byte]): seq[byte] =
     for i in 0 ..< 32: result[2 + i] = payload[i]
     result[34] = OpChecksig
   of 0x04, 0x05:
-    # Uncompressed P2PK — without a secp256k1 decompress we cannot recover
-    # the full 65-byte pubkey. We fall back to a placeholder OP_RETURN; the
-    # node will see no spendable script. This matches Core's behaviour when
-    # DecompressScript fails on a malformed pubkey (script <- OP_RETURN).
-    result = newSeq[byte](1)
-    result[0] = 0x6A'u8  # OP_RETURN
+    # Uncompressed P2PK. Recover the y-coordinate via libsecp256k1 and emit
+    # `0x41 <65-byte pubkey> OP_CHECKSIG` (67 bytes), matching Bitcoin Core's
+    # `compressor.cpp::DecompressScript` for nSize 0x04/0x05:
+    #   build 33-byte compressed pubkey: (0x02 | (tag - 0x02)) || x[32]
+    #   pubkey_parse, pubkey_serialize(UNCOMPRESSED) -> 65 bytes
+    #   wrap as raw P2PK script.
+    doAssert payload.len == 32
+    var compressed = newSeq[byte](33)
+    compressed[0] = 0x02'u8 or byte(tag - 0x02)
+    for i in 0 ..< 32: compressed[1 + i] = payload[i]
+    let uncompressed = snapshot_secp.decompressPubkey(compressed)
+    if uncompressed.len != 65:
+      # Core returns false from DecompressScript here; we propagate as an
+      # error so the snapshot load aborts loudly rather than silently
+      # corrupting the UTXO set.
+      raise newException(SnapshotError,
+        "ScriptCompression: invalid x-coordinate for uncompressed P2PK (tag " & $tag & ")")
+    result = newSeq[byte](67)
+    result[0] = 0x41'u8  # push 65 bytes
+    for i in 0 ..< 65: result[1 + i] = uncompressed[i]
+    result[66] = OpChecksig
   else:
     raise newException(SnapshotError, "unknown ScriptCompression tag: " & $tag)
 

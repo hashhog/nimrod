@@ -131,6 +131,59 @@ suite "ScriptCompression":
     let decoded = r.readCompressedScript()
     check decoded == script
 
+  test "Tag 0x04 recovers uncompressed P2PK via secp256k1 (generator G)":
+    # Vector: secp256k1 generator G.
+    # Compressed (even-y): 02 79be667e... -> tag 0x04, x = 79be667e...
+    # Uncompressed:        04 79be667e... 483ada77...
+    let xCoord = bytesFromHex(
+      "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+    let yCoord = bytesFromHex(
+      "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
+    # Reader-side input: tag 0x04 (single VARINT byte) followed by 32 x-bytes.
+    var w = BinaryWriter()
+    w.writeVarInt(0x04'u64)
+    w.writeBytes(xCoord)
+    var r = BinaryReader(data: w.data, pos: 0)
+    let decoded = r.readCompressedScript()
+    # Expected: 0x41 <65-byte pubkey> 0xAC, total 67 bytes.
+    check decoded.len == 67
+    check decoded[0] == 0x41'u8
+    check decoded[1] == 0x04'u8
+    check decoded[2 .. 33] == xCoord
+    check decoded[34 .. 65] == yCoord
+    check decoded[66] == 0xAC'u8
+
+  test "Tag 0x05 recovers uncompressed P2PK with odd y":
+    # Vector: pubkey 03 79be667e... is the odd-y partner of G's negation point.
+    # Use 03-prefixed compressed pubkey (odd y) = -G mod p.
+    # Compressed: 03 79be667e...  (same x, odd y)
+    # Uncompressed equivalent has odd y = p - 483ada77...
+    # We don't hard-code the odd-y bytes here; instead verify the decoder
+    # produces a valid 67-byte P2PK script with x preserved and odd y parity.
+    let xCoord = bytesFromHex(
+      "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+    var w = BinaryWriter()
+    w.writeVarInt(0x05'u64)
+    w.writeBytes(xCoord)
+    var r = BinaryReader(data: w.data, pos: 0)
+    let decoded = r.readCompressedScript()
+    check decoded.len == 67
+    check decoded[0] == 0x41'u8
+    check decoded[1] == 0x04'u8
+    check decoded[2 .. 33] == xCoord
+    # Odd y parity: last byte of y must be odd.
+    check (decoded[65].int and 1) == 1
+    check decoded[66] == 0xAC'u8
+
+  test "Tag 0x04 with invalid x-coordinate raises SnapshotError":
+    # x = all-zeros is not on the secp256k1 curve.
+    var w = BinaryWriter()
+    w.writeVarInt(0x04'u64)
+    w.writeBytes(newSeq[byte](32))
+    var r = BinaryReader(data: w.data, pos: 0)
+    expect SnapshotError:
+      discard r.readCompressedScript()
+
 # ----------------------------------------------------------------------------
 # Header serialization (file metadata)
 # ----------------------------------------------------------------------------

@@ -585,6 +585,32 @@ when defined(useSystemSecp256k1):
     if int(outputLen) != result.len:
       result.setLen(int(outputLen))
 
+  proc decompressPubkey*(compressed: openArray[byte]): seq[byte] =
+    ## Parse a 33-byte compressed pubkey and serialize it as a 65-byte
+    ## uncompressed pubkey. Returns @[] on parse failure.
+    ## Mirrors Bitcoin Core's CPubKey::Decompress (see compressor.cpp's
+    ## DecompressScript path for nSize 0x04 / 0x05).
+    if compressed.len != 33:
+      return @[]
+    var pubkey: Secp256k1Pubkey
+    var input = newSeq[byte](33)
+    for i in 0 ..< 33:
+      input[i] = compressed[i]
+    if secp256k1_ec_pubkey_parse(
+      getContext(), addr pubkey, addr input[0], 33
+    ) != 1:
+      return @[]
+    var outputLen: csize_t = 65
+    result = newSeq[byte](65)
+    const SECP256K1_EC_UNCOMPRESSED = 2'u32
+    if secp256k1_ec_pubkey_serialize(
+      getContext(), addr result[0], addr outputLen,
+      addr pubkey, SECP256K1_EC_UNCOMPRESSED
+    ) != 1:
+      return @[]
+    if int(outputLen) != 65:
+      return @[]
+
   proc tweakXonlyPubkey*(
     internalPk: array[32, byte],
     tweak: array[32, byte]
@@ -838,6 +864,9 @@ else:
   proc recoverCompactPubkey*(
     msgHash: array[32, byte], sig64: array[64, byte], recid: int, compressed: bool
   ): seq[byte] =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc decompressPubkey*(compressed: openArray[byte]): seq[byte] =
     raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
 
   # Stub CryptoEngine
