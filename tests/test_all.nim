@@ -65,6 +65,7 @@ import ./test_zmq
 import ./test_notification
 import ./test_regtest
 import ./test_softforks_bridge
+import ./test_wallet_dispatch
 import ./test_assumevalid
 import ./test_checkpoint
 import ./test_parallel_verify_ibd

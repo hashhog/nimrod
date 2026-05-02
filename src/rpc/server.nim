@@ -4319,7 +4319,7 @@ proc handleFinalizePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   else:
     result["psbt"] = %psbtObj.toBase64()
 
-proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
+proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
   case methodName
   # Blockchain
   of "getblockchaininfo":
@@ -4443,6 +4443,18 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
   # Utility
   of "validateaddress":
     rpc.handleValidateAddress(params)
+
+  # Wallet management
+  of "createwallet":
+    rpc.handleCreateWallet(params)
+  of "loadwallet":
+    rpc.handleLoadWallet(params)
+  of "unloadwallet":
+    rpc.handleUnloadWallet(params)
+  of "listwallets":
+    rpc.handleListWallets(params)
+  of "listwalletdir":
+    rpc.handleListWalletDir(params)
 
   # Wallet
   of "getnewaddress":
