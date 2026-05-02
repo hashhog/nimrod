@@ -259,6 +259,106 @@ suite "ChainState unspendable filter (CScript::IsUnspendable)":
 
     cs.close()
 
+suite "ChainState scrubunspendable (legacy datadir cleanup)":
+  ## The write-time `isUnspendable` filter (commit 94b7755) only stops new
+  ## OP_RETURN / oversize coins from entering the chainstate. Datadirs created
+  ## BEFORE that fix still carry orphan entries. `scrubUnspendable` is the
+  ## one-shot operator-invoked tool that walks cfUtxo and removes them.
+  ## These tests synthesize a "pre-fix" chainstate by writing the orphans
+  ## directly via `cs.db.putUtxo`, bypassing the new filter.
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "scrubUnspendable removes OP_RETURN + oversize coins, keeps spendable":
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    # Connect a real spendable coinbase via the normal path.
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let goodTxid = genesis.txs[0].txid()
+
+    # Synthesize three "legacy" orphan entries by going around the filter
+    # with direct db writes — this is exactly what a pre-fix nimrod build
+    # would have left on disk.
+    var op1Txid: array[32, byte]; op1Txid[0] = 0xAA
+    let opReturnEntry = UtxoEntry(
+      output: TxOut(value: Satoshi(0),
+                    scriptPubKey: @[byte(0x6a), 0x24] & newSeq[byte](36)),
+      height: 1, isCoinbase: true)
+    cs.db.putUtxo(OutPoint(txid: TxId(op1Txid), vout: 1), opReturnEntry)
+
+    var op2Txid: array[32, byte]; op2Txid[0] = 0xBB
+    let oversizeEntry = UtxoEntry(
+      output: TxOut(value: Satoshi(0), scriptPubKey: newSeq[byte](10001)),
+      height: 2, isCoinbase: false)
+    cs.db.putUtxo(OutPoint(txid: TxId(op2Txid), vout: 0), oversizeEntry)
+
+    var op3Txid: array[32, byte]; op3Txid[0] = 0xCC
+    let opReturnEmptyPushEntry = UtxoEntry(
+      output: TxOut(value: Satoshi(0), scriptPubKey: @[byte(0x6a)]),
+      height: 3, isCoinbase: false)
+    cs.db.putUtxo(OutPoint(txid: TxId(op3Txid), vout: 0), opReturnEmptyPushEntry)
+
+    # Sanity: the legacy orphans are visible via the DB layer.
+    check cs.db.getUtxo(OutPoint(txid: TxId(op1Txid), vout: 1)).isSome
+    check cs.db.getUtxo(OutPoint(txid: TxId(op2Txid), vout: 0)).isSome
+    check cs.db.getUtxo(OutPoint(txid: TxId(op3Txid), vout: 0)).isSome
+    # Real spendable coinbase is in the cache (not yet flushed to disk).
+    check cs.getUtxo(OutPoint(txid: goodTxid, vout: 0)).isSome
+
+    let res = cs.scrubUnspendable()
+    check res.removed == 3
+    check res.bytesFreed > 0
+
+    # All three orphans gone.
+    check cs.db.getUtxo(OutPoint(txid: TxId(op1Txid), vout: 1)).isNone
+    check cs.db.getUtxo(OutPoint(txid: TxId(op2Txid), vout: 0)).isNone
+    check cs.db.getUtxo(OutPoint(txid: TxId(op3Txid), vout: 0)).isNone
+    # Real coinbase UTXO is untouched.
+    check cs.getUtxo(OutPoint(txid: goodTxid, vout: 0)).isSome
+
+    cs.close()
+
+  test "scrubUnspendable is idempotent (second call removes zero)":
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+
+    # Plant one orphan and a real spendable entry written directly.
+    var orphanTxid: array[32, byte]; orphanTxid[0] = 0xDD
+    let orphan = UtxoEntry(
+      output: TxOut(value: Satoshi(0),
+                    scriptPubKey: @[byte(0x6a), 0x10] & newSeq[byte](16)),
+      height: 1, isCoinbase: true)
+    cs.db.putUtxo(OutPoint(txid: TxId(orphanTxid), vout: 0), orphan)
+
+    var spendableTxid: array[32, byte]; spendableTxid[0] = 0xEE
+    let spendable = UtxoEntry(
+      output: TxOut(value: Satoshi(5000),
+                    scriptPubKey: @[byte(0x00), 0x14] &
+                      @(array[20, byte](default(array[20, byte])))),
+      height: 2, isCoinbase: false)
+    cs.db.putUtxo(OutPoint(txid: TxId(spendableTxid), vout: 0), spendable)
+
+    let first = cs.scrubUnspendable()
+    check first.removed == 1
+    check first.bytesFreed > 0
+
+    let second = cs.scrubUnspendable()
+    check second.removed == 0
+    check second.bytesFreed == 0
+
+    # Spendable entry survived both passes.
+    check cs.db.getUtxo(OutPoint(txid: TxId(spendableTxid), vout: 0)).isSome
+    # Orphan still gone.
+    check cs.db.getUtxo(OutPoint(txid: TxId(orphanTxid), vout: 0)).isNone
+
+    cs.close()
+
 suite "ChainState coinbase maturity":
   setup:
     cleanupTestDb()

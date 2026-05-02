@@ -804,6 +804,70 @@ proc stopIBD*(cs: var ChainState) =
   # Re-enable WAL for normal operation
   cs.db.db.enableWAL()
 
+proc scrubUnspendable*(cs: var ChainState):
+    tuple[removed: uint64, bytesFreed: uint64] =
+  ## One-shot operator-invoked scrub: walk the entire UTXO column family,
+  ## delete every entry whose scriptPubKey is provably unspendable per
+  ## `CScript::IsUnspendable()` (OP_RETURN-prefixed OR > MAX_SCRIPT_SIZE).
+  ##
+  ## Closes the legacy datadir gap left by the byte-identity fix
+  ## (94b7755): existing chainstates created BEFORE that commit still carry
+  ## orphan OP_RETURN coins from segwit-coinbase witness commitments. The
+  ## write-time filter only stops new writes — it can't remove stale rows.
+  ##
+  ## Idempotent: a second call removes 0 rows. Safe to run with the cache
+  ## non-empty; we also drop in-cache unspendable entries so the user can
+  ## scrub mid-IBD if desired (though "operator-invoked, not on startup"
+  ## remains the canonical use case).
+  ##
+  ## Returns (removed_count, bytes_freed) where bytes_freed sums
+  ## (key_len + value_len) for every deleted entry (an estimate of LSM
+  ## payload reclaimed once compaction sweeps the tombstones).
+  result.removed = 0
+  result.bytesFreed = 0
+
+  # Phase 1: drop unspendable rows from the in-memory cache so we don't
+  # re-flush them and so a same-process gettxoutsetinfo sees the truth.
+  var cacheKeysToDrop: seq[OutPoint] = @[]
+  for op, entry in cs.utxoCache:
+    if isUnspendable(entry.output.scriptPubKey):
+      cacheKeysToDrop.add(op)
+  for op in cacheKeysToDrop:
+    cs.utxoCache.del(op)
+    if cs.cacheSize > 0:
+      dec cs.cacheSize
+
+  # Phase 2: stream the on-disk UTXO column family. Collect candidate keys
+  # first (we can't safely delete during iteration on every backend), then
+  # delete them in a single write batch.
+  var keysToDelete: seq[seq[byte]] = @[]
+  var bytesFreed: uint64 = 0
+  for (key, value) in cs.db.db.iterCf(cfUtxo):
+    # Defensive: skip malformed entries rather than crash mid-scrub.
+    var entry: UtxoEntry
+    try:
+      entry = deserializeUtxoEntry(value)
+    except CatchableError:
+      continue
+    if isUnspendable(entry.output.scriptPubKey):
+      keysToDelete.add(key)
+      bytesFreed += uint64(key.len + value.len)
+
+  if keysToDelete.len == 0:
+    info "scrubunspendable: no orphan entries found"
+    return (0'u64, 0'u64)
+
+  let batch = cs.db.db.newWriteBatch()
+  defer: batch.destroy()
+  for k in keysToDelete:
+    batch.delete(cfUtxo, k)
+  cs.db.db.write(batch)
+
+  result.removed = uint64(keysToDelete.len)
+  result.bytesFreed = bytesFreed
+  info "scrubunspendable: removed entries",
+       removed = result.removed, bytesFreed = result.bytesFreed
+
 proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainStateResult[void] =
   ## Fast-path block connection for IBD
   ## Skips: undo data, tx index, full block storage, per-block RocksDB flush

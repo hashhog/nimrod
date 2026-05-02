@@ -2908,6 +2908,32 @@ proc handleGetTxOutSetInfo(rpc: RpcServer, params: JsonNode): JsonNode =
 
   response
 
+proc handleScrubUnspendable*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Operator-invoked one-shot scrub: walk the chainstate UTXO column
+  ## family and delete every entry whose scriptPubKey is provably
+  ## unspendable per `CScript::IsUnspendable()` (OP_RETURN-prefixed OR
+  ## > MAX_SCRIPT_SIZE).
+  ##
+  ## Closes the legacy datadir gap left by the byte-identity write-time
+  ## filter (chainstate commit 94b7755): existing chainstates created
+  ## BEFORE that fix still carry orphan OP_RETURN coins from segwit
+  ## coinbase witness commitments; `gettxoutsetinfo` reads ~2x the correct
+  ## count on those datadirs. The scrub removes them in place.
+  ##
+  ## Idempotent — running twice removes 0 the second time.
+  ## Does NOT run automatically on startup; operator-invoked only.
+  ##
+  ## Arguments: (none — params ignored)
+  ##
+  ## Returns:
+  ##   { "removed": <uint>, "bytes_freed": <uint> }
+  discard params  # no parameters
+  let res = scrubUnspendable(rpc.chainState)
+  result = %*{
+    "removed": res.removed,
+    "bytes_freed": res.bytesFreed
+  }
+
 # ============================================================================
 # Wallet RPCs
 # ============================================================================
@@ -4334,6 +4360,8 @@ proc handleMethod(rpc: RpcServer, methodName: string, params: JsonNode): JsonNod
     rpc.handleLoadTxOutSet(params)
   of "gettxoutsetinfo":
     rpc.handleGetTxOutSetInfo(params)
+  of "scrubunspendable":
+    rpc.handleScrubUnspendable(params)
 
   # Mempool
   of "getmempoolinfo":
