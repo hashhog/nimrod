@@ -93,12 +93,18 @@ suite "CoinStatsIndex":
     check getBogoSize(@[]) == 50'u64  # 32 + 4 + 4 + 1 + 8 + 0 + 1
     check getBogoSize(@[1'u8, 2, 3]) == 53'u64  # 32 + 4 + 4 + 1 + 8 + 3 + 1
 
-  test "isUnspendable detection":
-    check isUnspendable(@[]) == true  # Empty
+  test "isUnspendable detection (Core CScript::IsUnspendable)":
+    # Core's IsUnspendable:
+    #   (size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE)
+    # Empty scripts are NOT unspendable (the size>0 guard).
+    check isUnspendable(@[]) == false  # Empty -- Core: size()>0 guard
     check isUnspendable(@[0x6a'u8]) == true  # OP_RETURN
     check isUnspendable(@[0x6a'u8, 0x04]) == true  # OP_RETURN with data
     check isUnspendable(@[0x76'u8, 0xa9]) == false  # P2PKH
     check isUnspendable(@[0x00'u8, 0x14]) == false  # P2WPKH
+    # Oversize: > MAX_SCRIPT_SIZE (10000 bytes).
+    check isUnspendable(newSeq[byte](10001)) == true   # 10001 bytes
+    check isUnspendable(newSeq[byte](10000)) == false  # exactly the limit
 
   test "genesis block handling":
     let blk = Block(

@@ -530,8 +530,9 @@ proc addCoins*(view: CoinsViewCache, tx: types.Transaction, height: int32) =
   let txid = tx.txid()
 
   for vout, output in tx.outputs:
-    # Skip unspendable outputs
-    if output.scriptPubKey.len > 0 and output.scriptPubKey[0] == 0x6a:  # OP_RETURN
+    # Skip unspendable outputs (OP_RETURN or scripts > MAX_SCRIPT_SIZE).
+    # Mirrors `IsUnspendable()` in bitcoin-core/src/script/script.h.
+    if isUnspendable(output.scriptPubKey):
       continue
 
     let outpoint = OutPoint(txid: txid, vout: uint32(vout))

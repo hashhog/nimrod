@@ -164,6 +164,101 @@ suite "ChainState UTXO management":
 
     cs.close()
 
+suite "ChainState unspendable filter (CScript::IsUnspendable)":
+  ## Regression for the dumptxoutset 2x-coin-count bug. Bitcoin Core's
+  ## `AddCoins` (coins.cpp) skips outputs whose scriptPubKey is provably
+  ## unspendable per `CScript::IsUnspendable()` (script.h:563): OP_RETURN-
+  ## prefixed OR larger than MAX_SCRIPT_SIZE (10000 bytes). nimrod's
+  ## chainstate must do the same so the UTXO set — and therefore
+  ## dumptxoutset — matches Core byte-for-byte.
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "OP_RETURN coinbase witness-commitment output not added to UTXO":
+    # This mirrors what Core-mined regtest blocks at height >= 1 carry:
+    # a spendable P2W* output PLUS a witness-commitment OP_RETURN output.
+    # The OP_RETURN output must NOT enter the chainstate.
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    # Build a coinbase that has TWO outputs: a P2W* spendable + an OP_RETURN.
+    let heightBytes = @[byte(1), 0, 0, 0]
+    let coinbase = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])),
+                          vout: 0xFFFFFFFF'u32),
+        scriptSig: @[byte(0x04)] & heightBytes,
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[
+        TxOut(value: Satoshi(5000000000),
+              scriptPubKey: @[byte(0x00), 0x14] &
+                @(array[20, byte](default(array[20, byte])))),
+        # 0x6a = OP_RETURN, 0x24 = push 36 bytes (witness commitment header).
+        TxOut(value: Satoshi(0),
+              scriptPubKey: @[byte(0x6a), 0x24] & newSeq[byte](36))
+      ],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let blk = makeTestBlock(genesisHash, 1, @[coinbase])
+
+    let r = cs.connectBlock(blk, 1)
+    check r.isOk
+
+    # The spendable output (vout=0) MUST be present.
+    check cs.getUtxo(OutPoint(txid: coinbase.txid(), vout: 0)).isSome
+    # The OP_RETURN witness-commitment output (vout=1) MUST NOT be present.
+    check cs.getUtxo(OutPoint(txid: coinbase.txid(), vout: 1)).isNone
+
+    cs.close()
+
+  test "oversize scriptPubKey (> MAX_SCRIPT_SIZE) not added to UTXO":
+    # MAX_SCRIPT_SIZE = 10000 bytes per Core script.h:40. Anything strictly
+    # larger is provably unspendable and never enters the chainstate.
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    let heightBytes = @[byte(1), 0, 0, 0]
+    # 10001 bytes — strictly above the limit. Core treats this as
+    # IsUnspendable() == true.
+    let oversized = newSeq[byte](10001)
+    let coinbase = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])),
+                          vout: 0xFFFFFFFF'u32),
+        scriptSig: @[byte(0x04)] & heightBytes,
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[
+        TxOut(value: Satoshi(5000000000),
+              scriptPubKey: @[byte(0x51)]),  # OP_1 -- spendable
+        TxOut(value: Satoshi(0), scriptPubKey: oversized)
+      ],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let blk = makeTestBlock(genesisHash, 1, @[coinbase])
+
+    let r = cs.connectBlock(blk, 1)
+    check r.isOk
+    # Spendable vout=0 present, oversize vout=1 absent.
+    check cs.getUtxo(OutPoint(txid: coinbase.txid(), vout: 0)).isSome
+    check cs.getUtxo(OutPoint(txid: coinbase.txid(), vout: 1)).isNone
+
+    cs.close()
+
 suite "ChainState coinbase maturity":
   setup:
     cleanupTestDb()

@@ -89,3 +89,20 @@ proc toBtc*(s: Satoshi): float =
 proc isSegwit*(tx: Transaction): bool =
   ## Returns true if transaction has witness data
   tx.witnesses.len > 0 and tx.witnesses.anyIt(it.len > 0)
+
+const
+  ## MAX_SCRIPT_SIZE matches Bitcoin Core's `script.h:40` (= 10000). Outputs
+  ## with a scriptPubKey larger than this are treated as provably unspendable
+  ## and never enter the chainstate UTXO set.
+  MaxScriptSizeBytes* = 10_000
+
+proc isUnspendable*(scriptPubKey: openArray[byte]): bool {.inline.} =
+  ## Mirrors `CScript::IsUnspendable()` in `bitcoin-core/src/script/script.h`:
+  ##   return (size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE);
+  ##
+  ## NOTE: empty scripts are NOT unspendable per Core (size() > 0 guard).
+  ## OP_RETURN = 0x6a. Used by chainstate population (connectBlock /
+  ## connectBlockIBD / applyBlock) and by createSnapshot as a defensive
+  ## filter for legacy datadirs that may have OP_RETURN coins persisted.
+  (scriptPubKey.len > 0 and scriptPubKey[0] == 0x6a'u8) or
+    scriptPubKey.len > MaxScriptSizeBytes
