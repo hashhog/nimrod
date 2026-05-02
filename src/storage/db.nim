@@ -158,6 +158,18 @@ proc rocksdb_flushoptions_set_wait*(opts: pointer, v: uint8)
 proc rocksdb_flush_cf*(db: RocksDbPtr, flushOpts: pointer,
     cf: RocksDbColumnFamilyHandle, errptr: ptr cstring)
 
+# Iterator API (used by chainstate scrub + future cursor-driven snapshot)
+proc rocksdb_create_iterator_cf*(db: RocksDbPtr, readOpts: RocksDbReadOptionsPtr,
+    cf: RocksDbColumnFamilyHandle): RocksDbIteratorPtr
+proc rocksdb_iter_destroy*(it: RocksDbIteratorPtr)
+proc rocksdb_iter_seek_to_first*(it: RocksDbIteratorPtr)
+proc rocksdb_iter_seek_to_last*(it: RocksDbIteratorPtr)
+proc rocksdb_iter_next*(it: RocksDbIteratorPtr)
+proc rocksdb_iter_valid*(it: RocksDbIteratorPtr): uint8
+proc rocksdb_iter_key*(it: RocksDbIteratorPtr, klen: ptr csize_t): cstring
+proc rocksdb_iter_value*(it: RocksDbIteratorPtr, vlen: ptr csize_t): cstring
+proc rocksdb_iter_get_error*(it: RocksDbIteratorPtr, errptr: ptr cstring)
+
 # Memory management
 proc rocksdb_free*(p: pointer)
 {.pop.}
@@ -533,6 +545,41 @@ proc flushAllColumnFamilies*(db: Database) =
       var err: cstring = nil
       rocksdb_flush_cf(db.db, flushOpts, db.cfHandles[cf], addr err)
       checkError(err)
+
+# ============================================================================
+# Iteration helpers — used by scrubunspendable to walk an entire CF.
+# ============================================================================
+
+iterator iterCf*(db: Database, cf: ColumnFamily): tuple[key: seq[byte], value: seq[byte]] =
+  ## Iterate over every (key, value) pair in `cf`. Yields a copy of each
+  ## entry so the caller may mutate the database while iterating (e.g. to
+  ## delete the just-yielded key). Internally this snapshots the iterator
+  ## by copying both buffers up front, then advances before yielding.
+  let it = rocksdb_create_iterator_cf(db.db, db.readOpts, db.cfHandles[cf])
+  if it == nil:
+    raise newException(RocksDbError, "failed to create iterator for cf " & $cf)
+  try:
+    rocksdb_iter_seek_to_first(it)
+    while rocksdb_iter_valid(it) != 0:
+      var klen: csize_t = 0
+      var vlen: csize_t = 0
+      let kPtr = rocksdb_iter_key(it, addr klen)
+      let vPtr = rocksdb_iter_value(it, addr vlen)
+      var key = newSeq[byte](klen)
+      var val = newSeq[byte](vlen)
+      if klen > 0:
+        copyMem(addr key[0], kPtr, klen)
+      if vlen > 0:
+        copyMem(addr val[0], vPtr, vlen)
+      # NOTE: we do NOT free kPtr/vPtr — RocksDB owns those buffers and
+      # invalidates them on the next iter_next/destroy.
+      yield (key, val)
+      rocksdb_iter_next(it)
+    var err: cstring = nil
+    rocksdb_iter_get_error(it, addr err)
+    checkError(err)
+  finally:
+    rocksdb_iter_destroy(it)
 
 # Key construction helpers (big-endian for ordered iteration)
 
