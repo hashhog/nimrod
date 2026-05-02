@@ -222,9 +222,10 @@ method customInit*(idx: CoinStatsIndex): bool =
 
   true
 
-proc isUnspendable*(scriptPubKey: seq[byte]): bool =
-  ## Check if script is provably unspendable (OP_RETURN or empty)
-  scriptPubKey.len == 0 or (scriptPubKey.len > 0 and scriptPubKey[0] == 0x6a)
+# Note: isUnspendable is now defined canonically in primitives/types.nim,
+# matching Bitcoin Core's CScript::IsUnspendable() (OP_RETURN or oversize).
+# Empty scripts are NOT considered unspendable per Core (size() > 0 guard).
+# This module re-uses the canonical helper for both append and detach paths.
 
 method customAppend*(idx: CoinStatsIndex, blockInfo: BlockInfo): bool =
   ## Process a new block

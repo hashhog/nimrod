@@ -508,6 +508,14 @@ proc createSnapshot*(
     if entry.height == 0 and entry.isCoinbase and
        op.txid == genesisCoinbaseTxid:
       continue
+    # Defensive: skip provably unspendable outputs at dump time too. The
+    # AddCoins-equivalent path (connectBlock / connectBlockIBD / applyBlock)
+    # already filters these, but legacy datadirs created before that fix may
+    # have OP_RETURN or oversize coins persisted. Belt-and-suspenders so we
+    # always produce Core-byte-compatible dumps regardless of chainstate
+    # provenance.
+    if isUnspendable(entry.output.scriptPubKey):
+      continue
     coins.add(SnapshotCoin(
       outpoint: op,
       output: entry.output,

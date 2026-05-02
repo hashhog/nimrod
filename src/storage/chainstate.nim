@@ -644,6 +644,14 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
 
     # Create outputs
     for voutIdx, output in tx.outputs:
+      # Skip provably unspendable outputs (OP_RETURN, oversized scripts).
+      # Mirrors `AddCoins` in bitcoin-core/src/coins.cpp which calls
+      # `IsUnspendable()` (script.h:563) and never adds them to the UTXO
+      # set. Without this filter, dumptxoutset emits 2x the coin count
+      # for any chain whose coinbases carry the segwit witness-commitment
+      # OP_RETURN output.
+      if isUnspendable(output.scriptPubKey):
+        continue
       let entry = UtxoEntry(
         output: output,
         height: height,
@@ -846,6 +854,9 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
 
     # Create outputs - add to cache (will be flushed in batch)
     for voutIdx, output in tx.outputs:
+      # Skip provably unspendable outputs — see connectBlock comment above.
+      if isUnspendable(output.scriptPubKey):
+        continue
       let entry = UtxoEntry(
         output: output,
         height: height,
@@ -1110,6 +1121,10 @@ proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
 
     # Create outputs
     for voutIdx, output in tx.outputs:
+      # Skip provably unspendable outputs (OP_RETURN, oversized scripts) —
+      # mirrors AddCoins in bitcoin-core/src/coins.cpp.
+      if isUnspendable(output.scriptPubKey):
+        continue
       let entry = UtxoEntry(
         output: output,
         height: height,
