@@ -967,6 +967,67 @@ proc checkMinimalPush(data: seq[byte], opcode: uint8): bool =
   else:
     true
 
+proc isOpSuccess*(opcode: uint8): bool =
+  ## BIP-342 OP_SUCCESSx detection. Mirrors Core's `IsOpSuccess`
+  ## (script/script.cpp:364): opcodes 80, 98, 126-129, 131-134,
+  ## 137-138, 141-142, 149-153, 187-254 unconditionally make the
+  ## tapscript succeed (and disable element-size + opcount limits).
+  ## A future soft fork may repurpose any of these to a new opcode;
+  ## any node that does NOT honor OP_SUCCESS will split off the
+  ## chain when the fork activates.
+  opcode == 80'u8 or opcode == 98'u8 or
+    (opcode >= 126'u8 and opcode <= 129'u8) or
+    (opcode >= 131'u8 and opcode <= 134'u8) or
+    (opcode >= 137'u8 and opcode <= 138'u8) or
+    (opcode >= 141'u8 and opcode <= 142'u8) or
+    (opcode >= 149'u8 and opcode <= 153'u8) or
+    (opcode >= 187'u8 and opcode <= 254'u8)
+
+proc tapscriptOpSuccessPrePass*(script: openArray[byte]): ScriptError =
+  ## Walk a tapscript end-to-end (skipping push-data payloads) and
+  ## return seOk on first OP_SUCCESSx encountered (Core
+  ## ExecuteWitnessScript at interpreter.cpp:1837-1852). Returns
+  ## seInvalidStack on a malformed push-data, seUnknownOpcode if no
+  ## OP_SUCCESSx is found in the script (caller should fall through
+  ## to normal eval).
+  var pc = 0
+  let scriptLen = script.len
+  while pc < scriptLen:
+    let opcode = script[pc]
+    pc += 1
+    if isOpSuccess(opcode):
+      return seOk
+    # Skip push-data payloads (and validate length, matching Core's
+    # GetOp; a malformed push terminates the pre-pass with BAD_OPCODE).
+    if opcode >= 0x01'u8 and opcode <= 0x4b'u8:
+      let pushLen = int(opcode)
+      if pc + pushLen > scriptLen:
+        return seInvalidStack
+      pc += pushLen
+    elif opcode == OP_PUSHDATA1:
+      if pc >= scriptLen: return seInvalidStack
+      let pushLen = int(script[pc])
+      pc += 1
+      if pc + pushLen > scriptLen: return seInvalidStack
+      pc += pushLen
+    elif opcode == OP_PUSHDATA2:
+      if pc + 2 > scriptLen: return seInvalidStack
+      let pushLen = int(script[pc]) or (int(script[pc + 1]) shl 8)
+      pc += 2
+      if pc + pushLen > scriptLen: return seInvalidStack
+      pc += pushLen
+    elif opcode == OP_PUSHDATA4:
+      if pc + 4 > scriptLen: return seInvalidStack
+      let pushLen = int(script[pc]) or (int(script[pc + 1]) shl 8) or
+                    (int(script[pc + 2]) shl 16) or (int(script[pc + 3]) shl 24)
+      pc += 4
+      if pc + pushLen > scriptLen: return seInvalidStack
+      pc += pushLen
+  # No OP_SUCCESSx found; sentinel value telling caller to proceed
+  # with normal eval. (We return seUnknownOpcode here as a convenient
+  # "did not short-circuit" signal — `eval` interprets it that way.)
+  seUnknownOpcode
+
 # Core evaluation function
 proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
            ctx: SigCheckContext): ScriptError =
@@ -2458,6 +2519,19 @@ proc verifyWitnessProgram*(
         if computedQ[i] != program[i]:
           return false
 
+      # BIP-342 OP_SUCCESSx pre-pass (Core ExecuteWitnessScript at
+      # script/interpreter.cpp:1837-1852). If the tapscript contains
+      # ANY OP_SUCCESSx opcode, the script unconditionally succeeds —
+      # bypassing stack-element-size limits, disabled-opcode checks,
+      # AND the cleanstack check. Must run BEFORE normal eval and
+      # before pushing witness args, so cleanstack is naturally
+      # bypassed (we just return true).
+      let preSuccess = tapscriptOpSuccessPrePass(tapscript)
+      if preSuccess == seOk:
+        return true
+      if preSuccess == seInvalidStack:
+        return false
+
       # Execute tapscript
       var interp = newInterpreter(flags)
       # Push witness items (except control block and script) onto stack
@@ -2728,6 +2802,13 @@ proc verifyWitnessProgramWithError*(
       for i in 0 ..< 32:
         if computedQ[i] != program[i]:
           return seTaprootError
+
+      # BIP-342 OP_SUCCESSx pre-pass; see bool variant comment.
+      let preSuccess = tapscriptOpSuccessPrePass(tapscript)
+      if preSuccess == seOk:
+        return seOk
+      if preSuccess == seInvalidStack:
+        return seInvalidStack
 
       # Execute tapscript
       var interp = newInterpreter(flags)
