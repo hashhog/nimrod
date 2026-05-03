@@ -492,6 +492,39 @@ suite "snapshot dump via ChainState":
     check coin.get().height == 1
     rd.close()
 
+  test "createSnapshot uses atomic-write protocol (no .incomplete on success)":
+    # Mirrors Bitcoin Core's rpc/blockchain.cpp::dumptxoutset which writes
+    # to `temppath = path + ".incomplete"`, fsyncs, then renames. After a
+    # successful dump only <path> should exist on disk; the temp must be
+    # gone so that operators copying the snapshot never see a torn file.
+    let testDir = getTempDir() / "nimrod_snapshot_atomic"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    var cs = newChainState(dbDir, mainnetParams())
+    defer: cs.close()
+
+    let txid = TxId(mkHashWith([0xA1'u8, 0xB2, 0xC3, 0xD4]))
+    let op = OutPoint(txid: txid, vout: 0)
+    let entry = UtxoEntry(
+      output: TxOut(value: Satoshi(1_00000000),
+                    scriptPubKey: @[0x51'u8]),
+      height: 100, isCoinbase: false
+    )
+    cs.putUtxoCache(op, entry)
+    cs.bestBlockHash = BlockHash(mkHashWith([0xEE'u8, 0xFF]))
+    cs.bestHeight = 100
+
+    let outPath = testDir / "snapshot.dat"
+    let tmpPath = outPath & ".incomplete"
+    discard createSnapshot(cs, outPath, mainnetParams())
+
+    check fileExists(outPath)
+    check (not fileExists(tmpPath))
+
 # ----------------------------------------------------------------------------
 # assumeutxo wiring on ConsensusParams
 # ----------------------------------------------------------------------------

@@ -27,7 +27,7 @@
 ## `ScriptCompression`, `CompressAmount`, `CompressScript`
 ## (`bitcoin-core/src/coins.h`, `bitcoin-core/src/compressor.{h,cpp}`).
 
-import std/[options, tables, os, algorithm]
+import std/[options, tables, os, algorithm, posix]
 import chronos
 import ../primitives/[types, serialize]
 import ../crypto/hashing
@@ -376,6 +376,16 @@ proc openSnapshotForWrite*(path: string, meta: SnapshotMetadata): SnapshotFile =
   w.writeSnapshotMetadata(meta)
   discard result.file.writeBytes(w.data, 0, w.data.len)
 
+proc syncSnapshotFile*(sf: SnapshotFile) =
+  ## Flush the user-space buffer and fsync the underlying file descriptor
+  ## so the snapshot bytes are durable on disk before any subsequent
+  ## atomic-rename. Mirrors Bitcoin Core's `Fdatasync` / `fclose` flush
+  ## in rpc/blockchain.cpp::dumptxoutset before the temppath → path rename.
+  if sf.file != nil:
+    sf.file.flushFile()
+    let fh = sf.file.getOsFileHandle()
+    discard posix.fsync(cint(fh))
+
 proc writeTxidGroup*(sf: SnapshotFile, txid: TxId, coins: seq[SnapshotCoin]) =
   ## Write one txid-group: txid | compactsize(coins.len) | per-coin bodies.
   ## Mirrors the lambda in WriteUTXOSnapshot (rpc/blockchain.cpp:3303).
@@ -503,6 +513,13 @@ proc createSnapshot*(
   ## Create a UTXO snapshot from the current chainstate UTXO cache.
   ## Mirrors the layout of `WriteUTXOSnapshot` in rpc/blockchain.cpp.
   ##
+  ## Atomic write protocol: bytes go to "<path>.incomplete", we fsync the
+  ## fd, then rename to <path>. Mirrors Bitcoin Core's
+  ## `temppath = path + ".incomplete"` flow in
+  ## rpc/blockchain.cpp::dumptxoutset so that an operator copying mid-dump
+  ## never sees a torn file, and a SIGKILL during dump leaves only the
+  ## .incomplete artifact (cleaned up here on any error path).
+  ##
   ## NOTE: a production-grade implementation would iterate the on-disk
   ## leveldb-equivalent (rocksdb cfUtxo) using a cursor; nimrod's db.nim
   ## doesn't expose iteration FFI yet, so we currently dump the in-memory
@@ -560,8 +577,16 @@ proc createSnapshot*(
     coinsCount: coinsCount
   )
 
-  let sf = openSnapshotForWrite(path, meta)
-  defer: sf.close()
+  # Atomic-write protocol (see proc doc above): write to <path>.incomplete,
+  # fsync, rename. On any error in this block we best-effort delete the
+  # temp file before re-raising.
+  let tmpPath = path & ".incomplete"
+  let sf = openSnapshotForWrite(tmpPath, meta)
+  var renamed = false
+  defer:
+    sf.close()
+    if not renamed and fileExists(tmpPath):
+      try: removeFile(tmpPath) except CatchableError: discard
 
   # Walk by txid groups, writing the snapshot file AND streaming each coin's
   # canonical `TxOutSer` bytes through a `HashWriter` (SHA256d) for the
@@ -592,6 +617,18 @@ proc createSnapshot*(
       )
       hw.update(coinBytes)
     i = j
+
+  # Durability: flush user-space buffer + fsync the underlying fd before
+  # the atomic rename. Without this, a power loss between rename and
+  # flush could leave <path> visible with zero-length or torn contents.
+  sf.syncSnapshotFile()
+  sf.close()
+
+  # Atomic rename: tmp -> final. After this point the snapshot file is
+  # visible to any concurrent reader; up until now an observer would only
+  # see the .incomplete temp.
+  moveFile(tmpPath, path)
+  renamed = true
 
   let txoutsetHash = if coins.len > 0: hw.finalizeHash()
                      else: default(array[32, byte])
