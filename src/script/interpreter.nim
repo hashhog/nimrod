@@ -2415,9 +2415,26 @@ proc verifyWitnessProgram*(
       tweakData.add(k)
       let taptweak = taggedHash("TapTweak", tweakData)
 
-      # TODO: Verify q = p + t*G where q is output key, p is internal key, t is tweak
-      # This requires EC point operations which would need secp256k1 library calls
-      # For now, we skip this verification
+      # BIP-341 §"Script validation rules" step 5: verify that the
+      # taproot output commitment matches, i.e.
+      #   Q == lift_x(P) + int(t)*G
+      # where P is the internal pubkey from the control block, t is the
+      # taptweak just computed, and Q is the 32-byte witness program.
+      # The control-block parity bit (bit 0 of byte 0) must equal the
+      # parity of the tweaked output key.
+      # Reference: bitcoin-core/src/script/interpreter.cpp:1980-1990
+      # (`VerifyTaprootCommitment`).
+      let parity = int(controlBlock[0] and 0x01'u8)
+      let (computedQ, computedParity) =
+        try:
+          tweakXonlyPubkey(internalPk, taptweak)
+        except Secp256k1Error:
+          return false
+      if computedParity != parity:
+        return false
+      for i in 0 ..< 32:
+        if computedQ[i] != program[i]:
+          return false
 
       # Execute tapscript
       var interp = newInterpreter(flags)
@@ -2629,6 +2646,61 @@ proc verifyWitnessProgramWithError*(
       w.writeVarBytes(tapscript)
       leafData.add(w.data)
       let tapleafHash = taggedHash("TapLeaf", leafData)
+
+      # Verify merkle proof and compute taproot output-key tweak.
+      # Reference: BIP-341 §"Script validation rules" and Core
+      # script/interpreter.cpp:1980-1990 (`VerifyTaprootCommitment`).
+      var k = tapleafHash
+      let pathLen = (controlBlock.len - 33) div 32
+
+      for i in 0 ..< pathLen:
+        var sibling: array[32, byte]
+        for j in 0 ..< 32:
+          sibling[j] = controlBlock[33 + i * 32 + j]
+
+        var combined: seq[byte]
+        # Lexicographic ordering (`TaggedHash("TapBranch", ...)`).
+        var kLess = false
+        for j in 0 ..< 32:
+          if k[j] < sibling[j]:
+            kLess = true
+            break
+          elif k[j] > sibling[j]:
+            break
+        if kLess:
+          combined.add(k)
+          combined.add(sibling)
+        else:
+          combined.add(sibling)
+          combined.add(k)
+
+        k = taggedHash("TapBranch", combined)
+
+      # Extract internal pubkey from control block.
+      var internalPk: array[32, byte]
+      for i in 0 ..< 32:
+        internalPk[i] = controlBlock[1 + i]
+
+      # Compute taptweak = TapTweak(internal_pubkey || merkle_root).
+      var tweakData: seq[byte]
+      tweakData.add(internalPk)
+      tweakData.add(k)
+      let taptweak = taggedHash("TapTweak", tweakData)
+
+      # Verify Q == lift_x(P) + int(t)*G AND parity matches the
+      # control-block parity bit. Without this, any control block can
+      # spend any P2TR output via the script path.
+      let parity = int(controlBlock[0] and 0x01'u8)
+      let (computedQ, computedParity) =
+        try:
+          tweakXonlyPubkey(internalPk, taptweak)
+        except Secp256k1Error:
+          return seTaprootError
+      if computedParity != parity:
+        return seTaprootError
+      for i in 0 ..< 32:
+        if computedQ[i] != program[i]:
+          return seTaprootError
 
       # Execute tapscript
       var interp = newInterpreter(flags)
