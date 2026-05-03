@@ -1965,6 +1965,17 @@ proc handleGetBlockTemplate(rpc: RpcServer, params: JsonNode): JsonNode =
     "default_witness_commitment": toHex(@[0x6a'u8, 0x24, 0xaa, 0x21, 0xa9, 0xed] & @(computeWitnessCommitment(tmpl.transactions)))
   }
 
+proc bip22ChainError(errMsg: string): string =
+  ## Map a chainstate error string to a BIP-22 result token.
+  ## Chainstate errors are free-form strings; we look for known substrings.
+  if "missing input" in errMsg or "missing or spent" in errMsg:
+    return "bad-txns-inputs-missingorspent"
+  if "immature coinbase" in errMsg:
+    return "bad-txns-premature-spend-of-coinbase"
+  if "duplicate" in errMsg:
+    return "bad-txns-duplicate"
+  return "rejected"
+
 proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   # NetworkDisable gate. Refuse submissions while a `dumptxoutset
   # rollback` dance is in progress. Mirrors Bitcoin Core's NetworkDisable
@@ -1981,11 +1992,13 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     let blockBytes = hexToBytes(blockHex)
     let blk = deserializeBlock(blockBytes)
 
-    # Full block validation (PoW, merkle root, transaction structure)
-    # Reference: Bitcoin Core ProcessNewBlock -> CheckBlock
+    # Full block validation (PoW, merkle root, transaction structure).
+    # Reference: Bitcoin Core ProcessNewBlock -> CheckBlock.
+    # Return canonical BIP-22 result strings per BIP-22 and Bitcoin Core
+    # BIP22ValidationResult() in src/rpc/mining.cpp.
     let checkResult = checkBlock(blk, rpc.params)
     if not checkResult.isOk:
-      return %($checkResult.error)
+      return %bip22String(checkResult.error)
 
     # Check prevhash connects to a known block
     # Reference: Bitcoin Core AcceptBlockHeader -> check prev block exists
@@ -2010,7 +2023,8 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
                             cs.connectBlock(blk, height)
 
       if not connectResult.isOk:
-        return %(connectResult.error)
+        # Map chainstate error string to BIP-22 token
+        return %bip22ChainError(connectResult.error)
 
       if not cs.ibdMode:
         # Remove confirmed transactions from mempool
@@ -2028,13 +2042,15 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         if rpc.peerManager != nil:
           asyncSpawn rpc.peerManager.broadcastBlock(blk)
 
-      newJNull()  # Success
+      newJNull()  # null = success per BIP-22
 
     else:
-      # prevhash does not match current tip — check if it's a known block
+      # prevhash does not match current tip.
+      # "inconclusive" per BIP-22: accepted but not yet known to be on best chain.
       let prevIdxOpt = cs.db.getBlockIndex(prevHash)
       if prevIdxOpt.isNone:
-        return %"prev-blk-not-found"
+        # Previous block truly unknown — "rejected" is closest BIP-22 token.
+        return %"rejected"
 
       # Known parent but not extending tip — only accept if more total work
       # Calculate what the new chain's total work would be
@@ -2070,16 +2086,17 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         newTotalWork[i] = byte(sum and 0xff)
         carry = sum shr 8
 
-      # Only switch if new chain has strictly more work
+      # Block is on a fork with same or less work — "inconclusive" per BIP-22.
       if compareWork256(newTotalWork, cs.totalWork) <= 0:
-        return %"inconclusive-not-best-prevblk"
+        return %"inconclusive"
 
       # New chain has more work — would need reorg. For submitblock, reject
       # blocks that require complex reorgs; P2P sync handles those.
-      return %"inconclusive-not-best-prevblk"
+      return %"inconclusive"
 
   except CatchableError as e:
-    %(e.msg)
+    # Unexpected exception — use "rejected" catch-all per BIP-22.
+    %"rejected"
 
 # Regtest mining RPCs
 

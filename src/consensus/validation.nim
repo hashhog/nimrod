@@ -90,6 +90,27 @@ proc err*(T: typedesc, e: ValidationError): ValidationResult[T] =
 template voidErr*(e: ValidationError): ValidationResult[void] =
   ValidationResult[void](isOk: false, error: e)
 
+proc bip22String*(e: ValidationError): string =
+  ## Map a ValidationError to the canonical BIP-22 result string.
+  ##
+  ## Per BIP-22 and Bitcoin Core BIP22ValidationResult() in
+  ## src/rpc/mining.cpp, submitblock must return short ASCII strings for
+  ## known rejection reasons.  Unknown or structural errors map to "rejected".
+  case e
+  of veBadPow, veExceedsTarget: "high-hash"
+  of veBadMerkleRoot: "bad-txnmrklroot"
+  of veBadWitnessCommitment: "bad-witness-merkle-match"
+  of veBadAmount: "bad-cb-amount"
+  of veSigopExceeded: "bad-blk-sigops"
+  of veDuplicateTx: "bad-txns-duplicate"
+  of veNonFinalTx: "bad-txns-nonfinal"
+  of veBadCoinbase: "bad-cb-height"
+  of veInputsMissing: "bad-txns-inputs-missingorspent"
+  of veScriptVerifyFailed: "mandatory-script-verify-flag-failed"
+  of veDoubleSpend: "bad-txns-inputs-spent"
+  of veOk: ""
+  else: "rejected"
+
 # Merkle root computation with Bitcoin's duplicate-last-if-odd rule
 proc computeMerkleRoot*(txids: seq[array[32, byte]]): array[32, byte] =
   ## Compute merkle root from a list of transaction hashes

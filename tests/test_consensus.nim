@@ -772,3 +772,48 @@ suite "BIP-34 coinbase height encoding (Core ContextualCheckBlock parity)":
     # 0x4c 0x01 0x01 is OP_PUSHDATA1 followed by length=1, data=0x01
     let tx = makeCoinbaseTx(@[byte(0x4c), byte(0x01), byte(0x01)])
     check validateCoinbase(tx, 1, p).isOk == false
+
+# ============================================================================
+# BIP-22 result-string mapping (bip22String)
+# ============================================================================
+suite "BIP-22 submitblock result strings":
+  ## Each ValidationError variant must map to the canonical ASCII token
+  ## defined in BIP-22 and Bitcoin Core BIP22ValidationResult()
+  ## (src/rpc/mining.cpp).
+
+  test "bad PoW -> high-hash":
+    check bip22String(veBadPow) == "high-hash"
+    check bip22String(veExceedsTarget) == "high-hash"
+
+  test "bad merkle root -> bad-txnmrklroot":
+    check bip22String(veBadMerkleRoot) == "bad-txnmrklroot"
+
+  test "bad witness commitment -> bad-witness-merkle-match":
+    check bip22String(veBadWitnessCommitment) == "bad-witness-merkle-match"
+
+  test "bad coinbase amount -> bad-cb-amount":
+    check bip22String(veBadAmount) == "bad-cb-amount"
+
+  test "sigops exceeded -> bad-blk-sigops":
+    check bip22String(veSigopExceeded) == "bad-blk-sigops"
+
+  test "duplicate tx -> bad-txns-duplicate":
+    check bip22String(veDuplicateTx) == "bad-txns-duplicate"
+
+  test "non-final tx -> bad-txns-nonfinal":
+    check bip22String(veNonFinalTx) == "bad-txns-nonfinal"
+
+  test "bad coinbase (height encoding) -> bad-cb-height":
+    check bip22String(veBadCoinbase) == "bad-cb-height"
+
+  test "missing inputs -> bad-txns-inputs-missingorspent":
+    check bip22String(veInputsMissing) == "bad-txns-inputs-missingorspent"
+
+  test "script verification failed -> mandatory-script-verify-flag-failed":
+    check bip22String(veScriptVerifyFailed) == "mandatory-script-verify-flag-failed"
+
+  test "catch-all errors -> rejected":
+    check bip22String(veBlockOverweight) == "rejected"
+    check bip22String(veBadTimestamp) == "rejected"
+    check bip22String(vePrevBlockMissing) == "rejected"
+    check bip22String(veSequenceLockNotSatisfied) == "rejected"
