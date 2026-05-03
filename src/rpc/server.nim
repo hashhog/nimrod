@@ -41,6 +41,12 @@ type
     walletManager*: WalletManager        ## Multi-wallet manager
     currentWalletName*: string           ## Current request's target wallet name
     zmq*: ZmqNotificationInterface       ## Optional: ZMQ notification interface
+    blockSubmissionPaused*: bool         ## NetworkDisable: when true, submitblock and inbound
+                                         ## block handlers refuse new blocks. Set during
+                                         ## `dumptxoutset rollback`'s rewind→dump→replay dance
+                                         ## to mirror Bitcoin Core's NetworkDisable RAII guard
+                                         ## around TemporaryRollback in
+                                         ## rpc/blockchain.cpp::dumptxoutset.
 
   RpcRequest = object
     jsonrpc: string
@@ -101,8 +107,15 @@ proc newRpcServer*(
     authPass: authPass,
     cookiePassword: cookiePassword,
     running: false,
-    crypto: newCryptoEngine()
+    crypto: newCryptoEngine(),
+    blockSubmissionPaused: false
   )
+
+proc isBlockSubmissionPaused*(rpc: RpcServer): bool =
+  ## Whether inbound block acceptance is currently gated by an active
+  ## `dumptxoutset rollback`. Mirrors Bitcoin Core's NetworkDisable check
+  ## in rpc/blockchain.cpp::dumptxoutset.
+  rpc != nil and rpc.blockSubmissionPaused
 
 proc toHex(data: openArray[byte]): string =
   result = ""
@@ -1953,6 +1966,12 @@ proc handleGetBlockTemplate(rpc: RpcServer, params: JsonNode): JsonNode =
   }
 
 proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
+  # NetworkDisable gate. Refuse submissions while a `dumptxoutset
+  # rollback` dance is in progress. Mirrors Bitcoin Core's NetworkDisable
+  # RAII around TemporaryRollback in rpc/blockchain.cpp::dumptxoutset.
+  if rpc.isBlockSubmissionPaused():
+    return %"rejected: block submission paused (dumptxoutset rollback in progress)"
+
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing hexdata parameter")
 
@@ -2741,6 +2760,34 @@ proc handleDumpTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
   if targetHeight > originalTipHeight:
     raise newRpcError(RpcInvalidParams,
       "Target height above current tip")
+
+  # Pruned-mode pre-check. Mirrors Bitcoin Core
+  # rpc/blockchain.cpp:dumptxoutset:
+  #     if (IsPruneMode() &&
+  #         target_index->nHeight < node.chainman->m_blockman.GetFirstBlock()->nHeight)
+  #         throw "Block height N not available (pruned data). Use a height after M.";
+  # We fail fast here so a pruned datadir does not begin a rewind that is
+  # guaranteed to fail when disconnectBlock reads pruned undo data.
+  if rpc.blockFileManager != nil and rpc.blockFileManager.isPruneMode():
+    let firstAvailable = rpc.blockFileManager.getPruneHeight()
+    if firstAvailable >= 0 and targetHeight < firstAvailable:
+      raise newRpcError(RpcMiscError,
+        "Block height " & $targetHeight &
+        " not available (pruned data). Use a height after " &
+        $(firstAvailable - 1) & ".")
+
+  # NetworkDisable RAII (Nim try/finally). Mirrors Bitcoin Core's
+  # NetworkDisable wrapper around TemporaryRollback in
+  # rpc/blockchain.cpp::dumptxoutset. Pause inbound block acceptance for
+  # the duration of the rewind→dump→replay dance; restore on every exit
+  # path (success, error, exception) so peers can resume submitting once
+  # the original tip is back. Only active when there's actual rewind work.
+  let networkPauseActive = targetHeight < originalTipHeight
+  if networkPauseActive:
+    rpc.blockSubmissionPaused = true
+  defer:
+    if networkPauseActive:
+      rpc.blockSubmissionPaused = false
 
   # Walk the active chain from the current tip down to (but not including)
   # targetHeight, collecting full Block payloads in disconnect order. We need
