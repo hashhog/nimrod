@@ -897,3 +897,9 @@ else:
     initiator: bool
   ): array[32, byte] =
     raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc tweakXonlyPubkey*(
+    internalPk: array[32, byte],
+    tweak: array[32, byte]
+  ): (array[32, byte], int) =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")

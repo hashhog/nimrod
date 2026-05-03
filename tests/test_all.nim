@@ -12,6 +12,7 @@ import ./test_witness_cleanstack
 import ./test_witness_pubkeytype
 import ./test_minimalif
 import ./test_tapscript_validation_weight
+import ./test_taproot_commitment
 import ./test_consensus
 import ./test_storage
 import ./test_messages
