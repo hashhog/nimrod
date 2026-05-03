@@ -937,14 +937,26 @@ proc validateBlock*(
   prevIndex: BlockIndex,
   utxos: ChainDb,
   params: ConsensusParams,
-  checkScripts: bool = true
+  checkScripts: bool = true,
+  checkPow: bool = true
 ): ValidationResult[void] =
   ## Full block validation per Bitcoin consensus rules
 
   # Validate header
-  let headerResult = validateBlockHeader(blk.header, prevIndex, params)
+  let headerResult = validateBlockHeader(blk.header, prevIndex, params, checkPow)
   if not headerResult.isOk:
     return voidErr(headerResult.error)
+
+  # BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
+  # block timestamp must be strictly greater than the median-time-past
+  # of the previous 11 blocks. validateBlockHeader explicitly defers
+  # this (it has no chain-DB access); add it here where `utxos` is in
+  # scope. Genesis is skipped because prevIndex.height >= 0 is always
+  # true for a non-genesis block we are validating.
+  if prevIndex.height >= 0:
+    let prevMtp = getMtpForHeight(utxos, prevIndex.height)
+    if blk.header.timestamp <= prevMtp:
+      return voidErr(veBadTimestamp)
 
   # Block must have at least one transaction (coinbase)
   if blk.txs.len == 0:
