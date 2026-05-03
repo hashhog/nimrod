@@ -1882,6 +1882,7 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
           return budgetErr
 
       var success = false
+      var skipDueToHashType = false
       if sig.len > 0:
         if pubkey.len == 32 and (sig.len == 64 or sig.len == 65):
           var hashType: uint8 = SIGHASH_DEFAULT
@@ -1889,20 +1890,31 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
           if sig.len == 65:
             hashType = sig[64]
+            # BIP-341 / Core SignatureHashSchnorr (interpreter.cpp:1516)
+            # plus the explicit-default rule (interpreter.cpp:1733).
+            # Mirrors the validation already performed in CHECKSIG
+            # (interpreter.nim:1638-1646): invalid byte ⇒ verification
+            # fails (success stays false) without computing the sighash.
+            if hashType == SIGHASH_DEFAULT:
+              skipDueToHashType = true
+            elif not (hashType <= 0x03'u8 or
+                      (hashType >= 0x81'u8 and hashType <= 0x83'u8)):
+              skipDueToHashType = true
 
-          for i in 0 ..< 64:
-            sigBytes[i] = sig[i]
+          if not skipDueToHashType:
+            for i in 0 ..< 64:
+              sigBytes[i] = sig[i]
 
-          var xonlyPk: array[32, byte]
-          for i in 0 ..< 32:
-            xonlyPk[i] = pubkey[i]
+            var xonlyPk: array[32, byte]
+            for i in 0 ..< 32:
+              xonlyPk[i] = pubkey[i]
 
-          let sighash = computeSighashTaproot(
-            ctx.tx, ctx.inputIndex, ctx.amounts, ctx.scriptPubKeys,
-            hashType, 1, ctx.annex, ctx.tapleafHash, ctx.codesepPos
-          )
+            let sighash = computeSighashTaproot(
+              ctx.tx, ctx.inputIndex, ctx.amounts, ctx.scriptPubKeys,
+              hashType, 1, ctx.annex, ctx.tapleafHash, ctx.codesepPos
+            )
 
-          success = verifySchnorr(xonlyPk, @sighash, sigBytes)
+            success = verifySchnorr(xonlyPk, @sighash, sigBytes)
 
       interp.push(fromScriptNum(if success: n + 1 else: n))
 
@@ -2319,6 +2331,11 @@ proc verifyWitnessProgram*(
         hashType = sig[64]
         if hashType == 0x00:
           return false  # Invalid explicit SIGHASH_DEFAULT
+        # BIP-341 / Core SignatureHashSchnorr (interpreter.cpp:1516):
+        # only {0x01, 0x02, 0x03, 0x81, 0x82, 0x83} are valid.
+        if not (hashType <= 0x03'u8 or
+                (hashType >= 0x81'u8 and hashType <= 0x83'u8)):
+          return false
 
       for i in 0 ..< 64:
         sigBytes[i] = sig[i]
@@ -2358,7 +2375,12 @@ proc verifyWitnessProgram*(
       let controlBlock = witnessStack[witnessStack.len - 1]
       let tapscript = witnessStack[witnessStack.len - 2]
 
-      if controlBlock.len < 33 or (controlBlock.len - 33) mod 32 != 0:
+      # BIP-341: control block size must be in
+      # [TAPROOT_CONTROL_BASE_SIZE, TAPROOT_CONTROL_MAX_SIZE]
+      # = [33, 33 + 32*128] = [33, 4129] and divisible after the base.
+      # Reference: bitcoin-core/src/script/interpreter.cpp:1970.
+      if controlBlock.len < 33 or controlBlock.len > 4129 or
+         (controlBlock.len - 33) mod 32 != 0:
         return false
 
       # Extract leaf version (mask with 0xFE to strip parity bit)
@@ -2630,7 +2652,12 @@ proc verifyWitnessProgramWithError*(
       let controlBlock = witnessStack[witnessStack.len - 1]
       let tapscript = witnessStack[witnessStack.len - 2]
 
-      if controlBlock.len < 33 or (controlBlock.len - 33) mod 32 != 0:
+      # BIP-341: control block size must be in
+      # [TAPROOT_CONTROL_BASE_SIZE, TAPROOT_CONTROL_MAX_SIZE]
+      # = [33, 4129] and divisible after the base.
+      # Reference: bitcoin-core/src/script/interpreter.cpp:1970.
+      if controlBlock.len < 33 or controlBlock.len > 4129 or
+         (controlBlock.len - 33) mod 32 != 0:
         return seTaprootError
 
       let leafVersion = controlBlock[0] and 0xFE
