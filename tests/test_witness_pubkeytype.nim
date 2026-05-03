@@ -263,24 +263,27 @@ suite "witness pubkeytype - P2WSH CHECKMULTISIG with flag":
     check err != seWitnessPubkeyType
 
 suite "witness pubkeytype - block validation flags":
-  test "getBlockScriptFlags includes sfWitnessPubkeyType at segwit height":
-    # This test verifies that the validation module correctly enables
-    # the sfWitnessPubkeyType flag at segwit activation height
+  test "getBlockScriptFlags excludes sfWitnessPubkeyType (policy-only)":
+    # sfWitnessPubkeyType is a STANDARD_SCRIPT_VERIFY_FLAG (policy only) per
+    # Bitcoin Core policy/policy.h:128.  The consensus block-script-flag
+    # computer (validation.cpp:2250-2289) does NOT include it at any height.
     let mainnet = mainnetParams()
 
-    # Before segwit
+    # Before segwit: must not be set
     let preSegwitFlags = getBlockScriptFlags(int32(mainnet.segwitHeight) - 1, mainnet)
     check sfWitnessPubkeyType notin preSegwitFlags
 
-    # At segwit activation
+    # At segwit activation: still must NOT be set (policy-only)
     let segwitFlags = getBlockScriptFlags(int32(mainnet.segwitHeight), mainnet)
-    check sfWitnessPubkeyType in segwitFlags
+    check sfWitnessPubkeyType notin segwitFlags
+    # WITNESS IS set (consensus rule)
     check sfWitness in segwitFlags
 
-  test "getBlockScriptFlags on regtest includes sfWitnessPubkeyType":
+  test "getBlockScriptFlags on regtest also excludes sfWitnessPubkeyType":
     let regtest = regtestParams()
 
-    # On regtest, segwit is active from genesis (height 0)
+    # On regtest, segwit is active from genesis (height 0).
+    # But sfWitnessPubkeyType must never be in the consensus computer.
     let flags = getBlockScriptFlags(0, regtest)
-    check sfWitnessPubkeyType in flags
+    check sfWitnessPubkeyType notin flags
     check sfWitness in flags
