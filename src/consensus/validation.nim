@@ -110,6 +110,7 @@ proc bip22String*(e: ValidationError): string =
   of veInputsMissing: "bad-txns-inputs-missingorspent"
   of veScriptVerifyFailed: "mandatory-script-verify-flag-failed"
   of veDoubleSpend: "bad-txns-inputs-spent"
+  of veBadTimestamp: "time-too-old"
   of veOk: ""
   else: "rejected"
 

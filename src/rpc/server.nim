@@ -2009,6 +2009,17 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # Block extends the current best chain — connect it
       let height = cs.bestHeight + 1
 
+      # BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
+      # block timestamp must be strictly greater than the median-time-past
+      # of the previous 11 blocks. getMtpForHeight uses the DB to walk the
+      # last 11 ancestors. Genesis blocks (height 0) are skipped because
+      # cs.bestHeight is -1 for an empty chain.
+      # Reference: bitcoin-core/src/validation.cpp:4092
+      if cs.bestHeight >= 0:
+        let prevMtp = getMtpForHeight(cs.db, cs.bestHeight)
+        if blk.header.timestamp <= prevMtp:
+          return %bip22String(veBadTimestamp)
+
       # Use IBD fast path when far from tip (>1000 blocks behind assume-valid)
       let useIBD = cs.params.assumeValidHeight > 0 and
                    height < cs.params.assumeValidHeight - 1000
