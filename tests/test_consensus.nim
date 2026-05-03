@@ -635,8 +635,10 @@ suite "script flags":
     let flags = getBlockScriptFlags(int32(params.segwitHeight), params)
     check sfWitness in flags
     check sfNullDummy in flags
-    check sfNullFail in flags
     check sfCheckSequenceVerify in flags
+    # sfNullFail and sfWitnessPubkeyType are policy-only (not consensus)
+    check sfNullFail notin flags
+    check sfWitnessPubkeyType notin flags
 
   test "post-taproot flags":
     let params = mainnetParams()
