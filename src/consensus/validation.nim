@@ -44,6 +44,7 @@ type
     veForkBelowCheckpoint = "cannot fork before the last checkpoint"
     veInsufficientChainWork = "chain does not meet minimum work requirement"
     veNonFinalTx = "non-final transaction: bad-txns-nonfinal"
+    veBip30DuplicateOutput = "bad-txns-BIP30: tried to overwrite transaction"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -104,6 +105,7 @@ proc bip22String*(e: ValidationError): string =
   of veSigopExceeded: "bad-blk-sigops"
   of veDuplicateTx: "bad-txns-duplicate"
   of veNonFinalTx: "bad-txns-nonfinal"
+  of veBip30DuplicateOutput: "bad-txns-BIP30"
   of veBadCoinbase: "bad-cb-height"
   of veInputsMissing: "bad-txns-inputs-missingorspent"
   of veScriptVerifyFailed: "mandatory-script-verify-flag-failed"
@@ -1334,6 +1336,36 @@ proc checkBlockLocktime*(blk: Block, height: uint32, lockTimeCutoff: uint32): Va
   for tx in blk.txs:
     if not isFinalTx(tx, height, lockTimeCutoff):
       return voidErr(veNonFinalTx)
+  ok()
+
+proc checkBip30*(blk: Block, height: int32, params: ConsensusParams,
+                 hasUtxo: proc(op: OutPoint): bool {.gcsafe, raises: [].}): ValidationResult[void] =
+  ## BIP-30: reject any block whose transactions would overwrite an existing
+  ## unspent output in the UTXO set (CVE-2012-1909).
+  ##
+  ## Two mainnet blocks (h=91842 and h=91880) predate BIP-30 and intentionally
+  ## duplicate earlier coinbase txids; they are permanently exempted.
+  ## After BIP-34 activation (h≥bip34_height), height-in-coinbase makes
+  ## duplicate txids practically impossible — skip for performance.
+  ## At h≥1,983,702 BIP-34 modular arithmetic repeats pre-BIP34 heights, so
+  ## re-enable.
+  ##
+  ## Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+  const bip34ImpliesBip30Limit = 1_983_702'i32
+  const bip30ExceptionHeights = [91842'i32, 91880'i32]
+
+  if height in bip30ExceptionHeights:
+    return ok()
+
+  if height >= int32(params.bip34Height) and height < bip34ImpliesBip30Limit:
+    return ok()
+
+  for tx in blk.txs:
+    let txid = tx.txid()
+    for vout in 0 ..< tx.outputs.len:
+      let op = OutPoint(txid: TxId(txid), vout: uint32(vout))
+      if hasUtxo(op):
+        return voidErr(veBip30DuplicateOutput)
   ok()
 
 proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
