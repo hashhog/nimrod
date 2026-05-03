@@ -978,10 +978,20 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
   var pc = 0
   let scriptLen = script.len
+  # BIP-341: opcode counter (0-based index of each opcode in the script).
+  # Mirrors Core's `opcode_pos` (interpreter.cpp:433, incremented at the top
+  # of the for-loop).  Used by the OP_CODESEPARATOR handler to record the
+  # position committed to the tapscript sigmsg (Core interpreter.cpp:1055,1565).
+  # Every opcode — including push-data ops — increments this counter exactly
+  # once, matching `++opcode_pos` in Core.
+  var opcodePos: uint32 = 0
 
   while pc < scriptLen:
     let opcode = script[pc]
     pc += 1
+    # Capture the position of this opcode BEFORE we might `continue`.
+    let currentOpcodePos = opcodePos
+    opcodePos += 1
 
     # Count non-push opcodes (BIP 342: tapscript replaces this with sigops budget)
     if ctx.sigVersion != sigTapscript and opcode.countsTowardOpLimit:
@@ -1525,7 +1535,14 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       interp.push(@hashed)
 
     of OP_CODESEPARATOR:
-      interp.codesepPos = uint32(pc)
+      # BIP-341: record the OPCODE INDEX, not the byte position.
+      # Core stores `opcode_pos` (interpreter.cpp:1055), the 0-based counter
+      # of opcodes processed so far, committed to the tapscript sigmsg at
+      # interpreter.cpp:1565.  The old `uint32(pc)` was the byte position
+      # AFTER the opcode byte (since pc was already incremented), which
+      # diverges from Core whenever any pushdata opcode precedes the
+      # OP_CODESEPARATOR (pushdata byte size > 1, so byte pos > opcode idx).
+      interp.codesepPos = currentOpcodePos
 
     of OP_CHECKSIG, OP_CHECKSIGVERIFY:
       if interp.stack.len < 2:
