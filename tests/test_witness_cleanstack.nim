@@ -341,7 +341,11 @@ suite "witness cleanstack - tapscript (v1)":
     dummyTx.outputs = @[TxOut(value: Satoshi(1000), scriptPubKey: @[])]
     dummyTx.lockTime = 0
 
-    # 20-byte program is invalid for v1 (must be 32 bytes)
+    # 20-byte program is not Taproot (which requires 32 bytes), but per
+    # BIP-141 / Core script/interpreter.cpp:1992-1997 unknown witness
+    # versions/lengths are anyone-can-spend (forward soft-fork compat).
+    # The DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM relay flag turns this
+    # into an error for the mempool path only.
     var program: seq[byte] = @[]
     for i in 0 ..< 20:
       program.add(byte(i))
@@ -349,5 +353,11 @@ suite "witness cleanstack - tapscript (v1)":
     let flags = {sfWitness, sfTaproot}
     let witness = @[@[0x01'u8]]
 
-    let err = verifyWitnessProgramWithError(witness, 1, program, dummyTx, 0, Satoshi(1000), flags)
-    check err == seWitnessProgramMismatch
+    # Without DISCOURAGE: success (anyone-can-spend).
+    let okErr = verifyWitnessProgramWithError(witness, 1, program, dummyTx, 0, Satoshi(1000), flags)
+    check okErr == seOk
+
+    # With DISCOURAGE: rejected on the relay path.
+    let discFlags = flags + {sfDiscourageUpgradableWitnessProgram}
+    let discErr = verifyWitnessProgramWithError(witness, 1, program, dummyTx, 0, Satoshi(1000), discFlags)
+    check discErr == seDiscourageUpgradableWitnessProgram
