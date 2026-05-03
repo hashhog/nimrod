@@ -43,6 +43,7 @@ type
     veCheckpointMismatch = "block hash does not match checkpoint"
     veForkBelowCheckpoint = "cannot fork before the last checkpoint"
     veInsufficientChainWork = "chain does not meet minimum work requirement"
+    veNonFinalTx = "non-final transaction: bad-txns-nonfinal"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -223,6 +224,10 @@ proc validateCoinbase*(tx: Transaction, height: int32, params: ConsensusParams):
 
   ok()
 
+# Locktime / sequence constants (mirror blocktemplate.nim to avoid import cycle)
+const LocktimeThreshold* = 500_000_000'u32  ## Below: block height; at/above: Unix timestamp
+const SequenceFinal* = 0xFFFFFFFF'u32       ## Disables relative locktime enforcement
+
 # Witness commitment extraction and validation
 const WitnessCommitmentPrefix* = [0x6a'u8, 0x24, 0xaa, 0x21, 0xa9, 0xed]
 
@@ -322,12 +327,12 @@ proc getBlockScriptFlags*(height: int32, params: ConsensusParams,
   if height >= int32(params.csvHeight):
     result.incl(sfCheckSequenceVerify)
 
-  # SegWit (BIP141/143/147) — activated at segwitHeight
+  # SegWit (BIP141/143/147) — WITNESS + NULLDUMMY are consensus rules.
+  # sfNullFail and sfWitnessPubkeyType are policy-only (STANDARD_SCRIPT_VERIFY_FLAGS
+  # per Bitcoin Core policy/policy.h:125,128) and must NOT appear here.
   if height >= int32(params.segwitHeight):
     result.incl(sfWitness)
     result.incl(sfNullDummy)
-    result.incl(sfNullFail)
-    result.incl(sfWitnessPubkeyType)  # BIP141: witness pubkeys must be compressed
 
   # Taproot (BIP340/341/342) — activated at taprootHeight
   if blockHash != TAPROOT_EXCEPTION_HASH and height >= int32(params.taprootHeight):
@@ -1256,6 +1261,33 @@ proc checkTransaction*(tx: Transaction, params: ConsensusParams): ValidationResu
     if totalOutput > MaxMoney:
       return voidErr(veBadOutputValue)
 
+  ok()
+
+proc isFinalTx*(tx: Transaction, blockHeight: uint32, lockTimeCutoff: uint32): bool =
+  ## Check if a transaction is final at a given block height and time.
+  ## A transaction is final if:
+  ## - lockTime == 0, OR
+  ## - lockTime < threshold (height if < 500_000_000, time if >= 500_000_000), OR
+  ## - all input sequences == SEQUENCE_FINAL (0xFFFFFFFF)
+  ## Reference: Bitcoin Core consensus/tx_verify.cpp IsFinalTx()
+  ## Called from ContextualCheckBlock (Core validation.cpp:4146)
+  if tx.lockTime == 0:
+    return true
+  let threshold = if tx.lockTime < LocktimeThreshold: blockHeight else: lockTimeCutoff
+  if tx.lockTime < threshold:
+    return true
+  for input in tx.inputs:
+    if input.sequence != SequenceFinal:
+      return false
+  true
+
+proc checkBlockLocktime*(blk: Block, height: uint32, lockTimeCutoff: uint32): ValidationResult[void] =
+  ## Contextual IsFinalTx check for all transactions in a block.
+  ## Mirrors Bitcoin Core ContextualCheckBlock validation.cpp:4146.
+  ## Must run even when scripts are skipped (assumevalid only skips sig-check).
+  for tx in blk.txs:
+    if not isFinalTx(tx, height, lockTimeCutoff):
+      return voidErr(veNonFinalTx)
   ok()
 
 proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =

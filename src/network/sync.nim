@@ -980,6 +980,22 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
     warn "invalid block", height = height, error = $checkResult.error
     return false
 
+  # ContextualCheckBlock: enforce IsFinalTx for every transaction
+  # (Bitcoin Core validation.cpp:4146). Consensus rule — runs even under
+  # assumevalid (assumevalid only skips script verification).
+  # lock_time_cutoff = MTP when CSV is active (BIP-113), block timestamp otherwise.
+  let csvActive = height >= int32(sm.params.csvHeight)
+  let lockTimeCutoff: uint32 =
+    if csvActive:
+      getMtpForHeight(sm.chainDb, height - 1)
+    else:
+      blk.header.timestamp
+  let finalTxResult = checkBlockLocktime(blk, uint32(height), lockTimeCutoff)
+  if not finalTxResult.isOk:
+    warn "block contains non-final transaction", height = height,
+         error = $finalTxResult.error
+    return false
+
   # Script verification: use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
   # Re-evaluated per block — NOT a persistent latch.
   #
@@ -1513,6 +1529,21 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
     let checkResult = checkBlock(blk, sm.params)
     if not checkResult.isOk:
       warn "invalid block during IBD", height = height, error = $checkResult.error
+      dl.receivedBlocks.del(height)
+      continue
+
+    # ContextualCheckBlock: enforce IsFinalTx for every transaction
+    # (Bitcoin Core validation.cpp:4146). Runs even under assumevalid.
+    let csvActiveIBD = height >= int32(sm.params.csvHeight)
+    let lockTimeCutoffIBD: uint32 =
+      if csvActiveIBD:
+        getMtpForHeight(sm.chainDb, height - 1)
+      else:
+        blk.header.timestamp
+    let finalTxResultIBD = checkBlockLocktime(blk, uint32(height), lockTimeCutoffIBD)
+    if not finalTxResultIBD.isOk:
+      warn "block contains non-final transaction (IBD)", height = height,
+           error = $finalTxResultIBD.error
       dl.receivedBlocks.del(height)
       continue
 
