@@ -2457,10 +2457,11 @@ proc verifyWitnessProgram*(
       return castToBool(interp.peek())
 
   else:
-    # Unknown witness version
+    # Unknown witness version (incl. v1 + non-32 non-P2A, and v2-v16):
+    # anyone-can-spend per BIP-141 forward soft-fork compatibility.
+    # Per Core script/interpreter.cpp:1992-1997, witness contents are
+    # NOT checked here — the future soft fork defines them.
     if sfDiscourageUpgradableWitnessProgram in flags:
-      return false
-    if witness.len == 0:
       return false
     return true
 
@@ -2559,11 +2560,15 @@ proc verifyWitnessProgramWithError*(
     else:
       return seWitnessProgramMismatch
 
-  elif version == 1 and sfTaproot in flags:
-    # Taproot (SegWit v1)
-    if program.len != 32:
-      return seWitnessProgramMismatch
+  elif version == 1 and program.len == 2 and program[0] == 0x4e'u8 and program[1] == 0x73'u8:
+    # BIP-444 Pay-to-Anchor (P2A): OP_1 <0x4e73>. Always spendable;
+    # the relay DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM flag does NOT
+    # apply (Core script/interpreter.cpp:1990 returns true unconditionally
+    # for P2A).
+    return seOk
 
+  elif version == 1 and sfTaproot in flags and program.len == 32:
+    # Taproot (SegWit v1, 32-byte program)
     if witness.len == 0:
       return seWitnessProgramMismatch
 
@@ -2661,12 +2666,12 @@ proc verifyWitnessProgramWithError*(
       return seOk
 
   else:
-    # Unknown witness version
+    # Unknown witness version (incl. v1 + non-32 non-P2A, and v2-v16):
+    # anyone-can-spend per BIP-141 forward soft-fork compatibility.
+    # Per Core script/interpreter.cpp:1992-1997, witness contents are
+    # NOT checked here — the future soft fork defines them.
     if sfDiscourageUpgradableWitnessProgram in flags:
       return seDiscourageUpgradableWitnessProgram
-    # Succeed for forward compatibility if flag not set
-    if witness.len == 0:
-      return seWitnessProgramMismatch
     return seOk
 
 # Backward compatibility: simple execute without full tx context
