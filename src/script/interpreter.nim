@@ -51,6 +51,7 @@ type
     seDiscourageUpgradableWitnessProgram = "discourage upgradable witness program"
     seTapscriptEmptyPubkey = "tapscript empty pubkey"
     seTapscriptCheckmultisig = "OP_CHECKMULTISIG(VERIFY) is not available in tapscript"
+    seTapscriptValidationWeight = "tapscript validation weight exceeded"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -86,6 +87,17 @@ type
     crypto*: CryptoEngine
     execStack*: seq[bool]  # Track IF/ELSE execution state
     codesepPos*: uint32    # Position after last OP_CODESEPARATOR
+    # BIP-342 tapscript validation-weight budget. Mirrors Core's
+    # ScriptExecutionData::m_validation_weight_left (interpreter.cpp:362).
+    # Initialized at the tapscript leaf entry to
+    #   GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET (50)
+    # then decremented by VALIDATION_WEIGHT_PER_SIGOP_PASSED (50) for
+    # every non-empty CHECKSIG / CHECKSIGVERIFY / CHECKSIGADD. Negative
+    # residue aborts with seTapscriptValidationWeight. The init flag
+    # mirrors Core's m_validation_weight_left_init: false on legacy /
+    # SegWit-v0 paths where the budget is not consulted.
+    validationWeightLeft*: int64
+    validationWeightInit*: bool
 
 # Bitcoin Script opcodes
 const
@@ -472,6 +484,43 @@ proc checkPubKeyEncoding*(pubkey: seq[byte], flags: set[ScriptFlags],
     return seWitnessPubkeyType
 
   seOk
+
+# BIP-342 helper: byte length of a Bitcoin compact-size encoding for n.
+# Mirrors Core's GetSizeOfCompactSize (serialize.h):
+#   <  0xfd            -> 1 byte
+#   <= 0xffff          -> 3 bytes
+#   <= 0xffffffff      -> 5 bytes
+#   else               -> 9 bytes
+proc compactSizeLen*(n: uint64): uint64 =
+  if n < 0xfd'u64: return 1
+  if n <= 0xffff'u64: return 3
+  if n <= 0xffffffff'u64: return 5
+  return 9
+
+# Compute the on-the-wire serialized size of a witness stack the way
+# Core's `::GetSerializeSize(witness.stack)` does it: a compact-size
+# item count followed by, for each item, its compact-size length
+# prefix and the item bytes themselves. Used to seed the BIP-342
+# tapscript validation-weight budget at the leaf entry point.
+proc serializedWitnessStackSize*(items: seq[seq[byte]]): uint64 =
+  var total = compactSizeLen(uint64(items.len))
+  for it in items:
+    total += compactSizeLen(uint64(it.len)) + uint64(it.len)
+  return total
+
+# Decrement the BIP-342 validation-weight counter by 50 (one
+# VALIDATION_WEIGHT_PER_SIGOP_PASSED). Returns seTapscriptValidationWeight
+# if the residue would go negative, matching Core's
+# `m_validation_weight_left -= 50; if (... < 0) ...` (interpreter.cpp:362-365).
+# Caller must only invoke this on the tapscript path with a non-empty
+# signature; the assert mirrors Core's m_validation_weight_left_init.
+proc consumeValidationWeight*(interp: var ScriptInterpreter): ScriptError =
+  if not interp.validationWeightInit:
+    return seTapscriptValidationWeight
+  interp.validationWeightLeft -= 50'i64
+  if interp.validationWeightLeft < 0'i64:
+    return seTapscriptValidationWeight
+  return seOk
 
 # Check if opcode counts toward op limit
 proc countsTowardOpLimit(opcode: uint8): bool =
@@ -1498,6 +1547,17 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
         if pkErr != seOk:
           return pkErr
 
+      # BIP-342 validation-weight budget: in tapscript, decrement by 50
+      # BEFORE pubkey inspection, gated on sig.len > 0. Mirrors Core's
+      # `success = !sig.empty()` check at interpreter.cpp:357-366.
+      # Per Core's comment, "Passing with an upgradable public key
+      # version is also counted", so the deduction fires before the
+      # 32-byte vs unknown branching below.
+      if ctx.sigVersion == sigTapscript and sig.len > 0:
+        let budgetErr = consumeValidationWeight(interp)
+        if budgetErr != seOk:
+          return budgetErr
+
       # BIP342: In tapscript, OP_CHECKSIG with empty pubkey (0 bytes) is an error
       if ctx.sigVersion == sigTapscript and pubkey.len == 0:
         return seTapscriptEmptyPubkey
@@ -1795,6 +1855,14 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
       if not ok:
         return seInvalidStack
+
+      # BIP-342 validation-weight budget: decrement by 50 BEFORE pubkey
+      # inspection / Schnorr verify, gated on sig.len > 0. Same gate
+      # used in CHECKSIG; see Core's interpreter.cpp:357-366.
+      if sig.len > 0:
+        let budgetErr = consumeValidationWeight(interp)
+        if budgetErr != seOk:
+          return budgetErr
 
       var success = false
       if sig.len > 0:
@@ -2340,6 +2408,15 @@ proc verifyWitnessProgram*(
       for i in 0 ..< witnessStack.len - 2:
         interp.push(witnessStack[i])
 
+      # BIP-342 validation-weight budget (interpreter.cpp:1981):
+      #   m_validation_weight_left = GetSerializeSize(witness.stack)
+      #                              + VALIDATION_WEIGHT_OFFSET (50)
+      # `witness` here is the ORIGINAL pre-pop witness stack (annex
+      # INCLUDED, control block + script INCLUDED, args INCLUDED), which
+      # is what Core passes to ::GetSerializeSize(witness.stack).
+      interp.validationWeightLeft = int64(serializedWitnessStackSize(witness)) + 50'i64
+      interp.validationWeightInit = true
+
       # Get all input amounts and scriptPubKeys for taproot sighash
       var tapAmounts: seq[Satoshi]
       var tapScriptPubKeys: seq[seq[byte]]
@@ -2535,6 +2612,12 @@ proc verifyWitnessProgramWithError*(
       var interp = newInterpreter(flags)
       for i in 0 ..< witnessStack.len - 2:
         interp.push(witnessStack[i])
+
+      # BIP-342 validation-weight budget (interpreter.cpp:1981).
+      # Use the ORIGINAL pre-pop `witness` (annex + control + script
+      # + args) as Core does in ::GetSerializeSize(witness.stack).
+      interp.validationWeightLeft = int64(serializedWitnessStackSize(witness)) + 50'i64
+      interp.validationWeightInit = true
 
       # Get all input amounts and scriptPubKeys for taproot sighash
       var tapAmts: seq[Satoshi]
