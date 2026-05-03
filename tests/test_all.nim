@@ -34,6 +34,7 @@ import ./test_rpc_thread_lifetime
 import ./test_perf
 import ./test_sequence_lock
 import ./test_bip68
+import ./test_isfinaltx
 import ./test_sigop
 import ./test_difficulty
 import ./test_misbehavior
