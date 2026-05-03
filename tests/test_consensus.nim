@@ -701,3 +701,74 @@ suite "validation result type":
     let r = voidErr(veBadPow)
     check r.isOk == false
     check r.error == veBadPow
+
+suite "BIP-34 coinbase height encoding (Core ContextualCheckBlock parity)":
+  # Reference: Bitcoin Core validation.cpp:4151-4159, script.h:433-448
+  # Canonical encoding: CScript() << nHeight
+  #   height 0    → OP_0 (0x00)
+  #   heights 1-16 → OP_1..OP_16 (0x51..0x60)
+  #   heights 17+ → length-prefixed sign-magnitude CScriptNum
+
+  proc makeCoinbaseTx(sig: seq[byte]): Transaction =
+    Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0xFFFFFFFF'u32),
+        scriptSig: sig,
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(5000000000), scriptPubKey: @[])],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+  test "encodeBip34Height canonical vectors":
+    check encodeBip34Height(0)  == @[byte(0x00)]
+    check encodeBip34Height(1)  == @[byte(0x51)]
+    check encodeBip34Height(16) == @[byte(0x60)]
+    check encodeBip34Height(17) == @[byte(0x01), byte(0x11)]
+    check encodeBip34Height(127) == @[byte(0x01), byte(0x7f)]
+    check encodeBip34Height(128) == @[byte(0x02), byte(0x80), byte(0x00)]
+    check encodeBip34Height(32768) == @[byte(0x03), byte(0x00), byte(0x80), byte(0x00)]
+    check encodeBip34Height(500000) == @[byte(0x03), byte(0x20), byte(0xa1), byte(0x07)]
+
+  test "canonical height 1 (OP_1) accepted":
+    var p = regtestParams(); p.bip34Height = 1
+    let tx = makeCoinbaseTx(@[byte(0x51), byte(0x00)])  # extra byte OK
+    check validateCoinbase(tx, 1, p).isOk == true
+
+  test "canonical height 16 (OP_16) accepted":
+    var p = regtestParams(); p.bip34Height = 1
+    let tx = makeCoinbaseTx(@[byte(0x60), byte(0x00)])
+    check validateCoinbase(tx, 16, p).isOk == true
+
+  test "canonical height 128 (sign-pad) accepted":
+    var p = regtestParams(); p.bip34Height = 1
+    let tx = makeCoinbaseTx(@[byte(0x02), byte(0x80), byte(0x00)])
+    check validateCoinbase(tx, 128, p).isOk == true
+
+  test "canonical height 32768 (sign-pad at 0x8000) accepted":
+    var p = regtestParams(); p.bip34Height = 1
+    let tx = makeCoinbaseTx(@[byte(0x03), byte(0x00), byte(0x80), byte(0x00)])
+    check validateCoinbase(tx, 32768, p).isOk == true
+
+  test "reject: length-prefixed 0x01 0x01 for height 1 (must be OP_1)":
+    var p = regtestParams(); p.bip34Height = 1
+    let tx = makeCoinbaseTx(@[byte(0x01), byte(0x01)])
+    check validateCoinbase(tx, 1, p).isOk == false
+
+  test "reject: length-prefixed 0x01 0x10 for height 16 (must be OP_16)":
+    var p = regtestParams(); p.bip34Height = 1
+    let tx = makeCoinbaseTx(@[byte(0x01), byte(0x10)])
+    check validateCoinbase(tx, 16, p).isOk == false
+
+  test "reject: zero-padded height 100 (non-canonical)":
+    var p = regtestParams(); p.bip34Height = 1
+    let tx = makeCoinbaseTx(@[byte(0x02), byte(0x64), byte(0x00)])
+    check validateCoinbase(tx, 100, p).isOk == false
+
+  test "reject: OP_PUSHDATA1 prefix for height 1":
+    var p = regtestParams(); p.bip34Height = 1
+    # 0x4c 0x01 0x01 is OP_PUSHDATA1 followed by length=1, data=0x01
+    let tx = makeCoinbaseTx(@[byte(0x4c), byte(0x01), byte(0x01)])
+    check validateCoinbase(tx, 1, p).isOk == false
