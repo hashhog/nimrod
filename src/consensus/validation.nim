@@ -188,34 +188,47 @@ proc isCoinbase*(tx: Transaction): bool =
   tx.inputs[0].prevOut.txid == TxId(default(array[32, byte])) and
   tx.inputs[0].prevOut.vout == 0xffffffff'u32
 
+proc encodeBip34Height*(height: int32): seq[byte] =
+  ## Build the canonical BIP-34 byte encoding for a block height.
+  ## Mirrors Bitcoin Core's CScript() << nHeight (script.h:433-448):
+  ##   height == 0  → OP_0 (0x00), single byte
+  ##   1..16        → OP_1..OP_16 (0x51..0x60), single byte
+  ##   otherwise    → length-prefixed sign-magnitude CScriptNum
+  if height == 0:
+    return @[byte(0x00)]
+  if height >= 1 and height <= 16:
+    return @[byte(0x50'u8 + uint8(height))]
+  # CScriptNum: minimal little-endian sign-magnitude with length prefix.
+  var h = uint32(height)
+  var le: seq[byte]
+  while h > 0:
+    le.add(byte(h and 0xff))
+    h = h shr 8
+  # If high bit of last byte is set, append zero sign byte.
+  if (le[^1] and 0x80'u8) != 0:
+    le.add(0x00'u8)
+  result = newSeq[byte](1 + le.len)
+  result[0] = byte(le.len)
+  for i, b in le:
+    result[1 + i] = b
+
 proc validateCoinbase*(tx: Transaction, height: int32, params: ConsensusParams): ValidationResult[void] =
   ## Validate coinbase transaction structure
   if not isCoinbase(tx):
     return voidErr(veNoCoinbase)
 
-  # BIP34: coinbase must include block height in scriptSig
-  # Height must be serialized as minimal CScriptNum at start of scriptSig
+  # BIP34: coinbase scriptSig must start with the byte-exact canonical encoding
+  # of the block height. Bitcoin Core validation.cpp:4151-4159:
+  #   CScript expect = CScript() << nHeight;
+  #   sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
   if height >= int32(params.bip34Height):
     let scriptSig = tx.inputs[0].scriptSig
-    if scriptSig.len < 1:
+    let expect = encodeBip34Height(height)
+    if scriptSig.len < expect.len:
       return voidErr(veBadCoinbaseSize)
-
-    # First byte indicates how many bytes encode the height
-    let heightBytes = int(scriptSig[0])
-    if heightBytes == 0 or heightBytes > 4:
-      if height > 0 or heightBytes != 0:
+    for i in 0 ..< expect.len:
+      if scriptSig[i] != expect[i]:
         return voidErr(veBadCoinbaseSize)
-
-    if scriptSig.len < 1 + heightBytes:
-      return voidErr(veBadCoinbaseSize)
-
-    # Decode the height (little-endian)
-    var encodedHeight: int64 = 0
-    for i in 0 ..< heightBytes:
-      encodedHeight = encodedHeight or (int64(scriptSig[1 + i]) shl (8 * i))
-
-    if encodedHeight != int64(height):
-      return voidErr(veBadCoinbaseSize)
 
   # Check scriptSig size (2-100 bytes per protocol)
   let scriptSigLen = tx.inputs[0].scriptSig.len
