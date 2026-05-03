@@ -15,6 +15,7 @@ import ./test_tapscript_validation_weight
 import ./test_taproot_commitment
 import ./test_taproot_p1_gaps
 import ./test_taproot_op_success
+import ./test_mtp_blockheader
 import ./test_consensus
 import ./test_storage
 import ./test_messages
