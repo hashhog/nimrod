@@ -996,6 +996,19 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
          error = $finalTxResult.error
     return false
 
+  # BIP-30: reject blocks that would overwrite existing UTXOs.
+  # Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+  if sm.chainState != nil:
+    let csNorm = sm.chainState
+    let bip30Lookup = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
+      try: csNorm.getUtxo(op).isSome
+      except: false
+    let bip30Result = checkBip30(blk, height, sm.params, bip30Lookup)
+    if not bip30Result.isOk:
+      warn "BIP-30 violation: block would overwrite existing UTXO", height = height,
+           error = $bip30Result.error
+      return false
+
   # Script verification: use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
   # Re-evaluated per block — NOT a persistent latch.
   #
@@ -1546,6 +1559,20 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
            error = $finalTxResultIBD.error
       dl.receivedBlocks.del(height)
       continue
+
+    # BIP-30 (IBD path): reject blocks that would overwrite existing UTXOs.
+    # Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+    if sm.chainState != nil:
+      let csIBD = sm.chainState
+      let bip30LookupIBD = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
+        try: csIBD.getUtxoIBD(op).isSome
+        except: false
+      let bip30ResultIBD = checkBip30(blk, height, sm.params, bip30LookupIBD)
+      if not bip30ResultIBD.isOk:
+        warn "BIP-30 violation in IBD: block would overwrite existing UTXO", height = height,
+             error = $bip30ResultIBD.error
+        dl.receivedBlocks.del(height)
+        continue
 
     # Apply block to chainstate using IBD fast path
     if sm.chainState != nil:
