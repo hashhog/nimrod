@@ -797,8 +797,8 @@ suite "BIP-22 submitblock result strings":
   test "sigops exceeded -> bad-blk-sigops":
     check bip22String(veSigopExceeded) == "bad-blk-sigops"
 
-  test "duplicate tx -> bad-txns-duplicate":
-    check bip22String(veDuplicateTx) == "bad-txns-duplicate"
+  test "duplicate tx -> bad-txns-inputs-missingorspent (Core parity)":
+    check bip22String(veDuplicateTx) == "bad-txns-inputs-missingorspent"
 
   test "non-final tx -> bad-txns-nonfinal":
     check bip22String(veNonFinalTx) == "bad-txns-nonfinal"

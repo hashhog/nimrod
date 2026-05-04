@@ -103,7 +103,9 @@ proc bip22String*(e: ValidationError): string =
   of veBadWitnessCommitment: "bad-witness-merkle-match"
   of veBadAmount: "bad-cb-amount"
   of veSigopExceeded: "bad-blk-sigops"
-  of veDuplicateTx: "bad-txns-duplicate"
+  # Core parity: in-block dup-txid → bad-txns-inputs-missingorspent (ConnectBlock prevout path).
+  # BIP-30 cross-block case stays bad-txns-BIP30 via veBip30DuplicateOutput.
+  of veDuplicateTx: "bad-txns-inputs-missingorspent"
   of veNonFinalTx: "bad-txns-nonfinal"
   of veBip30DuplicateOutput: "bad-txns-BIP30"
   of veBadCoinbase: "bad-cb-height"
