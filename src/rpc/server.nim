@@ -2032,42 +2032,23 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         return %"prev-block-index-missing"
       let prevIdx = prevIndexOpt.get()
 
-      # Skip script checks below assume-valid height (same heuristic as IBD).
-      # Consensus-critical checks (BIP-34 coinbase height, block weight, etc.)
-      # are always run; only script EXECUTION is skipped below assume-valid.
-      let checkScripts = not (cs.params.assumeValidHeight > 0 and
-                              height <= cs.params.assumeValidHeight)
-
-      let validateResult = validateBlock(blk, prevIdx, cs.db, cs.params,
-                                         checkScripts = checkScripts,
-                                         checkPow = false)  # PoW already checked by checkBlock
-      if not validateResult.isOk:
-        return %bip22String(validateResult.error)
-
-      # Gap 1 holding patch: BIP-30 dup-coinbase check missing from submitblock.
-      # Both IBD paths (applyBlock sync.nim and processReceivedBlocks) call
-      # checkBip30 explicitly; handleSubmitBlock did not.  validateBlock does not
-      # include this check (BIP-30 is its own helper; it requires a live UTXO
-      # lookup that validateBlock's interface cannot provide generically).
-      # Reference: bitcoin-core/src/validation.cpp::ConnectBlock / IsBIP30Repeat().
-      block:
-        let bip30LookupSubmit = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
-          try: cs.getUtxo(op).isSome
-          except: false
-        let bip30ResultSubmit = checkBip30(blk, height, cs.params, bip30LookupSubmit)
-        if not bip30ResultSubmit.isOk:
-          return %bip22String(bip30ResultSubmit.error)
-
-      # Script verification (verifyScripts) is the connect-block-stage eval of all
-      # input scripts.  validateBlock() above handles structural/contextual checks but
-      # does NOT call verifyScripts; that must be done here before connectBlock.
-      # Reference: Bitcoin Core ConnectBlock -> VerifyScripts (validation.cpp).
-      if checkScripts:
-        let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} =
-          cs.getUtxo(op)
-        let scriptResult = verifyScripts(blk, utxoLookup, height, rpc.crypto, cs.params)
-        if not scriptResult.isOk:
-          return %bip22String(scriptResult.error)
+      # Unified consensus check pipeline (Core ProcessNewBlock parity):
+      # checkBlock → validateBlock → checkBip30 → verifyScripts (gated on
+      # skipScripts).  All three nimrod block-acceptance entry points delegate
+      # to this single helper; structural divergence between paths is impossible.
+      # Reference: bitcoin-core/src/validation.cpp::Chainstate::ProcessNewBlock.
+      let skipScripts = cs.params.assumeValidHeight > 0 and
+                        height <= cs.params.assumeValidHeight
+      let utxoForAccept = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+        try: cs.getUtxo(op)
+        except: none(UtxoEntry)
+      let acceptResult = acceptBlock(blk, prevIdx, cs.db, cs.params,
+                                     skipScripts = skipScripts,
+                                     checkPow = false,  # PoW already checked by checkBlock above
+                                     getUtxo = utxoForAccept,
+                                     crypto = rpc.crypto)
+      if not acceptResult.isOk:
+        return %bip22String(acceptResult.error)
 
       # Use IBD fast path when far from tip (>1000 blocks behind assume-valid)
       let useIBD = cs.params.assumeValidHeight > 0 and
