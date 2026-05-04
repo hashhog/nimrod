@@ -502,40 +502,6 @@ proc handleSendCmpct*(state: var CompactBlockState, announce: bool, version: uin
     state.compactBlockVersion = version
     state.highBandwidthMode = announce
 
-proc processCompactBlock*(state: var CompactBlockState, cb: CompactBlock,
-                          mempool: Mempool): (BlockHash, ReadStatus, seq[uint16]) =
-  ## Process an incoming compact block
-  ## Returns: (block hash, status, missing tx indexes)
-
-  state.blocksReceived += 1
-
-  # Compute block hash
-  let headerData = serialize(cb.header)
-  let blockHash = BlockHash(doubleSha256(headerData))
-
-  # Initialize partially downloaded block
-  var (pdb, status) = initPartiallyDownloadedBlock(cb)
-  if status != rsOk:
-    state.failedReconstructions += 1
-    return (blockHash, status, @[])
-
-  # Fill from mempool
-  pdb.fillFromMempool(mempool)
-
-  # Check if complete
-  if pdb.isComplete():
-    state.successfulReconstructions += 1
-    state.pendingPartials[blockHash] = pdb
-    return (blockHash, rsOk, @[])
-
-  # Get missing indexes
-  let missing = pdb.getMissingTxIndexes()
-  state.txnsRequested += missing.len
-
-  # Store partial for later completion
-  state.pendingPartials[blockHash] = pdb
-
-  (blockHash, rsOk, missing)
 
 proc completeBlock*(state: var CompactBlockState, blockHash: BlockHash,
                     txns: seq[Transaction]): (Block, ReadStatus) =
