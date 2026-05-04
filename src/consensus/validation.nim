@@ -1388,6 +1388,10 @@ proc checkBlockLocktime*(blk: Block, height: uint32, lockTimeCutoff: uint32): Va
   ## Contextual IsFinalTx check for all transactions in a block.
   ## Mirrors Bitcoin Core ContextualCheckBlock validation.cpp:4146.
   ## Must run even when scripts are skipped (assumevalid only skips sig-check).
+  ##
+  ## DEAD CODE (wave-33b ledger): test-only callers (test_isfinaltx.nim:70, :81).
+  ## The live IsFinalTx enforcement is inside validateBlock (called from acceptBlock).
+  ## BIP-65 / BIP-68 / locktime fixes belong in validateBlock, NOT here.
   for tx in blk.txs:
     if not isFinalTx(tx, height, lockTimeCutoff):
       return voidErr(veNonFinalTx)
@@ -1513,19 +1517,11 @@ proc toLegacy*(r: ValidationResult[void]): LegacyValidationResult =
   else:
     LegacyValidationResult(valid: false, error: $r.error)
 
-# Overloaded procs that return legacy result
-proc checkBlockHeaderLegacy*(
-  header: BlockHeader,
-  params: ConsensusParams,
-  prevHeader: BlockHeader = default(BlockHeader)
-): LegacyValidationResult =
-  checkBlockHeader(header, params, prevHeader).toLegacy()
-
+# Legacy wrapper (kept for tests): checkTransactionLegacy is still called in
+# test_isfinaltx.nim. checkBlockHeaderLegacy and checkBlockLegacy deleted
+# (wave-33b ledger): zero callers, regression-injection magnets.
 proc checkTransactionLegacy*(tx: Transaction, params: ConsensusParams): LegacyValidationResult =
   checkTransaction(tx, params).toLegacy()
-
-proc checkBlockLegacy*(blk: Block, params: ConsensusParams): LegacyValidationResult =
-  checkBlock(blk, params).toLegacy()
 
 # ============================================================================
 # acceptBlock — unified check-only pipeline (Core ProcessNewBlock parity)
