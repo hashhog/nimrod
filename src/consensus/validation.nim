@@ -108,7 +108,9 @@ proc bip22String*(e: ValidationError): string =
   # Core parity: in-block dup-txid → bad-txns-inputs-missingorspent (ConnectBlock prevout path).
   # BIP-30 cross-block case stays bad-txns-BIP30 via veBip30DuplicateOutput.
   of veDuplicateTx: "bad-txns-inputs-missingorspent"
-  of veNonFinalTx: "bad-txns-nonfinal"
+  # BIP-68 SequenceLocks failure maps to the same string as IsFinalTx per
+  # Core validation.cpp:2558.
+  of veNonFinalTx, veSequenceLockNotSatisfied: "bad-txns-nonfinal"
   of veBip30DuplicateOutput: "bad-txns-BIP30"
   of veBadCoinbase: "bad-cb-height"
   of veBadCoinbaseSize: "bad-cb-length"
