@@ -107,6 +107,7 @@ proc bip22String*(e: ValidationError): string =
   of veNonFinalTx: "bad-txns-nonfinal"
   of veBip30DuplicateOutput: "bad-txns-BIP30"
   of veBadCoinbase: "bad-cb-height"
+  of veBadCoinbaseSize: "bad-cb-length"
   of veInputsMissing: "bad-txns-inputs-missingorspent"
   of veScriptVerifyFailed: "mandatory-script-verify-flag-failed"
   of veDoubleSpend: "bad-txns-inputs-spent"
@@ -235,6 +236,18 @@ proc encodeBip34Height*(height: int32): seq[byte] =
   result[0] = byte(le.len)
   for i, b in le:
     result[1 + i] = b
+
+proc validateCoinbaseSizeOnly*(tx: Transaction): ValidationResult[void] =
+  ## Context-free coinbase scriptSig length check.
+  ## Bitcoin Core consensus/tx_check.cpp:49: 2 <= scriptSig.size() <= 100.
+  ## Called from checkBlock (no height available); BIP-34 prefix check is
+  ## deferred to validateCoinbase (called from validateBlock with height).
+  if tx.inputs.len == 0:
+    return voidErr(veNoCoinbase)
+  let scriptSigLen = tx.inputs[0].scriptSig.len
+  if scriptSigLen < 2 or scriptSigLen > 100:
+    return voidErr(veBadCoinbaseSize)
+  ok()
 
 proc validateCoinbase*(tx: Transaction, height: int32, params: ConsensusParams): ValidationResult[void] =
   ## Validate coinbase transaction structure
@@ -1370,7 +1383,14 @@ proc checkBip30*(blk: Block, height: int32, params: ConsensusParams,
   ok()
 
 proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
-  ## Legacy block validation (simplified, without full UTXO context)
+  ## Context-free block validation (no UTXO access needed).
+  ## Checks: header PoW, transaction sanity (including coinbase scriptSig 2..100
+  ## bytes per consensus/tx_check.cpp:49), merkle root, and — when the block
+  ## carries a segwit witness commitment — re-derives the commitment hash and
+  ## compares it against the OP_RETURN payload (CheckWitnessMalleation,
+  ## validation.cpp:3870-3901).
+  ##
+  ## Reference: Bitcoin Core CheckBlock() / CheckWitnessMalleation()
 
   # Check header
   let headerResult = checkBlockHeader(blk.header, params)
@@ -1381,8 +1401,17 @@ proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
   if blk.txs.len == 0:
     return voidErr(veNoCoinbase)
 
-  # Check each transaction
+  # Validate coinbase scriptSig: must be 2..100 bytes per consensus/tx_check.cpp:49.
+  # Use a height of 0 here so only the byte-length cap fires; the BIP-34 height
+  # prefix check is contextual (needs the actual height) and is run later in
+  # validateBlock / handleSubmitBlock.
+  let cbResult = validateCoinbaseSizeOnly(blk.txs[0])
+  if not cbResult.isOk:
+    return cbResult
+
+  # Check each non-coinbase transaction
   for i, tx in blk.txs:
+    if i == 0: continue  # coinbase already checked above
     let txResult = checkTransaction(tx, params)
     if not txResult.isOk:
       return txResult
@@ -1395,6 +1424,39 @@ proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
   let computedRoot = computeMerkleRoot(txHashes)
   if computedRoot != blk.header.merkleRoot:
     return voidErr(veBadMerkleRoot)
+
+  # BIP-141 witness commitment recomputation.
+  # If the coinbase contains an OP_RETURN witness-commitment output AND any
+  # transaction in the block carries witness data, re-derive the expected
+  # commitment = SHA256d(witness_merkle_root || witness_reserved_value) and
+  # compare to the on-chain bytes.  A mismatch is bad-witness-merkle-match.
+  # Mirrors Bitcoin Core CheckWitnessMalleation (validation.cpp:3870-3901).
+  var hasWitness = false
+  for tx in blk.txs:
+    if tx.witnesses.len > 0:
+      for w in tx.witnesses:
+        if w.len > 0:
+          hasWitness = true
+          break
+      if hasWitness:
+        break
+
+  if hasWitness:
+    let commitmentOpt = findWitnessCommitment(blk.txs[0])
+    if commitmentOpt.isNone:
+      return voidErr(veBadWitnessCommitment)
+
+    # Compute wtxids: coinbase wtxid is all-zeros, rest are real
+    var wtxids: seq[array[32, byte]]
+    wtxids.add(default(array[32, byte]))
+    for i in 1 ..< blk.txs.len:
+      wtxids.add(array[32, byte](blk.txs[i].wtxid()))
+
+    let reserved = getWitnessReservedValue(blk.txs[0])
+    let computedCommitment = computeWitnessCommitment(wtxids, reserved)
+
+    if computedCommitment != commitmentOpt.get():
+      return voidErr(veBadWitnessCommitment)
 
   ok()
 
