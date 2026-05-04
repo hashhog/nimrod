@@ -980,118 +980,77 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
     warn "invalid block", height = height, error = $checkResult.error
     return false
 
-  # Gap 3 holding patch: contextual block validation (block weight, sigop cost,
-  # BIP-34 coinbase height, coinbase value, BIP-68 sequence locks).
-  # Bitcoin Core runs these via ContextualCheckBlock + ConnectBlock on every
-  # block-acceptance path (ProcessNewBlock → AcceptBlock).  applyBlock previously
-  # skipped validateBlock entirely, leaving the IBD path unprotected.
-  # checkPow=false: PoW was already verified by checkBlock above.
-  # checkScripts=false: script execution is handled separately by verifyScripts
-  # below (gated on shouldSkipScripts / assumevalid).
-  # Reference: bitcoin-core/src/validation.cpp::ProcessNewBlock → AcceptBlock.
-  try:
-    {.gcsafe.}:
-      let prevIdxApply = chainstate.BlockIndex(
-        hash: blk.header.prevBlock,
-        height: height - 1
-      )
-      let dbForValidate = if sm.chainState != nil: sm.chainState.db else: sm.chainDb
-      let validateResultApply = validateBlock(blk, prevIdxApply, dbForValidate,
-                                              sm.params,
-                                              checkScripts = false,
-                                              checkPow = false)
-      if not validateResultApply.isOk:
-        warn "contextual block validation failed (IBD applyBlock)", height = height,
-             error = $validateResultApply.error
-        return false
-  except Exception as e:
-    warn "contextual block validation error (IBD applyBlock)", height = height,
-         error = e.msg
-    return false
-
-  # ContextualCheckBlock: enforce IsFinalTx for every transaction
-  # (Bitcoin Core validation.cpp:4146). Consensus rule — runs even under
-  # assumevalid (assumevalid only skips script verification).
-  # lock_time_cutoff = MTP when CSV is active (BIP-113), block timestamp otherwise.
-  let csvActive = height >= int32(sm.params.csvHeight)
-  let lockTimeCutoff: uint32 =
-    if csvActive:
-      getMtpForHeight(sm.chainDb, height - 1)
-    else:
-      blk.header.timestamp
-  let finalTxResult = checkBlockLocktime(blk, uint32(height), lockTimeCutoff)
-  if not finalTxResult.isOk:
-    warn "block contains non-final transaction", height = height,
-         error = $finalTxResult.error
-    return false
-
-  # BIP-30: reject blocks that would overwrite existing UTXOs.
-  # Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
-  if sm.chainState != nil:
-    let csNorm = sm.chainState
-    let bip30Lookup = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
-      try: csNorm.getUtxo(op).isSome
-      except: false
-    let bip30Result = checkBip30(blk, height, sm.params, bip30Lookup)
-    if not bip30Result.isOk:
-      warn "BIP-30 violation: block would overwrite existing UTXO", height = height,
-           error = $bip30Result.error
-      return false
-
-  # Script verification: use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
-  # Re-evaluated per block — NOT a persistent latch.
+  # Unified consensus check pipeline (Core ProcessNewBlock parity):
+  # acceptBlock runs checkBlock → validateBlock → checkBip30 → verifyScripts
+  # in one place, eliminating the 3-entry-point hand-rolled-pipeline pattern.
+  # Reference: bitcoin-core/src/validation.cpp::Chainstate::ProcessNewBlock.
   #
+  # Assumevalid: use ancestor-check semantics (Bitcoin Core v28.0).
   # The ancestor-check MUST query the block INDEX (sm.headerChain), not the
   # active chain (sm.chainDb.getBlockHashByHeight).  Bitcoin Core's
-  # GetAncestor() walks the block-index pindex pointers; it does not require
-  # the ancestor to be on the active chain.  During IBD we have header-synced
-  # past assumeValidHeight long before the active chain reaches it, so using
-  # the chainDb active-chain map would leave activeHashAtAssumeValidHeight
-  # empty, trip ssrHashNotInIndex, and force script verification to run when
-  # the spec says it should be skipped.  See overnight-2026-04-13/
-  # NIMROD-MISSING-INPUT-DIAG.md for the stall analysis at mainnet 850846.
-  var avCtx = AssumeValidContext(
+  # GetAncestor() walks block-index pindex pointers; it does not require the
+  # ancestor to be on the active chain.  During IBD we have header-synced past
+  # assumeValidHeight long before the active chain reaches it, so using the
+  # active-chain map would leave activeHashAtAssumeValidHeight empty, trip
+  # ssrHashNotInIndex, and force script verification when it should be skipped.
+  # See overnight-2026-04-13/NIMROD-MISSING-INPUT-DIAG.md.
+  #
+  # Note on parallel verifier: verifyScriptsParallel (src/perf/parallel_verify.nim)
+  # was wired here in b751f80 but reverted because it fails deterministically at
+  # mainnet block 821384.  Likely cause: hardcoded mainnetParams() in the verifier
+  # computes script flags without height-aware BIP activation (P2-OPT-ROUND-2
+  # parallel-verify-bug-001).  The module is retained for a future ROUND-3 pass.
+  var avCtxApply = AssumeValidContext(
     blockHash: hash,
     blockHeight: height,
     assumeValidHeight: sm.params.assumeValidHeight,
     bestHeaderHeight: sm.headerTipHeight,
     bestHeaderChainWork: sm.headerChain.totalWork
   )
-  avCtx.activeHashAtBlockHeight = sm.headerChain.getHashByHeight(height)
+  avCtxApply.activeHashAtBlockHeight = sm.headerChain.getHashByHeight(height)
   if sm.params.assumeValidHeight > 0:
-    avCtx.activeHashAtAssumeValidHeight =
+    avCtxApply.activeHashAtAssumeValidHeight =
       sm.headerChain.getHashByHeight(sm.params.assumeValidHeight)
-  let skipReason = shouldSkipScripts(avCtx, sm.params)
-  let skipScripts = skipReason == ssrSkip
-  if not skipScripts and sm.chainState != nil:
-    try:
-      {.gcsafe.}:
-        let cs = sm.chainState
-        let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} =
-          cs.getUtxo(op)
-        let crypto = newCryptoEngine()
-        # Serial script verification.  The parallel verifier
-        # (verifyScriptsParallel in src/perf/parallel_verify.nim) was wired here
-        # in b751f80 but was reverted because it fails deterministically at
-        # mainnet block 821384.  Likely cause: hardcoded mainnetParams() in the
-        # verifier computes script flags without height-aware BIP activation,
-        # producing mismatched flags vs the serial path.  Tracked as P2-OPT-
-        # ROUND-2 parallel-verify-bug-001.  The parallel_verify.nim module is
-        # retained for a future P2-OPT-ROUND-3 pass that re-wires it correctly.
-        let scriptResult = verifyScripts(blk, utxoLookup, height, crypto, sm.params)
-        if not scriptResult.isOk:
+  let skipReason = shouldSkipScripts(avCtxApply, sm.params)
+  # Skip scripts when assumevalid covers this block, OR when chainState is nil
+  # (offline replay / chainDb-only mode — no UTXO set available for script eval).
+  let skipScripts = (skipReason == ssrSkip) or (sm.chainState == nil)
+  let prevIdxApply = chainstate.BlockIndex(
+    hash: blk.header.prevBlock,
+    height: height - 1
+  )
+  let dbForApply = if sm.chainState != nil: sm.chainState.db else: sm.chainDb
+  # UTXO lookup: use chainState when available; noop stub otherwise (BIP-30
+  # always passes with no UTXOs — equivalent to skipping BIP-30 when no DB).
+  let csApply = sm.chainState
+  let utxoForApply = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+    if csApply == nil: return none(UtxoEntry)
+    try: csApply.getUtxo(op)
+    except: none(UtxoEntry)
+  try:
+    {.gcsafe.}:
+      let cryptoApply = newCryptoEngine()
+      let acceptResultApply = acceptBlock(blk, prevIdxApply, dbForApply, sm.params,
+                                          skipScripts = skipScripts,
+                                          checkPow = false,  # PoW already checked by checkBlock above
+                                          getUtxo = utxoForApply,
+                                          crypto = cryptoApply)
+      if not acceptResultApply.isOk:
+        warn "block failed consensus checks (IBD applyBlock)", height = height,
+             error = $acceptResultApply.error
+        if acceptResultApply.error == veScriptVerifyFailed:
           warn "script verification failed", height = height,
-               error = $scriptResult.error, txCount = blk.txs.len,
+               error = $acceptResultApply.error, txCount = blk.txs.len,
                hasWitness = (blk.txs.len > 1 and blk.txs[1].witnesses.len > 0)
           if sm.failedBlockHeight == height:
             sm.failedBlockRetries += 1
           else:
             sm.failedBlockHeight = height
             sm.failedBlockRetries = 1
-          return false
-    except Exception as e:
-      warn "script verification error", height = height, error = e.msg
-      return false
+        return false
+  except Exception as e:
+    warn "block consensus check error (IBD applyBlock)", height = height, error = e.msg
+    return false
 
   # Apply block to chainstate
   # Use IBD fast path when catching up (skips undo data, batches writes)
@@ -1574,95 +1533,59 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
       dl.receivedBlocks.del(height)
       continue
 
-    # ContextualCheckBlock: enforce IsFinalTx for every transaction
-    # (Bitcoin Core validation.cpp:4146). Runs even under assumevalid.
-    let csvActiveIBD = height >= int32(sm.params.csvHeight)
-    let lockTimeCutoffIBD: uint32 =
-      if csvActiveIBD:
-        getMtpForHeight(sm.chainDb, height - 1)
-      else:
-        blk.header.timestamp
-    let finalTxResultIBD = checkBlockLocktime(blk, uint32(height), lockTimeCutoffIBD)
-    if not finalTxResultIBD.isOk:
-      warn "block contains non-final transaction (IBD)", height = height,
-           error = $finalTxResultIBD.error
-      dl.receivedBlocks.del(height)
-      continue
-
-    # BIP-30 (IBD path): reject blocks that would overwrite existing UTXOs.
-    # Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
-    if sm.chainState != nil:
-      let csIBD = sm.chainState
-      let bip30LookupIBD = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
-        try: csIBD.getUtxoIBD(op).isSome
-        except: false
-      let bip30ResultIBD = checkBip30(blk, height, sm.params, bip30LookupIBD)
-      if not bip30ResultIBD.isOk:
-        warn "BIP-30 violation in IBD: block would overwrite existing UTXO", height = height,
-             error = $bip30ResultIBD.error
-        dl.receivedBlocks.del(height)
-        continue
-
-    # Gap 4 holding patch: contextual block validation (block weight, sigop cost,
-    # BIP-34 coinbase height, coinbase value, BIP-68 sequence locks) plus
-    # script verification gated on assumevalid.
-    # processReceivedBlocks previously skipped validateBlock entirely AND never
-    # called verifyScripts, leaving the BlockDownloader fast path unprotected.
-    # checkPow=false: PoW verified by checkBlock above.
-    # checkScripts=false: script execution handled by verifyScripts below.
-    # Reference: bitcoin-core/src/validation.cpp::ProcessNewBlock → AcceptBlock.
-    var gap4PassedPRB = true
+    # Unified consensus check pipeline (Core ProcessNewBlock parity):
+    # acceptBlock runs checkBlock → validateBlock → checkBip30 → verifyScripts.
+    # Reference: bitcoin-core/src/validation.cpp::Chainstate::ProcessNewBlock.
+    #
+    # Assumevalid: mirror applyBlock's 6-condition shouldSkipScripts gate so
+    # that --noassumevalid operators get full script verification on this path.
+    # UTXO source: getUtxoIBD — IBD-batch-aware lookup for both BIP-30 and
+    # script verification (sees pending batch writes, not only flushed DB).
+    let headerBytesPRB = serialize(blk.header)
+    let hashPRB = BlockHash(doubleSha256(headerBytesPRB))
+    var avCtxPRB = AssumeValidContext(
+      blockHash: hashPRB,
+      blockHeight: height,
+      assumeValidHeight: sm.params.assumeValidHeight,
+      bestHeaderHeight: sm.headerTipHeight,
+      bestHeaderChainWork: sm.headerChain.totalWork
+    )
+    avCtxPRB.activeHashAtBlockHeight = sm.headerChain.getHashByHeight(height)
+    if sm.params.assumeValidHeight > 0:
+      avCtxPRB.activeHashAtAssumeValidHeight =
+        sm.headerChain.getHashByHeight(sm.params.assumeValidHeight)
+    let skipReasonPRB = shouldSkipScripts(avCtxPRB, sm.params)
+    # Skip scripts when assumevalid covers this block, OR when chainState is nil.
+    let skipScriptsPRB = (skipReasonPRB == ssrSkip) or (sm.chainState == nil)
+    let prevIdxPRB = chainstate.BlockIndex(
+      hash: blk.header.prevBlock,
+      height: height - 1
+    )
+    let dbForPRB = if sm.chainState != nil: sm.chainState.db else: sm.chainDb
+    let csPRB = sm.chainState
+    # Use getUtxoIBD so BIP-30 and script eval see the pending IBD write batch.
+    let utxoForPRB = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+      if csPRB == nil: return none(UtxoEntry)
+      try: csPRB.getUtxoIBD(op)
+      except: none(UtxoEntry)
+    var acceptPassedPRB = true
     {.gcsafe.}:
       try:
-        let prevIdxPRB = chainstate.BlockIndex(
-          hash: blk.header.prevBlock,
-          height: height - 1
-        )
-        let dbForValidatePRB = if sm.chainState != nil: sm.chainState.db else: sm.chainDb
-        let validateResultPRB = validateBlock(blk, prevIdxPRB, dbForValidatePRB,
-                                              sm.params,
-                                              checkScripts = false,
-                                              checkPow = false)
-        if not validateResultPRB.isOk:
-          warn "contextual block validation failed (IBD processReceivedBlocks)", height = height,
-               error = $validateResultPRB.error
-          gap4PassedPRB = false
-
-        # Script verification gated on assumevalid.  Mirror applyBlock's
-        # shouldSkipScripts gate so that --noassumevalid operators get full
-        # script verification through the BlockDownloader fast path.
-        # Reference: bitcoin-core/src/validation.cpp::ConnectBlock (fScriptChecks).
-        if gap4PassedPRB:
-          let headerBytesForAV = serialize(blk.header)
-          let hashForAV = BlockHash(doubleSha256(headerBytesForAV))
-          var avCtxPRB = AssumeValidContext(
-            blockHash: hashForAV,
-            blockHeight: height,
-            assumeValidHeight: sm.params.assumeValidHeight,
-            bestHeaderHeight: sm.headerTipHeight,
-            bestHeaderChainWork: sm.headerChain.totalWork
-          )
-          avCtxPRB.activeHashAtBlockHeight = sm.headerChain.getHashByHeight(height)
-          if sm.params.assumeValidHeight > 0:
-            avCtxPRB.activeHashAtAssumeValidHeight =
-              sm.headerChain.getHashByHeight(sm.params.assumeValidHeight)
-          let skipReasonPRB = shouldSkipScripts(avCtxPRB, sm.params)
-          let skipScriptsPRB = skipReasonPRB == ssrSkip
-          if not skipScriptsPRB and sm.chainState != nil:
-            let csPRB = sm.chainState
-            let utxoLookupPRB = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} =
-              csPRB.getUtxo(op)
-            let cryptoPRB = newCryptoEngine()
-            let scriptResultPRB = verifyScripts(blk, utxoLookupPRB, height, cryptoPRB, sm.params)
-            if not scriptResultPRB.isOk:
-              warn "script verification failed (IBD processReceivedBlocks)", height = height,
-                   error = $scriptResultPRB.error
-              gap4PassedPRB = false
+        let cryptoPRB = newCryptoEngine()
+        let acceptResultPRB = acceptBlock(blk, prevIdxPRB, dbForPRB, sm.params,
+                                          skipScripts = skipScriptsPRB,
+                                          checkPow = false,  # PoW already checked by checkBlock above
+                                          getUtxo = utxoForPRB,
+                                          crypto = cryptoPRB)
+        if not acceptResultPRB.isOk:
+          warn "block failed consensus checks (IBD processReceivedBlocks)", height = height,
+               error = $acceptResultPRB.error
+          acceptPassedPRB = false
       except Exception as e:
-        warn "block validation error (IBD processReceivedBlocks)", height = height,
+        warn "block consensus check error (IBD processReceivedBlocks)", height = height,
              error = e.msg
-        gap4PassedPRB = false
-    if not gap4PassedPRB:
+        acceptPassedPRB = false
+    if not acceptPassedPRB:
       dl.receivedBlocks.del(height)
       continue
 

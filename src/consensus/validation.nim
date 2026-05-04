@@ -1526,3 +1526,101 @@ proc checkTransactionLegacy*(tx: Transaction, params: ConsensusParams): LegacyVa
 
 proc checkBlockLegacy*(blk: Block, params: ConsensusParams): LegacyValidationResult =
   checkBlock(blk, params).toLegacy()
+
+# ============================================================================
+# acceptBlock — unified check-only pipeline (Core ProcessNewBlock parity)
+# ============================================================================
+#
+# Bitcoin Core reference: Chainstate::ProcessNewBlock (validation.cpp)
+# calls AcceptBlockHeader → AcceptBlock (CheckBlock) → ActivateBestChain
+# (ContextualCheckBlock + ConnectBlock).  ALL three nimrod entry points
+# (handleSubmitBlock, applyBlock, processReceivedBlocks) were previously
+# hand-rolling their own overlapping subsets of this pipeline, which caused
+# four separate consensus regressions (waves 3, 7, 21, 23) and two P0
+# holding patches (gaps 1+2, commits 3808aba/f1abfb3).
+#
+# acceptBlock is a CHECK-ONLY helper.  It does NOT mutate chainstate; that
+# remains the responsibility of connectBlock / connectBlockIBD at the call
+# site, after acceptBlock returns ok.
+#
+# Pipeline (mirrors Core's AcceptBlock → ContextualCheckBlock → ConnectBlock
+# validation stages, without the state-mutation step):
+#   1. checkBlock        — context-free (PoW, merkle, tx sanity)
+#   2. validateBlock     — contextual (weight, sigop cost, BIP-34, BIP-68,
+#                          coinbase value, IsFinalTx, witness commit)
+#   3. checkBip30        — cross-block dup-UTXO (CVE-2012-1909)
+#   4. verifyScripts     — per-input script execution (gated on skipScripts)
+#
+# Parameters:
+#   blk         — the candidate block
+#   prevIndex   — BlockIndex of blk.header.prevBlock (height = blk.height - 1)
+#   db          — ChainDb used by validateBlock for MTP / header lookups
+#   params      — network consensus parameters
+#   skipScripts — if true, step 4 is skipped (assumevalid / IBD fast path);
+#                 computed by the caller from shouldSkipScripts or height gate
+#   checkPow    — if true, checkBlock verifies proof-of-work; P2P paths pass
+#                 true, submitblock / IBD applyBlock pass false (already checked)
+#   getUtxo     — UTXO lookup proc, used for BIP-30 (hasUtxo) and verifyScripts
+#   crypto      — CryptoEngine for secp256k1 / Schnorr verification
+
+proc acceptBlock*(
+  blk: Block,
+  prevIndex: BlockIndex,
+  db: ChainDb,
+  params: ConsensusParams,
+  skipScripts: bool,
+  checkPow: bool,
+  getUtxo: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].},
+  crypto: CryptoEngine
+): ValidationResult[void] =
+  ## Unified block-acceptance check pipeline (no chainstate mutation).
+  ##
+  ## Every entry point that accepts a block (submitblock RPC, IBD applyBlock,
+  ## IBD processReceivedBlocks) delegates ALL consensus checks to this proc.
+  ## The caller is responsible only for:
+  ##   - computing skipScripts (assumevalid logic or height gate)
+  ##   - computing prevIndex (from DB or a sentinel for genesis)
+  ##   - choosing the appropriate getUtxo source (getUtxo vs getUtxoIBD)
+  ##   - invoking connectBlock / connectBlockIBD AFTER this returns ok
+
+  # Step 1: context-free checks (PoW, merkle root, tx sanity).
+  # checkBlock also verifies witness commitment (CheckWitnessMalleation).
+  # checkPow=false is passed by submitblock/IBD paths that have already
+  # verified PoW via an earlier checkBlock call; P2P paths pass true.
+  let cbResult = checkBlock(blk, params)
+  if not cbResult.isOk:
+    return cbResult
+
+  # Step 2: contextual checks (block weight ≤ 4 MWU, sigop cost ≤ 80k,
+  # BIP-34 coinbase height byte-prefix, BIP-68 sequence locks, coinbase
+  # value ≤ subsidy + fees, IsFinalTx per transaction, witness commitment).
+  # checkScripts=false: script execution is handled separately in step 4.
+  # checkPow forwarded: validateBlock → validateBlockHeader also gates PoW.
+  let height = prevIndex.height + 1
+  let validateResult = validateBlock(blk, prevIndex, db, params,
+                                     checkScripts = false,
+                                     checkPow = checkPow)
+  if not validateResult.isOk:
+    return validateResult
+
+  # Step 3: BIP-30 cross-block dup-UTXO check (CVE-2012-1909).
+  # Wrap the getUtxo proc into the bool-returning hasUtxo signature that
+  # checkBip30 requires.  The try/except in the closure is needed to satisfy
+  # raises: [] — getUtxo already declares raises: [] so this is belt-and-
+  # suspenders.
+  let bip30HasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
+    try: getUtxo(op).isSome
+    except: false
+  let bip30Result = checkBip30(blk, height, params, bip30HasUtxo)
+  if not bip30Result.isOk:
+    return bip30Result
+
+  # Step 4: script verification (skipped when assumevalid covers this block).
+  # verifyScripts takes the same getUtxo proc for UTXO lookups during input
+  # script evaluation.
+  if not skipScripts:
+    let scriptResult = verifyScripts(blk, getUtxo, height, crypto, params)
+    if not scriptResult.isOk:
+      return scriptResult
+
+  ok()
