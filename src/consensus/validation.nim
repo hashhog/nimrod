@@ -37,6 +37,7 @@ type
     veDuplicateInput = "duplicate transaction input"
     veBadOutputValue = "invalid output value"
     veNegativeOutput = "negative output value"
+    veOutputTooLarge = "output value exceeds MAX_MONEY"
     veFeeTooLow = "transaction fee too low"
     veBadBlockVersion = "invalid block version"
     vePrevBlockMissing = "previous block not found"
@@ -117,6 +118,8 @@ proc bip22String*(e: ValidationError): string =
   of veBadTimestamp: "time-too-old"
   # Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
   of veNegativeOutput: "bad-txns-vout-negative"
+  # Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
+  of veOutputTooLarge: "bad-txns-vout-toolarge"
   of veOk: ""
   else: "rejected"
 
@@ -1356,7 +1359,7 @@ proc checkTransaction*(tx: Transaction, params: ConsensusParams): ValidationResu
     if int64(output.value) < 0:
       return voidErr(veNegativeOutput)
     if output.value > MaxMoney:
-      return voidErr(veBadOutputValue)
+      return voidErr(veOutputTooLarge)
     totalOutput = totalOutput + output.value
     if totalOutput > MaxMoney:
       return voidErr(veBadOutputValue)
