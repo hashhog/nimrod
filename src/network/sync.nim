@@ -980,6 +980,35 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
     warn "invalid block", height = height, error = $checkResult.error
     return false
 
+  # Gap 3 holding patch: contextual block validation (block weight, sigop cost,
+  # BIP-34 coinbase height, coinbase value, BIP-68 sequence locks).
+  # Bitcoin Core runs these via ContextualCheckBlock + ConnectBlock on every
+  # block-acceptance path (ProcessNewBlock → AcceptBlock).  applyBlock previously
+  # skipped validateBlock entirely, leaving the IBD path unprotected.
+  # checkPow=false: PoW was already verified by checkBlock above.
+  # checkScripts=false: script execution is handled separately by verifyScripts
+  # below (gated on shouldSkipScripts / assumevalid).
+  # Reference: bitcoin-core/src/validation.cpp::ProcessNewBlock → AcceptBlock.
+  try:
+    {.gcsafe.}:
+      let prevIdxApply = chainstate.BlockIndex(
+        hash: blk.header.prevBlock,
+        height: height - 1
+      )
+      let dbForValidate = if sm.chainState != nil: sm.chainState.db else: sm.chainDb
+      let validateResultApply = validateBlock(blk, prevIdxApply, dbForValidate,
+                                              sm.params,
+                                              checkScripts = false,
+                                              checkPow = false)
+      if not validateResultApply.isOk:
+        warn "contextual block validation failed (IBD applyBlock)", height = height,
+             error = $validateResultApply.error
+        return false
+  except Exception as e:
+    warn "contextual block validation error (IBD applyBlock)", height = height,
+         error = e.msg
+    return false
+
   # ContextualCheckBlock: enforce IsFinalTx for every transaction
   # (Bitcoin Core validation.cpp:4146). Consensus rule — runs even under
   # assumevalid (assumevalid only skips script verification).
@@ -1573,6 +1602,69 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
              error = $bip30ResultIBD.error
         dl.receivedBlocks.del(height)
         continue
+
+    # Gap 4 holding patch: contextual block validation (block weight, sigop cost,
+    # BIP-34 coinbase height, coinbase value, BIP-68 sequence locks) plus
+    # script verification gated on assumevalid.
+    # processReceivedBlocks previously skipped validateBlock entirely AND never
+    # called verifyScripts, leaving the BlockDownloader fast path unprotected.
+    # checkPow=false: PoW verified by checkBlock above.
+    # checkScripts=false: script execution handled by verifyScripts below.
+    # Reference: bitcoin-core/src/validation.cpp::ProcessNewBlock → AcceptBlock.
+    var gap4PassedPRB = true
+    {.gcsafe.}:
+      try:
+        let prevIdxPRB = chainstate.BlockIndex(
+          hash: blk.header.prevBlock,
+          height: height - 1
+        )
+        let dbForValidatePRB = if sm.chainState != nil: sm.chainState.db else: sm.chainDb
+        let validateResultPRB = validateBlock(blk, prevIdxPRB, dbForValidatePRB,
+                                              sm.params,
+                                              checkScripts = false,
+                                              checkPow = false)
+        if not validateResultPRB.isOk:
+          warn "contextual block validation failed (IBD processReceivedBlocks)", height = height,
+               error = $validateResultPRB.error
+          gap4PassedPRB = false
+
+        # Script verification gated on assumevalid.  Mirror applyBlock's
+        # shouldSkipScripts gate so that --noassumevalid operators get full
+        # script verification through the BlockDownloader fast path.
+        # Reference: bitcoin-core/src/validation.cpp::ConnectBlock (fScriptChecks).
+        if gap4PassedPRB:
+          let headerBytesForAV = serialize(blk.header)
+          let hashForAV = BlockHash(doubleSha256(headerBytesForAV))
+          var avCtxPRB = AssumeValidContext(
+            blockHash: hashForAV,
+            blockHeight: height,
+            assumeValidHeight: sm.params.assumeValidHeight,
+            bestHeaderHeight: sm.headerTipHeight,
+            bestHeaderChainWork: sm.headerChain.totalWork
+          )
+          avCtxPRB.activeHashAtBlockHeight = sm.headerChain.getHashByHeight(height)
+          if sm.params.assumeValidHeight > 0:
+            avCtxPRB.activeHashAtAssumeValidHeight =
+              sm.headerChain.getHashByHeight(sm.params.assumeValidHeight)
+          let skipReasonPRB = shouldSkipScripts(avCtxPRB, sm.params)
+          let skipScriptsPRB = skipReasonPRB == ssrSkip
+          if not skipScriptsPRB and sm.chainState != nil:
+            let csPRB = sm.chainState
+            let utxoLookupPRB = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} =
+              csPRB.getUtxo(op)
+            let cryptoPRB = newCryptoEngine()
+            let scriptResultPRB = verifyScripts(blk, utxoLookupPRB, height, cryptoPRB, sm.params)
+            if not scriptResultPRB.isOk:
+              warn "script verification failed (IBD processReceivedBlocks)", height = height,
+                   error = $scriptResultPRB.error
+              gap4PassedPRB = false
+      except Exception as e:
+        warn "block validation error (IBD processReceivedBlocks)", height = height,
+             error = e.msg
+        gap4PassedPRB = false
+    if not gap4PassedPRB:
+      dl.receivedBlocks.del(height)
+      continue
 
     # Apply block to chainstate using IBD fast path
     if sm.chainState != nil:
