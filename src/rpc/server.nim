@@ -2044,6 +2044,20 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       if not validateResult.isOk:
         return %bip22String(validateResult.error)
 
+      # Gap 1 holding patch: BIP-30 dup-coinbase check missing from submitblock.
+      # Both IBD paths (applyBlock sync.nim and processReceivedBlocks) call
+      # checkBip30 explicitly; handleSubmitBlock did not.  validateBlock does not
+      # include this check (BIP-30 is its own helper; it requires a live UTXO
+      # lookup that validateBlock's interface cannot provide generically).
+      # Reference: bitcoin-core/src/validation.cpp::ConnectBlock / IsBIP30Repeat().
+      block:
+        let bip30LookupSubmit = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
+          try: cs.getUtxo(op).isSome
+          except: false
+        let bip30ResultSubmit = checkBip30(blk, height, cs.params, bip30LookupSubmit)
+        if not bip30ResultSubmit.isOk:
+          return %bip22String(bip30ResultSubmit.error)
+
       # Script verification (verifyScripts) is the connect-block-stage eval of all
       # input scripts.  validateBlock() above handles structural/contextual checks but
       # does NOT call verifyScripts; that must be done here before connectBlock.
