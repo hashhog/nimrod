@@ -968,6 +968,24 @@ proc countBlockSigops*(blk: Block, params: ConsensusParams): int =
     for outp in tx.outputs:
       result += countScriptSigops(outp.scriptPubKey)
 
+# Transaction locktime finality (BIP-65 / BIP-113)
+# Defined before validateBlock because validateBlock calls checkBlockLocktime.
+# Reference: Bitcoin Core consensus/tx_verify.cpp IsFinalTx()
+
+proc isFinalTxEarly(tx: Transaction, blockHeight: uint32, lockTimeCutoff: uint32): bool =
+  ## Inline copy of isFinalTx used by validateBlock.
+  ## The canonical public proc is declared later in the file; this avoids a
+  ## forward-declaration while keeping the public API unchanged.
+  if tx.lockTime == 0:
+    return true
+  let threshold = if tx.lockTime < LocktimeThreshold: blockHeight else: lockTimeCutoff
+  if tx.lockTime < threshold:
+    return true
+  for input in tx.inputs:
+    if input.sequence != SequenceFinal:
+      return false
+  true
+
 # Full block validation
 proc validateBlock*(
   blk: Block,
@@ -1066,6 +1084,19 @@ proc validateBlock*(
   var prevBlockMtp: uint32 = 0
   if bip68Active and prevIndex.height >= 0:
     prevBlockMtp = getMtpForHeight(utxos, prevIndex.height)
+
+  # ContextualCheckBlock: enforce IsFinalTx for every transaction
+  # (Bitcoin Core validation.cpp:4146). Consensus rule that must run even
+  # under assumevalid — assumevalid only skips script verification.
+  # lock_time_cutoff = MTP-of-11 of the parent when BIP-113/CSV is active,
+  # block header timestamp otherwise.
+  # Reference: consensus/tx_verify.cpp:IsFinalTx, BIP-113.
+  let lockTimeCutoffForFinal: uint32 =
+    if bip68Active and prevBlockMtp != 0: prevBlockMtp
+    else: blk.header.timestamp
+  for tx in blk.txs:
+    if not isFinalTxEarly(tx, uint32(height), lockTimeCutoffForFinal):
+      return voidErr(veNonFinalTx)
 
   # Create a closure for getMtpAtHeight that can be passed to sequence lock functions
   proc getMtpAtHeight(h: int32): uint32 =
