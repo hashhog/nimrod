@@ -36,6 +36,7 @@ type
     veBadTxVersion = "invalid transaction version"
     veDuplicateInput = "duplicate transaction input"
     veBadOutputValue = "invalid output value"
+    veNegativeOutput = "negative output value"
     veFeeTooLow = "transaction fee too low"
     veBadBlockVersion = "invalid block version"
     vePrevBlockMissing = "previous block not found"
@@ -114,6 +115,8 @@ proc bip22String*(e: ValidationError): string =
   of veScriptVerifyFailed: "mandatory-script-verify-flag-failed"
   of veDoubleSpend: "bad-txns-inputs-spent"
   of veBadTimestamp: "time-too-old"
+  # Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
+  of veNegativeOutput: "bad-txns-vout-negative"
   of veOk: ""
   else: "rejected"
 
@@ -1346,10 +1349,12 @@ proc checkTransaction*(tx: Transaction, params: ConsensusParams): ValidationResu
         return voidErr(veDuplicateInput)
 
   # Check output values
+  # NOTE: check negative before toolarge — mirrors Bitcoin Core
+  # consensus/tx_check.cpp::CheckTransaction order.
   var totalOutput = Satoshi(0)
   for output in tx.outputs:
     if int64(output.value) < 0:
-      return voidErr(veBadOutputValue)
+      return voidErr(veNegativeOutput)
     if output.value > MaxMoney:
       return voidErr(veBadOutputValue)
     totalOutput = totalOutput + output.value
