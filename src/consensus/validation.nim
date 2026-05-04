@@ -262,10 +262,10 @@ proc validateCoinbase*(tx: Transaction, height: int32, params: ConsensusParams):
     let scriptSig = tx.inputs[0].scriptSig
     let expect = encodeBip34Height(height)
     if scriptSig.len < expect.len:
-      return voidErr(veBadCoinbaseSize)
+      return voidErr(veBadCoinbase)
     for i in 0 ..< expect.len:
       if scriptSig[i] != expect[i]:
-        return voidErr(veBadCoinbaseSize)
+        return voidErr(veBadCoinbase)
 
   # Check scriptSig size (2-100 bytes per protocol)
   let scriptSigLen = tx.inputs[0].scriptSig.len

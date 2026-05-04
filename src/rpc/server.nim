@@ -2020,6 +2020,30 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         if blk.header.timestamp <= prevMtp:
           return %bip22String(veBadTimestamp)
 
+      # Contextual block validation: BIP-34 coinbase height, BIP-65/66,
+      # script verification, etc. Requires the prevIndex for height context.
+      # Reference: Bitcoin Core ContextualCheckBlock (validation.cpp:4130+).
+      let prevIndexOpt = if cs.bestHeight < 0:
+        # Genesis: no prevIndex in DB; build a sentinel with height=-1.
+        some(BlockIndex(height: -1'i32))
+      else:
+        cs.db.getBlockIndex(prevHash)
+      if prevIndexOpt.isNone:
+        return %"prev-block-index-missing"
+      let prevIdx = prevIndexOpt.get()
+
+      # Skip script checks below assume-valid height (same heuristic as IBD).
+      # Consensus-critical checks (BIP-34 coinbase height, block weight, etc.)
+      # are always run; only script EXECUTION is skipped below assume-valid.
+      let checkScripts = not (cs.params.assumeValidHeight > 0 and
+                              height <= cs.params.assumeValidHeight)
+
+      let validateResult = validateBlock(blk, prevIdx, cs.db, cs.params,
+                                         checkScripts = checkScripts,
+                                         checkPow = false)  # PoW already checked by checkBlock
+      if not validateResult.isOk:
+        return %bip22String(validateResult.error)
+
       # Use IBD fast path when far from tip (>1000 blocks behind assume-valid)
       let useIBD = cs.params.assumeValidHeight > 0 and
                    height < cs.params.assumeValidHeight - 1000

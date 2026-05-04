@@ -435,7 +435,7 @@ proc regtestParams*(): ConsensusParams =
   result.maxBlockSize = 1_000_000
   result.maxBlockSigopsCost = 80_000
   result.coinbaseMaturity = 100
-  result.bip34Height = 500
+  result.bip34Height = 1  # Bitcoin Core kernel/chainparams.cpp:536: consensus.BIP34Height = 1
   result.bip65Height = 1351
   result.bip66Height = 1251
   result.csvHeight = 0       # BIP68/112/113 active from genesis on regtest
