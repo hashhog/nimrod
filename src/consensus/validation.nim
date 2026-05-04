@@ -113,7 +113,7 @@ proc bip22String*(e: ValidationError): string =
   of veBadCoinbase: "bad-cb-height"
   of veBadCoinbaseSize: "bad-cb-length"
   of veInputsMissing: "bad-txns-inputs-missingorspent"
-  of veScriptVerifyFailed: "mandatory-script-verify-flag-failed"
+  of veScriptVerifyFailed: "block-script-verify-flag-failed"
   of veDoubleSpend: "bad-txns-inputs-spent"
   of veBadTimestamp: "time-too-old"
   # Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)

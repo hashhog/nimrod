@@ -2044,6 +2044,17 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       if not validateResult.isOk:
         return %bip22String(validateResult.error)
 
+      # Script verification (verifyScripts) is the connect-block-stage eval of all
+      # input scripts.  validateBlock() above handles structural/contextual checks but
+      # does NOT call verifyScripts; that must be done here before connectBlock.
+      # Reference: Bitcoin Core ConnectBlock -> VerifyScripts (validation.cpp).
+      if checkScripts:
+        let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} =
+          cs.getUtxo(op)
+        let scriptResult = verifyScripts(blk, utxoLookup, height, rpc.crypto, cs.params)
+        if not scriptResult.isOk:
+          return %bip22String(scriptResult.error)
+
       # Use IBD fast path when far from tip (>1000 blocks behind assume-valid)
       let useIBD = cs.params.assumeValidHeight > 0 and
                    height < cs.params.assumeValidHeight - 1000
