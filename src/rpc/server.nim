@@ -4678,6 +4678,309 @@ proc handleFinalizePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   else:
     result["psbt"] = %psbtObj.toBase64()
 
+# ============================================================================
+# Wave-47b P2 RPCs
+# Reference: Bitcoin Core src/rpc/blockchain.cpp + src/rpc/mining.cpp
+# ============================================================================
+
+proc w47bDsha256(data: openArray[byte]): array[32, byte] =
+  sha256d(data)
+
+proc w47bDsha256Pair(a, b: array[32, byte]): array[32, byte] =
+  var combined: array[64, byte]
+  for i in 0..31: combined[i] = a[i]
+  for i in 0..31: combined[32 + i] = b[i]
+  sha256d(combined)
+
+proc w47bTreeWidth(nTx, height: int): int =
+  (nTx + (1 shl height) - 1) shr height
+
+proc w47bCalcTreeHash(txids: seq[array[32, byte]], nTx, height, pos: int): array[32, byte] =
+  if height == 0:
+    if pos < nTx: return txids[pos]
+    return default(array[32, byte])
+  let left = w47bCalcTreeHash(txids, nTx, height - 1, pos * 2)
+  let rightPos = pos * 2 + 1
+  let right = if rightPos < w47bTreeWidth(nTx, height - 1):
+    w47bCalcTreeHash(txids, nTx, height - 1, rightPos)
+  else:
+    left
+  w47bDsha256Pair(left, right)
+
+proc w47bEncodeVarInt(n: int): seq[byte] =
+  if n < 0xFD:
+    @[byte(n)]
+  elif n <= 0xFFFF:
+    let v = uint16(n)
+    @[byte(0xFD), byte(v and 0xFF), byte(v shr 8)]
+  elif n <= 0xFFFFFFFF:
+    let v = uint32(n)
+    @[byte(0xFE), byte(v and 0xFF), byte((v shr 8) and 0xFF),
+      byte((v shr 16) and 0xFF), byte(v shr 24)]
+  else:
+    let v = uint64(n)
+    @[byte(0xFF), byte(v and 0xFF), byte((v shr 8) and 0xFF),
+      byte((v shr 16) and 0xFF), byte((v shr 24) and 0xFF),
+      byte((v shr 32) and 0xFF), byte((v shr 40) and 0xFF),
+      byte((v shr 48) and 0xFF), byte(v shr 56)]
+
+proc w47bBuildPartialMerkleTree(
+    headerBytes: array[80, byte],
+    txids: seq[array[32, byte]],
+    matches: seq[bool]): seq[byte] =
+  let n = txids.len
+  var height = 0
+  while (1 shl height) < n: inc height
+
+  var hashes: seq[array[32, byte]]
+  var bits: seq[bool]
+
+  proc traverse(h, pos: int) =
+    let start = pos shl h
+    let endRaw = (pos + 1) shl h
+    let endPos = min(endRaw, n)
+    var parentMatch = false
+    for i in start ..< endPos:
+      if matches[i]: parentMatch = true; break
+    bits.add(parentMatch)
+    if h == 0 or not parentMatch:
+      if h == 0:
+        hashes.add(if pos < n: txids[pos] else: default(array[32, byte]))
+      else:
+        hashes.add(w47bCalcTreeHash(txids, n, h, pos))
+    else:
+      traverse(h - 1, pos * 2)
+      if pos * 2 + 1 < w47bTreeWidth(n, h - 1):
+        traverse(h - 1, pos * 2 + 1)
+
+  traverse(height, 0)
+
+  result = @[]
+  for b in headerBytes: result.add(b)
+  result.add(byte(n and 0xFF))
+  result.add(byte((n shr 8) and 0xFF))
+  result.add(byte((n shr 16) and 0xFF))
+  result.add(byte(n shr 24))
+  result.add(w47bEncodeVarInt(hashes.len))
+  for h32 in hashes:
+    for b in h32: result.add(b)
+  let flagCount = (bits.len + 7) div 8
+  result.add(w47bEncodeVarInt(flagCount))
+  var flagBytes = newSeq[byte](flagCount)
+  for i, b in bits:
+    if b: flagBytes[i div 8] = flagBytes[i div 8] or byte(1 shl (i mod 8))
+  result.add(flagBytes)
+
+proc w47bReadVarInt(data: seq[byte], offset: int): tuple[val: int, next: int] =
+  if offset >= data.len: return (0, offset)
+  let first = data[offset]
+  if first == 0xFD:
+    if offset + 3 > data.len: return (0, data.len)
+    let v = int(data[offset+1]) or (int(data[offset+2]) shl 8)
+    return (v, offset + 3)
+  elif first == 0xFE:
+    if offset + 5 > data.len: return (0, data.len)
+    let v = int(data[offset+1]) or (int(data[offset+2]) shl 8) or
+            (int(data[offset+3]) shl 16) or (int(data[offset+4]) shl 24)
+    return (v, offset + 5)
+  elif first == 0xFF:
+    if offset + 9 > data.len: return (0, data.len)
+    let v = int(data[offset+1]) or (int(data[offset+2]) shl 8) or
+            (int(data[offset+3]) shl 16) or (int(data[offset+4]) shl 24)
+    return (v, offset + 9)
+  else:
+    return (int(first), offset + 1)
+
+proc w47bParsePartialMerkleTree(data: seq[byte]): tuple[matched: seq[array[32, byte]], root: array[32, byte]] =
+  if data.len < 4:
+    raise newRpcError(RpcMiscError, "Proof payload too short")
+  let nTx = int(data[0]) or (int(data[1]) shl 8) or (int(data[2]) shl 16) or (int(data[3]) shl 24)
+  var offset = 4
+
+  let (nHashes, off1) = w47bReadVarInt(data, offset)
+  offset = off1
+
+  var hashes: seq[array[32, byte]]
+  for _ in 0 ..< nHashes:
+    if offset + 32 > data.len:
+      raise newRpcError(RpcMiscError, "Proof truncated in hashes")
+    var h: array[32, byte]
+    for i in 0..31: h[i] = data[offset + i]
+    hashes.add(h)
+    offset += 32
+
+  let (nFlagBytes, off2) = w47bReadVarInt(data, offset)
+  offset = off2
+  if offset + nFlagBytes > data.len:
+    raise newRpcError(RpcMiscError, "Proof truncated in flags")
+  var allBits: seq[bool]
+  for i in 0 ..< nFlagBytes:
+    for bit in 0..7:
+      allBits.add((data[offset + i] and byte(1 shl bit)) != 0)
+
+  var treeHeight = 0
+  while (1 shl treeHeight) < nTx: inc treeHeight
+
+  var hashIdx = 0
+  var bitIdx = 0
+  var matched: seq[array[32, byte]]
+
+  proc consume(h, pos: int): array[32, byte] =
+    if bitIdx >= allBits.len:
+      raise newRpcError(RpcMiscError, "Bits exhausted in proof")
+    let parentMatch = allBits[bitIdx]
+    inc bitIdx
+    if h == 0:
+      let cur = if hashIdx < hashes.len: hashes[hashIdx] else: default(array[32, byte])
+      inc hashIdx
+      if parentMatch: matched.add(cur)
+      return cur
+    if not parentMatch:
+      let cur = if hashIdx < hashes.len: hashes[hashIdx] else: default(array[32, byte])
+      inc hashIdx
+      return cur
+    let left = consume(h - 1, pos * 2)
+    let rightPos = pos * 2 + 1
+    let right = if rightPos < w47bTreeWidth(nTx, h - 1):
+      consume(h - 1, rightPos)
+    else:
+      left
+    w47bDsha256Pair(left, right)
+
+  let computedRoot = consume(treeHeight, 0)
+  (matched, computedRoot)
+
+proc handleGetNetworkHashPS(rpc: RpcServer, params: JsonNode): JsonNode =
+  var nblocks: int32 = 120
+  var targetHeight: int32 = -1
+  if params.kind == JArray:
+    if params.len >= 1 and params[0].kind == JInt:
+      nblocks = int32(params[0].getInt())
+    if params.len >= 2 and params[1].kind == JInt:
+      targetHeight = int32(params[1].getInt())
+  let bestHeight = rpc.chainState.bestHeight
+  var tipH: int32 = bestHeight
+  if targetHeight >= 0 and targetHeight <= bestHeight:
+    tipH = targetHeight
+  if nblocks <= 0:
+    nblocks = tipH mod 2016
+    if nblocks == 0: nblocks = 1
+  if nblocks > tipH: nblocks = tipH
+  if nblocks == 0 or tipH == 0: return %0.0
+  let startH: int32 = tipH - nblocks
+  let tipHashOpt = rpc.chainState.db.getBlockHashByHeight(tipH)
+  let startHashOpt = rpc.chainState.db.getBlockHashByHeight(startH)
+  if tipHashOpt.isNone or startHashOpt.isNone: return %0.0
+  let tipIdxOpt = rpc.chainState.db.getBlockIndex(tipHashOpt.get())
+  let startIdxOpt = rpc.chainState.db.getBlockIndex(startHashOpt.get())
+  if tipIdxOpt.isNone or startIdxOpt.isNone: return %0.0
+  let tipIdx = tipIdxOpt.get()
+  let startIdx = startIdxOpt.get()
+  let timeDiff = int64(tipIdx.header.timestamp) - int64(startIdx.header.timestamp)
+  if timeDiff <= 0: return %0.0
+  var tipWork: uint64 = 0
+  var startWork: uint64 = 0
+  for i in 24..31:
+    tipWork = (tipWork shl 8) or uint64(tipIdx.totalWork[i])
+    startWork = (startWork shl 8) or uint64(startIdx.totalWork[i])
+  if tipWork <= startWork: return %0.0
+  %(float64(tipWork - startWork) / float64(timeDiff))
+
+proc handleGetTxOutProof(rpc: RpcServer, params: JsonNode): JsonNode =
+  if params.kind != JArray or params.len < 1:
+    raise newRpcError(RpcInvalidParams, "Expected [txids, (blockhash)]")
+  let txidsArr = params[0]
+  if txidsArr.kind != JArray or txidsArr.len == 0:
+    raise newRpcError(RpcInvalidParams, "txids must be a non-empty array")
+  var targetTxids: seq[array[32, byte]]
+  for item in txidsArr:
+    if item.kind != JString or item.getStr().len != 64:
+      raise newRpcError(RpcInvalidParams, "txid must be a 64-char hex string")
+    targetTxids.add(array[32, byte](parseTxId(item.getStr())))
+  var blkOpt: Option[Block]
+  var blkHeader: BlockHeader
+  if params.len >= 2:
+    let bhStr = params[1].getStr()
+    if bhStr.len != 64: raise newRpcError(RpcInvalidParams, "blockhash must be 64-char hex")
+    let bh = parseBlockHash(bhStr)
+    blkOpt = rpc.chainState.db.getBlock(bh)
+    if blkOpt.isNone: raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+    blkHeader = blkOpt.get().header
+  else:
+    let tipHeight = rpc.chainState.bestHeight
+    let searchStart = if tipHeight >= 100: tipHeight - 100 else: 0
+    var h = tipHeight
+    while h >= searchStart:
+      let hashOpt = rpc.chainState.db.getBlockHashByHeight(h)
+      if hashOpt.isSome:
+        let candidate = rpc.chainState.db.getBlock(hashOpt.get())
+        if candidate.isSome:
+          let blk = candidate.get()
+          var found = false
+          for tx in blk.txs:
+            let txid = array[32, byte](tx.txid())
+            for target in targetTxids:
+              if txid == target: found = true; break
+            if found: break
+          if found:
+            blkOpt = candidate
+            blkHeader = blk.header
+            break
+      if h == 0: break
+      dec h
+    if blkOpt.isNone:
+      raise newRpcError(RpcInvalidAddressOrKey, "Transaction not found in recent blocks")
+  let blk = blkOpt.get()
+  var allTxids: seq[array[32, byte]]
+  var matches: seq[bool]
+  for tx in blk.txs:
+    let txid = array[32, byte](tx.txid())
+    allTxids.add(txid)
+    var isTarget = false
+    for t in targetTxids:
+      if txid == t: isTarget = true; break
+    matches.add(isTarget)
+  for target in targetTxids:
+    var found = false
+    for txid in allTxids:
+      if txid == target: found = true; break
+    if not found: raise newRpcError(RpcInvalidParams, "Transaction not found in block")
+  var w = BinaryWriter()
+  w.writeBlockHeader(blkHeader)
+  var headerBytes: array[80, byte]
+  for i in 0..79: headerBytes[i] = w.data[i]
+  let proofBytes = w47bBuildPartialMerkleTree(headerBytes, allTxids, matches)
+  %toHex(proofBytes)
+
+proc handleVerifyTxOutProof(rpc: RpcServer, params: JsonNode): JsonNode =
+  if params.kind != JArray or params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "Expected [proof_hex]")
+  let hexStr = params[0].getStr()
+  if hexStr.len < 168 or hexStr.len mod 2 != 0:
+    raise newRpcError(RpcMiscError, "Proof too short")
+  let proofBytes = hexToBytes(hexStr)
+  if proofBytes.len < 84: raise newRpcError(RpcMiscError, "Proof too short")
+  let blockHashBytes = w47bDsha256(proofBytes[0..79])
+  let blockHash = BlockHash(blockHashBytes)
+  let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
+  if idxOpt.isNone: raise newRpcError(RpcInvalidAddressOrKey, "Block not in chain")
+  var merkleRootInHeader: array[32, byte]
+  for i in 0..31: merkleRootInHeader[i] = proofBytes[36 + i]
+  let payload = proofBytes[80 .. proofBytes.high]
+  let (matched, computedRoot) = w47bParsePartialMerkleTree(payload)
+  if computedRoot != merkleRootInHeader:
+    raise newRpcError(RpcMiscError, "Merkle root mismatch")
+  var resultArr = newJArray()
+  for txid in matched:
+    var display: array[32, byte] = txid
+    for i in 0..15: swap(display[i], display[31 - i])
+    resultArr.add(%toHex(display))
+  resultArr
+
+proc handleGetRPCInfo(rpc: RpcServer): JsonNode =
+  discard rpc
+  %*{"active_commands": [], "logpath": ""}
+
 proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
   case methodName
   # Blockchain
@@ -4881,6 +5184,16 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleUptime()
   of "help":
     rpc.handleHelp(params)
+
+  # Wave-47b P2 RPCs
+  of "getnetworkhashps":
+    rpc.handleGetNetworkHashPS(params)
+  of "gettxoutproof":
+    rpc.handleGetTxOutProof(params)
+  of "verifytxoutproof":
+    rpc.handleVerifyTxOutProof(params)
+  of "getrpcinfo":
+    rpc.handleGetRPCInfo()
 
   else:
     raise newRpcError(RpcMethodNotFound, "method not found: " & methodName)
