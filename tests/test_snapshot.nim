@@ -1388,3 +1388,123 @@ suite "loadtxoutset RPC gate":
     except RpcError as e:
       code2 = e.code
     check code2 == RpcInvalidParams
+
+# ----------------------------------------------------------------------------
+# importdescriptors RPC gate (cross-impl lying-RPC audit 2026-05-05).
+#
+# Pre-fix the handler walked the requests array, parsed each descriptor via
+# `parseDescriptor`/`getDescriptorInfo`, and returned `{"success": true}`
+# per descriptor without ever updating wallet state. Operators got a
+# successful JSON-RPC response; nothing actually landed.
+#
+# Same option-B refusal pattern as the 2026-05-05 loadtxoutset wave
+# (rustoshi 1d0a325 / hotbuns e355cd7 / clearbit c8866ef / nimrod 64a856d).
+# Audit: CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md.
+#
+# The gate must:
+#   1. Refuse with RpcWalletError (-4, Core RPC_WALLET_ERROR).
+#   2. Surface "importdescriptors not implemented" so operators know.
+#   3. NOT touch wallet state (no parseDescriptor call).
+# ----------------------------------------------------------------------------
+
+suite "importdescriptors RPC gate":
+
+  proc mkRpc(cs: ChainState, params: ConsensusParams): RpcServer =
+    let mp = newMempool(cs, params)
+    let fe = newFeeEstimator()
+    newRpcServer(
+      port = 18443'u16,
+      chainState = cs,
+      mempool = mp,
+      peerManager = nil,
+      feeEstimator = fe,
+      params = params
+    )
+
+  test "refuses with RpcWalletError and surfaces 'not implemented'":
+    let testDir = getTempDir() / "nimrod_importdesc_gate_basic"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    let rpc = mkRpc(cs, regtest)
+
+    var caught = false
+    var code = 0
+    var msg = ""
+    try:
+      # Well-formed requests array with one descriptor object. Pre-fix
+      # would have parseDescriptor'd the desc and returned
+      # [{"success": true, "warnings": []}].
+      discard rpc.handleImportDescriptors(%*[
+        [%*{"desc": "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"}]
+      ])
+    except RpcError as e:
+      caught = true
+      code = e.code
+      msg = e.msg
+    check caught
+    check code == RpcWalletError
+    check "importdescriptors not implemented" in msg
+
+  test "gate fires regardless of wallet presence":
+    # Pre-fix the very first thing the handler did was check
+    # `if rpc.wallet == nil: raise newRpcError(RpcMiscError, "wallet not loaded")`.
+    # Post-fix the gate must short-circuit to RpcWalletError even with
+    # no wallet configured (this RpcServer has none).
+    let testDir = getTempDir() / "nimrod_importdesc_gate_no_wallet"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    let rpc = mkRpc(cs, regtest)
+    check rpc.wallet == nil
+
+    var code = 0
+    try:
+      discard rpc.handleImportDescriptors(%*[
+        [%*{"desc": "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"}]
+      ])
+    except RpcError as e:
+      code = e.code
+    # Must be -4 (RpcWalletError), NOT -1 (RpcMiscError "wallet not loaded").
+    check code == RpcWalletError
+
+  test "still rejects malformed params before the gate":
+    let testDir = getTempDir() / "nimrod_importdesc_gate_bad_params"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    let rpc = mkRpc(cs, regtest)
+
+    # Empty params → RpcInvalidParams, NOT RpcWalletError.
+    var code = 0
+    try:
+      discard rpc.handleImportDescriptors(%*[])
+    except RpcError as e:
+      code = e.code
+    check code == RpcInvalidParams
+
+    # First param not an array → RpcInvalidParams.
+    var code2 = 0
+    try:
+      discard rpc.handleImportDescriptors(%*["not-an-array"])
+    except RpcError as e:
+      code2 = e.code
+    check code2 == RpcInvalidParams
