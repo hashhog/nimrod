@@ -47,6 +47,7 @@ type
     veInsufficientChainWork = "chain does not meet minimum work requirement"
     veNonFinalTx = "non-final transaction: bad-txns-nonfinal"
     veBip30DuplicateOutput = "bad-txns-BIP30: tried to overwrite transaction"
+    veOutputsBelowInputs = "transaction outputs exceed inputs (in-belowout)"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -125,6 +126,10 @@ proc bip22String*(e: ValidationError): string =
   of veNegativeOutput: "bad-txns-vout-negative"
   # Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
   of veOutputTooLarge: "bad-txns-vout-toolarge"
+  # Non-coinbase tx where sum(inputs) < sum(outputs).
+  # Core consensus/tx_verify.cpp::CheckTxInputs:
+  #   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+  of veOutputsBelowInputs: "bad-txns-in-belowout"
   of veOk: ""
   else: "rejected"
 
@@ -625,9 +630,11 @@ proc validateTransaction*(
       return err(int64, veBadAmount)
 
   # Fee = input - output (must be non-negative)
+  # Core consensus/tx_verify.cpp::CheckTxInputs:
+  #   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
   let fee = totalInput - totalOutput
   if fee < 0:
-    return err(int64, veBadAmount)
+    return err(int64, veOutputsBelowInputs)
 
   ok(fee)
 
