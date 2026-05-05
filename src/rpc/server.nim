@@ -47,6 +47,8 @@ type
                                          ## to mirror Bitcoin Core's NetworkDisable RAII guard
                                          ## around TemporaryRollback in
                                          ## rpc/blockchain.cpp::dumptxoutset.
+    startedAt*: int64                    ## Unix timestamp when this RpcServer was created;
+                                         ## used by the `uptime` RPC.
 
   RpcRequest = object
     jsonrpc: string
@@ -108,7 +110,8 @@ proc newRpcServer*(
     cookiePassword: cookiePassword,
     running: false,
     crypto: newCryptoEngine(),
-    blockSubmissionPaused: false
+    blockSubmissionPaused: false,
+    startedAt: getTime().toUnix()
   )
 
 proc isBlockSubmissionPaused*(rpc: RpcServer): bool =
@@ -2531,6 +2534,217 @@ proc handleClearBanned(rpc: RpcServer): JsonNode =
     rpc.peerManager.clearBanned()
   newJNull()
 
+proc handleDisconnectNode(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## disconnectnode "address" ( nodeid )
+  ## Force disconnect a connected peer by address or nodeid.
+  ## Reference: Bitcoin Core src/rpc/net.cpp::disconnectnode
+  if params.len < 1 or params[0].getStr() == "":
+    raise newRpcError(RpcInvalidParams, "missing address parameter")
+
+  let node = params[0].getStr()
+
+  if rpc.peerManager == nil:
+    raise newRpcError(RpcInternalError, "peer manager not available")
+
+  # Parse host:port
+  var host = node
+  var port = rpc.params.defaultPort
+  let colonIdx = node.rfind(':')
+  if colonIdx > 0:
+    host = node[0 ..< colonIdx]
+    try:
+      port = uint16(parseInt(node[colonIdx + 1 .. ^1]))
+    except ValueError:
+      raise newRpcError(RpcInvalidParams, "invalid port number")
+
+  var found = false
+  for peer in rpc.peerManager.getReadyPeers():
+    if peer.address == host and peer.port == port:
+      asyncSpawn rpc.peerManager.removePeer(peer)
+      found = true
+      break
+
+  if not found:
+    raise newRpcError(RpcInvalidParams, "Node not found in connected nodes")
+
+  newJNull()
+
+proc handleUptime(rpc: RpcServer): JsonNode =
+  ## uptime
+  ## Returns the total uptime of the server in seconds.
+  ## Reference: Bitcoin Core src/rpc/server.cpp::uptime
+  let now = getTime().toUnix()
+  %int(now - rpc.startedAt)
+
+proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
+  ## getmininginfo
+  ## Returns a json object containing mining-related information.
+  ## Reference: Bitcoin Core src/rpc/mining.cpp::getmininginfo
+  let height = rpc.chainState.bestHeight
+  let bits = block:
+    var b: uint32 = 0x1d00ffff'u32  # default genesis bits
+    let blkOpt = rpc.chainState.db.getBlock(rpc.chainState.bestBlockHash)
+    if blkOpt.isSome:
+      b = blkOpt.get().header.bits
+    b
+  let target = bitsToTarget(bits)
+  let difficulty = targetToDifficulty(target)
+  let chainName = case rpc.params.network
+    of Mainnet:  "main"
+    of Testnet3: "test"
+    of Testnet4: "testnet4"
+    of Regtest:  "regtest"
+    of Signet:   "signet"
+  %*{
+    "blocks": height,
+    "difficulty": difficulty,
+    "networkhashps": 0.0,
+    "pooledtx": rpc.mempool.count,
+    "chain": chainName,
+    "warnings": ""
+  }
+
+proc handleGetTxOut(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## gettxout "txid" n ( include_mempool )
+  ## Returns details about an unspent transaction output.
+  ## Reference: Bitcoin Core src/rpc/blockchain.cpp::gettxout
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams, "gettxout requires txid and vout parameters")
+
+  let txidHex = params[0].getStr()
+  if txidHex.len != 64:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid txid")
+
+  let voutNum = params[1].getInt()
+  let includeMempool = if params.len >= 3: params[2].getBool() else: true
+
+  # Parse txid (reverse display byte order → internal order)
+  var txidBytes: array[32, byte]
+  let reversed = reverseHex(txidHex)
+  for i in 0 ..< 32:
+    txidBytes[i] = byte(parseHexInt(reversed[i*2 .. i*2+1]))
+  let txid = TxId(txidBytes)
+
+  let isMainnet = rpc.params.network == Mainnet
+
+  # Check mempool first if requested
+  if includeMempool:
+    let entryOpt = rpc.mempool.get(txid)
+    if entryOpt.isSome:
+      let entry = entryOpt.get()
+      if voutNum >= 0 and voutNum < entry.tx.outputs.len:
+        let output = entry.tx.outputs[voutNum]
+        return %*{
+          "bestblock": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
+          "confirmations": 0,
+          "value": float64(int64(output.value)) / 100_000_000.0,
+          "scriptPubKey": buildScriptPubKeyJson(output.scriptPubKey, isMainnet),
+          "coinbase": false
+        }
+
+  # Look up in UTXO set
+  let outpoint = OutPoint(txid: txid, vout: uint32(voutNum))
+  let utxoOpt = rpc.chainState.getUtxo(outpoint)
+  if utxoOpt.isNone:
+    return newJNull()
+
+  let utxo = utxoOpt.get()
+  let confirmations = rpc.chainState.bestHeight - utxo.height + 1
+  %*{
+    "bestblock": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
+    "confirmations": confirmations,
+    "value": float64(int64(utxo.output.value)) / 100_000_000.0,
+    "scriptPubKey": buildScriptPubKeyJson(utxo.output.scriptPubKey, isMainnet),
+    "coinbase": utxo.isCoinbase
+  }
+
+proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## help ( "command" )
+  ## List all commands, or get help for a specified command.
+  ## Reference: Bitcoin Core src/rpc/server.cpp::help
+  let methods = @[
+    "== Blockchain ==",
+    "getbestblockhash",
+    "getblock \"blockhash\" ( verbosity )",
+    "getblockchaininfo",
+    "getblockcount",
+    "getblockhash height",
+    "getblockheader \"blockhash\" ( verbose )",
+    "getchaintips",
+    "getdeploymentinfo ( \"blockhash\" )",
+    "getdifficulty",
+    "getsyncstate",
+    "gettxout \"txid\" n ( include_mempool )",
+    "gettxoutsetinfo ( \"hash_type\" )",
+    "invalidateblock \"blockhash\"",
+    "preciousblock \"blockhash\"",
+    "pruneblockchain height",
+    "reconsiderblock \"blockhash\"",
+    "",
+    "== Mining ==",
+    "getblocktemplate ( template_request )",
+    "getmininginfo",
+    "submitblock \"hexdata\"",
+    "",
+    "== Mempool ==",
+    "dumpmempool",
+    "getmempoolancestors \"txid\" ( verbose )",
+    "getmempooldescendants \"txid\" ( verbose )",
+    "getmempoolentry \"txid\"",
+    "getmempoolinfo",
+    "getrawmempool ( verbose )",
+    "loadmempool",
+    "savemempool",
+    "testmempoolaccept [\"rawtx\",...]",
+    "",
+    "== Network ==",
+    "addnode \"node\" \"command\"",
+    "clearbanned",
+    "disconnectnode \"address\"",
+    "getconnectioncount",
+    "getnetworkinfo",
+    "getpeerinfo",
+    "getzmqnotifications",
+    "listbanned",
+    "setban \"subnet\" \"command\" ( bantime absolute )",
+    "",
+    "== Rawtransactions ==",
+    "decoderawtransaction \"hexstring\"",
+    "getrawtransaction \"txid\" ( verbose )",
+    "sendrawtransaction \"hexstring\"",
+    "submitpackage [\"rawtx\",...]",
+    "",
+    "== Util ==",
+    "estimaterawfee conf_target ( threshold )",
+    "estimatesmartfee conf_target ( \"estimate_mode\" )",
+    "signmessage \"address\" \"message\"",
+    "signmessagewithprivkey \"privkey\" \"message\"",
+    "validateaddress \"address\"",
+    "verifymessage \"address\" \"signature\" \"message\"",
+    "",
+    "== Wallet ==",
+    "createwallet \"wallet_name\"",
+    "getbalance",
+    "getnewaddress",
+    "getwalletinfo",
+    "listunspent",
+    "listtransactions ( count )",
+    "loadwallet \"filename\"",
+    "sendtoaddress \"address\" amount",
+    "unloadwallet",
+    "",
+    "== Control ==",
+    "help ( \"command\" )",
+    "stop",
+    "uptime",
+    "",
+    "== AssumeUTXO ==",
+    "dumptxoutset \"path\"",
+    "loadtxoutset \"path\"",
+    "scrubunspendable",
+  ]
+  %methods.join("\n")
+
 # Message signing / verification RPCs
 # Reference: Bitcoin Core src/rpc/signmessage.cpp + src/wallet/rpc/signmessage.cpp
 proc getTargetWallet(rpc: RpcServer): Wallet {.gcsafe.}
@@ -4447,6 +4661,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetChainTips()
   of "pruneblockchain":
     rpc.handlePruneBlockchain(params)
+  of "gettxout":
+    rpc.handleGetTxOut(params)
   of "getdeploymentinfo":
     rpc.handleGetDeploymentInfo(params)
 
@@ -4512,12 +4728,16 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleSetBan(params)
   of "clearbanned":
     rpc.handleClearBanned()
+  of "disconnectnode":
+    rpc.handleDisconnectNode(params)
 
   # ZMQ
   of "getzmqnotifications":
     rpc.handleGetZmqNotifications()
 
   # Mining
+  of "getmininginfo":
+    rpc.handleGetMiningInfo()
   of "getblocktemplate":
     rpc.handleGetBlockTemplate(params)
   of "submitblock":
@@ -4617,6 +4837,10 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   of "stop":
     # Return success - actual shutdown handled by caller
     %"nimrod server stopping"
+  of "uptime":
+    rpc.handleUptime()
+  of "help":
+    rpc.handleHelp(params)
 
   else:
     raise newRpcError(RpcMethodNotFound, "method not found: " & methodName)
