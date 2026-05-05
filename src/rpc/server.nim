@@ -72,6 +72,7 @@ const
 
   # Bitcoin Core specific error codes
   RpcInvalidAddressOrKey* = -5     # Invalid address or key
+  RpcWalletError* = -4             # Generic wallet RPC error (Core RPC_WALLET_ERROR)
   RpcTransactionError* = -25       # Generic transaction error
   RpcTransactionRejected* = -26    # Transaction rejected by mempool
   RpcTransactionAlreadyInChain* = -27  # Transaction already confirmed
@@ -4201,59 +4202,51 @@ proc handleDeriveAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
   except DescriptorError as e:
     raise newRpcError(RpcInvalidParams, "invalid descriptor: " & e.msg)
 
-proc handleImportDescriptors(rpc: RpcServer, params: JsonNode): JsonNode =
-  ## Import descriptors into the wallet
-  ## Reference: Bitcoin Core wallet/rpc/backup.cpp importdescriptors
+proc handleImportDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Refused with `RpcWalletError` (Core RPC_WALLET_ERROR / -4). The pre-fix
+  ## handler walked the requests array, ran each descriptor through
+  ## `parseDescriptor`/`getDescriptorInfo`, and returned `{"success": true}`
+  ## per descriptor without ever adding to the wallet's watched descriptors
+  ## or persisting state. The pre-fix code self-documented the gap at
+  ## L4244-4245:
   ##
-  ## Arguments:
-  ## 1. requests (array, required) - Array of import requests
+  ##     # For now, just validate and return success
+  ##     # Full implementation would add to wallet's watched descriptors
   ##
-  ## Returns: Array of results
-
-  if rpc.wallet == nil:
-    raise newRpcError(RpcMiscError, "wallet not loaded")
-
+  ## Operators got a successful JSON-RPC response; nothing actually landed
+  ## in the wallet. Same lying-RPC pattern as the haskoin `loadtxoutset`
+  ## bug closed earlier today (rustoshi 1d0a325 / hotbuns e355cd7 /
+  ## clearbit c8866ef / nimrod 64a856d wave from this morning).
+  ##
+  ## Wiring real descriptor-wallet support (descriptor → address derivation
+  ## → wallet DB write → blockchain rescan) is a multi-day project. The
+  ## honest gate is the fix; the real implementation is a follow-up.
+  ##
+  ## The gate fires AFTER cheap parameter-shape validation (so malformed
+  ## params still get RpcInvalidParams) but BEFORE any wallet state read
+  ## or write. The pre-fix `rpc.wallet == nil` check is gone — there is
+  ## no live wallet code path through this handler post-fix.
+  ##
+  ## Cross-impl audit:
+  ## `CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md`.
+  ##
+  ## Exported (`*`) so tests can call it directly the same way the
+  ## existing `handleLoadTxOutSet` tests do.
+  discard rpc  # gate fires before any rpc-state read
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing requests parameter")
-
   if params[0].kind != JArray:
     raise newRpcError(RpcInvalidParams, "requests must be an array")
 
-  var results = newJArray()
-
-  for request in params[0]:
-    var result = %*{"success": false}
-
-    try:
-      if not request.hasKey("desc"):
-        result["error"] = %*{"code": RpcInvalidParams, "message": "missing 'desc' field"}
-        results.add(result)
-        continue
-
-      let descriptorStr = request["desc"].getStr()
-      let timestamp = if request.hasKey("timestamp"): request["timestamp"] else: %"now"
-      let rangeParam = if request.hasKey("range"): request["range"] else: newJNull()
-      let internal = if request.hasKey("internal"): request["internal"].getBool() else: false
-      let watchonly = if request.hasKey("watchonly"): request["watchonly"].getBool() else: true
-      let label = if request.hasKey("label"): request["label"].getStr() else: ""
-
-      # Parse and validate the descriptor
-      let desc = parseDescriptor(descriptorStr)
-      let info = getDescriptorInfo(descriptorStr)
-
-      # For now, just validate and return success
-      # Full implementation would add to wallet's watched descriptors
-      result["success"] = %true
-      result["warnings"] = %*[]
-
-    except DescriptorError as e:
-      result["error"] = %*{"code": RpcInvalidParams, "message": e.msg}
-    except CatchableError as e:
-      result["error"] = %*{"code": RpcInternalError, "message": e.msg}
-
-    results.add(result)
-
-  results
+  raise newRpcError(
+    RpcWalletError,
+    "importdescriptors not implemented in nimrod; descriptor-wallet " &
+      "support is not wired (no descriptor→address derivation, no " &
+      "wallet DB write, no blockchain rescan). The pre-fix handler " &
+      "returned success without persisting anything. Operator-managed " &
+      "key import via `importprivkey` / `importaddress` is the " &
+      "supported path until descriptor wallets are wired end-to-end."
+  )
 
 # ============================================================================
 # PSBT RPCs
