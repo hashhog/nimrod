@@ -465,6 +465,22 @@ proc readMessage*(peer: Peer): Future[P2PMessage] {.async.} =
   else:
     return await peer.readMessageV1()
 
+# BIP-159 NODE_NETWORK_LIMITED advertisement gate.  Set from `nimrod.nim`
+# at daemon startup based on `config.pruneTarget > 0`.  When true,
+# `sendVersion` ORs `NodeNetworkLimited` (1<<10) into the outbound
+# `services` bitfield so peers know we serve only the recent
+# `MIN_BLOCKS_TO_KEEP` (288) keep window.  Mirrors Core's `init.cpp`
+# `nLocalServices |= NODE_NETWORK_LIMITED` when `IsPruneMode()` is true.
+var pruneModeAdvertise: bool = false
+
+proc setPruneModeAdvertise*(enabled: bool) =
+  ## Toggle BIP-159 NODE_NETWORK_LIMITED advertisement.  Idempotent.
+  pruneModeAdvertise = enabled
+
+proc pruneModeAdvertiseEnabled*(): bool =
+  ## True when we should advertise NODE_NETWORK_LIMITED in the version handshake.
+  pruneModeAdvertise
+
 proc peerBloomFiltersEnabled*(): bool =
   ## Gate for advertising NODE_BLOOM (service bit 1<<2) and for accepting
   ## inbound BIP-35 `mempool` messages.  Mirrors Bitcoin Core's
@@ -492,6 +508,12 @@ proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
   var ourServices = NodeNetwork or NodeWitness
   if peerBloomFiltersEnabled():
     ourServices = ourServices or NodeBloom
+  # BIP-159: signal limited-archive serving when prune mode is enabled.
+  # Core advertises NODE_NETWORK alongside NODE_NETWORK_LIMITED in the
+  # auto-prune case (the node still has the recent-288 window), so we
+  # keep NODE_NETWORK set as well.
+  if pruneModeAdvertiseEnabled():
+    ourServices = ourServices or NodeNetworkLimited
   let msg = newVersionMsg(
     version = ProtocolVersion,
     services = ourServices,
