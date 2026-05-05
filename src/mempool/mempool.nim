@@ -739,11 +739,25 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
     if not stdRes.ok:
       return err(TxId, "non-standard tx (" & stdRes.reason & ")")
 
+  # IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
+  # Mempool holds txs for the *next* block, so check against tipHeight+1
+  # and the current chain MTP (MEDIAN_TIME_PAST of last 11 blocks).
+  # Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckFinalTxAtTip
+  # (validation.cpp:819).
+  let tipHeight = mp.chainState.bestHeight
+  let mtp = getMtpForHeight(mp.chainState.db, tipHeight)
+  if not isFinalTx(tx, uint32(tipHeight + 1), mtp):
+    return err(TxId, "non-final")
+
   # Check for conflicts with mempool transactions (Full RBF)
   let conflicts = mp.findConflicts(tx)
   var conflictsToRemove = initHashSet[TxId]()
 
-  # Check inputs exist (either in chainstate or mempool)
+  # Check inputs exist (either in chainstate or mempool).
+  # Also enforces coinbase maturity (Gap N3): a tx spending an immature
+  # coinbase output must not enter the mempool.
+  # Mirrors Bitcoin Core CheckTxInputs (consensus/tx_verify.cpp) called from
+  # MemPoolAccept::PreChecks.
   for input in tx.inputs:
     let utxo = mp.chainState.getUtxo(input.prevOut)
     if utxo.isNone:
@@ -754,6 +768,37 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
       let parentEntry = mp.entries[input.prevOut.txid]
       if int(input.prevOut.vout) >= parentEntry.tx.outputs.len:
         return err(TxId, "invalid output index for mempool parent")
+    else:
+      # Coinbase maturity check: a confirmed coinbase output must have
+      # at least COINBASE_MATURITY (100) confirmations before it can
+      # be spent in the mempool.
+      let entry = utxo.get()
+      if entry.isCoinbase:
+        let age = tipHeight - entry.height
+        if age < int32(mp.params.coinbaseMaturity):
+          return err(TxId, "coinbase output not yet mature: age=" & $age &
+                     " required=" & $mp.params.coinbaseMaturity)
+
+  # BIP-68 sequence locks: reject txs whose relative-locktime constraints
+  # are not satisfied at the next block.  Uses per-input UTXO heights from
+  # the chainstate.  Mirrors Bitcoin Core MemPoolAccept::PreChecks →
+  # CheckSequenceLocksAtTip (validation.cpp:887).
+  proc lookupForSeqLock(op: OutPoint): Option[UtxoEntry] =
+    let confirmed = mp.chainState.getUtxo(op)
+    if confirmed.isSome:
+      return confirmed
+    # Unconfirmed mempool parent: synthesize a UtxoEntry at tipHeight+1
+    # (same convention as Bitcoin Core's CalculateLockPointsAtTip).
+    if op.txid in mp.entries:
+      return some(UtxoEntry(output: TxOut(), height: int32(tipHeight + 1), isCoinbase: false))
+    none(UtxoEntry)
+
+  proc getMtpAt(h: int32): uint32 = getMtpForHeight(mp.chainState.db, h)
+
+  let seqResult = checkSequenceLocksForTx(
+    tx, lookupForSeqLock, tipHeight + 1, mtp, getMtpAt, mp.params)
+  if not seqResult.isOk:
+    return err(TxId, "non-BIP68-final: " & $seqResult.error)
 
   # Calculate fee
   let feeOpt = calculateFee(tx, mp)
