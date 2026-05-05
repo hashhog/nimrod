@@ -1249,3 +1249,142 @@ suite "dumptxoutset rollback":
     expect RpcError:
       discard rpc.handleDumpTxOutSet(%*[outPath, "garbage"])
     check not fileExists(outPath)
+
+# ----------------------------------------------------------------------------
+# loadtxoutset RPC gate (cross-impl audit 2026-05-05).
+#
+# loadtxoutset RPC is gated to refuse-and-direct-at-CLI in this build, per
+# the cross-impl audit at
+# CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md and the
+# rustoshi 1d0a325 / hotbuns e355cd7 reference fixes. Pre-fix the handler
+# called `loadSnapshot(...)` on the live `chainState`, which DOES persist
+# the new tip (so restart self-heals) but the running `state.syncManager`
+# was set up at boot and the RpcServer has no reference to it — so the
+# daemon kept requesting blocks from the old tip after the RPC returned.
+#
+# The gate must:
+#   1. Refuse with RpcInternalError (-32603).
+#   2. Direct the operator at the --load-snapshot CLI flag.
+#   3. NOT call loadSnapshot (no chainState side effects).
+# ----------------------------------------------------------------------------
+
+suite "loadtxoutset RPC gate":
+
+  proc mkRpc(cs: ChainState, params: ConsensusParams): RpcServer =
+    let mp = newMempool(cs, params)
+    let fe = newFeeEstimator()
+    newRpcServer(
+      port = 18443'u16,
+      chainState = cs,
+      mempool = mp,
+      peerManager = nil,
+      feeEstimator = fe,
+      params = params
+    )
+
+  test "refuses with RpcInternalError and points at the CLI flag":
+    let testDir = getTempDir() / "nimrod_loadtxo_gate_basic"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    let rpc = mkRpc(cs, regtest)
+
+    var caught = false
+    var code = 0
+    var msg = ""
+    try:
+      discard rpc.handleLoadTxOutSet(%*["/some/snapshot.dat"])
+    except RpcError as e:
+      caught = true
+      code = e.code
+      msg = e.msg
+    check caught
+    check code == RpcInternalError
+    check "--load-snapshot" in msg
+
+  test "gate fires before any file I/O":
+    # Path does not exist; pre-fix code would have called loadSnapshot which
+    # opens the file and would have surfaced an OSError-flavoured message.
+    # Post-fix gate must short-circuit to the gate refusal regardless.
+    let testDir = getTempDir() / "nimrod_loadtxo_gate_nofile"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    let rpc = mkRpc(cs, regtest)
+
+    let bogusPath = testDir / "does-not-exist.dat"
+    check not fileExists(bogusPath)
+
+    var code = 0
+    try:
+      discard rpc.handleLoadTxOutSet(%*[bogusPath])
+    except RpcError as e:
+      code = e.code
+    check code == RpcInternalError
+
+  test "does not mutate chainState across the refused RPC":
+    # Pre-fix: loadSnapshot would have updated cs.bestBlockHash and
+    # cs.bestHeight on a successful load. The refusal must leave both
+    # unchanged. We can't easily craft a "would-have-succeeded" snapshot here,
+    # but we can pin the no-side-effects guarantee: a refused RPC leaves
+    # cs.bestHeight at whatever it was before.
+    let testDir = getTempDir() / "nimrod_loadtxo_gate_no_mutate"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    let preHeight = cs.bestHeight
+    let preHash = cs.bestBlockHash
+    let rpc = mkRpc(cs, regtest)
+
+    expect RpcError:
+      discard rpc.handleLoadTxOutSet(%*["/some/snapshot.dat"])
+
+    check cs.bestHeight == preHeight
+    check cs.bestBlockHash == preHash
+
+  test "still rejects malformed params before the gate":
+    let testDir = getTempDir() / "nimrod_loadtxo_gate_bad_params"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    let rpc = mkRpc(cs, regtest)
+
+    # Empty params → RpcInvalidParams, NOT RpcInternalError.
+    var code = 0
+    try:
+      discard rpc.handleLoadTxOutSet(%*[])
+    except RpcError as e:
+      code = e.code
+    check code == RpcInvalidParams
+
+    # Empty path → RpcInvalidParams.
+    var code2 = 0
+    try:
+      discard rpc.handleLoadTxOutSet(%*[""])
+    except RpcError as e:
+      code2 = e.code
+    check code2 == RpcInvalidParams

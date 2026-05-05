@@ -3198,43 +3198,55 @@ proc handleDumpTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
   if haveNChainTx:
     result["nchaintx"] = %nchaintx
 
-proc handleLoadTxOutSet(rpc: RpcServer, params: JsonNode): JsonNode =
-  ## Load a UTXO snapshot from a file
-  ## Reference: Bitcoin Core rpc/blockchain.cpp loadtxoutset
+proc handleLoadTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Refused with `RpcInternalError`. The handler used to call
+  ## `loadSnapshot(path, rpc.chainState, ...)` which DOES update the
+  ## persisted `targetCs.bestBlockHash` / `targetCs.bestHeight` and
+  ## writes via `cdb.updateBestBlock`. So persistence was correct.
+  ## What it did NOT do: refresh the running `state.syncManager`,
+  ## because `RpcServer` (`src/rpc/server.nim:27-51`) has no
+  ## reference to `syncManager`. After the RPC returned, syncManager
+  ## kept the cached `chainTip` / `chainTipHeight` it picked up at
+  ## startup (lines 1419-1420 in `src/nimrod.nim`) and continued
+  ## requesting blocks from the old tip indefinitely.
   ##
-  ## Arguments:
-  ## 1. path (string, required) - Path to the snapshot file
+  ## Restart self-heals (the snapshot tip is on disk) but mid-run the
+  ## daemon stayed wedged with stale in-memory state. The CLI path
+  ## (`src/nimrod.nim:1362-1380`) calls `loadSnapshot(...)` BEFORE
+  ## `state.syncManager = newSyncManager(...)` is constructed, so
+  ## syncManager picks up the new tip naturally — that's the
+  ## structural reason the CLI works and the RPC doesn't.
   ##
-  ## Returns:
-  ## {
-  ##   "coins_loaded": n,       (numeric) Number of coins loaded
-  ##   "tip_hash": "...",       (string) Block hash at snapshot tip
-  ##   "base_height": n,        (numeric) Block height of snapshot
-  ##   "path": "..."            (string) Full path to the snapshot file
-  ## }
+  ## Wiring `state.syncManager` into `RpcServer` is more invasive
+  ## than the gate fix and out of scope here. Mirrors rustoshi
+  ## 1d0a325 / hotbuns e355cd7 / blockbrew + clearbit
+  ## (cross-impl wave 2026-05-05). Same JSON-RPC error code Bitcoin
+  ## Core uses in `bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset`
+  ## when `ActivateSnapshot` cannot proceed (`RPC_INTERNAL_ERROR` /
+  ## -32603).
   ##
-  ## Note: The snapshot must match a known assumeUTXO hash in chainparams.
-  ## After loading, background validation will verify the snapshot.
+  ## The gate fires before any file I/O so a refused call leaves the
+  ## datadir untouched.
+  ##
+  ## Cross-impl audit:
+  ## `CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md`.
 
+  # Validate parameter shape only; never call loadSnapshot.
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing path parameter")
-
   let path = params[0].getStr()
   if path == "":
     raise newRpcError(RpcInvalidParams, "path cannot be empty")
 
-  let res = loadSnapshot(
-    path, rpc.chainState, rpc.chainState.params, rpc.chainState.params.assumeutxoData
+  raise newRpcError(
+    RpcInternalError,
+    "loadtxoutset RPC is disabled in this build because the live daemon " &
+      "cannot atomically activate a UTXO snapshot once the header-sync " &
+      "and block-download components have started. Use the CLI flag " &
+      "--load-snapshot=<path> at startup instead — that path imports " &
+      "the snapshot, pins the chain tip, and writes the block index " &
+      "before any P2P/sync components are constructed."
   )
-  if not res.success:
-    raise newRpcError(RpcMiscError, "loadtxoutset failed: " & res.error)
-
-  result = %*{
-    "coins_loaded": res.coinsLoaded,
-    "tip_hash": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
-    "base_height": rpc.chainState.bestHeight,
-    "path": path
-  }
 
 proc handleGetTxOutSetInfo(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Return statistics about the UTXO set
