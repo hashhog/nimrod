@@ -1779,12 +1779,27 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
     }
   ]
 
+  # Build localservices bitfield from the same flags `sendVersion` uses,
+  # so the RPC view matches what we actually advertise on the wire (BIP-159
+  # parity: NODE_NETWORK_LIMITED appears here iff prune mode is on).
+  var localServicesBits: uint64 = NodeNetwork or NodeWitness
+  var localServicesNames = newJArray()
+  localServicesNames.add(%"NETWORK")
+  localServicesNames.add(%"WITNESS")
+  if peerBloomFiltersEnabled():
+    localServicesBits = localServicesBits or NodeBloom
+    localServicesNames.add(%"BLOOM")
+  if pruneModeAdvertiseEnabled():
+    localServicesBits = localServicesBits or NodeNetworkLimited
+    localServicesNames.add(%"NETWORK_LIMITED")
+  let localServicesHex = toHex(localServicesBits, 16).toLowerAscii()
+
   %*{
     "version": 210000,
     "subversion": "/nimrod:0.1.0/",
     "protocolversion": 70016,
-    "localservices": "0000000000000409",
-    "localservicesnames": ["NETWORK", "WITNESS", "NETWORK_LIMITED"],
+    "localservices": localServicesHex,
+    "localservicesnames": localServicesNames,
     "localrelay": true,
     "timeoffset": 0,
     "networkactive": true,

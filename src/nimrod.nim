@@ -589,11 +589,27 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     # (msg_type == NetMsgType::GETDATA, line 4128). Items we cannot satisfy
     # are aggregated into a single NOTFOUND so the peer can move on instead
     # of timing out.
+    #
+    # BIP-159 peer-served-blocks gate: when prune mode is on, refuse to
+    # serve blocks below tip - MIN_BLOCKS_TO_KEEP (288).  Mirrors Core's
+    # net_processing.cpp short-circuit; emits notfound rather than reading
+    # a possibly-deleted block file.
+    const MinBlocksToKeep: int32 = 288
+    let pruneActive = pruneModeAdvertiseEnabled()
+    var pruneHorizon: int32 = -1
+    if pruneActive and state.chainState != nil and
+        state.chainState.bestHeight > MinBlocksToKeep:
+      pruneHorizon = state.chainState.bestHeight - MinBlocksToKeep
     var notFound: seq[InvVector] = @[]
     var servedBlocks = 0
     var servedTxs = 0
     for item in msg.getData:
       if item.invType == invBlock or item.invType == invWitnessBlock:
+        if pruneHorizon >= 0:
+          let idxOpt = state.chainState.db.getBlockIndex(BlockHash(item.hash))
+          if idxOpt.isSome and idxOpt.get().height < pruneHorizon:
+            notFound.add(item)
+            continue
         let blockOpt = state.chainState.db.getBlock(BlockHash(item.hash))
         if blockOpt.isSome:
           let blkMsg = newBlockMsg(blockOpt.get())
@@ -1300,6 +1316,13 @@ proc startNode*(config: NimrodConfig) {.async.} =
   ## Start the node
   ## Init order: db -> chainstate -> mempool -> peermanager -> sync -> fee estimator -> RPC -> P2P
   let params = getConsensusParams(config)
+
+  # BIP-159: latch the NODE_NETWORK_LIMITED advertisement gate from the
+  # parsed `pruneTarget` so the version handshake correctly signals
+  # limited-archive serving when prune mode is enabled.  Mirrors Core's
+  # `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
+  # `IsPruneMode()` is true).
+  setPruneModeAdvertise(config.pruneTarget > 0)
 
   # Create data directory
   if not dirExists(config.dataDir):
