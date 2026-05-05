@@ -118,6 +118,9 @@ proc bip22String*(e: ValidationError): string =
   of veScriptVerifyFailed: "block-script-verify-flag-failed"
   of veDoubleSpend: "bad-txns-inputs-spent"
   of veBadTimestamp: "time-too-old"
+  # Coinbase maturity violation (consensus/tx_verify.cpp::CheckTxInputs).
+  # Core: state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase")
+  of veImmatureCoinbase: "bad-txns-premature-spend-of-coinbase"
   # Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
   of veNegativeOutput: "bad-txns-vout-negative"
   # Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
