@@ -483,9 +483,10 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   let headerBytes = serialize(b.header)
   let computedHash = doubleSha256(headerBytes)
 
-  # Get block index for height
+  # Get block index for height and chainwork
   let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
   let height = if idxOpt.isSome: idxOpt.get().height else: 0'i32
+  let chainworkHex = if idxOpt.isSome: toHex(idxOpt.get().totalWork) else: "0"
 
   var txids: seq[string]
   for tx in b.txs:
@@ -499,6 +500,7 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     "hash": reverseHex(toHex(computedHash)),
     "confirmations": rpc.chainState.bestHeight - height + 1,
     "size": serialize(b).len,
+    "strippedsize": serialize(b).len,
     "weight": calculateBlockWeight(b),
     "height": height,
     "version": b.header.version,
@@ -519,10 +521,26 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       byte((b.header.bits shr 16) and 0xff),
       byte((b.header.bits shr 24) and 0xff)
     ])),
+    "target": toHex(target),
     "difficulty": targetToDifficulty(target),
-    "chainwork": "0",
+    "chainwork": chainworkHex,
     "nTx": b.txs.len
   }
+
+  # Build coinbase_tx from first transaction's first input (Core 27+ field)
+  if b.txs.len > 0:
+    let coinbaseTx = b.txs[0]
+    var coinbaseTxObj = %*{
+      "version": coinbaseTx.version,
+      "locktime": coinbaseTx.locktime
+    }
+    if coinbaseTx.inputs.len > 0:
+      coinbaseTxObj["sequence"] = %coinbaseTx.inputs[0].sequence
+      coinbaseTxObj["coinbase"] = %toHex(coinbaseTx.inputs[0].scriptSig)
+      # Add witness if present
+      if coinbaseTx.witnesses.len > 0 and coinbaseTx.witnesses[0].len > 0:
+        coinbaseTxObj["witness"] = %toHex(coinbaseTx.witnesses[0][0])
+    response["coinbase_tx"] = coinbaseTxObj
 
   if height > 0:
     response["previousblockhash"] = %reverseHex(toHex(array[32, byte](b.header.prevBlock)))
@@ -2589,18 +2607,40 @@ proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
     b
   let target = bitsToTarget(bits)
   let difficulty = targetToDifficulty(target)
+  # Compact bits as 8-char big-endian hex (Core format)
+  let bitsHex = toHex(cast[array[4, byte]]([
+    byte((bits shr 24) and 0xff),
+    byte((bits shr 16) and 0xff),
+    byte((bits shr 8) and 0xff),
+    byte(bits and 0xff)
+  ]))
+  let targetHex = toHex(target)
   let chainName = case rpc.params.network
     of Mainnet:  "main"
     of Testnet3: "test"
     of Testnet4: "testnet4"
     of Regtest:  "regtest"
     of Signet:   "signet"
+  # next block uses same bits as tip (accurate except at adjustment boundaries)
+  let nextHeight = height + 1
   %*{
     "blocks": height,
+    "currentblocksize": 0,
+    "currentblockweight": 0,
+    "currentblocktx": 0,
+    "bits": bitsHex,
     "difficulty": difficulty,
+    "target": targetHex,
+    "blockmintxfee": 0.00001000,
     "networkhashps": 0.0,
     "pooledtx": rpc.mempool.count,
     "chain": chainName,
+    "next": {
+      "height": nextHeight,
+      "bits": bitsHex,
+      "difficulty": difficulty,
+      "target": targetHex
+    },
     "warnings": ""
   }
 
