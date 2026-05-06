@@ -77,11 +77,29 @@ type
     # Out-of-order block buffer (blocks received ahead of chainTip)
     receivedBlocks*: Table[int32, Block]  ## height -> block buffer
     requestedHashes*: HashSet[BlockHash]  ## hashes currently in-flight
+    # Per-peer counter of consecutive unconnecting-headers messages.
+    # Mirrors Bitcoin Core's `nUnconnectingHeaders` accounting in
+    # net_processing.cpp::ProcessHeadersMessage.  When the count exceeds
+    # MaxNumUnconnectingHeadersMsgs (=10), the peer is banned.  Reset to
+    # 0 on every successful connecting batch.  Pre-fix, nimrod called
+    # banPeer immediately on the first orphan, which is stricter than
+    # Core and discards honest peers caught in transient reorgs.  See
+    # CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+    # (Pattern B).
+    unconnectingHeaders*: Table[int64, int]  ## peerId -> count
 
 const
   MaxHeadersPerRequest* = 2000
   MaxBlocksInFlight* = 512
   SyncTimeoutSeconds* = 60
+
+  ## Bitcoin Core's MAX_NUM_UNCONNECTING_HEADERS_MSGS
+  ## (net_processing.cpp).  A peer that delivers more than this many
+  ## successive unconnecting-headers messages is disconnected and
+  ## banned.  Tolerates up to 10 transient unlinked batches before
+  ## taking action — matches Core, looser than the pre-fix immediate
+  ## banPeer behavior.
+  MaxNumUnconnectingHeadersMsgs* = 10
 
   # Block download constants
   DownloadWindow* = 1024            ## Sliding window size for block requests
@@ -448,6 +466,7 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     minimumChainWork: initUInt256(),  # Will be set from chainstate
     receivedBlocks: initTable[int32, Block](),
     requestedHashes: initHashSet[BlockHash](),
+    unconnectingHeaders: initTable[int64, int](),
     numVerifyWorkers: numVerifyWorkers
   )
 
@@ -777,12 +796,30 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
         let prevHashOpt = sm.headerChain.getHeader(firstHeader.prevBlock)
 
         if prevHashOpt.isNone:
-          # Headers don't connect to any known block
-          # Could be a fork from earlier or completely disconnected
-          warn "headers don't connect to our chain",
-               peer = $peer, prevBlock = $firstHeader.prevBlock
-          # For now, reject unconnected headers
-          sm.peerManager.misbehavingPeer(peer, 20, "unconnected headers")
+          # Headers don't connect to any known block.  Bitcoin Core
+          # (net_processing.cpp::ProcessHeadersMessage) tolerates up to
+          # MaxNumUnconnectingHeadersMsgs=10 successive unconnecting
+          # messages before banning.  Pre-fix, nimrod immediately
+          # called misbehavingPeer(20)+ban after a few hits, dropping
+          # honest peers caught in transient reorgs.  See
+          # CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+          # (Pattern B).
+          let pid = getPeerId(peer)
+          sm.unconnectingHeaders[pid] = sm.unconnectingHeaders.getOrDefault(pid, 0) + 1
+          let count = sm.unconnectingHeaders[pid]
+          if count > MaxNumUnconnectingHeadersMsgs:
+            warn "peer exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS, banning",
+                 peer = $peer, count = count, max = MaxNumUnconnectingHeadersMsgs
+            sm.peerManager.misbehavingPeer(peer, 20, "too many unconnecting headers")
+            sm.unconnectingHeaders.del(pid)
+            return
+          # Under threshold: do NOT ban.  Re-issue getheaders so the
+          # peer can find a common ancestor (Core's
+          # FindForkInGlobalIndex behavior).
+          info "unconnecting headers from peer, re-requesting",
+               peer = $peer, count = count, max = MaxNumUnconnectingHeadersMsgs,
+               prevBlock = $firstHeader.prevBlock
+          await sm.requestHeaders(peer)
           return
 
         # Headers branch from an earlier point - check work threshold
@@ -878,6 +915,12 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
   info "processed headers", accepted = accepted,
        tipHeight = sm.headerChain.tipHeight,
        totalHeaders = headers.len
+
+  # Successful connecting batch resets the unconnecting-headers counter
+  # for this peer (mirrors Core's nUnconnectingHeaders = 0 in the
+  # success path of ProcessHeadersMessage).
+  if accepted > 0:
+    sm.unconnectingHeaders.del(getPeerId(peer))
 
   # If we received 2000 headers, request more
   if headers.len >= MaxHeadersPerRequest:
