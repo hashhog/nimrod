@@ -207,14 +207,18 @@ suite "HeadersSyncState Transitions":
 
     check state.getState() == Presync
 
-    # Create a header that connects to genesis
+    # Create a header that connects to genesis.
+    # Note: regtest powLimit is 0x207fffff, so almost any nonce passes
+    # the per-header PoW gate, but nonce=0 happens to land just above
+    # the target for the all-zero merkle root, so use nonce=1 (verified
+    # to satisfy checkProofOfWork in this configuration).
     let header = BlockHeader(
       version: 1,
       prevBlock: genesisHash,
       merkleRoot: default(array[32, byte]),
       timestamp: genesis.header.timestamp + 600,
       bits: genesis.header.bits,
-      nonce: 0
+      nonce: 1
     )
 
     let result = state.processNextHeaders(@[header], false)
@@ -426,3 +430,79 @@ suite "Anti-DoS Integration":
     # Just verify both have initialized salts
     check state1.hasherSalt != 0 or state2.hasherSalt != 0 or
           state1.commitOffset >= 0 or state2.commitOffset >= 0
+
+suite "HeadersSyncState Per-Header PoW Gate (HSync wave Job 1)":
+  ## Defense-in-depth: presync must reject headers whose hash does not
+  ## meet the claimed `bits` target.  Without this gate, a peer can fabricate
+  ## an arbitrary commitment trail and exhaust the work-accumulator /
+  ## commitment-deque slots before the main acceptance path catches it.
+  ## Mirrors bitcoin-core/src/validation.cpp::CheckProofOfWork called
+  ## inside HeadersSyncState::ProcessNextHeaders.
+
+  test "presync rejects header whose hash exceeds claimed target":
+    let params = regtestParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    let state = newHeadersSyncState(
+      peerId = 1,
+      params = params,
+      chainStartHeight = 0,
+      chainStartHash = genesisHash,
+      chainStartBits = genesis.header.bits,
+      chainStartWork = initUInt256(1),
+      minimumRequiredWork = initUInt256(2)
+    )
+
+    # Forge a header with mainnet-like difficulty (0x1d00ffff).  Its target
+    # is *much* tighter than regtest's 0x207fffff powLimit, so an all-zero
+    # merkle-root header with nonce 0 will not satisfy it.  The peer
+    # nonetheless claims it does — exactly the attack we're guarding against.
+    let cheatHeader = BlockHeader(
+      version: 1,
+      prevBlock: genesisHash,
+      merkleRoot: default(array[32, byte]),
+      timestamp: genesis.header.timestamp + 600,
+      bits: 0x1d00ffff'u32,                  # claimed mainnet-tight target
+      nonce: 0
+    )
+
+    let result = state.processNextHeaders(@[cheatHeader], false)
+    check not result.success
+
+  test "presync accepts header whose hash meets claimed target":
+    # The other side of the gate: a regtest header that *does* satisfy
+    # 0x207fffff must still flow through validateAndProcessSingleHeader.
+    # If the gate over-rejects, presync collapses for honest peers.
+    let params = regtestParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    let state = newHeadersSyncState(
+      peerId = 1,
+      params = params,
+      chainStartHeight = 0,
+      chainStartHash = genesisHash,
+      chainStartBits = genesis.header.bits,
+      chainStartWork = initUInt256(1),
+      minimumRequiredWork = initUInt256(uint64.high)  # stay in presync
+    )
+
+    # nonce=1 satisfies regtest powLimit for an all-zero merkle root header
+    # at this prevBlock + timestamp (verified offline against
+    # checkProofOfWork).  See validation.cpp::CheckProofOfWork — regtest
+    # 0x207fffff is ~2^256-1 so almost any hash qualifies.
+    let goodHeader = BlockHeader(
+      version: 1,
+      prevBlock: genesisHash,
+      merkleRoot: default(array[32, byte]),
+      timestamp: genesis.header.timestamp + 600,
+      bits: genesis.header.bits,
+      nonce: 1
+    )
+
+    let result = state.processNextHeaders(@[goodHeader], false)
+    check result.success
+    check state.getPresyncHeight() == 1

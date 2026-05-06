@@ -236,6 +236,19 @@ proc validateAndProcessSingleHeader(state: HeadersSyncState, header: BlockHeader
   let nextHeight = state.currentHeight + 1
   let powParams = toPowParams(state.params)
 
+  # Per-header PoW gate (defense-in-depth, mirrors Bitcoin Core's
+  # CheckProofOfWork called inside HeadersSyncState::ProcessNextHeaders →
+  # ValidateAndProcessSingleHeader; see validation.cpp::CheckProofOfWork).
+  # Without this, an attacker can fabricate the cheap commitment-trail with
+  # bogus headers whose hash does not meet the claimed `bits` target —
+  # the main acceptance path catches it later, but presync state machinery
+  # (commitment deque, work accumulator) advances meanwhile.
+  let headerHashForPow = hashHeader(header)
+  if not checkProofOfWork(headerHashForPow, header.bits, powParams):
+    debug "invalid proof of work in presync",
+          peer = state.peerId, height = nextHeight
+    return false
+
   # Validate difficulty transition
   if not permittedDifficultyTransition(powParams, int32(nextHeight),
                                        state.lastHeaderReceived.bits, header.bits):
@@ -245,8 +258,7 @@ proc validateAndProcessSingleHeader(state: HeadersSyncState, header: BlockHeader
 
   # Store commitment if at commitment height
   if state.shouldStoreCommitment(nextHeight):
-    let headerHash = hashHeader(header)
-    let commitment = state.computeCommitmentBit(headerHash)
+    let commitment = state.computeCommitmentBit(headerHashForPow)
     state.headerCommitments.addLast(commitment)
 
     if uint64(state.headerCommitments.len) > state.maxCommitments:
@@ -259,7 +271,7 @@ proc validateAndProcessSingleHeader(state: HeadersSyncState, header: BlockHeader
 
   # Update state
   state.lastHeaderReceived = header
-  state.lastHeaderHash = hashHeader(header)
+  state.lastHeaderHash = headerHashForPow
   state.currentHeight = nextHeight
 
   true

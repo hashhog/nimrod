@@ -4,8 +4,10 @@
 import std/os
 import unittest2
 import ../src/network/peer
+import ../src/network/peermanager
 import ../src/network/messages
 import ../src/consensus/params
+import ../src/primitives/types
 
 suite "peer creation":
   test "newPeer creates peer with correct initial state":
@@ -178,6 +180,50 @@ suite "NODE_BLOOM advertisement gate (BIP-35)":
       putEnv("NIMROD_PEER_BLOOM_FILTERS", v)
       check peerBloomFiltersEnabled() == true
     delEnv("NIMROD_PEER_BLOOM_FILTERS")
+
+suite "BIP-130 sendheaders block announcement (HSync wave Job 2)":
+  ## broadcastBlock must consult the peer's `sendHeaders` flag.  Pre-fix
+  ## nimrod tracked the flag (set on receipt of the `sendheaders` message
+  ## in peer.nim) but never branched on it — every announce went out as
+  ## `inv`, costing a round-trip per block on every peer that opted in.
+  ## Mirrors camlcoin lib/peer_manager.ml::announce_block.
+
+  test "peer with sendHeaders=true receives headers announcement":
+    let header = BlockHeader(
+      version: 1,
+      prevBlock: BlockHash(default(array[32, byte])),
+      merkleRoot: default(array[32, byte]),
+      timestamp: 1700000000,
+      bits: 0x207fffff'u32,
+      nonce: 42
+    )
+    var blockHash: array[32, byte]
+    blockHash[0] = 0xab
+
+    let msg = selectBlockAnnouncement(header, blockHash, true)
+    check msg.kind == mkHeaders
+    check msg.headers.len == 1
+    check msg.headers[0].nonce == 42'u32
+    check msg.headers[0].timestamp == 1700000000'u32
+
+  test "peer with sendHeaders=false receives inv announcement":
+    let header = BlockHeader(
+      version: 1,
+      prevBlock: BlockHash(default(array[32, byte])),
+      merkleRoot: default(array[32, byte]),
+      timestamp: 1700000000,
+      bits: 0x207fffff'u32,
+      nonce: 42
+    )
+    var blockHash: array[32, byte]
+    blockHash[0] = 0xab
+    blockHash[1] = 0xcd
+
+    let msg = selectBlockAnnouncement(header, blockHash, false)
+    check msg.kind == mkInv
+    check msg.invItems.len == 1
+    check msg.invItems[0].invType == invBlock
+    check msg.invItems[0].hash == blockHash
 
 when isMainModule:
   echo "Running peer tests..."
