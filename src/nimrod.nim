@@ -9,7 +9,7 @@ import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
 import ./storage/[db, chainstate, snapshot]
 import ./network/[peer, peermanager, sync, messages]
-import ./mempool/[mempool, persist]
+import ./mempool/[mempool, persist, orphan]
 import ./mining/fees
 import ./rpc/server
 import ./rpc/rpc_thread
@@ -89,6 +89,11 @@ type
     crypto*: CryptoEngine
     running*: bool
     recentlyRejected*: HashSet[TxId]  ## Recently-rejected tx filter, cleared on new block
+    orphanPool*: OrphanPool           ## Tx orphan pool: holds txs whose
+                                       ## parents we haven't seen yet, for
+                                       ## ~20 min, capped at 100 entries
+                                       ## globally and 25 per peer.  Mirrors
+                                       ## bitcoin-core/src/node/txorphanage.
 
 # Global for signal handling
 var globalNodeState*: NodeState = nil
@@ -543,16 +548,29 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
       # Remove confirmed transactions from mempool
       {.gcsafe.}:
         state.mempool.removeForBlock(msg.blk)
+        # Drop orphans that were confirmed (or invalidated by double-spend)
+        # in the new block.  Mirrors EraseForBlock in Core's txorphanage.
+        if state.orphanPool != nil:
+          discard state.orphanPool.removeForBlock(msg.blk)
       # Clear recently-rejected filter -- rejection reasons may no longer apply
       state.recentlyRejected.clear()
 
   of mkTx:
     var accepted = false
+    var missingInputs = false
     let txid = msg.tx.txid()
+    let orphanPeer: OrphanPeerId = (peer.address, peer.port)
     {.gcsafe.}:
       try:
         let txResult = state.mempool.acceptTransaction(msg.tx, state.crypto)
         accepted = txResult.isOk
+        if not accepted:
+          # acceptTransaction returns "input not found: ..." when at least
+          # one input has no UTXO and no mempool parent.  Treat that as a
+          # missing-parent (orphan) signal — every other rejection reason
+          # is a hard fail (consensus, policy, RBF, ...) and the tx should
+          # NOT enter the orphan pool.
+          missingInputs = txResult.error.startsWith("input not found")
       except CatchableError:
         discard
       except Exception:
@@ -560,6 +578,40 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     if accepted:
       # Relay to peers
       asyncSpawn state.peerManager.broadcastTx(msg.tx)
+      # Re-feed any orphans that were waiting on this tx as a parent.
+      # Each child that resolves can in turn unblock its own children, so
+      # we loop on a worklist until it drains.  Resolution failures are
+      # recorded in recentlyRejected exactly like top-level failures.
+      if state.orphanPool != nil:
+        var work = @[txid]
+        var iterations = 0
+        while work.len > 0 and iterations < 64:
+          inc iterations
+          let parent = work.pop()
+          let pending = state.orphanPool.takeChildrenOf(parent)
+          for child in pending:
+            var childOk = false
+            {.gcsafe.}:
+              try:
+                let r = state.mempool.acceptTransaction(child.tx, state.crypto)
+                childOk = r.isOk
+              except CatchableError:
+                discard
+              except Exception:
+                discard
+            if childOk:
+              asyncSpawn state.peerManager.broadcastTx(child.tx)
+              work.add(child.txid)
+            else:
+              if state.recentlyRejected.len < 50_000:
+                state.recentlyRejected.incl(child.txid)
+    elif missingInputs:
+      # Hold the orphan briefly in case the parent arrives.  Capped pool
+      # mirrors Core (100 txs / 100KB / peer cap).  Note we do NOT add to
+      # recentlyRejected here — that would block re-requesting from a
+      # subsequent peer once we see the parent.
+      if state.orphanPool != nil:
+        discard state.orphanPool.addOrphan(msg.tx, orphanPeer)
     else:
       # Track rejection to avoid re-requesting
       if state.recentlyRejected.len < 50_000:
@@ -1351,7 +1403,8 @@ proc startNode*(config: NimrodConfig) {.async.} =
     config: config,
     params: params,
     running: true,
-    recentlyRejected: initHashSet[TxId]()
+    recentlyRejected: initHashSet[TxId](),
+    orphanPool: newOrphanPool()
   )
   {.gcsafe.}:
     globalNodeState = state
