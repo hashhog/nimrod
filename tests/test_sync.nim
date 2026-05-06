@@ -357,3 +357,56 @@ suite "Anti-DoS Header Sync Integration":
     check lowWork < threshold
     check highWork >= threshold
     check not (lowWork >= threshold)
+
+# Core parity: per-peer unconnecting-headers counter must tolerate up
+# to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10 successive unlinked batches
+# before triggering a ban.  Mirrors Bitcoin Core's nUnconnectingHeaders
+# accounting in net_processing.cpp::ProcessHeadersMessage.  Pre-fix,
+# nimrod called misbehavingPeer(20) on the first orphan; see
+# CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+# (Pattern B).  Driving the SyncManager.handleHeaders path end-to-end
+# would require mocking PeerManager + Peer; this test exercises the
+# table-arithmetic invariants directly.
+suite "Unconnecting headers counter":
+  test "MaxNumUnconnectingHeadersMsgs constant is 10 (Core parity)":
+    check MaxNumUnconnectingHeadersMsgs == 10
+
+  test "counter increments and rolls over at threshold":
+    var unconnecting = initTable[int64, int]()
+    let pid: int64 = 42
+    # 10 successive bumps stay at-or-below threshold.
+    for i in 1 .. MaxNumUnconnectingHeadersMsgs:
+      unconnecting[pid] = unconnecting.getOrDefault(pid, 0) + 1
+      check unconnecting[pid] == i
+      check unconnecting[pid] <= MaxNumUnconnectingHeadersMsgs
+    # 11th bump exceeds — caller must ban.
+    unconnecting[pid] = unconnecting.getOrDefault(pid, 0) + 1
+    check unconnecting[pid] > MaxNumUnconnectingHeadersMsgs
+
+  test "counter resets on a successful connecting batch":
+    var unconnecting = initTable[int64, int]()
+    let pid: int64 = 7
+    # Saturate near threshold.
+    for _ in 1 .. (MaxNumUnconnectingHeadersMsgs - 1):
+      unconnecting[pid] = unconnecting.getOrDefault(pid, 0) + 1
+    check unconnecting[pid] == MaxNumUnconnectingHeadersMsgs - 1
+    # On a successful connecting batch handleHeaders deletes the entry.
+    unconnecting.del(pid)
+    check unconnecting.getOrDefault(pid, 0) == 0
+    # Subsequent unconnecting message starts fresh.
+    unconnecting[pid] = unconnecting.getOrDefault(pid, 0) + 1
+    check unconnecting[pid] == 1
+
+  test "per-peer counters are independent":
+    var unconnecting = initTable[int64, int]()
+    let pidA: int64 = 1
+    let pidB: int64 = 2
+    for _ in 1 .. MaxNumUnconnectingHeadersMsgs:
+      unconnecting[pidA] = unconnecting.getOrDefault(pidA, 0) + 1
+    # A is at the threshold, B has never been bumped.
+    check unconnecting[pidA] == MaxNumUnconnectingHeadersMsgs
+    check unconnecting.getOrDefault(pidB, 0) == 0
+    # B's first orphan is independent of A.
+    unconnecting[pidB] = unconnecting.getOrDefault(pidB, 0) + 1
+    check unconnecting[pidB] == 1
+    check unconnecting[pidA] == MaxNumUnconnectingHeadersMsgs
