@@ -672,3 +672,224 @@ suite "ChainState cache management":
 
       cs.close()
 ## IBD durability tests moved to test_ibd_durability.nim
+
+# ============================================================================
+# Side-branch acceptance tests (Pattern Y closure 2026-05-05)
+#
+# nimrod's pre-fix `handleSubmitBlock` side-branch arm computed a
+# hypothetical newTotalWork and returned "inconclusive" but never persisted
+# the side-branch block.  That made the corpus entry
+# `regression/reorg-via-submitblock` fail in PARTIAL form (B1 OK but B2
+# rejected with "rejected"): B1's parent (a base-chain block) was still in
+# the active block_index, so B1 returned "inconclusive"; but because B1
+# itself was never stored, B2 — whose parent IS B1 — fell into the
+# "previous block truly unknown" path and was rejected outright.  The fix
+# adds (a) `putBlockIndexHashOnly` to the storage layer and (b) two new
+# behaviours in the side-branch arm: side-branch blocks are persisted with
+# cumulative chain_work, and a strictly heavier side-branch triggers a
+# reorg via the existing `handleReorg`.  Counterpart to Bitcoin Core's
+# `BlockManager::AcceptBlock` (validation.cpp), which always writes a
+# CBlockIndex regardless of which chain the block lives on.
+# Reference fix in rustoshi: 68a422b.
+# ============================================================================
+
+suite "Side-branch block index persistence (Pattern Y storage layer)":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "putBlockIndexHashOnly stores hash entry but preserves height->hash":
+    # Build the database that submit_block's side-branch arm uses for
+    # parent lookup.  Active chain: G -> A1.  Side-branch: B1 sharing
+    # parent G.  After putBlockIndexHashOnly, both A1 and B1 should be
+    # findable by hash, but the height=1 -> hash mapping must STILL point
+    # at A1.  This is the exact invariant submit_block needs so that B2
+    # (parent = B1) can find its parent in a future call.
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    let blockA1 = makeSimpleBlock(genesisHash, 1, extra = 0xAA)
+    discard cs.connectBlock(blockA1, 1)
+    let hashA1 = getBlockHash(blockA1)
+    check cs.bestHeight == 1
+    check cs.bestBlockHash == hashA1
+
+    # Build a side-branch B1 sharing parent G.  Its hash differs from A1
+    # because we set a different `extra` byte in the coinbase.
+    let blockB1 = makeSimpleBlock(genesisHash, 1, extra = 0xBB)
+    let hashB1 = getBlockHash(blockB1)
+    check hashB1 != hashA1
+
+    # Persist B1 via the side-branch helper (mirrors what handleSubmitBlock's
+    # else-arm now does).
+    cs.db.storeBlock(blockB1)
+    let sideIdx = BlockIndex(
+      hash: hashB1,
+      height: 1,
+      status: bsValidated,
+      prevHash: blockB1.header.prevBlock,
+      header: blockB1.header,
+      totalWork: cs.totalWork,  # value doesn't matter for this test
+      undoPos: FlatFilePos(fileNum: -1, pos: -1),
+      failureFlags: BLOCK_NO_FAILURE,
+      sequenceId: 0
+    )
+    cs.db.putBlockIndexHashOnly(sideIdx)
+
+    # B1 must be findable by hash (side-branch parent-lookup invariant).
+    let b1IdxOpt = cs.db.getBlockIndex(hashB1)
+    check b1IdxOpt.isSome
+    check b1IdxOpt.get().hash == hashB1
+
+    # A1 must STILL be findable by hash.
+    let a1IdxOpt = cs.db.getBlockIndex(hashA1)
+    check a1IdxOpt.isSome
+
+    # Active chain ownership of height=1 must be unchanged: getBlockHashByHeight
+    # still points at A1.  Pre-fix `putBlockIndex` (which we deliberately did
+    # NOT call here) would have CLOBBERED this to point at B1.
+    let activeAt1 = cs.db.getBlockHashByHeight(1)
+    check activeAt1.isSome
+    check activeAt1.get() == hashA1
+
+    # B1's block body is also persisted (storeBlock).
+    let b1BlockOpt = cs.db.getBlock(hashB1)
+    check b1BlockOpt.isSome
+
+    cs.close()
+
+  test "side-branch chain B1->B2 — child can find parent in index":
+    # The exact failure mode Pattern Y exhibited in nimrod: even when B1
+    # is accepted as a side-branch and returns "inconclusive", the storage
+    # invariant must hold so that a follow-up B2 (parent = B1) can look up
+    # B1 via cs.db.getBlockIndex.  Pre-fix this lookup returned None.
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    let blockA1 = makeSimpleBlock(genesisHash, 1, extra = 0xAA)
+    discard cs.connectBlock(blockA1, 1)
+    let blockA2 = makeSimpleBlock(getBlockHash(blockA1), 2, extra = 0xAA)
+    discard cs.connectBlock(blockA2, 2)
+    check cs.bestHeight == 2
+
+    # Side-branch B1 (parent = G), persisted as side-branch.
+    let blockB1 = makeSimpleBlock(genesisHash, 1, extra = 0xBB)
+    let hashB1 = getBlockHash(blockB1)
+    cs.db.storeBlock(blockB1)
+    let b1Idx = BlockIndex(
+      hash: hashB1,
+      height: 1,
+      status: bsValidated,
+      prevHash: blockB1.header.prevBlock,
+      header: blockB1.header,
+      totalWork: cs.totalWork,
+      undoPos: FlatFilePos(fileNum: -1, pos: -1),
+      failureFlags: BLOCK_NO_FAILURE,
+      sequenceId: 0
+    )
+    cs.db.putBlockIndexHashOnly(b1Idx)
+
+    # Now build B2 (parent = B1).  Pre-fix cs.db.getBlockIndex(hashB1) was
+    # None — exactly the symptom the corpus entry caught.
+    let blockB2 = makeSimpleBlock(hashB1, 2, extra = 0xBB)
+    let hashB2 = getBlockHash(blockB2)
+    let parentLookup = cs.db.getBlockIndex(blockB2.header.prevBlock)
+    check parentLookup.isSome  # would be None pre-fix
+    check parentLookup.get().hash == hashB1
+    check parentLookup.get().height == 1
+
+    # And the active chain's tip is still A2.
+    check cs.bestHeight == 2
+
+    cs.close()
+
+suite "Reorg via side-branch extension (Pattern Y end-to-end)":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "heavier 3-block side-branch overtakes 2-block active chain":
+    # Mirrors the full corpus scenario `regression/reorg-via-submitblock`:
+    # active chain G->A1->A2 (h=2); submit B1, B2, B3 as a competing chain
+    # rooted at G; expect tip to flip to B3 with the displaced A blocks
+    # remaining findable in the block index.
+    #
+    # We exercise the same handleReorg call the new server.nim side-branch
+    # arm performs once newTotalWork > cs.totalWork.  The block-index
+    # plumbing (putBlockIndexHashOnly) is what makes the per-block parent
+    # lookups inside that arm succeed in the first place — verified above.
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    let blockA1 = makeSimpleBlock(genesisHash, 1, extra = 0xAA)
+    discard cs.connectBlock(blockA1, 1)
+    let blockA2 = makeSimpleBlock(getBlockHash(blockA1), 2, extra = 0xAA)
+    discard cs.connectBlock(blockA2, 2)
+    let coinbaseA1 = blockA1.txs[0].txid()
+    let coinbaseA2 = blockA2.txs[0].txid()
+    check cs.bestHeight == 2
+
+    # Build the heavier B-chain (3 blocks, all rooted at genesis).  Match
+    # the persistence pattern submit_block's side-branch arm uses: store
+    # each block + a hash-only block_index entry.
+    let blockB1 = makeSimpleBlock(genesisHash, 1, extra = 0xBB)
+    let blockB2 = makeSimpleBlock(getBlockHash(blockB1), 2, extra = 0xBB)
+    let blockB3 = makeSimpleBlock(getBlockHash(blockB2), 3, extra = 0xBB)
+
+    for blk in [blockB1, blockB2, blockB3]:
+      let h = getBlockHash(blk)
+      cs.db.storeBlock(blk)
+      let idx = BlockIndex(
+        hash: h,
+        height: cs.bestHeight + 1,  # placeholder; only matters for replay
+        status: bsValidated,
+        prevHash: blk.header.prevBlock,
+        header: blk.header,
+        totalWork: cs.totalWork,
+        undoPos: FlatFilePos(fileNum: -1, pos: -1),
+        failureFlags: BLOCK_NO_FAILURE,
+        sequenceId: 0
+      )
+      cs.db.putBlockIndexHashOnly(idx)
+
+    # Reorg from active tip (A2) back to genesis, then connect B1->B2->B3.
+    let newChain = @[blockB1, blockB2, blockB3]
+    let reorgRes = cs.handleReorg(genesisHash, newChain)
+    check reorgRes.isOk
+    check cs.bestHeight == 3
+    check cs.bestBlockHash == getBlockHash(blockB3)
+
+    # Chain B coinbases are now in UTXO; chain A coinbases are gone.
+    check cs.getUtxo(OutPoint(txid: blockB1.txs[0].txid(), vout: 0)).isSome
+    check cs.getUtxo(OutPoint(txid: blockB2.txs[0].txid(), vout: 0)).isSome
+    check cs.getUtxo(OutPoint(txid: blockB3.txs[0].txid(), vout: 0)).isSome
+    check cs.getUtxo(OutPoint(txid: coinbaseA1, vout: 0)).isNone
+    check cs.getUtxo(OutPoint(txid: coinbaseA2, vout: 0)).isNone
+
+    # The displaced A-chain blocks are still findable in the block_index
+    # (BlockManager::AcceptBlock parity — never deletes a known block).
+    # connectBlock for A1/A2 wrote both hash-keyed and height-keyed entries;
+    # the height-keyed one for h=1 has now been overwritten by B1 (correct,
+    # height index follows active chain), but the hash-keyed entries
+    # survive, so reconsiderblock / getblockheader can still find them.
+    check cs.db.getBlockIndex(getBlockHash(blockA1)).isSome
+    check cs.db.getBlockIndex(getBlockHash(blockA2)).isSome
+    # And block bodies are still on disk.
+    check cs.db.getBlock(getBlockHash(blockA1)).isSome
+    check cs.db.getBlock(getBlockHash(blockA2)).isSome
+
+    cs.close()
+

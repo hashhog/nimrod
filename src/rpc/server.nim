@@ -11,7 +11,7 @@ import ../consensus/[params, validation, chain, versionbits]
 import ../storage/[chainstate, blockstore, snapshot]
 import ../mempool/[mempool, package, persist]
 import ../crypto/[hashing, secp256k1, address, signmessage]
-import ../network/[peer, peermanager, banman]
+import ../network/[peer, peermanager, banman, messages]
 import ../mining/[fees, blocktemplate]
 import ../wallet/wallet
 import ../wallet/descriptor
@@ -2123,20 +2123,30 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       newJNull()  # null = success per BIP-22
 
     else:
-      # prevhash does not match current tip.
-      # "inconclusive" per BIP-22: accepted but not yet known to be on best chain.
+      # prevhash does not match current tip — this is a side-branch block.
+      # Mirrors Bitcoin Core's `BlockManager::AcceptBlock` (validation.cpp):
+      # every accepted block, whether on the active chain or a side-branch,
+      # gets a CBlockIndex entry with cumulative chain_work and BLOCK_HAVE_DATA.
+      # Storage and best-chain selection are decoupled — without this, the
+      # block_index lookup below for B2 (parent = B1 on a side-branch) would
+      # return None and reject with "rejected" even though the parent is on
+      # disk. Pattern Y bug surfaced by the
+      # `regression/reorg-via-submitblock` corpus entry on 2026-05-05; partial
+      # form (B1 OK, B2 rejected) per
+      # CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md.
       let prevIdxOpt = cs.db.getBlockIndex(prevHash)
       if prevIdxOpt.isNone:
         # Previous block truly unknown — "rejected" is closest BIP-22 token.
         return %"rejected"
 
-      # Known parent but not extending tip — only accept if more total work
-      # Calculate what the new chain's total work would be
       let prevIdx = prevIdxOpt.get()
       let headerBytes = serialize(blk.header)
-      let blockHash = doubleSha256(headerBytes)
+      let blockHash = BlockHash(doubleSha256(headerBytes))
+      let newHeight = prevIdx.height + 1
 
-      # Compute work for this block from its nBits target
+      # Compute work for this block from its nBits target. Mirrors the
+      # `calculateBlockWork` helper in chainstate.nim (file-private there;
+      # inlined here to avoid name-collision with network/sync.nim's `addWork`).
       let target = compactToTarget(blk.header.bits)
       var highestBit = 0
       for i in countdown(31, 0):
@@ -2155,8 +2165,10 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         let bitPos = workBit mod 8
         if bytePos < 32:
           blockWork[bytePos] = byte(1 shl bitPos)
+      else:
+        blockWork[0] = 1  # minimum work
 
-      # newTotalWork = prevIdx.totalWork + blockWork
+      # newTotalWork = prevIdx.totalWork + blockWork  (256-bit LE add)
       var newTotalWork = prevIdx.totalWork
       var carry: uint32 = 0
       for i in 0 ..< 32:
@@ -2164,13 +2176,101 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         newTotalWork[i] = byte(sum and 0xff)
         carry = sum shr 8
 
-      # Block is on a fork with same or less work — "inconclusive" per BIP-22.
+      # Persist the side-branch block: body + block-index entry. We deliberately
+      # do NOT update the height -> hash mapping (that belongs to the active
+      # chain) and we do NOT touch the UTXO set yet (that happens during reorg).
+      # Use a hash-only block-index put so the active chain's height index
+      # survives. status = bsValidated mirrors what `connectBlock` writes for
+      # happy-path acceptance; on a future reorg, the block goes through
+      # `connectBlock` again which updates undo-pos + retains validity.
+      cs.db.storeBlock(blk)
+      let sideIdx = BlockIndex(
+        hash: blockHash,
+        height: newHeight,
+        status: bsValidated,
+        prevHash: blk.header.prevBlock,
+        header: blk.header,
+        totalWork: newTotalWork,
+        undoPos: FlatFilePos(fileNum: -1, pos: -1),
+        failureFlags: BLOCK_NO_FAILURE,
+        sequenceId: 0
+      )
+      cs.db.putBlockIndexHashOnly(sideIdx)
+
+      # Block is on a fork with same or less work — accepted as side-branch
+      # per BIP-22 ("inconclusive": accepted but not yet known to be on best
+      # chain).
       if compareWork256(newTotalWork, cs.totalWork) <= 0:
         return %"inconclusive"
 
-      # New chain has more work — would need reorg. For submitblock, reject
-      # blocks that require complex reorgs; P2P sync handles those.
-      return %"inconclusive"
+      # Side-branch has STRICTLY MORE WORK than the active chain. Reorg.
+      # 1. Walk back from the new tip's parent collecting blocks until we hit
+      #    a block hash that the active chain owns at that height — that is
+      #    the fork point.
+      # 2. Build the new-chain block list (fork-point exclusive .. new tip
+      #    inclusive).
+      # 3. Hand off to `handleReorg`, which disconnects active-chain blocks
+      #    back to the fork point and connects the new chain via
+      #    `connectBlock` (refreshing UTXO + undo-files for each block).
+      var newChainBlocks: seq[Block] = @[blk]
+      var walkHash = blk.header.prevBlock
+      var walkHeight = prevIdx.height
+      var forkPoint: BlockHash = BlockHash(default(array[32, byte]))
+      var foundFork = false
+      while walkHeight >= 0:
+        let activeAtHeight = cs.db.getBlockHashByHeight(walkHeight)
+        if activeAtHeight.isSome and activeAtHeight.get() == walkHash:
+          forkPoint = walkHash
+          foundFork = true
+          break
+        let walkBlkOpt = cs.db.getBlock(walkHash)
+        if walkBlkOpt.isNone:
+          # Side-branch is missing an ancestor body — cannot reorg. Block is
+          # already stored above, surface as inconclusive (operator can
+          # reconsiderblock once the gap fills).
+          return %"inconclusive"
+        let walkBlk = walkBlkOpt.get()
+        newChainBlocks.add(walkBlk)
+        walkHash = walkBlk.header.prevBlock
+        dec walkHeight
+      if not foundFork:
+        # No common ancestor (e.g. side-branch rooted before genesis). Bail.
+        return %"inconclusive"
+
+      # newChainBlocks was built tip..fork; reverse to get fork+1..tip order
+      # for `handleReorg`.
+      newChainBlocks.reverse()
+
+      let reorgRes = cs.handleReorg(forkPoint, newChainBlocks)
+      if not reorgRes.isOk:
+        # Storage of the side-branch block already succeeded; the reorg
+        # failure leaves the original tip intact. Surface as inconclusive
+        # (same shape Core uses when AcceptBlock succeeds but ActivateBestChain
+        # later finds a problem).
+        return %"inconclusive"
+
+      # Reorg succeeded — refresh in-flight bookkeeping that the happy-path
+      # arm normally handles. Mempool: drop confirmed transactions from the
+      # new tip's blocks (they were never seen by the happy path because they
+      # arrived on a side-branch). Fee estimator: process each newly-connected
+      # block. Peer broadcast: relay the new tip.
+      var mp = rpc.mempool
+      for connected in newChainBlocks:
+        mp.removeForBlock(connected)
+
+      if rpc.feeEstimator != nil:
+        var hAt = cs.bestHeight - int32(newChainBlocks.len) + 1
+        for connected in newChainBlocks:
+          var confirmedTxids: seq[TxId]
+          for tx in connected.txs:
+            confirmedTxids.add(tx.txid())
+          rpc.feeEstimator.processBlock(hAt, confirmedTxids)
+          inc hAt
+
+      if rpc.peerManager != nil:
+        asyncSpawn rpc.peerManager.broadcastBlock(blk)
+
+      newJNull()  # null = success per BIP-22 (reorg activated this tip)
 
   except CatchableError as e:
     # Unexpected exception — use "rejected" catch-all per BIP-22.
