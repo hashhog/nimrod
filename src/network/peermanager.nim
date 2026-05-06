@@ -725,18 +725,39 @@ proc broadcastTx*(pm: PeerManager, tx: Transaction) {.async.} =
     except CatchableError as e:
       debug "failed to broadcast tx inv", peer = $peer, error = e.msg
 
+proc selectBlockAnnouncement*(
+  header: BlockHeader,
+  blockHash: array[32, byte],
+  peerSendHeaders: bool
+): P2PMessage =
+  ## Pure helper for BIP-130 announce-message selection.  Peers that sent us
+  ## `sendheaders` get a `headers` payload; the rest get an `inv`.  Pulled
+  ## out of broadcastBlock to make the branch unit-testable without a
+  ## live transport.  Reference: camlcoin lib/peer_manager.ml::announce_block,
+  ## bitcoin-core/src/net_processing.cpp::PeerManagerImpl::SendMessages.
+  if peerSendHeaders:
+    newHeaders(@[header])
+  else:
+    newInv(@[InvVector(invType: invBlock, hash: blockHash)])
+
 proc broadcastBlock*(pm: PeerManager, blk: Block) {.async.} =
+  ## Announce a new block to all connected peers, honoring the BIP-130
+  ## sendheaders preference (Pattern A).  Peers that sent us `sendheaders`
+  ## receive the header directly via a `headers` message; the rest get an
+  ## inv pointing at the block hash.
+  ## Reference: bitcoin-core/src/net_processing.cpp::PeerManagerImpl::SendMessages
+  ##   ("Try to find a peer to send announcements via headers");
+  ##   camlcoin lib/peer_manager.ml::announce_block.
   let headerBytes = serialize(blk.header)
   let blockHash = doubleSha256(headerBytes)
 
-  let inv = @[InvVector(invType: invBlock, hash: blockHash)]
-  let msg = newInv(inv)
-
   for peer in pm.getReadyPeers():
     try:
+      let msg = selectBlockAnnouncement(blk.header, blockHash, peer.sendHeaders)
       await peer.sendMessage(msg)
     except CatchableError as e:
-      debug "failed to broadcast block inv", peer = $peer, error = e.msg
+      debug "failed to broadcast block announcement",
+            peer = $peer, sendHeaders = peer.sendHeaders, error = e.msg
 
 proc broadcastInventory*(pm: PeerManager, inventory: seq[InvVector]) {.async.} =
   let msg = newInv(inventory)
