@@ -52,6 +52,7 @@ import ./test_eviction
 import ./test_anchor
 import ./test_eclipse
 import ./test_blockstore
+import ./test_pruner
 import ./test_utxo_cache
 import ./test_gcs
 import ./test_txindex
