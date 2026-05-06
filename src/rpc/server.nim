@@ -2915,7 +2915,9 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "listtransactions ( count )",
     "loadwallet \"filename\"",
     "sendtoaddress \"address\" amount",
+    "signrawtransactionwithwallet \"hexstring\" ( [{...},...] sighashtype )",
     "unloadwallet",
+    "walletcreatefundedpsbt [{...}] [{addr:amt},...] ( locktime options bip32derivs )",
     "",
     "== Control ==",
     "help ( \"command\" )",
@@ -4507,6 +4509,405 @@ proc handleCreatePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   # Return base64-encoded
   %psbtObj.toBase64()
 
+# ============================================================================
+# signrawtransactionwithwallet
+# ============================================================================
+#
+# Reference: Bitcoin Core src/wallet/rpc/spend.cpp::signrawtransactionwithwallet
+#            and our cross-impl gold standard:
+#            camlcoin/lib/rpc.ml::handle_signrawtransactionwithkey (line 2743+)
+#
+# This is the wallet-holder's "I have UTXOs, please sign" path. It bridges the
+# previously orphaned `createrawtransaction`/`createpsbt` ↔ `sendrawtransaction`
+# pipeline: prior to this dispatch, a wallet-holder had no way to go from
+# "have wallet UTXOs" to "broadcast tx" (Cat H wallet audit, 2026-05-06).
+#
+# Signing strategy:
+# - For each input, locate the prevout via (a) the optional `prevtxs` arg,
+#   (b) the wallet's own UTXO table, or (c) the chainstate UTXO set.
+# - Find the matching key in the wallet via findKeyForScript on the
+#   scriptPubKey of the prevout.
+# - For P2WPKH, sign with BIP143 (calls into the now-public
+#   wallet.signInputP2WPKH).
+# - Other script types are reported as un-signable in the per-input `errors`
+#   array (Core parity: failures are non-fatal, the partially-signed tx is
+#   still returned).
+proc handleSignRawTransactionWithWallet(rpc: RpcServer,
+                                         params: JsonNode): JsonNode =
+  ## signrawtransactionwithwallet "hexstring" ( [{...}, ...] sighashtype )
+  ## Sign inputs of a raw transaction using the loaded wallet's keys.
+  ##
+  ## Arguments:
+  ## 1. hexstring   (string, required) — hex-encoded raw transaction
+  ## 2. prevtxs     (array,  optional) — array of {txid, vout, scriptPubKey,
+  ##                                     amount} prevout descriptors
+  ## 3. sighashtype (string, optional, default "DEFAULT") — sighash flag
+  ##
+  ## Returns: { "hex": str, "complete": bool, "errors"?: array }
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing hexstring parameter")
+
+  let txHex = params[0].getStr()
+
+  var w = rpc.getTargetWallet()
+
+  if w.isEncrypted and w.isLocked:
+    raise newRpcError(RpcMiscError,
+      "wallet is locked; use walletpassphrase to unlock")
+
+  # Parse the raw transaction
+  var tx: Transaction
+  try:
+    let txBytes = hexToBytes(txHex)
+    tx = deserializeTransaction(txBytes)
+  except CatchableError as e:
+    raise newRpcError(RpcInvalidParams, "TX decode failed: " & e.msg)
+
+  # Ensure witnesses array exists for each input (deserialize may have
+  # produced an empty `witnesses` if the tx was non-segwit on the wire).
+  if tx.witnesses.len < tx.inputs.len:
+    let oldLen = tx.witnesses.len
+    tx.witnesses.setLen(tx.inputs.len)
+    for i in oldLen ..< tx.inputs.len:
+      tx.witnesses[i] = @[]
+
+  # Build a prevout lookup table from the optional `prevtxs` arg.
+  # Keys: (txid_internal, vout) → TxOut
+  var prevTable = initTable[tuple[txid: TxId, vout: uint32], TxOut]()
+  if params.len >= 2 and params[1].kind == JArray:
+    for prev in params[1]:
+      if prev.kind != JObject:
+        continue
+      if not (prev.hasKey("txid") and prev.hasKey("vout") and
+              prev.hasKey("scriptPubKey")):
+        continue
+      try:
+        let txidHex = prev["txid"].getStr()
+        if txidHex.len != 64: continue
+        let txid = parseTxId(txidHex)
+        let vout = uint32(prev["vout"].getInt())
+        let spk = hexToBytes(prev["scriptPubKey"].getStr())
+        var amount = Satoshi(0)
+        if prev.hasKey("amount"):
+          let v = prev["amount"]
+          if v.kind == JFloat:
+            amount = Satoshi(int64(v.getFloat() * 100_000_000.0))
+          elif v.kind == JInt:
+            amount = Satoshi(int64(v.getInt()) * 100_000_000)
+        prevTable[(txid, vout)] = TxOut(value: amount, scriptPubKey: spk)
+      except CatchableError:
+        continue
+
+  # Sign each input independently. Failures append to `errors` but do not
+  # abort the loop (Core parity).
+  var errors = newJArray()
+  var signedCount = 0
+
+  for i, txin in tx.inputs:
+    let key = (txin.prevOut.txid, txin.prevOut.vout)
+
+    # Resolve the prevout: prevtxs → wallet utxos → chainstate UTXO set.
+    var prevOut: TxOut
+    var found = false
+    if key in prevTable:
+      prevOut = prevTable[key]
+      found = true
+    elif txin.prevOut in w.utxos:
+      prevOut = w.utxos[txin.prevOut].output
+      found = true
+    elif rpc.chainState != nil:
+      let utxoOpt = rpc.chainState.getUtxo(txin.prevOut)
+      if utxoOpt.isSome:
+        prevOut = utxoOpt.get().output
+        found = true
+
+    if not found:
+      errors.add(%*{
+        "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+        "vout": txin.prevOut.vout,
+        "scriptSig": "",
+        "sequence": txin.sequence,
+        "error": "Input not found or already spent"
+      })
+      continue
+
+    # Look up the signing key for this prevout's scriptPubKey.
+    let keyOpt = w.findKeyForScript(prevOut.scriptPubKey)
+    if keyOpt.isNone:
+      errors.add(%*{
+        "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+        "vout": txin.prevOut.vout,
+        "scriptSig": "",
+        "sequence": txin.sequence,
+        "error": "Unable to sign input, invalid stack size (possibly missing key)"
+      })
+      continue
+
+    let dkey = keyOpt.get()
+    let spk = prevOut.scriptPubKey
+
+    # P2WPKH: 0x00 0x14 <20-byte-hash>
+    if spk.len == 22 and spk[0] == 0x00 and spk[1] == 0x14:
+      try:
+        signInputP2WPKH(tx, i, dkey.extKey.key, dkey.extKey.publicKey,
+                        prevOut.value)
+        inc signedCount
+      except CatchableError as e:
+        errors.add(%*{
+          "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+          "vout": txin.prevOut.vout,
+          "scriptSig": "",
+          "sequence": txin.sequence,
+          "error": "Signing failed: " & e.msg
+        })
+    elif spk.len == 34 and spk[0] == 0x51 and spk[1] == 0x20:
+      # P2TR — Schnorr signing not yet wired; report as un-signable.
+      errors.add(%*{
+        "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+        "vout": txin.prevOut.vout,
+        "scriptSig": "",
+        "sequence": txin.sequence,
+        "error": "P2TR signing not yet implemented in this wallet"
+      })
+    else:
+      errors.add(%*{
+        "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+        "vout": txin.prevOut.vout,
+        "scriptSig": "",
+        "sequence": txin.sequence,
+        "error": "Unsupported script type (only P2WPKH wallet signing supported)"
+      })
+
+  # Re-serialize the (possibly partially-signed) tx.
+  let signedHex = toHex(serialize(tx, includeWitness = true))
+  let complete = (errors.len == 0) and (signedCount == tx.inputs.len)
+
+  result = %*{
+    "hex": signedHex,
+    "complete": complete
+  }
+  if errors.len > 0:
+    result["errors"] = errors
+
+# ============================================================================
+# walletcreatefundedpsbt
+# ============================================================================
+#
+# Reference: bitcoin-core/src/wallet/rpc/spend.cpp::walletcreatefundedpsbt
+#
+# Creator + Updater roles: build an unsigned PSBT, automatically funding it
+# from the wallet's UTXOs if no inputs are pre-specified. We do NOT sign.
+# Returns { psbt, fee, changepos } (Core-compatible shape).
+proc handleWalletCreateFundedPsbt(rpc: RpcServer,
+                                   params: JsonNode): JsonNode =
+  ## walletcreatefundedpsbt [inputs] [{output, ...}] ( locktime options bip32derivs )
+  ##
+  ## Arguments:
+  ## 1. inputs   (array, optional) — pre-selected inputs ({txid, vout, sequence})
+  ## 2. outputs  (array, required) — [{address: amount}, {"data": hex}]
+  ## 3. locktime (int,   optional, default=0)
+  ## 4. options  (object, optional) — {feeRate, fee_rate, replaceable,
+  ##                                   changeAddress, subtractFeeFromOutputs}
+  ## 5. bip32derivs (bool, optional, default=true) — currently best-effort
+  ##
+  ## Returns: { psbt: base64, fee: BTC, changepos: int }
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams,
+      "missing required parameters: inputs, outputs")
+
+  var w = rpc.getTargetWallet()
+
+  if params[0].kind != JArray:
+    raise newRpcError(RpcInvalidParams, "inputs must be an array")
+  if params[1].kind != JArray:
+    raise newRpcError(RpcInvalidParams, "outputs must be an array")
+
+  # ---- Parse pre-selected inputs (may be empty → auto-fund) ----
+  var preInputs: seq[TxIn]
+  for inputObj in params[0]:
+    if inputObj.kind != JObject:
+      raise newRpcError(RpcInvalidParams, "each input must be an object")
+    if not inputObj.hasKey("txid") or not inputObj.hasKey("vout"):
+      raise newRpcError(RpcInvalidParams, "input missing txid or vout")
+    let txidHex = inputObj["txid"].getStr()
+    if txidHex.len != 64:
+      raise newRpcError(RpcInvalidAddressOrKey, "invalid txid length")
+    let txid = parseTxId(txidHex)
+    let vout = uint32(inputObj["vout"].getInt())
+    var sequence = 0xffffffff'u32
+    if inputObj.hasKey("sequence"):
+      sequence = uint32(inputObj["sequence"].getInt())
+    preInputs.add(TxIn(
+      prevOut: OutPoint(txid: txid, vout: vout),
+      scriptSig: @[],
+      sequence: sequence
+    ))
+
+  # ---- Parse outputs (and remember requested order for changepos) ----
+  var txOutputs: seq[TxOut]
+  for outputObj in params[1]:
+    if outputObj.kind != JObject:
+      raise newRpcError(RpcInvalidParams, "each output must be an object")
+
+    if outputObj.hasKey("data"):
+      let dataHex = outputObj["data"].getStr()
+      let data = hexToBytes(dataHex)
+      var script: seq[byte]
+      script.add(0x6a)  # OP_RETURN
+      if data.len <= 75:
+        script.add(byte(data.len))
+      elif data.len <= 255:
+        script.add(0x4c)
+        script.add(byte(data.len))
+      else:
+        raise newRpcError(RpcInvalidParams, "OP_RETURN data too long")
+      script.add(data)
+      txOutputs.add(TxOut(value: Satoshi(0), scriptPubKey: script))
+    else:
+      for k, v in outputObj:
+        if k == "data":
+          continue
+        let amountBtc = v.getFloat()
+        let amountSat = Satoshi(int64(amountBtc * 100_000_000))
+        try:
+          let parsedAddr = decodeAddress(k)
+          let spk = scriptPubKeyForAddress(parsedAddr)
+          txOutputs.add(TxOut(value: amountSat, scriptPubKey: spk))
+        except AddressError as e:
+          raise newRpcError(RpcInvalidAddressOrKey,
+            "invalid address: " & e.msg)
+
+  # ---- locktime ----
+  var locktime = 0'u32
+  if params.len >= 3 and params[2].kind != JNull:
+    locktime = uint32(params[2].getInt())
+
+  # ---- options ----
+  var feeRate = 0.0  # 0 means "use estimator"
+  var replaceable = true
+  var changeAddrOverride = ""
+  if params.len >= 4 and params[3].kind == JObject:
+    let opts = params[3]
+    if opts.hasKey("fee_rate"):
+      # sat/vB
+      feeRate = opts["fee_rate"].getFloat()
+    elif opts.hasKey("feeRate"):
+      # BTC/kvB → sat/vB
+      feeRate = opts["feeRate"].getFloat() * 100_000_000.0 / 1000.0
+    if opts.hasKey("replaceable") and opts["replaceable"].kind == JBool:
+      replaceable = opts["replaceable"].getBool()
+    if opts.hasKey("changeAddress"):
+      changeAddrOverride = opts["changeAddress"].getStr()
+
+  if feeRate <= 0.0:
+    if rpc.feeEstimator != nil:
+      feeRate = rpc.feeEstimator.estimateFee(6)
+    else:
+      feeRate = FallbackFeeRate
+
+  # ---- Build the unsigned, funded transaction ----
+  var fundedTx: Transaction
+  var totalIn = Satoshi(0)
+  var totalOut = Satoshi(0)
+  for o in txOutputs:
+    totalOut = totalOut + o.value
+
+  var changePos = -1
+  var changeOutputCount = 0  # 0 or 1
+
+  if preInputs.len > 0:
+    # Caller-specified inputs: build tx as-is. Fee = sum(inputs) - sum(outputs).
+    # We trust the caller has correctly chosen inputs; we don't add change.
+    # (Core's walletcreatefundedpsbt with explicit inputs and add_inputs=false
+    #  similarly does no extra coin selection — fee inferred from delta.)
+    fundedTx = Transaction(
+      version: 2'i32,
+      inputs: preInputs,
+      outputs: txOutputs,
+      witnesses: newSeq[seq[seq[byte]]](preInputs.len),
+      lockTime: locktime
+    )
+    # Resolve totalIn from wallet utxos / chainstate
+    for inp in preInputs:
+      if inp.prevOut in w.utxos:
+        totalIn = totalIn + w.utxos[inp.prevOut].output.value
+      elif rpc.chainState != nil:
+        let u = rpc.chainState.getUtxo(inp.prevOut)
+        if u.isSome:
+          totalIn = totalIn + u.get().output.value
+  else:
+    # Auto-fund using wallet.createTransaction. This adds a change output
+    # (when needed) and selects coins.
+    try:
+      fundedTx = w.createTransaction(txOutputs, feeRate)
+    except WalletError as e:
+      raise newRpcError(RpcWalletError, e.msg)
+    except CoinSelectionError as e:
+      raise newRpcError(RpcWalletError, e.msg)
+    # Sum totalIn from selected inputs
+    for inp in fundedTx.inputs:
+      if inp.prevOut in w.utxos:
+        totalIn = totalIn + w.utxos[inp.prevOut].output.value
+    # Detect the change output (if any). createTransaction appends change at
+    # the end of the outputs vector. changepos = index of that extra output;
+    # -1 if no change was needed.
+    if fundedTx.outputs.len > txOutputs.len:
+      changePos = txOutputs.len  # the one appended by createTransaction
+      changeOutputCount = 1
+
+  # ---- Apply locktime/replaceable RBF semantics ----
+  fundedTx.lockTime = locktime
+  if replaceable or locktime > 0:
+    for i in 0 ..< fundedTx.inputs.len:
+      if fundedTx.inputs[i].sequence == 0xffffffff'u32:
+        fundedTx.inputs[i].sequence = 0xfffffffd'u32
+
+  # ---- Optional changeAddress override (rebuild change output) ----
+  if changeOutputCount == 1 and changeAddrOverride.len > 0:
+    try:
+      let parsed = decodeAddress(changeAddrOverride)
+      let spk = scriptPubKeyForAddress(parsed)
+      fundedTx.outputs[changePos].scriptPubKey = spk
+    except AddressError as e:
+      raise newRpcError(RpcInvalidAddressOrKey,
+        "invalid changeAddress: " & e.msg)
+
+  # ---- Recompute fee from inputs/outputs ----
+  var sumOuts = Satoshi(0)
+  for o in fundedTx.outputs:
+    sumOuts = sumOuts + o.value
+  let fee = int64(totalIn) - int64(sumOuts)
+
+  # ---- Strip witnesses; PSBT carries an unsigned tx by spec ----
+  fundedTx.witnesses = newSeq[seq[seq[byte]]](fundedTx.inputs.len)
+  for i in 0 ..< fundedTx.witnesses.len:
+    fundedTx.witnesses[i] = @[]
+
+  # ---- Build PSBT and populate witnessUtxo for each input we know about ----
+  var psbtObj = createPsbt(fundedTx)
+  for i, inp in fundedTx.inputs:
+    var prev: TxOut
+    var have = false
+    if inp.prevOut in w.utxos:
+      prev = w.utxos[inp.prevOut].output
+      have = true
+    elif rpc.chainState != nil:
+      let u = rpc.chainState.getUtxo(inp.prevOut)
+      if u.isSome:
+        prev = u.get().output
+        have = true
+    if have:
+      try:
+        psbtObj.updateInput(i, prev, isWitness = true)
+      except CatchableError:
+        discard  # best-effort
+
+  %*{
+    "psbt": psbtObj.toBase64(),
+    "fee": float64(fee) / 100_000_000.0,
+    "changepos": changePos
+  }
+
 proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Decode a PSBT and return its contents
   ## Reference: Bitcoin Core rpc/rawtransaction.cpp decodepsbt
@@ -5313,6 +5714,12 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleCombinePsbt(params)
   of "finalizepsbt":
     rpc.handleFinalizePsbt(params)
+  of "walletcreatefundedpsbt":
+    rpc.handleWalletCreateFundedPsbt(params)
+
+  # Wallet signing
+  of "signrawtransactionwithwallet":
+    rpc.handleSignRawTransactionWithWallet(params)
 
   # Control
   of "stop":
