@@ -984,7 +984,7 @@ proc computeSighashP2WPKH*(tx: Transaction, inputIdx: int,
 
   doubleSha256(w.data)
 
-proc signInputP2WPKH(tx: var Transaction, inputIdx: int,
+proc signInputP2WPKH*(tx: var Transaction, inputIdx: int,
                       privateKey: PrivateKey, publicKey: PublicKey,
                       value: Satoshi) =
   ## Sign a P2WPKH input
