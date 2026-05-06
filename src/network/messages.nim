@@ -325,6 +325,8 @@ proc writeGetHeadersMsg*(w: var BinaryWriter, msg: GetHeadersMsg) =
 proc readGetHeadersMsg*(r: var BinaryReader): GetHeadersMsg =
   result.version = r.readUint32LE()
   let count = r.readCompactSize()
+  if count > MaxLocatorSz.uint64:
+    raise newException(ValueError, "getheaders locator size = " & $count & " exceeds MaxLocatorSz")
   for i in 0 ..< int(count):
     result.locatorHashes.add(r.readHash())
   result.hashStop = r.readHash()
@@ -339,6 +341,8 @@ proc writeGetBlocksMsg*(w: var BinaryWriter, msg: GetBlocksMsg) =
 proc readGetBlocksMsg*(r: var BinaryReader): GetBlocksMsg =
   result.version = r.readUint32LE()
   let count = r.readCompactSize()
+  if count > MaxLocatorSz.uint64:
+    raise newException(ValueError, "getblocks locator size = " & $count & " exceeds MaxLocatorSz")
   for i in 0 ..< int(count):
     result.locatorHashes.add(r.readHash())
   result.hashStop = r.readHash()
@@ -375,6 +379,8 @@ proc writeHeadersPayload*(w: var BinaryWriter, headers: seq[BlockHeader]) =
 
 proc readHeadersPayload*(r: var BinaryReader): seq[BlockHeader] =
   let count = r.readCompactSize()
+  if count > MaxHeadersPerMsg.uint64:
+    raise newException(ValueError, "headers message size = " & $count & " exceeds MaxHeadersPerMsg")
   for i in 0 ..< int(count):
     result.add(r.readBlockHeader())
     discard r.readCompactSize()  # Dummy tx count
@@ -614,12 +620,16 @@ proc deserializePayload*(cmd: string, payload: seq[byte]): P2PMessage =
   of "addr":
     var addresses: seq[TimestampedAddr]
     let count = r.readCompactSize()
+    if count > MaxGetAddrCount.uint64:
+      raise newException(ValueError, "addr message size = " & $count & " exceeds MaxGetAddrCount")
     for i in 0 ..< int(count):
       addresses.add(r.readTimestampedAddr())
     result = P2PMessage(kind: mkAddr, addresses: addresses)
   of "addrv2":
     var addressesV2: seq[TimestampedAddrV2]
     let count = r.readCompactSize()
+    if count > MaxGetAddrCount.uint64:
+      raise newException(ValueError, "addrv2 message size = " & $count & " exceeds MaxGetAddrCount")
     for i in 0 ..< int(count):
       let addrOpt = r.readTimestampedAddrV2()
       if addrOpt.isSome:
@@ -629,18 +639,24 @@ proc deserializePayload*(cmd: string, payload: seq[byte]): P2PMessage =
   of "inv":
     var invItems: seq[InvVector]
     let count = r.readCompactSize()
+    if count > MaxInvPerMsg.uint64:
+      raise newException(ValueError, "inv message size = " & $count & " exceeds MaxInvPerMsg")
     for i in 0 ..< int(count):
       invItems.add(r.readInvVector())
     result = P2PMessage(kind: mkInv, invItems: invItems)
   of "getdata":
     var getData: seq[InvVector]
     let count = r.readCompactSize()
+    if count > MaxInvPerMsg.uint64:
+      raise newException(ValueError, "getdata message size = " & $count & " exceeds MaxInvPerMsg")
     for i in 0 ..< int(count):
       getData.add(r.readInvVector())
     result = P2PMessage(kind: mkGetData, getData: getData)
   of "notfound":
     var notFound: seq[InvVector]
     let count = r.readCompactSize()
+    if count > MaxInvPerMsg.uint64:
+      raise newException(ValueError, "notfound message size = " & $count & " exceeds MaxInvPerMsg")
     for i in 0 ..< int(count):
       notFound.add(r.readInvVector())
     result = P2PMessage(kind: mkNotFound, notFound: notFound)
