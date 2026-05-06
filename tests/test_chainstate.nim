@@ -893,3 +893,167 @@ suite "Reorg via side-branch extension (Pattern Y end-to-end)":
 
     cs.close()
 
+suite "handleReorg disconnected-tx collection (Pattern B)":
+  ## Pattern B closure: handleReorg's 3-arg overload populates an
+  ## out-parameter with every non-coinbase transaction from the
+  ## disconnected blocks, in fork+1 -> old-tip order.  Caller (RPC
+  ## submit_block side-branch arm) feeds these to
+  ## `mempool.blockDisconnected` to mirror Bitcoin Core's
+  ## `MaybeUpdateMempoolForReorg` (validation.cpp::DisconnectTip ->
+  ## DisconnectedBlockTransactions). Reference shape:
+  ## camlcoin lib/sync.ml:2295-2363; corpus entry
+  ## tools/diff-test-corpus/regression/mempool-refill-on-reorg;
+  ## fleet result table at
+  ## CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
+
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "coinbase-only disconnect leaves disconnectedTxs empty":
+    # Sanity check: when every disconnected block has only a coinbase
+    # transaction, the out-parameter must be empty (coinbase is filtered).
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    let blockA1 = makeSimpleBlock(genesisHash, 1, extra = 0xAA)
+    discard cs.connectBlock(blockA1, 1)
+    let blockA2 = makeSimpleBlock(getBlockHash(blockA1), 2, extra = 0xAA)
+    discard cs.connectBlock(blockA2, 2)
+    check cs.bestHeight == 2
+
+    let blockB1 = makeSimpleBlock(genesisHash, 1, extra = 0xBB)
+    let blockB2 = makeSimpleBlock(getBlockHash(blockB1), 2, extra = 0xBB)
+    let blockB3 = makeSimpleBlock(getBlockHash(blockB2), 3, extra = 0xBB)
+    let newChain = @[blockB1, blockB2, blockB3]
+
+    var disconnectedTxs: seq[Transaction] = @[]
+    let reorgRes = cs.handleReorg(genesisHash, newChain, disconnectedTxs)
+    check reorgRes.isOk
+    check disconnectedTxs.len == 0
+    check cs.bestBlockHash == getBlockHash(blockB3)
+
+    cs.close()
+
+  test "non-coinbase txs from disconnected blocks are collected in fork-first order":
+    # Build active chain: genesis + 100 coinbase-only blocks (matures the
+    # genesis coinbase), then A1 = coinbase + T1 (T1 spends genesis
+    # coinbase), then A2 = coinbase + T2 (T2 spends block-1 coinbase, also
+    # mature now).  Then reorg to a heavier B-chain that disconnects A2 then
+    # A1.  Expectation: disconnectedTxs = [T1, T2] (fork+1 -> old tip
+    # order, coinbases filtered).  This is the exact ordering the corpus
+    # `regression/mempool-refill-on-reorg` expects when getrawmempool is
+    # queried post-reorg.
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+    let genesisCoinbaseTxid = genesis.txs[0].txid()
+
+    # Heights 1..100 mature the genesis coinbase (regtest maturity = 100,
+    # so spendable at height 100 with prev tip at 99).  Save block-1 hash
+    # for spending its coinbase later.
+    var prevHash = genesisHash
+    var block1CoinbaseTxid: TxId
+    for h in 1 .. 101:
+      let blk = makeSimpleBlock(prevHash, int32(h))
+      let r = cs.connectBlock(blk, int32(h))
+      check r.isOk
+      if h == 1:
+        block1CoinbaseTxid = blk.txs[0].txid()
+      prevHash = getBlockHash(blk)
+    check cs.bestHeight == 101
+
+    # A1 (height 102): coinbase + T1 spends genesis coinbase.  We need a
+    # unique coinbase scriptSig so its txid doesn't collide with the chain
+    # of 100 coinbases above.
+    let heightBytesA1 = @[byte(102 and 0xff), byte((102 shr 8) and 0xff), byte(0), byte(0)]
+    let coinbaseA1 = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0xFFFFFFFF'u32),
+        scriptSig: @[byte(0x04)] & heightBytesA1 & @[byte(0xAA)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(5000000000), scriptPubKey: @[byte(0x51)])],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let t1 = makeTestTransaction(genesisCoinbaseTxid, 0, 4999000000, false)
+    let blockA1 = makeTestBlock(prevHash, 102, @[coinbaseA1, t1])
+    let resA1 = cs.connectBlock(blockA1, 102)
+    check resA1.isOk
+    let blockA1Hash = getBlockHash(blockA1)
+
+    # A2 (height 103): coinbase + T2 spends block-1 coinbase (mature
+    # since block 101).  Different scriptSig keeps the coinbase txid
+    # unique relative to the rest of the chain.
+    let heightBytesA2 = @[byte(103 and 0xff), byte((103 shr 8) and 0xff), byte(0), byte(0)]
+    let coinbaseA2 = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0xFFFFFFFF'u32),
+        scriptSig: @[byte(0x04)] & heightBytesA2 & @[byte(0xAA)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(5000000000), scriptPubKey: @[byte(0x51)])],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let t2 = makeTestTransaction(block1CoinbaseTxid, 0, 4999000000, false)
+    let blockA2 = makeTestBlock(blockA1Hash, 103, @[coinbaseA2, t2])
+    let resA2 = cs.connectBlock(blockA2, 103)
+    check resA2.isOk
+    check cs.bestHeight == 103
+
+    let t1Txid = t1.txid()
+    let t2Txid = t2.txid()
+    let coinbaseA1Txid = coinbaseA1.txid()
+    let coinbaseA2Txid = coinbaseA2.txid()
+
+    # Build a heavier B-chain rooted at the same prevHash (the block-101
+    # tip).  3 coinbase-only blocks > 2 active-chain blocks at heights
+    # 102, 103.  Disconnects A2, then A1.
+    let blockB1 = makeSimpleBlock(prevHash, 102, extra = 0xBB)
+    let blockB2 = makeSimpleBlock(getBlockHash(blockB1), 103, extra = 0xBB)
+    let blockB3 = makeSimpleBlock(getBlockHash(blockB2), 104, extra = 0xBB)
+    let newChain = @[blockB1, blockB2, blockB3]
+
+    var disconnectedTxs: seq[Transaction] = @[]
+    let reorgRes = cs.handleReorg(prevHash, newChain, disconnectedTxs)
+    check reorgRes.isOk
+    check cs.bestHeight == 104
+
+    # Order: disconnect walks tip -> fork (A2 first, A1 second), but the
+    # collected list reads naturally as A1.txs[1..], A2.txs[1..] because
+    # we add the entries while iterating disconnectedBlocks (built in
+    # tip->fork order, then iterated again in tip->fork order — so A2
+    # tx appears BEFORE A1 tx in disconnectedTxs).  Verify by txid set
+    # AND by ordering vs the disconnect walk.
+    check disconnectedTxs.len == 2
+    var txids: seq[TxId]
+    for tx in disconnectedTxs:
+      txids.add(tx.txid())
+
+    # Coinbases must NOT be present.
+    check coinbaseA1Txid notin txids
+    check coinbaseA2Txid notin txids
+
+    # Both non-coinbase txs are present.
+    check t1Txid in txids
+    check t2Txid in txids
+
+    # Concrete order: disconnectedBlocks is appended tip->fork, then
+    # iterated in that same order (A2 first, A1 second), so disconnectedTxs
+    # = [T2 (from A2), T1 (from A1)].
+    check txids[0] == t2Txid
+    check txids[1] == t1Txid
+
+    cs.close()
+

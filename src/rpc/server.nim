@@ -2241,7 +2241,8 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # for `handleReorg`.
       newChainBlocks.reverse()
 
-      let reorgRes = cs.handleReorg(forkPoint, newChainBlocks)
+      var disconnectedTxs: seq[Transaction] = @[]
+      let reorgRes = cs.handleReorg(forkPoint, newChainBlocks, disconnectedTxs)
       if not reorgRes.isOk:
         # Storage of the side-branch block already succeeded; the reorg
         # failure leaves the original tip intact. Surface as inconclusive
@@ -2250,11 +2251,22 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         return %"inconclusive"
 
       # Reorg succeeded — refresh in-flight bookkeeping that the happy-path
-      # arm normally handles. Mempool: drop confirmed transactions from the
-      # new tip's blocks (they were never seen by the happy path because they
-      # arrived on a side-branch). Fee estimator: process each newly-connected
-      # block. Peer broadcast: relay the new tip.
+      # arm normally handles. Mempool: refill disconnected non-coinbase txs
+      # FIRST (Pattern B closure — mirrors Core's MaybeUpdateMempoolForReorg
+      # via the disconnect-pool, and camlcoin sync.ml:2354-2363), then drop
+      # confirmed transactions from the new tip's blocks (they were never
+      # seen by the happy path because they arrived on a side-branch).  The
+      # ordering matters when a tx appears in both the old and new chain:
+      # the refill admits it, the subsequent removeForBlock drops it,
+      # leaving the mempool with exactly the txs unique to the disconnected
+      # chain.  Fee estimator: process each newly-connected block.  Peer
+      # broadcast: relay the new tip.  Pattern B context:
+      # CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
       var mp = rpc.mempool
+      if disconnectedTxs.len > 0:
+        let nReadmitted = mp.blockDisconnected(disconnectedTxs, rpc.crypto)
+        debug "submitblock reorg: refilled mempool from disconnected blocks",
+              attempted = disconnectedTxs.len, readmitted = nReadmitted
       for connected in newChainBlocks:
         mp.removeForBlock(connected)
 

@@ -1009,6 +1009,37 @@ proc removeForBlock*(mp: Mempool, blk: Block) =
   for txid in toRemove:
     mp.removeTransaction(txid)
 
+# Re-admit transactions that came back from a disconnected block during a reorg.
+# Mirrors Bitcoin Core's `MaybeUpdateMempoolForReorg`
+# (validation.cpp::DisconnectTip → DisconnectedBlockTransactions → mempool
+# re-validation), and the camlcoin reference at
+# `lib/sync.ml:2354-2363`.  Pattern B closure for nimrod (see
+# CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md).
+#
+# Each tx is fed back through `acceptTransaction`, which re-runs all the
+# normal mempool admit checks (signatures, BIP-68 sequence locks,
+# coinbase maturity at the new tip height, fee/size policy, RBF
+# conflicts, ...).  Failures are silently dropped — the tx simply
+# disappears from the mempool, exactly like Core.  Returns the count
+# successfully re-admitted so callers can log a single summary line.
+proc blockDisconnected*(mp: Mempool, txs: seq[Transaction],
+                        crypto: CryptoEngine): int =
+  ## Re-admit non-coinbase transactions from a disconnected block.
+  ##
+  ## txs MUST already exclude coinbase transactions — caller is responsible.
+  ## See `chainstate.handleReorg` (3-arg overload) for the canonical source.
+  result = 0
+  for tx in txs:
+    let txid = tx.txid()
+    # Already in mempool (e.g. arrived via P2P relay during the reorg
+    # window) — skip; acceptTransaction would reject with "already in
+    # mempool" anyway, but doing the cheap check first avoids the noise.
+    if txid in mp.entries:
+      continue
+    let res = mp.acceptTransaction(tx, crypto)
+    if res.isOk:
+      inc result
+
 # Get transactions sorted by fee rate
 proc getTransactionsByFeeRate*(mp: Mempool, maxWeight: int): seq[MempoolEntry] =
   ## Get transactions sorted by ancestor fee rate (highest first)
