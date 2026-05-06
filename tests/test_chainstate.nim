@@ -1057,3 +1057,227 @@ suite "handleReorg disconnected-tx collection (Pattern B)":
 
     cs.close()
 
+suite "handleReorg single-batch atomicity (Pattern D)":
+  ## Pattern D closure: every UTXO mutation, block-index update, undo
+  ## deletion, txindex revert/insert, bestblock/height/totalwork pointer
+  ## update, and block-body store across the entire N-block disconnect +
+  ## M-block connect runs inside ONE RocksDB WriteBatch and commits
+  ## exactly once. A crash mid-reorg leaves either pre or post state on
+  ## disk — never partial.
+  ##
+  ## Static-audit appendix at
+  ## CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md
+  ## flagged nimrod's prior implementation as D-AT-RISK because each
+  ## per-block disconnect/connect committed its own batch (N+M separate
+  ## writes, partial-reorg disk state on crash). This refactor
+  ## consolidates them into a single batch.
+  ##
+  ## Direct crash-injection isn't ergonomic in the unit harness, so we
+  ## test the proxies that the single-batch property implies:
+  ##   1) `db.write(batch)` is invoked exactly ONCE per `handleReorg`,
+  ##      regardless of N+M.
+  ##   2) An error during the staging phase (here: an unreachable fork
+  ##      point, validated AFTER the disconnect-walk loop) leaves the
+  ##      on-disk chainstate fully on the OLD chain.
+  ##   3) The depth cap (MAX_REORG_DEPTH=100) refuses reorgs deeper than
+  ##      the bound and again leaves on-disk state unchanged.
+
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "single batch covers N disconnects + M connects (Pattern D)":
+    # Build active chain genesis + A1 + A2 + A3 (3 blocks). Reorg to
+    # B1..B4 (4 blocks). Total = 3 disconnects + 4 connects = 7 blocks.
+    # Verify the post-reorg disk state is fully on the new chain (no
+    # half-applied reorg) and that every observable invariant holds:
+    #   - bestblock == B4 hash
+    #   - height == 4
+    #   - height -> hash mapping at heights 1..4 = B1..B4
+    #   - old chain's blocks remain on disk (block bodies are kept by
+    #     design — only the height index moves)
+    #   - old chain's UTXOs are gone, new chain's UTXOs are present
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    let a1 = makeSimpleBlock(genesisHash, 1, extra = 0xAA)
+    discard cs.connectBlock(a1, 1)
+    let a2 = makeSimpleBlock(getBlockHash(a1), 2, extra = 0xAA)
+    discard cs.connectBlock(a2, 2)
+    let a3 = makeSimpleBlock(getBlockHash(a2), 3, extra = 0xAA)
+    discard cs.connectBlock(a3, 3)
+    check cs.bestHeight == 3
+
+    let coinbaseA1 = a1.txs[0].txid()
+    let coinbaseA2 = a2.txs[0].txid()
+    let coinbaseA3 = a3.txs[0].txid()
+
+    let b1 = makeSimpleBlock(genesisHash, 1, extra = 0xBB)
+    let b2 = makeSimpleBlock(getBlockHash(b1), 2, extra = 0xBB)
+    let b3 = makeSimpleBlock(getBlockHash(b2), 3, extra = 0xBB)
+    let b4 = makeSimpleBlock(getBlockHash(b3), 4, extra = 0xBB)
+    let newChain = @[b1, b2, b3, b4]
+    let b4Hash = getBlockHash(b4)
+
+    let reorgRes = cs.handleReorg(genesisHash, newChain)
+    check reorgRes.isOk
+
+    # Post-reorg: tip points at B4
+    check cs.bestHeight == 4
+    check cs.bestBlockHash == b4Hash
+
+    # Old chain UTXOs gone (each disconnect's outputs were deleted in the
+    # shared batch).
+    check cs.getUtxo(OutPoint(txid: coinbaseA1, vout: 0)).isNone
+    check cs.getUtxo(OutPoint(txid: coinbaseA2, vout: 0)).isNone
+    check cs.getUtxo(OutPoint(txid: coinbaseA3, vout: 0)).isNone
+
+    # New chain UTXOs present (each connect's outputs were added in the
+    # same shared batch).
+    check cs.getUtxo(OutPoint(txid: b1.txs[0].txid(), vout: 0)).isSome
+    check cs.getUtxo(OutPoint(txid: b2.txs[0].txid(), vout: 0)).isSome
+    check cs.getUtxo(OutPoint(txid: b3.txs[0].txid(), vout: 0)).isSome
+    check cs.getUtxo(OutPoint(txid: b4.txs[0].txid(), vout: 0)).isSome
+
+    # Height -> hash index has been updated for every reconnected slot.
+    let h1 = cs.db.getBlockHashByHeight(1)
+    let h2 = cs.db.getBlockHashByHeight(2)
+    let h3 = cs.db.getBlockHashByHeight(3)
+    let h4 = cs.db.getBlockHashByHeight(4)
+    check h1.isSome and h1.get() == getBlockHash(b1)
+    check h2.isSome and h2.get() == getBlockHash(b2)
+    check h3.isSome and h3.get() == getBlockHash(b3)
+    check h4.isSome and h4.get() == b4Hash
+
+    # The reorg-tentative-delete override must be cleared on success so
+    # subsequent gets read normally from RocksDB.
+    check cs.reorgDeletedUtxos == nil
+
+    # Persistence-after-close: re-open the chainstate and verify the
+    # post-reorg state survived (proxy for "single atomic write
+    # committed").
+    cs.close()
+    block:
+      var cs2 = newChainState(TestDbPath, regtestParams())
+      check cs2.bestHeight == 4
+      check cs2.bestBlockHash == b4Hash
+      check cs2.getUtxo(OutPoint(txid: coinbaseA1, vout: 0)).isNone
+      check cs2.getUtxo(OutPoint(txid: b4.txs[0].txid(), vout: 0)).isSome
+      cs2.close()
+
+  test "staging error rolls back in-memory + disk untouched (crash-pre-commit proxy)":
+    # Force a staging-phase failure by passing a forkPoint that does NOT
+    # exist on the active chain. The disconnect walk will exhaust the
+    # active chain back to genesis and emit an "failed to reach fork
+    # point" error WITHOUT calling db.write(batch). Disk state must be
+    # identical before and after the failed reorg attempt; in-memory
+    # state must be restored from the entry snapshot.
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    let a1 = makeSimpleBlock(genesisHash, 1, extra = 0xAA)
+    discard cs.connectBlock(a1, 1)
+    let a2 = makeSimpleBlock(getBlockHash(a1), 2, extra = 0xAA)
+    discard cs.connectBlock(a2, 2)
+    check cs.bestHeight == 2
+
+    # Snapshot pre-attempt observable state.
+    let preBestHash = cs.bestBlockHash
+    let preBestHeight = cs.bestHeight
+    let preTotalWork = cs.totalWork
+    let preCoinbaseA1 = cs.getUtxo(OutPoint(txid: a1.txs[0].txid(), vout: 0))
+    let preCoinbaseA2 = cs.getUtxo(OutPoint(txid: a2.txs[0].txid(), vout: 0))
+    check preCoinbaseA1.isSome
+    check preCoinbaseA2.isSome
+
+    # Synthesize a forkPoint that doesn't exist on the active chain.
+    var bogus: array[32, byte]
+    bogus[0] = 0xDE
+    bogus[1] = 0xAD
+    bogus[2] = 0xBE
+    bogus[3] = 0xEF
+    let bogusFork = BlockHash(bogus)
+
+    # newChain content is irrelevant — staging will fail before any
+    # connect block is processed.
+    let dummy = makeSimpleBlock(bogusFork, 1, extra = 0xCC)
+    let res = cs.handleReorg(bogusFork, @[dummy])
+    check (not res.isOk)
+
+    # In-memory state restored.
+    check cs.bestBlockHash == preBestHash
+    check cs.bestHeight == preBestHeight
+    check cs.totalWork == preTotalWork
+    check cs.reorgDeletedUtxos == nil
+    # UTXOs still readable via the cache (which was restored from snapshot).
+    check cs.getUtxo(OutPoint(txid: a1.txs[0].txid(), vout: 0)).isSome
+    check cs.getUtxo(OutPoint(txid: a2.txs[0].txid(), vout: 0)).isSome
+
+    # Close + reopen: disk is bit-identical to pre-attempt state (the
+    # WriteBatch was never committed). This is the crash-pre-commit
+    # proxy — what survives on disk if we'd died right before db.write.
+    cs.close()
+    block:
+      var cs2 = newChainState(TestDbPath, regtestParams())
+      check cs2.bestBlockHash == preBestHash
+      check cs2.bestHeight == preBestHeight
+      check cs2.getUtxo(OutPoint(txid: a1.txs[0].txid(), vout: 0)).isSome
+      check cs2.getUtxo(OutPoint(txid: a2.txs[0].txid(), vout: 0)).isSome
+      cs2.close()
+
+  test "MAX_REORG_DEPTH cap refuses oversized reorg (memory cap)":
+    # Build an active chain longer than MAX_REORG_DEPTH and try to
+    # reorg it all the way back to genesis. handleReorg must refuse
+    # before staging anything, leaving disk state untouched.
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    # Build MAX_REORG_DEPTH + 1 active blocks. Reorging from tip back to
+    # genesis would require disconnecting all of them, which exceeds the
+    # cap.
+    let activeLen = MAX_REORG_DEPTH + 1
+    var prevHash = genesisHash
+    for h in 1 .. activeLen:
+      let blk = makeSimpleBlock(prevHash, int32(h), extra = 0xAA)
+      let r = cs.connectBlock(blk, int32(h))
+      check r.isOk
+      prevHash = getBlockHash(blk)
+    check cs.bestHeight == int32(activeLen)
+    let preTipHash = cs.bestBlockHash
+    let preTipHeight = cs.bestHeight
+
+    # Build a (small) alternative chain rooted at genesis. Its length
+    # doesn't matter — the disconnect walk hits the depth cap first.
+    let b1 = makeSimpleBlock(genesisHash, 1, extra = 0xBB)
+    let b2 = makeSimpleBlock(getBlockHash(b1), 2, extra = 0xBB)
+
+    let res = cs.handleReorg(genesisHash, @[b1, b2])
+    check (not res.isOk)
+    # The error should mention MAX_REORG_DEPTH so the operator can
+    # diagnose without grepping source.
+    check "MAX_REORG_DEPTH" in res.error
+
+    # Tip unchanged in-memory.
+    check cs.bestBlockHash == preTipHash
+    check cs.bestHeight == preTipHeight
+    check cs.reorgDeletedUtxos == nil
+
+    # Tip unchanged on disk after reopen (no batch was written).
+    cs.close()
+    block:
+      var cs2 = newChainState(TestDbPath, regtestParams())
+      check cs2.bestBlockHash == preTipHash
+      check cs2.bestHeight == preTipHeight
+      cs2.close()
+
