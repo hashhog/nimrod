@@ -287,6 +287,15 @@ proc putBlockIndex*(cdb: ChainDb, idx: BlockIndex) =
   # Also store height -> hash mapping
   cdb.db.put(cfBlockIndex, blockIndexKey(idx.height), @(array[32, byte](idx.hash)))
 
+proc putBlockIndexHashOnly*(cdb: ChainDb, idx: BlockIndex) =
+  ## Store a block index entry by hash WITHOUT touching the height -> hash
+  ## mapping. Used for side-branch blocks where the active chain already
+  ## owns the height -> hash slot. Mirrors Bitcoin Core's
+  ## `BlockManager::AcceptBlock` (validation.cpp), which always writes the
+  ## CBlockIndex regardless of which chain the block lives on but never
+  ## mutates the active chain's height index until ActivateBestChain.
+  cdb.db.put(cfBlockIndex, blockKey(array[32, byte](idx.hash)), serializeBlockIndex(idx))
+
 proc getBlockIndex*(cdb: ChainDb, hash: BlockHash): Option[BlockIndex] =
   ## Get block index by hash
   let data = cdb.db.get(cfBlockIndex, blockKey(array[32, byte](hash)))
