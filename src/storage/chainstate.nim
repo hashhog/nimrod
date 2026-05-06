@@ -105,6 +105,15 @@ type
     # In-memory height->hash for blocks not yet flushed to RocksDB during IBD.
     # getBlockHashByHeight reads from RocksDB; this map covers the unflushed window.
     ibdHeightToHash*: Table[int32, BlockHash]
+    # Multi-block reorg atomicity: while a single-batch reorg is in progress
+    # (handleReorg), reads from getUtxo must be filtered against UTXOs that
+    # have been *staged* into the in-flight WriteBatch but not yet written
+    # to disk. Without this filter, a getUtxo cache-miss would fall through
+    # to RocksDB and return a stale (old-chain) UTXO that the staged batch
+    # has marked for deletion. See `handleReorg` (Pattern D — single-batch
+    # disconnect+reconnect, CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
+    # nil outside of handleReorg.
+    reorgDeletedUtxos*: TableRef[string, bool]
 
   ## Result type for chainstate operations
   ChainStateResult*[T] = object
@@ -434,7 +443,8 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     ibdDeletedUtxos: initTable[string, bool](),
     ibdBlocksSinceLastDiskFlush: 0,
     ibdDiskFlushInterval: IbdBatchFlushInterval,  # default: flush to disk every 2000 blocks
-    ibdHeightToHash: initTable[int32, BlockHash]()
+    ibdHeightToHash: initTable[int32, BlockHash](),
+    reorgDeletedUtxos: nil
   )
 
   # Load total work from DB if available
@@ -451,10 +461,22 @@ proc close*(cs: var ChainState) =
 proc getUtxo*(cs: ChainState, op: OutPoint): Option[UtxoEntry] =
   ## Get UTXO entry, checking cache first
   ## During IBD, also checks deletion tracking
+  ## During a single-batch reorg, also checks reorg-tentative-delete tracking
+  ## so cache-misses don't fall through to RocksDB and return UTXOs that the
+  ## in-flight batch has already marked for deletion.
+  let ck = outpointKey(op)
+
   # During IBD, check if this UTXO was deleted in the current unflushed batch
   if cs.ibdMode:
-    let ck = outpointKey(op)
     if ck in cs.ibdDeletedUtxos:
+      return none(UtxoEntry)
+
+  # During a multi-block reorg, the WriteBatch is held open across N+M blocks
+  # and not flushed to disk until the end. UTXOs that the batch has staged
+  # for deletion (created by disconnected old-chain blocks, or spent by
+  # connected new-chain blocks) must not be returned from RocksDB.
+  if cs.reorgDeletedUtxos != nil:
+    if ck in cs.reorgDeletedUtxos[]:
       return none(UtxoEntry)
 
   # Check local cache first
@@ -1111,11 +1133,41 @@ proc disconnectBlock*(cs: var ChainState, blk: Block): ChainStateResult[void] =
 
 # Handle a reorg
 
+const
+  ## Maximum reorg depth that nimrod will attempt to apply atomically.
+  ## Mirrors Bitcoin Core's MAX_REORG_LENGTH (validation.cpp) — Core
+  ## refuses to invalidate beyond this depth via `invalidateblock`. We
+  ## use the same limit as a guard rail on `handleReorg`'s single batch:
+  ## a 100-deep reorg with full undo data and bodies for both chains
+  ## fits comfortably in a RocksDB WriteBatch on commodity hardware,
+  ## while ruling out runaway batches that would exhaust memory or
+  ## block the writer thread for seconds.
+  MAX_REORG_DEPTH* = 100
+
 proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block],
                   disconnectedTxs: var seq[Transaction]): ChainStateResult[void] =
-  ## Handle a chain reorganization
-  ## 1. Disconnect blocks from current tip back to forkPoint
-  ## 2. Connect blocks in newChain
+  ## Handle a chain reorganization atomically.
+  ##
+  ## Pattern D (single-batch disconnect+reconnect): every UTXO mutation,
+  ## block-index update, undo deletion, txindex revert, txindex (re)insert,
+  ## bestblock/height/totalwork pointer update, and block-body store for
+  ## the entire N-block disconnect + M-block connect runs inside ONE
+  ## RocksDB WriteBatch. The batch is committed exactly once at the end
+  ## via `cs.db.db.write(batch)`.
+  ##
+  ## Crash semantics: a crash at any point before `db.write` returns
+  ## leaves the on-disk chainstate fully on the OLD (pre-reorg) chain —
+  ## RocksDB guarantees the WriteBatch either fully applies or not at
+  ## all. A crash AFTER `db.write` returns leaves the on-disk chainstate
+  ## fully on the NEW chain. There is no partial-reorg disk state.
+  ##
+  ## In-memory state (bestBlockHash / bestHeight / totalWork / utxoCache)
+  ## is mutated tentatively as each block is staged onto the batch. On
+  ## any error before commit, the snapshot taken at entry is restored —
+  ## no torn state escapes this proc.
+  ##
+  ## Disconnect depth is capped at MAX_REORG_DEPTH (100) to bound the
+  ## batch size and protect the writer thread.
   ##
   ## forkPoint: the last common ancestor block hash
   ## newChain: blocks to connect, in order from forkPoint+1 to new tip
@@ -1129,15 +1181,29 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   ## `disconnectpool.addForBlock` → `MaybeUpdateMempoolForReorg`
   ## (Pattern B closure for nimrod, see
   ## CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md).
+  ## Pattern D closure: see
+  ## CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md.
 
   disconnectedTxs.setLen(0)
 
-  # First, disconnect blocks from current tip to fork point
+  # Guard against re-entrant or nested reorg attempts. The single shared
+  # WriteBatch + reorgDeletedUtxos override only handles one reorg at a time.
+  if cs.reorgDeletedUtxos != nil:
+    return err("handleReorg called while another reorg is already in progress")
+
+  # First, walk back from current tip to fork point, collecting blocks
+  # and undo data we'll need. This pass does NOT mutate any state.
   var currentHash = cs.bestBlockHash
   var currentHeight = cs.bestHeight
-  var disconnectedBlocks: seq[(Block, UndoData)] = @[]
+  var disconnectedBlocks: seq[(Block, UndoData, int32)] = @[]
 
   while currentHash != forkPoint and currentHeight >= 0:
+    # Cap the disconnect depth so the single batch never grows unbounded.
+    if disconnectedBlocks.len >= MAX_REORG_DEPTH:
+      return err("reorg depth exceeds MAX_REORG_DEPTH=" & $MAX_REORG_DEPTH &
+                 " (refused to apply, current tip " & $cs.bestBlockHash &
+                 " forkPoint " & $forkPoint & ")")
+
     # Get the block to disconnect
     let blkOpt = cs.db.getBlock(currentHash)
     if blkOpt.isNone:
@@ -1150,38 +1216,248 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     if undoOpt.isNone:
       return err("missing undo data for block: " & $currentHash)
 
-    disconnectedBlocks.add((blk, undoOpt.get()))
+    disconnectedBlocks.add((blk, undoOpt.get(), currentHeight))
 
     # Move to previous block
     currentHash = blk.header.prevBlock
     dec currentHeight
 
-  # Disconnect in reverse order (from tip to fork point)
+  if currentHash != forkPoint:
+    return err("failed to reach fork point: walked back to height " &
+               $currentHeight & " hash " & $currentHash)
+
+  # ---- Snapshot in-memory state for rollback on staging error ----
+  let savedBestHash = cs.bestBlockHash
+  let savedBestHeight = cs.bestHeight
+  let savedTotalWork = cs.totalWork
+  # Table assignment in Nim copies the table contents, giving us an
+  # independent snapshot we can restore on error.
+  let savedCache = cs.utxoCache
+  let savedCacheSize = cs.cacheSize
+
+  # ---- Open the single WriteBatch for the entire reorg ----
+  let batch = cs.db.db.newWriteBatch()
+  defer: batch.destroy()
+
+  # Tentative-delete tracking so getUtxo() doesn't fall through to RocksDB
+  # and return UTXOs that the in-flight batch has marked for deletion.
+  cs.reorgDeletedUtxos = newTable[string, bool]()
+
+  template rollbackInMemory() =
+    cs.bestBlockHash = savedBestHash
+    cs.bestHeight = savedBestHeight
+    cs.totalWork = savedTotalWork
+    cs.utxoCache = savedCache
+    cs.cacheSize = savedCacheSize
+    cs.db.bestBlockHash = savedBestHash
+    cs.db.bestHeight = savedBestHeight
+    cs.reorgDeletedUtxos = nil
+    disconnectedTxs.setLen(0)
+
+  # ---- Stage all disconnects onto the shared batch ----
   var height = cs.bestHeight
-  for (blk, undo) in disconnectedBlocks:
-    # Collect non-coinbase txs from this disconnected block for caller-side
-    # mempool refill.  txIdx > 0 skips the coinbase (which is unspendable
-    # outside its own block and must not be re-admitted to the mempool).
-    # Mirrors camlcoin sync.ml:2304-2308.
+  for (blk, undo, blkHeight) in disconnectedBlocks:
+    if blkHeight != height:
+      rollbackInMemory()
+      return err("internal: disconnect height mismatch (expected " &
+                 $height & ", got " & $blkHeight & ")")
+
+    # Collect non-coinbase txs for caller-side mempool refill (Pattern B).
     for txIdx, tx in blk.txs:
       if txIdx > 0:
         disconnectedTxs.add(tx)
-    let disconnectRes = cs.disconnectBlock(blk, height, undo)
-    if not disconnectRes.isOk:
-      return err("failed to disconnect block at height " & $height & ": " & disconnectRes.error)
+
+    let headerBytes = serialize(blk.header)
+    let blockHash = BlockHash(doubleSha256(headerBytes))
+
+    # Process transactions in reverse: remove created outputs, drop tx index.
+    for txIdx in countdown(blk.txs.len - 1, 0):
+      let tx = blk.txs[txIdx]
+      let txId = tx.txid()
+      for voutIdx in 0 ..< tx.outputs.len:
+        let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
+        batch.delete(cfUtxo, key)
+        let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
+        cs.deleteUtxoCache(outpoint)
+        # Mark as tentatively deleted so a later in-batch read doesn't
+        # surface this UTXO from RocksDB.
+        cs.reorgDeletedUtxos[][outpointKey(outpoint)] = true
+      batch.delete(cfTxIndex, txIndexKey(array[32, byte](txId)))
+
+    # Restore spent outputs from undo data.
+    for (outpoint, entry) in undo.spentOutputs:
+      let key = utxoKey(array[32, byte](outpoint.txid), outpoint.vout)
+      batch.put(cfUtxo, key, serializeUtxoEntry(entry))
+      cs.putUtxoCache(outpoint, entry)
+      # If we previously marked this outpoint for tentative delete in an
+      # earlier disconnect (unlikely in a clean reorg, but possible if
+      # an old-chain block both spent and re-created the same outpoint),
+      # the put here supersedes that delete — clear the tentative flag.
+      cs.reorgDeletedUtxos[].del(outpointKey(outpoint))
+
+    # Drop legacy RocksDB undo data for this block.
+    batch.delete(cfMeta, undoKey(blockHash))
+
+    # Remove block index height mapping (the height slot will be reclaimed
+    # by the new chain's connect step).
+    batch.delete(cfBlockIndex, blockIndexKey(blkHeight))
+
+    # Subtract this block's work from the running total. Mirrors the
+    # arithmetic in the legacy disconnectBlock proc.
+    let blockWork = calculateBlockWork(blk.header.bits)
+    var newTotalWork = cs.totalWork
+    var borrow: int32 = 0
+    for i in 0 ..< 32:
+      let diff = int32(newTotalWork[i]) - int32(blockWork[i]) - borrow
+      if diff < 0:
+        newTotalWork[i] = byte((diff + 256) and 0xff)
+        borrow = 1
+      else:
+        newTotalWork[i] = byte(diff)
+        borrow = 0
+    cs.totalWork = newTotalWork
+
+    # Tentatively roll the tip pointer back one slot.
+    cs.bestBlockHash = blk.header.prevBlock
+    cs.bestHeight = blkHeight - 1
+    cs.db.bestBlockHash = blk.header.prevBlock
+    cs.db.bestHeight = blkHeight - 1
+
     dec height
 
-  # Verify we're at the fork point
   if cs.bestBlockHash != forkPoint:
-    return err("failed to reach fork point")
+    rollbackInMemory()
+    return err("failed to reach fork point after staging disconnects")
 
-  # Connect new chain
+  # ---- Stage all connects onto the same batch ----
   var newHeight = cs.bestHeight + 1
   for blk in newChain:
-    let connectRes = cs.connectBlock(blk, newHeight)
-    if not connectRes.isOk:
-      return err("failed to connect block at height " & $newHeight & ": " & connectRes.error)
+    let headerBytes = serialize(blk.header)
+    let blockHash = BlockHash(doubleSha256(headerBytes))
+
+    # Generate undo data BEFORE mutating UTXO state.
+    let undo = cs.generateUndoData(blk)
+    let blockUndo = cs.generateBlockUndo(blk)
+
+    # Write undo to flat file (rev*.dat). This is durable independent of
+    # the RocksDB batch, but committing it early is fine: on a mid-reorg
+    # crash, the rev*.dat entries become unreferenced (nothing in the
+    # block index points to them) and are inert until reclaimed.
+    var undoPos = FlatFilePos(fileNum: -1, pos: -1)
+    if blk.txs.len > 1:
+      let (pos, ok) = cs.undoMgr.writeBlockUndo(blockUndo, blk.header.prevBlock, cs.params)
+      if not ok:
+        rollbackInMemory()
+        return err("failed to write undo data for block " & $blockHash)
+      undoPos = pos
+
+    # Store full block data.
+    batch.put(cfBlocks, blockKey(array[32, byte](blockHash)), serialize(blk))
+
+    # Process each transaction.
+    for txIdx, tx in blk.txs:
+      let txId = tx.txid()
+
+      # Spend inputs (skip coinbase).
+      if txIdx > 0:
+        for input in tx.inputs:
+          let utxoOpt = cs.getUtxo(input.prevOut)
+          if utxoOpt.isNone:
+            rollbackInMemory()
+            return err("missing input during connect at height " & $newHeight &
+                       ": " & $input.prevOut.txid)
+
+          let entry = utxoOpt.get()
+
+          # Coinbase maturity check (matches connectBlock).
+          if entry.isCoinbase:
+            let age = newHeight - entry.height
+            if age < int32(cs.params.coinbaseMaturity):
+              let avCtx = buildAssumeValidContext(cs, blockHash, newHeight)
+              let skipReason = shouldSkipScripts(avCtx, cs.params)
+              if skipReason == ssrSkip:
+                warn "immature coinbase below assume-valid (allowing in reorg)",
+                     height = newHeight, coinbaseHeight = entry.height,
+                     age = age, prevTxid = $input.prevOut.txid,
+                     prevVout = input.prevOut.vout
+              else:
+                rollbackInMemory()
+                return err("immature coinbase spend during reorg at height " &
+                           $newHeight & ", coinbase height " & $entry.height &
+                           ", age " & $age & " < " & $cs.params.coinbaseMaturity)
+
+          let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
+          batch.delete(cfUtxo, key)
+          cs.deleteUtxoCache(input.prevOut)
+          cs.reorgDeletedUtxos[][outpointKey(input.prevOut)] = true
+
+      # Create outputs.
+      for voutIdx, output in tx.outputs:
+        if isUnspendable(output.scriptPubKey):
+          continue
+        let entry = UtxoEntry(
+          output: output,
+          height: newHeight,
+          isCoinbase: txIdx == 0
+        )
+        let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
+        let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
+        batch.put(cfUtxo, key, serializeUtxoEntry(entry))
+        cs.putUtxoCache(outpoint, entry)
+        # A connect creates a fresh UTXO; clear any earlier tentative-delete.
+        cs.reorgDeletedUtxos[].del(outpointKey(outpoint))
+
+      # Index transaction.
+      let loc = TxLocation(blockHash: blockHash, txIndex: uint32(txIdx))
+      batch.put(cfTxIndex, txIndexKey(array[32, byte](txId)), serializeTxLocation(loc))
+
+    # Add this block's work to the running total.
+    let blockWork = calculateBlockWork(blk.header.bits)
+    addWork(cs.totalWork, blockWork)
+
+    # Block index entry (with undo position) + height -> hash mapping.
+    let idx = BlockIndex(
+      hash: blockHash,
+      height: newHeight,
+      status: bsValidated,
+      prevHash: blk.header.prevBlock,
+      header: blk.header,
+      totalWork: cs.totalWork,
+      undoPos: undoPos
+    )
+    batch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
+    batch.put(cfBlockIndex, blockIndexKey(newHeight), @(array[32, byte](blockHash)))
+
+    # Legacy RocksDB undo (kept for backward compatibility with disconnectBlock paths).
+    batch.put(cfMeta, undoKey(blockHash), serializeUndoData(undo))
+
+    # Tentatively advance the tip pointer.
+    cs.bestBlockHash = blockHash
+    cs.bestHeight = newHeight
+    cs.db.bestBlockHash = blockHash
+    cs.db.bestHeight = newHeight
+
     inc newHeight
+
+  # Final tip pointers and totalwork live in cfMeta — write them ONCE,
+  # last, after all per-block writes are staged. On commit, RocksDB
+  # applies the whole batch atomically.
+  batch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](cs.bestBlockHash)))
+  var w = BinaryWriter()
+  w.writeInt32LE(cs.bestHeight)
+  batch.put(cfMeta, metaKey("height"), w.data)
+  batch.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
+
+  # ---- Single atomic commit ----
+  cs.db.db.write(batch)
+
+  # Clear the tentative-delete override; from here on getUtxo can read
+  # straight from RocksDB and see the post-reorg state.
+  cs.reorgDeletedUtxos = nil
+
+  # Flush cache if it grew above threshold during the reorg.
+  if cs.shouldFlush():
+    cs.flushCache()
 
   ok()
 
