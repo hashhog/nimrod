@@ -1111,13 +1111,26 @@ proc disconnectBlock*(cs: var ChainState, blk: Block): ChainStateResult[void] =
 
 # Handle a reorg
 
-proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]): ChainStateResult[void] =
+proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block],
+                  disconnectedTxs: var seq[Transaction]): ChainStateResult[void] =
   ## Handle a chain reorganization
   ## 1. Disconnect blocks from current tip back to forkPoint
   ## 2. Connect blocks in newChain
   ##
   ## forkPoint: the last common ancestor block hash
   ## newChain: blocks to connect, in order from forkPoint+1 to new tip
+  ##
+  ## disconnectedTxs (out): every non-coinbase transaction found in the
+  ## disconnected blocks, in the order Core uses for `MaybeUpdateMempoolForReorg`
+  ## (oldest-first per block, fork+1 → old tip).  Caller is responsible for
+  ## re-feeding these to the mempool via `mempool.blockDisconnected`.
+  ## Mirrors camlcoin `lib/sync.ml:2295-2363` (`disconnected_txs` ref) and
+  ## bitcoin-core `validation.cpp::DisconnectTip` →
+  ## `disconnectpool.addForBlock` → `MaybeUpdateMempoolForReorg`
+  ## (Pattern B closure for nimrod, see
+  ## CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md).
+
+  disconnectedTxs.setLen(0)
 
   # First, disconnect blocks from current tip to fork point
   var currentHash = cs.bestBlockHash
@@ -1146,6 +1159,13 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   # Disconnect in reverse order (from tip to fork point)
   var height = cs.bestHeight
   for (blk, undo) in disconnectedBlocks:
+    # Collect non-coinbase txs from this disconnected block for caller-side
+    # mempool refill.  txIdx > 0 skips the coinbase (which is unspendable
+    # outside its own block and must not be re-admitted to the mempool).
+    # Mirrors camlcoin sync.ml:2304-2308.
+    for txIdx, tx in blk.txs:
+      if txIdx > 0:
+        disconnectedTxs.add(tx)
     let disconnectRes = cs.disconnectBlock(blk, height, undo)
     if not disconnectRes.isOk:
       return err("failed to disconnect block at height " & $height & ": " & disconnectRes.error)
@@ -1164,6 +1184,15 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     inc newHeight
 
   ok()
+
+proc handleReorg*(cs: var ChainState, forkPoint: BlockHash,
+                  newChain: seq[Block]): ChainStateResult[void] =
+  ## Backwards-compatible thin wrapper that drops the disconnected-tx list.
+  ## New code paths that need mempool refill on reorg should call the
+  ## three-arg overload above and feed the result to
+  ## `mempool.blockDisconnected`.
+  var disconnectedTxs: seq[Transaction] = @[]
+  cs.handleReorg(forkPoint, newChain, disconnectedTxs)
 
 # ============================================================================
 # Legacy compatibility functions (operate on ChainDb directly)
