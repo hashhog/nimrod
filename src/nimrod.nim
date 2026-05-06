@@ -7,7 +7,7 @@ import chronicles
 
 import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
-import ./storage/[db, chainstate, snapshot]
+import ./storage/[db, chainstate, snapshot, blockstore, pruner]
 import ./network/[peer, peermanager, sync, messages]
 import ./mempool/[mempool, persist, orphan]
 import ./mining/fees
@@ -94,6 +94,16 @@ type
                                        ## ~20 min, capped at 100 entries
                                        ## globally and 25 per peer.  Mirrors
                                        ## bitcoin-core/src/node/txorphanage.
+    blockFileManager*: BlockFileManager  ## Block-file metadata holder. Wired
+                                          ## into the RPC server so
+                                          ## getblockchaininfo and
+                                          ## pruneblockchain answer correctly
+                                          ## even when block bodies live in
+                                          ## RocksDB (the production layout).
+    pruner*: Pruner                       ## Production prune driver. Owns
+                                          ## the auto-prune trigger and the
+                                          ## RocksDB-backed delete loop.
+                                          ## nil when --prune is not set.
 
 # Global for signal handling
 var globalNodeState*: NodeState = nil
@@ -246,7 +256,10 @@ Options:
   --rpcpassword=PASS     RPC password
   --bind=ADDR            P2P bind address (default: 0.0.0.0)
   --norpc                Disable RPC server
-  --prune=SIZE_MB        Enable pruning to keep SIZE_MB of blocks (min: 550)
+  --prune=SIZE_MB        Enable pruning. SIZE_MB=0 disables; SIZE_MB=1 enables
+                         manual mode (only the pruneblockchain RPC prunes;
+                         no auto-prune); SIZE_MB>=550 enables auto-prune to
+                         the given byte budget (Bitcoin Core parity).
   --ibd-flush-interval=N Force memtables to disk every N blocks during IBD (default: 2000, max: 5000)
   --verify-threads=N     Script verify thread count for parallel IBD (default: 0 = auto/CPU count)
 
@@ -347,8 +360,13 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           if pruneMiB < 0:
             echo "Invalid prune value: must be non-negative"
             quit(1)
-          elif pruneMiB > 0 and pruneMiB < 550:
-            echo "Prune configured below the minimum of 550 MiB"
+          # 0 = disabled; 1 = manual-only (Bitcoin Core sentinel); >= 550 =
+          # automatic prune. 2..549 is rejected exactly the way Core does
+          # (the manual sentinel is the only sub-floor value accepted).
+          elif pruneMiB > 1 and pruneMiB < 550:
+            echo "Prune configured below the minimum of 550 MiB " &
+                 "(use --prune=1 for manual-only mode, or --prune=N with " &
+                 "N >= 550 for auto-prune)"
             quit(1)
           result.config.pruneTarget = uint64(pruneMiB)
         except ValueError:
@@ -1455,6 +1473,33 @@ proc startNode*(config: NimrodConfig) {.async.} =
         height = state.chainState.bestHeight,
         bestBlock = $state.chainState.bestBlockHash
 
+  # 2c. Initialize block-file manager + production prune driver. Even when
+  # block bodies live in RocksDB (the production layout — flat blk*.dat
+  # files are never written), the BlockFileManager owns the prune
+  # bookkeeping (target, mode, getPruneHeight) that the RPC layer reads.
+  # The Pruner owns the actual delete loop (cfBlocks delete + rev*.dat
+  # unlink). Closes Cat-pruning RED for nimrod from
+  # CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md.
+  state.blockFileManager = newBlockFileManager(networkDir, params, state.chainState.db.db)
+  if config.pruneTarget > 0:
+    state.pruner = newPruner(
+      state.chainState,
+      state.blockFileManager,
+      params,
+      config.pruneTarget
+    )
+    let mode = case state.pruner.mode
+      of pmDisabled: "disabled"
+      of pmManualOnly: "manual-only (--prune=1)"
+      of pmAutomatic: "automatic"
+    info "prune subsystem enabled",
+         mode = mode,
+         target_bytes = state.pruner.currentTargetBytes(),
+         prune_height = state.pruner.currentPruneHeight()
+  else:
+    state.pruner = nil
+    info "prune subsystem disabled (no --prune flag)"
+
   # 3. Initialize mempool
   info "initializing mempool"
   state.mempool = newMempool(state.chainState, params)
@@ -1516,6 +1561,11 @@ proc startNode*(config: NimrodConfig) {.async.} =
       config.rpcPassword,
       cookiePass
     )
+    # Wire the BlockFileManager so getblockchaininfo and pruneblockchain
+    # answer correctly. The handler also reads `pruner` (when non-nil) for
+    # the actual delete path; see handlePruneBlockchain in src/rpc/server.nim.
+    state.rpcServer.blockFileManager = state.blockFileManager
+    state.rpcServer.pruner = state.pruner
     # Run RPC on a dedicated OS thread with its own chronos event loop so that
     # CPU-heavy block validation on the main thread does not block RPC accept
     # or response. See src/rpc/rpc_thread.nim for rationale and known v1 caveats.
@@ -1556,6 +1606,15 @@ proc startNode*(config: NimrodConfig) {.async.} =
 
     # Expire old mempool transactions periodically
     state.mempool.expire()
+
+    # Auto-prune trigger (no-op unless --prune=N with N >= 550 was set).
+    # Throttled internally by AutoPruneCheckInterval so this is cheap.
+    # Manual mode (--prune=1) is honored: autoPruneIfNeeded short-circuits.
+    if state.pruner != nil:
+      try:
+        state.pruner.autoPruneIfNeeded()
+      except CatchableError as e:
+        warn "auto-prune failed; will retry next heartbeat", error = e.msg
 
     await sleepAsync(10000)  # 10 second heartbeat
 

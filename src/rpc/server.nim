@@ -8,7 +8,7 @@ import chronicles
 import jsony
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation, chain, versionbits]
-import ../storage/[chainstate, blockstore, snapshot]
+import ../storage/[chainstate, blockstore, snapshot, pruner]
 import ../mempool/[mempool, package, persist]
 import ../crypto/[hashing, secp256k1, address, signmessage]
 import ../network/[peer, peermanager, banman, messages]
@@ -37,6 +37,10 @@ type
     running*: bool
     crypto*: CryptoEngine
     blockFileManager*: BlockFileManager  ## Optional: for pruning support
+    pruner*: Pruner                      ## Optional: production prune driver
+                                          ## (RocksDB delete loop + rev*.dat
+                                          ## unlinker). Wired by startNode
+                                          ## when --prune=N is passed.
     wallet*: Wallet                      ## Deprecated: use walletManager
     walletManager*: WalletManager        ## Multi-wallet manager
     currentWalletName*: string           ## Current request's target wallet name
@@ -293,12 +297,20 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
     of Regtest: "regtest"
     of Signet: "signet"
 
-  # Get pruning info
+  # Get pruning info. Two sources of truth:
+  #   * `pruner` (when wired) — authoritative for production prune state
+  #     (it tracks the RocksDB-backed delete loop and persists pruneHeight).
+  #   * `blockFileManager` — fallback, holds the prune-target metadata for
+  #     callers that wire bfm without a full Pruner (e.g. tests).
   var pruned = false
   var pruneHeight: int32 = -1
   var sizeOnDisk: uint64 = 0
 
-  if rpc.blockFileManager != nil:
+  if rpc.pruner != nil and rpc.pruner.isPruning:
+    pruned = true
+    pruneHeight = rpc.pruner.currentPruneHeight()
+    sizeOnDisk = rpc.pruner.estimateCurrentUsage()
+  elif rpc.blockFileManager != nil:
     pruned = rpc.blockFileManager.isPruneMode
     sizeOnDisk = rpc.blockFileManager.calculateCurrentUsage()
     if pruned:
@@ -331,8 +343,12 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   if pruned and pruneHeight >= 0:
     response["pruneheight"] = %pruneHeight
 
-  # Add prune_target_size if pruning is enabled
-  if rpc.blockFileManager != nil and rpc.blockFileManager.isPruneMode:
+  # Add prune_target_size if pruning is enabled. Prefer the Pruner's value
+  # because manual mode (--prune=1) reports the AutoPruneFloor as the
+  # underlying byte budget while signalling the manual flavor via mode.
+  if rpc.pruner != nil and rpc.pruner.isPruning:
+    response["prune_target_size"] = %rpc.pruner.currentTargetBytes()
+  elif rpc.blockFileManager != nil and rpc.blockFileManager.isPruneMode:
     response["prune_target_size"] = %rpc.blockFileManager.getPruneTarget()
 
   # Add softforks — same data source as getdeploymentinfo via buildDeployments.
@@ -3039,17 +3055,21 @@ proc handlePruneBlockchain(rpc: RpcServer, params: JsonNode): JsonNode =
   ##
   ## Arguments:
   ## 1. height (numeric, required) - The block height to prune up to
+  ##                                   (or unix timestamp >= 1e9 — Core uses
+  ##                                   GetBlockHashByTime in that case; we
+  ##                                   reject for now to avoid surprising
+  ##                                   semantics on a 4-year-history chain).
   ##
   ## Returns:
   ## The height of the last block pruned
   ##
-  ## Note: Pruning requires -prune option to be enabled
+  ## Note: Pruning requires -prune option to be enabled. Both auto-mode
+  ## (--prune=N, N >= 550) and manual-mode (--prune=1) accept this RPC; only
+  ## auto-mode runs the periodic background trigger.
 
-  if rpc.blockFileManager == nil:
-    raise newRpcError(RpcMiscError, "pruning is not enabled")
-
-  if not rpc.blockFileManager.isPruneMode:
-    raise newRpcError(RpcMiscError, "cannot prune blocks because node is not in prune mode")
+  if rpc.pruner == nil or not rpc.pruner.isPruning:
+    raise newRpcError(RpcMiscError,
+      "Cannot prune blocks because node is not in prune mode.")
 
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing height parameter")
@@ -3058,39 +3078,25 @@ proc handlePruneBlockchain(rpc: RpcServer, params: JsonNode): JsonNode =
   let chainHeight = rpc.chainState.bestHeight
 
   if targetHeight < 0:
-    raise newRpcError(RpcInvalidParams, "height must be non-negative")
+    raise newRpcError(RpcInvalidParams, "Negative block height.")
 
-  if targetHeight > chainHeight - MinBlocksToKeep:
+  # Bitcoin Core convention: a value >= 1_000_000_000 is interpreted as a
+  # unix timestamp. We don't support that variant yet — be explicit so the
+  # operator gets a useful error rather than silently pruning the genesis.
+  if targetHeight >= 1_000_000_000:
     raise newRpcError(RpcInvalidParams,
-      "Blockchain is shorter than the target height - " & $MinBlocksToKeep & " blocks")
+      "Could not find block with at least the specified timestamp.")
 
-  # Helper to get block hashes in a file
-  proc getBlockHashesInFile(fileNum: int32): seq[BlockHash] =
-    result = @[]
-    # Iterate through known heights and find blocks in this file
-    # This is a simplified approach - in production we'd use an index
-    let infoOpt = rpc.blockFileManager.loadFileInfo(fileNum)
-    if infoOpt.isSome:
-      let info = infoOpt.get()
-      for height in int32(info.nHeightFirst) .. int32(info.nHeightLast):
-        let hashOpt = rpc.chainState.db.getBlockHashByHeight(height)
-        if hashOpt.isSome:
-          let entry = rpc.blockFileManager.getBlockIndex(hashOpt.get())
-          if entry.isSome and entry.get().fileNum == fileNum:
-            result.add(hashOpt.get())
+  if targetHeight > chainHeight:
+    raise newRpcError(RpcInvalidParams,
+      "Blockchain is shorter than the attempted prune height.")
 
-  let (filesToPrune, prunedCount) = rpc.blockFileManager.findFilesToPruneManual(
-    int32(targetHeight),
-    chainHeight,
-    getBlockHashesInFile
-  )
-
-  # Delete the pruned files
-  rpc.blockFileManager.unlinkPrunedFiles(filesToPrune)
-
-  # Return the last pruned height
-  let pruneHeight = rpc.blockFileManager.getPruneHeight()
-  %pruneHeight
+  # Core caps the requested height at tip - MIN_BLOCKS_TO_KEEP via a warning
+  # log, but still allows the call (the FindFilesToPruneManual safety floor
+  # short-circuits any over-aggressive request). We do the same — let the
+  # pruner clamp internally.
+  let newPruneHeight = rpc.pruner.pruneToHeight(int32(targetHeight))
+  %newPruneHeight
 
 # ============================================================================
 # assumeUTXO / Snapshot RPCs

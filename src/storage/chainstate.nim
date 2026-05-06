@@ -154,7 +154,7 @@ proc outpointKey(op: OutPoint): string =
 
 # Serialization for BlockIndex
 
-proc serializeBlockIndex(idx: BlockIndex): seq[byte] =
+proc serializeBlockIndex*(idx: BlockIndex): seq[byte] =
   var w = BinaryWriter()
   w.writeBlockHash(idx.hash)
   w.writeInt32LE(idx.height)
@@ -170,7 +170,7 @@ proc serializeBlockIndex(idx: BlockIndex): seq[byte] =
   w.writeInt32LE(idx.sequenceId)
   w.data
 
-proc deserializeBlockIndex(data: seq[byte]): BlockIndex =
+proc deserializeBlockIndex*(data: seq[byte]): BlockIndex =
   var r = BinaryReader(data: data, pos: 0)
   result.hash = r.readBlockHash()
   result.height = r.readInt32LE()
