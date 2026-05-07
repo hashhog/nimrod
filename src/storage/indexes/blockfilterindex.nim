@@ -21,8 +21,10 @@ import std/[options, os, streams, strformat]
 import ./base
 import ./gcs
 import ../db
+import ../undo as chainundo
 import ../../primitives/[types, serialize]
 import ../../crypto/hashing
+import chronicles
 
 type
   ## Filter metadata stored in database
@@ -350,3 +352,85 @@ proc getFilterHash*(idx: BlockFilterIndex, height: int32): Option[array[32, byte
   if entryOpt.isNone:
     return none(array[32, byte])
   some(entryOpt.get().filterHash)
+
+# ============================================================================
+# Block-connect / IBD-backfill entry points
+# ============================================================================
+#
+# These are the population hooks called by the consensus pipeline whenever a
+# block is connected to the active chain (live IBD, P2P sync, RPC submitblock,
+# regtest mining, genesis init, post-startup catchup).  They translate from
+# nimrod's `storage/undo.BlockUndo` (the chainstate-side type) into the
+# `storage/indexes/base.BlockInfo` shape that `customAppend` consumes, and
+# then go through `processBlock` so `bestBlockHash`/`bestHeight` advance
+# atomically with the filter write.
+#
+# Reference: bitcoin-core/src/index/blockfilterindex.cpp::CustomAppend +
+# bitcoin-core/src/index/base.cpp::BaseIndex::ConnectBlock.
+
+proc convertBlockUndo(src: chainundo.BlockUndo): base.BlockUndo =
+  ## Convert chainstate-side BlockUndo (storage/undo.BlockUndo) to the
+  ## index-side BlockUndo (storage/indexes/base.BlockUndo).  The two types
+  ## are field-compatible but distinct (base.nim defines its own to avoid
+  ## a circular import on the chainstate module).
+  result.txUndo = newSeq[base.TxUndo](src.txUndo.len)
+  for i, srcTx in src.txUndo:
+    var dstTx = base.TxUndo()
+    dstTx.prevOutputs = newSeq[base.SpentOutput](srcTx.prevOutputs.len)
+    for j, srcSpent in srcTx.prevOutputs:
+      dstTx.prevOutputs[j] = base.SpentOutput(
+        output: srcSpent.output,
+        height: srcSpent.height,
+        isCoinbase: srcSpent.isCoinbase
+      )
+    result.txUndo[i] = dstTx
+
+proc addBlock*(idx: BlockFilterIndex, blk: Block, blockHash: BlockHash,
+               height: int32, blockUndo: chainundo.BlockUndo): bool =
+  ## Index a single block: compute + persist its BIP-158 basic filter,
+  ## advance the index's best-block tracker.  Safe to no-op when the index
+  ## is disabled or already past `height`; callers do NOT need to gate.
+  ##
+  ## Mirrors Bitcoin Core's BaseIndex::ConnectBlock → CustomAppend →
+  ## SetBestBlockIndex sequence.  The combined `processBlock` call writes
+  ## both the filter entry AND the bestBlockKey/bestHeightKey in two
+  ## separate batches; if the second fails, the index will re-pick-up the
+  ## same height on next start (idempotent — `customAppend` overwrites the
+  ## same height key, and the flat-file fltr*.dat appends a duplicate
+  ## record that is then orphaned by the new metadata pointer).
+  if idx == nil or not idx.enabled:
+    return true
+
+  # Skip blocks already indexed.  The IBD backfill loop in the daemon may
+  # call this for a contiguous range; the live-sync hook calls it block by
+  # block.  Either way we only ever advance.
+  if height <= idx.bestHeight:
+    return true
+
+  let info = base.BlockInfo(
+    hash: blockHash,
+    prevHash: blk.header.prevBlock,
+    height: height,
+    data: some(blk),
+    undoData: some(convertBlockUndo(blockUndo)),
+    fileNum: 0,
+    dataPos: 0
+  )
+
+  try:
+    if not idx.processBlock(info):
+      warn "blockfilterindex: customAppend failed",
+           height = height, hash = $blockHash
+      return false
+  except CatchableError as e:
+    warn "blockfilterindex: addBlock raised, skipping",
+         height = height, hash = $blockHash, error = e.msg
+    return false
+  except Exception as e:
+    # Defensive: index dispatch goes through a `method`, which Nim cannot
+    # raises-track, so a missing handler below in the implementation could
+    # surface as a bare `Exception`.  Keep the connect-block path live.
+    warn "blockfilterindex: addBlock raised non-Catchable, skipping",
+         height = height, hash = $blockHash, error = e.msg
+    return false
+  true

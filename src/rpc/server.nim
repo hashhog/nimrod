@@ -9,6 +9,7 @@ import jsony
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation, chain, versionbits]
 import ../storage/[chainstate, blockstore, snapshot, pruner]
+import ../storage/indexes/blockfilterindex
 import ../mempool/[mempool, package, persist]
 import ../crypto/[hashing, secp256k1, address, signmessage]
 import ../network/[peer, peermanager, banman, messages]
@@ -53,6 +54,9 @@ type
                                          ## rpc/blockchain.cpp::dumptxoutset.
     startedAt*: int64                    ## Unix timestamp when this RpcServer was created;
                                          ## used by the `uptime` RPC.
+    filterIndex*: BlockFilterIndex       ## Optional BIP-157 basic block-filter index;
+                                         ## populated alongside connectBlock in submitblock.
+                                         ## Wired by startNode when --blockfilterindex is set.
 
   RpcRequest = object
     jsonrpc: string
@@ -2111,6 +2115,15 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       elif not useIBD and cs.ibdMode:
         cs.stopIBD()
 
+      # Capture undo BEFORE connect mutates the UTXO cache (BIP-157
+      # filter elements need spent-prevout scriptPubKeys; the IBD fast
+      # path does not write undo to disk).  No-op when filter index is
+      # off, so cost is paid only when --blockfilterindex is enabled.
+      var undoForFilter = chainstate.BlockUndo()
+      let captureUndo = rpc.filterIndex != nil and rpc.filterIndex.enabled
+      if captureUndo:
+        undoForFilter = cs.generateBlockUndo(blk)
+
       let connectResult = if cs.ibdMode:
                             cs.connectBlockIBD(blk, height)
                           else:
@@ -2119,6 +2132,12 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       if not connectResult.isOk:
         # Map chainstate error string to BIP-22 token
         return %bip22ChainError(connectResult.error)
+
+      # BIP-157 filter index population (no-op when nil/disabled).
+      if captureUndo:
+        let bHdr = serialize(blk.header)
+        let bHash = BlockHash(doubleSha256(bHdr))
+        discard rpc.filterIndex.addBlock(blk, bHash, height, undoForFilter)
 
       if not cs.ibdMode:
         # Remove confirmed transactions from mempool
