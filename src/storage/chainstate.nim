@@ -8,6 +8,7 @@ import ./db
 import ./undo
 import ../primitives/[types, serialize]
 import ../crypto/hashing
+import ../crypto/muhash
 import ../consensus/params
 import ../consensus/assumevalid
 import chronicles
@@ -911,6 +912,163 @@ proc scrubUnspendable*(cs: var ChainState):
   result.bytesFreed = bytesFreed
   info "scrubunspendable: removed entries",
        removed = result.removed, bytesFreed = result.bytesFreed
+
+# ============================================================================
+# gettxoutsetinfo — UTXO set walk + Core-byte-parity statistics
+# ============================================================================
+#
+# Mirrors `bitcoin-core/src/kernel/coinstats.cpp::ComputeUTXOStats`. The
+# canonical iteration order is "raw txid bytes ascending, then vout
+# ascending"; nimrod's UTXO key is `txid(32) || vout(4 BE)` which sorts
+# lexicographically the same way RocksDB walks `cfUtxo`, so a forward
+# cursor walk yields Core's exact ordering.
+#
+# Per-tx grouping: Core's `ApplyHash` rebuilds a `std::map<uint32_t, Coin>`
+# keyed on vout for each txid. Since vout-asc cursor order == numeric-asc
+# map order for our 4-BE encoding, we can stream every (outpoint, coin)
+# pair through a single `HashWriter` (SHA256d) directly without
+# rebuffering by txid — the resulting digest is byte-identical to Core's
+# `hash_serialized_3`.
+#
+# Hash type:
+#   * `hash_serialized_3` — `HashWriter` (SHA256d) over canonical TxOutSer.
+#     This is the historical `gettxoutsetinfo` default.
+#   * `hash_serialized_2` — emitted as an alias to `hash_serialized_3` for
+#     compatibility with the cross-impl diff-test harness, which checks
+#     `_2` first before falling back to `_3` / `hash_serialized`.
+#   * `muhash` — `MuHash3072`. Order-independent, computed via the same
+#     TxOutSer byte stream (`bitcoin-core/src/kernel/coinstats.cpp:58-63`).
+#   * `none` — skip the hash, just return counts/totals.
+#
+# WARNING: same as Core's coinstats.cpp comment — the byte stream fed
+# through these hashes is exactly `serializeCoinForHash` (= TxOutSer).
+# Changing that layout invalidates assumeutxo commitments and snapshot
+# round-trip tests.
+
+type
+  CoinStatsHashType* = enum
+    cshtNone
+    cshtHashSerialized   ## SHA256d HashWriter (Core's hash_serialized_3)
+    cshtMuHash           ## MuHash3072 (gettxoutsetinfo hash_type=muhash)
+
+  UtxoSetInfo* = object
+    height*: int32
+    bestBlock*: BlockHash
+    transactions*: uint64    ## distinct txids with at least one UTXO
+    txOuts*: uint64          ## total number of UTXOs
+    bogosize*: uint64        ## Core's database-independent size estimate
+    totalAmount*: int64      ## sum of all UTXO values (satoshi)
+    hashType*: CoinStatsHashType
+    hashSerialized*: array[32, byte]  ## populated when hashType != cshtNone
+
+proc bogoSizeFor(scriptPubKeyLen: int): uint64 =
+  ## Mirrors `bitcoin-core/src/kernel/coinstats.cpp::GetBogoSize`:
+  ##   32 (txid) + 4 (vout) + 4 (height|coinbase) + 8 (amount) +
+  ##   2 (scriptPubKey len) + scriptPubKey.size().
+  uint64(32 + 4 + 4 + 8 + 2 + scriptPubKeyLen)
+
+proc computeUtxoSetInfo*(cs: var ChainState,
+                         hashType: CoinStatsHashType): UtxoSetInfo =
+  ## Walk the entire UTXO set and return Core-parity stats.
+  ##
+  ## Order: forward `cfUtxo` cursor (raw txid bytes asc, then vout asc).
+  ## This matches `ComputeUTXOStats` (`coinstats.cpp:111-146`).
+  ##
+  ## Pre-walk: flush in-memory state to disk so the cursor sees the
+  ## authoritative UTXO set. In IBD mode this drains the pending
+  ## WriteBatch and the deletion-tracking table; in steady-state it
+  ## flushes the read cache (a no-op if all entries are already on disk).
+  ## Without this, freshly-connected blocks would either be missed
+  ## (entries only in cache) or double-counted (entries pending in
+  ## ibdDeletedUtxos that still exist on disk).
+  if cs.ibdMode:
+    cs.flushIBDBatch()
+  else:
+    cs.flushCache()
+
+  result.height = cs.bestHeight
+  result.bestBlock = cs.bestBlockHash
+  result.hashType = hashType
+
+  var hw = initHashWriter()
+  var muh = newMuHash3072()
+
+  # Genesis-coinbase filter: Bitcoin Core skips ConnectBlock entirely for
+  # the genesis block (`validation.cpp:2337-2343`), so the genesis
+  # coinbase output never enters Core's UTXO set. nimrod DOES connect
+  # the genesis block via `connectBlock(genesis, 0)`, so the coin is
+  # persisted in cfUtxo. To match Core's `gettxoutsetinfo` byte-for-byte
+  # we filter it out here at read time. `createSnapshot` (snapshot.nim)
+  # applies the same filter at dump time for the same reason.
+  let genesisCoinbaseTxid = buildGenesisBlock(cs.params).txs[0].txid()
+  let genesisTxidBytes = array[32, byte](genesisCoinbaseTxid)
+
+  # Track distinct-tx count by detecting txid transitions in cursor order.
+  var sawAny = false
+  var prevTxidBytes: array[32, byte]
+
+  for (key, value) in cs.db.db.iterCf(cfUtxo):
+    if key.len != 36:
+      # Defensive: skip malformed entries rather than abort the walk.
+      continue
+    var entry: UtxoEntry
+    try:
+      entry = deserializeUtxoEntry(value)
+    except CatchableError:
+      continue
+
+    # Skip provably unspendable entries that may persist on legacy
+    # datadirs (pre-94b7755 chainstates carry orphan OP_RETURN coins
+    # from segwit witness-commitment outputs). Core's `AddCoins` filters
+    # these at write time so its UTXO walk never sees them; we mirror
+    # that by filtering at read time too. `scrubUnspendable` is the
+    # idempotent operator tool for permanent removal.
+    if isUnspendable(entry.output.scriptPubKey):
+      continue
+
+    # Reconstruct the outpoint from the 36-byte key (txid(32) || vout(4 BE)).
+    var txidBytes: array[32, byte]
+    copyMem(addr txidBytes[0], unsafeAddr key[0], 32)
+
+    # Skip the genesis coinbase — never in Core's UTXO set (see comment above).
+    if entry.height == 0 and entry.isCoinbase and txidBytes == genesisTxidBytes:
+      continue
+    let vout = (uint32(key[32]) shl 24) or
+               (uint32(key[33]) shl 16) or
+               (uint32(key[34]) shl 8)  or
+                uint32(key[35])
+    let outpoint = OutPoint(txid: TxId(txidBytes), vout: vout)
+
+    # Distinct-tx count: increment whenever the leading 32 bytes change.
+    if not sawAny or txidBytes != prevTxidBytes:
+      inc result.transactions
+      prevTxidBytes = txidBytes
+      sawAny = true
+
+    inc result.txOuts
+    result.bogosize += bogoSizeFor(entry.output.scriptPubKey.len)
+    result.totalAmount += int64(entry.output.value)
+
+    if hashType != cshtNone:
+      let coinBytes = serializeCoinForHash(
+        outpoint, int64(entry.output.value), entry.output.scriptPubKey,
+        entry.height, entry.isCoinbase)
+      case hashType
+      of cshtHashSerialized:
+        hw.update(coinBytes)
+      of cshtMuHash:
+        muh.insert(coinBytes)
+      of cshtNone: discard
+
+  case hashType
+  of cshtHashSerialized:
+    if result.txOuts > 0:
+      result.hashSerialized = hw.finalizeHash()
+    else:
+      result.hashSerialized = default(array[32, byte])
+  of cshtMuHash:
+    result.hashSerialized = muh.finalize()
+  of cshtNone: discard
 
 proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainStateResult[void] =
   ## Fast-path block connection for IBD
