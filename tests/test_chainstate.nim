@@ -1281,3 +1281,131 @@ suite "handleReorg single-batch atomicity (Pattern D)":
       check cs2.bestHeight == preTipHeight
       cs2.close()
 
+# ============================================================================
+# disconnectHook firing tests (BIP-157 Phase 2 reorg-aware filter chain)
+# ============================================================================
+# The chainstate disconnectHook is wired by src/nimrod.nim when
+# --blockfilterindex is enabled, and fires after legacy disconnectBlock
+# and Pattern-D handleReorg.  These tests use a simple recording closure
+# in lieu of the real BlockFilterIndex so we exercise the chainstate
+# wiring without dragging the index module into the chainstate test suite.
+#
+# Index-side behavior of `removeBlock` itself (the function the hook
+# wraps in the daemon) is covered by tests/test_blockfilter.nim.
+
+suite "ChainState disconnectHook (BIP-157 reorg-aware filter chain)":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "disconnectBlock fires hook with (hash, prevHash, height)":
+    var cs = newChainState(TestDbPath, regtestParams())
+    # Build chain to maturity so we can spend the genesis coinbase.
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+    let coinbaseTxid = genesis.txs[0].txid()
+    var prevHash = genesisHash
+    for h in 1 ..< 100:
+      let blk = makeSimpleBlock(prevHash, int32(h))
+      discard cs.connectBlock(blk, int32(h))
+      prevHash = getBlockHash(blk)
+    let parentOfSpendBlock = prevHash
+    let spendTx = makeTestTransaction(coinbaseTxid, 0, 4999000000, false)
+    let coinbase = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true)
+    let spendBlock = makeTestBlock(parentOfSpendBlock, 100, @[coinbase, spendTx])
+    discard cs.connectBlock(spendBlock, 100)
+    let spendBlockHash = getBlockHash(spendBlock)
+    let undo = cs.db.getUndoData(spendBlockHash).get()
+
+    # Recording hook: capture every (hash, prev, height) the chainstate
+    # fires.  We use a global var so the closure-cycle warning the daemon
+    # path also surfaces is avoided here (test is single-threaded).
+    var calls {.global.}: seq[tuple[hash: BlockHash, prev: BlockHash, height: int32]] = @[]
+    calls.setLen(0)
+    cs.disconnectHook = proc(h: BlockHash, p: BlockHash,
+                             ht: int32) {.raises: [].} =
+      calls.add((h, p, ht))
+
+    let r = cs.disconnectBlock(spendBlock, 100, undo)
+    check r.isOk
+
+    # Hook must have been called exactly once with the right args.
+    check calls.len == 1
+    check calls[0].hash == spendBlockHash
+    check calls[0].prev == parentOfSpendBlock
+    check calls[0].height == 100
+
+    cs.close()
+
+  test "disconnectBlock with nil hook does not crash (default-init)":
+    var cs = newChainState(TestDbPath, regtestParams())
+    check cs.disconnectHook == nil
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+    var prevHash = genesisHash
+    for h in 1 ..< 100:
+      let blk = makeSimpleBlock(prevHash, int32(h))
+      discard cs.connectBlock(blk, int32(h))
+      prevHash = getBlockHash(blk)
+    let parent = prevHash
+    let cb = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true)
+    let blk100 = makeTestBlock(parent, 100, @[cb])
+    discard cs.connectBlock(blk100, 100)
+    let blk100Hash = getBlockHash(blk100)
+    let undo = cs.db.getUndoData(blk100Hash).get()
+    # Hook is nil; chainstate must not call through nil.
+    let r = cs.disconnectBlock(blk100, 100, undo)
+    check r.isOk
+    check cs.bestHeight == 99
+    cs.close()
+
+  test "handleReorg fires hook for every disconnected block in tip-to-fork order":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    # Active chain: genesis -> 1A -> 2A.
+    let block1A = makeSimpleBlock(genesisHash, 1)
+    discard cs.connectBlock(block1A, 1)
+    let block1AHash = getBlockHash(block1A)
+    let block2A = makeSimpleBlock(block1AHash, 2)
+    discard cs.connectBlock(block2A, 2)
+    let block2AHash = getBlockHash(block2A)
+    check cs.bestHeight == 2
+
+    # Side chain (more work): 1B, 2B, 3B.
+    let block1B = makeSimpleBlock(genesisHash, 1, extra = 1)
+    let block1BHash = getBlockHash(block1B)
+    let block2B = makeSimpleBlock(block1BHash, 2, extra = 1)
+    let block2BHash = getBlockHash(block2B)
+    let block3B = makeSimpleBlock(block2BHash, 3, extra = 1)
+
+    var calls {.global.}: seq[tuple[hash: BlockHash, prev: BlockHash, height: int32]] = @[]
+    calls.setLen(0)
+    cs.disconnectHook = proc(h: BlockHash, p: BlockHash,
+                             ht: int32) {.raises: [].} =
+      calls.add((h, p, ht))
+
+    let r = cs.handleReorg(genesisHash, @[block1B, block2B, block3B])
+    check r.isOk
+    check cs.bestHeight == 3
+
+    # Hook fired for both disconnected blocks (2A first — tip — then 1A),
+    # in tip→fork order matching Core's per-block BlockDisconnected fan-out.
+    check calls.len == 2
+    check calls[0].hash == block2AHash
+    check calls[0].prev == block1AHash
+    check calls[0].height == 2
+    check calls[1].hash == block1AHash
+    check calls[1].prev == genesisHash
+    check calls[1].height == 1
+
+    cs.close()
+
+

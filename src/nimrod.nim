@@ -1646,6 +1646,22 @@ proc startNode*(config: NimrodConfig) {.async.} =
     info "initializing blockfilterindex (basic)"
     state.blockFilterIndex = newBlockFilterIndex(
       state.chainState.db.db, networkDir, bftBasic, enabled = true)
+    # Wire BIP-157 reorg-aware filter chain: when the chainstate disconnects
+    # a block (legacy disconnectBlock or Pattern-D handleReorg), roll the
+    # filter index back symmetrically.  The hook runs AFTER the chainstate
+    # batch commits.  Mirrors bitcoin-core's BaseIndex::BlockDisconnected.
+    let filterIdx = state.blockFilterIndex
+    state.chainState.disconnectHook = proc(blockHash: BlockHash,
+                                           prevHash: BlockHash,
+                                           height: int32) {.raises: [].} =
+      try:
+        discard filterIdx.removeBlock(blockHash, prevHash, height)
+      except CatchableError as e:
+        warn "blockfilterindex: disconnectHook removeBlock raised, continuing",
+             height = height, hash = $blockHash, error = e.msg
+      except Exception as e:
+        warn "blockfilterindex: disconnectHook removeBlock raised non-Catchable, continuing",
+             height = height, hash = $blockHash, error = e.msg
   else:
     state.blockFilterIndex = nil
 
