@@ -650,66 +650,91 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   # Store full block data
   batch.put(cfBlocks, blockKey(array[32, byte](blockHash)), serialize(blk))
 
-  # Process each transaction
-  for txIdx, tx in blk.txs:
-    let txId = tx.txid()
+  # Genesis block: skip transaction connection.
+  #
+  # Bitcoin Core special-cases the genesis block at the top of `ConnectBlock`
+  # (`bitcoin-core/src/validation.cpp:2337-2343`) and returns early without
+  # touching the UTXO set:
+  #
+  #     if (block.GetHash() == m_chainman.GetParams()
+  #             .GetConsensus().hashGenesisBlock) {
+  #         if (!fJustCheck)
+  #             view.SetBestBlock(pindex->GetBlockHash());
+  #         return true;
+  #     }
+  #
+  # Consequently the genesis coinbase output is unspendable and never
+  # enters Core's chainstate. Without this guard, `connectBlock(genesis, 0)`
+  # would write the genesis coinbase to `cfUtxo` and `gettxoutsetinfo` /
+  # `dumptxoutset` would diverge from Core by one coin (W12 + W14).
+  #
+  # We still write the block index entry, totalWork, best-block pointer,
+  # and full-block storage below — that bookkeeping is what `connectBlock`
+  # needs to set up the chain tip, equivalent to the post-skip codepath in
+  # Core's `ConnectTip` (`view.SetBestBlock` + the pindex flag updates).
+  if height == 0:
+    discard
+  else:
+    # Process each transaction
+    for txIdx, tx in blk.txs:
+      let txId = tx.txid()
 
-    # Spend inputs (skip coinbase which has no inputs to spend)
-    if txIdx > 0:
-      for input in tx.inputs:
-        let utxoOpt = cs.getUtxo(input.prevOut)
-        if utxoOpt.isNone:
-          return err("missing input: " & $input.prevOut.txid)
+      # Spend inputs (skip coinbase which has no inputs to spend)
+      if txIdx > 0:
+        for input in tx.inputs:
+          let utxoOpt = cs.getUtxo(input.prevOut)
+          if utxoOpt.isNone:
+            return err("missing input: " & $input.prevOut.txid)
 
-        let entry = utxoOpt.get()
+          let entry = utxoOpt.get()
 
-        # Check coinbase maturity
-        if entry.isCoinbase:
-          let age = height - entry.height
-          if age < int32(cs.params.coinbaseMaturity):
-            # Use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
-            # The maturity bypass only applies when the block is on the
-            # assumed-valid chain (ancestor check) — NOT a plain height check.
-            let avCtx = buildAssumeValidContext(cs, blockHash, height)
-            let skipReason = shouldSkipScripts(avCtx, cs.params)
-            if skipReason == ssrSkip:
-              warn "immature coinbase below assume-valid (allowing)",
-                   height = height, coinbaseHeight = entry.height,
-                   age = age, prevTxid = $input.prevOut.txid,
-                   prevVout = input.prevOut.vout
-            else:
-              return err("immature coinbase spend at height " & $height &
-                        ", coinbase height " & $entry.height &
-                        ", age " & $age & " < " & $cs.params.coinbaseMaturity)
+          # Check coinbase maturity
+          if entry.isCoinbase:
+            let age = height - entry.height
+            if age < int32(cs.params.coinbaseMaturity):
+              # Use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
+              # The maturity bypass only applies when the block is on the
+              # assumed-valid chain (ancestor check) — NOT a plain height check.
+              let avCtx = buildAssumeValidContext(cs, blockHash, height)
+              let skipReason = shouldSkipScripts(avCtx, cs.params)
+              if skipReason == ssrSkip:
+                warn "immature coinbase below assume-valid (allowing)",
+                     height = height, coinbaseHeight = entry.height,
+                     age = age, prevTxid = $input.prevOut.txid,
+                     prevVout = input.prevOut.vout
+              else:
+                return err("immature coinbase spend at height " & $height &
+                          ", coinbase height " & $entry.height &
+                          ", age " & $age & " < " & $cs.params.coinbaseMaturity)
 
-        # Delete from DB and cache
-        let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
-        batch.delete(cfUtxo, key)
-        cs.deleteUtxoCache(input.prevOut)
+          # Delete from DB and cache
+          let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
+          batch.delete(cfUtxo, key)
+          cs.deleteUtxoCache(input.prevOut)
 
-    # Create outputs
-    for voutIdx, output in tx.outputs:
-      # Skip provably unspendable outputs (OP_RETURN, oversized scripts).
-      # Mirrors `AddCoins` in bitcoin-core/src/coins.cpp which calls
-      # `IsUnspendable()` (script.h:563) and never adds them to the UTXO
-      # set. Without this filter, dumptxoutset emits 2x the coin count
-      # for any chain whose coinbases carry the segwit witness-commitment
-      # OP_RETURN output.
-      if isUnspendable(output.scriptPubKey):
-        continue
-      let entry = UtxoEntry(
-        output: output,
-        height: height,
-        isCoinbase: txIdx == 0
-      )
-      let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
-      let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
-      batch.put(cfUtxo, key, serializeUtxoEntry(entry))
-      cs.putUtxoCache(outpoint, entry)
+      # Create outputs
+      for voutIdx, output in tx.outputs:
+        # Skip provably unspendable outputs (OP_RETURN, oversized scripts).
+        # Mirrors `AddCoins` in bitcoin-core/src/coins.cpp which calls
+        # `IsUnspendable()` (script.h:563) and never adds them to the UTXO
+        # set. Without this filter, dumptxoutset emits 2x the coin count
+        # for any chain whose coinbases carry the segwit witness-commitment
+        # OP_RETURN output.
+        if isUnspendable(output.scriptPubKey):
+          continue
+        let entry = UtxoEntry(
+          output: output,
+          height: height,
+          isCoinbase: txIdx == 0
+        )
+        let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
+        let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
+        batch.put(cfUtxo, key, serializeUtxoEntry(entry))
+        cs.putUtxoCache(outpoint, entry)
 
-    # Index transaction
-    let loc = TxLocation(blockHash: blockHash, txIndex: uint32(txIdx))
-    batch.put(cfTxIndex, txIndexKey(array[32, byte](txId)), serializeTxLocation(loc))
+      # Index transaction
+      let loc = TxLocation(blockHash: blockHash, txIndex: uint32(txIdx))
+      batch.put(cfTxIndex, txIndexKey(array[32, byte](txId)), serializeTxLocation(loc))
 
   # Calculate and add work
   let blockWork = calculateBlockWork(blk.header.bits)
@@ -1683,37 +1708,45 @@ proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
   # Store full block data
   batch.put(cfBlocks, blockKey(array[32, byte](blockHash)), serialize(blk))
 
-  # Process each transaction
-  for txIdx, tx in blk.txs:
-    let txId = tx.txid()
+  # Genesis block: skip transaction connection — see `connectBlock` (above)
+  # for the full rationale and Bitcoin Core reference
+  # (`validation.cpp:2337-2343`). Without this guard, the legacy applyBlock
+  # path (still used from network/sync.nim:1162) would write the genesis
+  # coinbase into cfUtxo and re-introduce the W12/W14 divergence.
+  if height == 0:
+    discard
+  else:
+    # Process each transaction
+    for txIdx, tx in blk.txs:
+      let txId = tx.txid()
 
-    # Spend inputs (skip coinbase which has no inputs to spend)
-    if txIdx > 0:
-      for input in tx.inputs:
-        let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
-        batch.delete(cfUtxo, key)
+      # Spend inputs (skip coinbase which has no inputs to spend)
+      if txIdx > 0:
+        for input in tx.inputs:
+          let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
+          batch.delete(cfUtxo, key)
+          discard  # Cache removed — ChainState layer handles caching
+
+      # Create outputs
+      for voutIdx, output in tx.outputs:
+        # Skip provably unspendable outputs (OP_RETURN, oversized scripts) —
+        # mirrors AddCoins in bitcoin-core/src/coins.cpp.
+        if isUnspendable(output.scriptPubKey):
+          continue
+        let entry = UtxoEntry(
+          output: output,
+          height: height,
+          isCoinbase: txIdx == 0
+        )
+        let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
+        batch.put(cfUtxo, key, serializeUtxoEntry(entry))
+
+        let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
         discard  # Cache removed — ChainState layer handles caching
 
-    # Create outputs
-    for voutIdx, output in tx.outputs:
-      # Skip provably unspendable outputs (OP_RETURN, oversized scripts) —
-      # mirrors AddCoins in bitcoin-core/src/coins.cpp.
-      if isUnspendable(output.scriptPubKey):
-        continue
-      let entry = UtxoEntry(
-        output: output,
-        height: height,
-        isCoinbase: txIdx == 0
-      )
-      let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
-      batch.put(cfUtxo, key, serializeUtxoEntry(entry))
-
-      let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
-      discard  # Cache removed — ChainState layer handles caching
-
-    # Index transaction
-    let loc = TxLocation(blockHash: blockHash, txIndex: uint32(txIdx))
-    batch.put(cfTxIndex, txIndexKey(array[32, byte](txId)), serializeTxLocation(loc))
+      # Index transaction
+      let loc = TxLocation(blockHash: blockHash, txIndex: uint32(txIdx))
+      batch.put(cfTxIndex, txIndexKey(array[32, byte](txId)), serializeTxLocation(loc))
 
   # Create block index entry
   let idx = BlockIndex(

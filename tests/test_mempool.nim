@@ -294,17 +294,21 @@ suite "Mempool fee policy":
     var mp = newMempool(cs, params, minFeeRate = 10.0)  # High fee rate required
     let crypto = newCryptoEngine()
 
-    # Build chain with spendable coinbase
+    # Build chain with spendable coinbase. Genesis (h=0) writes no UTXO per
+    # W14 / Core parity, so use the h=1 coinbase as the spendable seed.
     let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
     discard cs.connectBlock(genesis, 0)
-    var prevHash = getBlockHash(genesis)
+    let genesisHash = getBlockHash(genesis)
+    let block1 = makeSimpleBlock(genesisHash, 1)
+    discard cs.connectBlock(block1, 1)
+    var prevHash = getBlockHash(block1)
 
-    for h in 1 .. 100:
+    for h in 2 .. 101:
       let blk = makeSimpleBlock(prevHash, int32(h))
       discard cs.connectBlock(blk, int32(h))
       prevHash = getBlockHash(blk)
 
-    let coinbaseTxid = genesis.txs[0].txid()
+    let coinbaseTxid = block1.txs[0].txid()
 
     # Create tx with very low fee (spending 5 BTC, outputting 4.999999 BTC = 1 sat fee)
     let tx = makeSpendTx(coinbaseTxid, 0, 4_999_999_999)
