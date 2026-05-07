@@ -1508,3 +1508,229 @@ suite "importdescriptors RPC gate":
     except RpcError as e:
       code2 = e.code
     check code2 == RpcInvalidParams
+
+# ----------------------------------------------------------------------------
+# gettxoutsetinfo (W12) — UTXO set walk + Core-byte-parity statistics
+#
+# Pins the cross-impl diff-test contract: `gettxoutsetinfo` must emit
+# `hash_serialized_3` (and `hash_serialized_2` alias) byte-identical to
+# Bitcoin Core's `kernel/coinstats.cpp::ComputeUTXOStats` over the same
+# UTXO set. nimrod was the last impl in the fleet still emitting
+# `"not implemented"` until W12 wired the handler.
+# ----------------------------------------------------------------------------
+
+# Shared helpers for "build a regtest chain" duplicated from the dumptxoutset
+# suite; we can't re-import the generic helper since suite-local procs are
+# not exported.
+proc utxoInfoBuildChain(cs: var ChainState, params: ConsensusParams,
+                        targetHeight: int32): BlockHash =
+  let genesis = buildGenesisBlock(params)
+  let r = cs.connectBlock(genesis, 0)
+  doAssert r.isOk
+  result = BlockHash(doubleSha256(serialize(genesis.header)))
+  var prevHash = result
+  var height: int32 = 1
+  while height <= targetHeight:
+    var scriptSig: seq[byte]
+    if height <= 0x7F:
+      scriptSig = @[byte(0x01), byte(height)]
+    else:
+      scriptSig = @[byte(0x02), byte(height and 0xFF),
+                                byte((height shr 8) and 0xFF)]
+    let coinbase = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])),
+                          vout: 0xFFFFFFFF'u32),
+        scriptSig: scriptSig,
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(50_00000000),
+                       scriptPubKey: @[byte(0x51)])],  # OP_TRUE
+      witnesses: @[],
+      lockTime: 0
+    )
+    let txHash = array[32, byte](coinbase.txid())
+    let blk = Block(
+      header: BlockHeader(
+        version: 1,
+        prevBlock: prevHash,
+        merkleRoot: txHash,
+        timestamp: uint32(1296688602 + height * 600),
+        bits: 0x207fffff'u32,
+        nonce: uint32(height)
+      ),
+      txs: @[coinbase]
+    )
+    let cr = cs.connectBlock(blk, height)
+    doAssert cr.isOk, cr.error
+    result = BlockHash(doubleSha256(serialize(blk.header)))
+    prevHash = result
+    inc height
+
+suite "gettxoutsetinfo Core-byte-parity":
+
+  test "computeUtxoSetInfo returns expected counts + nonzero hash":
+    # Build a small regtest chain and check the high-level invariants:
+    # one UTXO per coinbase block, one distinct txid per UTXO, total amount
+    # = N * 50 BTC, bogosize matches GetBogoSize(scriptPubKey=OP_TRUE).
+    # Byte-level Core parity is verified end-to-end by tools/diff-test.sh
+    # (cross-impl harness against bitcoin-core 31.99 on regtest).
+    let testDir = getTempDir() / "nimrod_utxosetinfo_basic"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard utxoInfoBuildChain(cs, regtest, 5)
+
+    let info = computeUtxoSetInfo(cs, cshtHashSerialized)
+
+    # 5 coinbase outputs (genesis is filtered, only h=1..5 enter UTXO).
+    check info.height == 5
+    check info.txOuts == 5
+    check info.transactions == 5
+    check info.totalAmount == 5'i64 * 50_00000000'i64
+    # bogosize = 5 * (32 + 4 + 4 + 8 + 2 + 1)  -- OP_TRUE script is 1 byte.
+    check info.bogosize == 5'u64 * 51'u64
+
+    # Hash must be non-zero (we have coins) and stable across calls.
+    check info.hashSerialized != default(array[32, byte])
+    let info2 = computeUtxoSetInfo(cs, cshtHashSerialized)
+    check info.hashSerialized == info2.hashSerialized
+
+  test "muhash variant produces different digest than hash_serialized":
+    # MuHash3072 finalize is `SHA256(numerator/denominator)`, structurally
+    # different from a SHA256d stream over TxOutSer bytes. Both walk the
+    # same coin stream, but the outer hash differs.
+    let testDir = getTempDir() / "nimrod_utxosetinfo_muhash"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard utxoInfoBuildChain(cs, regtest, 3)
+
+    let muInfo = computeUtxoSetInfo(cs, cshtMuHash)
+    let serInfo = computeUtxoSetInfo(cs, cshtHashSerialized)
+    check muInfo.txOuts == 3
+    check serInfo.txOuts == 3
+    check muInfo.hashSerialized != default(array[32, byte])
+    check serInfo.hashSerialized != default(array[32, byte])
+    # Hash kinds must differ for any non-trivial input set.
+    check muInfo.hashSerialized != serInfo.hashSerialized
+
+    # MuHash is order-independent — calling twice on the same set must yield
+    # the same digest.
+    let muInfo2 = computeUtxoSetInfo(cs, cshtMuHash)
+    check muInfo.hashSerialized == muInfo2.hashSerialized
+
+  test "hashType=cshtNone skips hash but still returns counts":
+    let testDir = getTempDir() / "nimrod_utxosetinfo_none"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard utxoInfoBuildChain(cs, regtest, 2)
+
+    let info = computeUtxoSetInfo(cs, cshtNone)
+    check info.txOuts == 2
+    check info.totalAmount == 2'i64 * 50_00000000'i64
+    check info.hashSerialized == default(array[32, byte])
+
+  test "RPC handler emits both hash_serialized_3 and hash_serialized_2":
+    # The cross-impl diff-test reads `hash_serialized_2` first; we emit
+    # both keys with identical values for harness compatibility.
+    let testDir = getTempDir() / "nimrod_gtxosi_rpc_keys"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard utxoInfoBuildChain(cs, regtest, 4)
+
+    let mp = newMempool(cs, regtest)
+    let fe = newFeeEstimator()
+    let rpc = newRpcServer(
+      port = 18443'u16, chainState = cs, mempool = mp,
+      peerManager = nil, feeEstimator = fe, params = regtest
+    )
+    let res = rpc.handleGetTxOutSetInfo(%*[])
+
+    check res.hasKey("hash_serialized_3")
+    check res.hasKey("hash_serialized_2")
+    check res["hash_serialized_3"].getStr() == res["hash_serialized_2"].getStr()
+    check res["hash_serialized_3"].getStr().len == 64
+    check res["hash_serialized_3"].getStr() != "not implemented"
+    check res["height"].getInt() == 4
+    check res["txouts"].getInt() == 4
+    check res["transactions"].getInt() == 4
+
+  test "RPC handler hash_type=muhash returns muhash key":
+    let testDir = getTempDir() / "nimrod_gtxosi_rpc_muhash"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard utxoInfoBuildChain(cs, regtest, 2)
+
+    let mp = newMempool(cs, regtest)
+    let fe = newFeeEstimator()
+    let rpc = newRpcServer(
+      port = 18443'u16, chainState = cs, mempool = mp,
+      peerManager = nil, feeEstimator = fe, params = regtest
+    )
+    let res = rpc.handleGetTxOutSetInfo(%*["muhash"])
+
+    check res.hasKey("muhash")
+    check not res.hasKey("hash_serialized_3")
+    check not res.hasKey("hash_serialized_2")
+    check res["muhash"].getStr().len == 64
+
+  test "RPC handler rejects unknown hash_type with RpcInvalidParams":
+    let testDir = getTempDir() / "nimrod_gtxosi_rpc_badtype"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+    discard utxoInfoBuildChain(cs, regtest, 1)
+
+    let mp = newMempool(cs, regtest)
+    let fe = newFeeEstimator()
+    let rpc = newRpcServer(
+      port = 18443'u16, chainState = cs, mempool = mp,
+      peerManager = nil, feeEstimator = fe, params = regtest
+    )
+    var code = 0
+    try:
+      discard rpc.handleGetTxOutSetInfo(%*["not-a-real-type"])
+    except RpcError as e:
+      code = e.code
+    check code == RpcInvalidParams

@@ -3403,34 +3403,79 @@ proc handleLoadTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
       "before any P2P/sync components are constructed."
   )
 
-proc handleGetTxOutSetInfo(rpc: RpcServer, params: JsonNode): JsonNode =
-  ## Return statistics about the UTXO set
-  ## Reference: Bitcoin Core rpc/blockchain.cpp gettxoutsetinfo
+proc formatBtcAmount(satoshi: int64): string =
+  ## Format a satoshi amount as Core's `ValueFromAmount` does:
+  ## `<sign><quotient>.<8-digit-remainder>`. JSON treats this as a number.
+  ## Reference: bitcoin-core/src/core_io.cpp::ValueFromAmount.
+  let neg = satoshi < 0
+  let abs = if neg: -satoshi else: satoshi
+  let q = abs div 100_000_000'i64
+  let r = abs mod 100_000_000'i64
+  var rStr = $r
+  while rStr.len < 8:
+    rStr = "0" & rStr
+  (if neg: "-" else: "") & $q & "." & rStr
+
+proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Return statistics about the UTXO set.
+  ##
+  ## Reference: bitcoin-core/src/rpc/blockchain.cpp::gettxoutsetinfo,
+  ## bitcoin-core/src/kernel/coinstats.cpp::ComputeUTXOStats.
   ##
   ## Arguments:
-  ## 1. hash_type (string, optional, default="hash_serialized_3") - Type of hash to compute
+  ## 1. hash_type (string, optional, default="hash_serialized_3") -
+  ##    "hash_serialized_3" (alias "hash_serialized_2", "hash_serialized"),
+  ##    "muhash", or "none".
   ##
   ## Returns:
   ## {
-  ##   "height": n,             (numeric) Current block height
-  ##   "bestblock": "...",      (string) Best block hash
-  ##   "txouts": n,             (numeric) Number of UTXOs (approximate from cache)
-  ##   "bogosize": n,           (numeric) Estimated size of UTXO set data
-  ##   "hash_serialized_3": "..." (string) SHA256d hash of UTXO set (if requested)
+  ##   "height":             (numeric) chain tip height
+  ##   "bestblock":          (string)  display-byte-order tip hash
+  ##   "transactions":       (numeric) distinct UTXO-bearing txids
+  ##   "txouts":             (numeric) total UTXO count
+  ##   "bogosize":           (numeric) Core's database-independent size estimate
+  ##   "hash_serialized_3":  (string)  SHA256d hash of UTXO set (HASH_SERIALIZED only)
+  ##   "hash_serialized_2":  (string)  alias for hash_serialized_3 (cross-impl harness compat)
+  ##   "muhash":             (string)  MuHash3072 finalize digest (MUHASH only)
+  ##   "total_amount":       (numeric) sum of all UTXO values, in BTC
   ## }
+  let hashTypeStr = if params.len >= 1: params[0].getStr() else: "hash_serialized_3"
 
-  let hashType = if params.len >= 1: params[0].getStr() else: "hash_serialized_3"
+  let coinHashType = case hashTypeStr
+    of "hash_serialized_3", "hash_serialized_2", "hash_serialized":
+      cshtHashSerialized
+    of "muhash":
+      cshtMuHash
+    of "none":
+      cshtNone
+    else:
+      raise newRpcError(RpcInvalidParams,
+                        "Invalid hash_type, must be one of: " &
+                        "hash_serialized_3, muhash, none")
+
+  let info = computeUtxoSetInfo(rpc.chainState, coinHashType)
 
   var response = %*{
-    "height": rpc.chainState.bestHeight,
-    "bestblock": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
-    "txouts": rpc.chainState.cacheSize,
-    "bogosize": rpc.chainState.cacheSize * 50  # Rough estimate: ~50 bytes per UTXO
+    "height": info.height,
+    "bestblock": reverseHex(toHex(array[32, byte](info.bestBlock))),
+    "transactions": info.transactions,
+    "txouts": info.txOuts,
+    "bogosize": info.bogosize,
+    "total_amount": parseJson(formatBtcAmount(info.totalAmount))
   }
 
-  # Compute UTXO hash if requested (requires snapshot module)
-  if hashType == "hash_serialized_3" or hashType == "hash_serialized":
-    response["hash_serialized_3"] = %"not implemented"
+  case coinHashType
+  of cshtHashSerialized:
+    # Emit BOTH `_3` (Core's current key) and `_2` (legacy alias the
+    # cross-impl diff-test prefers). Display byte-order via reverseHex,
+    # mirroring Core's `stats.hashSerialized.GetHex()` (uint256::GetHex
+    # reverses internally).
+    let hexStr = reverseHex(toHex(info.hashSerialized))
+    response["hash_serialized_3"] = %hexStr
+    response["hash_serialized_2"] = %hexStr
+  of cshtMuHash:
+    response["muhash"] = %reverseHex(toHex(info.hashSerialized))
+  of cshtNone: discard
 
   response
 
