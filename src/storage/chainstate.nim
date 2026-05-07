@@ -1018,15 +1018,13 @@ proc computeUtxoSetInfo*(cs: var ChainState,
   var hw = initHashWriter()
   var muh = newMuHash3072()
 
-  # Genesis-coinbase filter: Bitcoin Core skips ConnectBlock entirely for
-  # the genesis block (`validation.cpp:2337-2343`), so the genesis
-  # coinbase output never enters Core's UTXO set. nimrod DOES connect
-  # the genesis block via `connectBlock(genesis, 0)`, so the coin is
-  # persisted in cfUtxo. To match Core's `gettxoutsetinfo` byte-for-byte
-  # we filter it out here at read time. `createSnapshot` (snapshot.nim)
-  # applies the same filter at dump time for the same reason.
-  let genesisCoinbaseTxid = buildGenesisBlock(cs.params).txs[0].txid()
-  let genesisTxidBytes = array[32, byte](genesisCoinbaseTxid)
+  # NOTE: W12 (efdc4bf) had a walk-time genesis-coinbase filter here as a
+  # workaround for nimrod adding the genesis coinbase to cfUtxo via
+  # `connectBlock(genesis, 0)`. W14 fixes that at the writer
+  # (chainstate.nim:626 — height==0 skips per-tx UTXO mutation, matching
+  # `validation.cpp:2337-2343`), so the filter is no longer needed.
+  # `createSnapshot` keeps its dump-time filter as belt-and-suspenders
+  # for legacy datadirs created before W14.
 
   # Track distinct-tx count by detecting txid transitions in cursor order.
   var sawAny = false
@@ -1055,9 +1053,6 @@ proc computeUtxoSetInfo*(cs: var ChainState,
     var txidBytes: array[32, byte]
     copyMem(addr txidBytes[0], unsafeAddr key[0], 32)
 
-    # Skip the genesis coinbase — never in Core's UTXO set (see comment above).
-    if entry.height == 0 and entry.isCoinbase and txidBytes == genesisTxidBytes:
-      continue
     let vout = (uint32(key[32]) shl 24) or
                (uint32(key[33]) shl 16) or
                (uint32(key[34]) shl 8)  or
