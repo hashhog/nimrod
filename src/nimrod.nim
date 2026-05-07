@@ -7,7 +7,7 @@ import chronicles
 
 import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
-import ./storage/[db, chainstate, snapshot, blockstore, pruner]
+import ./storage/[db, chainstate, snapshot, blockstore, pruner, undo]
 import ./storage/indexes/[blockfilterindex, gcs]
 import ./network/[peer, peermanager, sync, messages]
 import ./mempool/[mempool, persist, orphan]
@@ -1634,11 +1634,111 @@ proc startNode*(config: NimrodConfig) {.async.} =
   state.peerManager.updateHeight(state.chainState.bestHeight)
   state.peerManager.setMessageCallback(messageCallback(state))
 
+  # 5b. Optional BIP-157 basic block-filter index.  Created BEFORE the sync
+  # manager so we can pass it down — the SyncManager fans every successful
+  # connectBlock out to the filter index when populated.  Reference:
+  # bitcoin-core/src/index/base.cpp::BaseIndex::ConnectBlock.
+  #
+  # When --blockfilterindex is OFF the field stays nil and the REST endpoints
+  # /rest/blockfilter[headers] return "Index is not enabled for filtertype
+  # basic" (Core parity).
+  if config.blockfilterindex:
+    info "initializing blockfilterindex (basic)"
+    state.blockFilterIndex = newBlockFilterIndex(
+      state.chainState.db.db, networkDir, bftBasic, enabled = true)
+  else:
+    state.blockFilterIndex = nil
+
   # 6. Initialize sync manager
   info "initializing sync manager"
-  state.syncManager = newSyncManager(state.peerManager, state.chainState.db, params, state.chainState, config.numVerifyWorkers)
+  state.syncManager = newSyncManager(state.peerManager, state.chainState.db, params,
+                                     state.chainState, config.numVerifyWorkers,
+                                     state.blockFilterIndex)
   state.syncManager.chainTip = state.chainState.bestBlockHash
   state.syncManager.chainTipHeight = state.chainState.bestHeight
+
+  # 6a. IBD backfill of the block-filter index.  If --blockfilterindex was
+  # toggled on AFTER an initial IBD, walk the chain from the index's
+  # last-known height up to the chain tip and emit a filter for every
+  # block.  This handles two distinct populating scenarios:
+  #
+  #   - Fresh datadir, flag was on: nothing to do (bestHeight == -1 == tip-1
+  #     after genesis connect; the live connectBlock hook handles it from
+  #     here).
+  #   - Existing datadir, flag flipped on at restart: walk the gap.  For
+  #     each height we read the block (cfBlocks) + the per-block undo from
+  #     rev*.dat (when present) and call addBlock().  Blocks connected via
+  #     the IBD fast path (connectBlockIBD) DO NOT have undo on disk; their
+  #     filter will be output-only (BIP-158 elements include outputs +
+  #     spent prevout scriptPubKeys, so this is partial — operator-visible
+  #     limitation of nimrod's IBD shortcut).  Covered by the "still being
+  #     indexed" REST 404 on those heights and a startup-log warn.
+  #
+  # Reference: bitcoin-core/src/index/base.cpp::BaseIndex::ThreadSync — Core
+  # also walks the gap on startup; we run synchronously here because nimrod
+  # currently has no async index thread, the operation is fast in practice
+  # for the (tip - filterIndexHeight) gap on a flag flip.
+  if state.blockFilterIndex != nil and state.blockFilterIndex.enabled:
+    let csForBackfill = state.chainState
+    let tipHeight = csForBackfill.bestHeight
+    let startHeight = state.blockFilterIndex.bestHeight + 1
+    if startHeight <= tipHeight:
+      info "blockfilterindex: backfilling",
+           fromHeight = startHeight, toHeight = tipHeight,
+           gap = (tipHeight - startHeight + 1)
+      var indexed = 0
+      var partial = 0
+      var skipped = 0
+      for h in startHeight .. tipHeight:
+        let hashOpt = csForBackfill.db.getBlockHashByHeight(h)
+        if hashOpt.isNone:
+          warn "blockfilterindex: missing height->hash, stopping backfill",
+               height = h
+          break
+        let hash = hashOpt.get()
+        let blkOpt = csForBackfill.db.getBlock(hash)
+        if blkOpt.isNone:
+          warn "blockfilterindex: missing block body, skipping",
+               height = h, hash = $hash
+          inc skipped
+          continue
+        let blk = blkOpt.get()
+
+        # Try to load the per-block undo.  Genesis (txs.len == 1, all
+        # coinbases) has none-by-construction; IBD-fast-path blocks have
+        # null undoPos.  In both cases we proceed with empty undo (the
+        # filter is then output-only).
+        var blockUndo = chainstate.BlockUndo()
+        let idxOpt = csForBackfill.db.getBlockIndex(hash)
+        if idxOpt.isSome:
+          let idx = idxOpt.get()
+          # FlatFilePos is "null" when fileNum or pos is negative; same predicate
+          # as storage/undo.nim::isNull (inlined to avoid pulling the undo
+          # module into nimrod.nim — chainstate already re-exports the type).
+          if idx.undoPos.fileNum >= 0 and idx.undoPos.pos >= 0:
+            let (loaded, ok) = csForBackfill.undoMgr.readBlockUndo(
+              idx.undoPos, blk.header.prevBlock, params)
+            if ok:
+              blockUndo = loaded
+            else:
+              inc partial
+          else:
+            # No undo on disk (genesis or IBD fast-path) — empty undo.
+            if h > 0 and blk.txs.len > 1:
+              inc partial
+
+        if state.blockFilterIndex.addBlock(blk, hash, h, blockUndo):
+          inc indexed
+        else:
+          inc skipped
+
+        if (indexed + skipped) mod 10_000 == 0:
+          info "blockfilterindex: backfill progress",
+               indexed = indexed, skipped = skipped, partial = partial,
+               currentHeight = h
+      info "blockfilterindex: backfill complete",
+           indexed = indexed, skipped = skipped, partial = partial,
+           bestHeight = state.blockFilterIndex.bestHeight
 
   # 7. Start RPC server
   if config.rpcEnabled:
@@ -1666,6 +1766,9 @@ proc startNode*(config: NimrodConfig) {.async.} =
     # the actual delete path; see handlePruneBlockchain in src/rpc/server.nim.
     state.rpcServer.blockFileManager = state.blockFileManager
     state.rpcServer.pruner = state.pruner
+    # Wire the BIP-157 filter index so submitblock populates it alongside
+    # the live P2P sync path.  nil when --blockfilterindex is OFF.
+    state.rpcServer.filterIndex = state.blockFilterIndex
     # Run RPC on a dedicated OS thread with its own chronos event loop so that
     # CPU-heavy block validation on the main thread does not block RPC accept
     # or response. See src/rpc/rpc_thread.nim for rationale and known v1 caveats.
@@ -1679,24 +1782,8 @@ proc startNode*(config: NimrodConfig) {.async.} =
     # `NodeState` keeps it pinned for the lifetime of the node.
     state.rpcThread = startRpcThread(state.rpcServer)
 
-  # 7a. Optional BIP-157 basic block-filter index. Without --blockfilterindex
-  # the field stays nil and /rest/blockfilter[headers] returns
-  # "Index is not enabled for filtertype basic" (Core parity).
-  #
-  # NOTE: backfill of historical blocks into this index is not yet wired
-  # into the IBD path in nimrod (the index module exists and can ingest
-  # `BlockInfo` via processBlock, but the connect-block hook hasn't been
-  # added). Until that lands, the REST endpoints will return "Filter not
-  # found. Block filters are still in the process of being indexed" for
-  # most heights — same wire shape Core emits during its own backfill.
-  # The listener and routing are still useful: they're what the audit
-  # called out as the dead-code surface.
-  if config.blockfilterindex:
-    info "initializing blockfilterindex (basic)"
-    state.blockFilterIndex = newBlockFilterIndex(
-      state.chainState.db.db, networkDir, bftBasic, enabled = true)
-  else:
-    state.blockFilterIndex = nil
+  # 7a. (BIP-157 block-filter index init was moved to step 5b above so the
+  # SyncManager can be wired with it from construction.)
 
   # 7c. Start REST HTTP server (default OFF, --rest gate, Core parity).
   if config.restEnabled:

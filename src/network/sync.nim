@@ -15,6 +15,7 @@ import ./headerssync
 import ../primitives/[types, serialize, uint256]
 import ../consensus/[params, pow, validation, assumevalid]
 import ../storage/chainstate
+import ../storage/indexes/blockfilterindex
 import ../crypto/[hashing, secp256k1]
 import ../perf/parallel_verify
 
@@ -87,6 +88,12 @@ type
     # CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
     # (Pattern B).
     unconnectingHeaders*: Table[int64, int]  ## peerId -> count
+    # Optional BIP-157 basic block-filter index — populated alongside each
+    # connectBlock/connectBlockIBD when --blockfilterindex is set.  nil
+    # when disabled.  Mirrors Core's `g_indexes` BaseIndex hook list:
+    # bitcoin-core/src/index/base.cpp::ConnectBlock fans out to every
+    # registered index after each successful block connect.
+    filterIndex*: BlockFilterIndex
 
 const
   MaxHeadersPerRequest* = 2000
@@ -442,7 +449,8 @@ proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
 proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
                      params: ConsensusParams,
                      chainState: ChainState = nil,
-                     numVerifyWorkers: int = 0): SyncManager =
+                     numVerifyWorkers: int = 0,
+                     filterIndex: BlockFilterIndex = nil): SyncManager =
   result = SyncManager(
     state: ssIdle,
     headerChain: initHeaderChain(),
@@ -467,7 +475,8 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     receivedBlocks: initTable[int32, Block](),
     requestedHashes: initHashSet[BlockHash](),
     unconnectingHeaders: initTable[int64, int](),
-    numVerifyWorkers: numVerifyWorkers
+    numVerifyWorkers: numVerifyWorkers,
+    filterIndex: filterIndex
   )
 
   # Initialize with genesis if chain is empty
@@ -1117,6 +1126,21 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
       sm.chainState.stopIBD()
       info "exiting IBD mode, switching to normal sync", height = height
 
+    # Pre-generate undo BEFORE the connect mutates the UTXO cache.  The
+    # filter index needs spent-output scriptPubKeys (BIP-158) which the
+    # IBD fast path does not write to disk; resolving them after-the-fact
+    # would miss anything already deleted from the cache.  Cheap: a few
+    # cache/DB lookups already done in the upcoming connect.
+    var undoForFilter = chainstate.BlockUndo()
+    let captureUndo = sm.filterIndex != nil and sm.filterIndex.enabled
+    if captureUndo:
+      try:
+        undoForFilter = sm.chainState.generateBlockUndo(blk)
+      except CatchableError:
+        undoForFilter = chainstate.BlockUndo()
+      except Exception:
+        undoForFilter = chainstate.BlockUndo()
+
     let connectResult = if sm.chainState.ibdMode:
                           sm.chainState.connectBlockIBD(blk, height)
                         else:
@@ -1124,6 +1148,16 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
     if not connectResult.isOk:
       warn "failed to connect block to chainstate", error = $connectResult.error
       return false
+
+    # Populate BIP-157 basic block-filter index (no-op when nil/disabled).
+    # Mirrors bitcoin-core/src/index/base.cpp::ConnectBlock fan-out.
+    if captureUndo:
+      try:
+        discard sm.filterIndex.addBlock(blk, hash, height, undoForFilter)
+      except CatchableError:
+        discard
+      except Exception:
+        discard
   else:
     sm.chainDb.applyBlock(blk, height)
 
@@ -1634,11 +1668,33 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
 
     # Apply block to chainstate using IBD fast path
     if sm.chainState != nil:
+      # See applyBlock() above for why we capture undo BEFORE connect.
+      var undoForFilter = chainstate.BlockUndo()
+      let captureUndo = sm.filterIndex != nil and sm.filterIndex.enabled
+      if captureUndo:
+        try:
+          undoForFilter = sm.chainState.generateBlockUndo(blk)
+        except CatchableError:
+          undoForFilter = chainstate.BlockUndo()
+        except Exception:
+          undoForFilter = chainstate.BlockUndo()
+
       let connectResult = sm.chainState.connectBlockIBD(blk, height)
       if not connectResult.isOk:
         warn "failed to connect block during IBD", height = height, error = $connectResult.error
         dl.receivedBlocks.del(height)
         continue
+
+      # BIP-157 filter index population (no-op when nil/disabled).
+      if captureUndo:
+        try:
+          let pHeader = serialize(blk.header)
+          let pHash = BlockHash(doubleSha256(pHeader))
+          discard sm.filterIndex.addBlock(blk, pHash, height, undoForFilter)
+        except CatchableError:
+          discard
+        except Exception:
+          discard
     else:
       sm.chainDb.applyBlock(blk, height)
 
