@@ -114,6 +114,18 @@ type
     # disconnect+reconnect, CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
     # nil outside of handleReorg.
     reorgDeletedUtxos*: TableRef[string, bool]
+    # Optional disconnect hook fired after a successful block disconnect
+    # (legacy `disconnectBlock` and Pattern-D `handleReorg`). Wired by the
+    # daemon (src/nimrod.nim) when --blockfilterindex is enabled, so the
+    # BIP-157 BlockFilterIndex's customRemove fires symmetrically with the
+    # connect-side `addBlock` hook in network/sync.nim + rpc/server.nim.
+    # nil when the index is disabled (or in tests that do not exercise the
+    # filter index). Indirected through a callback so chainstate.nim does
+    # not have to import storage/indexes/blockfilterindex (which would
+    # create a circular dep through indexes/base via undo-shim).
+    # Reference: bitcoin-core/src/index/base.cpp::BaseIndex::BlockDisconnected.
+    disconnectHook*: proc(blockHash: BlockHash, prevHash: BlockHash,
+                          height: int32) {.raises: [].}
 
   ## Result type for chainstate operations
   ChainStateResult*[T] = object
@@ -444,7 +456,8 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     ibdBlocksSinceLastDiskFlush: 0,
     ibdDiskFlushInterval: IbdBatchFlushInterval,  # default: flush to disk every 2000 blocks
     ibdHeightToHash: initTable[int32, BlockHash](),
-    reorgDeletedUtxos: nil
+    reorgDeletedUtxos: nil,
+    disconnectHook: nil
   )
 
   # Load total work from DB if available
@@ -1085,6 +1098,14 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
 
   cs.db.db.write(batch)
 
+  # Fire the disconnect hook (BIP-157 filter-index rollback).  Runs AFTER
+  # the chainstate batch commits so the filter index never observes a
+  # state the chainstate has not yet committed.  Hook errors are swallowed
+  # by the index implementation (see blockfilterindex.removeBlock) so a
+  # failed filter rollback does not corrupt the chainstate disconnect.
+  if cs.disconnectHook != nil:
+    cs.disconnectHook(blockHash, blk.header.prevBlock, height)
+
   ok()
 
 proc disconnectBlock*(cs: var ChainState, blk: Block): ChainStateResult[void] =
@@ -1255,6 +1276,12 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     disconnectedTxs.setLen(0)
 
   # ---- Stage all disconnects onto the shared batch ----
+  # Capture per-disconnect hash/prevHash/height tuples so the index
+  # disconnect hook (BIP-157 filter-index rollback) can fire AFTER the
+  # single batch commits.  Order is tip→fork (the natural disconnect
+  # order); the hook receives them in the same order so the filter
+  # index unwinds prevFilterHeader symmetrically.
+  var disconnectedForHook: seq[(BlockHash, BlockHash, int32)] = @[]
   var height = cs.bestHeight
   for (blk, undo, blkHeight) in disconnectedBlocks:
     if blkHeight != height:
@@ -1269,6 +1296,7 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
 
     let headerBytes = serialize(blk.header)
     let blockHash = BlockHash(doubleSha256(headerBytes))
+    disconnectedForHook.add((blockHash, blk.header.prevBlock, blkHeight))
 
     # Process transactions in reverse: remove created outputs, drop tx index.
     for txIdx in countdown(blk.txs.len - 1, 0):
@@ -1454,6 +1482,17 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   # Clear the tentative-delete override; from here on getUtxo can read
   # straight from RocksDB and see the post-reorg state.
   cs.reorgDeletedUtxos = nil
+
+  # Fire the disconnect hook for every disconnected block, in tip→fork
+  # order (same order they were staged onto the batch).  Used by the
+  # BIP-157 BlockFilterIndex to roll back its filter-header chain
+  # symmetrically with chainstate.  Mirrors Bitcoin Core's per-block
+  # BaseIndex::BlockDisconnected fan-out from validation.cpp::DisconnectTip.
+  # Runs AFTER the chainstate batch commits — the index never observes
+  # a state the chainstate has not yet committed.
+  if cs.disconnectHook != nil:
+    for (bh, ph, h) in disconnectedForHook:
+      cs.disconnectHook(bh, ph, h)
 
   # Flush cache if it grew above threshold during the reorg.
   if cs.shouldFlush():

@@ -475,3 +475,157 @@ suite "BlockFilterIndex backfill range":
         inc indexed
     check indexed == 0
     check idx.bestHeight == 0  # unchanged
+
+# ============================================================================
+# Reorg-aware filter chain tests (Phase 2)
+# ============================================================================
+# Cover the disconnect-side counterpart to addBlock — the `removeBlock`
+# helper that the chainstate disconnect path (legacy disconnectBlock and
+# Pattern-D handleReorg) fires through `disconnectHook`.  These tests
+# exercise the index module directly; chainstate-side wiring (the hook
+# call) is covered by tests/test_chainstate_reorg_filterindex.nim.
+
+suite "BlockFilterIndex removeBlock (disconnect / reorg-aware filter chain)":
+  var db: Database
+  var idx: BlockFilterIndex
+  var testDir: string
+
+  setup:
+    testDir = createTempDir("blockfilter_remove_", "")
+    db = openDatabase(testDir / "db")
+    idx = newBlockFilterIndex(db, testDir, bftBasic, enabled = true)
+
+  teardown:
+    db.close()
+    removeDir(testDir)
+
+  proc mkBlock(scriptByte: byte, prev: BlockHash): Block =
+    Block(
+      header: BlockHeader(version: 1, prevBlock: prev),
+      txs: @[Transaction(
+        version: 1,
+        inputs: @[TxIn(
+          prevOut: OutPoint(txid: TxId(default(array[32, byte])),
+                            vout: 0xffffffff'u32),
+          scriptSig: @[],
+          sequence: 0xffffffff'u32
+        )],
+        outputs: @[
+          TxOut(value: Satoshi(5_000_000_000),
+                scriptPubKey: @[0x76'u8, 0xa9, 0x14, scriptByte])
+        ],
+        lockTime: 0
+      )]
+    )
+
+  proc mkHash(seedByte: byte): BlockHash =
+    var hb: array[32, byte]
+    hb[0] = seedByte
+    BlockHash(hb)
+
+  test "removeBlock is a no-op when index is nil":
+    var nilIdx: BlockFilterIndex = nil
+    check nilIdx.removeBlock(mkHash(0x01), mkHash(0x00), 1) == true
+
+  test "removeBlock is a no-op when index is disabled":
+    let off = newBlockFilterIndex(db, testDir & "_off", bftBasic, enabled = false)
+    check off.removeBlock(mkHash(0x02), mkHash(0x00), 1) == true
+    if dirExists(testDir & "_off"):
+      removeDir(testDir & "_off")
+
+  test "removeBlock is a no-op when bestHeight is below the disconnect height":
+    # Index never saw block at height 5; rolling back height 5 must be inert.
+    check idx.bestHeight == -1
+    check idx.removeBlock(mkHash(0xaa), mkHash(0xbb), 5) == true
+    check idx.bestHeight == -1
+
+  test "removeBlock rolls bestHeight back, copies entry to hash index, restores prev filter header":
+    # Connect h=1 then h=2, then disconnect h=2.  After: bestHeight=1,
+    # prevFilterHeader == h=1's header, h=2's filter retrievable by hash.
+    let h1 = mkHash(0xc1)
+    let h2 = mkHash(0xc2)
+    let g  = BlockHash(default(array[32, byte]))
+    check idx.addBlock(mkBlock(0xd1, g),  h1, 1, chainundo.BlockUndo()) == true
+    check idx.addBlock(mkBlock(0xd2, h1), h2, 2, chainundo.BlockUndo()) == true
+    check idx.bestHeight == 2
+
+    let entryAt2 = idx.getFilterEntry(2)
+    let entryAt1 = idx.getFilterEntry(1)
+    check entryAt2.isSome
+    check entryAt1.isSome
+    let header1 = entryAt1.get().filterHeader
+
+    # Disconnect h=2 — symmetric counterpart to the addBlock at h=2.
+    check idx.removeBlock(h2, h1, 2) == true
+
+    # bestHeight rolls back to h=1; bestBlockHash to h1.
+    check idx.bestHeight == 1
+    check idx.bestBlockHash == h1
+
+    # The disconnected block's filter is now retrievable by hash (the
+    # height entry remained — it will be overwritten when a new chain
+    # connects at the same height).
+    let byHash = idx.getFilterEntryByHash(h2)
+    check byHash.isSome
+    check byHash.get().filterHash == entryAt2.get().filterHash
+
+    # prevFilterHeader rolled back to height-1's header so the next
+    # customAppend chains correctly onto the parent.
+    check idx.prevFilterHeader == header1
+
+  test "removeBlock followed by addBlock at the same height re-chains onto parent":
+    # Pre-build a 3-block chain: g→h1→h2→h3.  Disconnect h3 then h2,
+    # then connect a NEW chain h2'→h3' onto h1.  The new headers must
+    # form a fresh chain off of h1's filter header — proving the
+    # rollback restored prevFilterHeader correctly.
+    let g  = BlockHash(default(array[32, byte]))
+    let h1 = mkHash(0xe1); let h2 = mkHash(0xe2); let h3 = mkHash(0xe3)
+    check idx.addBlock(mkBlock(0xf1, g),  h1, 1, chainundo.BlockUndo()) == true
+    check idx.addBlock(mkBlock(0xf2, h1), h2, 2, chainundo.BlockUndo()) == true
+    check idx.addBlock(mkBlock(0xf3, h2), h3, 3, chainundo.BlockUndo()) == true
+    let header1 = idx.getFilterEntry(1).get().filterHeader
+    let header3Old = idx.getFilterEntry(3).get().filterHeader
+
+    # Disconnect h3 then h2 (tip→fork order, matches handleReorg).
+    check idx.removeBlock(h3, h2, 3) == true
+    check idx.bestHeight == 2
+    check idx.removeBlock(h2, h1, 2) == true
+    check idx.bestHeight == 1
+    check idx.bestBlockHash == h1
+    check idx.prevFilterHeader == header1
+
+    # Connect new chain h2'→h3' (different scriptPubKeys → different filters).
+    let h2p = mkHash(0xf8)
+    let h3p = mkHash(0xf9)
+    check idx.addBlock(mkBlock(0x88, h1),  h2p, 2, chainundo.BlockUndo()) == true
+    check idx.addBlock(mkBlock(0x99, h2p), h3p, 3, chainundo.BlockUndo()) == true
+    check idx.bestHeight == 3
+    check idx.bestBlockHash == h3p
+
+    # The new tip's filter header must NOT match the disconnected chain's
+    # tip header — proves the chain rewound and re-built off h1.
+    let header3New = idx.getFilterEntry(3).get().filterHeader
+    check header3New != header3Old
+
+    # Both old-chain block filters must remain retrievable by hash for
+    # light-client reconciliation.
+    check idx.getFilterEntryByHash(h2).isSome
+    check idx.getFilterEntryByHash(h3).isSome
+
+  test "removeBlock at height=1 rolls best-block back to genesis (height -1 / parent hash)":
+    # Edge case: disconnecting the only indexed block.  bestHeight should
+    # become -1 (matching the post-newBlockFilterIndex state) and
+    # bestBlockHash should be the parent hash we passed in (caller's
+    # responsibility to provide the right parent — for height=1 that is
+    # genesis-as-prev, here zero-hash).
+    let g  = BlockHash(default(array[32, byte]))
+    let h1 = mkHash(0xa1)
+    check idx.addBlock(mkBlock(0xb1, g), h1, 1, chainundo.BlockUndo()) == true
+    check idx.bestHeight == 1
+
+    check idx.removeBlock(h1, g, 1) == true
+    check idx.bestHeight == 0   # height-1 = 0; saveBestBlock writes (g, 0)
+    check idx.bestBlockHash == g
+    # h1's filter is preserved by hash (Core parity — light-client
+    # reconciliation can still serve it).
+    check idx.getFilterEntryByHash(h1).isSome

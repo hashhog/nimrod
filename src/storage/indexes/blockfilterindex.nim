@@ -434,3 +434,62 @@ proc addBlock*(idx: BlockFilterIndex, blk: Block, blockHash: BlockHash,
          height = height, hash = $blockHash, error = e.msg
     return false
   true
+
+proc removeBlock*(idx: BlockFilterIndex, blockHash: BlockHash,
+                  prevHash: BlockHash, height: int32): bool =
+  ## Roll the filter index back across a single block disconnect.  This is
+  ## the symmetric counterpart to `addBlock` and is invoked by the
+  ## chainstate disconnect path (legacy `disconnectBlock` and Pattern-D
+  ## `handleReorg`).
+  ##
+  ## Behavior, per Bitcoin Core's BaseIndex::BlockDisconnected →
+  ## blockfilterindex.cpp::CustomRemove:
+  ##   1. Copy the height-keyed filter entry to the hash-keyed index, so
+  ##      the disconnected filter is still retrievable for light-client
+  ##      reconciliation while another block re-takes the height slot.
+  ##   2. Roll `prevFilterHeader` back to the parent's filter header (read
+  ##      from DB at height-1), so the next `customAppend` chains onto
+  ##      the correct filter-header history.
+  ##   3. Move best-block back to (prevHash, height-1) via
+  ##      `BaseIndex::saveBestBlock` (in `revertBlock`).
+  ##
+  ## Safe to no-op when the index is nil/disabled or when the recorded
+  ## bestHeight is already at-or-below height-1 (idempotent re-replay).
+  ## Callers do NOT need to gate.
+  ##
+  ## Reference: bitcoin-core/src/index/base.cpp::BaseIndex::BlockDisconnected
+  ## + bitcoin-core/src/index/blockfilterindex.cpp::CustomRemove.
+  if idx == nil or not idx.enabled:
+    return true
+
+  # Already rolled back past this height — nothing to do.  Either the
+  # caller is replaying a disconnect after an earlier crash-recovery, or
+  # a reorg-staging error is unwinding us already.
+  if idx.bestHeight < height:
+    return true
+
+  let info = base.BlockInfo(
+    hash: blockHash,
+    prevHash: prevHash,
+    height: height,
+    data: none(Block),
+    undoData: none(base.BlockUndo),
+    fileNum: 0,
+    dataPos: 0
+  )
+
+  try:
+    if not idx.revertBlock(info):
+      warn "blockfilterindex: customRemove failed",
+           height = height, hash = $blockHash
+      return false
+  except CatchableError as e:
+    warn "blockfilterindex: removeBlock raised, skipping",
+         height = height, hash = $blockHash, error = e.msg
+    return false
+  except Exception as e:
+    # Defensive: see addBlock for rationale.  Keep the disconnect path live.
+    warn "blockfilterindex: removeBlock raised non-Catchable, skipping",
+         height = height, hash = $blockHash, error = e.msg
+    return false
+  true
