@@ -8,11 +8,13 @@ import chronicles
 import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
 import ./storage/[db, chainstate, snapshot, blockstore, pruner]
+import ./storage/indexes/[blockfilterindex, gcs]
 import ./network/[peer, peermanager, sync, messages]
 import ./mempool/[mempool, persist, orphan]
 import ./mining/fees
 import ./rpc/server
 import ./rpc/rpc_thread
+import ./rpc/rest
 import ./crypto/[secp256k1, hashing]
 import ./util/ops
 
@@ -67,6 +69,22 @@ type
                           ## byte-compatible UTXO snapshot before entering
                           ## the main loop (assumeUTXO fast-sync). Must
                           ## point to a fresh, network-matching snapshot.
+    restEnabled*: bool    ## --rest: serve the read-only Bitcoin Core REST
+                          ## surface (/rest/block, /rest/headers,
+                          ## /rest/blockfilter, …). Default OFF — matches
+                          ## Bitcoin Core's `-rest` flag (also default off).
+    restPort*: uint16     ## --restport=N: TCP port for the REST listener
+                          ## (default: rpcPort + 1000). REST is bound to its
+                          ## own port — Core shares the JSON-RPC socket, but
+                          ## nimrod's RPC runs on a dedicated thread (see
+                          ## rpc_thread.nim) so REST gets its own listener.
+    blockfilterindex*: bool ## --blockfilterindex: maintain the BIP-157
+                            ## "basic" filter index. Mirrors Bitcoin Core's
+                            ## `-blockfilterindex=basic`. Required for the
+                            ## /rest/blockfilter[headers] endpoints to
+                            ## return data; without it those endpoints
+                            ## report "Index is not enabled for filtertype
+                            ## basic" (HTTP 400) — same as Core.
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -104,6 +122,19 @@ type
                                           ## the auto-prune trigger and the
                                           ## RocksDB-backed delete loop.
                                           ## nil when --prune is not set.
+    blockFilterIndex*: BlockFilterIndex   ## BIP-157 basic filter index.
+                                          ## nil when --blockfilterindex is
+                                          ## not set. Wired into RestServer
+                                          ## so /rest/blockfilter[headers]
+                                          ## can read it.
+    restServer*: RestServer               ## Optional /rest/* HTTP server.
+                                          ## nil when --rest is not set.
+    restThread*: Thread[RestServer]       ## REST listener runs on its own
+                                          ## OS thread — same rationale as
+                                          ## the RPC thread (event-loop
+                                          ## isolation from main-thread
+                                          ## verifyScripts batches; see
+                                          ## rpc_thread.nim).
 
 # Global for signal handling
 var globalNodeState*: NodeState = nil
@@ -132,7 +163,10 @@ proc defaultConfig*(): NimrodConfig =
     logFile: "",
     readyFd: -1,
     reindex: false,
-    loadSnapshot: ""
+    loadSnapshot: "",
+    restEnabled: false,
+    restPort: 0,            # 0 = derive from rpcPort (rpcPort + 1000)
+    blockfilterindex: false
   )
 
 proc loadConfigFile*(config: var NimrodConfig) =
@@ -220,6 +254,20 @@ proc loadConfigFile*(config: var NimrodConfig) =
       config.logFile = value
     of "reindex":
       config.reindex = value.toLowerAscii() in ["1", "true", "yes"]
+    of "rest":
+      config.restEnabled = value.toLowerAscii() in ["1", "true", "yes"]
+    of "restport":
+      try: config.restPort = uint16(parseInt(value))
+      except ValueError: discard
+    of "blockfilterindex":
+      # Core accepts `-blockfilterindex` (boolean) and
+      # `-blockfilterindex=basic`. We treat any non-"0"/"false"/empty value
+      # as enable-basic (the only filter type defined by BIP-158 today).
+      let v = value.toLowerAscii()
+      if v in ["", "1", "true", "yes", "basic"]:
+        config.blockfilterindex = true
+      elif v in ["0", "false", "no"]:
+        config.blockfilterindex = false
     else:
       discard
 
@@ -274,6 +322,16 @@ Operational:
   --reindex              Wipe chainstate before start (re-download from peers)
   --load-snapshot=PATH   Load a Bitcoin Core byte-compatible UTXO snapshot
                          (assumeUTXO) into chainstate before entering main loop
+  --rest                 Enable the read-only REST HTTP server (default off,
+                         matches Bitcoin Core -rest). Endpoints: /rest/block,
+                         /rest/headers, /rest/blockhashbyheight, /rest/tx,
+                         /rest/getutxos, /rest/mempool/info|contents,
+                         /rest/blockfilter, /rest/blockfilterheaders.
+  --restport=PORT        REST listener port (default: rpcport + 1000)
+  --blockfilterindex     Maintain BIP-157 basic block-filter index. Required
+                         for the /rest/blockfilter[headers] endpoints to
+                         return data. Mirrors Bitcoin Core
+                         -blockfilterindex=basic.
 
   -h, --help             Show this help
   -v, --version          Show version
@@ -436,6 +494,30 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           echo "Invalid --load-snapshot: missing path"
           quit(1)
         result.config.loadSnapshot = p.val
+      of "rest":
+        # Accept `--rest` and `--rest=0/1`.
+        if p.val.len == 0:
+          result.config.restEnabled = true
+        else:
+          result.config.restEnabled = p.val.toLowerAscii() in ["1", "true", "yes"]
+      of "restport", "rest-port":
+        try: result.config.restPort = uint16(parseInt(p.val))
+        except ValueError:
+          echo "Invalid rest port: " & p.val
+          quit(1)
+      of "blockfilterindex":
+        # Bitcoin Core accepts `-blockfilterindex` (boolean) and
+        # `-blockfilterindex=basic`. Treat any non-"0"/"false"/empty value
+        # as enable-basic (only filter type BIP-158 defines today).
+        let v = p.val.toLowerAscii()
+        if v.len == 0 or v in ["1", "true", "yes", "basic"]:
+          result.config.blockfilterindex = true
+        elif v in ["0", "false", "no"]:
+          result.config.blockfilterindex = false
+        else:
+          echo "Invalid --blockfilterindex value: " & p.val &
+               " (use 1 / 0 / basic)"
+          quit(1)
       of "help", "h":
         showHelp()
         quit(0)
@@ -975,6 +1057,13 @@ proc setupSignalHandlers*() =
         info "flushing UTXO cache"
         globalNodeState.chainState.flushCache()
 
+      # Stop REST server (best-effort: just flips the running flag; the
+      # listener exits the next accept(). The thread storage on
+      # NodeState.restThread is freed when the NodeState ref drops).
+      if globalNodeState.restServer != nil:
+        info "stopping REST server"
+        globalNodeState.restServer.stop()
+
       # Stop RPC server and remove cookie file
       if globalNodeState.rpcServer != nil:
         info "stopping RPC server"
@@ -1382,6 +1471,17 @@ proc startMetricsServer(state: NodeState, port: uint16) {.async.} =
 
   server.close()
 
+proc restThreadMain(rest: RestServer) {.thread.} =
+  ## Thread entry point for the REST listener.  Mirrors rpcThreadMain in
+  ## src/rpc/rpc_thread.nim — chronos dispatchers are thread-local, so the
+  ## REST server gets its own event loop on this thread and is not blocked
+  ## by main-thread block validation or by the RPC thread.
+  {.gcsafe.}:
+    try:
+      waitFor rest.start()
+    except CatchableError as e:
+      error "REST thread crashed", error = e.msg
+
 proc startNode*(config: NimrodConfig) {.async.} =
   ## Start the node
   ## Init order: db -> chainstate -> mempool -> peermanager -> sync -> fee estimator -> RPC -> P2P
@@ -1578,6 +1678,46 @@ proc startNode*(config: NimrodConfig) {.async.} =
     # quickly the new pthread is scheduled).  Holding the handle on
     # `NodeState` keeps it pinned for the lifetime of the node.
     state.rpcThread = startRpcThread(state.rpcServer)
+
+  # 7a. Optional BIP-157 basic block-filter index. Without --blockfilterindex
+  # the field stays nil and /rest/blockfilter[headers] returns
+  # "Index is not enabled for filtertype basic" (Core parity).
+  #
+  # NOTE: backfill of historical blocks into this index is not yet wired
+  # into the IBD path in nimrod (the index module exists and can ingest
+  # `BlockInfo` via processBlock, but the connect-block hook hasn't been
+  # added). Until that lands, the REST endpoints will return "Filter not
+  # found. Block filters are still in the process of being indexed" for
+  # most heights — same wire shape Core emits during its own backfill.
+  # The listener and routing are still useful: they're what the audit
+  # called out as the dead-code surface.
+  if config.blockfilterindex:
+    info "initializing blockfilterindex (basic)"
+    state.blockFilterIndex = newBlockFilterIndex(
+      state.chainState.db.db, networkDir, bftBasic, enabled = true)
+  else:
+    state.blockFilterIndex = nil
+
+  # 7c. Start REST HTTP server (default OFF, --rest gate, Core parity).
+  if config.restEnabled:
+    let restPort =
+      if config.restPort != 0: config.restPort
+      else: uint16(int(config.rpcPort) + 1000)
+    info "starting REST server", port = restPort
+    state.restServer = newRestServer(
+      restPort,
+      state.chainState,
+      state.mempool,
+      params,
+      txIndex = nil,
+      filterIndex = state.blockFilterIndex
+    )
+    # Same OS-thread model as the RPC server: each chronos dispatcher is
+    # thread-local, so the REST listener gets its own event loop and is
+    # not blocked by main-thread verifyScripts batches. Keep the thread
+    # storage on `state` so it stays pinned for process lifetime — same
+    # SIGSEGV trap rpc_thread.nim documents.
+    createThread(state.restThread, restThreadMain, state.restServer)
 
   # 7b. Start Prometheus metrics server
   if config.metricsPort > 0:

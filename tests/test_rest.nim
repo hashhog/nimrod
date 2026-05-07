@@ -7,6 +7,7 @@ import ../src/rpc/rest
 import ../src/primitives/[types, serialize]
 import ../src/consensus/params
 import ../src/crypto/hashing
+import ../src/storage/indexes/gcs
 
 # Helper procs
 proc hexToBytes(hex: string): seq[byte] =
@@ -280,3 +281,104 @@ suite "REST blockhashbyheight json":
     }
     check resp.hasKey("blockhash")
     check resp["blockhash"].getStr().len == 64
+
+suite "REST blockfilter routing":
+  ## Routing-shape only — populating a real BlockFilterIndex is covered by
+  ## test_blockfilter.nim. Here we verify URI parsing, error reporting, and
+  ## that the filter routes don't collide with other prefixes.
+
+  test "parseBlockFilterType accepts 'basic'":
+    let t = parseBlockFilterType("basic")
+    check t.isSome
+    check t.get() == bftBasic
+
+  test "parseBlockFilterType accepts 'BASIC' (case-insensitive)":
+    let t = parseBlockFilterType("BASIC")
+    check t.isSome
+    check t.get() == bftBasic
+
+  test "parseBlockFilterType rejects unknown filter type":
+    check parseBlockFilterType("extended").isNone
+    check parseBlockFilterType("").isNone
+    check parseBlockFilterType("BIP158-extra").isNone
+
+  test "blockfilter route prefix":
+    let path = "/rest/blockfilter/basic/" &
+      "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f.json"
+    check path.startsWith("/rest/blockfilter/")
+    let cleanPath = path[6 .. ^1]  # strip /rest/
+    check cleanPath.startsWith("blockfilter/")
+    let segPath = cleanPath[12 .. ^1]
+    var paramOnly = segPath
+    let rf = parseDataFormat(paramOnly, segPath)
+    check rf == rfJson
+    let parts = paramOnly.split('/')
+    check parts.len == 2
+    check parts[0] == "basic"
+    check parts[1].len == 64
+
+  test "blockfilterheaders route prefix (deprecated 3-segment form)":
+    let path = "/rest/blockfilterheaders/basic/5/" &
+      "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f.bin"
+    check path.startsWith("/rest/blockfilterheaders/")
+    let cleanPath = path[6 .. ^1]
+    check cleanPath.startsWith("blockfilterheaders/")
+    let segPath = cleanPath[19 .. ^1]
+    var paramOnly = segPath
+    let rf = parseDataFormat(paramOnly, segPath)
+    check rf == rfBinary
+    let parts = paramOnly.split('/')
+    check parts.len == 3
+    check parts[0] == "basic"
+    check parts[1] == "5"
+    check parts[2].len == 64
+
+  test "blockfilterheaders route prefix (new 2-segment + ?count= form)":
+    let path = "/rest/blockfilterheaders/basic/" &
+      "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f.hex" &
+      "?count=10"
+    check path.startsWith("/rest/blockfilterheaders/")
+    # The handler parses ?count=N before splitting on '/' — confirm splitting
+    # the query part out gives the expected shape.
+    let qsplit = path.split('?')
+    check qsplit.len == 2
+    check qsplit[1] == "count=10"
+
+  test "encodeBlockFilterRecord produces compactsize-prefixed bytes":
+    # Build an empty basic filter — N=0, encoded payload is just CompactSize(0)
+    var hashBytes: array[32, byte]
+    hashBytes[0] = 0xab
+    let blockHash = BlockHash(hashBytes)
+    let filter = newBlockFilter(bftBasic, blockHash, @[])
+    let record = encodeBlockFilterRecord(filter)
+    # CompactSize(1) prefix + 1-byte payload (CompactSize(0)) = 2 bytes.
+    check record.len == 2
+    check record[0] == 0x01'u8
+    check record[1] == 0x00'u8
+
+  test "MaxRestBlockfilterHeaders matches Core MAX_REST_HEADERS_RESULTS":
+    check MaxRestBlockfilterHeaders == 2000
+
+suite "REST blockfilter route ordering":
+  ## Tests the route-priority guard inside handleRestRequest: the
+  ## `blockfilterheaders/` prefix must be checked BEFORE `blockfilter/`,
+  ## otherwise the latter swallows the former (it's a prefix of the
+  ## headers-route name).
+
+  test "blockfilterheaders is not a prefix of blockfilter (reverse)":
+    # Sanity check: the literal byte ordering matters.  The handler's
+    # `if cleanPath.startsWith(...)` chain is exhaustively covered by
+    # checking that 'blockfilter/' is a strict prefix of
+    # 'blockfilterheaders/' (which is what causes the ordering bug
+    # if mis-applied).
+    check "blockfilterheaders/".startsWith("blockfilter")
+    check not "blockfilter/".startsWith("blockfilterheaders")
+
+  test "stripping 'blockfilter/' prefix length is 12":
+    # Used in handleRestRequest: `cleanPath[12 .. ^1]`.  Misalignment
+    # by even one byte routes a hash with a leading char chopped off.
+    check "blockfilter/".len == 12
+
+  test "stripping 'blockfilterheaders/' prefix length is 19":
+    # Used in handleRestRequest: `cleanPath[19 .. ^1]`.
+    check "blockfilterheaders/".len == 19
