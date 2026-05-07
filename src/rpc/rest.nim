@@ -13,6 +13,8 @@ import ../consensus/params
 import ../consensus/validation as consensus_validation
 import ../storage/[chainstate, blockstore]
 import ../storage/indexes/txindex
+import ../storage/indexes/blockfilterindex
+import ../storage/indexes/gcs
 import ../mempool/mempool
 import ../crypto/hashing
 
@@ -32,6 +34,7 @@ type
     params*: ConsensusParams
     running*: bool
     txIndex*: TxIndex  ## Optional: for tx lookup
+    filterIndex*: BlockFilterIndex  ## Optional: BIP-157 cfilter / cfheader lookup
 
 const
   MaxGetUtxosOutpoints* = 15  ## Max outpoints per getutxos request
@@ -45,7 +48,8 @@ proc newRestServer*(
   chainState: ChainState,
   mempool: Mempool,
   params: ConsensusParams,
-  txIndex: TxIndex = nil
+  txIndex: TxIndex = nil,
+  filterIndex: BlockFilterIndex = nil
 ): RestServer =
   RestServer(
     port: port,
@@ -53,7 +57,8 @@ proc newRestServer*(
     mempool: mempool,
     params: params,
     running: false,
-    txIndex: txIndex
+    txIndex: txIndex,
+    filterIndex: filterIndex
   )
 
 # ============================================================================
@@ -697,6 +702,223 @@ proc handleRestMempoolContents*(rest: RestServer): RestResponse =
   restJson(entries)
 
 # ============================================================================
+# Block filter endpoints (BIP-157)
+# ============================================================================
+
+const
+  MaxRestBlockfilterHeaders* = 2000
+    ## Max cfheaders per request, mirrors MAX_REST_HEADERS_RESULTS in
+    ## bitcoin-core/src/rest.cpp.
+
+proc parseBlockFilterType*(name: string): Option[BlockFilterType] =
+  ## Mirrors Bitcoin Core's `BlockFilterTypeByName`. Only "basic" is currently
+  ## defined per BIP-158, but we keep the table-shaped API for forward
+  ## compatibility with any new filter type the BIP series adds later.
+  case name.toLowerAscii
+  of "basic": some(bftBasic)
+  else: none(BlockFilterType)
+
+proc encodeBlockFilterRecord*(filter: BlockFilter): seq[byte] =
+  ## Same wire shape as Bitcoin Core's `DataStream ssResp{}; ssResp << filter;`
+  ## (see rest.cpp::rest_block_filter and blockfilter.h SerializationOps).
+  ## A filter is serialized as `compactsize_len(filter) || filter_bytes`.
+  let encoded = getEncodedFilter(filter)
+  var w = BinaryWriter()
+  w.writeCompactSize(uint64(encoded.len))
+  result = w.data
+  result.add(encoded)
+
+proc handleRestBlockFilter*(rest: RestServer, uriPart: string): RestResponse =
+  ## GET /rest/blockfilter/<filtertype>/<blockhash>.<format>
+  ## Reference: bitcoin-core/src/rest.cpp::rest_block_filter (line 622).
+  var param = uriPart
+  let rf = parseDataFormat(param, uriPart)
+
+  if rf == rfUndef:
+    return restError(Http404, "output format not found (available: " &
+                              availableFormatsString() & ")")
+
+  let parts = param.split('/')
+  if parts.len != 2:
+    return restError(Http400,
+      "Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>")
+
+  let typeName = parts[0]
+  let hashStr = parts[1]
+
+  let filterTypeOpt = parseBlockFilterType(typeName)
+  if filterTypeOpt.isNone:
+    return restError(Http400, "Unknown filtertype " & typeName)
+  let filterType = filterTypeOpt.get()
+
+  let blockHash = try:
+    parseBlockHash(hashStr)
+  except CatchableError:
+    return restError(Http400, "Invalid hash: " & hashStr)
+
+  if rest.filterIndex == nil or not rest.filterIndex.enabled:
+    return restError(Http400,
+      "Index is not enabled for filtertype " & typeName)
+
+  if rest.filterIndex.filterType != filterType:
+    return restError(Http400,
+      "Index is not enabled for filtertype " & typeName)
+
+  let idxOpt = rest.chainState.db.getBlockIndex(blockHash)
+  if idxOpt.isNone:
+    return restError(Http404, hashStr & " not found")
+  let height = idxOpt.get().height
+
+  # Confirm the requested block is on the active chain — Core only serves
+  # filters for blocks that were connected (BLOCK_VALID_SCRIPTS). We mirror
+  # that by checking that the height->hash mapping resolves to the same hash.
+  let activeOpt = rest.chainState.db.getBlockHashByHeight(height)
+  let blockWasConnected = activeOpt.isSome and activeOpt.get() == blockHash
+
+  let filterOpt = rest.filterIndex.getFilter(height, blockHash)
+  if filterOpt.isNone:
+    var errmsg = "Filter not found."
+    if not blockWasConnected:
+      errmsg.add(" Block was not connected to active chain.")
+    elif rest.filterIndex.bestHeight < height:
+      errmsg.add(" Block filters are still in the process of being indexed.")
+    else:
+      errmsg.add(" This error is unexpected and indicates index corruption.")
+    return restError(Http404, errmsg)
+
+  let filter = filterOpt.get()
+
+  case rf
+  of rfBinary:
+    restBinary(encodeBlockFilterRecord(filter))
+  of rfHex:
+    restHex(encodeBlockFilterRecord(filter))
+  of rfJson:
+    restJson(%*{"filter": toHex(getEncodedFilter(filter))})
+  else:
+    restError(Http404, "output format not found")
+
+proc handleRestBlockFilterHeaders*(rest: RestServer, uriPart: string): RestResponse =
+  ## GET /rest/blockfilterheaders/<filtertype>/<count>/<blockhash>.<format>
+  ## (deprecated path, still served for parity)
+  ## GET /rest/blockfilterheaders/<filtertype>/<blockhash>.<format>?count=<N>
+  ## (new path with query parameter — Core 28+)
+  ## Reference: bitcoin-core/src/rest.cpp::rest_filter_header (line 500).
+  var param = uriPart
+  let rf = parseDataFormat(param, uriPart)
+
+  if rf == rfUndef:
+    return restError(Http404, "output format not found (available: " &
+                              availableFormatsString() & ")")
+
+  # Strip query string (?count=N) before splitting; remember it for the
+  # 2-segment new-style path.
+  var queryCount = ""
+  let qpos = param.find('?')
+  if qpos >= 0:
+    let qs = param[qpos + 1 .. ^1]
+    param = param[0 ..< qpos]
+    for kv in qs.split('&'):
+      let eq = kv.find('=')
+      if eq > 0 and kv[0 ..< eq] == "count":
+        queryCount = kv[eq + 1 .. ^1]
+
+  let parts = param.split('/')
+  var typeName = ""
+  var rawCount = ""
+  var hashStr = ""
+
+  if parts.len == 3:
+    # Deprecated path: /<filtertype>/<count>/<blockhash>
+    typeName = parts[0]
+    rawCount = parts[1]
+    hashStr = parts[2]
+  elif parts.len == 2:
+    # New path: /<filtertype>/<blockhash>?count=N
+    typeName = parts[0]
+    hashStr = parts[1]
+    rawCount = if queryCount.len > 0: queryCount else: "5"
+  else:
+    return restError(Http400,
+      "Invalid URI format. Expected /rest/blockfilterheaders/" &
+      "<filtertype>/<blockhash>.<ext>?count=<count>")
+
+  let count = try:
+    parseInt(rawCount)
+  except ValueError:
+    return restError(Http400,
+      "Header count is invalid or out of acceptable range (1-" &
+      $MaxRestBlockfilterHeaders & "): " & rawCount)
+
+  if count < 1 or count > MaxRestBlockfilterHeaders:
+    return restError(Http400,
+      "Header count is invalid or out of acceptable range (1-" &
+      $MaxRestBlockfilterHeaders & "): " & rawCount)
+
+  let filterTypeOpt = parseBlockFilterType(typeName)
+  if filterTypeOpt.isNone:
+    return restError(Http400, "Unknown filtertype " & typeName)
+  let filterType = filterTypeOpt.get()
+
+  let blockHash = try:
+    parseBlockHash(hashStr)
+  except CatchableError:
+    return restError(Http400, "Invalid hash: " & hashStr)
+
+  if rest.filterIndex == nil or not rest.filterIndex.enabled:
+    return restError(Http400,
+      "Index is not enabled for filtertype " & typeName)
+
+  if rest.filterIndex.filterType != filterType:
+    return restError(Http400,
+      "Index is not enabled for filtertype " & typeName)
+
+  # Walk the active chain forward from the requested hash, mirroring
+  # Core's `while (pindex && active_chain.Contains(pindex))` loop.
+  let idxOpt = rest.chainState.db.getBlockIndex(blockHash)
+  if idxOpt.isNone:
+    return restError(Http404, hashStr & " not found")
+  let startHeight = idxOpt.get().height
+
+  let activeStart = rest.chainState.db.getBlockHashByHeight(startHeight)
+  if activeStart.isNone or activeStart.get() != blockHash:
+    return restError(Http404, hashStr & " not found")
+
+  var filterHeaders: seq[array[32, byte]]
+  filterHeaders.setLen(0)
+  var h = startHeight
+  while filterHeaders.len < count and h <= rest.chainState.bestHeight:
+    let entryOpt = rest.filterIndex.getFilterEntry(h)
+    if entryOpt.isNone:
+      var errmsg = "Filter not found."
+      if rest.filterIndex.bestHeight < h:
+        errmsg.add(" Block filters are still in the process of being indexed.")
+      else:
+        errmsg.add(" This error is unexpected and indicates index corruption.")
+      return restError(Http404, errmsg)
+    filterHeaders.add(entryOpt.get().filterHeader)
+    inc h
+
+  case rf
+  of rfBinary:
+    var data: seq[byte]
+    for fh in filterHeaders:
+      data.add(@fh)
+    restBinary(data)
+  of rfHex:
+    var data: seq[byte]
+    for fh in filterHeaders:
+      data.add(@fh)
+    restHex(data)
+  of rfJson:
+    var arr = newJArray()
+    for fh in filterHeaders:
+      arr.add(%reverseHex(toHex(fh)))
+    restJson(arr)
+  else:
+    restError(Http404, "output format not found")
+
+# ============================================================================
 # Request routing
 # ============================================================================
 
@@ -733,6 +955,14 @@ proc handleRestRequest*(rest: RestServer, path: string): RestResponse =
 
   if cleanPath == "mempool/contents.json":
     return rest.handleRestMempoolContents()
+
+  # NOTE: order matters — `blockfilterheaders/` must be checked before
+  # `blockfilter/`, otherwise the headers prefix matches the filter route.
+  if cleanPath.startsWith("blockfilterheaders/"):
+    return rest.handleRestBlockFilterHeaders(cleanPath[19 .. ^1])
+
+  if cleanPath.startsWith("blockfilter/"):
+    return rest.handleRestBlockFilter(cleanPath[12 .. ^1])
 
   restError(Http404, "Not found")
 
