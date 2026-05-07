@@ -316,36 +316,50 @@ suite "ChainDb":
   test "atomic applyBlock":
     var cdb = openChainDb(TestDbPath)
 
+    # Apply genesis at h=0 (per W14 / Core parity, no UTXO mutation —
+    # block storage, index entry, and best-block pointer still update).
     let genesis = makeTestBlock(BlockHash(default(array[32, byte])), 0, 2)
     cdb.applyBlock(genesis, 0)
 
     # Check block was stored
-    let headerBytes = serialize(genesis.header)
-    let blockHash = BlockHash(doubleSha256(headerBytes))
-    let retrieved = cdb.getBlock(blockHash)
+    let genesisHeaderBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisHeaderBytes))
+    let retrieved = cdb.getBlock(genesisHash)
     check retrieved.isSome
 
-    # Check UTXOs were created for coinbase
-    let coinbaseTxid = genesis.txs[0].txid()
-    let coinbaseOutpoint = OutPoint(txid: coinbaseTxid, vout: 0)
-    let coinbaseUtxo = cdb.getUtxo(coinbaseOutpoint)
-    check coinbaseUtxo.isSome
-    check coinbaseUtxo.get().isCoinbase == true
-    check coinbaseUtxo.get().height == 0
+    # Genesis coinbase MUST NOT be in the UTXO set (Core parity).
+    let genesisCoinbaseTxid = genesis.txs[0].txid()
+    check cdb.getUtxo(OutPoint(txid: genesisCoinbaseTxid, vout: 0)).isNone
 
     # Check best block was updated
     check cdb.bestHeight == 0
-    check cdb.bestBlockHash == blockHash
+    check cdb.bestBlockHash == genesisHash
 
     # Check block index
-    let idx = cdb.getBlockIndex(blockHash)
-    check idx.isSome
-    check idx.get().status == bsValidated
+    let genesisIdx = cdb.getBlockIndex(genesisHash)
+    check genesisIdx.isSome
+    check genesisIdx.get().status == bsValidated
 
-    # Check tx index
+    # Apply a non-genesis block (h=1) and verify its UTXO is created normally.
+    let block1 = makeTestBlock(genesisHash, 1, 2)
+    cdb.applyBlock(block1, 1)
+
+    let block1HeaderBytes = serialize(block1.header)
+    let block1Hash = BlockHash(doubleSha256(block1HeaderBytes))
+    let coinbaseTxid = block1.txs[0].txid()
+    let coinbaseUtxo = cdb.getUtxo(OutPoint(txid: coinbaseTxid, vout: 0))
+    check coinbaseUtxo.isSome
+    check coinbaseUtxo.get().isCoinbase == true
+    check coinbaseUtxo.get().height == 1
+
+    check cdb.bestHeight == 1
+    check cdb.bestBlockHash == block1Hash
+
+    # Tx index at h=1 (genesis txindex was also intentionally skipped — this
+    # mirrors `connectBlock`'s genesis-skip behaviour).
     let txLoc = cdb.getTxIndex(coinbaseTxid)
     check txLoc.isSome
-    check txLoc.get().blockHash == blockHash
+    check txLoc.get().blockHash == block1Hash
     check txLoc.get().txIndex == 0
 
     cdb.close()

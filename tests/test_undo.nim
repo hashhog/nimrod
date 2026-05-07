@@ -97,6 +97,22 @@ proc getBlockHash(blk: Block): BlockHash =
   let headerBytes = serialize(blk.header)
   BlockHash(doubleSha256(headerBytes))
 
+proc seedSpendableCoinbase(
+  cs: var ChainState,
+  chainId: int32 = 0
+): tuple[fixtureBlock: Block, fixtureHash: BlockHash, coinbaseTxid: TxId] =
+  ## Connect genesis (h=0, no UTXO per W14 / Core parity) + a fixture
+  ## coinbase block at h=1. See test_chainstate.nim's matching helper for
+  ## the rationale: nimrod no longer adds the genesis coinbase to the UTXO
+  ## set, so tests that need a spendable seed must use h=1.
+  let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0, chainId)
+  discard cs.connectBlock(genesis, 0)
+  let genesisHash = getBlockHash(genesis)
+  let fixture = makeSimpleBlock(genesisHash, 1, chainId)
+  discard cs.connectBlock(fixture, 1)
+  let fixtureHash = getBlockHash(fixture)
+  (fixture, fixtureHash, fixture.txs[0].txid())
+
 suite "Undo data serialization":
   test "serialize and deserialize SpentOutput":
     let spent = SpentOutput(
@@ -305,29 +321,27 @@ suite "ChainState disconnect with flat file undo":
   test "connect and disconnect single block":
     var cs = newChainState(TestDbPath, regtestParams())
 
-    # Connect genesis
-    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
-    discard cs.connectBlock(genesis, 0)
-    let genesisHash = getBlockHash(genesis)
-    let coinbaseTxid = genesis.txs[0].txid()
+    # Seed: genesis (h=0, no UTXO per W14) + fixture coinbase at h=1.
+    let (block1, _, coinbaseTxid) = seedSpendableCoinbase(cs)
 
-    check cs.bestHeight == 0
+    check cs.bestHeight == 1
     check cs.getUtxo(OutPoint(txid: coinbaseTxid, vout: 0)).isSome
 
-    # Connect block 1
-    let block1 = makeSimpleBlock(genesisHash, 1)
-    discard cs.connectBlock(block1, 1)
+    # Connect block 2
+    let block1Hash = getBlockHash(block1)
+    let block2 = makeSimpleBlock(block1Hash, 2)
+    discard cs.connectBlock(block2, 2)
+    check cs.bestHeight == 2
+
+    # Disconnect block 2 using flat file undo
+    let disconnectRes = cs.disconnectBlock(block2)
+    check disconnectRes.isOk
     check cs.bestHeight == 1
 
-    # Disconnect block 1 using flat file undo
-    let disconnectRes = cs.disconnectBlock(block1)
-    check disconnectRes.isOk
-    check cs.bestHeight == 0
+    # Block 2 coinbase should be gone
+    check cs.getUtxo(OutPoint(txid: block2.txs[0].txid(), vout: 0)).isNone
 
-    # Block 1 coinbase should be gone
-    check cs.getUtxo(OutPoint(txid: block1.txs[0].txid(), vout: 0)).isNone
-
-    # Genesis coinbase should still exist
+    # Fixture (h=1) coinbase should still exist
     check cs.getUtxo(OutPoint(txid: coinbaseTxid, vout: 0)).isSome
 
     cs.close()
@@ -335,35 +349,32 @@ suite "ChainState disconnect with flat file undo":
   test "disconnect block with spent UTXOs":
     var cs = newChainState(TestDbPath, regtestParams())
 
-    # Connect genesis
-    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
-    discard cs.connectBlock(genesis, 0)
-    let genesisHash = getBlockHash(genesis)
-    let coinbaseTxid = genesis.txs[0].txid()
+    # Seed: genesis (h=0, no UTXO per W14) + fixture coinbase at h=1.
+    let (_, fixtureHash, coinbaseTxid) = seedSpendableCoinbase(cs)
 
-    # Build chain to maturity (100 blocks)
-    var prevHash = genesisHash
-    for h in 1 ..< 100:
+    # Build chain to maturity (h=1 coinbase spendable at h=101).
+    var prevHash = fixtureHash
+    for h in 2 ..< 101:
       let blk = makeSimpleBlock(prevHash, int32(h))
       discard cs.connectBlock(blk, int32(h))
       prevHash = getBlockHash(blk)
 
-    # Spend genesis coinbase at height 100
+    # Spend fixture coinbase at height 101
     let spendTx = makeTestTransaction(coinbaseTxid, 0, 4999000000, false)
-    let coinbase = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true, 100)
-    let spendBlock = makeTestBlock(prevHash, 100, @[coinbase, spendTx])
-    discard cs.connectBlock(spendBlock, 100)
+    let coinbase = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true, 101)
+    let spendBlock = makeTestBlock(prevHash, 101, @[coinbase, spendTx])
+    discard cs.connectBlock(spendBlock, 101)
 
-    # Genesis UTXO should be spent
+    # Fixture UTXO should be spent
     check cs.getUtxo(OutPoint(txid: coinbaseTxid, vout: 0)).isNone
-    check cs.bestHeight == 100
+    check cs.bestHeight == 101
 
     # Disconnect the spend block
     let disconnectRes = cs.disconnectBlock(spendBlock)
     check disconnectRes.isOk
-    check cs.bestHeight == 99
+    check cs.bestHeight == 100
 
-    # Genesis UTXO should be restored
+    # Fixture coinbase UTXO should be restored
     let restoredUtxo = cs.getUtxo(OutPoint(txid: coinbaseTxid, vout: 0))
     check restoredUtxo.isSome
     check int64(restoredUtxo.get().output.value) == 5000000000
@@ -439,40 +450,37 @@ suite "Chain reorg with flat file undo":
   test "reorg with spent outputs":
     var cs = newChainState(TestDbPath, regtestParams())
 
-    # Connect genesis
-    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0, chainId = 0)
-    discard cs.connectBlock(genesis, 0)
-    let genesisHash = getBlockHash(genesis)
-    let genesisCoinbase = genesis.txs[0].txid()
+    # Seed: genesis (h=0, no UTXO per W14) + fixture coinbase at h=1.
+    let (_, fixtureHash, fixtureCoinbase) = seedSpendableCoinbase(cs, chainId = 1)
 
-    # Build to maturity and spend genesis coinbase (chainId = 1 for this chain)
-    var prevHash = genesisHash
-    for h in 1 ..< 100:
+    # Build to maturity and spend fixture coinbase (chainId = 1 chain).
+    var prevHash = fixtureHash
+    for h in 2 ..< 101:
       let blk = makeSimpleBlock(prevHash, int32(h), chainId = 1)
       discard cs.connectBlock(blk, int32(h))
       prevHash = getBlockHash(blk)
 
-    # Spend genesis at height 100
-    let spendTx = makeTestTransaction(genesisCoinbase, 0, 4999000000, false)
-    let cb100 = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true, 100)
-    let block100 = makeTestBlock(prevHash, 100, @[cb100, spendTx], chainId = 1)
-    discard cs.connectBlock(block100, 100)
+    # Spend fixture coinbase at height 101
+    let spendTx = makeTestTransaction(fixtureCoinbase, 0, 4999000000, false)
+    let cb101 = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true, 101)
+    let block101 = makeTestBlock(prevHash, 101, @[cb101, spendTx], chainId = 1)
+    discard cs.connectBlock(block101, 101)
 
-    check cs.getUtxo(OutPoint(txid: genesisCoinbase, vout: 0)).isNone
+    check cs.getUtxo(OutPoint(txid: fixtureCoinbase, vout: 0)).isNone
     check cs.getUtxo(OutPoint(txid: spendTx.txid(), vout: 0)).isSome
 
-    # Create alternative chain from height 99 that doesn't spend genesis (chainId = 2)
-    let altBlock100 = makeSimpleBlock(prevHash, 100, chainId = 2)
-    let altBlock100Hash = getBlockHash(altBlock100)
-    let altBlock101 = makeSimpleBlock(altBlock100Hash, 101, chainId = 2)
+    # Create alternative chain from height 100 that doesn't spend fixture (chainId = 2)
+    let altBlock101 = makeSimpleBlock(prevHash, 101, chainId = 2)
+    let altBlock101Hash = getBlockHash(altBlock101)
+    let altBlock102 = makeSimpleBlock(altBlock101Hash, 102, chainId = 2)
 
-    # Reorg: fork at height 99
-    let reorgRes = cs.handleReorg(prevHash, @[altBlock100, altBlock101])
+    # Reorg: fork at height 100
+    let reorgRes = cs.handleReorg(prevHash, @[altBlock101, altBlock102])
     check reorgRes.isOk
-    check cs.bestHeight == 101
+    check cs.bestHeight == 102
 
-    # Genesis coinbase should be restored (unspent in new chain)
-    check cs.getUtxo(OutPoint(txid: genesisCoinbase, vout: 0)).isSome
+    # Fixture coinbase should be restored (unspent in new chain)
+    check cs.getUtxo(OutPoint(txid: fixtureCoinbase, vout: 0)).isSome
 
     # The spend transaction output should not exist
     check cs.getUtxo(OutPoint(txid: spendTx.txid(), vout: 0)).isNone
