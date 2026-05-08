@@ -6,6 +6,7 @@ import nimcrypto/[sha2, hmac, pbkdf2]
 import ../primitives/[types, serialize]
 import ../crypto/[hashing, secp256k1, address, base58]
 import ../consensus/params
+import ../script/interpreter
 import ../storage/chainstate
 import ./coinselection
 import ./crypter
@@ -996,66 +997,35 @@ proc createTransaction*(wallet: var Wallet, outputs: seq[TxOut],
     result.witnesses[i] = @[]
 
 proc computeSighashP2WPKH*(tx: Transaction, inputIdx: int,
-                           scriptCode: seq[byte], value: Satoshi): array[32, byte] =
-  ## Compute BIP143 sighash for P2WPKH
-  var w = BinaryWriter()
-
-  # 1. nVersion
-  w.writeInt32LE(tx.version)
-
-  # 2. hashPrevouts (double SHA256 of all outpoints)
-  var prevoutsW = BinaryWriter()
-  for input in tx.inputs:
-    prevoutsW.writeOutPoint(input.prevOut)
-  let hashPrevouts = doubleSha256(prevoutsW.data)
-  w.writeBytes(hashPrevouts)
-
-  # 3. hashSequence (double SHA256 of all sequences)
-  var sequenceW = BinaryWriter()
-  for input in tx.inputs:
-    sequenceW.writeUint32LE(input.sequence)
-  let hashSequence = doubleSha256(sequenceW.data)
-  w.writeBytes(hashSequence)
-
-  # 4. outpoint being signed
-  w.writeOutPoint(tx.inputs[inputIdx].prevOut)
-
-  # 5. scriptCode (for P2WPKH: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG)
-  w.writeVarBytes(scriptCode)
-
-  # 6. value of the output being spent
-  w.writeInt64LE(int64(value))
-
-  # 7. nSequence of the input being signed
-  w.writeUint32LE(tx.inputs[inputIdx].sequence)
-
-  # 8. hashOutputs (double SHA256 of all outputs)
-  var outputsW = BinaryWriter()
-  for output in tx.outputs:
-    outputsW.writeTxOut(output)
-  let hashOutputs = doubleSha256(outputsW.data)
-  w.writeBytes(hashOutputs)
-
-  # 9. nLockTime
-  w.writeUint32LE(tx.lockTime)
-
-  # 10. sighash type (SIGHASH_ALL = 0x01)
-  w.writeUint32LE(0x01)
-
-  doubleSha256(w.data)
+                           scriptCode: seq[byte], value: Satoshi,
+                           hashType: uint32 = uint32(SIGHASH_ALL)): array[32, byte] =
+  ## Compute BIP-143 sighash for a P2WPKH input.
+  ##
+  ## Thin wrapper over the canonical interpreter implementation
+  ## (`script/interpreter.computeSighashSegwitV0`). Previously this
+  ## proc had a hand-rolled body that hard-coded `hashType = 0x01`
+  ## (SIGHASH_ALL), silently mis-signing any non-default sighash.
+  ## See W27-B / `CORE-PARITY-AUDIT/_fix-verification-methodology-2026-05-04.md`.
+  computeSighashSegwitV0(tx, inputIdx, scriptCode, value, hashType)
 
 proc signInputP2WPKH*(tx: var Transaction, inputIdx: int,
                       privateKey: PrivateKey, publicKey: PublicKey,
-                      value: Satoshi) =
-  ## Sign a P2WPKH input
+                      value: Satoshi,
+                      hashType: uint32 = uint32(SIGHASH_ALL)) =
+  ## Sign a P2WPKH input.
+  ##
+  ## `hashType` defaults to SIGHASH_ALL for backwards compatibility.
+  ## Any combination of SIGHASH_{ALL,NONE,SINGLE} optionally OR'd with
+  ## SIGHASH_ANYONECANPAY is accepted; the byte is appended to the DER
+  ## signature on the witness stack.
   # Build scriptCode: OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG
   let pkh = hash160(publicKey)
   var scriptCode = @[0x76'u8, 0xa9, 0x14]  # OP_DUP OP_HASH160 PUSH20
   scriptCode.add(@pkh)
   scriptCode.add([0x88'u8, 0xac])  # OP_EQUALVERIFY OP_CHECKSIG
 
-  # Compute sighash
-  let sighash = computeSighashP2WPKH(tx, inputIdx, scriptCode, value)
+  # Compute sighash with the requested hashType (was hard-coded SIGHASH_ALL).
+  let sighash = computeSighashP2WPKH(tx, inputIdx, scriptCode, value, hashType)
 
   # Sign
   let sig = sign(privateKey, sighash)
@@ -1097,20 +1067,30 @@ proc signInputP2WPKH*(tx: var Transaction, inputIdx: int,
   derSig.add(byte(sBytes.len))
   derSig.add(sBytes)
 
-  derSig.add(0x01)  # SIGHASH_ALL
+  # Append sighash type byte (low 8 bits of hashType, e.g. SIGHASH_ALL = 0x01).
+  derSig.add(byte(hashType and 0xff))
 
   # Set witness: [signature, pubkey]
   tx.witnesses[inputIdx] = @[derSig, @(publicKey)]
 
 proc signTransaction*(wallet: Wallet, tx: var Transaction,
-                      utxos: seq[WalletUtxo]): bool =
-  ## Sign all inputs of a transaction
-  ## Returns true if all inputs were signed successfully
+                      utxos: seq[WalletUtxo],
+                      hashTypes: seq[uint32] = @[]): bool =
+  ## Sign all inputs of a transaction.
+  ## `hashTypes` (optional) — per-input sighash flag. If empty, defaults to
+  ## SIGHASH_ALL for every input. If non-empty, must have the same length as
+  ## `utxos` (one entry per input) and is the natural plumbing point for
+  ## PSBT's `PSBT_IN_SIGHASH_TYPE` (`psbt.nim:110`).
+  ## Returns true if all inputs were signed successfully.
 
   if utxos.len != tx.inputs.len:
     raise newException(WalletError, "utxo count doesn't match input count")
+  if hashTypes.len != 0 and hashTypes.len != utxos.len:
+    raise newException(WalletError, "hashTypes length must match utxos length")
 
   for i, utxo in utxos:
+    let hashType = if hashTypes.len == 0: uint32(SIGHASH_ALL) else: hashTypes[i]
+
     # Find the key for this UTXO
     let keyOpt = wallet.findKeyForScript(utxo.output.scriptPubKey)
     if keyOpt.isNone:
@@ -1122,7 +1102,8 @@ proc signTransaction*(wallet: Wallet, tx: var Transaction,
     # Determine address type from scriptPubKey
     if spk.len == 22 and spk[0] == 0x00 and spk[1] == 0x14:
       # P2WPKH
-      signInputP2WPKH(tx, i, key.extKey.key, key.extKey.publicKey, utxo.output.value)
+      signInputP2WPKH(tx, i, key.extKey.key, key.extKey.publicKey,
+                      utxo.output.value, hashType)
     elif spk.len == 34 and spk[0] == 0x51 and spk[1] == 0x20:
       # P2TR - requires Schnorr signature (simplified)
       raise newException(WalletError, "P2TR signing not yet fully implemented")

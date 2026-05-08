@@ -6,6 +6,7 @@ import ../src/wallet/wallet
 import ../src/primitives/types
 import ../src/crypto/[hashing, secp256k1, address]
 import ../src/consensus/params
+import ../src/script/interpreter  # W27-B: computeSighashSegwitV0 cross-check
 
 suite "BIP39 Mnemonic":
   test "generate 12-word mnemonic":
@@ -368,6 +369,117 @@ when defined(useSystemSecp256k1):
       for b in sighash:
         if b != 0: allZero = false
       check not allZero
+
+    # ----- W27-B: hashType plumbing through computeSighashP2WPKH -----
+    # Build a small 2-input / 2-output tx so that SIGHASH_NONE and
+    # SIGHASH_SINGLE differ from SIGHASH_ALL on more than the trailing
+    # 4-byte hashType field (i.e. they actually exercise the
+    # output/sequence suppression branches).
+    proc buildMultiInputTx(): tuple[tx: Transaction, scriptCode: seq[byte]] =
+      let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+      var w = newWallet(mnemonic)
+      w.addAccount(purpose = 84, gap = 3)
+      let firstKey = w.accounts[0].externalKeys[0]
+      let pkh = hash160(firstKey.extKey.publicKey)
+
+      var prevA, prevB: array[32, byte]
+      prevA[0] = 0x01
+      prevB[0] = 0x02
+
+      var sc = @[0x76'u8, 0xa9, 0x14]
+      sc.add(@pkh)
+      sc.add([0x88'u8, 0xac])
+
+      let tx = Transaction(
+        version: 2,
+        inputs: @[
+          TxIn(prevOut: OutPoint(txid: TxId(prevA), vout: 0'u32),
+               scriptSig: @[], sequence: 0xfffffffd'u32),
+          TxIn(prevOut: OutPoint(txid: TxId(prevB), vout: 1'u32),
+               scriptSig: @[], sequence: 0xfffffffe'u32),
+        ],
+        outputs: @[
+          TxOut(value: Satoshi(50_000),
+                scriptPubKey: @[0x00'u8, 0x14] & @pkh),
+          TxOut(value: Satoshi(40_000),
+                scriptPubKey: @[0x00'u8, 0x14] & @pkh),
+        ],
+        witnesses: @[@[], @[]],
+        lockTime: 0
+      )
+      (tx, sc)
+
+    test "P2WPKH sighash SIGHASH_ALL preserves legacy default":
+      # Default (no hashType arg) MUST equal explicit SIGHASH_ALL — this
+      # is the backwards-compat invariant. Pre-W27B the proc hard-coded
+      # 0x01 internally; this test pins the equality.
+      let (tx, scriptCode) = buildMultiInputTx()
+      let amt = Satoshi(100_000)
+
+      let dflt = computeSighashP2WPKH(tx, 0, scriptCode, amt)
+      let allExplicit =
+        computeSighashP2WPKH(tx, 0, scriptCode, amt, 0x01'u32)
+      check dflt == allExplicit
+
+      # And it must also match the canonical interpreter path, since
+      # the wallet wrapper now delegates to it.
+      let canonical = computeSighashSegwitV0(tx, 0, scriptCode, amt, 0x01'u32)
+      check dflt == canonical
+
+    test "P2WPKH sighash SIGHASH_NONE zeros hashOutputs in digest":
+      # BIP-143: under SIGHASH_NONE, hashOutputs == 32 zero bytes (output
+      # suppression). The digest therefore must NOT match SIGHASH_ALL,
+      # and must match the canonical interpreter computation directly.
+      let (tx, scriptCode) = buildMultiInputTx()
+      let amt = Satoshi(100_000)
+
+      let none = computeSighashP2WPKH(tx, 0, scriptCode, amt, 0x02'u32)
+      let all  = computeSighashP2WPKH(tx, 0, scriptCode, amt, 0x01'u32)
+      check none != all
+
+      let canonicalNone =
+        computeSighashSegwitV0(tx, 0, scriptCode, amt, 0x02'u32)
+      check none == canonicalNone
+
+      # Mutating outputs must not affect a SIGHASH_NONE digest, since
+      # outputs are zeroed out of the preimage. This is the property
+      # the pre-W27B stub silently violated by always signing with 0x01.
+      var mutated = tx
+      mutated.outputs[0].value = Satoshi(123_456)
+      mutated.outputs[1].scriptPubKey = @[0x6a'u8]  # OP_RETURN
+      let mutatedNone =
+        computeSighashP2WPKH(mutated, 0, scriptCode, amt, 0x02'u32)
+      check mutatedNone == none
+
+    test "P2WPKH sighash SIGHASH_SINGLE binds only the matching output":
+      # BIP-143: SIGHASH_SINGLE commits to outputs[inputIndex] only.
+      # Therefore: (a) the digest differs from SIGHASH_ALL, (b) it equals
+      # the canonical interpreter result, and (c) mutating *another*
+      # output (here outputs[1] when signing input 0) must not change it.
+      let (tx, scriptCode) = buildMultiInputTx()
+      let amt = Satoshi(100_000)
+
+      let single = computeSighashP2WPKH(tx, 0, scriptCode, amt, 0x03'u32)
+      let all    = computeSighashP2WPKH(tx, 0, scriptCode, amt, 0x01'u32)
+      check single != all
+
+      let canonicalSingle =
+        computeSighashSegwitV0(tx, 0, scriptCode, amt, 0x03'u32)
+      check single == canonicalSingle
+
+      var mutated = tx
+      mutated.outputs[1].value = Satoshi(999_999)
+      let mutatedSingle =
+        computeSighashP2WPKH(mutated, 0, scriptCode, amt, 0x03'u32)
+      check mutatedSingle == single
+
+      # Sanity: mutating the *bound* output (index 0) DOES change the
+      # digest, confirming SIGHASH_SINGLE actually commits to it.
+      var mutated0 = tx
+      mutated0.outputs[0].value = Satoshi(11_111)
+      let mutatedSingle0 =
+        computeSighashP2WPKH(mutated0, 0, scriptCode, amt, 0x03'u32)
+      check mutatedSingle0 != single
 
 else:
   echo "Note: secp256k1-dependent wallet tests skipped (compile with -d:useSystemSecp256k1)"
