@@ -4781,9 +4781,22 @@ proc handleSignRawTransactionWithWallet(rpc: RpcServer,
         })
       else:
         let redeemScript = redeemTable[rsKey]
+        # W31: every P2SH dispatch path MUST first prove the supplied
+        # redeemScript actually hashes to the prevout's script-hash, or a
+        # forged redeemScript turns the wallet into a signing oracle.
+        # Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature
+        # (TX_SCRIPTHASH branch) + camlcoin/lib/wallet.ml:1262.
+        if not verifyP2SHCommitment(redeemScript, prevOut.scriptPubKey):
+          errors.add(%*{
+            "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+            "vout": txin.prevOut.vout,
+            "scriptSig": "",
+            "sequence": txin.sequence,
+            "error": "redeemScript hash160 does not match scriptPubKey"
+          })
         # P2SH-P2WPKH: redeemScript = 22 bytes, 0x00 0x14 <hash160>
-        if redeemScript.len == 22 and redeemScript[0] == 0x00 and
-           redeemScript[1] == 0x14:
+        elif redeemScript.len == 22 and redeemScript[0] == 0x00 and
+             redeemScript[1] == 0x14:
           try:
             signInputP2SHP2WPKH(tx, i, dkey.extKey.key, dkey.extKey.publicKey,
                                 prevOut.value)
@@ -4806,6 +4819,19 @@ proc handleSignRawTransactionWithWallet(rpc: RpcServer,
               "scriptSig": "",
               "sequence": txin.sequence,
               "error": "P2SH-P2WSH requires witnessScript in prevtxs"
+            })
+          # W31: also verify witnessScript commits to redeemScript[2..33]
+          # (sha256 inner check).  Without this an attacker could forge a
+          # witnessScript whose redeemScript happens to be wallet-recognized
+          # but whose inner sighash is attacker-controlled.
+          elif not verifyP2SHWrappedP2WSHCommitment(witnessTable[rsKey],
+                                                    redeemScript):
+            errors.add(%*{
+              "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+              "vout": txin.prevOut.vout,
+              "scriptSig": "",
+              "sequence": txin.sequence,
+              "error": "witnessScript sha256 does not match redeemScript"
             })
           else:
             try:
@@ -4844,6 +4870,18 @@ proc handleSignRawTransactionWithWallet(rpc: RpcServer,
           "scriptSig": "",
           "sequence": txin.sequence,
           "error": "P2WSH input requires witnessScript in prevtxs"
+        })
+      # W31: prove `sha256(witnessScript) == spk[2..33]` before signing.
+      # Reference: bitcoin-core/src/script/sign.cpp (TX_WITNESS_V0_SCRIPTHASH
+      # branch of SignStep). Without this check a forged witnessScript would
+      # be hashed under a wallet sighash and signed.
+      elif not verifyP2WSHCommitment(witnessTable[wsKey], spk):
+        errors.add(%*{
+          "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+          "vout": txin.prevOut.vout,
+          "scriptSig": "",
+          "sequence": txin.sequence,
+          "error": "witnessScript sha256 does not match scriptPubKey"
         })
       else:
         try:
