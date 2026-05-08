@@ -14,7 +14,8 @@
 ## - ECDSA verify: ~50,000 ops/sec on modern x86_64
 ## - Schnorr verify: ~45,000 ops/sec on modern x86_64
 
-import std/[os]
+import std/[os, options]
+export options
 
 # Constants - must match libsecp256k1 headers
 const
@@ -219,6 +220,22 @@ when defined(useSystemSecp256k1):
     party: cint,
     hashfp: Secp256k1EllswiftXdhHashFunction,
     data: pointer
+  ): cint {.importc, cdecl.}
+
+  # BIP-32 / BIP-86 scalar + point tweak primitives
+  # Used for HD child-key derivation (BIP-32) and Taproot tweak (BIP-341/86).
+  # Both return 0 on overflow / invalid result; caller MUST handle that case
+  # (per BIP-32: bump the child index and try again; probability ~2^-127).
+  proc secp256k1_ec_seckey_tweak_add(
+    ctx: Secp256k1Context,
+    seckey: ptr byte,
+    tweak32: ptr byte
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_ec_pubkey_tweak_add(
+    ctx: Secp256k1Context,
+    pubkey: ptr Secp256k1Pubkey,
+    tweak32: ptr byte
   ): cint {.importc, cdecl.}
 
   var globalContext: Secp256k1Context
@@ -646,6 +663,61 @@ when defined(useSystemSecp256k1):
     result = (outputKey, int(parity))
 
   # ==========================================================================
+  # BIP-32 scalar / point tweak (mod n) — wraps libsecp's tweak_add primitives
+  # ==========================================================================
+
+  proc tweakSeckeyAdd*(
+    seckey: array[32, byte],
+    tweak: array[32, byte]
+  ): Option[array[32, byte]] =
+    ## Compute (seckey + tweak) mod n using libsecp256k1 (BIP-32 CKD_priv).
+    ##
+    ## Returns `none` if the call would overflow (tweak >= n) OR if the
+    ## resulting child key is zero. Per BIP-32 the caller MUST bump the
+    ## child index and retry in that case (probability ~2^-127, in practice
+    ## unreachable, but consensus-correct callers must handle it).
+    var sk = seckey
+    var tw = tweak
+    if secp256k1_ec_seckey_tweak_add(
+      getContext(), addr sk[0], addr tw[0]
+    ) != 1:
+      return none(array[32, byte])
+    return some(sk)
+
+  proc tweakPubkeyAdd*(
+    pubkey: PublicKey,
+    tweak: array[32, byte]
+  ): Option[PublicKey] =
+    ## Compute pubkey + tweak*G using libsecp256k1 (BIP-32 CKD_pub).
+    ##
+    ## Returns `none` if the call would overflow (tweak >= n) OR if the
+    ## resulting point is the point-at-infinity. Per BIP-32 the caller MUST
+    ## bump the child index and retry in that case.
+    var inputPk = pubkey
+    var parsed: Secp256k1Pubkey
+    if secp256k1_ec_pubkey_parse(
+      getContext(), addr parsed, addr inputPk[0], 33
+    ) != 1:
+      return none(PublicKey)
+
+    var tw = tweak
+    if secp256k1_ec_pubkey_tweak_add(
+      getContext(), addr parsed, addr tw[0]
+    ) != 1:
+      return none(PublicKey)
+
+    var serialized: PublicKey
+    var outputLen: csize_t = 33
+    if secp256k1_ec_pubkey_serialize(
+      getContext(), addr serialized[0], addr outputLen,
+      addr parsed, SECP256K1_EC_COMPRESSED
+    ) != 1:
+      return none(PublicKey)
+    if int(outputLen) != 33:
+      return none(PublicKey)
+    return some(serialized)
+
+  # ==========================================================================
   # ElligatorSwift (BIP-324)
   # ==========================================================================
 
@@ -902,4 +974,16 @@ else:
     internalPk: array[32, byte],
     tweak: array[32, byte]
   ): (array[32, byte], int) =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc tweakSeckeyAdd*(
+    seckey: array[32, byte],
+    tweak: array[32, byte]
+  ): Option[array[32, byte]] =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc tweakPubkeyAdd*(
+    pubkey: PublicKey,
+    tweak: array[32, byte]
+  ): Option[PublicKey] =
     raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
