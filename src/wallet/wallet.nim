@@ -1008,6 +1008,77 @@ proc computeSighashP2WPKH*(tx: Transaction, inputIdx: int,
   ## See W27-B / `CORE-PARITY-AUDIT/_fix-verification-methodology-2026-05-04.md`.
   computeSighashSegwitV0(tx, inputIdx, scriptCode, value, hashType)
 
+proc compactSigToDer(sig: Signature, hashType: uint32): seq[byte] =
+  ## Encode a compact (r||s) ECDSA signature as DER + sighash-type byte.
+  ##
+  ## Output shape: 0x30 <seqLen> 0x02 <rLen> <r> 0x02 <sLen> <s> <hashType>.
+  ## Big-endian INTs are stripped of leading 0x00 unless the next byte has
+  ## bit 0x80 set (per DER); that also forces a leading 0x00 if the high
+  ## bit of the most-significant byte is set.
+  ##
+  ## Factored out from `signInputP2WPKH` (W29-E) so all four spend types
+  ## share one DER encoder.
+  var r: array[32, byte]
+  var s: array[32, byte]
+  copyMem(addr r[0], addr sig[0], 32)
+  copyMem(addr s[0], addr sig[32], 32)
+
+  var rBytes: seq[byte]
+  rBytes.add(@r)
+  while rBytes.len > 1 and rBytes[0] == 0 and (rBytes[1] and 0x80) == 0:
+    rBytes.delete(0)
+  if (rBytes[0] and 0x80) != 0:
+    rBytes.insert(0, 0)
+
+  var sBytes: seq[byte]
+  sBytes.add(@s)
+  while sBytes.len > 1 and sBytes[0] == 0 and (sBytes[1] and 0x80) == 0:
+    sBytes.delete(0)
+  if (sBytes[0] and 0x80) != 0:
+    sBytes.insert(0, 0)
+
+  result = @[]
+  result.add(0x30)  # SEQUENCE
+  let seqLen = 2 + rBytes.len + 2 + sBytes.len
+  result.add(byte(seqLen))
+  result.add(0x02)  # INTEGER (r)
+  result.add(byte(rBytes.len))
+  result.add(rBytes)
+  result.add(0x02)  # INTEGER (s)
+  result.add(byte(sBytes.len))
+  result.add(sBytes)
+  # Append sighash-type byte (low 8 bits, e.g. SIGHASH_ALL = 0x01).
+  result.add(byte(hashType and 0xff))
+
+proc pushScript(s: openArray[byte]): seq[byte] =
+  ## Wrap a script blob in a Bitcoin-script push opcode (PUSHDATA*).
+  ##
+  ## - len <  0x4c       : <len> <data>
+  ## - len <= 0xff       : 0x4c <len> <data>      (OP_PUSHDATA1)
+  ## - len <= 0xffff     : 0x4d <len LE16> <data> (OP_PUSHDATA2)
+  ## - else              : 0x4e <len LE32> <data> (OP_PUSHDATA4)
+  ##
+  ## Used to wrap redeemScripts inside scriptSig and witnessScripts inside
+  ## scriptSig pushes (for P2SH-P2WSH).
+  result = @[]
+  if s.len < 0x4c:
+    result.add(byte(s.len))
+  elif s.len <= 0xff:
+    result.add(0x4c)
+    result.add(byte(s.len))
+  elif s.len <= 0xffff:
+    result.add(0x4d)
+    result.add(byte(s.len and 0xff))
+    result.add(byte((s.len shr 8) and 0xff))
+  else:
+    result.add(0x4e)
+    result.add(byte(s.len and 0xff))
+    result.add(byte((s.len shr 8) and 0xff))
+    result.add(byte((s.len shr 16) and 0xff))
+    result.add(byte((s.len shr 24) and 0xff))
+  for b in s:
+    result.add(b)
+
 proc signInputP2WPKH*(tx: var Transaction, inputIdx: int,
                       privateKey: PrivateKey, publicKey: PublicKey,
                       value: Satoshi,
@@ -1029,49 +1100,146 @@ proc signInputP2WPKH*(tx: var Transaction, inputIdx: int,
 
   # Sign
   let sig = sign(privateKey, sighash)
-
-  # Build DER signature with sighash type
-  var derSig: seq[byte]
-  derSig.add(0x30)  # SEQUENCE
-
-  # Extract r and s from compact signature
-  var r: array[32, byte]
-  var s: array[32, byte]
-  copyMem(addr r[0], addr sig[0], 32)
-  copyMem(addr s[0], addr sig[32], 32)
-
-  # Build r integer
-  var rBytes: seq[byte]
-  rBytes.add(@r)
-  while rBytes.len > 1 and rBytes[0] == 0 and (rBytes[1] and 0x80) == 0:
-    rBytes.delete(0)
-  if (rBytes[0] and 0x80) != 0:
-    rBytes.insert(0, 0)
-
-  # Build s integer
-  var sBytes: seq[byte]
-  sBytes.add(@s)
-  while sBytes.len > 1 and sBytes[0] == 0 and (sBytes[1] and 0x80) == 0:
-    sBytes.delete(0)
-  if (sBytes[0] and 0x80) != 0:
-    sBytes.insert(0, 0)
-
-  let seqLen = 2 + rBytes.len + 2 + sBytes.len
-  derSig.add(byte(seqLen))
-
-  derSig.add(0x02)  # INTEGER
-  derSig.add(byte(rBytes.len))
-  derSig.add(rBytes)
-
-  derSig.add(0x02)  # INTEGER
-  derSig.add(byte(sBytes.len))
-  derSig.add(sBytes)
-
-  # Append sighash type byte (low 8 bits of hashType, e.g. SIGHASH_ALL = 0x01).
-  derSig.add(byte(hashType and 0xff))
+  let derSig = compactSigToDer(sig, hashType)
 
   # Set witness: [signature, pubkey]
   tx.witnesses[inputIdx] = @[derSig, @(publicKey)]
+
+proc signInputP2PKH*(tx: var Transaction, inputIdx: int,
+                     privateKey: PrivateKey, publicKey: PublicKey,
+                     hashType: uint32 = uint32(SIGHASH_ALL)) =
+  ## Sign a legacy P2PKH input (BIP-62).
+  ##
+  ## scriptCode is the prevout's scriptPubKey shape:
+  ##   OP_DUP OP_HASH160 <hash160(pubkey)> OP_EQUALVERIFY OP_CHECKSIG
+  ##
+  ## Output:
+  ##   tx.inputs[inputIdx].scriptSig = <sig+hashType> <pubkey>
+  ##   tx.witnesses[inputIdx] = []
+  ##
+  ## Cross-impl reference: blockbrew SignTxInputP2PKH (W27-D 5d9d942),
+  ## camlcoin sign_p2pkh, lunarblock W28 a977878.
+  let pkh = hash160(publicKey)
+  var scriptCode = @[0x76'u8, 0xa9, 0x14]
+  scriptCode.add(@pkh)
+  scriptCode.add([0x88'u8, 0xac])
+
+  let sighash = computeSighashLegacy(tx, inputIdx, scriptCode, hashType)
+  let sig = sign(privateKey, sighash)
+  let derSig = compactSigToDer(sig, hashType)
+
+  # Build scriptSig: <push sig+hashType> <push pubkey>
+  var scriptSig: seq[byte]
+  scriptSig.add(byte(derSig.len))
+  scriptSig.add(derSig)
+  scriptSig.add(byte(publicKey.len))
+  scriptSig.add(@publicKey)
+  tx.inputs[inputIdx].scriptSig = scriptSig
+  # Legacy: empty witness for this input.
+  tx.witnesses[inputIdx] = @[]
+
+proc signInputP2SHP2WPKH*(tx: var Transaction, inputIdx: int,
+                          privateKey: PrivateKey, publicKey: PublicKey,
+                          value: Satoshi,
+                          hashType: uint32 = uint32(SIGHASH_ALL)) =
+  ## Sign a wrapped-segwit (BIP49) P2SH-P2WPKH input.
+  ##
+  ## - redeemScript = OP_0 <hash160(pubkey)>           (22 bytes)
+  ## - scriptSig    = <push redeemScript>              (single push)
+  ## - witness      = [<sig+hashType>, <pubkey>]       (BIP-143)
+  ##
+  ## BIP-143 vector 4 (Core's test) covers this exact shape.
+  let wpkh = hash160(publicKey)
+  var redeemScript = @[0x00'u8, 0x14]  # OP_0 PUSH20
+  redeemScript.add(@wpkh)
+
+  # Inner witness signing matches P2WPKH: scriptCode is the implicit
+  # P2PKH-shaped form, NOT the redeemScript itself. (BIP-143 §"Native witness
+  # — P2WPKH or P2SH-P2WPKH": scriptCode is the canonical P2PKH script of
+  # the witness program's hash.)
+  var scriptCode = @[0x76'u8, 0xa9, 0x14]  # OP_DUP OP_HASH160 PUSH20
+  scriptCode.add(@wpkh)
+  scriptCode.add([0x88'u8, 0xac])  # OP_EQUALVERIFY OP_CHECKSIG
+
+  let sighash = computeSighashSegwitV0(tx, inputIdx, scriptCode, value, hashType)
+  let sig = sign(privateKey, sighash)
+  let derSig = compactSigToDer(sig, hashType)
+
+  # scriptSig is just one push: the redeemScript.
+  tx.inputs[inputIdx].scriptSig = pushScript(redeemScript)
+  # Witness like P2WPKH: [signature, pubkey].
+  tx.witnesses[inputIdx] = @[derSig, @(publicKey)]
+
+proc signInputP2WSH*(tx: var Transaction, inputIdx: int,
+                     privateKeys: openArray[PrivateKey],
+                     witnessScript: openArray[byte],
+                     value: Satoshi,
+                     hashType: uint32 = uint32(SIGHASH_ALL),
+                     isMultisig: bool = true) =
+  ## Sign a native P2WSH input.
+  ##
+  ## scriptCode = witnessScript (BIP-143 §"P2WSH").
+  ##
+  ## For multisig (default): emits witness
+  ##   [OP_0, sig1+hashType, ..., sigM+hashType, witnessScript]
+  ## where the leading empty element is the CHECKMULTISIG dummy. Each
+  ## supplied private key produces one signature in the order given;
+  ## CHECKMULTISIG verifies signatures in pubkey order, so the caller
+  ## is responsible for ordering `privateKeys` to match the order the
+  ## corresponding pubkeys appear in `witnessScript`.
+  ##
+  ## For non-multisig (e.g. single OP_CHECKSIG witnessScript), pass
+  ## `isMultisig = false`. Witness is then
+  ##   [sig+hashType, witnessScript]
+  ## (no CHECKMULTISIG dummy).
+  ##
+  ## Wave 28 (lunarblock a977878) used the same shape for the 2-of-3 gate.
+  doAssert privateKeys.len >= 1, "signInputP2WSH: need >= 1 private key"
+  let sighash = computeSighashSegwitV0(tx, inputIdx, witnessScript,
+                                       value, hashType)
+
+  var witness: seq[seq[byte]] = @[]
+  if isMultisig:
+    witness.add(@[])  # CHECKMULTISIG bug: leading dummy.
+  for i in 0 ..< privateKeys.len:
+    let sig = sign(privateKeys[i], sighash)
+    witness.add(compactSigToDer(sig, hashType))
+  witness.add(@witnessScript)
+
+  tx.inputs[inputIdx].scriptSig = @[]
+  tx.witnesses[inputIdx] = witness
+
+proc signInputP2SHP2WSH*(tx: var Transaction, inputIdx: int,
+                         privateKeys: openArray[PrivateKey],
+                         witnessScript: openArray[byte],
+                         value: Satoshi,
+                         hashType: uint32 = uint32(SIGHASH_ALL),
+                         isMultisig: bool = true) =
+  ## Sign a wrapped P2SH-P2WSH input.
+  ##
+  ## - redeemScript = OP_0 <sha256(witnessScript)>     (34 bytes)
+  ## - scriptSig    = <push redeemScript>
+  ## - witness      = same as native P2WSH (sighash uses witnessScript as
+  ##                  scriptCode, NOT the redeemScript)
+  ##
+  ## BIP-143 vector 6 covers this exact shape.
+  let wsHash = sha256(witnessScript)
+  var redeemScript = @[0x00'u8, 0x20]  # OP_0 PUSH32
+  redeemScript.add(@wsHash)
+
+  let sighash = computeSighashSegwitV0(tx, inputIdx, witnessScript,
+                                       value, hashType)
+
+  var witness: seq[seq[byte]] = @[]
+  if isMultisig:
+    witness.add(@[])
+  for i in 0 ..< privateKeys.len:
+    let sig = sign(privateKeys[i], sighash)
+    witness.add(compactSigToDer(sig, hashType))
+  witness.add(@witnessScript)
+
+  tx.inputs[inputIdx].scriptSig = pushScript(redeemScript)
+  tx.witnesses[inputIdx] = witness
 
 proc signTransaction*(wallet: Wallet, tx: var Transaction,
                       utxos: seq[WalletUtxo],
@@ -1099,14 +1267,34 @@ proc signTransaction*(wallet: Wallet, tx: var Transaction,
     let key = keyOpt.get()
     let spk = utxo.output.scriptPubKey
 
-    # Determine address type from scriptPubKey
+    # Determine address type from scriptPubKey.
+    #
+    # The wallet-only path can sign anything decodable from scriptPubKey
+    # alone: P2WPKH (BIP49/BIP84) and legacy P2PKH (BIP44). P2SH-P2WPKH /
+    # P2WSH / P2SH-P2WSH need caller-supplied redeemScript/witnessScript
+    # and are routed through `handleSignRawTransactionWithWallet` instead.
     if spk.len == 22 and spk[0] == 0x00 and spk[1] == 0x14:
-      # P2WPKH
+      # P2WPKH (BIP49/84 native witness program)
       signInputP2WPKH(tx, i, key.extKey.key, key.extKey.publicKey,
                       utxo.output.value, hashType)
+    elif spk.len == 25 and spk[0] == 0x76 and spk[1] == 0xa9 and
+         spk[2] == 0x14 and spk[23] == 0x88 and spk[24] == 0xac:
+      # P2PKH (BIP44 legacy): OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+      signInputP2PKH(tx, i, key.extKey.key, key.extKey.publicKey, hashType)
     elif spk.len == 34 and spk[0] == 0x51 and spk[1] == 0x20:
       # P2TR - requires Schnorr signature (simplified)
       raise newException(WalletError, "P2TR signing not yet fully implemented")
+    elif spk.len == 23 and spk[0] == 0xa9 and spk[1] == 0x14 and
+         spk[22] == 0x87:
+      # Bare P2SH (OP_HASH160 <20> OP_EQUAL): need redeemScript from caller;
+      # route through signrawtransactionwithwallet (which accepts a
+      # `redeemScript` field on each prevtxs entry).
+      raise newException(WalletError,
+        "P2SH signing requires redeemScript; use signrawtransactionwithwallet")
+    elif spk.len == 34 and spk[0] == 0x00 and spk[1] == 0x20:
+      # Native P2WSH: need witnessScript from caller; route through RPC.
+      raise newException(WalletError,
+        "P2WSH signing requires witnessScript; use signrawtransactionwithwallet")
     else:
       raise newException(WalletError, "unsupported script type for signing")
 

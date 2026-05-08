@@ -4637,7 +4637,13 @@ proc handleSignRawTransactionWithWallet(rpc: RpcServer,
 
   # Build a prevout lookup table from the optional `prevtxs` arg.
   # Keys: (txid_internal, vout) → TxOut
+  #
+  # W29-E: also collect optional `redeemScript` (P2SH wraps) and
+  # `witnessScript` (P2WSH inner scripts) so the signer can route to
+  # the wrapped / native-segwit-v0 paths.
   var prevTable = initTable[tuple[txid: TxId, vout: uint32], TxOut]()
+  var redeemTable = initTable[tuple[txid: TxId, vout: uint32], seq[byte]]()
+  var witnessTable = initTable[tuple[txid: TxId, vout: uint32], seq[byte]]()
   if params.len >= 2 and params[1].kind == JArray:
     for prev in params[1]:
       if prev.kind != JObject:
@@ -4659,6 +4665,14 @@ proc handleSignRawTransactionWithWallet(rpc: RpcServer,
           elif v.kind == JInt:
             amount = Satoshi(int64(v.getInt()) * 100_000_000)
         prevTable[(txid, vout)] = TxOut(value: amount, scriptPubKey: spk)
+        if prev.hasKey("redeemScript") and prev["redeemScript"].kind == JString:
+          let rs = prev["redeemScript"].getStr()
+          if rs.len > 0:
+            redeemTable[(txid, vout)] = hexToBytes(rs)
+        if prev.hasKey("witnessScript") and prev["witnessScript"].kind == JString:
+          let ws = prev["witnessScript"].getStr()
+          if ws.len > 0:
+            witnessTable[(txid, vout)] = hexToBytes(ws)
       except CatchableError:
         continue
 
@@ -4710,6 +4724,16 @@ proc handleSignRawTransactionWithWallet(rpc: RpcServer,
     let dkey = keyOpt.get()
     let spk = prevOut.scriptPubKey
 
+    # ------------------------------------------------------------------
+    # W29-E: extended dispatch over all 5 standard wallet spend types.
+    #   1. P2WPKH      — native v0 witness (existing)
+    #   2. P2PKH       — legacy (W29-E)
+    #   3. P2SH-P2WPKH — wrapped, redeemScript supplied (W29-E)
+    #   4. P2WSH       — native v0, witnessScript supplied (W29-E, multisig)
+    #   5. P2SH-P2WSH  — wrapped, witnessScript supplied (W29-E, multisig)
+    # P2TR remains un-wired (BIP-371 PSBT taproot fields out of scope).
+    # ------------------------------------------------------------------
+
     # P2WPKH: 0x00 0x14 <20-byte-hash>
     if spk.len == 22 and spk[0] == 0x00 and spk[1] == 0x14:
       try:
@@ -4724,6 +4748,118 @@ proc handleSignRawTransactionWithWallet(rpc: RpcServer,
           "sequence": txin.sequence,
           "error": "Signing failed: " & e.msg
         })
+
+    # P2PKH (legacy BIP44):
+    #   OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    elif spk.len == 25 and spk[0] == 0x76 and spk[1] == 0xa9 and
+         spk[2] == 0x14 and spk[23] == 0x88 and spk[24] == 0xac:
+      try:
+        signInputP2PKH(tx, i, dkey.extKey.key, dkey.extKey.publicKey)
+        inc signedCount
+      except CatchableError as e:
+        errors.add(%*{
+          "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+          "vout": txin.prevOut.vout,
+          "scriptSig": "",
+          "sequence": txin.sequence,
+          "error": "Signing failed: " & e.msg
+        })
+
+    # P2SH (bare wrap): OP_HASH160 <20> OP_EQUAL.
+    # We must distinguish P2SH-P2WPKH from P2SH-P2WSH using the supplied
+    # redeemScript shape (caller responsibility per BIP-174).
+    elif spk.len == 23 and spk[0] == 0xa9 and spk[1] == 0x14 and
+         spk[22] == 0x87:
+      let rsKey = (txin.prevOut.txid, txin.prevOut.vout)
+      if rsKey notin redeemTable:
+        errors.add(%*{
+          "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+          "vout": txin.prevOut.vout,
+          "scriptSig": "",
+          "sequence": txin.sequence,
+          "error": "P2SH input requires redeemScript in prevtxs"
+        })
+      else:
+        let redeemScript = redeemTable[rsKey]
+        # P2SH-P2WPKH: redeemScript = 22 bytes, 0x00 0x14 <hash160>
+        if redeemScript.len == 22 and redeemScript[0] == 0x00 and
+           redeemScript[1] == 0x14:
+          try:
+            signInputP2SHP2WPKH(tx, i, dkey.extKey.key, dkey.extKey.publicKey,
+                                prevOut.value)
+            inc signedCount
+          except CatchableError as e:
+            errors.add(%*{
+              "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+              "vout": txin.prevOut.vout,
+              "scriptSig": "",
+              "sequence": txin.sequence,
+              "error": "Signing failed: " & e.msg
+            })
+        # P2SH-P2WSH: redeemScript = 34 bytes, 0x00 0x20 <sha256>
+        elif redeemScript.len == 34 and redeemScript[0] == 0x00 and
+             redeemScript[1] == 0x20:
+          if rsKey notin witnessTable:
+            errors.add(%*{
+              "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+              "vout": txin.prevOut.vout,
+              "scriptSig": "",
+              "sequence": txin.sequence,
+              "error": "P2SH-P2WSH requires witnessScript in prevtxs"
+            })
+          else:
+            try:
+              # Wallet-only single-key signing: use the matched derived key.
+              # Multisig P2SH-P2WSH with multiple wallet keys is out of scope
+              # for this dispatch (caller would use PSBT).
+              signInputP2SHP2WSH(tx, i, [dkey.extKey.key],
+                                 witnessTable[rsKey],
+                                 prevOut.value,
+                                 isMultisig = false)
+              inc signedCount
+            except CatchableError as e:
+              errors.add(%*{
+                "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+                "vout": txin.prevOut.vout,
+                "scriptSig": "",
+                "sequence": txin.sequence,
+                "error": "Signing failed: " & e.msg
+              })
+        else:
+          errors.add(%*{
+            "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+            "vout": txin.prevOut.vout,
+            "scriptSig": "",
+            "sequence": txin.sequence,
+            "error": "Unsupported P2SH redeemScript shape"
+          })
+
+    # Native P2WSH: 0x00 0x20 <32-byte-sha256>
+    elif spk.len == 34 and spk[0] == 0x00 and spk[1] == 0x20:
+      let wsKey = (txin.prevOut.txid, txin.prevOut.vout)
+      if wsKey notin witnessTable:
+        errors.add(%*{
+          "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+          "vout": txin.prevOut.vout,
+          "scriptSig": "",
+          "sequence": txin.sequence,
+          "error": "P2WSH input requires witnessScript in prevtxs"
+        })
+      else:
+        try:
+          # Single-key wallet-owned P2WSH (rare but well-defined).
+          signInputP2WSH(tx, i, [dkey.extKey.key], witnessTable[wsKey],
+                         prevOut.value, isMultisig = false)
+          inc signedCount
+        except CatchableError as e:
+          errors.add(%*{
+            "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+            "vout": txin.prevOut.vout,
+            "scriptSig": "",
+            "sequence": txin.sequence,
+            "error": "Signing failed: " & e.msg
+          })
+
     elif spk.len == 34 and spk[0] == 0x51 and spk[1] == 0x20:
       # P2TR — Schnorr signing not yet wired; report as un-signable.
       errors.add(%*{
