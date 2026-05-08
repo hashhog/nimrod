@@ -29,6 +29,7 @@ import ./test_template
 import ./test_sync
 import ./test_headerssync
 import ./test_wallet
+import ./test_bip32_bip86_vectors
 import ./test_coinselection
 import ./test_maturity
 import ./test_encrypt
