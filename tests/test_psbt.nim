@@ -321,6 +321,165 @@ suite "PSBT Serialization":
     check pubkey in restored.inputs[0].hdKeypaths
     check restored.inputs[0].hdKeypaths[pubkey].fingerprint == origin.fingerprint
 
+  test "global xpub uses BIP-174 byte layout (no redundant CompactSize prefix)":
+    # Regression for W34-C: psbt.nim:510-515 used to wrap the key-origin
+    # bytes in a CompactSize length, which round-tripped against itself but
+    # would not match Bitcoin Core's decodepsbt output. BIP-174 specifies
+    # that the value of a PSBT_GLOBAL_XPUB record is the raw key origin
+    # (4-byte master fingerprint || N*4 path indices, all little-endian);
+    # the outer record length is supplied by writeKeyValue itself.
+    var txid: array[32, byte]
+    let tx = Transaction(
+      version: 2,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(txid), vout: 0),
+        scriptSig: @[],
+        sequence: 0xffffffff'u32
+      )],
+      outputs: @[],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    var psbt = createPsbt(tx)
+
+    # 78-byte BIP32 extended key (xpub serialization size is fixed).
+    # Use a recognisable canary pattern so the regex below finds the
+    # value bytes deterministically.
+    var xpub = newSeq[byte](78)
+    for i in 0 ..< 78:
+      xpub[i] = byte(0xA0 or (i and 0x0F))
+
+    let origin = KeyOriginInfo(
+      fingerprint: [0xDE'u8, 0xAD, 0xBE, 0xEF],
+      path: @[84'u32 or 0x80000000'u32,
+              0'u32  or 0x80000000'u32,
+              0'u32  or 0x80000000'u32]
+    )
+    psbt.xpubs[origin] = initHashSet[seq[byte]]()
+    psbt.xpubs[origin].incl(xpub)
+
+    let serialized = psbt.serialize()
+
+    # ----- Byte-layout assertions (no CompactSize prefix on the value) -----
+    # Records inside a PSBT key-value pair are
+    #   <CompactSize keylen> <key bytes> <CompactSize valuelen> <value bytes>
+    # For our global xpub: keylen = 79 (1 type byte + 78 xpub bytes), and
+    # the value MUST be exactly the origin bytes:
+    #   4 (fingerprint) + 3 * 4 (path) = 16 bytes
+    let expectedOrigin = @[
+      origin.fingerprint[0], origin.fingerprint[1],
+      origin.fingerprint[2], origin.fingerprint[3]
+    ] &
+      @[
+        byte(origin.path[0] and 0xFF), byte((origin.path[0] shr 8) and 0xFF),
+        byte((origin.path[0] shr 16) and 0xFF), byte((origin.path[0] shr 24) and 0xFF),
+        byte(origin.path[1] and 0xFF), byte((origin.path[1] shr 8) and 0xFF),
+        byte((origin.path[1] shr 16) and 0xFF), byte((origin.path[1] shr 24) and 0xFF),
+        byte(origin.path[2] and 0xFF), byte((origin.path[2] shr 8) and 0xFF),
+        byte((origin.path[2] shr 16) and 0xFF), byte((origin.path[2] shr 24) and 0xFF)
+      ]
+    check expectedOrigin.len == 16
+
+    # Locate the record by scanning for <0x4F> <0x01> <xpub[0..7]>:
+    #   0x4F = CompactSize keylen 79 (single byte, since 79 < 0xFD)
+    #   0x01 = PSBT_GLOBAL_XPUB type
+    var recordStart = -1
+    for i in 0 .. serialized.len - (1 + 1 + 8):
+      if serialized[i] == 0x4F'u8 and serialized[i+1] == 0x01'u8 and
+         serialized[i+2] == xpub[0] and serialized[i+3] == xpub[1] and
+         serialized[i+4] == xpub[2] and serialized[i+5] == xpub[3]:
+        recordStart = i
+        break
+    check recordStart >= 0
+
+    # After the 79-byte key blob (1 keylen + 1 type + 78 xpub), the next
+    # byte is the value-length CompactSize. With BIP-174-correct layout
+    # this is exactly 16 (origin size). The buggy old layout would emit
+    # 17 here (16 + 1 byte for an inner CompactSize=16) and a leading
+    # 0x10 inside the value — assert against both shapes explicitly.
+    let valLenOff = recordStart + 1 + 79  # past keylen + key blob
+    check valLenOff < serialized.len
+    check serialized[valLenOff] == 16'u8   # NOT 17 (old buggy length)
+
+    let valStart = valLenOff + 1
+    check valStart + 16 <= serialized.len
+    let valBytes = serialized[valStart ..< valStart + 16]
+    check valBytes == expectedOrigin
+    # Explicit guard against a regression to the redundant-prefix layout:
+    # the value MUST NOT begin with a CompactSize encoding of 16 (0x10)
+    # followed by the fingerprint.
+    check not (valBytes[0] == 0x10'u8 and
+               valBytes[1] == origin.fingerprint[0])
+
+    # ----- Round-trip still works -----
+    let restored = deserialize(serialized)
+    check origin in restored.xpubs
+    check xpub in restored.xpubs[origin]
+    let restoredOrigin = block:
+      var found: KeyOriginInfo
+      for k, _ in restored.xpubs:
+        if k.fingerprint == origin.fingerprint:
+          found = k
+          break
+      found
+    check restoredOrigin.fingerprint == origin.fingerprint
+    check restoredOrigin.path == origin.path
+
+  test "user-constructed Proprietary serializes canonical key from identifier+subtype":
+    # Regression for W34-C Phase 3: previously the serializer wrote only
+    # `prop.key`, so a Proprietary record built from `identifier` and
+    # `subtype` alone (the natural API surface) silently emitted a malformed
+    # zero-length key. Now `encodeProprietary` synthesizes the canonical
+    # BIP-174 key blob (<0xFC><CompactSize id-len><id><CompactSize subtype>)
+    # when `prop.key` is empty.
+    var txid: array[32, byte]
+    let tx = Transaction(
+      version: 2,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(txid), vout: 0),
+        scriptSig: @[],
+        sequence: 0xffffffff'u32
+      )],
+      outputs: @[],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    var psbt = createPsbt(tx)
+    let identifier = @[byte(0x42), 0x49, 0x50, 0x39, 0x39, 0x39]  # "BIP999"
+    psbt.proprietary.add(PsbtProprietary(
+      identifier: identifier,
+      subtype: 7'u64,
+      key: @[],   # left empty on purpose — exercising the new code path
+      value: @[byte(0xCA), 0xFE]
+    ))
+
+    let serialized = psbt.serialize()
+    let restored = deserialize(serialized)
+
+    check restored.proprietary.len == 1
+    let r = restored.proprietary[0]
+    check r.identifier == identifier
+    check r.subtype == 7'u64
+    check r.value == @[byte(0xCA), 0xFE]
+
+    # Round-trip through encodeProprietary directly:
+    let canonical = proprietaryKey(PSBT_GLOBAL_PROPRIETARY, identifier, 7'u64)
+    # Layout: 0xFC | 0x06 | 'B' 'I' 'P' '9' '9' '9' | 0x07
+    check canonical == @[byte(0xFC), 0x06,
+                         byte('B'), byte('I'), byte('P'),
+                         byte('9'), byte('9'), byte('9'),
+                         byte(0x07)]
+
+    # And the on-wire record contains that exact key blob:
+    var found = false
+    for i in 0 .. serialized.len - canonical.len:
+      if serialized[i ..< i + canonical.len] == canonical:
+        found = true
+        break
+    check found
+
 suite "PSBT Base64":
   test "encode and decode base64":
     var txid: array[32, byte]

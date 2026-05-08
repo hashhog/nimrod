@@ -196,6 +196,30 @@ proc deserializeKeyOrigin*(r: var BinaryReader, length: int): KeyOriginInfo =
   for i in 0 ..< numIndices:
     result.path.add(r.readUint32LE())
 
+proc proprietaryKey*(typeByte: uint8, identifier: openArray[byte],
+                     subtype: uint64, keydata: openArray[byte] = []): seq[byte] =
+  ## Build the canonical BIP-174 proprietary key blob:
+  ##   <typeByte> <CompactSize id-len> <id> <CompactSize subtype> <keydata>
+  ## Used when the caller fills `identifier`/`subtype` on a PsbtProprietary
+  ## but leaves `key` empty.
+  var w = BinaryWriter()
+  w.writeUint8(typeByte)
+  w.writeCompactSize(uint64(identifier.len))
+  w.writeBytes(identifier)
+  w.writeCompactSize(subtype)
+  if keydata.len > 0:
+    w.writeBytes(keydata)
+  result = w.data
+
+proc encodeProprietary*(prop: PsbtProprietary, typeByte: uint8): seq[byte] =
+  ## Pick the on-wire key for a proprietary record. Prefer `prop.key` when
+  ## the caller supplied it (round-trip from a parsed PSBT); otherwise build
+  ## the canonical key from (typeByte, identifier, subtype).
+  if prop.key.len > 0:
+    prop.key
+  else:
+    proprietaryKey(typeByte, prop.identifier, prop.subtype)
+
 # =============================================================================
 # PsbtInput helpers
 # =============================================================================
@@ -426,7 +450,7 @@ proc serializePsbtInput*(w: var BinaryWriter, input: PsbtInput) =
 
   # Proprietary
   for prop in input.proprietary:
-    w.writeKeyValue(prop.key, prop.value)
+    w.writeKeyValue(encodeProprietary(prop, PSBT_IN_PROPRIETARY), prop.value)
 
   # Unknown
   for key, value in input.unknown:
@@ -480,7 +504,7 @@ proc serializePsbtOutput*(w: var BinaryWriter, output: PsbtOutput) =
 
   # Proprietary
   for prop in output.proprietary:
-    w.writeKeyValue(prop.key, prop.value)
+    w.writeKeyValue(encodeProprietary(prop, PSBT_OUT_PROPRIETARY), prop.value)
 
   # Unknown
   for key, value in output.unknown:
@@ -503,14 +527,15 @@ proc serialize*(psbt: Psbt): seq[byte] =
   w.writeKeyValue([PSBT_GLOBAL_UNSIGNED_TX], txData)
 
   # Global xpubs
+  # BIP-174: value is the raw key origin bytes (4-byte fingerprint + N*4 path
+  # indices). The outer key/value length comes from writeKeyValue itself; an
+  # extra CompactSize prefix here would not match Core's decodepsbt. Mirror
+  # the input/output BIP32_DERIVATION pattern (lines 347-352, 449-454).
   for origin, xpubSet in psbt.xpubs:
     for xpub in xpubSet:
       var key = @[PSBT_GLOBAL_XPUB]
       key.add(xpub)
       var valW = BinaryWriter()
-      # First write the length, then the origin
-      let originLen = 4 + origin.path.len * 4
-      valW.writeCompactSize(uint64(originLen))
       valW.serializeKeyOrigin(origin)
       w.writeKeyValue(key, valW.data)
 
@@ -522,7 +547,7 @@ proc serialize*(psbt: Psbt): seq[byte] =
 
   # Proprietary
   for prop in psbt.proprietary:
-    w.writeKeyValue(prop.key, prop.value)
+    w.writeKeyValue(encodeProprietary(prop, PSBT_GLOBAL_PROPRIETARY), prop.value)
 
   # Unknown
   for key, value in psbt.unknown:
@@ -853,9 +878,10 @@ proc deserialize*(data: openArray[byte]): Psbt =
         raise newException(PsbtError, "invalid global xpub key size")
       let xpub = key[1 ..< key.len]
 
+      # BIP-174: value is the raw key origin (fingerprint + path), no
+      # CompactSize prefix. Length is the value size itself.
       var valR = BinaryReader(data: value, pos: 0)
-      let originLen = int(valR.readCompactSize())
-      let origin = valR.deserializeKeyOrigin(originLen)
+      let origin = valR.deserializeKeyOrigin(value.len)
 
       if origin notin result.xpubs:
         result.xpubs[origin] = initHashSet[seq[byte]]()
