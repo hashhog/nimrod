@@ -87,6 +87,17 @@ const CoinbaseMaturity* = 100
 # Forward declarations
 proc addAccount*(wallet: var Wallet, purpose: uint32 = 84, accountIndex: uint32 = 0, gap: int = 20)
 
+# BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data).
+# Duplicated locally (also in script/interpreter.nim) to keep the wallet
+# free of any interpreter dep.
+proc walletTaggedHash(tag: string, data: openArray[byte]): array[32, byte] =
+  let tagHash = sha256(cast[seq[byte]](tag))
+  var preimage = newSeq[byte](64 + data.len)
+  for i in 0 ..< 32: preimage[i] = tagHash[i]
+  for i in 0 ..< 32: preimage[32 + i] = tagHash[i]
+  for i in 0 ..< data.len: preimage[64 + i] = data[i]
+  sha256(preimage)
+
 # =============================================================================
 # BIP39: Mnemonic Generation and Seed Derivation
 # =============================================================================
@@ -486,11 +497,19 @@ proc derivePath(wallet: Wallet, purpose, coinType, account, chain, index: uint32
   of 84:  # BIP84 - P2WPKH
     let wpkh = hash160(extKey.publicKey)
     result.address = Address(kind: P2WPKH, wpkh: wpkh)
-  of 86:  # BIP86 - P2TR (Taproot)
-    # For P2TR, we use the x-only public key (first 32 bytes after compression marker)
-    var xonly: array[32, byte]
-    copyMem(addr xonly[0], addr extKey.publicKey[1], 32)
-    result.address = Address(kind: P2TR, taprootKey: xonly)
+  of 86:  # BIP86 - P2TR (Taproot, single-key, no script tree)
+    # Per BIP-86 the address output key is the *tweaked* x-only key:
+    #   internal_key P = compressed_pubkey[1..33]   (drop the parity byte)
+    #   t            = tagged_hash("TapTweak", P)   (empty merkle root)
+    #   Q            = P + t * G
+    # Sending coins to the raw internal x-only key (the previous behavior
+    # here) makes the output unspendable by any compliant signer because
+    # no one ever derives Q from those funds.
+    var internalXonly: array[32, byte]
+    copyMem(addr internalXonly[0], addr extKey.publicKey[1], 32)
+    let tweak = walletTaggedHash("TapTweak", internalXonly)
+    let tweaked = tweakXonlyPubkey(internalXonly, tweak)
+    result.address = Address(kind: P2TR, taprootKey: tweaked[0])
   else:
     raise newException(WalletError, "unsupported purpose: " & $purpose)
 
