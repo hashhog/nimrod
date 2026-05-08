@@ -266,24 +266,36 @@ proc deriveChild*(parent: ExtendedKey, index: uint32): ExtendedKey =
   # Right 32 bytes = new chain code
   copyMem(addr result.chainCode[0], addr output.data[32], 32)
 
+  # IL = left 32 bytes of HMAC output, used as the additive tweak for both
+  # CKD_priv and CKD_pub. Per BIP-32: if IL >= n OR the resulting key is
+  # invalid (zero seckey / point-at-infinity pubkey), the caller MUST bump
+  # the child index and retry. libsecp's tweak_add primitives signal this
+  # by returning 0; we surface that as a `WalletError` so the caller (or
+  # any future retry loop) can react. Probability ~2^-127 — in practice
+  # unreachable, but consensus-correct callers must handle it.
+  var il: array[32, byte]
+  copyMem(addr il[0], addr output.data[0], 32)
+
   if parent.isPrivate:
     # Private key derivation: child_key = (parent_key + IL) mod n
-    # For simplicity, we do byte-level addition with secp256k1 tweak
-    # IL is treated as a scalar to add to the parent private key
-    var il: array[32, byte]
-    copyMem(addr il[0], addr output.data[0], 32)
-
-    # Add scalars mod curve order (simplified - should use proper big int)
-    var carry: uint32 = 0
-    for i in countdown(31, 0):
-      let sum = uint32(parent.key[i]) + uint32(il[i]) + carry
-      result.key[i] = byte(sum and 0xff)
-      carry = sum shr 8
-
+    # Implemented via libsecp256k1 secp256k1_ec_seckey_tweak_add (mirrors
+    # Bitcoin Core src/key.cpp::CKey::Derive).
+    let tweaked = tweakSeckeyAdd(parent.key, il)
+    if tweaked.isNone:
+      raise newException(WalletError,
+        "BIP-32 child key invalid (IL >= n or child == 0); bump index and retry")
+    result.key = tweaked.get()
     result.publicKey = derivePublicKey(result.key)
   else:
-    # Public key derivation: child_pubkey = point(IL) + parent_pubkey
-    raise newException(WalletError, "public key derivation not yet implemented")
+    # Public key derivation: child_pubkey = parent_pubkey + IL*G
+    # Implemented via libsecp256k1 secp256k1_ec_pubkey_tweak_add.
+    let tweakedPk = tweakPubkeyAdd(parent.publicKey, il)
+    if tweakedPk.isNone:
+      raise newException(WalletError,
+        "BIP-32 child pubkey invalid (IL >= n or child == infinity); bump index and retry")
+    result.publicKey = tweakedPk.get()
+    # No private key available in xpub-only derivation; leave result.key zeroed
+    # (default array initialisation) and isPrivate = false (already set above).
 
 proc derivePathStr*(master: ExtendedKey, path: string): ExtendedKey =
   ## Derive key from path string like "m/44'/0'/0'/0/0"
