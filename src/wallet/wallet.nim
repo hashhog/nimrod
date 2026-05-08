@@ -226,12 +226,41 @@ proc masterKeyFromSeed*(seed: array[64, byte]): ExtendedKey =
   # Left 32 bytes = private key, Right 32 bytes = chain code
   copyMem(addr result.key[0], addr output.data[0], 32)
   copyMem(addr result.chainCode[0], addr output.data[32], 32)
-
   result.depth = 0
   result.parentFingerprint = [0'u8, 0, 0, 0]
   result.childIndex = 0
   result.isPrivate = true
   result.publicKey = derivePublicKey(result.key)
+
+proc masterKeyFromSeedRaw*(seed: openArray[byte]): ExtendedKey =
+  ## Derive master extended private key from a variable-length raw seed.
+  ## BIP-32 specifies HMAC-SHA512(key="Bitcoin seed", data=seed_bytes) over
+  ## the raw byte string of the seed (16, 32 or 64 bytes per the spec).
+  ## The fixed-size masterKeyFromSeed wrapper above always passes 64 bytes;
+  ## official BIP-32 test vectors use 16-byte and other sizes, so this
+  ## variant is provided for tests / interop.
+  var hmacCtx: HMAC[sha512]
+  hmacCtx.init("Bitcoin seed")
+  hmacCtx.update(seed)
+  let output = hmacCtx.finish()
+  hmacCtx.clear()
+
+  copyMem(addr result.key[0], addr output.data[0], 32)
+  copyMem(addr result.chainCode[0], addr output.data[32], 32)
+  result.depth = 0
+  result.parentFingerprint = [0'u8, 0, 0, 0]
+  result.childIndex = 0
+  result.isPrivate = true
+  result.publicKey = derivePublicKey(result.key)
+
+proc neuter*(key: ExtendedKey): ExtendedKey =
+  ## Return the public-only ("neutered") form of an extended key.
+  ## Same chain code, depth, parentFingerprint and childIndex; private key
+  ## bytes zeroed; isPrivate=false; publicKey unchanged.
+  result = key
+  result.isPrivate = false
+  for i in 0 ..< 32:
+    result.key[i] = 0
 
 proc fingerprint*(key: ExtendedKey): array[4, byte] =
   ## Get the fingerprint of a key (first 4 bytes of Hash160 of pubkey)
