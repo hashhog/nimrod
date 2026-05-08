@@ -74,6 +74,7 @@ import ./test_regtest
 import ./test_softforks_bridge
 import ./test_wallet_dispatch
 import ./test_wallet_phase2_segwitv0
+import ./test_p2sh_commitment
 import ./test_assumevalid
 import ./test_checkpoint
 import ./test_parallel_verify_ibd

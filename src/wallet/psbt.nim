@@ -1054,6 +1054,14 @@ proc finalizePsbtInput*(input: var PsbtInput): bool =
     if input.witnessScript.len == 0:
       return false
 
+    # W31: refuse to emit a witness referencing a witnessScript that does
+    # not commit to spk[2..33]. Without this an attacker who supplied a
+    # forged PSBT_IN_WITNESSSCRIPT would extract a "valid"-looking final
+    # tx the network rejects, after we've already laundered partialSigs
+    # against an attacker-chosen sighash.
+    if not verifyP2WSHCommitment(input.witnessScript, spk):
+      return false
+
     # For multisig, collect signatures in order
     # This is simplified - full implementation needs proper ordering
     var witness: seq[seq[byte]]
@@ -1091,6 +1099,12 @@ proc finalizePsbtInput*(input: var PsbtInput): bool =
 
   # P2SH: OP_HASH160 <20> OP_EQUAL
   elif spk.len == 23 and spk[0] == 0xa9 and spk[1] == 0x14:
+    # W31: redeemScript must hash to the prevout's script-hash, otherwise a
+    # forged PSBT_IN_REDEEMSCRIPT would be embedded into the final scriptSig
+    # and the wallet's already-collected partialSigs were produced under an
+    # attacker-chosen sighash. Refuse to finalize.
+    if not verifyP2SHCommitment(input.redeemScript, spk):
+      return false
     # Check for P2SH-P2WPKH
     if input.redeemScript.len == 22 and input.redeemScript[0] == 0x00:
       if input.partialSigs.len != 1:
