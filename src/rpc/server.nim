@@ -1855,10 +1855,25 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
                      blk.header.timestamp, none(bool), mainnet)
 
 proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Decode a raw transaction hex to a TxToUniv-shaped JSON object.
+  ##
+  ## Reference: bitcoin-core/src/rpc/rawtransaction.cpp decoderawtransaction()
+  ## → TxToUniv(tx, block_hash=uint256(), entry, include_hex=false)
+  ## → core_io.cpp TxToUniv (vin via ScriptToAsmStr(fAttemptSighashDecode=true),
+  ##   vout via ScriptPubKeyToUniv with include_address=true).
+  ##
+  ## Shape: {txid, hash, version, size, vsize, weight, locktime, vin[], vout[]}.
+  ## No top-level "hex" field (Core's include_hex=false at rawtransaction.cpp:443).
+  ##
+  ## Uses the same buildVinJson / buildVoutJson helpers as decodepsbt so that
+  ## vin (coinbase detection, txinwitness, scriptSig.asm) and vout
+  ## (btcAmountNode 8-decimal, buildScriptPubKeyJson with desc/type/address)
+  ## are byte-identical with Bitcoin Core 31.99 (W55).
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing hexstring parameter")
 
   let txHex = params[0].getStr()
+  let mainnet = rpc.params.network == Mainnet
 
   try:
     let txBytes = hexToBytes(txHex)
@@ -1868,25 +1883,12 @@ proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     let weight = validation.calculateTransactionWeight(tx)
 
     var inputs = newJArray()
-    for inp in tx.inputs:
-      inputs.add(%*{
-        "txid": reverseHex(toHex(array[32, byte](inp.prevOut.txid))),
-        "vout": inp.prevOut.vout,
-        "scriptSig": %*{
-          "hex": toHex(inp.scriptSig)
-        },
-        "sequence": inp.sequence
-      })
+    for i in 0 ..< tx.inputs.len:
+      inputs.add(buildVinJson(tx, i))
 
     var outputs = newJArray()
     for i, outp in tx.outputs:
-      outputs.add(%*{
-        "value": float64(int64(outp.value)) / 100000000.0,
-        "n": i,
-        "scriptPubKey": %*{
-          "hex": toHex(outp.scriptPubKey)
-        }
-      })
+      outputs.add(buildVoutJson(outp, i, mainnet))
 
     %*{
       "txid": reverseHex(toHex(array[32, byte](txid))),
