@@ -682,7 +682,44 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
 
   response
 
+# Forward declarations for helpers defined later in this file that are needed
+# by handleGetBlock (verbosity=2 path) and by buildVinJson.
+# Nim requires definitions to precede use sites unless forward declarations are
+# provided.
+proc btcAmountNode*(sats: int64): JsonNode
+proc disassembleScriptSigAsmStr*(script: seq[byte]): string
+proc buildVinJson(tx: Transaction, inputIndex: int): JsonNode
+proc buildVoutJson(output: TxOut, index: int, mainnet: bool): JsonNode
+
+proc blockStrippedSize(b: Block): int =
+  ## Block size WITHOUT witness data: 80-byte header + varint(tx_count) +
+  ## sum of legacy-serialized (no-witness) tx sizes.
+  ## Matches Bitcoin Core's GetBlockWeight's non-witness component.
+  var size = 80  # header is always 80 bytes and has no witness
+  let txCount = b.txs.len
+  # varint size for tx count
+  if txCount < 0xFD:
+    inc size
+  elif txCount <= 0xFFFF:
+    size += 3
+  elif txCount <= 0xFFFFFFFF:
+    size += 5
+  else:
+    size += 9
+  for tx in b.txs:
+    size += serializeLegacy(tx).len
+  size
+
 proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getblock <hash> [verbosity]
+  ##   verbosity=0 → raw hex
+  ##   verbosity=1 → header fields + txid array  (default)
+  ##   verbosity=2 → header fields + full tx objects with hex + fee
+  ##
+  ## Reference: bitcoin-core/src/rpc/blockchain.cpp BlockToJSON /
+  ## core_io.cpp TxToUniv.  All header fields (bits, versionHex, chainwork,
+  ## mediantime, target, difficulty) use the same W57 helpers as
+  ## handleGetBlockHeader to achieve byte-identity with Bitcoin Core 31.99.
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing blockhash parameter")
 
@@ -711,64 +748,252 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   # Get block index for height and chainwork
   let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
   let height = if idxOpt.isSome: idxOpt.get().height else: 0'i32
-  let chainworkHex = if idxOpt.isSome: toHex(idxOpt.get().totalWork) else: "0"
 
-  var txids: seq[string]
-  for tx in b.txs:
-    let txBytes = serialize(tx)
-    let txid = doubleSha256(txBytes)
-    txids.add(reverseHex(toHex(txid)))
+  # bits: big-endian 8-char hex of the compact nBits field (e.g. "17021ff0")
+  # W57: was little-endian, corrected to big-endian (same as getblockheader).
+  let bitsHex = toHex([
+    byte((b.header.bits shr 24) and 0xff),
+    byte((b.header.bits shr 16) and 0xff),
+    byte((b.header.bits shr 8) and 0xff),
+    byte(b.header.bits and 0xff)
+  ])
 
-  let target = bitsToTarget(b.header.bits)
+  # versionHex: big-endian 8-char hex of version (e.g. "20000000")
+  # W57: was little-endian, corrected to big-endian (same as getblockheader).
+  let versionHex = toHex([
+    byte((uint32(b.header.version) shr 24) and 0xff),
+    byte((uint32(b.header.version) shr 16) and 0xff),
+    byte((uint32(b.header.version) shr 8) and 0xff),
+    byte(uint32(b.header.version) and 0xff)
+  ])
 
-  var response = %*{
-    "hash": reverseHex(toHex(computedHash)),
-    "confirmations": rpc.chainState.bestHeight - height + 1,
-    "size": serialize(b).len,
-    "strippedsize": serialize(b).len,
-    "weight": calculateBlockWeight(b),
-    "height": height,
-    "version": b.header.version,
-    "versionHex": toHex(cast[array[4, byte]]([
-      byte(b.header.version and 0xff),
-      byte((b.header.version shr 8) and 0xff),
-      byte((b.header.version shr 16) and 0xff),
-      byte((b.header.version shr 24) and 0xff)
-    ])),
-    "merkleroot": reverseHex(toHex(b.header.merkleRoot)),
-    "tx": txids,
-    "time": b.header.timestamp,
-    "mediantime": b.header.timestamp,
-    "nonce": b.header.nonce,
-    "bits": toHex(cast[array[4, byte]]([
-      byte(b.header.bits and 0xff),
-      byte((b.header.bits shr 8) and 0xff),
-      byte((b.header.bits shr 16) and 0xff),
-      byte((b.header.bits shr 24) and 0xff)
-    ])),
-    "target": toHex(target),
-    "difficulty": targetToDifficulty(target),
-    "chainwork": chainworkHex,
-    "nTx": b.txs.len
-  }
+  # chainwork: recompute via 256-bit arithmetic, same as W57 getblockheader fix.
+  # The stored totalWork used an approximate float64 formula; computeChainwork
+  # walks backwards summing getBitsProof() per block for byte-identical output.
+  let chainwork    = computeChainwork(rpc.chainState.db, blockHash, height)
+  let chainworkHex = chainworkHexBE(chainwork)
 
-  # Build coinbase_tx from first transaction's first input (Core 27+ field)
+  # mediantime: median of last 11 blocks (Bitcoin Core GetMedianTimePast).
+  # W57: was block.timestamp, now getMtpForHeight (same fix as getblockheader).
+  let mediantime = int64(getMtpForHeight(rpc.chainState.db, height))
+
+  # target: big-endian 64-char hex of the 256-bit difficulty target.
+  # compactToTarget returns little-endian; reverseHex for big-endian.
+  # W57: was toHex(target) (little-endian), now reverseHex(toHex(target)).
+  let target    = bitsToTarget(b.header.bits)
+  let targetHex = reverseHex(toHex(target))
+
+  # difficulty: use Core-exact getDifficultyFromBits + difficultyJson.
+  # W57: old targetToDifficulty() diverged in precision from Core.
+  let diffNode = difficultyJson(getDifficultyFromBits(b.header.bits))
+
+  # Block sizes:
+  #   size         = full serialization including witness
+  #   strippedsize = serialization WITHOUT witness data
+  #   weight       = 3 * strippedsize + size  (BIP141)
+  # W59: strippedsize was wrongly equal to size (serialize(b).len includes
+  # witness).  Now computed via blockStrippedSize().
+  let fullSize     = serialize(b).len
+  let strippedSize = blockStrippedSize(b)
+  let blockWeight  = 3 * strippedSize + fullSize
+
+  let mainnet = rpc.params.network == Mainnet
+
+  # ── tx array ────────────────────────────────────────────────────────────────
+  # verbosity=1 → txid strings; verbosity=2 → full TxToUniv objects with hex.
+  var txArray = newJArray()
+
+  # For verbosity=2 fee computation we need the spent input values.
+  # Strategy: pre-compute a complete outpoint→value map (feeMap) covering all
+  # inputs across all non-coinbase txs in the block.  Sources in priority order:
+  #   1. txindex (batch, grouped by creating block) — most accurate, immune to
+  #      IBD undo-data corruption.  Block reads are amortized: group all inputs
+  #      that reference the same creating block and read that block once.
+  #   2. Flat file BlockUndo — per-tx, per-input; covers inputs not in txindex.
+  #   3. RocksDB UndoData outpoint map — last resort flat list.
+  # Reference: bitcoin-core/src/core_io.cpp TxToUniv (have_undo path) /
+  # src/rpc/blockchain.cpp BlockToJSON SHOW_DETAILS case.
+  var blockUndoLoaded: Option[BlockUndo]
+  var feeMap: Table[OutPoint, int64]   # pre-computed outpoint → satoshi value
+  var haveUndo = false
+
+  if verbosity >= 2:
+    # ── Phase 1: txindex batch lookup ────────────────────────────────────────
+    # Collect all unique spending txids needed, do txindex lookups, group by
+    # creating block hash, then read each creating block once.
+    #
+    # Data structure: blockHash → seq[(spendTxId, txIndex)]
+    # For each resolved txid, populate ALL its output values in feeMap
+    # (not just the specific vout we saw first), so that multiple inputs
+    # spending different vouts of the same creating tx are all covered.
+    type TxRef = tuple[spendTxId: TxId, txIndex: int]
+    var blockNeeds: Table[BlockHash, seq[TxRef]]
+    var resolvedTxids: HashSet[TxId]
+
+    for txIter, txLoop in b.txs:
+      if txIter == 0: continue  # skip coinbase
+      for inp in txLoop.inputs:
+        if inp.prevOut.txid in resolvedTxids: continue
+        let locOpt = rpc.chainState.db.getTxIndex(inp.prevOut.txid)
+        if locOpt.isSome:
+          let loc = locOpt.get()
+          if loc.blockHash notin blockNeeds:
+            blockNeeds[loc.blockHash] = @[]
+          blockNeeds[loc.blockHash].add((inp.prevOut.txid, int(loc.txIndex)))
+          resolvedTxids.incl(inp.prevOut.txid)
+
+    # Read each creating block once, extract ALL output values for needed txs.
+    for creatingBlockHash, refs in blockNeeds:
+      let creatingBlkOpt = rpc.chainState.db.getBlock(creatingBlockHash)
+      if creatingBlkOpt.isNone: continue
+      let creatingBlk = creatingBlkOpt.get()
+      for r in refs:
+        if r.txIndex >= creatingBlk.txs.len: continue
+        let creatingTx = creatingBlk.txs[r.txIndex]
+        # Populate ALL outputs (not just one vout) so multiple inputs spending
+        # different outputs of the same creating tx are all covered.
+        for voutIdx, creatingOut in creatingTx.outputs:
+          let op = OutPoint(txid: r.spendTxId, vout: uint32(voutIdx))
+          feeMap[op] = int64(creatingOut.value)
+
+    # ── Phase 2: flat file BlockUndo ─────────────────────────────────────────
+    # Pre-load flat file BlockUndo (fast, per-tx structured).
+    if idxOpt.isSome:
+      let buOpt = rpc.chainState.getBlockUndoFromFile(idxOpt.get(), b.header.prevBlock)
+      if buOpt.isSome:
+        blockUndoLoaded = buOpt
+        haveUndo = true
+
+    # ── Phase 3: RocksDB undo map ────────────────────────────────────────────
+    let undoOpt = rpc.chainState.db.getUndoData(blockHash)
+    if undoOpt.isSome:
+      if not haveUndo: haveUndo = true
+      for (op, entry) in undoOpt.get().spentOutputs:
+        # Only add to feeMap if not already resolved by txindex (txindex wins).
+        if op notin feeMap:
+          feeMap[op] = int64(entry.output.value)
+
+  for txIdx, tx in b.txs:
+    if verbosity == 1:
+      # verbosity=1: emit txid string (legacy hash, reversed for display).
+      let txLegacyBytes = serializeLegacy(tx)
+      let txidBytes     = doubleSha256(txLegacyBytes)
+      txArray.add(%reverseHex(toHex(txidBytes)))
+    else:
+      # verbosity=2: emit full TxToUniv shape including hex.
+      # txid = hash of legacy serialization (no witness)
+      # hash = hash of full serialization (wtxid)
+      let legacyBytes = serializeLegacy(tx)
+      let fullTxBytes = serialize(tx, includeWitness = true)
+      let txidHash    = doubleSha256(legacyBytes)
+      let wtxidHash   = doubleSha256(fullTxBytes)
+      let txidStr     = reverseHex(toHex(txidHash))
+      let hashStr     = reverseHex(toHex(wtxidHash))
+
+      let txFullSize  = fullTxBytes.len
+      let txBaseSize  = legacyBytes.len
+      let txWeight    = txBaseSize * 3 + txFullSize
+      let txVsize     = (txWeight + 3) div 4  # ceil(weight/4)
+
+      # Build vin array using the shared W55 buildVinJson helpers.
+      var vinArr = newJArray()
+      for i in 0 ..< tx.inputs.len:
+        vinArr.add(buildVinJson(tx, i))
+
+      # Build vout array using the shared W55 buildVoutJson helpers.
+      var voutArr = newJArray()
+      for i, outp in tx.outputs:
+        voutArr.add(buildVoutJson(outp, i, mainnet))
+
+      var txObj = newJObject()
+      txObj["txid"]     = %txidStr
+      txObj["hash"]     = %hashStr
+      txObj["version"]  = %tx.version
+      txObj["size"]     = %txFullSize
+      txObj["vsize"]    = %txVsize
+      txObj["weight"]   = %txWeight
+      txObj["locktime"] = %tx.lockTime
+      txObj["vin"]      = vinArr
+      txObj["vout"]     = voutArr
+      txObj["hex"]      = %toHex(fullTxBytes)
+
+      # fee field: sum input values (from the pre-computed feeMap + flat file undo
+      # fallback) minus output values.
+      # Only present for non-coinbase txs when undo data is available.
+      # Reference: bitcoin-core/src/core_io.cpp TxToUniv have_undo block.
+      if txIdx > 0:
+        var amtIn: int64 = 0
+        var amtOut: int64 = 0
+        var allInputsKnown = true
+
+        for inpIdx, inp in tx.inputs:
+          var inpVal: int64 = -1
+
+          # 1. Pre-computed feeMap (txindex + RocksDB undo, resolved in Phase 1+3).
+          inpVal = feeMap.getOrDefault(inp.prevOut, -1'i64)
+
+          # 2. Flat file BlockUndo: per-input prevOutputs (for inputs not in feeMap).
+          if inpVal < 0 and blockUndoLoaded.isSome:
+            let bu = blockUndoLoaded.get()
+            let txUndoIdx = txIdx - 1
+            if txUndoIdx < bu.txUndo.len:
+              let txUndo = bu.txUndo[txUndoIdx]
+              if inpIdx < txUndo.prevOutputs.len:
+                inpVal = int64(txUndo.prevOutputs[inpIdx].output.value)
+
+          if inpVal < 0:
+            allInputsKnown = false
+            break
+          amtIn += inpVal
+
+        for outp in tx.outputs:
+          amtOut += int64(outp.value)
+
+        let fee = amtIn - amtOut
+        if allInputsKnown and fee >= 0:
+          txObj["fee"] = btcAmountNode(fee)
+
+      txArray.add(txObj)
+
+  # Build coinbase_tx summary object (Core 27+ field).
+  # Reference: bitcoin-core/src/rpc/blockchain.cpp BlockToJSON coinbase_tx.
+  # Shape: {coinbase, locktime, sequence, version, witness} — NOT a full tx.
+  var coinbaseTxObj = newJObject()
   if b.txs.len > 0:
-    let coinbaseTx = b.txs[0]
-    var coinbaseTxObj = %*{
-      "version": coinbaseTx.version,
-      "locktime": coinbaseTx.locktime
-    }
-    if coinbaseTx.inputs.len > 0:
-      coinbaseTxObj["sequence"] = %coinbaseTx.inputs[0].sequence
-      coinbaseTxObj["coinbase"] = %toHex(coinbaseTx.inputs[0].scriptSig)
-      # Add witness if present
-      if coinbaseTx.witnesses.len > 0 and coinbaseTx.witnesses[0].len > 0:
-        coinbaseTxObj["witness"] = %toHex(coinbaseTx.witnesses[0][0])
-    response["coinbase_tx"] = coinbaseTxObj
+    let cbtx = b.txs[0]
+    if cbtx.inputs.len > 0:
+      coinbaseTxObj["coinbase"] = %toHex(cbtx.inputs[0].scriptSig)
+    coinbaseTxObj["locktime"] = %cbtx.lockTime
+    if cbtx.inputs.len > 0:
+      coinbaseTxObj["sequence"] = %cbtx.inputs[0].sequence
+    coinbaseTxObj["version"] = %cbtx.version
+    # witness: first item of the first witness stack (the BIP141 commitment nonce).
+    if cbtx.witnesses.len > 0 and cbtx.witnesses[0].len > 0:
+      coinbaseTxObj["witness"] = %toHex(cbtx.witnesses[0][0])
 
+  # Assemble the response object.
+  var response = newJObject()
+  response["bits"]         = %bitsHex
+  response["chainwork"]    = %chainworkHex
+  response["confirmations"] = %int(rpc.chainState.bestHeight - height + 1)
+  response["coinbase_tx"]  = coinbaseTxObj
+  response["difficulty"]   = diffNode
+  response["hash"]         = %reverseHex(toHex(computedHash))
+  response["height"]       = %height
+  response["mediantime"]   = %mediantime
+  response["merkleroot"]   = %reverseHex(toHex(b.header.merkleRoot))
+  response["nTx"]          = %b.txs.len
+  response["nonce"]        = %b.header.nonce
   if height > 0:
     response["previousblockhash"] = %reverseHex(toHex(array[32, byte](b.header.prevBlock)))
+  response["size"]         = %fullSize
+  response["strippedsize"] = %strippedSize
+  response["target"]       = %targetHex
+  response["time"]         = %int64(b.header.timestamp)
+  response["tx"]           = txArray
+  response["version"]      = %b.header.version
+  response["versionHex"]   = %versionHex
+  response["weight"]       = %blockWeight
 
   if height < rpc.chainState.bestHeight:
     let nextHashOpt = rpc.chainState.db.getBlockHashByHeight(height + 1)
@@ -1542,21 +1767,47 @@ proc inferAddrDescriptor*(script: seq[byte], mainnet: bool): string =
   ## `InferDescriptor` (script/descriptor.cpp:2897) when called without a
   ## SigningProvider that has the keys (which is the case for `decodepsbt`).
   ##
-  ## For witness_v1_taproot (OP_1 <32-byte x-only key>) Core emits:
-  ##   rawtr(<32-byte-hex>)#<checksum>
-  ## because InferDescriptor recognises the x-only key and wraps it in
-  ## RawTrDescriptor rather than AddressDescriptor (src/script/descriptor.cpp).
+  ## Cases (in InferScript priority order):
+  ##   - witness_v1_taproot (OP_1 <32-byte x-only key>) → rawtr(<hex>)
+  ##   - bare multisig (OP_m <keys> OP_n OP_CHECKMULTISIG) → multi(m, key1, ...)
+  ##   - any script with an extractable address → addr(<address>)
+  ##   - everything else → raw(<hex>)
   ##
-  ## For all other standard scripts Core falls through to:
-  ##   if (ExtractDestination(script, dest)) return AddressDescriptor(dest);
-  ##   else return RawDescriptor(script);
-  ## so we emit `addr(<address>)` or `raw(<hex>)` respectively.
+  ## Reference: bitcoin-core/src/script/descriptor.cpp InferScript lines 2732-2744.
   let scriptType = getScriptType(script)
   let payload =
     if scriptType == "witness_v1_taproot" and script.len == 34:
       # Extract the 32-byte x-only pubkey (bytes 2..33) and emit rawtr(<hex>)
       let xonlyHex = toHex(script[2 ..< 34])
       "rawtr(" & xonlyHex & ")"
+    elif scriptType == "multisig" and script.len >= 4 and script[^1] == 0xae:
+      # Bare multisig: parse threshold and pubkeys, emit multi(m, key1, ...).
+      # Reference: bitcoin-core/src/script/descriptor.cpp InferScript line 2732.
+      # Script format: OP_M <push><pubkey1> ... <push><pubkeyN> OP_N OP_CHECKMULTISIG
+      let opM = script[0]
+      let m =
+        if opM == 0x00: 0           # OP_0
+        elif opM >= 0x51 and opM <= 0x60: int(opM) - 0x50  # OP_1..OP_16
+        else: -1
+      if m < 0:
+        "raw(" & toHex(script) & ")"
+      else:
+        var keys: seq[string]
+        var i = 1
+        var ok = true
+        while i < script.len - 2:  # stop before OP_N OP_CHECKMULTISIG
+          let pushLen = int(script[i])
+          if pushLen == 0: break
+          if i + 1 + pushLen > script.len - 2:
+            ok = false; break
+          keys.add(toHex(script[i + 1 ..< i + 1 + pushLen]))
+          i += 1 + pushLen
+        if not ok or keys.len == 0:
+          "raw(" & toHex(script) & ")"
+        else:
+          var parts = @[$m]
+          parts.add(keys)
+          "multi(" & parts.join(",") & ")"
     else:
       let addrOpt = extractAddressFromScript(script, mainnet)
       if addrOpt.isSome:
@@ -1609,7 +1860,7 @@ proc buildVinJson(tx: Transaction, inputIndex: int): JsonNode =
       "txid": reverseHex(toHex(array[32, byte](inp.prevOut.txid))),
       "vout": inp.prevOut.vout,
       "scriptSig": %*{
-        "asm": disassembleScript(inp.scriptSig),
+        "asm": disassembleScriptSigAsmStr(inp.scriptSig),
         "hex": toHex(inp.scriptSig)
       },
       "sequence": inp.sequence

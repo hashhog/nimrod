@@ -417,6 +417,19 @@ proc deleteUndoData*(cdb: ChainDb, blockHash: BlockHash) =
   ## Remove undo data for a block
   cdb.db.delete(cfMeta, undoKey(blockHash))
 
+proc getBlockUndoFromFile*(cs: ChainState, blockIdx: BlockIndex,
+                           prevHash: BlockHash): Option[BlockUndo] =
+  ## Read BlockUndo from the flat file rev*.dat using the block index undoPos.
+  ## Returns none if undoPos is invalid, undoMgr is nil, or the read fails.
+  ## Exported so that RPC handlers can compute per-tx fees without needing
+  ## to import undo.nim directly.
+  if blockIdx.undoPos.fileNum < 0 or blockIdx.undoPos.pos < 0:
+    return none(BlockUndo)
+  if cs.undoMgr == nil:
+    return none(BlockUndo)
+  let (bu, ok) = cs.undoMgr.readBlockUndo(blockIdx.undoPos, prevHash, cs.params)
+  if ok: some(bu) else: none(BlockUndo)
+
 # Chain state updates (ChainDb)
 
 proc updateBestBlock*(cdb: ChainDb, hash: BlockHash, height: int32) =
