@@ -1297,19 +1297,27 @@ proc inferAddrDescriptor*(script: seq[byte], mainnet: bool): string =
   ## `InferDescriptor` (script/descriptor.cpp:2897) when called without a
   ## SigningProvider that has the keys (which is the case for `decodepsbt`).
   ##
-  ## In that no-keys path, Core falls all the way through to:
+  ## For witness_v1_taproot (OP_1 <32-byte x-only key>) Core emits:
+  ##   rawtr(<32-byte-hex>)#<checksum>
+  ## because InferDescriptor recognises the x-only key and wraps it in
+  ## RawTrDescriptor rather than AddressDescriptor (src/script/descriptor.cpp).
+  ##
+  ## For all other standard scripts Core falls through to:
   ##   if (ExtractDestination(script, dest)) return AddressDescriptor(dest);
   ##   else return RawDescriptor(script);
-  ## so for known address-encodable scripts we emit `addr(<address>)` and
-  ## otherwise `raw(<hex>)`. The 8-char BIP-380 checksum is appended via
-  ## `addDescriptorChecksum` (wallet/descriptor.nim, already audited
-  ## byte-identical to Core's `DescriptorChecksum`).
-  let addrOpt = extractAddressFromScript(script, mainnet)
+  ## so we emit `addr(<address>)` or `raw(<hex>)` respectively.
+  let scriptType = getScriptType(script)
   let payload =
-    if addrOpt.isSome:
-      "addr(" & addrOpt.get() & ")"
+    if scriptType == "witness_v1_taproot" and script.len == 34:
+      # Extract the 32-byte x-only pubkey (bytes 2..33) and emit rawtr(<hex>)
+      let xonlyHex = toHex(script[2 ..< 34])
+      "rawtr(" & xonlyHex & ")"
     else:
-      "raw(" & toHex(script) & ")"
+      let addrOpt = extractAddressFromScript(script, mainnet)
+      if addrOpt.isSome:
+        "addr(" & addrOpt.get() & ")"
+      else:
+        "raw(" & toHex(script) & ")"
   try:
     addDescriptorChecksum(payload)
   except DescriptorError:
@@ -5578,18 +5586,14 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     var inputObj = newJObject()
 
     # UTXO info
-    if inp.nonWitnessUtxo.isSome:
-      let prevTx = inp.nonWitnessUtxo.get()
-      inputObj["non_witness_utxo"] = buildNonWitnessUtxoJson(prevTx, mainnet)
-      # Get the specific output value
-      if psbtObj.tx.isSome:
-        let outpoint = psbtObj.tx.get().inputs[i].prevOut
-        if int(outpoint.vout) < prevTx.outputs.len:
-          totalInputValue = totalInputValue + prevTx.outputs[outpoint.vout].value
-        else:
-          hasAllUtxos = false
-      else:
-        hasAllUtxos = false
+    # Reference: bitcoin-core/src/rpc/rawtransaction.cpp lines 1122-1156.
+    # Core uses a single `txout` variable overwritten by both utxo branches;
+    # the final `txout.nValue` is added to `total_in` exactly once.
+    # When both witness_utxo AND non_witness_utxo are present the
+    # non_witness_utxo branch runs second and its vout value wins.
+    # We track haveAUtxo and the winning value separately to avoid double-add.
+    var haveAUtxo = false
+    var inputUtxoValue = Satoshi(0)
 
     if inp.witnessUtxo.isSome:
       let utxo = inp.witnessUtxo.get()
@@ -5597,8 +5601,26 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
         "amount": btcAmountNode(int64(utxo.value)),
         "scriptPubKey": buildScriptPubKeyJson(utxo.scriptPubKey, mainnet)
       }
-      totalInputValue = totalInputValue + utxo.value
-    elif inp.nonWitnessUtxo.isNone:
+      inputUtxoValue = utxo.value
+      haveAUtxo = true
+
+    if inp.nonWitnessUtxo.isSome:
+      let prevTx = inp.nonWitnessUtxo.get()
+      inputObj["non_witness_utxo"] = buildNonWitnessUtxoJson(prevTx, mainnet)
+      # non_witness_utxo overwrites the value (same as Core's txout overwrite)
+      if psbtObj.tx.isSome:
+        let outpoint = psbtObj.tx.get().inputs[i].prevOut
+        if int(outpoint.vout) < prevTx.outputs.len:
+          inputUtxoValue = prevTx.outputs[outpoint.vout].value
+          haveAUtxo = true
+        else:
+          hasAllUtxos = false
+      else:
+        hasAllUtxos = false
+
+    if haveAUtxo:
+      totalInputValue = totalInputValue + inputUtxoValue
+    else:
       hasAllUtxos = false
 
     # Partial signatures
@@ -5625,13 +5647,15 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
       inputObj["witness_script"] = buildScriptTypeJson(inp.witnessScript)
 
     # BIP32 derivation paths
+    # Reference: bitcoin-core/src/util/bip32.cpp WriteHDKeypath(path) — default
+    # apostrophe=false, so hardened components use 'h' not "'".
     if inp.hdKeypaths.len > 0:
       var derivsArray = newJArray()
       for pubkey, origin in inp.hdKeypaths:
         var pathStr = "m"
         for idx in origin.path:
           if (idx and 0x80000000'u32) != 0:
-            pathStr.add("/" & $(idx and 0x7fffffff'u32) & "'")
+            pathStr.add("/" & $(idx and 0x7fffffff'u32) & "h")
           else:
             pathStr.add("/" & $idx)
         derivsArray.add(%*{
@@ -5657,15 +5681,118 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
         witnessArray.add(%toHex(item))
       inputObj["final_scriptwitness"] = witnessArray
 
-    # Taproot fields
+    # Taproot fields (BIP-371)
+    # taproot_key_path_sig (0x13)
     if inp.tapKeySig.len > 0:
-      inputObj["tap_key_sig"] = %toHex(inp.tapKeySig)
+      inputObj["taproot_key_path_sig"] = %toHex(inp.tapKeySig)
 
+    # taproot_script_path_sigs (0x14) — array of {pubkey, leaf_hash, sig}
+    # Core iterates m_tap_script_sigs (std::map sorted by (xonly, leaf_hash))
+    if inp.tapScriptSigs.len > 0:
+      var scriptSigsArray = newJArray()
+      var sortedKeys: seq[(array[32, byte], array[32, byte])]
+      for keyPair in inp.tapScriptSigs.keys:
+        sortedKeys.add(keyPair)
+      sortedKeys.sort(proc(a, b: (array[32, byte], array[32, byte])): int =
+        for i in 0 ..< 32:
+          if a[0][i] < b[0][i]: return -1
+          if a[0][i] > b[0][i]: return 1
+        for i in 0 ..< 32:
+          if a[1][i] < b[1][i]: return -1
+          if a[1][i] > b[1][i]: return 1
+        0)
+      for keyPair in sortedKeys:
+        let sig = inp.tapScriptSigs[keyPair]
+        scriptSigsArray.add(%*{
+          "pubkey": toHex(keyPair[0]),
+          "leaf_hash": toHex(keyPair[1]),
+          "sig": toHex(sig)
+        })
+      inputObj["taproot_script_path_sigs"] = scriptSigsArray
+
+    # taproot_scripts (0x15) — array of {script, leaf_ver, control_blocks[]}
+    # Core iterates m_tap_scripts: std::map<(script, leaf_ver), set<control_block>>
+    if inp.tapScripts.len > 0:
+      var tapScriptsArray = newJArray()
+      # Sort by (script_hex, leaf_ver) for determinism
+      var sortedLeafKeys: seq[(seq[byte], int)]
+      for leafKey in inp.tapScripts.keys:
+        sortedLeafKeys.add(leafKey)
+      sortedLeafKeys.sort(proc(a, b: (seq[byte], int)): int =
+        let minLen = min(a[0].len, b[0].len)
+        for i in 0 ..< minLen:
+          if a[0][i] < b[0][i]: return -1
+          if a[0][i] > b[0][i]: return 1
+        if a[0].len < b[0].len: return -1
+        if a[0].len > b[0].len: return 1
+        cmp(a[1], b[1]))
+      for leafKey in sortedLeafKeys:
+        let controlBlocks = inp.tapScripts[leafKey]
+        var cbArray = newJArray()
+        var sortedCbs: seq[seq[byte]]
+        for cb in controlBlocks:
+          sortedCbs.add(cb)
+        sortedCbs.sort(proc(a, b: seq[byte]): int =
+          let minLen = min(a.len, b.len)
+          for i in 0 ..< minLen:
+            if a[i] < b[i]: return -1
+            if a[i] > b[i]: return 1
+          cmp(a.len, b.len))
+        for cb in sortedCbs:
+          cbArray.add(%toHex(cb))
+        tapScriptsArray.add(%*{
+          "script": toHex(leafKey[0]),
+          "leaf_ver": leafKey[1],
+          "control_blocks": cbArray
+        })
+      inputObj["taproot_scripts"] = tapScriptsArray
+
+    # taproot_bip32_derivs (0x16) — array of {pubkey, master_fingerprint, path, leaf_hashes[]}
+    # Core iterates m_tap_bip32_paths: std::map<XOnlyPubKey, ...> (lex sorted by pubkey)
+    if inp.tapBip32Paths.len > 0:
+      var tapDerivArray = newJArray()
+      var sortedXonlys: seq[array[32, byte]]
+      for xonly in inp.tapBip32Paths.keys:
+        sortedXonlys.add(xonly)
+      sortedXonlys.sort(proc(a, b: array[32, byte]): int =
+        for i in 0 ..< 32:
+          if a[i] < b[i]: return -1
+          if a[i] > b[i]: return 1
+        0)
+      for xonly in sortedXonlys:
+        let (leafHashes, origin) = inp.tapBip32Paths[xonly]
+        var pathStr = "m"
+        for idx in origin.path:
+          if (idx and 0x80000000'u32) != 0:
+            pathStr.add("/" & $(idx and 0x7fffffff'u32) & "h")
+          else:
+            pathStr.add("/" & $idx)
+        var leafHashesArray = newJArray()
+        var sortedLeafHashes: seq[array[32, byte]]
+        for lh in leafHashes:
+          sortedLeafHashes.add(lh)
+        sortedLeafHashes.sort(proc(a, b: array[32, byte]): int =
+          for i in 0 ..< 32:
+            if a[i] < b[i]: return -1
+            if a[i] > b[i]: return 1
+          0)
+        for lh in sortedLeafHashes:
+          leafHashesArray.add(%toHex(lh))
+        tapDerivArray.add(%*{
+          "pubkey": toHex(xonly),
+          "master_fingerprint": toHex(origin.fingerprint),
+          "path": pathStr,
+          "leaf_hashes": leafHashesArray
+        })
+      inputObj["taproot_bip32_derivs"] = tapDerivArray
+
+    # taproot_internal_key (0x17)
     if inp.tapInternalKey != default(array[32, byte]):
-      inputObj["tap_internal_key"] = %toHex(inp.tapInternalKey)
+      inputObj["taproot_internal_key"] = %toHex(inp.tapInternalKey)
 
+    # taproot_merkle_root (0x18)
     if inp.tapMerkleRoot != default(array[32, byte]):
-      inputObj["tap_merkle_root"] = %toHex(inp.tapMerkleRoot)
+      inputObj["taproot_merkle_root"] = %toHex(inp.tapMerkleRoot)
 
     inputsArray.add(inputObj)
 
@@ -5692,7 +5819,7 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
         var pathStr = "m"
         for idx in origin.path:
           if (idx and 0x80000000'u32) != 0:
-            pathStr.add("/" & $(idx and 0x7fffffff'u32) & "'")
+            pathStr.add("/" & $(idx and 0x7fffffff'u32) & "h")
           else:
             pathStr.add("/" & $idx)
         derivsArray.add(%*{
@@ -5702,8 +5829,84 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
         })
       outputObj["bip32_derivs"] = derivsArray
 
+    # taproot_internal_key (PSBT_OUT_TAP_INTERNAL_KEY = 0x05)
     if outp.tapInternalKey != default(array[32, byte]):
-      outputObj["tap_internal_key"] = %toHex(outp.tapInternalKey)
+      outputObj["taproot_internal_key"] = %toHex(outp.tapInternalKey)
+
+    # taproot_tree (PSBT_OUT_TAP_TREE = 0x06) — array of {depth, leaf_ver, script}
+    if outp.tapTree.len > 0:
+      var treeArray = newJArray()
+      for (depth, leafVer, script) in outp.tapTree:
+        treeArray.add(%*{
+          "depth": int(depth),
+          "leaf_ver": int(leafVer),
+          "script": toHex(script)
+        })
+      outputObj["taproot_tree"] = treeArray
+
+    # taproot_bip32_derivs (PSBT_OUT_TAP_BIP32_DERIVATION = 0x07)
+    # Core iterates std::map<XOnlyPubKey, ...> (lex sorted by pubkey)
+    if outp.tapBip32Paths.len > 0:
+      var tapDerivArray = newJArray()
+      var sortedXonlys: seq[array[32, byte]]
+      for xonly in outp.tapBip32Paths.keys:
+        sortedXonlys.add(xonly)
+      sortedXonlys.sort(proc(a, b: array[32, byte]): int =
+        for i in 0 ..< 32:
+          if a[i] < b[i]: return -1
+          if a[i] > b[i]: return 1
+        0)
+      for xonly in sortedXonlys:
+        let (leafHashes, origin) = outp.tapBip32Paths[xonly]
+        var pathStr = "m"
+        for idx in origin.path:
+          if (idx and 0x80000000'u32) != 0:
+            pathStr.add("/" & $(idx and 0x7fffffff'u32) & "h")
+          else:
+            pathStr.add("/" & $idx)
+        var leafHashesArray = newJArray()
+        var sortedLeafHashes: seq[array[32, byte]]
+        for lh in leafHashes:
+          sortedLeafHashes.add(lh)
+        sortedLeafHashes.sort(proc(a, b: array[32, byte]): int =
+          for i in 0 ..< 32:
+            if a[i] < b[i]: return -1
+            if a[i] > b[i]: return 1
+          0)
+        for lh in sortedLeafHashes:
+          leafHashesArray.add(%toHex(lh))
+        tapDerivArray.add(%*{
+          "pubkey": toHex(xonly),
+          "master_fingerprint": toHex(origin.fingerprint),
+          "path": pathStr,
+          "leaf_hashes": leafHashesArray
+        })
+      outputObj["taproot_bip32_derivs"] = tapDerivArray
+
+    # musig2_participant_pubkeys (PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS = 0x08)
+    # Core emits array of {aggregate_pubkey, participant_pubkeys[]}
+    # Core's std::map is sorted by aggregate_pubkey (lex order)
+    if outp.musig2Participants.len > 0:
+      var musigArray = newJArray()
+      var sortedAggKeys: seq[seq[byte]]
+      for aggKey in outp.musig2Participants.keys:
+        sortedAggKeys.add(aggKey)
+      sortedAggKeys.sort(proc(a, b: seq[byte]): int =
+        let minLen = min(a.len, b.len)
+        for i in 0 ..< minLen:
+          if a[i] < b[i]: return -1
+          if a[i] > b[i]: return 1
+        cmp(a.len, b.len))
+      for aggKey in sortedAggKeys:
+        let participants = outp.musig2Participants[aggKey]
+        var partArray = newJArray()
+        for pk in participants:
+          partArray.add(%toHex(pk))
+        musigArray.add(%*{
+          "aggregate_pubkey": toHex(aggKey),
+          "participant_pubkeys": partArray
+        })
+      outputObj["musig2_participant_pubkeys"] = musigArray
 
     outputsArray.add(outputObj)
 

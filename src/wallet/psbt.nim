@@ -139,6 +139,10 @@ type
     tapTree*: seq[(uint8, uint8, seq[byte])]  ## (depth, leaf_ver, script)
     tapBip32Paths*: Table[array[32, byte], (HashSet[array[32, byte]], KeyOriginInfo)]
 
+    # MuSig2 fields (BIP-327 / PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS = 0x08)
+    # agg_pubkey (33 bytes compressed) -> sorted list of participant pubkeys (33 bytes each)
+    musig2Participants*: Table[seq[byte], seq[seq[byte]]]
+
     # Unknown and proprietary
     unknown*: Table[seq[byte], seq[byte]]
     proprietary*: seq[PsbtProprietary]
@@ -869,6 +873,21 @@ proc deserializePsbtOutput*(r: var BinaryReader): PsbtOutput =
         leafHashes.incl(valR.readHash())
       let origin = valR.deserializeKeyOrigin(value.len - valR.pos)
       result.tapBip32Paths[xonly] = (leafHashes, origin)
+
+    of PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS:
+      # key = [type_byte(1)] + [aggregate_pubkey(33)]
+      # value = concatenated participant pubkeys (33 bytes each)
+      if key.len != 34:
+        raise newException(PsbtError, "musig2 participant pubkeys output key must be 34 bytes")
+      let aggPubkey = key[1 ..< 34]
+      var participants: seq[seq[byte]]
+      var pos = 0
+      while pos + 33 <= value.len:
+        participants.add(value[pos ..< pos + 33])
+        pos += 33
+      if pos != value.len:
+        raise newException(PsbtError, "musig2 participants pubkeys value size is not a multiple of 33")
+      result.musig2Participants[aggPubkey] = participants
 
     of PSBT_OUT_PROPRIETARY:
       var prop = PsbtProprietary(key: key, value: value)
