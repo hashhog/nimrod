@@ -1379,6 +1379,298 @@ proc buildVoutJson(output: TxOut, index: int, mainnet: bool): JsonNode =
     "scriptPubKey": buildScriptPubKeyJson(output.scriptPubKey, mainnet)
   }
 
+proc sighashToStr*(sighashType: int32): string =
+  ## Map a PSBT sighash-type integer to its Bitcoin Core string label.
+  ##
+  ## Reference: bitcoin-core/src/core_io.cpp SighashToStr (line ~343).
+  ## The map covers the 6 defined SIGHASH values; anything else returns "".
+  ##
+  ## PSBT_IN_SIGHASH_TYPE stores a 4-byte little-endian uint32; the lower byte
+  ## is the sighash flag (the same byte that is appended to a DER signature).
+  let low = uint8(sighashType and 0xff)
+  case low
+  of 0x01: "ALL"
+  of 0x02: "NONE"
+  of 0x03: "SINGLE"
+  of 0x81: "ALL|ANYONECANPAY"
+  of 0x82: "NONE|ANYONECANPAY"
+  of 0x83: "SINGLE|ANYONECANPAY"
+  else: ""
+
+proc isValidDerSigEncoding*(vch: seq[byte]): bool =
+  ## Check whether a push looks like a valid DER signature (+ sighash byte).
+  ##
+  ## Mirrors bitcoin-core/src/script/interpreter.cpp IsValidSignatureEncoding.
+  ## Used by `disassembleScriptSigAsmStr` to decide whether to append [SigHashType].
+  if vch.len < 9 or vch.len > 73: return false
+  if vch[0] != 0x30: return false
+  if vch[1] != uint8(vch.len - 3): return false
+  let lenR = int(vch[3])
+  if 5 + lenR >= vch.len: return false
+  let lenS = int(vch[5 + lenR])
+  if lenR + lenS + 7 != vch.len: return false
+  if vch[2] != 0x02: return false
+  if lenR == 0: return false
+  if (vch[4] and 0x80) != 0: return false
+  if lenR > 1 and vch[4] == 0x00 and (vch[5] and 0x80) == 0: return false
+  if vch[lenR + 4] != 0x02: return false
+  if lenS == 0: return false
+  if (vch[lenR + 6] and 0x80) != 0: return false
+  if lenS > 1 and vch[lenR + 6] == 0x00 and (vch[lenR + 7] and 0x80) == 0: return false
+  true
+
+proc disassembleScriptSigAsmStr*(script: seq[byte]): string =
+  ## Disassemble a scriptSig with sighash-type decoding enabled.
+  ##
+  ## Reference: bitcoin-core/src/core_io.cpp ScriptToAsmStr(..., fAttemptSighashDecode=true).
+  ##
+  ## For push-data operands whose length > 4:
+  ##   1. Check IsValidSignatureEncoding (DER format + sighash byte).
+  ##   2. If it passes, strip the last byte, map it via sighashToStr, and
+  ##      append the "[TYPE]" suffix if the type is defined.
+  ##   3. Emit hex(stripped_data) + optional "[TYPE]" suffix.
+  ## For push-data operands whose length <= 4: emit as CScriptNum decimal.
+  ## Non-push opcodes: same as disassembleScript.
+  var result = ""
+  var i = 0
+
+  proc pushDataHex(data: seq[byte]): string =
+    var h = ""
+    for b in data:
+      h.add(toHex(b, 2).toLowerAscii())
+    h
+
+  while i < script.len:
+    if result.len > 0:
+      result.add(" ")
+
+    let op = script[i]
+
+    # Push data opcodes
+    var dataLen = 0
+    var dataStart = 0
+    if op >= 0x01 and op <= 0x4b:
+      dataLen = int(op)
+      dataStart = i + 1
+      i += 1 + dataLen
+    elif op == 0x4c:  # OP_PUSHDATA1
+      if i + 1 >= script.len: result.add("[error]"); break
+      dataLen = int(script[i + 1])
+      dataStart = i + 2
+      i += 2 + dataLen
+    elif op == 0x4d:  # OP_PUSHDATA2
+      if i + 2 >= script.len: result.add("[error]"); break
+      dataLen = int(script[i + 1]) or (int(script[i + 2]) shl 8)
+      dataStart = i + 3
+      i += 3 + dataLen
+    elif op == 0x4e:  # OP_PUSHDATA4
+      if i + 4 >= script.len: result.add("[error]"); break
+      dataLen = int(script[i + 1]) or (int(script[i + 2]) shl 8) or
+                (int(script[i + 3]) shl 16) or (int(script[i + 4]) shl 24)
+      dataStart = i + 5
+      i += 5 + dataLen
+    else:
+      # Non-push opcode — same table as disassembleScript
+      let opName = case op
+        of 0x00: "0"
+        of 0x4f: "-1"
+        of 0x51: "1"
+        of 0x52: "2"
+        of 0x53: "3"
+        of 0x54: "4"
+        of 0x55: "5"
+        of 0x56: "6"
+        of 0x57: "7"
+        of 0x58: "8"
+        of 0x59: "9"
+        of 0x5a: "10"
+        of 0x5b: "11"
+        of 0x5c: "12"
+        of 0x5d: "13"
+        of 0x5e: "14"
+        of 0x5f: "15"
+        of 0x60: "16"
+        else:
+          # Re-use the opcode names from disassembleScript's else branch
+          case op
+          of 0x61: "OP_NOP"
+          of 0x63: "OP_IF"
+          of 0x64: "OP_NOTIF"
+          of 0x67: "OP_ELSE"
+          of 0x68: "OP_ENDIF"
+          of 0x69: "OP_VERIFY"
+          of 0x6a: "OP_RETURN"
+          of 0x6b: "OP_TOALTSTACK"
+          of 0x6c: "OP_FROMALTSTACK"
+          of 0x6d: "OP_2DROP"
+          of 0x6e: "OP_2DUP"
+          of 0x6f: "OP_3DUP"
+          of 0x70: "OP_2OVER"
+          of 0x71: "OP_2ROT"
+          of 0x72: "OP_2SWAP"
+          of 0x73: "OP_IFDUP"
+          of 0x74: "OP_DEPTH"
+          of 0x75: "OP_DROP"
+          of 0x76: "OP_DUP"
+          of 0x77: "OP_NIP"
+          of 0x78: "OP_OVER"
+          of 0x79: "OP_PICK"
+          of 0x7a: "OP_ROLL"
+          of 0x7b: "OP_ROT"
+          of 0x7c: "OP_SWAP"
+          of 0x7d: "OP_TUCK"
+          of 0x82: "OP_SIZE"
+          of 0x87: "OP_EQUAL"
+          of 0x88: "OP_EQUALVERIFY"
+          of 0x8b: "OP_1ADD"
+          of 0x8c: "OP_1SUB"
+          of 0x8f: "OP_NEGATE"
+          of 0x90: "OP_ABS"
+          of 0x91: "OP_NOT"
+          of 0x92: "OP_0NOTEQUAL"
+          of 0x93: "OP_ADD"
+          of 0x94: "OP_SUB"
+          of 0x9a: "OP_BOOLAND"
+          of 0x9b: "OP_BOOLOR"
+          of 0x9c: "OP_NUMEQUAL"
+          of 0x9d: "OP_NUMEQUALVERIFY"
+          of 0x9e: "OP_NUMNOTEQUAL"
+          of 0x9f: "OP_LESSTHAN"
+          of 0xa0: "OP_GREATERTHAN"
+          of 0xa1: "OP_LESSTHANOREQUAL"
+          of 0xa2: "OP_GREATERTHANOREQUAL"
+          of 0xa3: "OP_MIN"
+          of 0xa4: "OP_MAX"
+          of 0xa5: "OP_WITHIN"
+          of 0xa6: "OP_RIPEMD160"
+          of 0xa7: "OP_SHA1"
+          of 0xa8: "OP_SHA256"
+          of 0xa9: "OP_HASH160"
+          of 0xaa: "OP_HASH256"
+          of 0xab: "OP_CODESEPARATOR"
+          of 0xac: "OP_CHECKSIG"
+          of 0xad: "OP_CHECKSIGVERIFY"
+          of 0xae: "OP_CHECKMULTISIG"
+          of 0xaf: "OP_CHECKMULTISIGVERIFY"
+          of 0xb0: "OP_NOP1"
+          of 0xb1: "OP_CHECKLOCKTIMEVERIFY"
+          of 0xb2: "OP_CHECKSEQUENCEVERIFY"
+          of 0xb3: "OP_NOP4"
+          of 0xb4: "OP_NOP5"
+          of 0xb5: "OP_NOP6"
+          of 0xb6: "OP_NOP7"
+          of 0xb7: "OP_NOP8"
+          of 0xb8: "OP_NOP9"
+          of 0xb9: "OP_NOP10"
+          of 0xba: "OP_CHECKSIGADD"
+          else: "OP_UNKNOWN[" & toHex(op, 2) & "]"
+      result.add(opName)
+      i += 1
+      continue
+
+    # We have a push: dataStart..dataStart+dataLen
+    if dataStart + dataLen > script.len:
+      result.add("[error]")
+      break
+
+    let vch = script[dataStart ..< dataStart + dataLen]
+    if vch.len <= 4:
+      # CScriptNum decimal
+      var v: int64 = 0
+      if vch.len > 0:
+        for j in 0 ..< vch.len:
+          v = v or (int64(vch[j]) shl (8 * j))
+        if (vch[vch.len - 1] and 0x80) != 0:
+          let mask = int64(0x80) shl (8 * (vch.len - 1))
+          v = -(v and not mask)
+      result.add($v)
+    else:
+      # Attempt sighash decode
+      var decoded = vch
+      var sighashSuffix = ""
+      if isValidDerSigEncoding(vch):
+        let shType = sighashToStr(int32(vch[^1]))
+        if shType.len > 0:
+          decoded = vch[0 ..< vch.len - 1]
+          sighashSuffix = "[" & shType & "]"
+      result.add(pushDataHex(decoded) & sighashSuffix)
+
+  result
+
+proc buildScriptTypeJson*(script: seq[byte]): JsonNode =
+  ## Build script JSON object with {asm, hex, type} — no desc, no address.
+  ##
+  ## Used for redeem_script / witness_script fields in decodepsbt input objects.
+  ## Reference: bitcoin-core/src/core_io.cpp ScriptToUniv called with default
+  ## args (include_address=false), which means NO `desc` and NO `address` are
+  ## emitted — only asm + hex + type.
+  let scriptType = getScriptType(script)
+  %*{
+    "asm": disassembleScript(script),
+    "hex": toHex(script),
+    "type": scriptType
+  }
+
+proc buildNonWitnessUtxoJson*(prevTx: Transaction, mainnet: bool): JsonNode =
+  ## Build the full TxToUniv shape for non_witness_utxo, WITHOUT the "hex" field.
+  ##
+  ## Reference: bitcoin-core/src/rpc/rawtransaction.cpp line 1142:
+  ##   TxToUniv(*input.non_witness_utxo, uint256(), non_wit, /*include_hex=*/false)
+  ##
+  ## Shape: {txid, hash, version, size, vsize, weight, locktime, vin[], vout[]}
+  ## vin[i]: {txid, vout, scriptSig:{asm,hex}, sequence, txinwitness?}
+  ##         (or {coinbase, sequence} for coinbase inputs)
+  ## vout[i]: {value, n, scriptPubKey:{asm,desc,hex,address?,type}}
+  ##
+  ## Note: "hash" is the wtxid (witness tx hash), not the txid.
+  ## Note: "size" is the serialized size INCLUDING witness; same as Core's
+  ##       ComputeTotalSize().
+  let txid = prevTx.txid()
+  let wtxid = prevTx.wtxid()
+  let weight = validation.calculateTransactionWeight(prevTx)
+  let vsize = (weight + 3) div 4
+  let size = serialize(prevTx).len
+
+  result = newJObject()
+  result["txid"] = %reverseHex(toHex(array[32, byte](txid)))
+  result["hash"] = %reverseHex(toHex(array[32, byte](wtxid)))
+  result["version"] = %prevTx.version
+  result["size"] = %size
+  result["vsize"] = %vsize
+  result["weight"] = %weight
+  result["locktime"] = %prevTx.lockTime
+
+  # vin array
+  var vinArr = newJArray()
+  for idx, inp in prevTx.inputs:
+    let isCoinbase = inp.prevOut.txid == TxId(default(array[32, byte])) and
+                     inp.prevOut.vout == 0xFFFFFFFF'u32
+    var vinObj = newJObject()
+    if isCoinbase:
+      vinObj["coinbase"] = %toHex(inp.scriptSig)
+    else:
+      vinObj["txid"] = %reverseHex(toHex(array[32, byte](inp.prevOut.txid)))
+      vinObj["vout"] = %inp.prevOut.vout
+      vinObj["scriptSig"] = %*{
+        "asm": disassembleScriptSigAsmStr(inp.scriptSig),
+        "hex": toHex(inp.scriptSig)
+      }
+    # txinwitness — only when non-empty
+    if idx < prevTx.witnesses.len and prevTx.witnesses[idx].len > 0:
+      var witnessArr = newJArray()
+      for item in prevTx.witnesses[idx]:
+        witnessArr.add(%toHex(item))
+      vinObj["txinwitness"] = witnessArr
+    vinObj["sequence"] = %inp.sequence
+    vinArr.add(vinObj)
+  result["vin"] = vinArr
+
+  # vout array (full scriptPubKey shape with desc + address)
+  var voutArr = newJArray()
+  for idx, outp in prevTx.outputs:
+    voutArr.add(buildVoutJson(outp, idx, mainnet))
+  result["vout"] = voutArr
+
 proc buildVerboseTxJson(tx: Transaction, blockHash: Option[BlockHash],
                         confirmations: int32, blocktime: uint32,
                         inActiveChain: Option[bool], mainnet: bool): JsonNode =
@@ -5288,12 +5580,7 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     # UTXO info
     if inp.nonWitnessUtxo.isSome:
       let prevTx = inp.nonWitnessUtxo.get()
-      inputObj["non_witness_utxo"] = %*{
-        "txid": reverseHex(toHex(array[32, byte](prevTx.txid()))),
-        "version": prevTx.version,
-        "size": serialize(prevTx).len,
-        "locktime": prevTx.lockTime
-      }
+      inputObj["non_witness_utxo"] = buildNonWitnessUtxoJson(prevTx, mainnet)
       # Get the specific output value
       if psbtObj.tx.isSome:
         let outpoint = psbtObj.tx.get().inputs[i].prevOut
@@ -5321,22 +5608,21 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
         sigsObj[toHex(pubkey)] = %toHex(sig)
       inputObj["partial_signatures"] = sigsObj
 
-    # Sighash type
+    # Sighash type — emit the string label ("ALL", "NONE", "SINGLE", ...)
+    # Reference: bitcoin-core/src/core_io.cpp SighashToStr (called from decodepsbt
+    # rpc/rawtransaction.cpp line ~1169). Empty string for unknown types.
     if inp.sighashType.isSome:
-      inputObj["sighash"] = %($inp.sighashType.get())
+      inputObj["sighash"] = %sighashToStr(inp.sighashType.get())
 
-    # Scripts
+    # Scripts — emit {asm, hex, type} via buildScriptTypeJson.
+    # Reference: bitcoin-core/src/rpc/rawtransaction.cpp lines 1173-1182,
+    # which calls ScriptToUniv with default args (include_address=false),
+    # so NO desc and NO address are emitted — only asm + hex + type.
     if inp.redeemScript.len > 0:
-      inputObj["redeem_script"] = %*{
-        "asm": disassembleScript(inp.redeemScript),
-        "hex": toHex(inp.redeemScript)
-      }
+      inputObj["redeem_script"] = buildScriptTypeJson(inp.redeemScript)
 
     if inp.witnessScript.len > 0:
-      inputObj["witness_script"] = %*{
-        "asm": disassembleScript(inp.witnessScript),
-        "hex": toHex(inp.witnessScript)
-      }
+      inputObj["witness_script"] = buildScriptTypeJson(inp.witnessScript)
 
     # BIP32 derivation paths
     if inp.hdKeypaths.len > 0:
@@ -5355,10 +5641,13 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
         })
       inputObj["bip32_derivs"] = derivsArray
 
-    # Final scripts
+    # Final scripts — final_scriptSig.asm uses sighash-decode mode (true).
+    # Reference: bitcoin-core/src/rpc/rawtransaction.cpp line 1201:
+    #   scriptsig.pushKV("asm", ScriptToAsmStr(input.final_script_sig, true))
+    # The 'true' means DER sigs have their last byte decoded as e.g. "[ALL]".
     if inp.finalScriptSig.len > 0:
       inputObj["final_scriptSig"] = %*{
-        "asm": disassembleScript(inp.finalScriptSig),
+        "asm": disassembleScriptSigAsmStr(inp.finalScriptSig),
         "hex": toHex(inp.finalScriptSig)
       }
 
