@@ -2,7 +2,7 @@
 ## Bitcoin Core compatible RPC interface with HTTP Basic auth
 ## JSON-RPC 2.0 compliant with proper error codes
 
-import std/[json, strutils, tables, options, base64, parseutils, times, sets, os, algorithm]
+import std/[json, strutils, tables, options, base64, parseutils, times, sets, os, algorithm, streams]
 import chronos
 import chronicles
 import jsony
@@ -1258,13 +1258,81 @@ proc disassembleScript(script: seq[byte]): string =
 
   return result
 
+proc rawNumberNode*(s: string): JsonNode =
+  ## Construct a JsonNode that serializes as a raw (unquoted) numeric token.
+  ##
+  ## Nim's stdlib `JFloat` formats whole-BTC values as `1.0`, which differs
+  ## from Bitcoin Core's `ValueFromAmount` (which always emits `%d.%08d`,
+  ## e.g. `1.00000000`) and breaks `decodepsbt` byte-identity vs Core
+  ## (W50 diagnostic, W51).
+  ##
+  ## `parseJson` with `rawFloats = true` constructs a `JString` with the
+  ## stdlib's internal `isUnquoted` flag set; that flag tells `toUgly` /
+  ## `$` to emit the string back without quotes — preserving the exact
+  ## decimal text we hand it. We use that as a stdlib-supported route to
+  ## the otherwise-unexported "raw number" node kind.
+  ##
+  ## Reference: bitcoin-core/src/core_io.cpp `ValueFromAmount`.
+  var st = newStringStream(s)
+  result = parseJson(st, "rawnum", false, true)
+
+proc formatBitcoinAmount*(sats: int64): string =
+  ## Format a satoshi amount the way Bitcoin Core's `ValueFromAmount`
+  ## (core_io.cpp:285) does: `%s%d.%08d`. Always 8 fractional digits, no
+  ## scientific notation, sign on the whole part.
+  let neg = sats < 0
+  let abs = if neg: -sats else: sats
+  let whole = abs div 100_000_000'i64
+  let frac = abs mod 100_000_000'i64
+  result = (if neg: "-" else: "") & $whole & "." & align($frac, 8, '0')
+
+proc btcAmountNode*(sats: int64): JsonNode =
+  ## Emit a satoshi amount as a Core-shaped raw JSON number
+  ## (e.g. `1.00000000`, never `1.0`). See `formatBitcoinAmount` +
+  ## `rawNumberNode` for details.
+  rawNumberNode(formatBitcoinAmount(sats))
+
+proc inferAddrDescriptor*(script: seq[byte], mainnet: bool): string =
+  ## Build a BIP-380 descriptor string for a scriptPubKey, mirroring Core's
+  ## `InferDescriptor` (script/descriptor.cpp:2897) when called without a
+  ## SigningProvider that has the keys (which is the case for `decodepsbt`).
+  ##
+  ## In that no-keys path, Core falls all the way through to:
+  ##   if (ExtractDestination(script, dest)) return AddressDescriptor(dest);
+  ##   else return RawDescriptor(script);
+  ## so for known address-encodable scripts we emit `addr(<address>)` and
+  ## otherwise `raw(<hex>)`. The 8-char BIP-380 checksum is appended via
+  ## `addDescriptorChecksum` (wallet/descriptor.nim, already audited
+  ## byte-identical to Core's `DescriptorChecksum`).
+  let addrOpt = extractAddressFromScript(script, mainnet)
+  let payload =
+    if addrOpt.isSome:
+      "addr(" & addrOpt.get() & ")"
+    else:
+      "raw(" & toHex(script) & ")"
+  try:
+    addDescriptorChecksum(payload)
+  except DescriptorError:
+    # Defensive: address/hex chars are always inside the descriptor input
+    # charset, so this path is unreachable for well-formed inputs.
+    payload
+
 proc buildScriptPubKeyJson(script: seq[byte], mainnet: bool): JsonNode =
-  ## Build scriptPubKey JSON object with type, asm, hex, address
+  ## Build scriptPubKey JSON object with type, asm, hex, address, desc.
+  ##
+  ## Reference: bitcoin-core/src/core_io.cpp `ScriptToUniv` /
+  ## `ScriptPubKeyToUniv`. Core unconditionally emits a `desc` key carrying
+  ## `InferDescriptor(...).ToString()` plus its 8-char BIP-380 checksum
+  ## (rpc/rawtransaction.cpp `decodepsbt`); without a key provider this
+  ## resolves to `addr(<address>)#<csum>` for standard scripts and
+  ## `raw(<hex>)#<csum>` otherwise. W51: closes the SHAPE-MISSING `desc`
+  ## gap surfaced by W50.
   let scriptType = getScriptType(script)
   let addrOpt = extractAddressFromScript(script, mainnet)
 
   result = %*{
     "asm": disassembleScript(script),
+    "desc": inferAddrDescriptor(script, mainnet),
     "hex": toHex(script),
     "type": scriptType
   }
@@ -1302,9 +1370,11 @@ proc buildVinJson(tx: Transaction, inputIndex: int): JsonNode =
     result["txinwitness"] = txinwitness
 
 proc buildVoutJson(output: TxOut, index: int, mainnet: bool): JsonNode =
-  ## Build vout JSON object for an output
+  ## Build vout JSON object for an output. `value` is emitted as Core-shaped
+  ## fixed 8-decimal text (`%d.%08d`, see `btcAmountNode`) so that
+  ## whole-BTC amounts read `1.00000000` not Nim's `1.0` (W50 / W51).
   %*{
-    "value": float64(int64(output.value)) / 100_000_000.0,
+    "value": btcAmountNode(int64(output.value)),
     "n": index,
     "scriptPubKey": buildScriptPubKeyJson(output.scriptPubKey, mainnet)
   }
@@ -5237,7 +5307,7 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     if inp.witnessUtxo.isSome:
       let utxo = inp.witnessUtxo.get()
       inputObj["witness_utxo"] = %*{
-        "amount": float64(int64(utxo.value)) / 100_000_000.0,
+        "amount": btcAmountNode(int64(utxo.value)),
         "scriptPubKey": buildScriptPubKeyJson(utxo.scriptPubKey, mainnet)
       }
       totalInputValue = totalInputValue + utxo.value
@@ -5348,7 +5418,8 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
 
     outputsArray.add(outputObj)
 
-  # Calculate fee if we have all UTXOs
+  # Calculate fee if we have all UTXOs.  Emit Core-shaped fixed 8-decimal
+  # amount (see `btcAmountNode`).
   var feeNode = newJNull()
   if hasAllUtxos and psbtObj.tx.isSome:
     var totalOutput = Satoshi(0)
@@ -5356,7 +5427,7 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
       totalOutput = totalOutput + outp.value
     if int64(totalInputValue) >= int64(totalOutput):
       let fee = totalInputValue - totalOutput
-      feeNode = %(float64(int64(fee)) / 100_000_000.0)
+      feeNode = btcAmountNode(int64(fee))
 
   result = %*{
     "tx": txJson,
