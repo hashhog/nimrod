@@ -1549,6 +1549,145 @@ proc countUnsignedInputs*(psbt: Psbt): int =
     if not input.isSigned():
       inc result
 
+# =============================================================================
+# W48: Core-correct analyzepsbt classifier
+#
+# Mirrors `bitcoin-core/src/node/psbt.cpp::AnalyzePSBT` and
+# `bitcoin-core/src/rpc/rawtransaction.cpp::analyzepsbt`.
+#
+# The legacy `analyzePsbt` above keeps a coarser "any partial sig means
+# finalizer" heuristic (callers depend on its `PsbtAnalysis` shape). The
+# helpers below — used by the analyzepsbt RPC handler — implement Core's
+# precise per-input classification:
+#
+#   1. final_script_sig or final_script_witness present  -> extractor
+#   2. has UTXO + enough partial_sigs (M of N for multisig) -> finalizer
+#   3. has UTXO                                          -> signer
+#   4. else                                              -> updater
+#
+# PSBT-level `next` is the MIN per-input role under Core's order:
+#   creator < updater < signer < finalizer < extractor   (`psbt.cpp:91-95`).
+#
+# Reference: hotbuns W47-5 (`b6ccf2a`) `analyzePSBTCore`.
+# Reference: camlcoin W41 (`2a22a0e`) `psbt_next_role`.
+# =============================================================================
+
+type
+  AnalyzedInput* = object
+    hasUtxo*: bool
+    isFinal*: bool
+    nextRole*: string                 ## one of {extractor, finalizer, signer, updater}
+    missingSignatures*: seq[seq[byte]]  ## hex-pubkeys whose partial sig is absent (multisig signer-state only)
+
+  AnalyzedPsbt* = object
+    inputs*: seq[AnalyzedInput]
+    nextRole*: string                 ## min over per-input roles (Core ordering)
+
+proc requiredSigCount*(input: PsbtInput): Option[int] =
+  ## Compute the minimum number of partial signatures required to finalize
+  ## an input. Mirrors Core's `SignPSBTInput` dummy-sign attempt in
+  ## `src/node/psbt.cpp::AnalyzePSBT` — for next-role analysis, only the
+  ## missing-sigs count matters.
+  ##
+  ## - Multisig (P2SH / P2WSH / P2SH-P2WSH): M from the redeem/witness script.
+  ## - Taproot key-path: 1 (the schnorr sig).
+  ## - Single-sig (P2PKH / P2WPKH / P2SH-P2WPKH): 1.
+  ## - No utxo / no script: none (caller treats as "cannot classify").
+  if input.witnessScript.len > 0:
+    let parsed = parseMultisigScript(input.witnessScript)
+    if parsed.isSome:
+      return some(parsed.get()[0])
+    return some(1)  ## Non-multisig P2WSH: single-sig finalize.
+  if input.redeemScript.len > 0:
+    let parsed = parseMultisigScript(input.redeemScript)
+    if parsed.isSome:
+      return some(parsed.get()[0])
+    return some(1)  ## Bare P2SH non-multisig (e.g. P2SH-P2WPKH wrapper).
+  if input.tapInternalKey != default(array[32, byte]):
+    return some(1)
+  if input.witnessUtxo.isSome or input.nonWitnessUtxo.isSome:
+    return some(1)  ## Plain P2PKH/P2WPKH single-sig.
+  none(int)
+
+proc isInputReadyToFinalize*(input: PsbtInput): bool =
+  ## Is this input ready for the finalizer step?
+  ##
+  ## Mirrors Core's "dummy-sign succeeds" branch in `AnalyzePSBT`: when a
+  ## non-finalized input has every signature it needs (M-of-N for multisig;
+  ## 1 for single-sig; tap_key_sig for taproot), the next role is FINALIZER,
+  ## not SIGNER.
+  if input.isSigned():
+    return false
+  if input.tapKeySig.len > 0:
+    return true
+  let nSigs = input.partialSigs.len
+  if nSigs == 0:
+    return false
+  let needed = requiredSigCount(input)
+  if needed.isNone:
+    ## Cannot classify; mirror hotbuns/camlcoin fallback — don't regress
+    ## single-sig inputs by demanding a script we don't have.
+    return nSigs >= 1
+  nSigs >= needed.get()
+
+proc inputNextRoleCore*(input: PsbtInput): string =
+  ## Per-input next role (Core-shape strings).
+  ## Mirrors `bitcoin-core/src/node/psbt.cpp::AnalyzePSBT` branching.
+  if input.isSigned():
+    return "extractor"
+  let hasUtxo = input.witnessUtxo.isSome or input.nonWitnessUtxo.isSome
+  if not hasUtxo:
+    return "updater"
+  if isInputReadyToFinalize(input):
+    return "finalizer"
+  "signer"
+
+proc roleRank(role: string): int =
+  ## Core ordering: creator < updater < signer < finalizer < extractor.
+  case role
+  of "creator": 0
+  of "updater": 1
+  of "signer": 2
+  of "finalizer": 3
+  of "extractor": 4
+  else: 4
+
+proc analyzePsbtCore*(psbt: Psbt): AnalyzedPsbt =
+  ## Compute the Core-shape `analyzepsbt` result.
+  ##
+  ## Per-input `next` is computed via `inputNextRoleCore`. PSBT-level
+  ## `next` is the minimum per-input role under Core's ordering. For
+  ## multisig signer-state inputs, `missingSignatures` lists pubkeys
+  ## whose partial sig is absent (informational; harness only checks
+  ## the top-level `.next`).
+  result.nextRole = "extractor"
+  for inp in psbt.inputs:
+    var ai: AnalyzedInput
+    ai.hasUtxo = inp.witnessUtxo.isSome or inp.nonWitnessUtxo.isSome
+    ai.isFinal = inp.isSigned()
+    ai.nextRole = inputNextRoleCore(inp)
+
+    if ai.nextRole == "signer":
+      ## Best-effort missing-pubkey list for multisig signer-state inputs.
+      let script =
+        if inp.witnessScript.len > 0: inp.witnessScript
+        elif inp.redeemScript.len > 0: inp.redeemScript
+        else: @[]
+      if script.len > 0:
+        let parsed = parseMultisigScript(script)
+        if parsed.isSome:
+          let (_, keys) = parsed.get()
+          for pk in keys:
+            if pk notin inp.partialSigs:
+              ai.missingSignatures.add(pk)
+
+    if roleRank(ai.nextRole) < roleRank(result.nextRole):
+      result.nextRole = ai.nextRole
+    result.inputs.add(ai)
+
+  if psbt.inputs.len == 0:
+    result.nextRole = "creator"
+
 proc getInputUtxo*(psbt: Psbt, index: int): Option[TxOut] =
   ## Get the UTXO for a specific input
   if index >= psbt.inputs.len:

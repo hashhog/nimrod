@@ -5455,6 +5455,65 @@ proc handleFinalizePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   else:
     result["psbt"] = %psbtObj.toBase64()
 
+proc handleAnalyzePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## analyzepsbt: analyse a PSBT and report next-role per input + globally.
+  ##
+  ## Output shape mirrors Bitcoin Core's `analyzepsbt`
+  ## (`bitcoin-core/src/rpc/rawtransaction.cpp::analyzepsbt`,
+  ## `bitcoin-core/src/node/psbt.cpp::AnalyzePSBT`):
+  ##
+  ##   {
+  ##     "inputs": [
+  ##       { "has_utxo": bool, "is_final": bool, "next": role,
+  ##         "missing": { "signatures": ["pubkey-hex", ...] }  (optional) },
+  ##       ...
+  ##     ],
+  ##     "next": role
+  ##   }
+  ##
+  ## PSBT-level `next` is the min per-input role under Core's order
+  ## (creator < updater < signer < finalizer < extractor; see
+  ## `bitcoin-core/src/node/psbt.cpp:91-95`). Multisig inputs are
+  ## classified by parsing the redeem/witness CHECKMULTISIG layout to
+  ## derive the M threshold; an input with M partial sigs is reported as
+  ## "finalizer" (closes W41 / W47-5: any-sig-means-signer regression).
+  ##
+  ## Reference: hotbuns W47-5 (`b6ccf2a`) `analyzePSBTCore`.
+  ## Reference: camlcoin W41 (`2a22a0e`) `psbt_next_role`.
+
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing psbt parameter")
+
+  let psbtBase64 = params[0].getStr()
+
+  var psbtObj: Psbt
+  try:
+    psbtObj = fromBase64(psbtBase64)
+  except PsbtError as e:
+    raise newRpcError(RpcInvalidParams, "invalid PSBT: " & e.msg)
+  except CatchableError as e:
+    raise newRpcError(RpcInvalidParams, "invalid PSBT: " & e.msg)
+
+  let analysis = analyzePsbtCore(psbtObj)
+
+  result = newJObject()
+  var inputsJson = newJArray()
+  for ai in analysis.inputs:
+    var inp = newJObject()
+    inp["has_utxo"] = %ai.hasUtxo
+    inp["is_final"] = %ai.isFinal
+    inp["next"] = %ai.nextRole
+    if ai.missingSignatures.len > 0:
+      var miss = newJObject()
+      var sigs = newJArray()
+      for pk in ai.missingSignatures:
+        sigs.add(%toHex(pk))
+      miss["signatures"] = sigs
+      inp["missing"] = miss
+    inputsJson.add(inp)
+  result["inputs"] = inputsJson
+  result["next"] = %analysis.nextRole
+
 # ============================================================================
 # Wave-47b P2 RPCs
 # Reference: Bitcoin Core src/rpc/blockchain.cpp + src/rpc/mining.cpp
@@ -5952,6 +6011,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleCombinePsbt(params)
   of "finalizepsbt":
     rpc.handleFinalizePsbt(params)
+  of "analyzepsbt":
+    rpc.handleAnalyzePsbt(params)
   of "walletcreatefundedpsbt":
     rpc.handleWalletCreateFundedPsbt(params)
 

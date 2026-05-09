@@ -1042,6 +1042,99 @@ suite "W47 multisig finalize":
     let parsed = deserialize(b1)
     check parsed.serialize() == b1
 
+suite "W48 analyzepsbt Core classifier":
+  ## Mirrors hotbuns W47-5 (`b6ccf2a`) and camlcoin W41 (`2a22a0e`).
+  ## Reference: bitcoin-core/src/node/psbt.cpp `AnalyzePSBT`.
+
+  const PK_A = @[0x02'u8,
+    0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+    0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x01,
+    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+    0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x11, 0x21]
+  const PK_B = @[0x03'u8,
+    0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
+    0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00]
+  const SIG_A = @[0xAA'u8] & newSeq[byte](70)
+  const SIG_B = @[0xBB'u8] & newSeq[byte](70)
+
+  proc buildMultisigScript(m: int, pubkeys: seq[seq[byte]]): seq[byte] =
+    result.add(byte(0x50 + m))
+    for pk in pubkeys:
+      result.add(byte(pk.len))
+      result.add(pk)
+    result.add(byte(0x50 + pubkeys.len))
+    result.add(0xae'u8)
+
+  proc dummyTx(): Transaction =
+    var txid: array[32, byte]
+    Transaction(
+      version: 2,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(txid), vout: 0),
+        scriptSig: @[],
+        sequence: 0xffffffff'u32
+      )],
+      outputs: @[TxOut(
+        value: Satoshi(90000),
+        scriptPubKey: @[0x00'u8, 0x14] & newSeq[byte](20)
+      )],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+  test "W48: signed-but-not-finalized 2-of-2 multisig -> next=finalizer":
+    # W41 regression: a 2-of-2 multisig PSBT with both partial sigs but
+    # no finalScriptSig must classify as finalizer (not signer).
+    let redeem = buildMultisigScript(2, @[PK_A, PK_B])
+    let p2sh = @[0xa9'u8, 0x14'u8] & @(hash160(redeem)) & @[0x87'u8]
+    var psbt = createPsbt(dummyTx())
+    psbt.inputs[0].witnessUtxo = some(TxOut(
+      value: Satoshi(100000), scriptPubKey: p2sh))
+    psbt.inputs[0].redeemScript = redeem
+    psbt.addPartialSig(0, PK_A, SIG_A)
+    psbt.addPartialSig(0, PK_B, SIG_B)
+
+    let analysis = analyzePsbtCore(psbt)
+    check analysis.inputs.len == 1
+    check analysis.inputs[0].hasUtxo
+    check not analysis.inputs[0].isFinal
+    check analysis.inputs[0].nextRole == "finalizer"
+    check analysis.nextRole == "finalizer"
+
+  test "W48: partially-signed 1-of-2 -> next=signer + missing.signatures":
+    # 2-of-2 multisig with only 1 sig present -> still signer; missing list
+    # contains the absent pubkey.
+    let redeem = buildMultisigScript(2, @[PK_A, PK_B])
+    let p2sh = @[0xa9'u8, 0x14'u8] & @(hash160(redeem)) & @[0x87'u8]
+    var psbt = createPsbt(dummyTx())
+    psbt.inputs[0].witnessUtxo = some(TxOut(
+      value: Satoshi(100000), scriptPubKey: p2sh))
+    psbt.inputs[0].redeemScript = redeem
+    psbt.addPartialSig(0, PK_A, SIG_A)
+
+    let analysis = analyzePsbtCore(psbt)
+    check analysis.inputs[0].nextRole == "signer"
+    check analysis.nextRole == "signer"
+    # Only PK_B is missing.
+    check analysis.inputs[0].missingSignatures.len == 1
+    check analysis.inputs[0].missingSignatures[0] == PK_B
+
+  test "W48: finalized PSBT -> next=extractor":
+    # An input with finalScriptSig set must classify as extractor regardless
+    # of remaining producer fields.
+    var psbt = createPsbt(dummyTx())
+    psbt.inputs[0].witnessUtxo = some(TxOut(
+      value: Satoshi(100000),
+      scriptPubKey: @[0x00'u8, 0x14] & newSeq[byte](20)))
+    psbt.inputs[0].finalScriptSig = @[0xde'u8, 0xad, 0xbe, 0xef]
+
+    let analysis = analyzePsbtCore(psbt)
+    check analysis.inputs[0].isFinal
+    check analysis.inputs[0].nextRole == "extractor"
+    check analysis.nextRole == "extractor"
+
 # Run tests if executed directly
 when isMainModule:
   echo "Running PSBT tests..."
