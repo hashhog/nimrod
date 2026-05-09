@@ -231,3 +231,66 @@ suite "IsStandardTx — weight cap":
     let r = isStandardTx(tx)
     check not r.ok
     check r.reason == "tx-size"
+
+# ---------------------------------------------------------------------------
+# W58-1 regression: malformed-push OP_RETURN must be nonstandard in the
+# mempool path (isStandardTx → classifyStdTxout → isStandardOpReturn).
+#
+# W56 (bc1e2c8) fixed getScriptType() in src/rpc/server.nim (decodescript).
+# This suite verifies the mempool classifier uses the same IsPushOnly logic
+# and has always been correct — and locks it in as a regression test.
+#
+# Test vector: hex `6a09deadbeef`
+#   0x6a = OP_RETURN
+#   0x09 = direct push-9-bytes  (but only 4 bytes follow → truncated)
+#   0xde 0xad 0xbe 0xef        (4 bytes, 5 short of the claimed 9)
+#
+# Bitcoin Core `decodescript 6a09deadbeef` → "type": "nonstandard"
+# ---------------------------------------------------------------------------
+suite "W58-1 regression — malformed-push OP_RETURN":
+  proc malformedOpReturn(): seq[byte] =
+    ## OP_RETURN + push-9-bytes opcode, but only 4 data bytes follow.
+    @[byte(0x6a), 0x09, 0xde, 0xad, 0xbe, 0xef]
+
+  proc validOpReturn32(): seq[byte] =
+    ## OP_RETURN + well-formed push-32-bytes (the common case).
+    result = @[byte(0x6a), 0x20]  # OP_RETURN, push-32
+    for i in 0 ..< 32: result.add(byte(i))
+
+  test "malformed-push OP_RETURN classified nonstandard by isStandardOpReturn":
+    let ok = isStandardOpReturn(malformedOpReturn())
+    check not ok
+
+  test "valid 32-byte OP_RETURN classified standard by isStandardOpReturn":
+    let ok = isStandardOpReturn(validOpReturn32())
+    check ok
+
+  test "malformed-push OP_RETURN classified stxNonStandard by classifyStdTxout":
+    let kind = classifyStdTxout(malformedOpReturn())
+    check kind == stxNonStandard
+
+  test "valid 32-byte OP_RETURN classified stxNullData by classifyStdTxout":
+    let kind = classifyStdTxout(validOpReturn32())
+    check kind == stxNullData
+
+  test "isStandardTx rejects tx with malformed-push OP_RETURN output":
+    ## The mempool policy gate (acceptTransaction → isStandardTx) must reject
+    ## a tx whose vout contains the malformed script, not accept it as nulldata.
+    var tx = baseTx()
+    tx.outputs[0] = TxOut(
+      value: Satoshi(0),
+      scriptPubKey: malformedOpReturn()
+    )
+    let r = isStandardTx(tx)
+    check not r.ok
+    check r.reason == "scriptpubkey"
+
+  test "isStandardTx accepts tx with valid OP_RETURN output":
+    ## Positive control: a well-formed OP_RETURN must still be accepted.
+    var tx = baseTx()
+    tx.outputs[0] = TxOut(
+      value: Satoshi(0),
+      scriptPubKey: validOpReturn32()
+    )
+    let r = isStandardTx(tx)
+    check r.ok
