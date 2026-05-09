@@ -1031,9 +1031,50 @@ proc getScriptType(script: seq[byte]): string =
     if (pushLen == 33 or pushLen == 65) and script.len == int(pushLen) + 2:
       return "pubkey"
 
-  # OP_RETURN: null data
+  # OP_RETURN: null data — Core requires IsPushOnly(begin()+1) too.
+  # A script starting with OP_RETURN but containing a truncated push
+  # (e.g. trailing bytes where pushLen > remaining) is NONSTANDARD.
   if script.len >= 1 and script[0] == 0x6a:
-    return "nulldata"
+    # Verify that bytes [1..] form a valid push-only sequence (all opcodes <= 0x60
+    # and all data pushes well-formed). Mirrors CScript::IsPushOnly.
+    block checkPushOnly:
+      var j = 1
+      while j < script.len:
+        let op = int(script[j])
+        if op >= 0x01 and op <= 0x4b:
+          # Direct push: need op more bytes
+          if j + 1 + op > script.len:
+            break checkPushOnly  # truncated → nonstandard
+          j += 1 + op
+        elif op == 0x4c:  # OP_PUSHDATA1
+          if j + 1 >= script.len:
+            break checkPushOnly
+          let dlen = int(script[j + 1])
+          if j + 2 + dlen > script.len:
+            break checkPushOnly
+          j += 2 + dlen
+        elif op == 0x4d:  # OP_PUSHDATA2
+          if j + 2 >= script.len:
+            break checkPushOnly
+          let dlen = int(script[j + 1]) or (int(script[j + 2]) shl 8)
+          if j + 3 + dlen > script.len:
+            break checkPushOnly
+          j += 3 + dlen
+        elif op == 0x4e:  # OP_PUSHDATA4
+          if j + 4 >= script.len:
+            break checkPushOnly
+          let dlen = int(script[j + 1]) or (int(script[j + 2]) shl 8) or
+                     (int(script[j + 3]) shl 16) or (int(script[j + 4]) shl 24)
+          if j + 5 + dlen > script.len:
+            break checkPushOnly
+          j += 5 + dlen
+        elif op <= 0x60:
+          # OP_0 (0x00) through OP_16 (0x60): valid push opcodes
+          j += 1
+        else:
+          # opcode > OP_16 → not push-only → nonstandard
+          break checkPushOnly
+      return "nulldata"  # all bytes valid push-only
 
   # Multisig: OP_M <pubkeys> OP_N OP_CHECKMULTISIG
   if script.len >= 4 and script[^1] == 0xae:
@@ -1903,6 +1944,174 @@ proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     }
   except CatchableError as e:
     raise newRpcError(RpcInvalidParams, "invalid transaction: " & e.msg)
+
+proc buildP2SHWrapAddress(script: seq[byte], mainnet: bool): string =
+  ## Compute P2SH-wrap address for a redeem script.
+  ## P2SH = base58check(version=0x05/0xC4 || HASH160(redeemScript))
+  let h = hash160(script)
+  let addrVal = Address(kind: P2SH, scriptHash: h)
+  encodeAddress(addrVal, mainnet)
+
+proc buildP2WPKHScript(hash: openArray[byte]): seq[byte] =
+  ## Build OP_0 <20-byte-hash> witness program (P2WPKH).
+  result = newSeq[byte](22)
+  result[0] = 0x00  # OP_0
+  result[1] = 0x14  # push 20 bytes
+  for i in 0 ..< 20:
+    result[2 + i] = hash[i]
+
+proc buildP2WSHScript(script: seq[byte]): seq[byte] =
+  ## Build OP_0 <32-byte-SHA256(script)> witness program (P2WSH).
+  let h = sha256(script)
+  result = newSeq[byte](34)
+  result[0] = 0x00  # OP_0
+  result[1] = 0x20  # push 32 bytes
+  for i in 0 ..< 32:
+    result[2 + i] = h[i]
+
+proc extractPubkeyFromP2PK(script: seq[byte]): seq[byte] =
+  ## Extract the raw pubkey bytes from a P2PK script: <pushLen> <pubkey> OP_CHECKSIG.
+  if script.len < 35:
+    return @[]
+  let pushLen = int(script[0])
+  if (pushLen == 33 or pushLen == 65) and script.len == pushLen + 2:
+    return script[1 ..< 1 + pushLen]
+  return @[]
+
+proc extractPubkeysFromMultisig(script: seq[byte]): seq[seq[byte]] =
+  ## Extract pubkeys from a multisig script: OP_M <pubkeys> OP_N OP_CHECKMULTISIG.
+  ## Returns empty list if parsing fails.
+  result = @[]
+  if script.len < 4 or script[^1] != 0xae:
+    return
+  var i = 1  # skip OP_M
+  while i < script.len - 2:  # stop before OP_N OP_CHECKMULTISIG
+    let pushLen = int(script[i])
+    if pushLen == 0:
+      break
+    if i + 1 + pushLen > script.len:
+      return @[]
+    result.add(script[i + 1 ..< i + 1 + pushLen])
+    i += 1 + pushLen
+
+proc allPubkeysCompressed(pubkeys: seq[seq[byte]]): bool =
+  ## Check that all pubkeys are compressed (33 bytes, prefix 0x02 or 0x03).
+  for pk in pubkeys:
+    if pk.len != 33:
+      return false
+    if pk[0] != 0x02 and pk[0] != 0x03:
+      return false
+  return true
+
+proc hasOpChecksigAdd(script: seq[byte]): bool =
+  ## Check if script contains OP_CHECKSIGADD (0xba).
+  for b in script:
+    if b == 0xba:  # OP_CHECKSIGADD
+      return true
+  return false
+
+proc handleDecodeScript(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Decode a hex-encoded script.
+  ##
+  ## Reference: bitcoin-core/src/rpc/rawtransaction.cpp `decodescript` (~line 450)
+  ##
+  ## Shape: {asm, desc, type, address?, p2sh?, segwit?}
+  ## Key: top-level has NO `hex` field (ScriptToUniv called with include_hex=false).
+  ## Inner segwit object HAS `hex` (ScriptToUniv called with include_hex=true).
+  ##
+  ## can_wrap types: pubkey, pubkeyhash, multisig, nonstandard,
+  ##   witness_v0_keyhash, witness_v0_scripthash.
+  ## can_wrap_P2WSH types: pubkey (compressed only), pubkeyhash, nonstandard,
+  ##   multisig (compressed only).
+  ##
+  ## Segwit wrap construction:
+  ##   PUBKEY    → P2WPKH(Hash160(pubkey))
+  ##   PUBKEYHASH → P2WPKH(raw-hash-in-script)
+  ##   Others    → P2WSH(SHA256(script))
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing hexstring parameter")
+
+  let hexStr = params[0].getStr()
+  let script: seq[byte] =
+    if hexStr.len > 0:
+      try:
+        hexToBytes(hexStr)
+      except CatchableError as e:
+        raise newRpcError(RpcInvalidParams, "script decode failed: " & e.msg)
+    else:
+      @[]
+
+  let mainnet = rpc.params.network == Mainnet
+  let scriptType = getScriptType(script)
+
+  # Build top-level object (same as buildScriptPubKeyJson but WITHOUT hex).
+  let addrOpt = extractAddressFromScript(script, mainnet)
+  result = %*{
+    "asm": disassembleScript(script),
+    "desc": inferAddrDescriptor(script, mainnet),
+    "type": scriptType
+  }
+  if addrOpt.isSome:
+    result["address"] = %addrOpt.get()
+
+  # Determine can_wrap (mirrors Core's switch + validity checks).
+  let canWrap =
+    case scriptType
+    of "pubkey", "pubkeyhash", "multisig", "nonstandard",
+       "witness_v0_keyhash", "witness_v0_scripthash":
+      # Additional checks: not unspendable (OP_RETURN prefix), no OP_CHECKSIGADD
+      let isUnspendable = script.len > 0 and script[0] == 0x6a  # OP_RETURN
+      not isUnspendable and not hasOpChecksigAdd(script)
+    else:
+      # nulldata, scripthash, witness_v1_taproot, anchor, witness_unknown
+      false
+
+  if canWrap:
+    result["p2sh"] = %buildP2SHWrapAddress(script, mainnet)
+
+    # Determine can_wrap_P2WSH.
+    let canWrapP2WSH =
+      case scriptType
+      of "pubkey":
+        let pk = extractPubkeyFromP2PK(script)
+        pk.len == 33  # only compressed pubkeys (33 bytes, not 65)
+      of "multisig":
+        let pks = extractPubkeysFromMultisig(script)
+        allPubkeysCompressed(pks)
+      of "pubkeyhash", "nonstandard":
+        true
+      else:
+        # witness_v0_keyhash, witness_v0_scripthash → already segwit, no P2WSH wrap
+        false
+
+    if canWrapP2WSH:
+      # Build the witness script and its ScriptToUniv-shaped inner object.
+      let segwitScript: seq[byte] =
+        case scriptType
+        of "pubkey":
+          # P2WPKH from Hash160(pubkey)
+          let pk = extractPubkeyFromP2PK(script)
+          buildP2WPKHScript(hash160(pk))
+        of "pubkeyhash":
+          # P2WPKH from raw 20-byte hash in script (bytes 3..22)
+          buildP2WPKHScript(script[3 ..< 23])
+        else:
+          # P2WSH from SHA256(script) for nonstandard/multisig
+          buildP2WSHScript(script)
+
+      let segwitAddrOpt = extractAddressFromScript(segwitScript, mainnet)
+      var sr = %*{
+        "asm": disassembleScript(segwitScript),
+        "desc": inferAddrDescriptor(segwitScript, mainnet),
+        "hex": toHex(segwitScript),
+        "type": getScriptType(segwitScript)
+      }
+      if segwitAddrOpt.isSome:
+        sr["address"] = %segwitAddrOpt.get()
+      # p2sh-segwit = P2SH wrap of the witness script
+      sr["p2sh-segwit"] = %buildP2SHWrapAddress(segwitScript, mainnet)
+
+      result["segwit"] = sr
 
 proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Submit a raw transaction to the network
@@ -6452,6 +6661,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetRawTransaction(params)
   of "decoderawtransaction":
     rpc.handleDecodeRawTransaction(params)
+  of "decodescript":
+    rpc.handleDecodeScript(params)
   of "sendrawtransaction":
     rpc.handleSendRawTransaction(params)
   of "submitpackage":
