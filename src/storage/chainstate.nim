@@ -64,6 +64,7 @@ type
     undoPos*: FlatFilePos        ## Position of undo data in rev*.dat files
     failureFlags*: BlockFailureFlags  ## Failure flags for invalidateblock/reconsiderblock
     sequenceId*: int32           ## For preciousblock: lower = more precious
+    nTx*: int32                  ## Number of transactions in this block (0 = unknown)
 
   UtxoEntry* = object
     output*: TxOut
@@ -181,6 +182,8 @@ proc serializeBlockIndex*(idx: BlockIndex): seq[byte] =
   # Serialize failure flags and sequence ID (new in phase 51)
   w.writeUint8(uint8(idx.failureFlags))
   w.writeInt32LE(idx.sequenceId)
+  # Serialize nTx (W57: transaction count per block for getblockheader RPC)
+  w.writeInt32LE(idx.nTx)
   w.data
 
 proc deserializeBlockIndex*(data: seq[byte]): BlockIndex =
@@ -205,6 +208,11 @@ proc deserializeBlockIndex*(data: seq[byte]): BlockIndex =
   else:
     result.failureFlags = BLOCK_NO_FAILURE
     result.sequenceId = 0
+  # Deserialize nTx (W57, backward compatible — 0 if not present in old data)
+  if r.remaining() >= 4:
+    result.nTx = r.readInt32LE()
+  else:
+    result.nTx = 0
 
 # Serialization for UtxoEntry
 
@@ -748,7 +756,8 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
     prevHash: blk.header.prevBlock,
     header: blk.header,
     totalWork: cs.totalWork,
-    undoPos: undoPos
+    undoPos: undoPos,
+    nTx: int32(blk.txs.len)
   )
   batch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
   batch.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](blockHash)))
@@ -1167,7 +1176,8 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
     prevHash: blk.header.prevBlock,
     header: blk.header,
     totalWork: cs.totalWork,
-    undoPos: FlatFilePos(fileNum: -1, pos: -1)
+    undoPos: FlatFilePos(fileNum: -1, pos: -1),
+    nTx: int32(blk.txs.len)
   )
   cs.ibdBatch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
   cs.ibdBatch.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](blockHash)))
@@ -1629,7 +1639,8 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
       prevHash: blk.header.prevBlock,
       header: blk.header,
       totalWork: cs.totalWork,
-      undoPos: undoPos
+      undoPos: undoPos,
+      nTx: int32(blk.txs.len)
     )
     batch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
     batch.put(cfBlockIndex, blockIndexKey(newHeight), @(array[32, byte](blockHash)))
@@ -1750,7 +1761,8 @@ proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
     status: bsValidated,
     prevHash: blk.header.prevBlock,
     header: blk.header,
-    totalWork: default(array[32, byte])  # TODO: calculate actual work
+    totalWork: default(array[32, byte]),  # TODO: calculate actual work
+    nTx: int32(blk.txs.len)
   )
   batch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
   batch.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](blockHash)))

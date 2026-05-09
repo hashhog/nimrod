@@ -419,6 +419,176 @@ proc handleGetBlockHash(rpc: RpcServer, params: JsonNode): JsonNode =
 
   %reverseHex(toHex(array[32, byte](hashOpt.get())))
 
+## 256-bit integer helpers for chainwork calculation
+## Representation: array[32, byte] big-endian (index 0 = MSB).
+
+proc u256FromBitsTarget(bits: uint32): array[32, byte] =
+  ## Convert compact nBits to 256-bit target, big-endian (like compactToTarget
+  ## but in big-endian byte order for chainwork arithmetic).
+  let exponent = int((bits shr 24) and 0xff)
+  let mantissa = bits and 0x007fffff
+  if (bits and 0x00800000) != 0 or exponent == 0 or mantissa == 0:
+    return default(array[32, byte])
+  # Place 3-byte mantissa at byte position (32 - exponent) from MSB.
+  # The mantissa is: [byte2, byte1, byte0] in big-endian.
+  let pos = 32 - exponent  # position of the most-significant mantissa byte
+  if pos >= 0 and pos < 32:
+    result[pos] = byte((mantissa shr 16) and 0xff)
+  if pos + 1 >= 0 and pos + 1 < 32:
+    result[pos + 1] = byte((mantissa shr 8) and 0xff)
+  if pos + 2 >= 0 and pos + 2 < 32:
+    result[pos + 2] = byte(mantissa and 0xff)
+
+proc u256Not(a: array[32, byte]): array[32, byte] =
+  for i in 0 ..< 32:
+    result[i] = not a[i]
+
+proc u256Add1(a: array[32, byte]): array[32, byte] =
+  ## a + 1, big-endian
+  result = a
+  var carry = 1'u32
+  for i in countdown(31, 0):
+    let s = uint32(result[i]) + carry
+    result[i] = byte(s and 0xff)
+    carry = s shr 8
+    if carry == 0: break
+
+proc u256Cmp(a, b: array[32, byte]): int =
+  for i in 0 ..< 32:
+    if a[i] < b[i]: return -1
+    if a[i] > b[i]: return 1
+  0
+
+proc u256Sub(a, b: array[32, byte]): array[32, byte] =
+  var borrow = 0'i32
+  for i in countdown(31, 0):
+    let diff = int32(a[i]) - int32(b[i]) - borrow
+    if diff < 0:
+      result[i] = byte(diff + 256)
+      borrow = 1
+    else:
+      result[i] = byte(diff)
+      borrow = 0
+
+proc u256MulByte(a: array[32, byte], q: uint32): array[32, byte] =
+  var carry = 0'u32
+  for i in countdown(31, 0):
+    let p = uint32(a[i]) * q + carry
+    result[i] = byte(p and 0xff)
+    carry = p shr 8
+
+proc u256Div(num, den: array[32, byte]): array[32, byte] =
+  ## 256-bit division: num / den (big-endian). Restoring radix-256 long division.
+  ## Only used for chainwork calculation (called once per block in getblockheader).
+  var rem = default(array[32, byte])
+  for i in 0 ..< 32:
+    # Shift rem left by 8 bits and bring in next byte of num
+    for j in 0 ..< 31:
+      rem[j] = rem[j + 1]
+    rem[31] = num[i]
+    # Binary search for q in [0,255] such that q*den <= rem < (q+1)*den
+    var lo = 0'u32
+    var hi = 255'u32
+    while lo < hi:
+      let mid = (lo + hi + 1) div 2
+      if u256Cmp(u256MulByte(den, mid), rem) <= 0:
+        lo = mid
+      else:
+        hi = mid - 1
+    result[i] = byte(lo)
+    rem = u256Sub(rem, u256MulByte(den, lo))
+
+proc u256AddBE(a: var array[32, byte], b: array[32, byte]) =
+  ## a += b in-place, big-endian
+  var carry = 0'u32
+  for i in countdown(31, 0):
+    let s = uint32(a[i]) + uint32(b[i]) + carry
+    a[i] = byte(s and 0xff)
+    carry = s shr 8
+
+proc getBitsProof(bits: uint32): array[32, byte] =
+  ## Bitcoin Core's GetBitsProof: (~target / (target+1)) + 1 (big-endian).
+  ## Reference: bitcoin-core/src/chain.cpp GetBitsProof().
+  let target = u256FromBitsTarget(bits)
+  # Check for zero target
+  var allZero = true
+  for b in target:
+    if b != 0: allZero = false; break
+  if allZero:
+    return default(array[32, byte])
+  let notTarget = u256Not(target)
+  let targetP1  = u256Add1(target)
+  let divided   = u256Div(notTarget, targetP1)
+  u256Add1(divided)
+
+proc computeChainwork*(cdb: ChainDb, startHash: BlockHash, height: int32): array[32, byte] =
+  ## Walk backwards from startHash to genesis, summing getBitsProof(bits) for
+  ## each block.  Returns the correct 256-bit cumulative chainwork (big-endian),
+  ## matching Bitcoin Core's nChainWork.
+  ##
+  ## O(height) RocksDB reads.  getBitsProof results are memoized by bits value
+  ## since all blocks in a 2016-block epoch share the same bits (≈400 unique
+  ## values for mainnet), keeping the computational cost negligible vs. I/O.
+  var proofCache: Table[uint32, array[32, byte]]
+  var acc = default(array[32, byte])
+  var h   = startHash
+  for _ in 0 .. height:
+    let idxOpt = cdb.getBlockIndex(h)
+    if idxOpt.isNone: break
+    let idx = idxOpt.get()
+    let bits = idx.header.bits
+    let proof =
+      if bits in proofCache: proofCache[bits]
+      else:
+        let p = getBitsProof(bits)
+        proofCache[bits] = p
+        p
+    u256AddBE(acc, proof)
+    if idx.height == 0: break  # reached genesis
+    h = idx.prevHash
+  acc
+
+proc chainworkHexBE*(w: array[32, byte]): string =
+  ## Format a big-endian 256-bit chainwork as a 64-char lowercase hex string.
+  result = newStringOfCap(64)
+  for b in w:
+    result.add(toHex(b, 2).toLowerAscii)
+
+proc getDifficultyFromBits(bits: uint32): float64 =
+  ## Calculate difficulty from nBits — matches Bitcoin Core's GetDifficulty()
+  ## in rpc/blockchain.cpp exactly (std::setprecision(16) << result).
+  ## Core: dDiff = 0x0000ffff / mantissa, then adjust by 256× per exponent
+  ## shift from the canonical exponent of 29.
+  let nShift = int((bits shr 24) and 0xff)
+  var dDiff = float64(0x0000ffff) / float64(bits and 0x00ffffff)
+  var shift = nShift
+  while shift < 29:
+    dDiff = dDiff * 256.0
+    inc shift
+  while shift > 29:
+    dDiff = dDiff / 256.0
+    dec shift
+  dDiff
+
+proc difficultyJson(d: float64): JsonNode =
+  ## Serialize a difficulty value as a JSON number matching Core's output.
+  ## Core uses std::setprecision(16) (default C++ float format, 16 sig digits,
+  ## trailing zeros stripped, no decimal point for integral values).
+  ## Uses parseJson(rawFloats=true) to bypass Nim's roundtrip float formatter.
+  var s = formatFloat(d, ffDefault, 16)
+  # Strip trailing zeros after decimal point
+  if '.' in s:
+    var i = s.len - 1
+    while i > 0 and s[i] == '0':
+      dec i
+    if s[i] == '.':
+      dec i
+    s = s[0 .. i]
+  # Parse as raw JSON number (isUnquoted trick — same as rawNumberNode but
+  # inlined here because rawNumberNode is defined later in the file).
+  var st = newStringStream(s)
+  parseJson(st, "diffnum", false, true)
+
 proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing blockhash parameter")
@@ -440,31 +610,65 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let target = bitsToTarget(idx.header.bits)
 
-  var response = %*{
-    "hash": reverseHex(toHex(array[32, byte](idx.hash))),
-    "confirmations": rpc.chainState.bestHeight - idx.height + 1,
-    "height": idx.height,
-    "version": idx.header.version,
-    "versionHex": toHex(cast[array[4, byte]]([
-      byte(idx.header.version and 0xff),
-      byte((idx.header.version shr 8) and 0xff),
-      byte((idx.header.version shr 16) and 0xff),
-      byte((idx.header.version shr 24) and 0xff)
-    ])),
-    "merkleroot": reverseHex(toHex(idx.header.merkleRoot)),
-    "time": idx.header.timestamp,
-    "mediantime": idx.header.timestamp,
-    "nonce": idx.header.nonce,
-    "bits": toHex(cast[array[4, byte]]([
-      byte(idx.header.bits and 0xff),
-      byte((idx.header.bits shr 8) and 0xff),
-      byte((idx.header.bits shr 16) and 0xff),
-      byte((idx.header.bits shr 24) and 0xff)
-    ])),
-    "difficulty": targetToDifficulty(target),
-    "chainwork": toHex(idx.totalWork),
-    "nTx": 0
-  }
+  # bits: big-endian hex of the compact nBits field (e.g. "1d00ffff")
+  let bitsHex = toHex([
+    byte((idx.header.bits shr 24) and 0xff),
+    byte((idx.header.bits shr 16) and 0xff),
+    byte((idx.header.bits shr 8) and 0xff),
+    byte(idx.header.bits and 0xff)
+  ])
+
+  # versionHex: big-endian 8-char hex of version (e.g. "20000002")
+  let versionHex = toHex([
+    byte((uint32(idx.header.version) shr 24) and 0xff),
+    byte((uint32(idx.header.version) shr 16) and 0xff),
+    byte((uint32(idx.header.version) shr 8) and 0xff),
+    byte(uint32(idx.header.version) and 0xff)
+  ])
+
+  # chainwork: recompute the correct 256-bit cumulative work from the stored
+  # block bits.  nimrod's stored totalWork used an approximate formula that
+  # diverges from Core's (~target/(target+1))+1; we walk backwards from this
+  # block and sum getBitsProof() to get the byte-identical value.
+  let chainwork    = computeChainwork(rpc.chainState.db, blockHash, idx.height)
+  let chainworkHex = chainworkHexBE(chainwork)
+
+  # mediantime: Bitcoin Core GetMedianTimePast() — median of this block and up
+  # to 10 predecessors (same window as getMtpForHeight).
+  let mediantime = int64(getMtpForHeight(rpc.chainState.db, idx.height))
+
+  # target: big-endian 64-char hex of the full 256-bit difficulty target derived
+  # from bits. compactToTarget returns little-endian; reverseHex for big-endian.
+  let targetHex = reverseHex(toHex(target))
+
+  # nTx: read from the BlockIndex (populated during block connect, W57).
+  # For blocks processed before W57 (nTx=0 in old serialized data), try the
+  # flatfile BlockIndexEntry and the RocksDB full-block fallback.
+  var nTx = int(idx.nTx)
+  if nTx == 0 and rpc.blockFileManager != nil:
+    let bfeOpt = rpc.blockFileManager.getBlockIndex(blockHash)
+    if bfeOpt.isSome:
+      nTx = int(bfeOpt.get().nTx)
+  if nTx == 0:
+    let blkOpt = rpc.chainState.db.getBlock(blockHash)
+    if blkOpt.isSome:
+      nTx = blkOpt.get().txs.len
+
+  var response = newJObject()
+  response["bits"] = %bitsHex
+  response["chainwork"] = %chainworkHex
+  response["confirmations"] = %int(rpc.chainState.bestHeight - idx.height + 1)
+  response["difficulty"] = difficultyJson(getDifficultyFromBits(idx.header.bits))
+  response["hash"] = %reverseHex(toHex(array[32, byte](idx.hash)))
+  response["height"] = %idx.height
+  response["mediantime"] = %mediantime
+  response["merkleroot"] = %reverseHex(toHex(idx.header.merkleRoot))
+  response["nTx"] = %nTx
+  response["nonce"] = %idx.header.nonce
+  response["target"] = %targetHex
+  response["time"] = %int64(idx.header.timestamp)
+  response["version"] = %idx.header.version
+  response["versionHex"] = %versionHex
 
   # Add previousblockhash if not genesis
   if idx.height > 0:
@@ -2809,7 +3013,8 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         totalWork: newTotalWork,
         undoPos: FlatFilePos(fileNum: -1, pos: -1),
         failureFlags: BLOCK_NO_FAILURE,
-        sequenceId: 0
+        sequenceId: 0,
+        nTx: int32(blk.txs.len)
       )
       cs.db.putBlockIndexHashOnly(sideIdx)
 
