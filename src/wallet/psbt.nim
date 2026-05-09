@@ -332,6 +332,51 @@ proc writeKeyValue(w: var BinaryWriter, key: openArray[byte], value: openArray[b
   w.writeCompactSize(uint64(value.len))
   w.writeBytes(value)
 
+# ---------------------------------------------------------------------------
+# Canonical-emit helpers (W47)
+# ---------------------------------------------------------------------------
+# nimrod stores `partialSigs` and `hdKeypaths` in `Table[seq[byte], …]`.
+# Nim's `Table` iteration order is hash-bucket order — neither insertion
+# order nor lex order — so naive `for k, v in tbl:` produces non-canonical
+# bytes that break `combinepsbt` idempotence (T2) and per-fixture
+# byte-identity (T3). Mirror the fleet sort-on-emit decision:
+#   - partial_sigs: sort by HASH160(pubkey) (blockbrew W45 / beamchain W46-2)
+#   - bip32_derivation: sort by raw pubkey (Core's `Sort()` in psbt.cpp)
+# Reference: `bitcoin-core/src/psbt.h` — Core uses `std::map` (lex sorted)
+# for both fields, so any iteration order that matches Core's per-key
+# canonicalization works. We follow the per-impl convention for parity.
+
+proc sortedPartialSigs(t: Table[seq[byte], seq[byte]]):
+    seq[(seq[byte], seq[byte])] =
+  ## Return (pubkey, sig) pairs sorted by HASH160(pubkey). Order chosen for
+  ## fleet parity (blockbrew W45). Returns empty seq if table is empty.
+  result = newSeqOfCap[(seq[byte], seq[byte])](t.len)
+  for k, v in t:
+    result.add((k, v))
+  result.sort(proc(a, b: (seq[byte], seq[byte])): int =
+    let ha = hash160(a[0])
+    let hb = hash160(b[0])
+    for i in 0 ..< 20:
+      if ha[i] != hb[i]:
+        return cmp(ha[i], hb[i])
+    return 0)
+
+proc sortedHdKeypaths(t: Table[seq[byte], KeyOriginInfo]):
+    seq[(seq[byte], KeyOriginInfo)] =
+  ## Return (pubkey, origin) pairs sorted by raw pubkey bytes. Mirrors Core's
+  ## `std::map<CPubKey, ...>` ordering in psbt.h.
+  result = newSeqOfCap[(seq[byte], KeyOriginInfo)](t.len)
+  for k, v in t:
+    result.add((k, v))
+  result.sort(proc(a, b: (seq[byte], KeyOriginInfo)): int =
+    let la = a[0].len
+    let lb = b[0].len
+    let n = min(la, lb)
+    for i in 0 ..< n:
+      if a[0][i] != b[0][i]:
+        return cmp(a[0][i], b[0][i])
+    cmp(la, lb))
+
 proc serializePsbtInput*(w: var BinaryWriter, input: PsbtInput) =
   ## Serialize a PSBTInput
   # Non-witness UTXO
@@ -345,10 +390,15 @@ proc serializePsbtInput*(w: var BinaryWriter, input: PsbtInput) =
     valW.writeTxOut(input.witnessUtxo.get())
     w.writeKeyValue([PSBT_IN_WITNESS_UTXO], valW.data)
 
-  # Only write signature data if not finalized
+  # Only write signature data if not finalized.
+  # W47 encoder gate: mirrors `bitcoin-core/src/psbt.h:313` — once
+  # final_script_sig / final_script_witness is set, producer-only fields
+  # MUST NOT be emitted. (This file already had the gate; W47 retains it
+  # and pairs it with a cleared-on-finalize step in finalizePsbtInput so
+  # the in-memory shape stays honest for downstream callers.)
   if input.finalScriptSig.len == 0 and input.finalScriptWitness.len == 0:
-    # Partial signatures
-    for pubkey, sig in input.partialSigs:
+    # Partial signatures — sorted by HASH160(pubkey) for canonical emit (W47).
+    for (pubkey, sig) in sortedPartialSigs(input.partialSigs):
       var key = @[PSBT_IN_PARTIAL_SIG]
       key.add(pubkey)
       w.writeKeyValue(key, sig)
@@ -367,8 +417,8 @@ proc serializePsbtInput*(w: var BinaryWriter, input: PsbtInput) =
     if input.witnessScript.len > 0:
       w.writeKeyValue([PSBT_IN_WITNESSSCRIPT], input.witnessScript)
 
-    # HD keypaths
-    for pubkey, origin in input.hdKeypaths:
+    # HD keypaths — sorted by raw pubkey for canonical emit (W47).
+    for (pubkey, origin) in sortedHdKeypaths(input.hdKeypaths):
       var key = @[PSBT_IN_BIP32_DERIVATION]
       key.add(pubkey)
       var valW = BinaryWriter()
@@ -469,8 +519,8 @@ proc serializePsbtOutput*(w: var BinaryWriter, output: PsbtOutput) =
   if output.witnessScript.len > 0:
     w.writeKeyValue([PSBT_OUT_WITNESSSCRIPT], output.witnessScript)
 
-  # HD keypaths
-  for pubkey, origin in output.hdKeypaths:
+  # HD keypaths — sorted by raw pubkey for canonical emit (W47).
+  for (pubkey, origin) in sortedHdKeypaths(output.hdKeypaths):
     var key = @[PSBT_OUT_BIP32_DERIVATION]
     key.add(pubkey)
     var valW = BinaryWriter()
@@ -1043,24 +1093,161 @@ proc combinePsbts*(psbts: seq[Psbt]): Psbt =
       if key notin result.unknown:
         result.unknown[key] = value
 
-proc finalizePsbtInput*(input: var PsbtInput): bool =
-  ## Finalizer: Finalize an input by combining partial signatures
-  ## Returns true if finalization was successful
+# =============================================================================
+# Multisig finalize helpers (W47, mirrors rustoshi W46 / beamchain W46-2 /
+# haskoin W46. Closes W42-A diagnostic gap: nimrod was at 1/5 on
+# `tools/psbt-multi-input-test.sh` because the finalizer only handled
+# single-sig P2WPKH / P2SH-P2WPKH, with the P2WSH branch unconditionally
+# concatenating Table-iteration-order signatures (non-canonical AND broken
+# for M-of-N where M < N). Reference for layout decisions:
+# `bitcoin-core/src/script/sign.cpp::ProduceSignature` and BIP-11.)
+# =============================================================================
+
+proc pushToScriptSig*(script: var seq[byte], data: openArray[byte]) =
+  ## Append a length-prefixed push using the minimal Bitcoin script
+  ## encoding (1-byte length for <=75B, OP_PUSHDATA1 for 76..255,
+  ## OP_PUSHDATA2 for 256..65535). Mirrors `CScript::operator<<` in
+  ## `bitcoin-core/src/script/script.h`. Used by the legacy P2SH-multisig
+  ## finalizer to push signatures + the redeem script into final scriptSig;
+  ## also handy for the P2SH-P2WSH outer scriptSig (1 push of redeem).
+  let n = data.len
+  if n == 0:
+    script.add(0x00'u8)            # OP_0 / empty push
+  elif n <= 75:
+    script.add(byte(n))
+    for b in data: script.add(b)
+  elif n <= 255:
+    script.add(0x4c'u8)            # OP_PUSHDATA1
+    script.add(byte(n))
+    for b in data: script.add(b)
+  elif n <= 65535:
+    script.add(0x4d'u8)            # OP_PUSHDATA2
+    script.add(byte(n and 0xff))
+    script.add(byte((n shr 8) and 0xff))
+    for b in data: script.add(b)
+  else:
+    script.add(0x4e'u8)            # OP_PUSHDATA4
+    script.add(byte(n and 0xff))
+    script.add(byte((n shr 8) and 0xff))
+    script.add(byte((n shr 16) and 0xff))
+    script.add(byte((n shr 24) and 0xff))
+    for b in data: script.add(b)
+
+proc parseMultisigScript*(script: openArray[byte]):
+    Option[(int, seq[seq[byte]])] =
+  ## Parse a `<M> <pk1> ... <pkN> <N> OP_CHECKMULTISIG` script and return
+  ## (M, pubkeys-in-script-order). Returns none on shape mismatch.
+  ## Mirrors `bitcoin-core/src/script/solver.cpp::MatchMultisig`.
+  if script.len < 4: return none((int, seq[seq[byte]]))
+  if script[script.len - 1] != 0xae'u8:  # OP_CHECKMULTISIG
+    return none((int, seq[seq[byte]]))
+  let mOp = script[0]
+  if mOp < 0x51'u8 or mOp > 0x60'u8:     # OP_1 .. OP_16
+    return none((int, seq[seq[byte]]))
+  let m = int(mOp - 0x50'u8)
+  let nOp = script[script.len - 2]
+  if nOp < 0x51'u8 or nOp > 0x60'u8:
+    return none((int, seq[seq[byte]]))
+  let n = int(nOp - 0x50'u8)
+  if m == 0 or m > n or n > 20:
+    return none((int, seq[seq[byte]]))
+
+  var keys: seq[seq[byte]]
+  var i = 1
+  let endIdx = script.len - 2
+  while i < endIdx:
+    let pushLen = int(script[i])
+    if pushLen != 33 and pushLen != 65:
+      return none((int, seq[seq[byte]]))
+    inc i
+    if i + pushLen > endIdx:
+      return none((int, seq[seq[byte]]))
+    var pk = newSeq[byte](pushLen)
+    for j in 0 ..< pushLen:
+      pk[j] = script[i + j]
+    keys.add(pk)
+    i += pushLen
+  if keys.len != n:
+    return none((int, seq[seq[byte]]))
+  some((m, keys))
+
+proc collectMultisigSigsInScriptOrder(
+    partialSigs: Table[seq[byte], seq[byte]],
+    keys: seq[seq[byte]], m: int): Option[seq[seq[byte]]] =
+  ## Walk `keys` in script-pubkey order and pick partialSigs[pk] for each
+  ## key we hold a signature for, stopping at M. Returns none if fewer than
+  ## M signatures are available. Critical for CHECKMULTISIG: signatures
+  ## MUST be in script-order, NOT insertion order, NOT sorted by pubkey.
+  ## Reference: `bitcoin-core/src/script/sign.cpp::SignStep` (TX_MULTISIG
+  ## branch) + the W46 closure in rustoshi/beamchain/haskoin.
+  var sigs: seq[seq[byte]]
+  for pk in keys:
+    if pk in partialSigs:
+      sigs.add(partialSigs[pk])
+      if sigs.len == m:
+        break
+  if sigs.len < m:
+    return none(seq[seq[byte]])
+  some(sigs)
+
+proc clearProducerFields(input: var PsbtInput) =
+  ## BIP-174 finalizer-role contract: once final_script_sig /
+  ## final_script_witness is set, producer-only fields SHOULD be cleared
+  ## from the in-memory map. Mirrors lunarblock W41 / ouroboros W43 /
+  ## beamchain W46-2 / rustoshi W46. The encoder's `if !finalized` gate
+  ## already guards the on-wire bytes; clearing keeps callers honest.
+  ##
+  ## CRITICAL (W43-1 regression-avoidance): callers MUST set
+  ## `finalScriptSig` / `finalScriptWitness` BEFORE invoking this. Clearing
+  ## first leaves the input half-finalized if a later step throws.
+  ##
+  ## We deliberately KEEP `nonWitnessUtxo` / `witnessUtxo` because the
+  ## extractor still needs them for amount-bounded signing checks.
+  input.partialSigs.clear()
+  input.sighashType = none(int32)
+  input.redeemScript.setLen(0)
+  input.witnessScript.setLen(0)
+  input.hdKeypaths.clear()
+  input.tapKeySig.setLen(0)
+  input.tapInternalKey = default(array[32, byte])
+
+proc finalizePsbtInput*(input: var PsbtInput;
+                        spkOverride: openArray[byte] = []): bool =
+  ## Finalizer: Finalize an input by combining partial signatures.
+  ## Returns true on success, false if data missing or script type
+  ## unsupported. Handles:
+  ##   - P2WPKH (single-sig)
+  ##   - Native P2WSH (multisig + single-CHECKSIG)
+  ##   - P2TR key-path
+  ##   - P2PKH (single-sig)
+  ##   - P2SH-P2WPKH (single-sig)
+  ##   - P2SH-P2WSH (multisig + single-CHECKSIG)
+  ##   - Legacy P2SH-multisig
+  ##
+  ## W47: multisig + P2SH-P2WSH branches added to close W42-A
+  ## diagnostic. See `parseMultisigScript`/`clearProducerFields` for
+  ## design notes.
+  ##
+  ## `spkOverride`: when the caller already knows the prevout's
+  ## scriptPubKey (e.g. dispatch from `finalizePsbt` which can resolve
+  ## `nonWitnessUtxo[outpoint.vout]`), pass it here. Used to support
+  ## legacy P2SH inputs that ONLY ship `nonWitnessUtxo` (per BIP-174).
 
   # Skip if already finalized
   if input.isSigned():
     return true
 
-  # Check if we have the UTXO
-  if input.witnessUtxo.isNone and input.nonWitnessUtxo.isNone:
-    return false
-
   # Get the scriptPubKey
   var spk: seq[byte]
-  if input.witnessUtxo.isSome:
+  if spkOverride.len > 0:
+    spk = @spkOverride
+  elif input.witnessUtxo.isSome:
     spk = input.witnessUtxo.get().scriptPubKey
+  elif input.nonWitnessUtxo.isNone:
+    return false
   else:
-    # Would need to look up from nonWitnessUtxo using the outpoint
+    # No outpoint context here. Caller must dispatch via `finalizePsbt`
+    # for non-witness inputs.
     return false
 
   # Determine script type and finalize accordingly
@@ -1072,6 +1259,7 @@ proc finalizePsbtInput*(input: var PsbtInput): bool =
 
     for pubkey, sig in input.partialSigs:
       input.finalScriptWitness = @[sig, pubkey]
+      clearProducerFields(input)
       return true
 
   # P2WSH: OP_0 <32 bytes>
@@ -1088,21 +1276,39 @@ proc finalizePsbtInput*(input: var PsbtInput): bool =
     if not verifyP2WSHCommitment(input.witnessScript, spk):
       return false
 
-    # For multisig, collect signatures in order
-    # This is simplified - full implementation needs proper ordering
-    var witness: seq[seq[byte]]
-    witness.add(@[])  # Empty element for CHECKMULTISIG bug
-    for pubkey, sig in input.partialSigs:
-      witness.add(sig)
-    witness.add(input.witnessScript)
-    input.finalScriptWitness = witness
-    return true
+    # W47: prefer canonical multisig assembly. If the witnessScript parses
+    # as M-of-N CHECKMULTISIG, build `[OP_0_byte, sig1, ..., sigM,
+    # witness_script]` with sigs in script-pubkey order. Fall back to the
+    # single-CHECKSIG layout `[sig, witness_script]` otherwise.
+    let parsed = parseMultisigScript(input.witnessScript)
+    if parsed.isSome:
+      let (m, keys) = parsed.get()
+      let sigsOpt = collectMultisigSigsInScriptOrder(input.partialSigs, keys, m)
+      if sigsOpt.isNone:
+        return false
+      var witness: seq[seq[byte]] = newSeqOfCap[seq[byte]](m + 2)
+      witness.add(@[])  # CHECKMULTISIG bug-compat empty pad
+      for sig in sigsOpt.get():
+        witness.add(sig)
+      witness.add(input.witnessScript)
+      input.finalScriptWitness = witness
+      clearProducerFields(input)
+      return true
+    else:
+      # Single-CHECKSIG-style witness script (or non-canonical shape).
+      if input.partialSigs.len != 1:
+        return false
+      for pubkey, sig in input.partialSigs:
+        input.finalScriptWitness = @[sig, input.witnessScript]
+        clearProducerFields(input)
+        return true
 
   # P2TR: OP_1 <32 bytes>
   elif spk.len == 34 and spk[0] == 0x51 and spk[1] == 0x20:
     # Key path spend
     if input.tapKeySig.len > 0:
       input.finalScriptWitness = @[input.tapKeySig]
+      clearProducerFields(input)
       return true
 
     # Script path would need tap leaf script
@@ -1116,11 +1322,10 @@ proc finalizePsbtInput*(input: var PsbtInput): bool =
     for pubkey, sig in input.partialSigs:
       # Build scriptSig: <sig> <pubkey>
       var scriptSig: seq[byte]
-      scriptSig.add(byte(sig.len))
-      scriptSig.add(sig)
-      scriptSig.add(byte(pubkey.len))
-      scriptSig.add(pubkey)
+      pushToScriptSig(scriptSig, sig)
+      pushToScriptSig(scriptSig, pubkey)
       input.finalScriptSig = scriptSig
+      clearProducerFields(input)
       return true
 
   # P2SH: OP_HASH160 <20> OP_EQUAL
@@ -1129,32 +1334,106 @@ proc finalizePsbtInput*(input: var PsbtInput): bool =
     # forged PSBT_IN_REDEEMSCRIPT would be embedded into the final scriptSig
     # and the wallet's already-collected partialSigs were produced under an
     # attacker-chosen sighash. Refuse to finalize.
+    if input.redeemScript.len == 0:
+      return false
     if not verifyP2SHCommitment(input.redeemScript, spk):
       return false
-    # Check for P2SH-P2WPKH
-    if input.redeemScript.len == 22 and input.redeemScript[0] == 0x00:
+
+    # P2SH-P2WPKH: redeemScript = OP_0 <20-byte pubkey hash>
+    if input.redeemScript.len == 22 and input.redeemScript[0] == 0x00 and
+       input.redeemScript[1] == 0x14:
       if input.partialSigs.len != 1:
         return false
 
       for pubkey, sig in input.partialSigs:
-        # Final scriptSig is just the redeem script push
+        # Final scriptSig is a single push of the redeem script
         var scriptSig: seq[byte]
-        scriptSig.add(byte(input.redeemScript.len))
-        scriptSig.add(input.redeemScript)
+        pushToScriptSig(scriptSig, input.redeemScript)
         input.finalScriptSig = scriptSig
         input.finalScriptWitness = @[sig, pubkey]
+        clearProducerFields(input)
         return true
+
+    # P2SH-P2WSH: redeemScript = OP_0 <32-byte sha256(witnessScript)>
+    if input.redeemScript.len == 34 and input.redeemScript[0] == 0x00 and
+       input.redeemScript[1] == 0x20:
+      if input.witnessScript.len == 0:
+        return false
+      # Verify the redeemScript commits to the witnessScript.
+      if not verifyP2WSHCommitment(input.witnessScript, input.redeemScript):
+        return false
+
+      # Inner witness assembly: same as native P2WSH.
+      let parsed = parseMultisigScript(input.witnessScript)
+      var witness: seq[seq[byte]]
+      if parsed.isSome:
+        let (m, keys) = parsed.get()
+        let sigsOpt = collectMultisigSigsInScriptOrder(input.partialSigs, keys, m)
+        if sigsOpt.isNone:
+          return false
+        witness = newSeqOfCap[seq[byte]](m + 2)
+        witness.add(@[])  # CHECKMULTISIG empty pad
+        for sig in sigsOpt.get():
+          witness.add(sig)
+        witness.add(input.witnessScript)
+      else:
+        if input.partialSigs.len != 1:
+          return false
+        for pubkey, sig in input.partialSigs:
+          witness = @[sig, input.witnessScript]
+          break
+
+      # Outer scriptSig: a single push of the redeemScript.
+      var scriptSig: seq[byte]
+      pushToScriptSig(scriptSig, input.redeemScript)
+      input.finalScriptSig = scriptSig
+      input.finalScriptWitness = witness
+      clearProducerFields(input)
+      return true
+
+    # Legacy P2SH-multisig: redeemScript parses as M-of-N CHECKMULTISIG.
+    # Layout: `OP_0 <sig1> ... <sigM> <push(redeemScript)>`. OP_0 is the
+    # CHECKMULTISIG empty-pad bug-compat byte. Sigs MUST be in script-
+    # pubkey order. Reference: BIP-11 / Core sign.cpp::ProduceSignature.
+    let parsed = parseMultisigScript(input.redeemScript)
+    if parsed.isSome:
+      let (m, keys) = parsed.get()
+      let sigsOpt = collectMultisigSigsInScriptOrder(input.partialSigs, keys, m)
+      if sigsOpt.isNone:
+        return false
+      var scriptSig: seq[byte]
+      scriptSig.add(0x00'u8)  # OP_0 / empty pad
+      for sig in sigsOpt.get():
+        pushToScriptSig(scriptSig, sig)
+      pushToScriptSig(scriptSig, input.redeemScript)
+      input.finalScriptSig = scriptSig
+      clearProducerFields(input)
+      return true
 
     return false
 
   false
 
 proc finalizePsbt*(psbt: var Psbt): bool =
-  ## Finalizer: Finalize all inputs
-  ## Returns true if all inputs were finalized
+  ## Finalizer: Finalize all inputs.
+  ## Returns true if all inputs were finalized.
+  ##
+  ## W47: resolves prevout scriptPubKey from `nonWitnessUtxo` using the
+  ## outpoint (`tx.inputs[i].prevOut.vout`) for legacy / pre-segwit inputs
+  ## that don't carry `witnessUtxo`. This is required for the canonical
+  ## Core 2-in PSBT fixture (`tools/psbt-multi-input-fixture.json`) where
+  ## input 0 is legacy P2SH-multisig + non-witness UTXO only.
   result = true
   for i in 0 ..< psbt.inputs.len:
-    if not finalizePsbtInput(psbt.inputs[i]):
+    var spkOverride: seq[byte]
+    if psbt.inputs[i].witnessUtxo.isNone and
+       psbt.inputs[i].nonWitnessUtxo.isSome and
+       psbt.tx.isSome:
+      let prevTx = psbt.inputs[i].nonWitnessUtxo.get()
+      let vout = int(psbt.tx.get().inputs[i].prevOut.vout)
+      if vout < prevTx.outputs.len:
+        spkOverride = prevTx.outputs[vout].scriptPubKey
+    if not finalizePsbtInput(psbt.inputs[i], spkOverride):
       result = false
 
 proc extractTransaction*(psbt: Psbt): Option[Transaction] =

@@ -834,6 +834,214 @@ suite "PSBT Error Handling":
     expect PsbtError:
       discard deserialize(data)
 
+# =============================================================================
+# W47: multisig finalize regressions
+# =============================================================================
+# Mirrors rustoshi `test_w46_p2sh_multisig_finalize_script_order` and
+# beamchain `beamchain_psbt_tests.erl:706`. Each test uses asymmetric
+# pubkeys (HASH160 order != raw order) per W46-4 lesson so a wrong-order
+# bug stays visible.
+
+suite "W47 multisig finalize":
+  # Three asymmetric 33-byte pubkeys (compressed). Picked so script order
+  # (insertion order: A, B, C) differs from both lex order on the raw bytes
+  # AND from HASH160 order. Verified by visual inspection of byte 1.
+  const PK_A = @[0x02'u8,
+    0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+    0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x01,
+    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+    0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x11, 0x21]
+  const PK_B = @[0x03'u8,
+    0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
+    0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00]
+  const PK_C = @[0x02'u8,
+    0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7,
+    0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF,
+    0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7,
+    0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF]
+
+  # Three distinguishable signatures (DER-shaped: 0x30 <len> ...).
+  const SIG_A = @[0xAA'u8] & newSeq[byte](70)
+  const SIG_B = @[0xBB'u8] & newSeq[byte](70)
+  const SIG_C = @[0xCC'u8] & newSeq[byte](70)
+
+  proc buildMultisigScript(m: int, pubkeys: seq[seq[byte]]): seq[byte] =
+    ## Helper: emit `<M> <pk1> ... <pkN> <N> OP_CHECKMULTISIG`.
+    result.add(byte(0x50 + m))      # OP_M
+    for pk in pubkeys:
+      result.add(byte(pk.len))
+      result.add(pk)
+    result.add(byte(0x50 + pubkeys.len))  # OP_N
+    result.add(0xae'u8)             # OP_CHECKMULTISIG
+
+  proc dummyTx(): Transaction =
+    var txid: array[32, byte]
+    Transaction(
+      version: 2,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(txid), vout: 0),
+        scriptSig: @[],
+        sequence: 0xffffffff'u32
+      )],
+      outputs: @[TxOut(
+        value: Satoshi(90000),
+        scriptPubKey: @[0x00'u8, 0x14] & newSeq[byte](20)
+      )],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+  test "W47: parseMultisigScript returns script-order pubkeys":
+    let redeem = buildMultisigScript(2, @[PK_A, PK_B, PK_C])
+    let parsed = parseMultisigScript(redeem)
+    check parsed.isSome
+    let (m, keys) = parsed.get()
+    check m == 2
+    check keys.len == 3
+    check keys[0] == PK_A
+    check keys[1] == PK_B
+    check keys[2] == PK_C
+
+  test "W47: parseMultisigScript rejects malformed":
+    # Wrong terminator
+    var bad = buildMultisigScript(2, @[PK_A, PK_B])
+    bad[bad.len - 1] = 0xac'u8     # OP_CHECKSIG
+    check parseMultisigScript(bad).isNone
+    # M > N
+    let badMN = @[0x53'u8, byte(PK_A.len)] & PK_A & @[byte(PK_A.len)] & PK_A &
+                @[0x52'u8, 0xae'u8]
+    check parseMultisigScript(badMN).isNone
+
+  test "W47: legacy P2SH-multisig finalizes in script-pubkey order":
+    # 2-of-3 legacy P2SH-multisig. Insert sigs in REVERSE order to prove
+    # script-order matters, not insertion order.
+    let redeem = buildMultisigScript(2, @[PK_A, PK_B, PK_C])
+    let p2sh = @[0xa9'u8, 0x14'u8] & @(hash160(redeem)) & @[0x87'u8]
+
+    var psbt = createPsbt(dummyTx())
+    let utxo = TxOut(value: Satoshi(100000), scriptPubKey: p2sh)
+    psbt.inputs[0].nonWitnessUtxo = some(Transaction(
+      version: 2,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(default(array[32, byte])),
+                                       vout: 0),
+                     scriptSig: @[], sequence: 0xffffffff'u32)],
+      outputs: @[utxo, utxo],  # vout=0 used by dummyTx()
+      witnesses: @[], lockTime: 0))
+    psbt.inputs[0].witnessUtxo = some(utxo)  # also set so finalize uses spk
+    psbt.inputs[0].redeemScript = redeem
+    # Insert C, then A: tests that we don't take insertion order.
+    psbt.addPartialSig(0, PK_C, SIG_C)
+    psbt.addPartialSig(0, PK_A, SIG_A)
+
+    check finalizePsbtInput(psbt.inputs[0])
+    check psbt.inputs[0].finalScriptSig.len > 0
+    # Expected scriptSig: 0x00 push(SIG_A) push(SIG_C) push(redeem)
+    let ss = psbt.inputs[0].finalScriptSig
+    check ss[0] == 0x00'u8                  # OP_0 empty pad
+    check ss[1] == byte(SIG_A.len)
+    check ss[2] == 0xAA'u8                  # SIG_A first byte
+    let cOff = 2 + SIG_A.len
+    check ss[cOff] == byte(SIG_C.len)
+    check ss[cOff + 1] == 0xCC'u8           # SIG_C first byte (script-order)
+    # Producer fields cleared.
+    check psbt.inputs[0].partialSigs.len == 0
+    check psbt.inputs[0].redeemScript.len == 0
+
+  test "W47: native P2WSH-multisig finalize witness layout":
+    let witScript = buildMultisigScript(2, @[PK_A, PK_B, PK_C])
+    let p2wsh = @[0x00'u8, 0x20'u8] & @(sha256(witScript))
+
+    var psbt = createPsbt(dummyTx())
+    psbt.inputs[0].witnessUtxo = some(TxOut(
+      value: Satoshi(100000), scriptPubKey: p2wsh))
+    psbt.inputs[0].witnessScript = witScript
+    # Insert in REVERSE order again.
+    psbt.addPartialSig(0, PK_B, SIG_B)
+    psbt.addPartialSig(0, PK_A, SIG_A)
+
+    check finalizePsbtInput(psbt.inputs[0])
+    let wit = psbt.inputs[0].finalScriptWitness
+    check wit.len == 4                      # OP_0 pad + 2 sigs + script
+    check wit[0].len == 0                   # CHECKMULTISIG empty pad
+    check wit[1] == SIG_A                   # script-order: A before B
+    check wit[2] == SIG_B
+    check wit[3] == witScript
+    # Producer fields cleared.
+    check psbt.inputs[0].partialSigs.len == 0
+    check psbt.inputs[0].witnessScript.len == 0
+
+  test "W47: P2SH-P2WSH-multisig finalize outer + inner":
+    let witScript = buildMultisigScript(2, @[PK_A, PK_B, PK_C])
+    let redeem = @[0x00'u8, 0x20'u8] & @(sha256(witScript))
+    let p2sh = @[0xa9'u8, 0x14'u8] & @(hash160(redeem)) & @[0x87'u8]
+
+    var psbt = createPsbt(dummyTx())
+    psbt.inputs[0].witnessUtxo = some(TxOut(
+      value: Satoshi(100000), scriptPubKey: p2sh))
+    psbt.inputs[0].redeemScript = redeem
+    psbt.inputs[0].witnessScript = witScript
+    psbt.addPartialSig(0, PK_C, SIG_C)
+    psbt.addPartialSig(0, PK_B, SIG_B)
+
+    check finalizePsbtInput(psbt.inputs[0])
+    # Outer scriptSig = single push of redeemScript (34B push).
+    let ss = psbt.inputs[0].finalScriptSig
+    check ss.len == 35                       # 1 length byte + 34
+    check ss[0] == byte(redeem.len)
+    for i in 0 ..< redeem.len:
+      check ss[1 + i] == redeem[i]
+    # Inner witness = OP_0 pad + sigs in script-order + witnessScript.
+    let wit = psbt.inputs[0].finalScriptWitness
+    check wit.len == 4
+    check wit[0].len == 0
+    check wit[1] == SIG_B                    # script-order: B before C
+    check wit[2] == SIG_C
+    check wit[3] == witScript
+
+  test "W47: encoder gate suppresses producer fields after finalize":
+    # Build a P2WSH-multisig PSBT, finalize, serialize, deserialize.
+    # Confirm the round-trip retains the final fields and DROPS the
+    # producer fields (encoder gate at psbt.nim emit branch).
+    let witScript = buildMultisigScript(2, @[PK_A, PK_B])
+    let p2wsh = @[0x00'u8, 0x20'u8] & @(sha256(witScript))
+
+    var psbt = createPsbt(dummyTx())
+    psbt.inputs[0].witnessUtxo = some(TxOut(
+      value: Satoshi(100000), scriptPubKey: p2wsh))
+    psbt.inputs[0].witnessScript = witScript
+    psbt.addPartialSig(0, PK_A, SIG_A)
+    psbt.addPartialSig(0, PK_B, SIG_B)
+    check finalizePsbt(psbt)
+
+    let bytes = psbt.serialize()
+    let round = deserialize(bytes)
+    check round.inputs[0].finalScriptWitness.len == 4
+    check round.inputs[0].partialSigs.len == 0
+    check round.inputs[0].witnessScript.len == 0
+
+  test "W47: canonical sort-on-emit makes serialize idempotent":
+    # Same PSBT, two emit cycles, must produce identical bytes regardless
+    # of Table iteration order (Nim Table is hash-bucket order).
+    let redeem = buildMultisigScript(2, @[PK_A, PK_B, PK_C])
+    let p2sh = @[0xa9'u8, 0x14'u8] & @(hash160(redeem)) & @[0x87'u8]
+
+    var psbt = createPsbt(dummyTx())
+    psbt.inputs[0].witnessUtxo = some(TxOut(
+      value: Satoshi(100000), scriptPubKey: p2sh))
+    psbt.inputs[0].redeemScript = redeem
+    psbt.addPartialSig(0, PK_C, SIG_C)
+    psbt.addPartialSig(0, PK_A, SIG_A)
+    psbt.addPartialSig(0, PK_B, SIG_B)
+
+    let b1 = psbt.serialize()
+    let b2 = psbt.serialize()
+    check b1 == b2
+    # Round-trip: parse + re-emit must also be byte-identical.
+    let parsed = deserialize(b1)
+    check parsed.serialize() == b1
+
 # Run tests if executed directly
 when isMainModule:
   echo "Running PSBT tests..."
