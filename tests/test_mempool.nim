@@ -1711,6 +1711,84 @@ suite "Mempool RBF conflict removal":
 
     cs.close()
 
+# ---------------------------------------------------------------------------
+# W71 — PreChecks gate tests (coinbase rejection + MIN_STANDARD_TX_NONWITNESS_SIZE)
+# These test acceptTransaction directly, not just isStandardTx.
+# ---------------------------------------------------------------------------
+
+suite "W71 — coinbase rejected from mempool (PreChecks gate)":
+  ## Bitcoin Core MemPoolAccept::PreChecks validation.cpp:803-804:
+  ##   if (tx.IsCoinBase()) return state.Invalid(TX_CONSENSUS, "coinbase")
+  ## A coinbase tx must never enter the mempool.
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "coinbase tx rejected with 'coinbase' error":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    let mp = newMempool(cs, params)
+    let crypto = newCryptoEngine()
+
+    let cbTx = makeCoinbaseTx(0)
+    let res = mp.acceptTransaction(cbTx, crypto)
+    check not res.isOk
+    check "coinbase" in res.error
+
+    cs.close()
+
+suite "W71 — MIN_STANDARD_TX_NONWITNESS_SIZE gate (CVE-2017-12842)":
+  ## Bitcoin Core MemPoolAccept::PreChecks validation.cpp:813-814:
+  ##   if (::GetSerializeSize(TX_NO_WITNESS(tx)) < 65) → "tx-size-small"
+  ## A non-witness serialization < 65 bytes is rejected.
+  ##
+  ## Note: constructing a tx with a valid UTXO that is also < 65 bytes
+  ## non-witness is hard (the minimal 10-byte tx has no inputs); so we
+  ## test the size check in isolation via a hand-crafted tiny tx that
+  ## has no valid UTXO backing. acceptTransaction will reject at the
+  ## size gate before reaching UTXO lookup.
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "tiny tx (non-witness size < 65) rejected with 'tx-size-small'":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    let mp = newMempool(cs, params)
+    let crypto = newCryptoEngine()
+
+    # Minimal 1-in/1-out tx with empty scriptSig and tiny output script (1 byte).
+    # Legacy size = 4(ver) + 1(varint vin) + 36(outpoint) + 1(varint scriptSig) +
+    #               0(scriptSig) + 4(seq) + 1(varint vout) + 8(value) +
+    #               1(varint spk) + 1(spk) + 4(locktime) = 61 bytes — below 65.
+    let tinyTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],          # 0 bytes
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(
+        value: Satoshi(0),
+        scriptPubKey: @[byte(0x6a)]  # bare OP_RETURN, 1 byte
+      )],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+    let nwSize = serializeLegacy(tinyTx).len
+    check nwSize < 65  # Assert the tx is actually tiny
+
+    let res = mp.acceptTransaction(tinyTx, crypto)
+    check not res.isOk
+    check "tx-size-small" in res.error
+
+    cs.close()
+
 when isMainModule:
   # Run all tests
   discard

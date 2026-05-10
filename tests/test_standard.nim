@@ -6,6 +6,7 @@ import std/options
 import ../src/mempool/standard
 import ../src/primitives/[types, serialize]
 import ../src/script/interpreter
+import ../src/consensus/validation
 
 # A reasonable scriptPubKey: P2PKH (always standard).
 proc p2pkh(): seq[byte] =
@@ -140,15 +141,18 @@ suite "IsStandardTx — OP_RETURN datacarrier":
     let r = isStandardTx(tx)
     check r.ok
 
-  test "two OP_RETURN outputs rejected (multi-op-return)":
+  test "two small OP_RETURN outputs accepted when within budget":
+    # Bitcoin Core 31.99 IsStandardTx has NO count limit on OP_RETURN outputs.
+    # Multiple OP_RETURNs are standard as long as the cumulative byte budget
+    # (MAX_OP_RETURN_RELAY = 100_000 bytes) is not exceeded.
+    # policy/policy.cpp:145-151 — only a bytes-budget deduction, no count check.
     var tx = baseTx()
     tx.outputs = @[
       TxOut(value: Satoshi(0), scriptPubKey: opReturnPayload(@[byte(0x01)])),
       TxOut(value: Satoshi(0), scriptPubKey: opReturnPayload(@[byte(0x02)]))
     ]
     let r = isStandardTx(tx)
-    check not r.ok
-    check r.reason == "multi-op-return"
+    check r.ok
 
   test "OP_RETURN above datacarrier budget rejected":
     var tx = baseTx()
@@ -292,5 +296,80 @@ suite "W58-1 regression — malformed-push OP_RETURN":
       value: Satoshi(0),
       scriptPubKey: validOpReturn32()
     )
+    let r = isStandardTx(tx)
+    check r.ok
+
+# ---------------------------------------------------------------------------
+# W71 — new gate tests
+# ---------------------------------------------------------------------------
+
+suite "W71 — MIN_STANDARD_TX_NONWITNESS_SIZE (CVE-2017-12842 mitigation)":
+  ## Bitcoin Core PreChecks validation.cpp:813-814:
+  ##   if (::GetSerializeSize(TX_NO_WITNESS(tx)) < MIN_STANDARD_TX_NONWITNESS_SIZE)
+  ##       return state.Invalid(..., "tx-size-small");
+  ## MIN_STANDARD_TX_NONWITNESS_SIZE = 65 (policy/policy.h:40).
+  ## isStandardTx itself does not enforce this (it lives in PreChecks), so we
+  ## test it via the serialized size helper used in acceptTransaction.
+
+  test "base tx non-witness size is >= 65 bytes":
+    ## The baseTx() helper has 1 input + 1 P2PKH output; its legacy
+    ## (non-witness) serialization should be well over 65 bytes.
+    let tx = baseTx()
+    let nwSize = serializeLegacy(tx).len
+    check nwSize >= 65
+
+suite "W71 — coinbase mempool rejection (Bitcoin Core validation.cpp:803-804)":
+  ## Core PreChecks: if (tx.IsCoinBase()) return state.Invalid(..., "coinbase")
+  ## A coinbase tx must never enter the mempool — it is only valid inside a block.
+
+  proc makeCoinbaseTx(): Transaction =
+    Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(
+          txid: TxId(default(array[32, byte])),
+          vout: 0xFFFFFFFF'u32
+        ),
+        scriptSig: @[byte(0x03), 0x01, 0x00, 0x00],  # BIP34 height push
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(
+        value: Satoshi(5_000_000_000),
+        scriptPubKey: @[byte(OP_DUP), OP_HASH160, 0x14] &
+                      @(default(array[20, byte])) &
+                      @[byte(OP_EQUALVERIFY), OP_CHECKSIG]
+      )],
+      witnesses: @[],
+      lockTime: 0
+    )
+
+  test "isCoinbase detects coinbase tx":
+    check isCoinbase(makeCoinbaseTx())
+
+  test "isCoinbase returns false for regular tx":
+    check not isCoinbase(baseTx())
+
+suite "W71 — multi-OP_RETURN count NOT limited by Core 31.99":
+  ## Regression lock: previous nimrod code rejected txs with 2+ OP_RETURN outputs
+  ## via a nullDataCount > 1 check. Bitcoin Core 31.99 IsStandardTx has no such
+  ## count limit — only a cumulative bytes-budget (MAX_OP_RETURN_RELAY = 100_000).
+  ## Multiple OP_RETURNs fitting the budget must be standard.
+
+  test "three tiny OP_RETURN outputs accepted (each 2 bytes, well within budget)":
+    var tx = baseTx()
+    tx.outputs = @[
+      TxOut(value: Satoshi(0), scriptPubKey: @[byte(OP_RETURN), 0x01, 0x41]),
+      TxOut(value: Satoshi(0), scriptPubKey: @[byte(OP_RETURN), 0x01, 0x42]),
+      TxOut(value: Satoshi(0), scriptPubKey: @[byte(OP_RETURN), 0x01, 0x43])
+    ]
+    let r = isStandardTx(tx)
+    check r.ok
+
+  test "two OP_RETURN outputs within budget accepted":
+    var tx = baseTx()
+    tx.outputs = @[
+      TxOut(value: Satoshi(0), scriptPubKey: opReturnPayload(@[byte(0x01)])),
+      TxOut(value: Satoshi(0), scriptPubKey: opReturnPayload(@[byte(0x02)]))
+    ]
     let r = isStandardTx(tx)
     check r.ok
