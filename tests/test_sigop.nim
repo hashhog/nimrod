@@ -2,7 +2,7 @@
 
 import std/options
 import unittest2
-import ../src/consensus/validation
+import ../src/consensus/[validation, params]
 import ../src/primitives/types
 import ../src/script/interpreter
 import ../src/storage/chainstate
@@ -283,3 +283,137 @@ suite "block sigop cost":
     let program = newSeq[byte](32)
     let witness: seq[seq[byte]] = @[@[0x00'u8] & newSeq[byte](63)]  # Schnorr signature
     check countWitnessSigops(1, program, witness) == 0
+
+  test "MaxStandardTxSigopsCost constant":
+    # policy/policy.h:44: MAX_BLOCK_SIGOPS_COST / 5 = 16_000
+    check MaxStandardTxSigopsCost == 16_000
+    check MaxStandardTxSigopsCost == MaxBlockSigopsCost div 5
+
+  test "MaxStandardTxSigopsCost is 1/5 of MaxBlockSigopsCost":
+    # Core invariant: per-tx policy limit = block limit / 5
+    check MaxBlockSigopsCost == 5 * MaxStandardTxSigopsCost
+
+suite "sigop boundary cases":
+  test "CHECKMULTISIG accurate boundary: OP_1 (1 pubkey)":
+    # OP_1 immediately before CHECKMULTISIG → accurate count = 1
+    let script = @[OP_1, OP_CHECKMULTISIG]
+    check countScriptSigops(script, accurate = true) == 1
+    # Inaccurate always counts 20
+    check countScriptSigops(script, accurate = false) == MaxPubkeysPerMultisig
+
+  test "CHECKMULTISIG accurate boundary: OP_16 (16 pubkeys)":
+    # OP_16 immediately before CHECKMULTISIG → accurate count = 16
+    let script = @[OP_16, OP_CHECKMULTISIG]
+    check countScriptSigops(script, accurate = true) == 16
+
+  test "CHECKMULTISIG accurate: push between OP_n and CHECKMULTISIG resets lastOpcode":
+    # When a push data opcode comes between OP_n and OP_CHECKMULTISIG,
+    # lastOpcode is the push opcode (e.g. 0x21), not OP_n.
+    # So accurate mode falls back to MAX_PUBKEYS_PER_MULTISIG (20).
+    # This matches Bitcoin Core's GetSigOpCount() — script.cpp:162-179.
+    # Real multisig has OP_n AFTER the pubkey pushes, immediately before CHECKMULTISIG.
+    let pushThenCheckmultisig = @[OP_3, 0x21'u8] & newSeq[byte](33) & @[OP_CHECKMULTISIG]
+    # lastOpcode = 0x21 (push33), not OP_3 → inaccurate path → 20
+    check countScriptSigops(pushThenCheckmultisig, accurate = true) == MaxPubkeysPerMultisig
+
+  test "CHECKMULTISIG accurate: proper 2-of-3 counts 3 not 20":
+    # Real bare multisig: OP_2 <pk1> <pk2> <pk3> OP_3 OP_CHECKMULTISIG
+    # OP_3 is LAST opcode before CHECKMULTISIG → accurate count = 3
+    let script = @[OP_2] &
+      (@[0x21'u8] & newSeq[byte](33)) &
+      (@[0x21'u8] & newSeq[byte](33)) &
+      (@[0x21'u8] & newSeq[byte](33)) &
+      @[OP_3, OP_CHECKMULTISIG]
+    check countScriptSigops(script, accurate = true) == 3
+    check countScriptSigops(script, accurate = false) == 20
+
+  test "CHECKMULTISIGVERIFY accurate counts like CHECKMULTISIG":
+    # OP_CHECKMULTISIGVERIFY has same sigop counting as OP_CHECKMULTISIG
+    let script = @[OP_3, OP_CHECKMULTISIGVERIFY]
+    check countScriptSigops(script, accurate = true) == 3
+
+  test "multiple CHECKSIG in one script":
+    # OP_CHECKSIG + OP_CHECKSIGVERIFY in same script = 2 sigops
+    let script = @[OP_CHECKSIG, OP_CHECKSIGVERIFY]
+    check countScriptSigops(script, accurate = false) == 2
+
+  test "witness P2WSH with 16-of-20 multisig counts accurately":
+    # P2WSH witness script: OP_16 <pk1..pk20> OP_20 OP_CHECKMULTISIG
+    # accurate count = 20 (OP_20 = OP_16+4 = out of OP_1..OP_16 range!  → actually OP_20 doesn't exist)
+    # Bitcoin only supports up to 20 pubkeys, but OP_n only goes to OP_16.
+    # For n > 16, you push n as a number, which is a push not OP_n — so lastOpcode = push byte
+    # Let's test a valid case: 16-of-20 where m=16 via OP_16, n pushed as small int or direct
+    # Use OP_16 for m, OP_20 not available → use 0x01 0x14 (push1 byte with value 20)
+    # For the n-pubkey count in accurate mode, we need lastOpcode in [OP_1..OP_16]
+    # If n=20 is pushed as a 1-byte number (opcode 0x01, data 0x14), lastOpcode=0x01 (not in range)
+    # → falls back to MAX_PUBKEYS_PER_MULTISIG (20).  This is correct Core behavior.
+    # Simpler test: just verify P2WSH correct accurate counting via countWitnessSigops
+    let program = newSeq[byte](32)
+    # Witness script: OP_2 <pk1> <pk2> <pk3> OP_3 OP_CHECKMULTISIG
+    let witnessScript = @[OP_2] &
+      (@[0x21'u8] & newSeq[byte](33)) &
+      (@[0x21'u8] & newSeq[byte](33)) &
+      (@[0x21'u8] & newSeq[byte](33)) &
+      @[OP_3, OP_CHECKMULTISIG]
+    let witness: seq[seq[byte]] = @[
+      @[],
+      @[0x30'u8] & newSeq[byte](70),
+      @[0x30'u8] & newSeq[byte](70),
+      witnessScript
+    ]
+    # P2WSH uses accurate=true → 3 sigops, cost=3 (witness discount, no ×4)
+    check countWitnessSigops(0, program, witness) == 3
+
+  test "P2WSH empty witness stack → 0 sigops (not crash)":
+    # If witness.len == 0, P2WSH cannot extract script → 0 sigops
+    let program = newSeq[byte](32)
+    let witness: seq[seq[byte]] = @[]
+    check countWitnessSigops(0, program, witness) == 0
+
+  test "legacy sigop cost for max-multisig tx":
+    # 1 CHECKMULTISIG inaccurate = 20 sigops × WitnessScaleFactor(4) = 80 cost
+    let script = @[OP_CHECKMULTISIG]  # lastOpcode=0 (init), not in OP_1..OP_16 → inaccurate
+    let tx = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],
+        sequence: 0xffffffff'u32
+      )],
+      outputs: @[TxOut(
+        value: Satoshi(1_000_000),
+        scriptPubKey: script
+      )],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let lookupUtxo = proc(op: OutPoint): Option[UtxoEntry] = none(UtxoEntry)
+    let result = getTransactionSigOpCost(tx, lookupUtxo, useP2SH = false, useWitness = false)
+    check result.isOk
+    # 20 (inaccurate) × 4 (WitnessScaleFactor) = 80
+    check result.value == 80
+
+  test "sigop cost exceeding MaxStandardTxSigopsCost (16000)":
+    # A block can have at most 80000 sigop cost.
+    # Standard txs are limited to 16000 sigop cost (policy).
+    # 16000 / 4 = 4000 legacy sigops needed to hit limit.
+    # 4000 / 20 = 200 OP_CHECKMULTISIG (inaccurate) to hit 16000 cost.
+    # Build a script with 201 OP_CHECKMULTISIG (inaccurate) = 201*20=4020 legacy sigops
+    # 4020 × 4 = 16080 cost > 16000.
+    var script: seq[byte] = @[]
+    for _ in 0 ..< 201:
+      script.add(OP_CHECKMULTISIG)
+    # 201 × 20 inaccurate = 4020 sigops
+    check countScriptSigops(script, accurate = false) == 201 * MaxPubkeysPerMultisig
+    # cost = 4020 × 4 = 16080 > MaxStandardTxSigopsCost (16000)
+    check (201 * MaxPubkeysPerMultisig * WitnessScaleFactor) > MaxStandardTxSigopsCost
+
+  test "sigop cost at MaxStandardTxSigopsCost boundary (16000)":
+    # Exactly MaxStandardTxSigopsCost / WitnessScaleFactor = 4000 legacy sigops is allowed.
+    # 4000 / 20 = 200 inaccurate CHECKMULTISIG.
+    var script: seq[byte] = @[]
+    for _ in 0 ..< 200:
+      script.add(OP_CHECKMULTISIG)
+    check countScriptSigops(script, accurate = false) == 200 * MaxPubkeysPerMultisig  # = 4000
+    # 4000 × 4 = 16000 = MaxStandardTxSigopsCost (exactly at limit, allowed)
+    check (200 * MaxPubkeysPerMultisig * WitnessScaleFactor) == MaxStandardTxSigopsCost

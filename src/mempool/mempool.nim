@@ -881,6 +881,30 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
   if hasEphemeralDust(tx):
     return err(TxId, "tx has ephemeral dust output but no child spending it; use package relay")
 
+  # Sigop cost check: reject txs that exceed per-tx policy limit.
+  # Bitcoin Core MemPoolAccept::PreChecks, validation.cpp:908-942:
+  #   nSigOpsCost = GetTransactionSigOpCost(tx, view, STANDARD_SCRIPT_VERIFY_FLAGS)
+  #   if nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST → "bad-txns-too-many-sigops"
+  # MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST / 5 = 16_000 (policy/policy.h:44).
+  proc lookupForSigops(op: OutPoint): Option[UtxoEntry] =
+    let confirmed = mp.chainState.getUtxo(op)
+    if confirmed.isSome:
+      return confirmed
+    if op.txid in mp.entries:
+      let parentEntry = mp.entries[op.txid]
+      if int(op.vout) < parentEntry.tx.outputs.len:
+        return some(UtxoEntry(
+          output: parentEntry.tx.outputs[int(op.vout)],
+          height: int32(tipHeight),
+          isCoinbase: false
+        ))
+    none(UtxoEntry)
+
+  let sigopResult = getTransactionSigOpCost(tx, lookupForSigops, useP2SH = true, useWitness = true)
+  if sigopResult.isOk:
+    if sigopResult.value > MaxStandardTxSigopsCost:
+      return err(TxId, "bad-txns-too-many-sigops")
+
   # Verify scripts for each input
   let scriptFlags = getBlockScriptFlags(mp.chainState.bestHeight, mp.params)
 
