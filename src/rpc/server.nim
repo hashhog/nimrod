@@ -4028,7 +4028,7 @@ proc handleGetTxOut(rpc: RpcServer, params: JsonNode): JsonNode =
         return %*{
           "bestblock": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
           "confirmations": 0,
-          "value": float64(int64(output.value)) / 100_000_000.0,
+          "value": btcAmountNode(int64(output.value)),
           "scriptPubKey": buildScriptPubKeyJson(output.scriptPubKey, isMainnet),
           "coinbase": false
         }
@@ -4044,7 +4044,7 @@ proc handleGetTxOut(rpc: RpcServer, params: JsonNode): JsonNode =
   %*{
     "bestblock": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
     "confirmations": confirmations,
-    "value": float64(int64(utxo.output.value)) / 100_000_000.0,
+    "value": btcAmountNode(int64(utxo.output.value)),
     "scriptPubKey": buildScriptPubKeyJson(utxo.output.scriptPubKey, isMainnet),
     "coinbase": utxo.isCoinbase
   }
