@@ -84,6 +84,8 @@ const
   MaxBlockWeight* = 4_000_000
   MaxBlockSize* = 1_000_000
   MaxBlockSigopsCost* = 80_000
+  ## Policy limit per-tx: MAX_BLOCK_SIGOPS_COST / 5 (policy/policy.h:44 in Core)
+  MaxStandardTxSigopsCost* = MaxBlockSigopsCost div 5  # = 16_000
   WitnessScaleFactor* = 4
   MedianTimeSpan* = 11
   MaxFutureBlockTime* = 7200  # 2 hours in seconds
