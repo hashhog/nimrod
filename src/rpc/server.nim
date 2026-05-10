@@ -1196,88 +1196,6 @@ proc handleGetMempoolInfo(rpc: RpcServer): JsonNode =
     "fullrbf": true
   }
 
-proc handleGetRawMempool(rpc: RpcServer, params: JsonNode): JsonNode =
-  let verbose = if params.len >= 1: params[0].getBool() else: false
-
-  if verbose:
-    var entries = newJObject()
-    for txid, entry in rpc.mempool.entries:
-      let vsize = (entry.weight + 3) div 4
-      # Full RBF: all mempool transactions are replaceable
-      entries[$txid] = %*{
-        "vsize": vsize,
-        "weight": entry.weight,
-        "fee": float64(int64(entry.fee)) / 100000000.0,
-        "time": entry.timeAdded.toUnix(),
-        "height": entry.height,
-        "descendantcount": 1,
-        "descendantsize": vsize,
-        "descendantfees": int64(entry.fee),
-        "ancestorcount": 1,
-        "ancestorsize": vsize,
-        "ancestorfees": int64(entry.ancestorFee),
-        "bip125-replaceable": true
-      }
-    return entries
-  else:
-    var txids: seq[string]
-    for txid in rpc.mempool.entries.keys:
-      txids.add(reverseHex(toHex(array[32, byte](txid))))
-    return %txids
-
-proc handleGetMempoolEntry(rpc: RpcServer, params: JsonNode): JsonNode =
-  ## Returns mempool data for a given transaction
-  ## Reference: Bitcoin Core rpc/mempool.cpp getmempoolentry
-  if params.len < 1:
-    raise newRpcError(RpcInvalidParams, "missing txid parameter")
-
-  let txidHex = params[0].getStr()
-  if txidHex.len != 64:
-    raise newRpcError(RpcInvalidAddressOrKey, "Invalid txid")
-
-  # Parse txid (reverse byte order from hex display format)
-  var txidBytes: array[32, byte]
-  let reversed = reverseHex(txidHex)
-  for i in 0 ..< 32:
-    txidBytes[i] = byte(parseHexInt(reversed[i*2 .. i*2+1]))
-
-  let txid = TxId(txidBytes)
-  let entryOpt = rpc.mempool.get(txid)
-
-  if entryOpt.isNone:
-    raise newRpcError(RpcInvalidAddressOrKey, "Transaction not in mempool")
-
-  let entry = entryOpt.get()
-  let vsize = (entry.weight + 3) div 4
-  let feeRate = float64(int64(entry.fee)) / float64(vsize) / 100000.0  # BTC/kvB
-
-  # Full RBF: all mempool transactions are replaceable
-  %*{
-    "vsize": vsize,
-    "weight": entry.weight,
-    "fee": float64(int64(entry.fee)) / 100000000.0,
-    "modifiedfee": float64(int64(entry.fee)) / 100000000.0,
-    "time": entry.timeAdded.toUnix(),
-    "height": entry.height,
-    "descendantcount": 1,
-    "descendantsize": vsize,
-    "descendantfees": int64(entry.fee),
-    "ancestorcount": entry.ancestorCount,
-    "ancestorsize": entry.ancestorSize,
-    "ancestorfees": int64(entry.ancestorFee),
-    "wtxid": reverseHex(toHex(array[32, byte](entry.tx.wtxid()))),
-    "fees": {
-      "base": float64(int64(entry.fee)) / 100000000.0,
-      "modified": float64(int64(entry.fee)) / 100000000.0,
-      "ancestor": float64(int64(entry.ancestorFee)) / 100000000.0,
-      "descendant": float64(int64(entry.fee)) / 100000000.0
-    },
-    "depends": [],  # TODO: calculate dependencies
-    "spentby": [],  # TODO: calculate spenders
-    "bip125-replaceable": true,
-    "unbroadcast": false
-  }
-
 proc parseTxidParam(hexStr: string): TxId =
   ## Decode a 64-char display-format hex txid into the internal LE representation.
   if hexStr.len != 64:
@@ -1289,33 +1207,83 @@ proc parseTxidParam(hexStr: string): TxId =
   TxId(bytes)
 
 proc mempoolEntryJson(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNode =
-  ## Verbose getmempool{ancestors,descendants} entry, mirrors getmempoolentry.
+  ## Canonical per-entry object for getmempoolentry, getrawmempool (verbose),
+  ## getmempoolancestors (verbose), getmempooldescendants (verbose).
+  ## Reference: bitcoin-core/src/rpc/mempool.cpp entryToJSON (Core 31.99).
+  ##
+  ## Field order matches Core exactly.  Notable: top-level "fee"/"modifiedfee"/
+  ## "descendantfees"/"ancestorfees" are ABSENT (removed in Core 31.99, replaced
+  ## by the "fees" sub-object).  "chunkweight" and "fees.chunk" are added.
+  ## W70d: aligned to Core 31.99 entryToJSON field set.
   let vsize = (entry.weight + 3) div 4
-  %*{
-    "vsize": vsize,
-    "weight": entry.weight,
-    "fee": float64(int64(entry.fee)) / 100000000.0,
-    "modifiedfee": float64(int64(entry.fee)) / 100000000.0,
-    "time": entry.timeAdded.toUnix(),
-    "height": entry.height,
-    "descendantcount": 1,
-    "descendantsize": vsize,
-    "descendantfees": int64(entry.fee),
-    "ancestorcount": entry.ancestorCount,
-    "ancestorsize": entry.ancestorSize,
-    "ancestorfees": int64(entry.ancestorFee),
-    "wtxid": reverseHex(toHex(array[32, byte](entry.tx.wtxid()))),
-    "fees": {
-      "base": float64(int64(entry.fee)) / 100000000.0,
-      "modified": float64(int64(entry.fee)) / 100000000.0,
-      "ancestor": float64(int64(entry.ancestorFee)) / 100000000.0,
-      "descendant": float64(int64(entry.fee)) / 100000000.0
-    },
-    "depends": [],
-    "spentby": [],
-    "bip125-replaceable": true,
-    "unbroadcast": false
-  }
+  let feeF   = float64(int64(entry.fee))   / 100000000.0
+  let ancestF = float64(int64(entry.ancestorFee)) / 100000000.0
+  # descendant fee: nimrod mempool tracks per-entry fee only;
+  # for the single-entry case (no descendants) it equals the entry fee.
+  let descendF = feeF
+  # chunkweight: for now emit weight as a proxy (full cluster-aware
+  # chunk scheduling is not yet implemented in nimrod's mempool).
+  let chunkWeight = entry.weight
+  var obj = newJObject()
+  obj["vsize"]           = %vsize
+  obj["weight"]          = %entry.weight
+  obj["time"]            = %entry.timeAdded.toUnix()
+  obj["height"]          = %entry.height
+  obj["descendantcount"] = %1
+  obj["descendantsize"]  = %vsize
+  obj["ancestorcount"]   = %entry.ancestorCount
+  obj["ancestorsize"]    = %entry.ancestorSize
+  obj["wtxid"]           = %reverseHex(toHex(array[32, byte](entry.tx.wtxid())))
+  obj["chunkweight"]     = %chunkWeight
+  var feesObj = newJObject()
+  feesObj["base"]       = %feeF
+  feesObj["modified"]   = %feeF
+  feesObj["ancestor"]   = %ancestF
+  feesObj["descendant"] = %descendF
+  feesObj["chunk"]      = %feeF
+  obj["fees"]             = feesObj
+  obj["depends"]          = newJArray()
+  obj["spentby"]          = newJArray()
+  obj["bip125-replaceable"] = %true
+  obj["unbroadcast"]      = %false
+  obj
+
+proc handleGetRawMempool(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getrawmempool [verbose] [mempool_sequence]
+  ## Reference: bitcoin-core/src/rpc/mempool.cpp getrawmempool / entryToJSON.
+  let verbose = if params.len >= 1: params[0].getBool() else: false
+
+  if verbose:
+    # Verbose: keyed by txid (display format), value = full entryToJSON object.
+    # W70d: was a truncated inline object missing modifiedfee, wtxid, fees,
+    # depends, spentby, unbroadcast, and had hardcoded ancestorcount=1.
+    # Now delegates to mempoolEntryJson for byte-parity with Core.
+    var entries = newJObject()
+    for txid, entry in rpc.mempool.entries:
+      entries[$txid] = mempoolEntryJson(rpc, txid, entry)
+    return entries
+  else:
+    var txids: seq[string]
+    for txid in rpc.mempool.entries.keys:
+      txids.add(reverseHex(toHex(array[32, byte](txid))))
+    return %txids
+
+proc handleGetMempoolEntry(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getmempoolentry txid
+  ## Returns mempool data for a given transaction.
+  ## Reference: Bitcoin Core rpc/mempool.cpp getmempoolentry / entryToJSON.
+  ## W70d: was duplicating mempoolEntryJson inline (with a dead feeRate var);
+  ## now calls the shared helper.
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing txid parameter")
+
+  let txid = parseTxidParam(params[0].getStr())
+  let entryOpt = rpc.mempool.get(txid)
+
+  if entryOpt.isNone:
+    raise newRpcError(RpcInvalidAddressOrKey, "Transaction not in mempool")
+
+  mempoolEntryJson(rpc, txid, entryOpt.get())
 
 proc handleGetMempoolAncestors(rpc: RpcServer, params: JsonNode): JsonNode =
   ## getmempoolancestors txid [verbose=false]
@@ -4121,6 +4089,10 @@ proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
   ## getmininginfo
   ## Returns a json object containing mining-related information.
   ## Reference: Bitcoin Core src/rpc/mining.cpp::getmininginfo
+  ## W70d: was using targetToDifficulty (imprecise float path) and emitting
+  ## targetHex as little-endian (toHex without reverseHex).  Now uses the W57
+  ## helpers getDifficultyFromBits+difficultyJson and reverseHex(toHex(target))
+  ## for byte-parity with Core.
   let height = rpc.chainState.bestHeight
   let bits = block:
     var b: uint32 = 0x1d00ffff'u32  # default genesis bits
@@ -4129,7 +4101,7 @@ proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
       b = blkOpt.get().header.bits
     b
   let target = bitsToTarget(bits)
-  let difficulty = targetToDifficulty(target)
+  let diffNode = difficultyJson(getDifficultyFromBits(bits))
   # Compact bits as 8-char big-endian hex (Core format)
   let bitsHex = toHex(cast[array[4, byte]]([
     byte((bits shr 24) and 0xff),
@@ -4137,7 +4109,8 @@ proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
     byte((bits shr 8) and 0xff),
     byte(bits and 0xff)
   ]))
-  let targetHex = toHex(target)
+  # target: big-endian 64-char hex (same as getblock/getblockheader)
+  let targetHex = reverseHex(toHex(target))
   let chainName = case rpc.params.network
     of Mainnet:  "main"
     of Testnet3: "test"
@@ -4146,26 +4119,26 @@ proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
     of Signet:   "signet"
   # next block uses same bits as tip (accurate except at adjustment boundaries)
   let nextHeight = height + 1
-  %*{
-    "blocks": height,
-    "currentblocksize": 0,
-    "currentblockweight": 0,
-    "currentblocktx": 0,
-    "bits": bitsHex,
-    "difficulty": difficulty,
-    "target": targetHex,
-    "blockmintxfee": 0.00001000,
-    "networkhashps": 0.0,
-    "pooledtx": rpc.mempool.count,
-    "chain": chainName,
-    "next": {
-      "height": nextHeight,
-      "bits": bitsHex,
-      "difficulty": difficulty,
-      "target": targetHex
-    },
-    "warnings": ""
-  }
+  var resp = newJObject()
+  resp["blocks"]           = %height
+  resp["currentblocksize"] = %0
+  resp["currentblockweight"] = %0
+  resp["currentblocktx"]  = %0
+  resp["bits"]             = %bitsHex
+  resp["difficulty"]       = diffNode
+  resp["target"]           = %targetHex
+  resp["blockmintxfee"]    = %0.00001000
+  resp["networkhashps"]    = %0.0
+  resp["pooledtx"]         = %rpc.mempool.count
+  resp["chain"]            = %chainName
+  var nextObj = newJObject()
+  nextObj["height"]     = %nextHeight
+  nextObj["bits"]       = %bitsHex
+  nextObj["difficulty"] = diffNode
+  nextObj["target"]     = %targetHex
+  resp["next"]     = nextObj
+  resp["warnings"] = %""
+  resp
 
 proc handleGetTxOut(rpc: RpcServer, params: JsonNode): JsonNode =
   ## gettxout "txid" n ( include_mempool )
