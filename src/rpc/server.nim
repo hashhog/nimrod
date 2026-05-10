@@ -4391,6 +4391,32 @@ proc handleVerifyMessage(rpc: RpcServer, params: JsonNode): JsonNode =
   of mvrOk:
     return %true
 
+proc handleSignMessageWithPrivkey(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## signmessagewithprivkey "privkey" "message"
+  ## Sign a message with a given WIF-encoded private key (no wallet required).
+  ## Reference: bitcoin-core/src/rpc/signmessage.cpp SignMessageWithPrivKey
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams,
+      "signmessagewithprivkey requires 2 parameters: privkey, message")
+
+  let wifStr = params[0].getStr()
+  let message = params[1].getStr()
+
+  var privKey: PrivateKey
+  var compressed: bool
+  try:
+    let decoded = decodeWIF(wifStr)
+    privKey = decoded.key
+    compressed = decoded.compressed
+  except DescriptorError as e:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid private key: " & e.msg)
+
+  try:
+    let signature = signMessage(privKey, message, compressed = compressed)
+    return %signature
+  except Secp256k1Error as e:
+    raise newRpcError(RpcInvalidAddressOrKey, "Sign failed: " & e.msg)
+
 proc handleValidateAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing address parameter")
@@ -7502,6 +7528,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   # Message signing
   of "signmessage":
     rpc.handleSignMessage(params)
+  of "signmessagewithprivkey":
+    rpc.handleSignMessageWithPrivkey(params)
   of "verifymessage":
     rpc.handleVerifyMessage(params)
 
