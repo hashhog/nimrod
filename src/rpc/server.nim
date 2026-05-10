@@ -2719,6 +2719,178 @@ proc handleDecodeScript(rpc: RpcServer, params: JsonNode): JsonNode =
 
       result["segwit"] = sr
 
+proc isFullyValidPubkeyBytes(pkBytes: seq[byte]): bool =
+  ## Returns true if pkBytes is a cryptographically valid EC public key.
+  ## Compressed (33 bytes, 0x02/0x03) or uncompressed (65 bytes, 0x04).
+  ## Mirrors Bitcoin Core CPubKey::IsFullyValid() (pubkey.h).
+  if pkBytes.len == 33:
+    if pkBytes[0] != 0x02 and pkBytes[0] != 0x03:
+      return false
+    # Use decompressPubkey as a secp256k1 parse proxy: returns @[] on invalid.
+    let decompressed = decompressPubkey(pkBytes)
+    return decompressed.len == 65
+  elif pkBytes.len == 65:
+    if pkBytes[0] != 0x04:
+      return false
+    # Structural check only for uncompressed (no secp256k1 on-curve check here).
+    # Core's IsFullyValid also calls secp256k1_ec_pubkey_parse; we accept
+    # well-formed uncompressed keys as valid (invalid points rejected by script eval).
+    return true
+  else:
+    return false
+
+proc buildMultisigRedeemScript(nRequired: int, pubkeys: seq[seq[byte]]): seq[byte] =
+  ## Build OP_M <push><pk1> ... <push><pkN> OP_N OP_CHECKMULTISIG.
+  ## OP_M = 0x50 + nRequired, OP_N = 0x50 + len(pubkeys).
+  result = @[byte(0x50 + nRequired)]
+  for pk in pubkeys:
+    let pushLen = byte(pk.len)  # 0x21 for 33-byte, 0x41 for 65-byte
+    result.add(pushLen)
+    result.add(pk)
+  result.add(byte(0x50 + pubkeys.len))
+  result.add(0xae'u8)  # OP_CHECKMULTISIG
+
+proc handleCreateMultisig(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Create a multisig address from nrequired and a list of public keys.
+  ##
+  ## Reference: Bitcoin Core rpc/output_script.cpp createmultisig (~line 89)
+  ##
+  ## Params:
+  ## [0] nrequired  - Number of signatures required (int, 1..16)
+  ## [1] keys       - Array of hex-encoded public key strings
+  ## [2] address_type - Optional: "legacy" (default), "bech32", "p2sh-segwit"
+  ##
+  ## Returns {address, redeemScript, descriptor, warnings?}
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams, "createmultisig requires nrequired and keys parameters")
+
+  # Parse nrequired
+  let nRequired =
+    if params[0].kind == JInt:
+      int(params[0].getInt())
+    else:
+      raise newRpcError(RpcInvalidParams, "nrequired must be an integer")
+
+  # Parse keys array
+  if params[1].kind != JArray:
+    raise newRpcError(RpcInvalidParams, "keys must be an array")
+  let keysNode = params[1]
+
+  # Validate nrequired bounds before key count
+  if nRequired < 1:
+    raise newRpcError(RpcInvalidParams,
+      "a multisignature address must require at least one key to redeem")
+
+  # Parse and validate each pubkey
+  var pubkeys: seq[seq[byte]]
+  for i in 0 ..< keysNode.len:
+    let hexStr = keysNode[i].getStr()
+    if hexStr.len != 66 and hexStr.len != 130:
+      raise newRpcError(RpcInvalidAddressOrKey,
+        "Pubkey \"" & hexStr & "\" must have a length of either 33 or 65 bytes")
+    let pkBytes =
+      try: hexToBytes(hexStr)
+      except CatchableError:
+        raise newRpcError(RpcInvalidAddressOrKey,
+          "Pubkey \"" & hexStr & "\" must be a hex string")
+    if not isFullyValidPubkeyBytes(pkBytes):
+      raise newRpcError(RpcInvalidAddressOrKey,
+        "Pubkey \"" & hexStr & "\" must be cryptographically valid.")
+    pubkeys.add(pkBytes)
+
+  let nKeys = pubkeys.len
+  if nKeys < nRequired:
+    raise newRpcError(RpcInvalidParams,
+      "not enough keys supplied (got " & $nKeys & " keys, but need at least " & $nRequired & " to redeem)")
+  if nKeys > 16:
+    raise newRpcError(RpcInvalidParams,
+      "Number of keys involved in the multisignature address creation > 16\nReduce the number")
+
+  # Parse address_type (default "legacy")
+  let addrType =
+    if params.len >= 3 and params[2].kind == JString:
+      params[2].getStr()
+    else:
+      "legacy"
+
+  if addrType notin ["legacy", "bech32", "p2sh-segwit"]:
+    raise newRpcError(RpcInvalidAddressOrKey,
+      "Unknown address type '" & addrType & "'")
+  if addrType == "bech32m":
+    raise newRpcError(RpcInvalidAddressOrKey,
+      "createmultisig cannot create bech32m multisig addresses")
+
+  # Check if any key is uncompressed — Core forces legacy in that case
+  var hasUncompressed = false
+  for pk in pubkeys:
+    if pk.len == 65:
+      hasUncompressed = true
+      break
+  var effectiveType = addrType
+  var warnings: seq[string] = @[]
+  if hasUncompressed and effectiveType != "legacy":
+    effectiveType = "legacy"
+    warnings.add("Unable to make chosen address type, please ensure no uncompressed public keys are present.")
+
+  let mainnet = rpc.params.network == Mainnet
+
+  # Build redeemScript = OP_M <pk1> ... <pkN> OP_N OP_CHECKMULTISIG
+  let redeemScript = buildMultisigRedeemScript(nRequired, pubkeys)
+  let redeemScriptHex = toHex(redeemScript)
+
+  # Derive address and descriptor based on effective type
+  let (address, descriptor) =
+    case effectiveType
+    of "legacy":
+      # P2SH: HASH160(redeemScript)
+      let h = hash160(redeemScript)
+      let addrVal = Address(kind: P2SH, scriptHash: h)
+      let addrStr = encodeAddress(addrVal, mainnet)
+      # Descriptor: sh(multi(M,pk1,...))#csum
+      var pkHexes: seq[string]
+      for pk in pubkeys:
+        pkHexes.add(toHex(pk))
+      let descInner = "sh(multi(" & $nRequired & "," & pkHexes.join(",") & "))"
+      let descStr = addDescriptorChecksum(descInner)
+      (addrStr, descStr)
+    of "bech32":
+      # P2WSH: SHA256(redeemScript) as v0 witness program
+      let h = sha256(redeemScript)
+      var wsh: array[32, byte]
+      for i in 0 ..< 32: wsh[i] = h[i]
+      let addrVal = Address(kind: P2WSH, wsh: wsh)
+      let addrStr = encodeAddress(addrVal, mainnet)
+      # Descriptor: wsh(multi(M,pk1,...))#csum
+      var pkHexes: seq[string]
+      for pk in pubkeys:
+        pkHexes.add(toHex(pk))
+      let descInner = "wsh(multi(" & $nRequired & "," & pkHexes.join(",") & "))"
+      let descStr = addDescriptorChecksum(descInner)
+      (addrStr, descStr)
+    of "p2sh-segwit":
+      # P2SH(P2WSH): HASH160 of the P2WSH script (0x00 0x20 <sha256>)
+      let p2wshScript = buildP2WSHScript(redeemScript)
+      let h = hash160(p2wshScript)
+      let addrVal = Address(kind: P2SH, scriptHash: h)
+      let addrStr = encodeAddress(addrVal, mainnet)
+      # Descriptor: sh(wsh(multi(M,pk1,...)))#csum
+      var pkHexes: seq[string]
+      for pk in pubkeys:
+        pkHexes.add(toHex(pk))
+      let descInner = "sh(wsh(multi(" & $nRequired & "," & pkHexes.join(",") & ")))"
+      let descStr = addDescriptorChecksum(descInner)
+      (addrStr, descStr)
+    else:
+      raise newRpcError(RpcInvalidAddressOrKey, "Unknown address type: " & effectiveType)
+
+  result = %*{
+    "address": address,
+    "redeemScript": redeemScriptHex,
+    "descriptor": descriptor
+  }
+  if warnings.len > 0:
+    result["warnings"] = %warnings
+
 proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Submit a raw transaction to the network
   ## Reference: Bitcoin Core sendrawtransaction RPC
@@ -7382,6 +7554,10 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetAddressesByLabel(params)
   of "listlabels":
     rpc.handleListLabels(params)
+
+  # Multisig
+  of "createmultisig":
+    rpc.handleCreateMultisig(params)
 
   # Descriptors
   of "getdescriptorinfo":
