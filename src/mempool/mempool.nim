@@ -747,6 +747,20 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
   if not stdRes.ok:
     return err(TxId, "non-standard tx (" & stdRes.reason & ")")
 
+  # Witness standardness check (Bitcoin Core IsWitnessStandard, policy/policy.cpp:265-351).
+  # Runs after IsStandardTx so UTXO existence is already confirmed above.
+  let witStdRes = isWitnessStandard(tx, proc(input: TxIn): seq[byte] =
+    let utxo = mp.chainState.getUtxo(input.prevOut)
+    if utxo.isSome:
+      utxo.get().output.scriptPubKey
+    else:
+      # Unconfirmed mempool parent (already validated above).
+      let parentEntry = mp.entries[input.prevOut.txid]
+      parentEntry.tx.outputs[input.prevOut.vout].scriptPubKey
+  )
+  if not witStdRes.ok:
+    return err(TxId, witStdRes.reason)
+
   # IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
   # Mempool holds txs for the *next* block, so check against tipHeight+1
   # and the current chain MTP (MEDIAN_TIME_PAST of last 11 blocks).

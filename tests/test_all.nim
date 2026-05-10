@@ -80,6 +80,7 @@ import ./test_checkpoint
 import ./test_parallel_verify_ibd
 import ./test_bip324
 import ./test_standard
+import ./test_witness_standard
 import ./test_bip331
 import ./test_mempool_persist
 import ./test_ops

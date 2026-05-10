@@ -1,6 +1,7 @@
 ## Transaction standardness policy (BIP / policy/policy.cpp)
 ##
-## Mirrors Bitcoin Core's `IsStandardTx()` from src/policy/policy.cpp.
+## Mirrors Bitcoin Core's `IsStandardTx()` from src/policy/policy.cpp and
+## `IsWitnessStandard()` from src/policy/policy.cpp:265-351.
 ## Already-checked invariants that live elsewhere in nimrod:
 ##   * MAX_STANDARD_TX_WEIGHT (400_000 WU)  — checked in mempool.acceptTransaction
 ##                                            *before* this is called, but we
@@ -14,6 +15,7 @@
 ##   * OP_RETURN (datacarrier) bytes-budget across vout
 ##   * Bare multisig gating
 ##   * Dust threshold (with MAX_DUST_OUTPUTS_PER_TX allowance for ephemeral dust)
+##   * IsWitnessStandard: 6-gate witness policy check (W72)
 
 import std/options
 import ../primitives/[types, serialize]
@@ -286,3 +288,199 @@ proc isStandardTxOk*(tx: Transaction): bool =
   ## Convenience wrapper that drops the reason string.
   let (ok, _) = isStandardTx(tx)
   ok
+
+# ---------------------------------------------------------------------------
+# IsWitnessStandard (policy/policy.cpp:265-351)
+# ---------------------------------------------------------------------------
+#
+# Implements all 6 gates from Bitcoin Core's IsWitnessStandard().
+# Takes a prevout-lookup callback so this module stays free of chainstate
+# imports (which would create circular dependencies with mempool.nim).
+#
+# Gate 1  (policy.cpp:283-285):  P2A with any witness → nonstandard
+# Gate 2  (policy.cpp:288-299):  P2SH-wrapped: eval scriptSig pushes; top = redeemScript
+# Gate 3  (policy.cpp:305-306):  non-witness prevScript + non-empty witness → nonstandard
+# Gate 4  (policy.cpp:309-318):  P2WSH v0 32B: script ≤ 3600; stack-1 ≤ 100; each item ≤ 80
+# Gate 5  (policy.cpp:324-348):  P2TR v1 32B (not P2SH): annex 0x50 → reject; tapscript 0xc0 → each item ≤ 80; empty stack → reject
+# Gate 6  (policy.cpp:267-268):  coinbase exempt
+
+const
+  ## policy/policy.h: MAX_STANDARD_P2WSH_SCRIPT_SIZE = 3600
+  MaxStandardP2WSHScriptSize* = 3600
+  ## policy/policy.h: MAX_STANDARD_P2WSH_STACK_ITEMS = 100
+  MaxStandardP2WSHStackItems* = 100
+  ## policy/policy.h: MAX_STANDARD_P2WSH_STACK_ITEM_SIZE = 80
+  MaxStandardP2WSHStackItemSize* = 80
+  ## policy/policy.h: MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE = 80
+  MaxStandardTapscriptStackItemSize* = 80
+  ## BIP-341: annex tag byte
+  AnnexTag* = 0x50'u8
+  ## BIP-341: TAPROOT_LEAF_MASK (mask off version parity bit)
+  TaprootLeafMask* = 0xfe'u8
+  ## BIP-342: TAPROOT_LEAF_TAPSCRIPT leaf version
+  TaprootLeafTapscript* = 0xc0'u8
+
+proc isCoinbaseTx(tx: Transaction): bool {.inline.} =
+  ## Local copy of isCoinbase to avoid importing consensus/validation.nim
+  ## (which pulls in chainstate and secp256k1). Identical logic.
+  tx.inputs.len == 1 and
+  tx.inputs[0].prevOut.txid == TxId(default(array[32, byte])) and
+  tx.inputs[0].prevOut.vout == 0xffffffff'u32
+
+proc evalScriptSigPushes*(scriptSig: seq[byte]): tuple[ok: bool, stack: seq[seq[byte]]] =
+  ## Evaluate a push-only scriptSig and return the resulting stack.
+  ## Mirrors the EvalScript(stack, scriptSig, SCRIPT_VERIFY_NONE, ...) call
+  ## in Core's IsWitnessStandard (policy.cpp:293).  No crypto; pushes only.
+  var stack: seq[seq[byte]] = @[]
+  var pc = 0
+  while pc < scriptSig.len:
+    let op = scriptSig[pc]
+    inc pc
+    if op == 0x00'u8:
+      # OP_0: push empty byte vector
+      stack.add(@[])
+    elif op >= 0x01'u8 and op <= 0x4b'u8:
+      # Direct push of N bytes
+      let n = int(op)
+      if pc + n > scriptSig.len:
+        return (false, @[])
+      stack.add(scriptSig[pc ..< pc + n])
+      pc += n
+    elif op == 0x4c'u8:
+      # OP_PUSHDATA1
+      if pc >= scriptSig.len:
+        return (false, @[])
+      let n = int(scriptSig[pc])
+      inc pc
+      if pc + n > scriptSig.len:
+        return (false, @[])
+      stack.add(scriptSig[pc ..< pc + n])
+      pc += n
+    elif op == 0x4d'u8:
+      # OP_PUSHDATA2
+      if pc + 1 >= scriptSig.len:
+        return (false, @[])
+      let n = int(scriptSig[pc]) or (int(scriptSig[pc + 1]) shl 8)
+      pc += 2
+      if pc + n > scriptSig.len:
+        return (false, @[])
+      stack.add(scriptSig[pc ..< pc + n])
+      pc += n
+    elif op == 0x4e'u8:
+      # OP_PUSHDATA4
+      if pc + 3 >= scriptSig.len:
+        return (false, @[])
+      let n = int(scriptSig[pc]) or
+              (int(scriptSig[pc + 1]) shl 8) or
+              (int(scriptSig[pc + 2]) shl 16) or
+              (int(scriptSig[pc + 3]) shl 24)
+      pc += 4
+      if pc + n > scriptSig.len:
+        return (false, @[])
+      stack.add(scriptSig[pc ..< pc + n])
+      pc += n
+    elif op == 0x4f'u8:
+      # OP_1NEGATE: push -1 (little-endian 0x81)
+      stack.add(@[0x81'u8])
+    elif op >= 0x51'u8 and op <= 0x60'u8:
+      # OP_1 .. OP_16: push single byte 1..16
+      stack.add(@[byte(op - 0x50'u8)])
+    else:
+      # Non-push opcode: fail (Core uses SCRIPT_VERIFY_NONE which still
+      # fails on non-push opcodes in scriptSig evaluation via EvalScript).
+      return (false, @[])
+  (true, stack)
+
+proc isWitnessStandard*(
+    tx: Transaction,
+    getPrevScriptPubKey: proc(input: TxIn): seq[byte]
+  ): tuple[ok: bool, reason: string] =
+  ## IsWitnessStandard port (policy/policy.cpp:265-351).
+  ##
+  ## `getPrevScriptPubKey` must return the scriptPubKey of the UTXO being
+  ## spent by each input.  The caller (acceptTransaction in mempool.nim)
+  ## already has these from its UTXO lookups.
+  ##
+  ## Returns (true, "") when standard.  On rejection, `reason` matches
+  ## the Bitcoin Core rejection string "bad-witness-nonstandard".
+
+  # Gate 6: coinbase is exempt (policy.cpp:267-268).
+  if isCoinbaseTx(tx):
+    return (true, "")
+
+  for i, txin in tx.inputs:
+    # Skip inputs with empty witness (policy.cpp:274-275).
+    let hasWitness = i < tx.witnesses.len and tx.witnesses[i].len > 0
+    if not hasWitness:
+      continue
+
+    var prevScript = getPrevScriptPubKey(txin)
+
+    # Gate 1: P2A with any witness is nonstandard (policy.cpp:283-285).
+    if isP2A(prevScript):
+      return (false, "bad-witness-nonstandard")
+
+    # Gate 2: P2SH-wrapped — extract redeemScript from scriptSig
+    # (policy.cpp:288-299).
+    var p2sh = false
+    if isP2SH(prevScript):
+      let (evalOk, stack) = evalScriptSigPushes(txin.scriptSig)
+      if not evalOk:
+        return (false, "bad-witness-nonstandard")
+      if stack.len == 0:
+        return (false, "bad-witness-nonstandard")
+      # Top of stack is the serialised redeemScript.
+      prevScript = stack[stack.len - 1]
+      p2sh = true
+
+    # Gate 3: non-witness prevScript with non-empty witness → nonstandard
+    # (policy.cpp:305-306).
+    let (isWit, witnessVersion, witnessProgram) = isWitnessProgram(prevScript)
+    if not isWit:
+      return (false, "bad-witness-nonstandard")
+
+    let witness = tx.witnesses[i]
+
+    # Gate 4: P2WSH v0 32-byte program (policy.cpp:309-318).
+    if witnessVersion == 0 and witnessProgram.len == 32:
+      # witness.stack.back() is the witnessScript; the rest are stack items.
+      if witness[witness.len - 1].len > MaxStandardP2WSHScriptSize:
+        return (false, "bad-witness-nonstandard")
+      let sizeWitnessStack = witness.len - 1
+      if sizeWitnessStack > MaxStandardP2WSHStackItems:
+        return (false, "bad-witness-nonstandard")
+      for j in 0 ..< sizeWitnessStack:
+        if witness[j].len > MaxStandardP2WSHStackItemSize:
+          return (false, "bad-witness-nonstandard")
+
+    # Gate 5: P2TR v1 32-byte program, not P2SH-wrapped (policy.cpp:324-348).
+    elif witnessVersion == 1 and witnessProgram.len == 32 and not p2sh:
+      # Check for annex: present if ≥2 items and last item starts with 0x50.
+      var stack = witness  # local mutable copy (we'll pop from the end logically)
+
+      if stack.len >= 2 and stack[stack.len - 1].len > 0 and
+         stack[stack.len - 1][0] == AnnexTag:
+        # Annexes are nonstandard (no semantics defined yet) — policy.cpp:327-330.
+        return (false, "bad-witness-nonstandard")
+
+      if stack.len >= 2:
+        # Script-path spend: pop control block, then script.
+        # (policy.cpp:331-341)
+        let controlBlock = stack[stack.len - 1]
+        stack.setLen(stack.len - 1)  # pop control block
+        stack.setLen(stack.len - 1)  # pop script (ignore)
+        if controlBlock.len == 0:
+          return (false, "bad-witness-nonstandard")
+        if (controlBlock[0] and TaprootLeafMask) == TaprootLeafTapscript:
+          # Tapscript leaf: check each remaining stack item ≤ 80 bytes.
+          for item in stack:
+            if item.len > MaxStandardTapscriptStackItemSize:
+              return (false, "bad-witness-nonstandard")
+      elif stack.len == 1:
+        # Key-path spend: no policy rules (policy.cpp:342-344).
+        discard
+      else:
+        # 0 stack elements: already invalid by consensus (policy.cpp:345-348).
+        return (false, "bad-witness-nonstandard")
+
+  (true, "")
