@@ -79,6 +79,7 @@ import ./test_assumevalid
 import ./test_checkpoint
 import ./test_parallel_verify_ibd
 import ./test_bip324
+import ./test_rbf
 import ./test_standard
 import ./test_witness_standard
 import ./test_bip331

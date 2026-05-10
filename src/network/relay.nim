@@ -644,10 +644,12 @@ proc checkIncrementalRelayFee*(originalFees: int64, replacementFees: int64,
   ##
   ## Returns (ok: true, error: "") if check passes, (ok: false, error: message) otherwise
 
-  # Rule #3: New tx must pay higher absolute fee
-  if replacementFees <= originalFees:
+  # Rule #3 (PaysForRBF): replacement fees >= original fees.
+  # Core uses < (not <=): equal fees satisfy Rule #3.
+  # Reference: Bitcoin Core src/policy/rbf.cpp PaysForRBF() line 109.
+  if replacementFees < originalFees:
     return (false, "replacement fee " & $replacementFees &
-                   " not higher than original fee " & $originalFees)
+                   " less than original fee " & $originalFees)
 
   # Rule #4: Additional fee must cover bandwidth cost
   # additional_fee >= incrementalRelayFee * replacementVsize / 1000
