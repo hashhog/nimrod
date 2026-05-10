@@ -2220,11 +2220,149 @@ proc buildVerboseTxJson(tx: Transaction, blockHash: Option[BlockHash],
   if inActiveChain.isSome:
     result["in_active_chain"] = %inActiveChain.get()
 
+proc enrichVerbosity2(rpc: RpcServer, tx: Transaction, result: var JsonNode,
+                      mainnet: bool,
+                      currentBlockIdx: Option[BlockIndex],
+                      txInBlockIdx: int) =
+  ## Add verbosity=2 fields to a getrawtransaction response:
+  ##   - per-vin "prevout" enrichment {generated, height, value, scriptPubKey}
+  ##   - top-level "fee" (sum inputs - sum outputs, in BTC)
+  ##
+  ## Prevout resolution strategy (priority order):
+  ##   1. txindex → creating block → creating tx outputs + height + coinbase flag
+  ##   2. Flat file BlockUndo (current block undo data) — per (txIdx, inputIdx)
+  ##   3. RocksDB UndoData outpoint map
+  ##
+  ## Reference: bitcoin-core/src/core_io.cpp TxToUniv (have_undo path) and
+  ## bitcoin-core/src/rpc/rawtransaction.cpp getrawtransaction verbosity==2.
+
+  # Phase 1: txindex batch lookup — group inputs by creating block, read once.
+  # Maps inp.prevOut → (value_sats, scriptPubKey_bytes, height, isCoinbase).
+  type PrevoutInfo = tuple[value: int64, script: seq[byte], height: int32, generated: bool]
+  var prevoutMap: Table[OutPoint, PrevoutInfo]
+  var resolvedTxids: HashSet[TxId]
+
+  # Check if tx is coinbase (skip prevout enrichment for coinbase inputs).
+  let isTxCoinbase = tx.inputs.len > 0 and
+    tx.inputs[0].prevOut.txid == TxId(default(array[32, byte])) and
+    tx.inputs[0].prevOut.vout == 0xFFFFFFFF'u32
+
+  if not isTxCoinbase:
+    # Group inputs by creating block hash for amortized block reads.
+    type TxRef = tuple[spendTxId: TxId, txIndex: int]
+    var blockNeeds: Table[BlockHash, seq[TxRef]]
+
+    for inp in tx.inputs:
+      if inp.prevOut.txid in resolvedTxids: continue
+      let locOpt = rpc.chainState.db.getTxIndex(inp.prevOut.txid)
+      if locOpt.isSome:
+        let loc = locOpt.get()
+        if loc.blockHash notin blockNeeds:
+          blockNeeds[loc.blockHash] = @[]
+        blockNeeds[loc.blockHash].add((inp.prevOut.txid, int(loc.txIndex)))
+        resolvedTxids.incl(inp.prevOut.txid)
+
+    # For each creating block, read once and extract all needed outputs.
+    for creatingBlockHash, refs in blockNeeds:
+      let creatingBlkOpt = rpc.chainState.db.getBlock(creatingBlockHash)
+      if creatingBlkOpt.isNone: continue
+      let creatingBlk = creatingBlkOpt.get()
+
+      # Get creating block's height for the height field.
+      let creatingIdxOpt = rpc.chainState.db.getBlockIndex(creatingBlockHash)
+      let creatingHeight = if creatingIdxOpt.isSome: creatingIdxOpt.get().height else: 0'i32
+
+      for r in refs:
+        if r.txIndex >= creatingBlk.txs.len: continue
+        let creatingTx = creatingBlk.txs[r.txIndex]
+        # Determine if this creating tx is coinbase.
+        let creatingIsCoinbase = creatingTx.inputs.len > 0 and
+          creatingTx.inputs[0].prevOut.txid == TxId(default(array[32, byte])) and
+          creatingTx.inputs[0].prevOut.vout == 0xFFFFFFFF'u32
+
+        # Populate ALL outputs of this creating tx.
+        for voutIdx, creatingOut in creatingTx.outputs:
+          let op = OutPoint(txid: r.spendTxId, vout: uint32(voutIdx))
+          prevoutMap[op] = (int64(creatingOut.value), creatingOut.scriptPubKey,
+                            creatingHeight, creatingIsCoinbase)
+
+    # Phase 2: flat file BlockUndo fallback for inputs not in txindex.
+    var blockUndoLoaded: Option[BlockUndo]
+    if currentBlockIdx.isSome:
+      let blkIdx = currentBlockIdx.get()
+      let buOpt = rpc.chainState.getBlockUndoFromFile(blkIdx, blkIdx.prevHash)
+      if buOpt.isSome:
+        blockUndoLoaded = buOpt
+
+    # Phase 3: RocksDB UndoData fallback.
+    var undoDataLoaded: Option[UndoData]
+    if currentBlockIdx.isSome:
+      let udOpt = rpc.chainState.db.getUndoData(currentBlockIdx.get().hash)
+      if udOpt.isSome:
+        undoDataLoaded = udOpt
+
+    # Build prevout JSON for each vin using resolved data.
+    var amtIn: int64 = 0
+    var amtOut: int64 = 0
+    var allInputsKnown = true
+
+    let vinNode = result["vin"]
+    for inpIdx, inp in tx.inputs:
+      var info: PrevoutInfo
+      var found = false
+
+      # 1. Check txindex-resolved map.
+      if inp.prevOut in prevoutMap:
+        info = prevoutMap[inp.prevOut]
+        found = true
+
+      # 2. Flat file BlockUndo (current block undo, per txIdx-1, inpIdx).
+      if not found and blockUndoLoaded.isSome:
+        let bu = blockUndoLoaded.get()
+        let txUndoIdx = txInBlockIdx - 1  # undo is 0-indexed for non-coinbase txs
+        if txUndoIdx >= 0 and txUndoIdx < bu.txUndo.len:
+          let txUndo = bu.txUndo[txUndoIdx]
+          if inpIdx < txUndo.prevOutputs.len:
+            let spent = txUndo.prevOutputs[inpIdx]
+            info = (int64(spent.output.value), spent.output.scriptPubKey,
+                    spent.height, spent.isCoinbase)
+            found = true
+
+      # 3. RocksDB UndoData outpoint map.
+      if not found and undoDataLoaded.isSome:
+        for (op, entry) in undoDataLoaded.get().spentOutputs:
+          if op == inp.prevOut:
+            info = (int64(entry.output.value), entry.output.scriptPubKey,
+                    entry.height, entry.isCoinbase)
+            found = true
+            break
+
+      if found:
+        amtIn += info.value
+        var prevoutObj = newJObject()
+        prevoutObj["generated"] = %info.generated
+        prevoutObj["height"] = %info.height
+        prevoutObj["value"] = btcAmountNode(info.value)
+        prevoutObj["scriptPubKey"] = buildScriptPubKeyJson(info.script, mainnet)
+        vinNode[inpIdx]["prevout"] = prevoutObj
+      else:
+        allInputsKnown = false
+
+    for outp in tx.outputs:
+      amtOut += int64(outp.value)
+
+    # Add top-level fee if all inputs resolved and fee is non-negative.
+    let fee = amtIn - amtOut
+    if allInputsKnown and fee >= 0:
+      result["fee"] = btcAmountNode(fee)
+
 proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   ## getrawtransaction "txid" ( verbose "blockhash" )
   ##
-  ## Returns raw transaction data. If verbose=false (default), returns hex string.
-  ## If verbose=true, returns JSON object with decoded transaction data.
+  ## Returns raw transaction data.
+  ##   verbose=0 (or false, default) → hex string
+  ##   verbose=1 (or true)           → JSON object with decoded transaction data
+  ##   verbose=2                     → verbose + per-vin prevout enrichment + fee
   ##
   ## By default, only mempool transactions are returned. With txindex enabled,
   ## confirmed transactions can also be retrieved. If blockhash is provided,
@@ -2239,15 +2377,18 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   if txidHex.len != 64:
     raise newRpcError(RpcInvalidAddressOrKey, "Invalid txid")
 
-  # Parse verbose parameter (supports bool or int)
-  var verbose = false
+  # Parse verbosity parameter (int or bool).
+  #   false / 0  → raw hex
+  #   true  / 1  → verbose JSON (TxToUniv, no prevout)
+  #   2          → verbose JSON + per-vin prevout + fee (W60)
+  var verbosity = 0
   if params.len >= 2:
     if params[1].kind == JBool:
-      verbose = params[1].getBool()
+      verbosity = if params[1].getBool(): 1 else: 0
     elif params[1].kind == JInt:
-      verbose = params[1].getInt() > 0
+      verbosity = params[1].getInt()
     elif params[1].kind == JNull:
-      discard  # Keep default false
+      discard  # Keep default 0
     else:
       raise newRpcError(RpcInvalidParams, "verbose must be a boolean or integer")
 
@@ -2279,11 +2420,13 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     if idxOpt.isNone:
       raise newRpcError(RpcMiscError, "Block not available")
 
-    # Search for transaction in block
+    # Search for transaction in block; track index for undo-data fallback.
     var foundTx: Option[Transaction] = none(Transaction)
-    for tx in blk.txs:
+    var txInBlockIdx = 0
+    for i, tx in blk.txs:
       if tx.txid() == txid:
         foundTx = some(tx)
+        txInBlockIdx = i
         break
 
     if foundTx.isNone:
@@ -2292,35 +2435,37 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
     let tx = foundTx.get()
 
-    if not verbose:
+    if verbosity == 0:
       return %toHex(serialize(tx))
 
     # Check if block is in active chain
     let blockIdx = idxOpt.get()
-    let tipHashOpt = rpc.chainState.db.getBlockHashByHeight(rpc.chainState.bestHeight)
-    var inActiveChain = false
-    if tipHashOpt.isSome:
-      # Block is in active chain if we can reach it from the tip by height
-      let heightHashOpt = rpc.chainState.db.getBlockHashByHeight(blockIdx.height)
-      inActiveChain = heightHashOpt.isSome and heightHashOpt.get() == blockHash
+    let heightHashOpt = rpc.chainState.db.getBlockHashByHeight(blockIdx.height)
+    let inActiveChain = heightHashOpt.isSome and heightHashOpt.get() == blockHash
 
     let confirmations = if inActiveChain:
       rpc.chainState.bestHeight - blockIdx.height + 1
     else:
       -1'i32  # Not in active chain
 
-    return buildVerboseTxJson(tx, some(blockHash), confirmations,
-                              blk.header.timestamp, some(inActiveChain), mainnet)
+    var txJson = buildVerboseTxJson(tx, some(blockHash), confirmations,
+                                    blk.header.timestamp, some(inActiveChain), mainnet)
+
+    if verbosity >= 2:
+      enrichVerbosity2(rpc, tx, txJson, mainnet, some(blockIdx), txInBlockIdx)
+
+    return txJson
 
   # No explicit blockhash: check mempool first, then txindex
   let mempoolTx = rpc.mempool.getTransaction(txid)
   if mempoolTx.isSome:
     let tx = mempoolTx.get()
 
-    if not verbose:
+    if verbosity == 0:
       return %toHex(serialize(tx))
 
-    # Unconfirmed transaction - no block info
+    # Unconfirmed transaction — no block info, no undo data.
+    # verbosity=2 cannot resolve prevouts for mempool txs; emit verbosity=1 shape.
     return buildVerboseTxJson(tx, none(BlockHash), 0, 0, none(bool), mainnet)
 
   # Check tx index for confirmed transactions
@@ -2340,15 +2485,21 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let tx = blk.txs[loc.txIndex]
 
-  if not verbose:
+  if verbosity == 0:
     return %toHex(serialize(tx))
 
   let idxOpt = rpc.chainState.db.getBlockIndex(loc.blockHash)
   let blockHeight = if idxOpt.isSome: idxOpt.get().height else: 0'i32
   let confirmations = rpc.chainState.bestHeight - blockHeight + 1
 
-  buildVerboseTxJson(tx, some(loc.blockHash), confirmations,
-                     blk.header.timestamp, none(bool), mainnet)
+  var txJson = buildVerboseTxJson(tx, some(loc.blockHash), confirmations,
+                                  blk.header.timestamp, none(bool), mainnet)
+
+  if verbosity >= 2:
+    let blockIdxForUndo = idxOpt
+    enrichVerbosity2(rpc, tx, txJson, mainnet, blockIdxForUndo, int(loc.txIndex))
+
+  txJson
 
 proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Decode a raw transaction hex to a TxToUniv-shaped JSON object.
