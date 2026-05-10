@@ -4227,32 +4227,38 @@ proc handleValidateAddress(rpc: RpcServer, params: JsonNode): JsonNode =
 
   try:
     let parsedAddr = decodeAddress(addrStr)
-    let isMain = isMainnet(addrStr)
-
-    var addrType: string
-    case parsedAddr.kind
-    of P2PKH: addrType = "pubkeyhash"
-    of P2SH: addrType = "scripthash"
-    of P2WPKH: addrType = "witness_v0_keyhash"
-    of P2WSH: addrType = "witness_v0_scripthash"
-    of P2TR: addrType = "witness_v1_taproot"
 
     let scriptPubKey = scriptPubKeyForAddress(parsedAddr)
+    let isWitness = parsedAddr.kind in {P2WPKH, P2WSH, P2TR}
+    # Core: isscript=true for P2SH and any witness program >20 bytes (P2WSH=32B, P2TR=32B)
+    let isScript = parsedAddr.kind in {P2SH, P2WSH, P2TR}
 
-    %*{
-      "isvalid": true,
-      "address": addrStr,
-      "scriptPubKey": toHex(scriptPubKey),
-      "isscript": parsedAddr.kind == P2SH or parsedAddr.kind == P2WSH,
-      "iswitness": parsedAddr.kind in {P2WPKH, P2WSH, P2TR},
-      "witness_version": (if parsedAddr.kind == P2TR: 1 elif parsedAddr.kind in {P2WPKH, P2WSH}: 0 else: -1),
-      "address_type": addrType
-    }
+    result = newJObject()
+    result["address"]      = %addrStr
+    result["isscript"]     = %isScript
+    result["isvalid"]      = %true
+    result["iswitness"]    = %isWitness
+    result["scriptPubKey"] = %toHex(scriptPubKey)
+    if isWitness:
+      # witness_program: hex of the raw program bytes
+      var prog: string
+      case parsedAddr.kind
+      of P2WPKH:
+        prog = toHex(parsedAddr.wpkh)
+      of P2WSH:
+        prog = toHex(parsedAddr.wsh)
+      of P2TR:
+        prog = toHex(parsedAddr.taprootKey)
+      else:
+        prog = ""
+      result["witness_program"]  = %prog
+      let witnessVer = if parsedAddr.kind == P2TR: 1 else: 0
+      result["witness_version"]  = %witnessVer
   except AddressError:
-    %*{
-      "isvalid": false,
-      "address": addrStr
-    }
+    result = newJObject()
+    result["error"] = %"Invalid or unsupported Segwit (Bech32) or Base58 encoding."
+    result["error_locations"] = newJArray()
+    result["isvalid"] = %false
 
 # ============================================================================
 # Pruning RPCs
