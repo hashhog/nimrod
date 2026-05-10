@@ -1352,7 +1352,7 @@ suite "Mempool RBF rules validation":
 
     let result = mp.checkRbfRules(newTx, Satoshi(500), 100, conflicts)
     check not result.isOk
-    check "insufficient fee" in result.error
+    check "less fees than conflicting" in result.error
 
     cs.close()
 
@@ -1577,7 +1577,8 @@ suite "Mempool RBF bip125-replaceable":
   test "all mempool txs are replaceable with full RBF":
     var cs = newChainState(TestDbPath, regtestParams())
     let params = regtestParams()
-    var mp = newMempool(cs, params)
+    # fullRbf=true: every mempool tx is replaceable regardless of signaling
+    var mp = newMempool(cs, params, fullRbf = true)
 
     # Add a tx with non-signaling sequence (0xFFFFFFFF)
     var txid1: array[32, byte]

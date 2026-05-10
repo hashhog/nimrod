@@ -35,6 +35,7 @@ type
     minFeeRate*: float64    ## Minimum fee rate to accept (sat/vbyte)
     chainState*: ChainState
     params*: ConsensusParams
+    fullRbf*: bool          ## If true, any mempool tx is replaceable regardless of signaling (mempoolfullrbf=1)
     ## Package limits
     ancestorLimit*: int     ## Max ancestor count including self (default 25)
     descendantLimit*: int   ## Max descendant count including self (default 25)
@@ -54,9 +55,10 @@ const
   DefaultAncestorSizeLimit* = DefaultAncestorSizeLimitKvB * 1000  ## 101,000 vbytes
   DefaultDescendantSizeLimit* = DefaultDescendantSizeLimitKvB * 1000  ## 101,000 vbytes
 
-  ## RBF constants (Bitcoin Core defaults)
-  MaxReplacementCandidates* = 100       ## Max transactions (conflicts + descendants) evicted per RBF
-  DefaultIncrementalRelayFee* = 1.0     ## Incremental relay fee in sat/vbyte
+  ## RBF constants (Bitcoin Core: util/rbf.h, policy/rbf.h)
+  MaxBip125RbfSequence* = 0xfffffffd'u32  ## nSequence threshold: any input <= this signals opt-in RBF
+  MaxReplacementCandidates* = 100         ## Max transactions (conflicts + descendants) evicted per RBF
+  DefaultIncrementalRelayFee* = 1.0       ## Incremental relay fee in sat/vbyte
 
   ## TRUC (v3) policy constants (BIP-431)
   TrucVersion* = 3'i32                  ## Transaction version for TRUC policy
@@ -87,6 +89,8 @@ proc err*(T: typedesc, msg: string): MempoolResult[T] =
   MempoolResult[T](isOk: false, error: msg)
 
 # Forward declarations
+proc signalsOptInRBF*(tx: Transaction): bool
+proc isRbfOptIn*(mp: Mempool, tx: Transaction): bool
 proc evictLowestFee*(mp: Mempool)
 proc calculateDescendants*(mp: Mempool, txid: TxId): HashSet[TxId]
 proc calculateAncestors*(mp: Mempool, tx: Transaction): HashSet[TxId]
@@ -102,6 +106,7 @@ proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true)
 proc newMempool*(chainState: ChainState, params: ConsensusParams,
                  maxSize: int = DefaultMaxMempoolSize,
                  minFeeRate: float64 = DefaultMinFeeRate,
+                 fullRbf: bool = false,
                  ancestorLimit: int = DefaultAncestorLimit,
                  descendantLimit: int = DefaultDescendantLimit,
                  ancestorSizeLimit: int = DefaultAncestorSizeLimit,
@@ -114,6 +119,7 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
     minFeeRate: minFeeRate,
     chainState: chainState,
     params: params,
+    fullRbf: fullRbf,
     ancestorLimit: ancestorLimit,
     descendantLimit: descendantLimit,
     ancestorSizeLimit: ancestorSizeLimit,
@@ -1173,8 +1179,41 @@ proc updateDescendantFees*(mp: Mempool, txid: TxId) =
       mp.updateDescendantFees(childTxid)
 
 # ============================================================================
-# Replace-by-Fee (BIP125 Full RBF)
+# Replace-by-Fee (BIP125)
+# Reference: Bitcoin Core src/util/rbf.h, src/util/rbf.cpp, src/policy/rbf.cpp
 # ============================================================================
+
+proc signalsOptInRBF*(tx: Transaction): bool =
+  ## Gate 1 — BIP-125 opt-in RBF signaling.
+  ## A transaction signals opt-in RBF when at least one input has
+  ## nSequence <= MAX_BIP125_RBF_SEQUENCE (0xfffffffd).
+  ## UNSIGNED comparison: 0xfffffffd < 0xfffffffe < 0xffffffff (SEQUENCE_FINAL).
+  ## Reference: Bitcoin Core src/util/rbf.cpp SignalsOptInRBF()
+  for input in tx.inputs:
+    if input.sequence <= MaxBip125RbfSequence:
+      return true
+  false
+
+proc isRbfOptIn*(mp: Mempool, tx: Transaction): bool =
+  ## Check whether tx opts in to RBF, considering both the tx itself and
+  ## any in-mempool ancestors (Gate 1 + Gate 2).
+  ## Reference: Bitcoin Core src/policy/rbf.cpp IsRBFOptIn()
+  ##
+  ## Gate 1: tx itself signals (any input nSequence <= 0xfffffffd).
+  ## Gate 2: any unconfirmed ancestor in the mempool signals.
+  ## Full-RBF mode (fullRbf=true): always returns true.
+  if mp.fullRbf:
+    return true
+  # Gate 1: direct signaling
+  if signalsOptInRBF(tx):
+    return true
+  # Gate 2: ancestor inheritance — walk mempool ancestors of tx
+  let ancestors = mp.calculateAncestors(tx)
+  for ancestorTxid in ancestors:
+    if ancestorTxid in mp.entries:
+      if signalsOptInRBF(mp.entries[ancestorTxid].tx):
+        return true
+  false
 
 proc findConflicts*(mp: Mempool, tx: Transaction): HashSet[TxId] =
   ## Find all mempool transactions that conflict with tx (spend the same inputs)
@@ -1207,56 +1246,75 @@ proc calculateConflictFees*(mp: Mempool, allConflicts: HashSet[TxId]): (Satoshi,
 
 proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
                     conflicts: HashSet[TxId], incrementalRelayFee: float64 = DefaultIncrementalRelayFee): MempoolResult[HashSet[TxId]] =
-  ## Check if tx can replace the conflicting transactions
-  ## Returns the set of all transactions to be evicted (conflicts + descendants) or an error
+  ## Check if tx can replace the conflicting transactions.
+  ## Returns the set of all transactions to be evicted (conflicts + descendants) or an error.
   ##
-  ## Rules (Full RBF - no signaling requirement):
-  ## 1. (Removed) BIP125 signaling - Full RBF allows replacing any mempool tx
-  ## 2. New tx must not spend outputs from conflicting txs (would create invalid tx)
-  ## 3. New tx must pay higher absolute fee than sum of all evicted txs
-  ## 4. Fee increase must cover bandwidth cost: (newFee - oldFee) >= incrementalRelayFee * newVsize
-  ## 5. Cannot evict more than MAX_REPLACEMENT_CANDIDATES transactions
+  ## BIP-125 gates (reference: Bitcoin Core src/policy/rbf.cpp):
+  ## Gate 1  — tx (or ancestor) signals opt-in via nSequence <= 0xfffffffd; skipped in fullRbf mode.
+  ## Gate 2  — ancestor inheritance: any mempool ancestor that signals makes tx replaceable.
+  ## Rule #5 — conflicts + descendants must not exceed MAX_REPLACEMENT_CANDIDATES (100).
+  ## Rule #2 — replacement must not spend outputs from transactions it is evicting.
+  ## Rule #3 — replacement fees >= original fees (>= not >; equal is allowed).
+  ## Rule #4 — additional fees >= min_relay_fee * replacement_vsize (pays for bandwidth).
+  ##
+  ## NOTE: Rule #8 (ImprovesFeerateDiagram, Core 27+) is deferred; cluster tracking required.
 
-  # Get all transactions that would be evicted (conflicts + their descendants)
+  # Gate 1 + Gate 2: BIP-125 opt-in signaling (skipped in fullRbf mode).
+  # In standard mode, at least one directly-conflicting tx must be replaceable —
+  # i.e., it or one of its ancestors signals opt-in.
+  # Reference: Bitcoin Core src/policy/rbf.cpp IsRBFOptIn()
+  if not mp.fullRbf:
+    var anySignals = false
+    for conflictTxid in conflicts:
+      if conflictTxid in mp.entries:
+        let conflictTx = mp.entries[conflictTxid].tx
+        if signalsOptInRBF(conflictTx):
+          anySignals = true
+          break
+        # Gate 2: check ancestors of the conflicting tx for inherited signaling
+        let conflictAncestors = mp.calculateAncestors(conflictTx)
+        for ancestorTxid in conflictAncestors:
+          if ancestorTxid in mp.entries and signalsOptInRBF(mp.entries[ancestorTxid].tx):
+            anySignals = true
+            break
+      if anySignals:
+        break
+    if not anySignals:
+      return err(HashSet[TxId], "rejecting replacement: original transaction does not signal RBF opt-in (BIP-125)")
+
+  # Rule #5: Don't evict more than MAX_REPLACEMENT_CANDIDATES transactions.
+  # Reference: Bitcoin Core src/policy/rbf.cpp GetEntriesForConflicts() — checks cluster count.
+  # We conservatively count total evicted txs (conflicts + descendants) since we lack cluster tracking.
   let allConflicts = mp.getAllConflictsWithDescendants(conflicts)
-
-  # Rule #5: Don't evict more than MAX_REPLACEMENT_CANDIDATES transactions
   if len(allConflicts) > MaxReplacementCandidates:
     return err(HashSet[TxId], "rejecting replacement: too many potential replacements (" &
                $len(allConflicts) & " > " & $MaxReplacementCandidates & ")")
 
-  # Rule #2: New tx must not spend outputs from any of the conflicting transactions
-  # (This would create a dependency on txs being evicted, which is invalid)
+  # Rule #2 (HasNoNewUnconfirmed): replacement must not spend outputs from any evicted tx.
+  # Reference: Bitcoin Core src/policy/rbf.cpp EntriesAndTxidsDisjoint()
   for input in tx.inputs:
     if input.prevOut.txid in allConflicts:
       return err(HashSet[TxId], "replacement tx spends output from conflicting transaction " &
                  $input.prevOut.txid)
 
-  # Calculate total fees of all conflicting transactions
-  let (conflictFees, conflictVsize) = mp.calculateConflictFees(allConflicts)
+  # Calculate total fees of all conflicting transactions.
+  let (conflictFees, conflictTotalVsize) = mp.calculateConflictFees(allConflicts)
+  discard conflictTotalVsize  # vsize of replaced txs; unused — replacement vsize drives Rule #4
 
-  # Rule #3: New tx must pay higher absolute fee
-  if txFee <= conflictFees:
-    return err(HashSet[TxId], "rejecting replacement: insufficient fee (" &
-               $int64(txFee) & " <= " & $int64(conflictFees) & " sats)")
+  # Rule #3 (PaysForRBF part 1): replacement fees >= original fees.
+  # Core: "if (replacement_fees < original_fees) → reject"  (< not <=; equal is allowed).
+  # Reference: Bitcoin Core src/policy/rbf.cpp PaysForRBF() line 109.
+  if int64(txFee) < int64(conflictFees):
+    return err(HashSet[TxId], "rejecting replacement %s, less fees than conflicting txs; " &
+               $int64(txFee) & " < " & $int64(conflictFees) & " sats")
 
-  # Rule #4: Additional fee must pay for bandwidth at incremental relay fee rate
-  # (newFee - conflictFees) >= incrementalRelayFee * newVsize
+  # Rule #4 (PaysForRBF part 2): additional fees >= incremental relay fee * replacement vsize.
+  # Reference: Bitcoin Core src/policy/rbf.cpp PaysForRBF() line 118.
   let additionalFee = int64(txFee) - int64(conflictFees)
   let requiredAdditionalFee = int64(incrementalRelayFee * float64(txVsize))
   if additionalFee < requiredAdditionalFee:
     return err(HashSet[TxId], "rejecting replacement: not enough additional fees to relay (" &
                $additionalFee & " < " & $requiredAdditionalFee & " sats)")
-
-  # Also check that new tx has higher fee rate than each directly conflicting tx
-  let newFeeRate = float64(int64(txFee)) / float64(txVsize)
-  for conflictTxid in conflicts:
-    if conflictTxid in mp.entries:
-      let conflictEntry = mp.entries[conflictTxid]
-      if newFeeRate <= conflictEntry.feeRate:
-        return err(HashSet[TxId], "rejecting replacement: fee rate " &
-                   $newFeeRate & " not higher than conflicting tx " &
-                   $conflictTxid & " fee rate " & $conflictEntry.feeRate)
 
   ok(allConflicts)
 
@@ -1266,10 +1324,24 @@ proc removeConflicts*(mp: Mempool, conflicts: HashSet[TxId]) =
     mp.removeTransaction(conflictTxid)
 
 proc isBip125Replaceable*(mp: Mempool, txid: TxId): bool =
-  ## Check if a transaction is replaceable according to BIP125
-  ## With Full RBF (-mempoolfullrbf=1), all mempool transactions are replaceable
-  ## This function always returns true for transactions in the mempool
-  txid in mp.entries
+  ## Check if a transaction in the mempool is replaceable according to BIP-125.
+  ## Gate 1: tx itself signals opt-in (any input nSequence <= 0xfffffffd).
+  ## Gate 2: any in-mempool ancestor signals opt-in.
+  ## Full-RBF mode: all mempool txs are replaceable regardless of signaling.
+  ## Reference: Bitcoin Core src/policy/rbf.cpp IsRBFOptIn()
+  if txid notin mp.entries:
+    return false
+  if mp.fullRbf:
+    return true
+  let tx = mp.entries[txid].tx
+  if signalsOptInRBF(tx):
+    return true
+  # Gate 2: walk ancestors for inherited signaling
+  let ancestors = mp.calculateAncestors(tx)
+  for ancestorTxid in ancestors:
+    if ancestorTxid in mp.entries and signalsOptInRBF(mp.entries[ancestorTxid].tx):
+      return true
+  false
 
 # ============================================================================
 # Package Relay (CPFP)

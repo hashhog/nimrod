@@ -98,16 +98,20 @@ suite "Incremental relay fee":
     check ok == true
     check error == ""
 
-  test "checkIncrementalRelayFee fails if fee not higher":
-    # Original: 1000 sats, Replacement: 1000 sats (not higher)
+  test "checkIncrementalRelayFee: equal fees pass Rule #3 but fail Rule #4":
+    # Original: 1000 sats, Replacement: 1000 sats.
+    # Rule #3: replacement_fees >= original_fees → 1000 >= 1000 → passes (Core uses <, not <=).
+    # Rule #4: additional_fee = 0 < required (200 vbytes * 1 sat/vB) → fails.
+    # BIP-125 / Bitcoin Core src/policy/rbf.cpp PaysForRBF() line 109.
     let (ok, error) = checkIncrementalRelayFee(1000, 1000, 200)
     check ok == false
-    check "not higher" in error
+    check "additional fee" in error  # Rule #4 fires, not Rule #3
 
   test "checkIncrementalRelayFee fails if fee lower":
+    # replacement < original → Rule #3 rejects.
     let (ok, error) = checkIncrementalRelayFee(1000, 500, 200)
     check ok == false
-    check "not higher" in error
+    check "less than" in error
 
   test "checkIncrementalRelayFee fails if additional fee too low":
     # Original: 1000 sats, Replacement: 1001 sats, 200 vbytes
