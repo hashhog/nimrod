@@ -724,20 +724,28 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
   if not basicResult.isOk:
     return err(TxId, "invalid transaction: " & $basicResult.error)
 
+  # Coinbase transactions are only valid inside blocks, not as mempool entries.
+  # Bitcoin Core MemPoolAccept::PreChecks, validation.cpp:803-804.
+  if isCoinbase(tx):
+    return err(TxId, "coinbase")
+
+  # Transactions smaller than MIN_STANDARD_TX_NONWITNESS_SIZE (65 bytes)
+  # are rejected to mitigate CVE-2017-12842 (64-byte tx collision attack).
+  # Bitcoin Core MemPoolAccept::PreChecks, validation.cpp:813-814.
+  const MinStandardTxNonwitnessSize = 65
+  let nonwitnessSize = serializeLegacy(tx).len
+  if nonwitnessSize < MinStandardTxNonwitnessSize:
+    return err(TxId, "tx-size-small")
+
   # Calculate weight and check 400K WU policy limit
   let weight = calculateWeight(tx)
   if weight > MaxStandardTxWeight:
     return err(TxId, "transaction weight " & $weight & " exceeds max " & $MaxStandardTxWeight)
 
   # Standardness check (Bitcoin Core IsStandardTx, policy/policy.cpp).
-  # Coinbase is excluded — it is rejected upstream by checkTransaction()
-  # (no inputs from a real tx is impossible here, but be explicit).
-  if tx.inputs.len > 0 and not (tx.inputs.len == 1 and
-       array[32, byte](tx.inputs[0].prevOut.txid) == default(array[32, byte]) and
-       tx.inputs[0].prevOut.vout == 0xFFFFFFFF'u32):
-    let stdRes = isStandardTx(tx)
-    if not stdRes.ok:
-      return err(TxId, "non-standard tx (" & stdRes.reason & ")")
+  let stdRes = isStandardTx(tx)
+  if not stdRes.ok:
+    return err(TxId, "non-standard tx (" & stdRes.reason & ")")
 
   # IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
   # Mempool holds txs for the *next* block, so check against tipHeight+1

@@ -247,7 +247,6 @@ proc isStandardTx*(tx: Transaction,
                                opts.maxDatacarrierBytes.get()
                              else:
                                0
-  var nullDataCount = 0
   var dustCount = 0
 
   for output in tx.outputs:
@@ -257,11 +256,13 @@ proc isStandardTx*(tx: Transaction,
 
     case kind
     of stxNullData:
+      # Per-output bytes are deducted from a shared budget (policy/policy.cpp:145-151).
+      # Core 31.99 has NO count limit on OP_RETURN outputs — multiple OP_RETURNs
+      # are standard as long as the cumulative byte budget is not exceeded.
       let sz = output.scriptPubKey.len
       if sz > datacarrierBytesLeft:
         return (false, "datacarrier")
       datacarrierBytesLeft -= sz
-      inc nullDataCount
     of stxMultisig:
       if not opts.permitBareMultisig:
         return (false, "bare-multisig")
@@ -278,13 +279,6 @@ proc isStandardTx*(tx: Transaction,
   # ("dust"). Below or equal is allowed (ephemeral anchors).
   if dustCount > StdMaxDustOutputsPerTx:
     return (false, "dust")
-
-  # Core also rejects more than one OP_RETURN per tx ("multi-op-return"
-  # in policy/policy.cpp via the BIP-431 test). nimrod's mempool already
-  # rejects via the ephemeral path for that case, but the canonical
-  # standardness reason is more useful in logs/tests.
-  if nullDataCount > 1:
-    return (false, "multi-op-return")
 
   (true, "")
 
