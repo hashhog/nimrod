@@ -95,6 +95,7 @@ import ./test_bip30
 import ./test_csv_comprehensive
 import ./test_bip66
 import ./test_mempool_eviction_w86
+import ./test_disconnect_block
 
 when isMainModule:
   echo "Running all tests..."

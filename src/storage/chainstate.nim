@@ -1231,36 +1231,148 @@ proc getUtxoIBD*(cs: ChainState, op: OutPoint): Option[UtxoEntry] =
 
 # Disconnect a block from the chain
 
+proc isBip30UnspendableForDisconnect(height: int32, blockHash: BlockHash): bool =
+  ## Return true iff this block's coinbase outputs are considered unspendable
+  ## for the purpose of DisconnectBlock — i.e. the two original BIP-30
+  ## violating mainnet blocks whose duplicate coinbases were overwritten.
+  ##
+  ## Reference: Bitcoin Core validation.cpp:2201-2202 (DisconnectBlock).
+  ##   h=91722  hash=00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e
+  ##   h=91812  hash=00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f
+  ##
+  ## Duplicated here (not imported from validation.nim) to avoid a circular
+  ## dependency: chainstate <- validation <- chainstate.
+  const bip30Unspend1Hash = block:
+    var h: array[32, byte]
+    let hex = "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"
+    for i in 0..31:
+      let hi = hex[i*2]; let lo = hex[i*2+1]
+      let hiV = (if hi >= '0' and hi <= '9': ord(hi)-ord('0') elif hi >= 'a' and hi <= 'f': ord(hi)-ord('a')+10 else: ord(hi)-ord('A')+10)
+      let loV = (if lo >= '0' and lo <= '9': ord(lo)-ord('0') elif lo >= 'a' and lo <= 'f': ord(lo)-ord('a')+10 else: ord(lo)-ord('A')+10)
+      h[31 - i] = byte(hiV * 16 + loV)
+    h
+  const bip30Unspend2Hash = block:
+    var h: array[32, byte]
+    let hex = "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"
+    for i in 0..31:
+      let hi = hex[i*2]; let lo = hex[i*2+1]
+      let hiV = (if hi >= '0' and hi <= '9': ord(hi)-ord('0') elif hi >= 'a' and hi <= 'f': ord(hi)-ord('a')+10 else: ord(hi)-ord('A')+10)
+      let loV = (if lo >= '0' and lo <= '9': ord(lo)-ord('0') elif lo >= 'a' and lo <= 'f': ord(lo)-ord('a')+10 else: ord(lo)-ord('A')+10)
+      h[31 - i] = byte(hiV * 16 + loV)
+    h
+  (height == 91722'i32 and array[32, byte](blockHash) == bip30Unspend1Hash) or
+  (height == 91812'i32 and array[32, byte](blockHash) == bip30Unspend2Hash)
+
 proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoData): ChainStateResult[void] =
-  ## Disconnect a block: restore spent outputs, remove created outputs
-  ## Requires undo data to restore spent UTXOs
+  ## Disconnect a block: restore spent outputs, remove created outputs.
+  ## Requires undo data to restore spent UTXOs.
+  ##
+  ## Gates mirroring Bitcoin Core validation.cpp DisconnectBlock:
+  ##  Gate 1: Skip IsUnspendable outputs — they were never stored (validation.cpp:2214).
+  ##  Gate 2: fEnforceBIP30 — relax output-mismatch for h=91722/91812 coinbases (val:2201-2202).
+  ##  Gate 3: Restore inputs in reverse vin order (validation.cpp:2233).
+  ##  Gate 4: SetBestBlock unconditionally (validation.cpp:2245).
 
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
+  # Gate 2: BIP-30 unspendable exception for the two historical duplicate-coinbase
+  # blocks (h=91722, h=91812).  Their coinbase outputs were overwritten by later
+  # duplicates, so the SpendCoin check would fail; suppress it here.
+  # Reference: validation.cpp:2201-2202, 2209-2221.
+  let fEnforceBip30 = not isBip30UnspendableForDisconnect(height, blockHash)
+
   let batch = cs.db.db.newWriteBatch()
   defer: batch.destroy()
 
-  # Process transactions in reverse order
+  # Process transactions in reverse order (validation.cpp:2205)
   for txIdx in countdown(blk.txs.len - 1, 0):
     let tx = blk.txs[txIdx]
     let txId = tx.txid()
+    let isCoinbase = (txIdx == 0)
+    # is_bip30_exception: coinbase of an unspendable block — mismatch is tolerated.
+    let isBip30Exception = isCoinbase and not fEnforceBip30
 
-    # Remove created outputs
+    # Gate 1: Remove created outputs, skipping IsUnspendable ones.
+    # Unspendable outputs (OP_RETURN or >MAX_SCRIPT_SIZE) were never written to
+    # the UTXO set on connect, so deleting them here is a harmless no-op on RocksDB,
+    # but skipping them is the correct behavior matching Core (validation.cpp:2214).
     for voutIdx in 0 ..< tx.outputs.len:
-      let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
-      batch.delete(cfUtxo, key)
+      if isUnspendable(tx.outputs[voutIdx].scriptPubKey):
+        continue  # Gate 1: never stored, never remove
       let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
-      cs.deleteUtxoCache(outpoint)
+      let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
+      # Gate 2: For the BIP-30 unspendable coinbases, the UTXO was overwritten;
+      # skip the delete to avoid an inconsistency marker (equivalent to Core's
+      # fClean=false path that still proceeds).
+      if not isBip30Exception:
+        batch.delete(cfUtxo, key)
+        cs.deleteUtxoCache(outpoint)
 
     # Remove tx index entry
     batch.delete(cfTxIndex, txIndexKey(array[32, byte](txId)))
 
-  # Restore spent outputs from undo data
+  # Restore spent outputs from undo data — mirrors `ApplyTxInUndo`
+  # (validation.cpp:2149-2175).
+  #
+  # Gate 3: Core restores inputs in reverse vin order within each tx
+  # (validation.cpp:2233: for j = vin.size(); j > 0; --j).  The UndoData
+  # flat list is already ordered per-tx forward, so we restore per-outpoint
+  # by key — order is irrelevant for KV correctness.
+  #
+  # Gate 5 (ApplyTxInUndo: HaveCoin overwrite check, val:2153):
+  #   If the outpoint we're about to restore is already in the UTXO set
+  #   (alive), the restore is an "overwrite" — Core sets fClean=false but
+  #   still proceeds (it's a non-fatal inconsistency).  We don't track an
+  #   fClean flag, but we MUST still proceed with the put — the in-memory
+  #   batch.put will overwrite the existing entry, matching Core's
+  #   `view.AddCoin(out, std::move(undo), !fClean)` with possible_overwrite=true.
+  #
+  # Gate 6 (ApplyTxInUndo: missing-metadata sibling recovery, val:2155-2166):
+  #   In legacy undo records, only the LAST spend of a transaction's outputs
+  #   carried height/coinbase metadata.  When restoring an earlier-spent
+  #   sibling, undo.nHeight == 0 and we recover the metadata from any other
+  #   unspent output of the same tx (AccessByTxid).  Newer undo records
+  #   always carry per-output metadata so this path is dormant on
+  #   chains synced with modern code, but is required for correctness on
+  #   legacy datadirs and crash-recovery from old undo files.
   for (outpoint, entry) in undo.spentOutputs:
+    var restoreEntry = entry
+
+    # Gate 6: missing-metadata sibling recovery.
+    if restoreEntry.height == 0 and not restoreEntry.isCoinbase:
+      # Look up any other output of the same tx that is still unspent and
+      # copy its (height, isCoinbase) metadata into this restore entry.
+      # Walk vout indices forward as Core does (AccessByTxid in coins.cpp).
+      var foundMeta = false
+      const MaxOutputsToProbe = 65535  # MAX_OUTPUTS_PER_BLOCK bound
+      var probeVout: uint32 = 0
+      while probeVout < uint32(MaxOutputsToProbe):
+        if probeVout == outpoint.vout:
+          inc probeVout
+          continue
+        let probeOp = OutPoint(txid: outpoint.txid, vout: probeVout)
+        let alt = cs.getUtxo(probeOp)
+        if alt.isSome:
+          restoreEntry.height = alt.get().height
+          restoreEntry.isCoinbase = alt.get().isCoinbase
+          foundMeta = true
+          break
+        # If we've passed the rough limit and found nothing, stop.
+        # Real coinbases are at vout=0; spends rarely exceed a few hundred outputs.
+        if probeVout > 2000'u32 and not foundMeta:
+          break
+        inc probeVout
+      if not foundMeta:
+        # No sibling found — Core returns DISCONNECT_FAILED here
+        # (validation.cpp:2164).  This indicates corrupted/orphan undo data.
+        return err("DisconnectBlock: missing metadata for outpoint " &
+                   $outpoint & " and no unspent sibling found in same tx " &
+                   "(legacy undo record corruption)")
+
     let key = utxoKey(array[32, byte](outpoint.txid), outpoint.vout)
-    batch.put(cfUtxo, key, serializeUtxoEntry(entry))
-    cs.putUtxoCache(outpoint, entry)
+    batch.put(cfUtxo, key, serializeUtxoEntry(restoreEntry))
+    cs.putUtxoCache(outpoint, restoreEntry)
 
   # Remove undo data for this block
   batch.delete(cfMeta, undoKey(blockHash))
@@ -1283,19 +1395,22 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
       borrow = 0
   cs.totalWork = newTotalWork
 
-  # Update best block to previous
+  # Gate 4: SetBestBlock unconditionally — Core always calls
+  # view.SetBestBlock(pindex->pprev->GetBlockHash()) (validation.cpp:2245).
+  # The old guard `if newBestHeight >= 0` was wrong: it skipped the update
+  # when disconnecting block 0 (which should not happen in practice but is
+  # still incorrect semantics).  We always update.
   let newBestHeight = height - 1
-  if newBestHeight >= 0:
-    batch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](blk.header.prevBlock)))
-    var w = BinaryWriter()
-    w.writeInt32LE(newBestHeight)
-    batch.put(cfMeta, metaKey("height"), w.data)
-    batch.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
+  batch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](blk.header.prevBlock)))
+  var w = BinaryWriter()
+  w.writeInt32LE(newBestHeight)
+  batch.put(cfMeta, metaKey("height"), w.data)
+  batch.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
 
-    cs.bestBlockHash = blk.header.prevBlock
-    cs.bestHeight = newBestHeight
-    cs.db.bestBlockHash = blk.header.prevBlock
-    cs.db.bestHeight = newBestHeight
+  cs.bestBlockHash = blk.header.prevBlock
+  cs.bestHeight = newBestHeight
+  cs.db.bestBlockHash = blk.header.prevBlock
+  cs.db.bestHeight = newBestHeight
 
   cs.db.db.write(batch)
 
@@ -1328,22 +1443,42 @@ proc disconnectBlock*(cs: var ChainState, blk: Block): ChainStateResult[void] =
   if not idx.undoPos.isNull:
     let (blockUndo, ok) = cs.undoMgr.readBlockUndo(idx.undoPos, blk.header.prevBlock, cs.params)
     if ok:
-      # Convert BlockUndo to UndoData format for the existing disconnection logic
+      # Gate: blockUndo.txUndo.len + 1 must equal blk.txs.len (one TxUndo per
+      # non-coinbase tx).  Mismatch means the undo data is inconsistent with the
+      # block body — fail hard rather than silently restoring wrong inputs.
+      # Reference: Bitcoin Core validation.cpp:2190-2193.
+      #
+      # Note: must be UNCONDITIONAL — an early `blk.txs.len > 1` guard would
+      # let a coinbase-only block with a non-empty txUndo (corruption) slip
+      # through and silently restore phantom UTXOs.  Core's check fires for
+      # every block, including 1-tx coinbase-only blocks where vtxundo must be
+      # empty.
+      if blockUndo.txUndo.len + 1 != blk.txs.len:
+        return err("DisconnectBlock: block/undo tx count mismatch: block has " &
+                   $blk.txs.len & " txs but undo has " & $blockUndo.txUndo.len &
+                   " entries (expected " & $(blk.txs.len - 1) & ")")
+
+      # Convert BlockUndo to UndoData format for the existing disconnection logic.
+      # Each TxUndo's prevOutputs are in forward vin order; the per-tx index
+      # aligns spent[j] with vin[j] for outpoint reconstruction.
       var undo = UndoData()
-      var inputIdx = 0
       for txIdx in 1 ..< blk.txs.len:  # Skip coinbase
         let tx = blk.txs[txIdx]
-        if txIdx - 1 < blockUndo.txUndo.len:
-          let txUndo = blockUndo.txUndo[txIdx - 1]
-          for i, spent in txUndo.prevOutputs:
-            if i < tx.inputs.len:
-              let outpoint = tx.inputs[i].prevOut
-              let entry = UtxoEntry(
-                output: spent.output,
-                height: spent.height,
-                isCoinbase: spent.isCoinbase
-              )
-              undo.spentOutputs.add((outpoint, entry))
+        let txUndo = blockUndo.txUndo[txIdx - 1]
+        # Gate: per-tx vin count must equal txUndo.prevOutputs count.
+        # Reference: validation.cpp:2229-2232.
+        if txUndo.prevOutputs.len != tx.inputs.len:
+          return err("DisconnectBlock: tx " & $txIdx &
+                     " vin count (" & $tx.inputs.len &
+                     ") != undo prevout count (" & $txUndo.prevOutputs.len & ")")
+        for i, spent in txUndo.prevOutputs:
+          let outpoint = tx.inputs[i].prevOut
+          let entry = UtxoEntry(
+            output: spent.output,
+            height: spent.height,
+            isCoinbase: spent.isCoinbase
+          )
+          undo.spentOutputs.add((outpoint, entry))
       return cs.disconnectBlock(blk, height, undo)
 
   # Fall back to RocksDB undo data
@@ -1500,10 +1635,15 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     disconnectedForHook.add((blockHash, blk.header.prevBlock, blkHeight))
 
     # Process transactions in reverse: remove created outputs, drop tx index.
+    # Gate: skip IsUnspendable outputs — they were never added to the UTXO set
+    # (validation.cpp:2214) so attempting to delete them is a no-op that also
+    # pollutes the reorgDeletedUtxos tracking set.
     for txIdx in countdown(blk.txs.len - 1, 0):
       let tx = blk.txs[txIdx]
       let txId = tx.txid()
       for voutIdx in 0 ..< tx.outputs.len:
+        if isUnspendable(tx.outputs[voutIdx].scriptPubKey):
+          continue  # never stored, never remove (validation.cpp:2214)
         let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
         batch.delete(cfUtxo, key)
         let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
@@ -1802,13 +1942,18 @@ proc disconnectBlock*(cdb: ChainDb, blk: Block, height: int32) =
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
-  # Process transactions in reverse order
+  # Process transactions in reverse order (validation.cpp:2205)
   for txIdx in countdown(blk.txs.len - 1, 0):
     let tx = blk.txs[txIdx]
     let txId = tx.txid()
 
-    # Remove created outputs
+    # Remove created outputs.
+    # Gate: skip IsUnspendable outputs — they were never stored
+    # (validation.cpp:2214 + Core's CCoinsViewCache::AddCoin in coins.cpp:91
+    # which short-circuits for IsUnspendable scripts).
     for voutIdx in 0 ..< tx.outputs.len:
+      if isUnspendable(tx.outputs[voutIdx].scriptPubKey):
+        continue
       let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
       batch.delete(cfUtxo, key)
       let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
