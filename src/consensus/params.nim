@@ -94,6 +94,24 @@ const
   DifficultyAdjustmentInterval* = 2016
   MaxCompactTarget* = 0x1d00ffff'u32
 
+  ## Minimum transaction weight (consensus/consensus.h:23).
+  ## 60 is the lower bound for the size of a valid serialized CTransaction;
+  ## multiplied by WitnessScaleFactor. Used for per-tx sanity checks and
+  ## in merkleblock to bound the maximum number of transactions per block.
+  MinTransactionWeight* = WitnessScaleFactor * 60  # = 240
+
+  ## Minimum serializable transaction weight (consensus/consensus.h:24).
+  ## 10 is the lower bound for the serialized CTransaction size (version +
+  ## 0-input varint + 0-output varint + locktime = 10 bytes); multiplied by
+  ## WitnessScaleFactor.  Used in compact block relay to bound the sanity
+  ## check on the number of short-IDs (blockencodings.cpp:64).
+  MinSerializableTransactionWeight* = WitnessScaleFactor * 10  # = 40
+
+  ## Default sigops-to-bytes ratio used in fee-rate calculations
+  ## (policy/policy.h:50). GetVirtualTransactionSize uses this to convert
+  ## sigop cost to virtual bytes: vsize = ceil(max(weight, sigops*20) / 4).
+  DefaultBytesPerSigop* = 20
+
   # BIP68 sequence lock constants
   # Note: These are also defined in script/interpreter.nim for OP_CHECKSEQUENCEVERIFY
   # Using SequenceLock prefix to avoid name collision

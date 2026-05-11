@@ -7,6 +7,7 @@ import std/[tables, options]
 import ../primitives/[types, serialize]
 import ../crypto/[hashing, siphash]
 import ../mempool/mempool
+import ../consensus/params
 
 const
   ## Short ID length in bytes (6 bytes = 48 bits)
@@ -19,9 +20,12 @@ const
   ## At minimum, coinbase (index 0) must be prefilled
   MaxPrefilledTxns* = 10000
 
-  ## Maximum transactions per block (sanity check)
-  ## MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT
-  MaxBlockTxns* = 4_000_000 div 60
+  ## Maximum transactions per block (sanity check).
+  ## Mirrors Bitcoin Core blockencodings.cpp:64:
+  ##   MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 4_000_000 / 40 = 100_000.
+  ## Previously this used 60 (MIN_TRANSACTION_WEIGHT / WitnessScaleFactor) by mistake,
+  ## giving 66_666 and leaving the guard too tight.
+  MaxBlockTxns* = MaxBlockWeight div MinSerializableTransactionWeight  # = 100_000
 
 type
   ## Status codes for compact block operations
