@@ -92,6 +92,7 @@ import ./test_bip141_witness_commitment
 import ./test_truc
 import ./test_bip30
 import ./test_csv_comprehensive
+import ./test_bip66
 
 when isMainModule:
   echo "Running all tests..."
