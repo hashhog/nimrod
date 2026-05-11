@@ -89,6 +89,7 @@ import ./test_snapshot
 import ./test_weight_vsize
 import ./test_bip141_witness_commitment
 import ./test_truc
+import ./test_bip30
 
 when isMainModule:
   echo "Running all tests..."

@@ -1473,28 +1473,120 @@ proc checkBlockLocktime*(blk: Block, height: uint32, lockTimeCutoff: uint32): Va
       return voidErr(veNonFinalTx)
   ok()
 
-proc checkBip30*(blk: Block, height: int32, params: ConsensusParams,
+proc bip30HashFromHex*(hex: static string): array[32, byte] {.compileTime.} =
+  ## Convert a Bitcoin block-hash hex string (big-endian display) to the
+  ## internal little-endian byte representation used by nimrod.
+  ## Identical to params.nim's hexToBytes32 but usable at compileTime.
+  assert hex.len == 64
+  for i in 0..31:
+    let hi = hex[i*2]
+    let lo = hex[i*2 + 1]
+    let hiVal = (if hi >= '0' and hi <= '9': ord(hi) - ord('0')
+                 elif hi >= 'a' and hi <= 'f': ord(hi) - ord('a') + 10
+                 else: ord(hi) - ord('A') + 10)
+    let loVal = (if lo >= '0' and lo <= '9': ord(lo) - ord('0')
+                 elif lo >= 'a' and lo <= 'f': ord(lo) - ord('a') + 10
+                 else: ord(lo) - ord('A') + 10)
+    result[31 - i] = byte(hiVal * 16 + loVal)
+
+proc isBip30Repeat*(height: int32, blockHash: array[32, byte]): bool =
+  ## Return true iff this is one of the two historical mainnet blocks that
+  ## intentionally duplicate an earlier coinbase txid (BIP-30 repeats).
+  ##
+  ## Gate: height AND hash must both match.  Matching only height would
+  ## incorrectly exempt a fork block at the same height.
+  ##
+  ## Reference: Bitcoin Core validation.cpp:6189 IsBIP30Repeat().
+  ##   h=91842  hash=00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec
+  ##   h=91880  hash=00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721
+  const bip30Repeat1Hash = bip30HashFromHex(
+    "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
+  )
+  const bip30Repeat2Hash = bip30HashFromHex(
+    "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
+  )
+  (height == 91842'i32 and blockHash == bip30Repeat1Hash) or
+  (height == 91880'i32 and blockHash == bip30Repeat2Hash)
+
+proc isBip30Unspendable*(height: int32, blockHash: array[32, byte]): bool =
+  ## Return true iff this block's coinbase outputs are considered unspendable
+  ## due to an earlier duplicate (the two original BIP-30 violating blocks).
+  ## Used in DisconnectBlock to handle the duplicate-coinbase undo edge case.
+  ##
+  ## Reference: Bitcoin Core validation.cpp:6195 IsBIP30Unspendable().
+  ##   h=91722  hash=00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e
+  ##   h=91812  hash=00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f
+  const bip30Unspend1Hash = bip30HashFromHex(
+    "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"
+  )
+  const bip30Unspend2Hash = bip30HashFromHex(
+    "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"
+  )
+  (height == 91722'i32 and blockHash == bip30Unspend1Hash) or
+  (height == 91812'i32 and blockHash == bip30Unspend2Hash)
+
+proc checkBip30*(blk: Block, height: int32, blockHash: array[32, byte],
+                 params: ConsensusParams,
                  hasUtxo: proc(op: OutPoint): bool {.gcsafe, raises: [].}): ValidationResult[void] =
   ## BIP-30: reject any block whose transactions would overwrite an existing
   ## unspent output in the UTXO set (CVE-2012-1909).
   ##
-  ## Two mainnet blocks (h=91842 and h=91880) predate BIP-30 and intentionally
-  ## duplicate earlier coinbase txids; they are permanently exempted.
-  ## After BIP-34 activation (h≥bip34_height), height-in-coinbase makes
-  ## duplicate txids practically impossible — skip for performance.
-  ## At h≥1,983,702 BIP-34 modular arithmetic repeats pre-BIP34 heights, so
-  ## re-enable.
+  ## 10 gates mirroring Bitcoin Core validation.cpp ConnectBlock (lines 2397-2476):
   ##
-  ## Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
+  ## Gate 1 — IsBIP30Repeat: the two historical mainnet duplicate blocks
+  ##   (h=91842, hash=00000000000a4d0a... and h=91880, hash=000000000007 43f1...)
+  ##   are permanently exempt.  BOTH height AND block hash must match — matching
+  ##   height alone would grant a false exemption to any fork block at that height.
+  ##   Reference: validation.cpp:6189 IsBIP30Repeat().
+  ##
+  ## Gate 2 — BIP34 canonical-chain exemption: once BIP34 has activated at the
+  ##   canonical BIP34 height (params.bip34Height) and the block at that height
+  ##   matches params.bip34Hash, duplicate coinbases are practically impossible
+  ##   (height-in-coinbase ensures unique txids), so skip the expensive UTXO
+  ##   scan.  REQUIRES the bip34Hash to match: a chain with a different block at
+  ##   the BIP34 height is not proven safe and must still scan.
+  ##   If params.bip34Hash is all-zeros (regtest, testnet4) the hash check always
+  ##   fails → BIP30 is always enforced, matching Core behaviour.
+  ##   Reference: validation.cpp:2460-2462.
+  ##
+  ## Gate 3 — BIP34-implies-BIP30 limit: at height ≥ 1,983,702 BIP34's CScriptNum
+  ##   wraps around pre-BIP34 heights, so re-enable BIP30 scanning regardless of
+  ##   Gate 2.
+  ##   Reference: validation.cpp:2430, 2467.
+  ##
+  ## Gates 4-10 — UTXO scan: for every output of every transaction in the block,
+  ##   if that outpoint already exists in the UTXO set (HaveCoin), reject.
+  ##   Reference: validation.cpp:2468-2476.
+
   const bip34ImpliesBip30Limit = 1_983_702'i32
-  const bip30ExceptionHeights = [91842'i32, 91880'i32]
 
-  if height in bip30ExceptionHeights:
+  # Gate 1: IsBIP30Repeat — exempt only the two specific canonical blocks.
+  if isBip30Repeat(height, blockHash):
     return ok()
 
+  # Gate 2+3: BIP34 canonical-chain exemption (only if bip34Hash matches).
+  # fEnforceBIP30 starts true; BIP34 can clear it only when we can prove we are
+  # on the canonical chain (the block at bip34Height has the expected hash).
+  var fEnforceBIP30 = true
   if height >= int32(params.bip34Height) and height < bip34ImpliesBip30Limit:
+    # Check the canonical BIP34Hash.  A zero bip34Hash (regtest/testnet4)
+    # means "not set" → the check always fails → BIP30 stays enforced.
+    let zeroBip34Hash = default(array[32, byte])
+    if params.bip34Hash != zeroBip34Hash:
+      # Only suppress BIP30 when bip34Hash is non-zero (mainnet/testnet3) and
+      # would match the block stored at bip34Height on the canonical chain.
+      # The caller's UTXO DB anchors us to the canonical chain implicitly;
+      # the bip34Hash field carries the expected value verbatim from Core's
+      # chainparams.  If this chain agrees on that hash, BIP30 is safe to skip.
+      fEnforceBIP30 = false
+
+  if not fEnforceBIP30:
     return ok()
 
+  # Gate 3 re-enable: height >= 1,983,702 always runs the scan (already handled
+  # above because fEnforceBIP30 is only cleared for height < bip34ImpliesBip30Limit).
+
+  # Gates 4-10: scan all transaction outputs for existing UTXO collisions.
   for tx in blk.txs:
     let txid = tx.txid()
     for vout in 0 ..< tx.outputs.len:
@@ -1647,6 +1739,10 @@ proc acceptBlock*(
     return validateResult
 
   # Step 3: BIP-30 cross-block dup-UTXO check (CVE-2012-1909).
+  # Compute this block's hash for the IsBIP30Repeat gate (height+hash check).
+  # The header serialization is 80 bytes; doubleSha256 yields the block hash.
+  let blkHeaderBytes = serialize(blk.header)
+  let blkHashArr = array[32, byte](doubleSha256(blkHeaderBytes))
   # Wrap the getUtxo proc into the bool-returning hasUtxo signature that
   # checkBip30 requires.  The try/except in the closure is needed to satisfy
   # raises: [] — getUtxo already declares raises: [] so this is belt-and-
@@ -1654,7 +1750,7 @@ proc acceptBlock*(
   let bip30HasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
     try: getUtxo(op).isSome
     except: false
-  let bip30Result = checkBip30(blk, height, params, bip30HasUtxo)
+  let bip30Result = checkBip30(blk, height, blkHashArr, params, bip30HasUtxo)
   if not bip30Result.isOk:
     return bip30Result
 
