@@ -50,6 +50,10 @@ type
     veNonFinalTx = "non-final transaction: bad-txns-nonfinal"
     veBip30DuplicateOutput = "bad-txns-BIP30: tried to overwrite transaction"
     veOutputsBelowInputs = "transaction outputs exceed inputs (in-belowout)"
+    veTxOversize = "transaction exceeds maximum size (bad-txns-oversize)"
+    veTxOutTotalTooLarge = "sum of outputs exceeds MAX_MONEY (bad-txns-txouttotal-toolarge)"
+    veNullPrevout = "non-coinbase input has null prevout (bad-txns-prevout-null)"
+    veFeesOutOfRange = "accumulated block fees out of range (bad-txns-accumulated-fee-outofrange)"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -134,6 +138,14 @@ proc bip22String*(e: ValidationError): string =
   # Core consensus/tx_verify.cpp::CheckTxInputs:
   #   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
   of veOutputsBelowInputs: "bad-txns-in-belowout"
+  # bad-txns-oversize: single tx base-size * 4 > MAX_BLOCK_WEIGHT (tx_check.cpp:19)
+  of veTxOversize: "bad-txns-oversize"
+  # bad-txns-txouttotal-toolarge: running sum of outputs exceeds MAX_MONEY (tx_check.cpp:33)
+  of veTxOutTotalTooLarge: "bad-txns-txouttotal-toolarge"
+  # bad-txns-prevout-null: non-coinbase input references null outpoint (tx_check.cpp:56)
+  of veNullPrevout: "bad-txns-prevout-null"
+  # bad-txns-accumulated-fee-outofrange: sum of tx fees in block out of range (validation.cpp:2543)
+  of veFeesOutOfRange: "bad-txns-accumulated-fee-outofrange"
   of veOk: ""
   else: "rejected"
 
@@ -664,25 +676,33 @@ proc validateTransaction*(
   if tx.outputs.len == 0:
     return err(int64, veBadOutputValue)
 
-  # Check for duplicate inputs
+  # Check for duplicate inputs (CVE-2018-17144)
   var seenInputs = initTable[string, bool]()
   for inp in tx.inputs:
-    let key = $inp.prevOut.txid & ":" & $inp.prevOut.vout
+    let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
     if key in seenInputs:
       return err(int64, veDuplicateInput)
     seenInputs[key] = true
 
-  # Check output values
+  # Non-coinbase: no null prevouts (Core consensus/tx_check.cpp:54-56)
+  # "bad-txns-prevout-null"
+  if not isCoinbase(tx):
+    for inp in tx.inputs:
+      if inp.prevOut.txid == TxId(default(array[32, byte])) and inp.prevOut.vout == 0xFFFFFFFF'u32:
+        return err(int64, veNullPrevout)
+
+  # Check output values (CVE-2010-5139)
+  # Use distinct error codes matching Core tx_check.cpp / bip22String mapping.
   var totalOutput = int64(0)
   for output in tx.outputs:
     let value = int64(output.value)
     if value < 0:
-      return err(int64, veBadOutputValue)
+      return err(int64, veNegativeOutput)
     if value > int64(MaxMoney):
-      return err(int64, veBadOutputValue)
+      return err(int64, veOutputTooLarge)
     totalOutput += value
     if totalOutput > int64(MaxMoney):
-      return err(int64, veBadOutputValue)
+      return err(int64, veTxOutTotalTooLarge)
 
   # Gather inputs and check availability
   var totalInput = int64(0)
@@ -1231,6 +1251,11 @@ proc validateBlock*(
 
     totalFees += txResult.value
 
+    # Accumulated fees must stay within MoneyRange after each tx.
+    # Core validation.cpp:2543-2547: if (!MoneyRange(nFees)) → "bad-txns-accumulated-fee-outofrange"
+    if totalFees < 0 or totalFees > int64(MaxMoney):
+      return voidErr(veFeesOutOfRange)
+
     # Count sigops for this transaction with proper witness discount
     let sigopResult = getTransactionSigOpCost(tx, lookupUtxo, useP2SH = true, useWitness = useWitnessSigops)
     if sigopResult.isOk:
@@ -1418,22 +1443,35 @@ proc checkBlockHeader*(
   ok()
 
 proc checkTransaction*(tx: Transaction, params: ConsensusParams): ValidationResult[void] =
-  ## Legacy basic transaction validation (without UTXO context)
+  ## Context-free basic transaction validation (without UTXO context).
+  ##
+  ## Gates mirror Bitcoin Core consensus/tx_check.cpp::CheckTransaction:
+  ##   G1  tx.vin not empty                      → "bad-txns-vin-empty"
+  ##   G2  tx.vout not empty                     → "bad-txns-vout-empty"
+  ##   G3  base-size * 4 <= MAX_BLOCK_WEIGHT     → "bad-txns-oversize" (CVE-2010-5141 precursor)
+  ##   G4  each output value >= 0               → "bad-txns-vout-negative"
+  ##   G5  each output value <= MAX_MONEY        → "bad-txns-vout-toolarge"
+  ##   G6  running sum <= MAX_MONEY              → "bad-txns-txouttotal-toolarge"
+  ##   G7  no duplicate (txid, vout) pairs       → "bad-txns-inputs-duplicate" (CVE-2018-17144)
+  ##   G8  coinbase: 2 <= scriptSig.len <= 100   → "bad-cb-length"
+  ##   G9  non-coinbase: no null prevout         → "bad-txns-prevout-null"
+  ## Reference: Bitcoin Core consensus/tx_check.cpp:11-58
 
-  # Must have at least one input and one output
+  # G1: must have at least one input
   if tx.inputs.len == 0:
     return voidErr(veInputsMissing)
+  # G2: must have at least one output
   if tx.outputs.len == 0:
     return voidErr(veBadOutputValue)
 
-  # Check for duplicate inputs
-  for i in 0 ..< tx.inputs.len:
-    for j in (i + 1) ..< tx.inputs.len:
-      if tx.inputs[i].prevOut.txid == tx.inputs[j].prevOut.txid and
-         tx.inputs[i].prevOut.vout == tx.inputs[j].prevOut.vout:
-        return voidErr(veDuplicateInput)
+  # G3: transaction size check — base (non-witness) serialization * 4 must not exceed
+  # MAX_BLOCK_WEIGHT. This is checked BEFORE output values per Core tx_check.cpp order.
+  # Mirrors: GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+  let baseSize = serializeLegacy(tx).len
+  if baseSize * WitnessScaleFactor > MaxBlockWeight:
+    return voidErr(veTxOversize)
 
-  # Check output values
+  # G4-G6: Check output values and running total (CVE-2010-5139)
   # NOTE: check negative before toolarge — mirrors Bitcoin Core
   # consensus/tx_check.cpp::CheckTransaction order.
   var totalOutput = Satoshi(0)
@@ -1444,7 +1482,29 @@ proc checkTransaction*(tx: Transaction, params: ConsensusParams): ValidationResu
       return voidErr(veOutputTooLarge)
     totalOutput = totalOutput + output.value
     if totalOutput > MaxMoney:
-      return voidErr(veBadOutputValue)
+      return voidErr(veTxOutTotalTooLarge)
+
+  # G7: Check for duplicate inputs (CVE-2018-17144)
+  # O(n) with a hash set — same asymptotic complexity as Core's std::set insert.
+  var seenInputs = initTable[string, bool]()
+  for inp in tx.inputs:
+    let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
+    if key in seenInputs:
+      return voidErr(veDuplicateInput)
+    seenInputs[key] = true
+
+  # G8/G9: coinbase vs non-coinbase checks
+  if isCoinbase(tx):
+    # G8: coinbase scriptSig length must be 2..100 bytes
+    let scriptSigLen = tx.inputs[0].scriptSig.len
+    if scriptSigLen < 2 or scriptSigLen > 100:
+      return voidErr(veBadCoinbaseSize)
+  else:
+    # G9: non-coinbase inputs must not reference null outpoints
+    # Core consensus/tx_check.cpp:54-56: if (txin.prevout.IsNull()) → "bad-txns-prevout-null"
+    for inp in tx.inputs:
+      if inp.prevOut.txid == TxId(default(array[32, byte])) and inp.prevOut.vout == 0xFFFFFFFF'u32:
+        return voidErr(veNullPrevout)
 
   ok()
 
