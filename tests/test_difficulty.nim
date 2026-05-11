@@ -129,6 +129,57 @@ suite "compact target conversion (UInt256)":
     let bits = target.getCompact()
     check bits == origBits
 
+  # Overflow tests — matching Bitcoin Core arith_uint256.cpp:190-192.
+  # Pre-fix nimrod silently returned a truncated non-zero value for these inputs,
+  # which could cause a crafted nBits to pass PoW validation when Core rejects it.
+
+  test "setCompact overflow nSize > 34 returns zero":
+    ## nSize = 35 (0x23), any nonzero mantissa -> overflow
+    ## Compact: (35 << 24) | 0x000001 = 0x23000001
+    let bits = 0x23000001'u32
+    let target = setCompact(bits)
+    check target.isZero()
+
+  test "setCompact overflow nSize = 34 nonzero mantissa returns zero":
+    ## nSize = 34 (0x22), mantissa = 0x000001 (nonzero) -> nSize > 34? no.
+    ## nSize > 34 is the first condition; 34 does NOT trigger it.
+    ## mantissa = 0x000001 <= 0xff, so condition 2 (nWord > 0xff && nSize > 33) is false.
+    ## mantissa = 0x000001 <= 0xffff, so condition 3 (nWord > 0xffff && nSize > 32) is false.
+    ## So nSize=34, mantissa=1 is NOT an overflow — it's a valid (near-max) target.
+    let bits = 0x22000001'u32
+    let target = setCompact(bits)
+    # exponent=34, mantissa=1 is valid (not overflow): target = 1 << (31*8) = a 1 in byte 31
+    check not target.isZero()
+
+  test "setCompact overflow nWord > 0xff and nSize > 33 returns zero":
+    ## nSize = 34 (0x22), mantissa = 0x000100 (0x100 > 0xff) -> overflow
+    ## Compact: (34 << 24) | 0x000100 = 0x22000100
+    let bits = 0x22000100'u32
+    let target = setCompact(bits)
+    check target.isZero()
+
+  test "setCompact overflow nWord > 0xffff and nSize > 32 returns zero":
+    ## nSize = 33 (0x21), mantissa = 0x010000 (> 0xffff) -> overflow
+    ## Compact: (33 << 24) | 0x010000 = 0x21010000
+    let bits = 0x21010000'u32
+    let target = setCompact(bits)
+    check target.isZero()
+
+  test "setCompact nSize = 33 mantissa = 0xffff no overflow":
+    ## nSize = 33 (0x21), mantissa = 0x00ffff (0xffff not > 0xffff, and 33 not > 33) -> NOT overflow
+    ## Compact: (33 << 24) | 0x00ffff = 0x2100ffff
+    let bits = 0x2100ffff'u32
+    let target = setCompact(bits)
+    # Should be a valid (very large, near-max) target
+    check not target.isZero()
+
+  test "setCompact nSize = 32 mantissa = 0x7fffff no overflow (regtest-like)":
+    ## nSize = 32 (0x20), mantissa = 0x7fffff -> NOT overflow (nWord <= 0xffff is false,
+    ## but nSize=32 is not > 32, so condition 3 is false; condition 2 needs nSize > 33, false)
+    let bits = 0x207fffff'u32
+    let target = setCompact(bits)
+    check not target.isZero()
+
 suite "PowParams creation":
   test "mainnet params":
     let p = mainnetParams()
@@ -904,4 +955,191 @@ suite "signet difficulty behavior":
     # Should have increased target (decreased difficulty) due to slow blocks
     let oldTarget = setCompact(signetBits)
     let newTarget = setCompact(newBits)
+    check newTarget > oldTarget
+
+suite "checkProofOfWork rejects overflow compact targets":
+  ## Bug: pre-fix nimrod's setCompact silently truncated overflow nBits to a
+  ## non-zero value, which could then pass the powLimit and hash checks.
+  ## Fix: setCompact now returns zero for overflow inputs (matching Core DeriveTarget).
+
+  test "overflow nBits nSize > 34 rejected by checkProofOfWork":
+    let p = mainnetParams()
+    var powParams: PowParams
+    powParams.network = Mainnet
+    powParams.powLimit = p.powLimit
+    # A zero hash meets any non-zero target; this test shows that an overflow
+    # nBits is rejected even though the hash would otherwise pass.
+    var hash: array[32, byte]  # all-zero hash
+    let overflowBits = 0x23000001'u32  # nSize=35 -> overflow
+    check not checkProofOfWork(BlockHash(hash), overflowBits, powParams)
+
+  test "overflow nBits nWord > 0xff and nSize > 33 rejected":
+    let p = mainnetParams()
+    var powParams: PowParams
+    powParams.network = Mainnet
+    powParams.powLimit = p.powLimit
+    var hash: array[32, byte]
+    let overflowBits = 0x22000100'u32  # nSize=34, nWord=0x100 > 0xff -> overflow
+    check not checkProofOfWork(BlockHash(hash), overflowBits, powParams)
+
+  test "overflow nBits nWord > 0xffff and nSize > 32 rejected":
+    let p = mainnetParams()
+    var powParams: PowParams
+    powParams.network = Mainnet
+    powParams.powLimit = p.powLimit
+    var hash: array[32, byte]
+    let overflowBits = 0x21010000'u32  # nSize=33, nWord=0x010000 > 0xffff -> overflow
+    check not checkProofOfWork(BlockHash(hash), overflowBits, powParams)
+
+suite "BIP94 firstBlockBits zero-guard removal":
+  ## Bug: the old calculateNextWorkRequired had `if params.enforceBIP94 and firstBlockBits != 0`.
+  ## This silently fell back to lastIndex.header.bits when firstBlockBits == 0, which
+  ## would be wrong if the first block of a BIP94 period legitimately had nBits == 0.
+  ## Fix: removed the `!= 0` guard — enforceBIP94 unconditionally uses firstBlockBits.
+  ##
+  ## In practice nBits == 0 cannot appear on a real chain.  This test verifies
+  ## the structural fix: the caller (getNextWorkRequired) now always passes
+  ## firstIndex.header.bits for BIP94 nets, and calculateNextWorkRequired uses it
+  ## without any extra guard.
+
+  test "BIP94 retarget with exact-target period uses firstBlockBits":
+    ## Replicates the existing BIP94 test but via calculateNextWorkRequired directly,
+    ## confirming the function uses firstBlockBits (not lastIndex.header.bits) when
+    ## enforceBIP94 = true.
+    let p = testnet4Params()
+    var powParams: PowParams
+    powParams.network = Testnet4
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powNoRetargeting = false
+    powParams.enforceBIP94 = true
+
+    let realBits = 0x1c123456'u32
+    let differentBits = 0x1d00ffff'u32  # powLimit — different from realBits
+
+    # lastIndex has differentBits; firstBlockBits = realBits
+    let lastIndex = pow.BlockIndex(
+      height: 2015,
+      header: BlockHeader(
+        bits: differentBits,
+        timestamp: uint32(p.powTargetTimespan)  # exact target timespan -> no change
+      )
+    )
+
+    # With BIP94: should use firstBlockBits (realBits), result ≈ realBits (exact timespan)
+    let newBits = calculateNextWorkRequired(lastIndex, 0, powParams, realBits)
+
+    # Without BIP94 guard bug: would use differentBits (lastIndex.header.bits) -> wrong
+    let wrongBits = calculateNextWorkRequired(pow.BlockIndex(
+      height: 2015,
+      header: BlockHeader(bits: differentBits, timestamp: uint32(p.powTargetTimespan))
+    ), 0, PowParams(
+      network: Testnet4,
+      powLimit: p.powLimit,
+      powTargetTimespan: p.powTargetTimespan,
+      powTargetSpacing: p.powTargetSpacing,
+      powNoRetargeting: false,
+      enforceBIP94: false  # non-BIP94 to simulate old buggy behaviour
+    ))
+
+    # BIP94 result should differ from non-BIP94 when bits differ
+    check newBits != wrongBits
+    # BIP94 result should match realBits (exact timespan → no change)
+    check newBits == realBits
+
+suite "clamp boundary values":
+  ## Verify the exact min/max clamp values match Core:
+  ## minTimespan = 1_209_600 / 4 = 302_400
+  ## maxTimespan = 1_209_600 * 4 = 4_838_400
+
+  test "actualTimespan below min clamp 302_400 is clamped":
+    let p = mainnetParams()
+    var powParams: PowParams
+    powParams.network = Mainnet
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powNoRetargeting = false
+
+    # actualTimespan = 1 (far below 302_400) should give same result as actualTimespan = 302_400
+    let bits = 0x1c00ffff'u32
+    let lastIndex1 = pow.BlockIndex(
+      height: 2015,
+      header: BlockHeader(bits: bits, timestamp: 1)
+    )
+    let lastIndex2 = pow.BlockIndex(
+      height: 2015,
+      header: BlockHeader(bits: bits, timestamp: 302_400)
+    )
+
+    let result1 = calculateNextWorkRequired(lastIndex1, 0, powParams)
+    let result2 = calculateNextWorkRequired(lastIndex2, 0, powParams)
+    check result1 == result2
+
+  test "actualTimespan above max clamp 4_838_400 is clamped":
+    let p = mainnetParams()
+    var powParams: PowParams
+    powParams.network = Mainnet
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powNoRetargeting = false
+
+    # actualTimespan = 10_000_000 (far above 4_838_400) should give same result as 4_838_400
+    let bits = 0x1c00ffff'u32
+    let lastIndex1 = pow.BlockIndex(
+      height: 2015,
+      header: BlockHeader(bits: bits, timestamp: 10_000_000)
+    )
+    let lastIndex2 = pow.BlockIndex(
+      height: 2015,
+      header: BlockHeader(bits: bits, timestamp: 4_838_400)
+    )
+
+    let result1 = calculateNextWorkRequired(lastIndex1, 0, powParams)
+    let result2 = calculateNextWorkRequired(lastIndex2, 0, powParams)
+    check result1 == result2
+
+  test "actualTimespan exactly at min clamp boundary":
+    let p = mainnetParams()
+    var powParams: PowParams
+    powParams.network = Mainnet
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powNoRetargeting = false
+
+    let bits = 0x1c00ffff'u32
+    let lastIndex = pow.BlockIndex(
+      height: 2015,
+      header: BlockHeader(bits: bits, timestamp: 302_400)  # exactly at min
+    )
+
+    let result = calculateNextWorkRequired(lastIndex, 0, powParams)
+    # 302_400 / 1_209_600 = 1/4: difficulty should be 4x harder
+    let oldTarget = setCompact(bits)
+    let newTarget = setCompact(result)
+    # newTarget = oldTarget * 302_400 / 1_209_600 = oldTarget / 4
+    check newTarget < oldTarget
+
+  test "actualTimespan exactly at max clamp boundary":
+    let p = mainnetParams()
+    var powParams: PowParams
+    powParams.network = Mainnet
+    powParams.powLimit = p.powLimit
+    powParams.powTargetTimespan = p.powTargetTimespan
+    powParams.powTargetSpacing = p.powTargetSpacing
+    powParams.powNoRetargeting = false
+
+    let bits = 0x1c00ffff'u32
+    let lastIndex = pow.BlockIndex(
+      height: 2015,
+      header: BlockHeader(bits: bits, timestamp: 4_838_400)  # exactly at max
+    )
+
+    let result = calculateNextWorkRequired(lastIndex, 0, powParams)
+    # 4_838_400 / 1_209_600 = 4: difficulty should be 4x easier
+    let oldTarget = setCompact(bits)
+    let newTarget = setCompact(result)
     check newTarget > oldTarget
