@@ -2,7 +2,7 @@
 ## Stores the UTXOs consumed by each block's transactions
 ## Uses flat file storage (rev*.dat) with checksums for integrity
 
-import std/[os, options, streams]
+import std/[os, options, streams, tables]
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 import ../consensus/params
@@ -319,30 +319,66 @@ proc readBlockUndo*(
 type
   UtxoLookup* = proc(outpoint: OutPoint): Option[tuple[output: TxOut, height: int32, isCoinbase: bool]]
 
-proc generateBlockUndo*(blk: Block, utxoLookup: UtxoLookup): BlockUndo =
-  ## Generate undo data for a block by looking up all spent UTXOs
-  ## This should be called BEFORE the block is connected to preserve UTXO state
+proc generateBlockUndo*(blk: Block, utxoLookup: UtxoLookup,
+                        height: int32 = -1): BlockUndo =
+  ## Generate undo data for a block by looking up all spent UTXOs.
+  ## This should be called BEFORE the block is connected to preserve UTXO state.
   ##
-  ## utxoLookup: function to look up UTXO by outpoint
-
+  ## utxoLookup: function to look up UTXO by outpoint.
+  ## height: height of the block being connected; used as the creation-height
+  ## stamp for any intra-block output spent later in the same block.  Pass -1
+  ## (default) to use 0 — only callers that consume the undo for disconnect
+  ## need an accurate height, and pure consensus correctness is preserved
+  ## either way (the height stamp only affects subsequent maturity checks
+  ## post-disconnect).
+  ##
+  ## W93 Gate (Core val:2600 / coins.cpp AddCoins): a later tx in the same
+  ## block may spend an output created by an earlier tx in the same block.
+  ## In Bitcoin Core, UpdateCoins runs incrementally per-tx so the view sees
+  ## intra-block coins.  Here we run before any state mutation, so we must
+  ## track intra-block outputs locally — otherwise disconnectBlock fails the
+  ## vin-count gate (chainstate.nim:1470 — Bitcoin Core val:2229-2232).
+  let coinHeight = if height >= 0: height else: 0'i32
+  var intra = initTable[string, tuple[output: TxOut, height: int32, isCoinbase: bool]]()
   for txIdx, tx in blk.txs:
-    # Skip coinbase (has no inputs to spend)
     if txIdx == 0:
+      # Index coinbase outputs as intra-block candidates.  Note: this proc
+      # has no access to IsUnspendable (it lives in primitives), so we
+      # include all outputs — the lookup is keyed by outpoint, so spurious
+      # OP_RETURN entries are simply never read.
+      let cbTxid = tx.txid()
+      for vout, output in tx.outputs:
+        let key = $array[32, byte](cbTxid) & ":" & $vout
+        intra[key] = (output, coinHeight, true)
       continue
 
     var txUndo = TxUndo()
-
     for input in tx.inputs:
-      let utxoOpt = utxoLookup(input.prevOut)
-      if utxoOpt.isSome:
-        let (output, height, isCoinbase) = utxoOpt.get()
+      let intraKey = $array[32, byte](input.prevOut.txid) & ":" & $input.prevOut.vout
+      if intraKey in intra:
+        let (output, h, isCb) = intra[intraKey]
         txUndo.prevOutputs.add(SpentOutput(
           output: output,
-          height: height,
-          isCoinbase: isCoinbase
+          height: h,
+          isCoinbase: isCb
         ))
-
+        intra.del(intraKey)
+        continue
+      let utxoOpt = utxoLookup(input.prevOut)
+      if utxoOpt.isSome:
+        let (output, h, isCb) = utxoOpt.get()
+        txUndo.prevOutputs.add(SpentOutput(
+          output: output,
+          height: h,
+          isCoinbase: isCb
+        ))
     result.txUndo.add(txUndo)
+
+    # After this tx, add its outputs to the intra-block index.
+    let thisTxid = tx.txid()
+    for vout, output in tx.outputs:
+      let key = $array[32, byte](thisTxid) & ":" & $vout
+      intra[key] = (output, coinHeight, false)
 
 # ============================================================================
 # Helper to check if position is valid
