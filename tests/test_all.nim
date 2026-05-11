@@ -86,6 +86,7 @@ import ./test_bip331
 import ./test_mempool_persist
 import ./test_ops
 import ./test_snapshot
+import ./test_weight_vsize
 
 when isMainModule:
   echo "Running all tests..."

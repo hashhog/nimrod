@@ -224,6 +224,30 @@ proc calculateTransactionWeight*(tx: Transaction): int =
   let baseSize = serializeLegacy(tx).len
   (baseSize * 3) + fullSize
 
+proc getSigOpsAdjustedWeight*(weight: int64, sigopCost: int64, bytesPerSigop: int = DefaultBytesPerSigop): int64 =
+  ## Return the weight adjusted upward for expensive sigops, matching
+  ## Bitcoin Core GetSigOpsAdjustedWeight (policy/policy.cpp:390-393).
+  ## weight_adjusted = max(weight, sigopCost * bytesPerSigop)
+  ## When bytesPerSigop == 0 the sigop term is ignored (no adjustment).
+  if bytesPerSigop == 0:
+    return weight
+  max(weight, sigopCost * int64(bytesPerSigop))
+
+proc getVirtualTransactionSize*(weight: int64, sigopCost: int64, bytesPerSigop: int = DefaultBytesPerSigop): int64 =
+  ## Compute the virtual transaction size (weight reinterpreted as vbytes)
+  ## with optional sigop-cost adjustment.
+  ## Mirrors Bitcoin Core GetVirtualTransactionSize (policy/policy.cpp:395-398):
+  ##   vsize = ceil(max(weight, sigopCost * bytesPerSigop) / WITNESS_SCALE_FACTOR)
+  ##         = (getSigOpsAdjustedWeight(...) + 3) / 4
+  ## When sigopCost == 0 and bytesPerSigop == 0 this reduces to ceil(weight/4).
+  (getSigOpsAdjustedWeight(weight, sigopCost, bytesPerSigop) + int64(WitnessScaleFactor) - 1) div int64(WitnessScaleFactor)
+
+proc getVirtualTransactionSize*(tx: Transaction, sigopCost: int64 = 0, bytesPerSigop: int = DefaultBytesPerSigop): int64 =
+  ## Convenience overload: compute vsize directly from a Transaction.
+  ## Mirrors Bitcoin Core GetVirtualTransactionSize(const CTransaction&, ...)
+  ## (policy/policy.cpp:400-403 and policy/policy.h:186-189).
+  getVirtualTransactionSize(int64(calculateTransactionWeight(tx)), sigopCost, bytesPerSigop)
+
 # Coinbase validation
 proc isCoinbase*(tx: Transaction): bool =
   ## Check if transaction is a coinbase transaction
