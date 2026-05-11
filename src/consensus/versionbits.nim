@@ -55,6 +55,10 @@ type
 const
   AlwaysActive* = -1'i64       ## Deployment always active (for testing)
   NeverActive* = -2'i64        ## Deployment never active
+  ## NO_TIMEOUT: deployment never expires (Core BIP9Deployment::NO_TIMEOUT =
+  ## std::numeric_limits<int64_t>::max()). Using high(int64) here.
+  ## Reference: consensus/params.h:70.
+  NoTimeout* = high(int64)
 
   # Version bits constants
   VersionBitsTopBits* = 0x20000000'i32   ## Top 3 bits = 001 for BIP9 signaling
@@ -63,14 +67,20 @@ const
 
   # Standard deployment parameters
   MainnetPeriod* = 2016
-  MainnetThreshold* = 1815     ## 90% of 2016
-  TestnetThreshold* = 1512     ## 75% of 2016
+  MainnetThreshold* = 1815     ## 90% of 2016 (mainnet 95%, adjusted to 90% for taproot/BIP341)
+  TestnetThreshold* = 1512     ## 75% of 2016 (testnet3/testnet4 per BIP9 suggestion)
+  RegtestPeriod* = 144         ## Faster period for regtest (Core chainparams.cpp:555)
+  RegtestThreshold* = 108      ## 75% of 144 for regtest (Core chainparams.cpp:554)
 
 # Standard deployment indices (matches Bitcoin Core DeploymentPos)
+# NOTE: In current Bitcoin Core, MAX_VERSION_BITS_DEPLOYMENTS = 1 (only TESTDUMMY).
+# Taproot is a buried deployment (activated by height 709632), not a live BIP-9
+# versionbits deployment.  We keep dpTaproot here for the RPC getblockchaininfo
+# "softforks" output but it MUST NOT be included in computeBlockVersion loops.
+# Reference: consensus/params.h:37-42, deploymentinfo.cpp:11-16.
 type
   DeploymentPos* = enum
     dpTestDummy = 0
-    dpTaproot = 1
 
 # Helper to get deployment mask for a bit position
 proc deploymentMask*(bit: int): uint32 {.inline.} =
@@ -510,21 +520,78 @@ proc taprootDeployment*(network: Network): BIP9Deployment =
       threshold: 108
     )
 
-proc testDummyDeployment*(): BIP9Deployment =
-  ## Test deployment for verification (matches Bitcoin Core TESTDUMMY)
-  BIP9Deployment(
-    name: "testdummy",
-    bit: 28,
-    startTime: NeverActive,
-    timeout: 0,
-    minActivationHeight: 0,
-    period: MainnetPeriod,
-    threshold: MainnetThreshold
-  )
+proc testDummyDeployment*(network: Network): BIP9Deployment =
+  ## Get TESTDUMMY deployment parameters for a network.
+  ##
+  ## Reference: Bitcoin Core kernel/chainparams.cpp:
+  ##   mainnet  (line 102-107): NEVER_ACTIVE, NO_TIMEOUT, period=2016, threshold=1815 (90%)
+  ##   testnet3 (line 225-230): NEVER_ACTIVE, NO_TIMEOUT, period=2016, threshold=1512 (75%)
+  ##   testnet4 (line 325-330): NEVER_ACTIVE, NO_TIMEOUT, period=2016, threshold=1512 (75%)
+  ##   signet   (line 468-473): NEVER_ACTIVE, NO_TIMEOUT, period=2016, threshold=1815 (90%)
+  ##   regtest  (line 550-555): startTime=0,  NO_TIMEOUT, period=144,  threshold=108  (75%)
+  ##
+  ## BUGS fixed (W91):
+  ##   Bug 1: timeout was 0 for all networks — must be NoTimeout (INT64_MAX).
+  ##          With timeout=0, MTP>=0 is always true so STARTED immediately fails.
+  ##          This only bites when startTime != NeverActive (i.e. regtest).
+  ##   Bug 2: regtest used NeverActive/period=2016/threshold=1815 instead of
+  ##          startTime=0/period=144/threshold=108.
+  ##   Bug 3: testnet3/testnet4 threshold was 1815 instead of 1512.
+  case network
+  of Mainnet:
+    # 90% threshold, Core kernel/chainparams.cpp:106
+    BIP9Deployment(
+      name: "testdummy",
+      bit: 28,
+      startTime: NeverActive,
+      timeout: NoTimeout,
+      minActivationHeight: 0,
+      period: MainnetPeriod,
+      threshold: MainnetThreshold
+    )
+  of Testnet3, Testnet4:
+    # 75% threshold, Core kernel/chainparams.cpp:229 / 329
+    BIP9Deployment(
+      name: "testdummy",
+      bit: 28,
+      startTime: NeverActive,
+      timeout: NoTimeout,
+      minActivationHeight: 0,
+      period: MainnetPeriod,
+      threshold: TestnetThreshold
+    )
+  of Signet:
+    # 90% threshold, Core kernel/chainparams.cpp:472
+    BIP9Deployment(
+      name: "testdummy",
+      bit: 28,
+      startTime: NeverActive,
+      timeout: NoTimeout,
+      minActivationHeight: 0,
+      period: MainnetPeriod,
+      threshold: MainnetThreshold
+    )
+  of Regtest:
+    # Core kernel/chainparams.cpp:550-555
+    # startTime=0 (NOT NEVER_ACTIVE — testdummy is activatable on regtest)
+    # period=144, threshold=108 (75% of 144)
+    BIP9Deployment(
+      name: "testdummy",
+      bit: 28,
+      startTime: 0,
+      timeout: NoTimeout,
+      minActivationHeight: 0,
+      period: RegtestPeriod,
+      threshold: RegtestThreshold
+    )
 
 proc getDeployments*(network: Network): seq[BIP9Deployment] =
-  ## Get all deployments for a network
-  @[
-    testDummyDeployment(),
-    taprootDeployment(network)
-  ]
+  ## Get the active BIP-9 versionbits deployments for a network.
+  ##
+  ## Only deployments that are STILL live BIP-9 versionbits deployments are
+  ## returned here (i.e., not yet buried).  In current Bitcoin Core there is
+  ## exactly one: DEPLOYMENT_TESTDUMMY (MAX_VERSION_BITS_DEPLOYMENTS = 1).
+  ## Taproot was buried at height 709632 and is NOT a live versionbits deployment.
+  ##
+  ## Reference: consensus/params.h:37-42, deploymentinfo.cpp:11-16.
+  @[testDummyDeployment(network)]
