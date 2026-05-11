@@ -41,6 +41,9 @@ type
     descendantLimit*: int   ## Max descendant count including self (default 25)
     ancestorSizeLimit*: int ## Max total ancestor vsize in vbytes (default 101,000)
     descendantSizeLimit*: int ## Max total descendant vsize in vbytes (default 101,000)
+    ## Cluster limits (Bitcoin Core cluster mempool, policy/policy.h:72-74)
+    clusterLimit*: int      ## Max transactions per cluster (default 64)
+    clusterSizeLimit*: int  ## Max total cluster vsize in vbytes (default 101,000)
 
 const
   DefaultMaxMempoolSize* = 300_000_000  ## 300 MB
@@ -48,12 +51,24 @@ const
   MaxStandardTxWeight* = 400_000        ## 400K weight units max per tx
 
   ## Package limits (Bitcoin Core defaults)
-  DefaultAncestorLimit* = 25            ## Max ancestors including self
-  DefaultDescendantLimit* = 25          ## Max descendants including self
+  DefaultAncestorLimit* = 25            ## Max ancestors including self (policy/policy.h:76)
+  DefaultDescendantLimit* = 25          ## Max descendants including self (policy/policy.h:78)
   DefaultAncestorSizeLimitKvB* = 101    ## Max total ancestor vsize in kvB
   DefaultDescendantSizeLimitKvB* = 101  ## Max total descendant vsize in kvB
   DefaultAncestorSizeLimit* = DefaultAncestorSizeLimitKvB * 1000  ## 101,000 vbytes
   DefaultDescendantSizeLimit* = DefaultDescendantSizeLimitKvB * 1000  ## 101,000 vbytes
+
+  ## Cluster limits (Bitcoin Core cluster mempool, policy/policy.h:72-74)
+  DefaultClusterLimit* = 64             ## Max transactions per cluster (DEFAULT_CLUSTER_LIMIT)
+  DefaultClusterSizeLimitKvB* = 101     ## Max total cluster vsize in kvB (DEFAULT_CLUSTER_SIZE_LIMIT_KVB)
+  DefaultClusterSizeLimit* = DefaultClusterSizeLimitKvB * 1000  ## 101,000 vbytes
+
+  ## Extra descendant allowance for CPFP packages (policy/policy.h:90):
+  ## a tx with exactly 1 in-mempool ancestor is accepted even if it would
+  ## push the ancestor's descendant vsize above the normal limit, as long
+  ## as the tx's own vsize <= EXTRA_DESCENDANT_TX_SIZE_LIMIT.  This lets
+  ## small CPFP fee-bumpers get in even when the parent is at the boundary.
+  ExtraDescendantTxSizeLimit* = 10_000  ## 10 kvB (EXTRA_DESCENDANT_TX_SIZE_LIMIT)
 
   ## RBF constants (Bitcoin Core: util/rbf.h, policy/rbf.h)
   MaxBip125RbfSequence* = 0xfffffffd'u32  ## nSequence threshold: any input <= this signals opt-in RBF
@@ -110,7 +125,9 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
                  ancestorLimit: int = DefaultAncestorLimit,
                  descendantLimit: int = DefaultDescendantLimit,
                  ancestorSizeLimit: int = DefaultAncestorSizeLimit,
-                 descendantSizeLimit: int = DefaultDescendantSizeLimit): Mempool =
+                 descendantSizeLimit: int = DefaultDescendantSizeLimit,
+                 clusterLimit: int = DefaultClusterLimit,
+                 clusterSizeLimit: int = DefaultClusterSizeLimit): Mempool =
   Mempool(
     entries: initTable[TxId, MempoolEntry](),
     spentBy: initTable[OutPoint, TxId](),
@@ -123,7 +140,9 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
     ancestorLimit: ancestorLimit,
     descendantLimit: descendantLimit,
     ancestorSizeLimit: ancestorSizeLimit,
-    descendantSizeLimit: descendantSizeLimit
+    descendantSizeLimit: descendantSizeLimit,
+    clusterLimit: clusterLimit,
+    clusterSizeLimit: clusterSizeLimit
   )
 
 # Basic accessors
@@ -666,48 +685,84 @@ proc calculateDescendantStats*(mp: Mempool, txid: TxId): (int, int) =
 
 # Check package limits for a new transaction
 proc checkPackageLimits*(mp: Mempool, tx: Transaction, weight: int): MempoolResult[void] =
-  ## Check if adding this transaction would violate ancestor/descendant limits
-  ## Returns ok(()) if limits are satisfied, err(msg) otherwise
+  ## Check if adding this transaction would violate ancestor/descendant/cluster limits.
+  ##
+  ## Gates enforced (matching Bitcoin Core policy/policy.h + validation.cpp):
+  ##   G1  ancestor count  <= ancestorLimit (default 25)
+  ##   G2  ancestor vsize  <= ancestorSizeLimit (default 101,000 vB)
+  ##   G3  each ancestor's descendant count after add  <= descendantLimit (25)
+  ##   G4  each ancestor's descendant vsize after add  <= descendantSizeLimit (101,000 vB)
+  ##       … with EXTRA_DESCENDANT_TX_SIZE_LIMIT exception (G5):
+  ##   G5  if tx has exactly 1 in-mempool ancestor AND vsize <= 10,000 vB, skip G4
+  ##       (EXTRA_DESCENDANT_TX_SIZE_LIMIT, policy/policy.h:90)
+  ##   G6  cluster count (tx + all ancestors) <= clusterLimit (default 64)
+  ##   G7  cluster vsize  <= clusterSizeLimit (default 101,000 vB)
+  ##
+  ## Returns ok(()) if all limits are satisfied, err(msg) otherwise.
 
   let vsize = (weight + 3) div 4
 
   # Calculate ancestor stats for the new transaction
   let (ancestorCount, ancestorSize) = mp.calculateAncestorStats(tx, vsize)
 
-  # Check ancestor count limit (including self)
+  # G1: ancestor count limit (including self)
   if ancestorCount > mp.ancestorLimit:
     return err(void, "exceeds ancestor limit: " & $ancestorCount & " > " & $mp.ancestorLimit)
 
-  # Check ancestor size limit
+  # G2: ancestor size limit
   if ancestorSize > mp.ancestorSizeLimit:
     return err(void, "exceeds ancestor size limit: " & $ancestorSize & " vB > " & $mp.ancestorSizeLimit & " vB")
 
-  # Check descendant limits for each ancestor
-  # Adding this tx increases each ancestor's descendant count by 1 and size by vsize
+  # Compute the ancestor set once (used in G3/G4/G5/G6/G7).
   let ancestors = mp.calculateAncestors(tx)
+
+  # G5 precondition: tx qualifies for extra-descendant allowance if it has
+  # exactly 1 in-mempool ancestor AND its own vsize <= ExtraDescendantTxSizeLimit.
+  # When the allowance applies we skip the descendant VSIZE check (G4) for that
+  # ancestor — but we still enforce the descendant COUNT check (G3).
+  # Core reference: policy/policy.h:90 EXTRA_DESCENDANT_TX_SIZE_LIMIT comment.
+  let extraDescAllowed = (ancestors.len == 1) and (vsize <= ExtraDescendantTxSizeLimit)
+
+  # G3/G4: Check descendant limits for each ancestor.
+  # Adding this tx increases each ancestor's descendant count by 1 and size by vsize.
   for ancestorTxid in ancestors:
     let (descCount, descSize) = mp.calculateDescendantStats(ancestorTxid)
-    # After adding the new tx, the ancestor would have descCount + 1 descendants
-    # and descSize + vsize total descendant size
+
+    # G3: descendant count
     if descCount + 1 > mp.descendantLimit:
       return err(void, "would exceed descendant limit for ancestor " & $ancestorTxid &
                        ": " & $(descCount + 1) & " > " & $mp.descendantLimit)
-    if descSize + vsize > mp.descendantSizeLimit:
-      return err(void, "would exceed descendant size limit for ancestor " & $ancestorTxid &
-                       ": " & $(descSize + vsize) & " vB > " & $mp.descendantSizeLimit & " vB")
 
-  # Also check immediate parents (mempool entries this tx spends from)
-  # These need the descendant check too
+    # G4 (with G5 exception): descendant vsize
+    if not extraDescAllowed:
+      if descSize + vsize > mp.descendantSizeLimit:
+        return err(void, "would exceed descendant size limit for ancestor " & $ancestorTxid &
+                         ": " & $(descSize + vsize) & " vB > " & $mp.descendantSizeLimit & " vB")
+
+  # Also check immediate parents (mempool entries this tx spends from) in case
+  # calculateAncestors missed an edge (shouldn't happen, belt-and-braces).
   for input in tx.inputs:
     if input.prevOut.txid in mp.entries:
       let parentTxid = input.prevOut.txid
       if parentTxid notin ancestors:
-        # This shouldn't happen, but handle it anyway
         let (descCount, descSize) = mp.calculateDescendantStats(parentTxid)
         if descCount + 1 > mp.descendantLimit:
           return err(void, "would exceed descendant limit for parent " & $parentTxid)
-        if descSize + vsize > mp.descendantSizeLimit:
-          return err(void, "would exceed descendant size limit for parent " & $parentTxid)
+        if not extraDescAllowed:
+          if descSize + vsize > mp.descendantSizeLimit:
+            return err(void, "would exceed descendant size limit for parent " & $parentTxid)
+
+  # G6: cluster count — the cluster of this tx consists of itself + all ancestors.
+  # (In a full cluster-mempool implementation the cluster boundary includes all
+  # transactions connected via ancestor/descendant links; here we conservatively
+  # use the ancestor-set + self as a lower-bound proxy.)
+  let clusterCount = ancestors.len + 1  # +1 for the tx itself
+  if clusterCount > mp.clusterLimit:
+    return err(void, "too-large-cluster: cluster count " & $clusterCount & " > " & $mp.clusterLimit)
+
+  # G7: cluster vsize (ancestor vsize including self already computed as ancestorSize)
+  if ancestorSize > mp.clusterSizeLimit:
+    return err(void, "too-large-cluster: cluster vsize " & $ancestorSize & " vB > " & $mp.clusterSizeLimit & " vB")
 
   MempoolResult[void](isOk: true)
 

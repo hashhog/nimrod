@@ -11,8 +11,9 @@ import std/[tables, algorithm, sets, options, hashes, sequtils]
 import ../primitives/types
 
 const
-  ## Maximum cluster size (replaces ancestor/descendant limits)
-  MaxClusterSize* = 100
+  ## Maximum cluster count (transactions per cluster). Bitcoin Core
+  ## DEFAULT_CLUSTER_LIMIT = 64 (policy/policy.h:72).
+  MaxClusterSize* = 64
 
 type
   ## Fee fraction: fee and size for calculating fee rate
