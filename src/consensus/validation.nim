@@ -8,6 +8,7 @@ import ../storage/chainstate
 import ../script/interpreter
 import ../perf/sig_cache
 import ./params
+from ./pow import nil
 
 export params
 export sig_cache
@@ -54,6 +55,9 @@ type
     veTxOutTotalTooLarge = "sum of outputs exceeds MAX_MONEY (bad-txns-txouttotal-toolarge)"
     veNullPrevout = "non-coinbase input has null prevout (bad-txns-prevout-null)"
     veFeesOutOfRange = "accumulated block fees out of range (bad-txns-accumulated-fee-outofrange)"
+    veIncorrectProofOfWork = "incorrect proof of work (bad-diffbits)"
+    veTimeWarpAttack = "block timestamp too early on diff adjustment block (time-timewarp-attack)"
+    veTimeTooNew = "block timestamp too far in the future (time-too-new)"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -146,6 +150,14 @@ proc bip22String*(e: ValidationError): string =
   of veNullPrevout: "bad-txns-prevout-null"
   # bad-txns-accumulated-fee-outofrange: sum of tx fees in block out of range (validation.cpp:2543)
   of veFeesOutOfRange: "bad-txns-accumulated-fee-outofrange"
+  # incorrect proof of work: nBits doesn't match GetNextWorkRequired (validation.cpp:4089)
+  of veIncorrectProofOfWork: "bad-diffbits"
+  # time-timewarp-attack: BIP94 diff-adjustment block too far back (validation.cpp:4102)
+  of veTimeWarpAttack: "time-timewarp-attack"
+  # time-too-new: block timestamp too far in the future (validation.cpp:4109)
+  of veTimeTooNew: "time-too-new"
+  # bad-version: obsolete block version after BIP34/66/65 activation (validation.cpp:4116)
+  of veBadBlockVersion: "bad-version"
   of veOk: ""
   else: "rejected"
 
@@ -751,30 +763,131 @@ proc validateBlockHeader*(
   params: ConsensusParams,
   checkPow: bool = true
 ): ValidationResult[void] =
-  ## Validate block header against consensus rules
+  ## Validate block header against consensus rules.
+  ##
+  ## Checks: PoW hash meets nBits target, timestamp not too far in future,
+  ## and prevBlock hash matches.
+  ##
+  ## NOTE: This proc does NOT have access to the chain DB, so it cannot
+  ## enforce MTP (time-too-old), bad-diffbits, bad-version, or
+  ## time-timewarp-attack. Those contextual checks are performed by
+  ## contextualCheckBlockHeader (called from validateBlock).
 
-  # Check proof of work
+  # Check proof of work — hash must be <= target encoded by nBits.
+  # Core validation.cpp CheckBlockHeader: just the hash-meets-target gate.
   if checkPow:
     let headerBytes = serialize(header)
     let hash = BlockHash(doubleSha256(headerBytes))
     if not hashMeetsTarget(hash, header.bits):
       return voidErr(veExceedsTarget)
 
-  # Check timestamp > MTP of previous 11 blocks
-  # For simplicity, just check against previous block for now
-  # Full MTP check requires access to previous 11 headers
-  if header.timestamp <= prevIndex.header.timestamp:
-    # This is a simplified check - full implementation would use MTP
-    discard  # Allow for now, full MTP check done in validateBlock
+  # Check timestamp not too far in future (time-too-new).
+  # Core: block.Time() > NodeClock::now() + MAX_FUTURE_BLOCK_TIME (validation.cpp:4108).
+  # Use int64 arithmetic to avoid uint32 wrap-around when now is large.
+  let nowSec = getTime().toUnix()
+  if int64(header.timestamp) > nowSec + int64(MaxFutureBlockTime):
+    return voidErr(veTimeTooNew)
 
-  # Check timestamp not too far in future
-  let now = getTime().toUnix().uint32
-  if header.timestamp > now + uint32(MaxFutureBlockTime):
-    return voidErr(veBadTimestamp)
-
-  # Check previous block hash matches
+  # Check previous block hash matches.
   if header.prevBlock != prevIndex.hash:
     return voidErr(vePrevBlockMissing)
+
+  ok()
+
+# MAX_TIMEWARP constant (consensus/consensus.h:35, BIP94)
+const MaxTimeWarp* = 600'i64
+
+proc contextualCheckBlockHeader*(
+  header: BlockHeader,
+  prevIndex: BlockIndex,
+  utxos: ChainDb,
+  params: ConsensusParams
+): ValidationResult[void] =
+  ## Contextual block-header validation that requires chain state.
+  ##
+  ## Implements Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4080-4121):
+  ##
+  ## Gate 1  (bad-diffbits, line 4088): header.nBits must equal GetNextWorkRequired.
+  ## Gate 2  (time-too-old,  line 4092): timestamp > MedianTimePast of prev 11 blocks.
+  ## Gate 3  (time-timewarp-attack, line 4097-4105): BIP94 anti-timewarp on
+  ##           difficulty adjustment blocks (testnet4/regtest w/ enforceBIP94 only).
+  ## Gate 4  (bad-version, line 4113-4118): reject obsolete nVersion after
+  ##           BIP34 (< 2), BIP66 (< 3), BIP65 (< 4) activation.
+  ##
+  ## NOTE: time-too-new is enforced in validateBlockHeader (no chain access needed).
+
+  let height = prevIndex.height + 1
+
+  # Gate 1: bad-diffbits — nBits must match GetNextWorkRequired.
+  # Core validation.cpp:4088-4089.
+  # Build a pow.BlockIndex for the prev block so we can call into pow.nim.
+  let powPrev = pow.BlockIndex(
+    height: prevIndex.height,
+    header: prevIndex.header,
+    hash: prevIndex.hash
+  )
+
+  # getAncestor callback: walks the chain DB by hash using prevHash links.
+  # pow.nim calls this to reach back 2015 blocks at retarget boundaries.
+  proc getAncestor(idx: pow.BlockIndex, targetHeight: int32): pow.BlockIndex =
+    ## Walk the stored chain back to targetHeight starting from idx.
+    var cur = pow.BlockIndex(height: idx.height, header: idx.header, hash: idx.hash)
+    while cur.height > targetHeight:
+      let parentOpt = utxos.getBlockIndex(cur.header.prevBlock)
+      if parentOpt.isNone:
+        # Ancestor missing — return what we have (best-effort; PoW check will
+        # fail naturally if nBits is wrong, and we can't compute expected bits
+        # without the full chain). Return a zero index at the target height.
+        return pow.BlockIndex(height: targetHeight, header: default(BlockHeader), hash: default(BlockHash))
+      let parent = parentOpt.get()
+      cur = pow.BlockIndex(height: parent.height, header: parent.header, hash: parent.hash)
+    cur
+
+  let powNetwork: pow.NetworkKind = case params.network
+    of Mainnet:  pow.Mainnet
+    of Testnet3: pow.Testnet3
+    of Testnet4: pow.Testnet4
+    of Regtest:  pow.Regtest
+    of Signet:   pow.Signet
+  let powParams = pow.PowParams(
+    network:                  powNetwork,
+    powLimit:                 params.powLimit,
+    powTargetTimespan:        params.powTargetTimespan,
+    powTargetSpacing:         params.powTargetSpacing,
+    powAllowMinDifficultyBlocks: params.powAllowMinDifficultyBlocks,
+    powNoRetargeting:         params.powNoRetargeting,
+    enforceBIP94:             params.enforceBIP94
+  )
+
+  let expectedBits = pow.getNextWorkRequired(powPrev, header.timestamp, powParams, getAncestor)
+  if header.bits != expectedBits:
+    return voidErr(veIncorrectProofOfWork)
+
+  # Gate 2: time-too-old — timestamp must be strictly greater than MTP.
+  # Core validation.cpp:4092-4093.
+  # getMtpForHeight(utxos, prevIndex.height) gives the MTP of the prev block.
+  let prevMtp = getMtpForHeight(utxos, prevIndex.height)
+  if header.timestamp <= prevMtp:
+    return voidErr(veBadTimestamp)
+
+  # Gate 3: time-timewarp-attack (BIP94, testnet4/regtest only).
+  # Core validation.cpp:4097-4105.
+  if params.enforceBIP94:
+    if height mod int32(params.difficultyAdjustmentInterval) == 0:
+      if int64(header.timestamp) < int64(prevIndex.header.timestamp) - MaxTimeWarp:
+        return voidErr(veTimeWarpAttack)
+
+  # Gate 4: bad-version — reject obsolete block versions after soft-fork activation.
+  # Core validation.cpp:4113-4118.
+  # BIP34: nVersion < 2 rejected after BIP34 activation height.
+  if header.version < 2 and height >= int32(params.bip34Height):
+    return voidErr(veBadBlockVersion)
+  # BIP66: nVersion < 3 rejected after BIP66 activation height.
+  if header.version < 3 and height >= int32(params.bip66Height):
+    return voidErr(veBadBlockVersion)
+  # BIP65: nVersion < 4 rejected after BIP65 activation height.
+  if header.version < 4 and height >= int32(params.bip65Height):
+    return voidErr(veBadBlockVersion)
 
   ok()
 
@@ -1123,21 +1236,19 @@ proc validateBlock*(
 ): ValidationResult[void] =
   ## Full block validation per Bitcoin consensus rules
 
-  # Validate header
+  # Step 1a: non-contextual header checks (PoW hash, time-too-new, prevHash).
+  # Core CheckBlockHeader (validation.cpp:4030-4049).
   let headerResult = validateBlockHeader(blk.header, prevIndex, params, checkPow)
   if not headerResult.isOk:
     return voidErr(headerResult.error)
 
-  # BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
-  # block timestamp must be strictly greater than the median-time-past
-  # of the previous 11 blocks. validateBlockHeader explicitly defers
-  # this (it has no chain-DB access); add it here where `utxos` is in
-  # scope. Genesis is skipped because prevIndex.height >= 0 is always
-  # true for a non-genesis block we are validating.
-  if prevIndex.height >= 0:
-    let prevMtp = getMtpForHeight(utxos, prevIndex.height)
-    if blk.header.timestamp <= prevMtp:
-      return voidErr(veBadTimestamp)
+  # Step 1b: contextual header checks (validation.cpp:4080-4121):
+  #   bad-diffbits, time-too-old (MTP), time-timewarp-attack (BIP94), bad-version.
+  # Only run when we have a real previous block (height >= 0 is always true for
+  # non-genesis, but genesis itself is not validated through this path).
+  let ctxResult = contextualCheckBlockHeader(blk.header, prevIndex, utxos, params)
+  if not ctxResult.isOk:
+    return voidErr(ctxResult.error)
 
   # Block must have at least one transaction (coinbase)
   if blk.txs.len == 0:
