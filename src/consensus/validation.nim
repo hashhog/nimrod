@@ -30,6 +30,8 @@ type
     veBadAmount = "invalid transaction amount"
     veImmatureCoinbase = "spending immature coinbase"
     veBadWitnessCommitment = "witness commitment mismatch"
+    veWitnessNonceSize = "invalid witness reserved value size"
+    veUnexpectedWitness = "unexpected witness data"
     veScriptVerifyFailed = "script verification failed"
     veBadCoinbase = "invalid coinbase transaction"
     veNoCoinbase = "missing coinbase transaction"
@@ -104,6 +106,8 @@ proc bip22String*(e: ValidationError): string =
   of veBadPow, veExceedsTarget: "high-hash"
   of veBadMerkleRoot: "bad-txnmrklroot"
   of veBadWitnessCommitment: "bad-witness-merkle-match"
+  of veWitnessNonceSize: "bad-witness-nonce-size"
+  of veUnexpectedWitness: "unexpected-witness"
   of veBadAmount: "bad-cb-amount"
   of veSigopExceeded: "bad-blk-sigops"
   # Core parity: in-block dup-txid → bad-txns-inputs-missingorspent (ConnectBlock prevout path).
@@ -342,12 +346,70 @@ proc findWitnessCommitment*(tx: Transaction): Option[array[32, byte]] =
   none(array[32, byte])
 
 proc getWitnessReservedValue*(tx: Transaction): array[32, byte] =
-  ## Get witness reserved value from coinbase witness
-  ## Default is all zeros if not present
+  ## Get witness reserved value from coinbase witness.
+  ## Returns all-zeros if no witness or wrong size (caller must validate size separately).
   if tx.witnesses.len > 0 and tx.witnesses[0].len > 0:
     let stack = tx.witnesses[0]
     if stack.len > 0 and stack[0].len == 32:
       copyMem(addr result[0], unsafeAddr stack[0][0], 32)
+
+proc checkWitnessMalleation*(blk: Block, segwitActive: bool): ValidationResult[void] =
+  ## CheckWitnessMalleation — BIP-141 witness commitment validation.
+  ##
+  ## Mirrors Bitcoin Core validation.cpp:3864-3916 (CheckWitnessMalleation)
+  ## as called from ContextualCheckBlock (validation.cpp:4169).
+  ##
+  ## Gates (12):
+  ##   G1  segwitActive controls the two branches below.
+  ##   G2  Scan coinbase outputs, keep the LAST one matching the 6-byte magic
+  ##       (OP_RETURN 0x24 0xaa 0x21 0xa9 0xed) with size >= 38 bytes.
+  ##   G3  MINIMUM_WITNESS_COMMITMENT = 38 bytes enforced in findWitnessCommitment.
+  ##   G4  Magic bytes: 0x6a 0x24 0xaa 0x21 0xa9 0xed enforced in findWitnessCommitment.
+  ##   G5  If segwit active and commitment found:
+  ##         coinbase witness[0] (per-input stack 0) must have exactly 1 item …
+  ##   G6  … of exactly 32 bytes (= witness nonce). → "bad-witness-nonce-size"
+  ##   G7  Coinbase wtxid is all-zeros; non-coinbase wtxids are GetWitnessHash().
+  ##   G8  Witness merkle root = ComputeMerkleRoot(wtxids) (same alg as txid root).
+  ##   G9  commitment = SHA256d(witnessRoot || nonce) must match the 32 bytes at
+  ##       script offset [6..37]. → "bad-witness-merkle-match"
+  ##   G10 If segwit active but NO commitment present: OK (no error).
+  ##   G11 If segwit NOT active: any transaction with non-empty witness data
+  ##       is illegal. → "unexpected-witness"
+  ##   G12 Block has at least 1 tx (coinbase) — asserted before this call.
+  let commitmentOpt = findWitnessCommitment(blk.txs[0])
+  if segwitActive:
+    if commitmentOpt.isSome:
+      # G5+G6: coinbase witness[input 0] must be a stack of exactly 1 item of 32 bytes.
+      # Core validation.cpp:3878-3885.
+      let witnessStack =
+        if blk.txs[0].witnesses.len > 0: blk.txs[0].witnesses[0]
+        else: newSeq[seq[byte]]()
+      if witnessStack.len != 1 or witnessStack[0].len != 32:
+        return voidErr(veWitnessNonceSize)
+
+      # G7+G8+G9: compute witness merkle root, then SHA256d(root || nonce).
+      # Core validation.cpp:3890-3898.
+      var wtxids: seq[array[32, byte]]
+      wtxids.add(default(array[32, byte]))  # coinbase wtxid is all-zeros
+      for i in 1 ..< blk.txs.len:
+        wtxids.add(array[32, byte](blk.txs[i].wtxid()))
+
+      var nonce: array[32, byte]
+      copyMem(addr nonce[0], unsafeAddr witnessStack[0][0], 32)
+      let computedCommitment = computeWitnessCommitment(wtxids, nonce)
+
+      if computedCommitment != commitmentOpt.get():
+        return voidErr(veBadWitnessCommitment)
+    # G10: no commitment present → no error (Core does not require one).
+  else:
+    # G11: segwit not active — witness data in any tx is illegal.
+    # Core validation.cpp:3905-3913.
+    for tx in blk.txs:
+      for inputIdx in 0 ..< tx.witnesses.len:
+        if tx.witnesses[inputIdx].len > 0:
+          return voidErr(veUnexpectedWitness)
+
+  ok()
 
 # Median Time Past (MTP) calculation
 proc getMedianTimePast*(prevHeaders: seq[BlockHeader]): uint32 =
@@ -1205,35 +1267,13 @@ proc validateBlock*(
   if coinbaseValue > int64(subsidy) + totalFees:
     return voidErr(veBadAmount)
 
-  # Check witness commitment (SegWit)
-  if height >= int32(params.segwitHeight):
-    var hasWitness = false
-    for tx in blk.txs:
-      if tx.witnesses.len > 0:
-        for w in tx.witnesses:
-          if w.len > 0:
-            hasWitness = true
-            break
-        if hasWitness:
-          break
-
-    if hasWitness:
-      let commitmentOpt = findWitnessCommitment(blk.txs[0])
-      if commitmentOpt.isNone:
-        return voidErr(veBadWitnessCommitment)
-
-      # Compute witness commitment
-      var wtxids: seq[array[32, byte]]
-      # Coinbase wtxid is all zeros
-      wtxids.add(default(array[32, byte]))
-      for i in 1 ..< blk.txs.len:
-        wtxids.add(array[32, byte](blk.txs[i].wtxid()))
-
-      let reserved = getWitnessReservedValue(blk.txs[0])
-      let computedCommitment = computeWitnessCommitment(wtxids, reserved)
-
-      if computedCommitment != commitmentOpt.get():
-        return voidErr(veBadWitnessCommitment)
+  # BIP-141 witness commitment validation — delegates to checkWitnessMalleation.
+  # Reference: Bitcoin Core ContextualCheckBlock (validation.cpp:4169) calling
+  # CheckWitnessMalleation with expect_witness_commitment = segwit-active.
+  let segwitActive = height >= int32(params.segwitHeight)
+  let witnessResult = checkWitnessMalleation(blk, segwitActive)
+  if not witnessResult.isOk:
+    return witnessResult
 
   ok()
 
@@ -1506,39 +1546,10 @@ proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
   if computedRoot != blk.header.merkleRoot:
     return voidErr(veBadMerkleRoot)
 
-  # BIP-141 witness commitment recomputation.
-  # If the coinbase contains an OP_RETURN witness-commitment output AND any
-  # transaction in the block carries witness data, re-derive the expected
-  # commitment = SHA256d(witness_merkle_root || witness_reserved_value) and
-  # compare to the on-chain bytes.  A mismatch is bad-witness-merkle-match.
-  # Mirrors Bitcoin Core CheckWitnessMalleation (validation.cpp:3870-3901).
-  var hasWitness = false
-  for tx in blk.txs:
-    if tx.witnesses.len > 0:
-      for w in tx.witnesses:
-        if w.len > 0:
-          hasWitness = true
-          break
-      if hasWitness:
-        break
-
-  if hasWitness:
-    let commitmentOpt = findWitnessCommitment(blk.txs[0])
-    if commitmentOpt.isNone:
-      return voidErr(veBadWitnessCommitment)
-
-    # Compute wtxids: coinbase wtxid is all-zeros, rest are real
-    var wtxids: seq[array[32, byte]]
-    wtxids.add(default(array[32, byte]))
-    for i in 1 ..< blk.txs.len:
-      wtxids.add(array[32, byte](blk.txs[i].wtxid()))
-
-    let reserved = getWitnessReservedValue(blk.txs[0])
-    let computedCommitment = computeWitnessCommitment(wtxids, reserved)
-
-    if computedCommitment != commitmentOpt.get():
-      return voidErr(veBadWitnessCommitment)
-
+  # Witness commitment check is intentionally absent here.
+  # Bitcoin Core CheckBlock() is context-free and explicitly defers witness
+  # malleability to ContextualCheckBlock() (validation.cpp:3943-3944).
+  # The check runs in validateBlock() which has segwit-activation context.
   ok()
 
 # Legacy result type for backward compatibility
