@@ -589,29 +589,107 @@ proc calculateBlockWork(bits: uint32): array[32, byte] =
 
 # Generate undo data before connecting a block
 
-proc generateUndoData*(cs: ChainState, blk: Block): UndoData =
-  ## Generate undo data for a block (record all spent outputs)
-  ## Legacy format - kept for backward compatibility
+proc generateUndoData*(cs: ChainState, blk: Block, height: int32 = -1): UndoData =
+  ## Generate undo data for a block (record all spent outputs).
+  ## Legacy format - kept for backward compatibility.
+  ##
+  ## ``height`` is the height of the block being connected.  It is used as
+  ## the per-coin ``height`` for any intra-block output spent later in the
+  ## same block (those outputs would otherwise live at the current block's
+  ## height in Bitcoin Core's view — they are not yet flushed to chainstate).
+  ## If callers pass -1 (legacy default) we fall back to ``cs.bestHeight + 1``
+  ## which is the height of the block currently being connected in all the
+  ## existing call sites.
+  ##
+  ## W93 Gate (Core val:2600 / coins.cpp AddCoins): Bitcoin Core's view is
+  ## mutated incrementally — `UpdateCoins` is called immediately after each
+  ## transaction's input checks, so a later tx in the same block can spend
+  ## an output created by an earlier tx in the same block.  nimrod calls
+  ## `generateUndoData` BEFORE any state mutation, so `cs.getUtxo()` cannot
+  ## see same-block outputs.  We must therefore track intra-block outputs
+  ## locally and consult them first, otherwise the undo entry is silently
+  ## dropped and disconnectBlock fails with the vin-count gate
+  ## (chainstate.nim:1470 — Bitcoin Core val:2229-2232).
+  let coinHeight = if height >= 0: height else: cs.bestHeight + 1
+  var intra = initTable[string, UtxoEntry]()
   for txIdx, tx in blk.txs:
     # Skip coinbase inputs (nothing spent)
     if txIdx == 0:
+      # Add coinbase outputs to intra-block index so a later tx in the
+      # same block could spend them (CSV-style; matches Core's AddCoins
+      # order).  Skip provably unspendable outputs to mirror AddCoins.
+      let cbTxid = tx.txid()
+      for vout, output in tx.outputs:
+        if isUnspendable(output.scriptPubKey):
+          continue
+        let key = $array[32, byte](cbTxid) & ":" & $vout
+        intra[key] = UtxoEntry(
+          output: output, height: coinHeight,
+          isCoinbase: true
+        )
       continue
 
     for input in tx.inputs:
+      let intraKey = $array[32, byte](input.prevOut.txid) & ":" & $input.prevOut.vout
+      if intraKey in intra:
+        result.spentOutputs.add((input.prevOut, intra[intraKey]))
+        intra.del(intraKey)
+        continue
       let utxoOpt = cs.getUtxo(input.prevOut)
       if utxoOpt.isSome:
         result.spentOutputs.add((input.prevOut, utxoOpt.get()))
 
-proc generateBlockUndo*(cs: ChainState, blk: Block): BlockUndo =
-  ## Generate BlockUndo data for flat file storage
-  ## One TxUndo per non-coinbase transaction, each containing all spent outputs
+    # After spending, add this tx's outputs to the intra-block index.
+    let thisTxid = tx.txid()
+    for vout, output in tx.outputs:
+      if isUnspendable(output.scriptPubKey):
+        continue
+      let key = $array[32, byte](thisTxid) & ":" & $vout
+      intra[key] = UtxoEntry(
+        output: output, height: coinHeight,
+        isCoinbase: false
+      )
+
+proc generateBlockUndo*(cs: ChainState, blk: Block, height: int32 = -1): BlockUndo =
+  ## Generate BlockUndo data for flat file storage.
+  ## One TxUndo per non-coinbase transaction, each containing all spent outputs.
+  ##
+  ## ``height`` is the height of the block being connected (same semantics as
+  ## ``generateUndoData``).
+  ##
+  ## W93 Gate (Core val:2600 / coins.cpp AddCoins): same intra-block tracking
+  ## as `generateUndoData` — see comment there.  Without this, a block with
+  ## an intra-block tx chain (tx[2] spends tx[1]'s output) writes a TxUndo
+  ## with fewer prevOutputs than tx.inputs, and disconnectBlock fails the
+  ## vin-count gate (chainstate.nim:1470 — Bitcoin Core val:2229-2232).
+  let coinHeight = if height >= 0: height else: cs.bestHeight + 1
+  var intra = initTable[string, UtxoEntry]()
   for txIdx, tx in blk.txs:
-    # Skip coinbase (has no inputs to spend)
     if txIdx == 0:
+      # Index coinbase outputs as intra-block candidates.
+      let cbTxid = tx.txid()
+      for vout, output in tx.outputs:
+        if isUnspendable(output.scriptPubKey):
+          continue
+        let key = $array[32, byte](cbTxid) & ":" & $vout
+        intra[key] = UtxoEntry(
+          output: output, height: coinHeight,
+          isCoinbase: true
+        )
       continue
 
     var txUndo = TxUndo()
     for input in tx.inputs:
+      let intraKey = $array[32, byte](input.prevOut.txid) & ":" & $input.prevOut.vout
+      if intraKey in intra:
+        let entry = intra[intraKey]
+        txUndo.prevOutputs.add(SpentOutput(
+          output: entry.output,
+          height: entry.height,
+          isCoinbase: entry.isCoinbase
+        ))
+        intra.del(intraKey)
+        continue
       let utxoOpt = cs.getUtxo(input.prevOut)
       if utxoOpt.isSome:
         let entry = utxoOpt.get()
@@ -621,6 +699,17 @@ proc generateBlockUndo*(cs: ChainState, blk: Block): BlockUndo =
           isCoinbase: entry.isCoinbase
         ))
     result.txUndo.add(txUndo)
+
+    # After this tx, add its outputs to intra-block index for any later tx.
+    let thisTxid = tx.txid()
+    for vout, output in tx.outputs:
+      if isUnspendable(output.scriptPubKey):
+        continue
+      let key = $array[32, byte](thisTxid) & ":" & $vout
+      intra[key] = UtxoEntry(
+        output: output, height: coinHeight,
+        isCoinbase: false
+      )
 
 # Connect a block to the chain
 
@@ -652,9 +741,24 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
-  # Generate undo data before making changes (both formats for compatibility)
-  let undo = cs.generateUndoData(blk)
-  let blockUndo = cs.generateBlockUndo(blk)
+  # W93 Gate (Core val:2333): the view's best block must match the candidate
+  # block's parent before mutation.  Bitcoin Core enforces this via
+  # `assert(hashPrevBlock == view.GetBestBlock())` (validation.cpp:2333).
+  # Without this guard, calling connectBlock with a non-extending block —
+  # e.g. via a stale RPC call, an internal scheduler bug, or a future
+  # callsite that forgets the parent check — would silently corrupt the
+  # UTXO set.  Genesis (height==0) bypasses because cs.bestBlockHash is
+  # zero-initialised before genesis is applied.
+  if height > 0 and cs.bestBlockHash != blk.header.prevBlock:
+    return err("connectBlock precondition violated: cs.bestBlockHash " &
+               $cs.bestBlockHash & " != block.prevBlock " &
+               $blk.header.prevBlock & " (height " & $height & ")")
+
+  # Generate undo data before making changes (both formats for compatibility).
+  # Pass `height` so intra-block-spent outputs get the correct creation height
+  # in their SpentOutput entries (matches Core's UpdateCoins per-tx AddCoins).
+  let undo = cs.generateUndoData(blk, height)
+  let blockUndo = cs.generateBlockUndo(blk, height)
 
   # Write undo data to flat file
   var undoPos = FlatFilePos(fileNum: -1, pos: -1)
@@ -1119,6 +1223,15 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
 
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
+
+  # W93 Gate (Core val:2333): same precondition as connectBlock above.  IBD
+  # callsites have always relied on the SyncManager to enforce this, but
+  # defense-in-depth keeps the chainstate self-consistent if anyone wires
+  # a new caller without the parent check.  Genesis (height==0) bypasses.
+  if height > 0 and cs.bestBlockHash != blk.header.prevBlock:
+    return err("connectBlockIBD precondition violated: cs.bestBlockHash " &
+               $cs.bestBlockHash & " != block.prevBlock " &
+               $blk.header.prevBlock & " (height " & $height & ")")
 
   # Process each transaction - UTXO updates only
   for txIdx, tx in blk.txs:
@@ -1864,6 +1977,18 @@ proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
+  # W93 Gate (Core val:2333): precondition that the existing best block hash
+  # matches the candidate's parent.  Defensive check — sync.nim's outer loop
+  # already enforces this, but applyBlock is exposed for legacy callers and
+  # silently corrupting the DB on a wrong-parent block would be much worse
+  # than a logged warning.  Skip for genesis (height==0) where bestBlockHash
+  # is the all-zero default.
+  if height > 0 and cdb.bestBlockHash != blk.header.prevBlock:
+    warn "applyBlock precondition violated, skipping",
+         expectedPrev = $cdb.bestBlockHash, gotPrev = $blk.header.prevBlock,
+         height = height
+    return
+
   # Store full block data
   batch.put(cfBlocks, blockKey(array[32, byte](blockHash)), serialize(blk))
 
@@ -1907,6 +2032,18 @@ proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
       let loc = TxLocation(blockHash: blockHash, txIndex: uint32(txIdx))
       batch.put(cfTxIndex, txIndexKey(array[32, byte](txId)), serializeTxLocation(loc))
 
+  # W93: derive totalWork from the parent index instead of writing default(0).
+  # Storing zero work on every applyBlock-path block index entry would corrupt
+  # any future chain-selection logic that ranks by totalWork.  Falls back to a
+  # genesis sentinel (all-zero) only for height==0.
+  var totalWork: array[32, byte] = default(array[32, byte])
+  if height > 0:
+    let prevIdxOpt = cdb.getBlockIndex(blk.header.prevBlock)
+    if prevIdxOpt.isSome:
+      totalWork = prevIdxOpt.get().totalWork
+  let blockWork = calculateBlockWork(blk.header.bits)
+  addWork(totalWork, blockWork)
+
   # Create block index entry
   let idx = BlockIndex(
     hash: blockHash,
@@ -1914,7 +2051,7 @@ proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
     status: bsValidated,
     prevHash: blk.header.prevBlock,
     header: blk.header,
-    totalWork: default(array[32, byte]),  # TODO: calculate actual work
+    totalWork: totalWork,
     nTx: int32(blk.txs.len)
   )
   batch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
@@ -1925,6 +2062,8 @@ proc applyBlock*(cdb: ChainDb, blk: Block, height: int32) =
   var w = BinaryWriter()
   w.writeInt32LE(height)
   batch.put(cfMeta, metaKey("height"), w.data)
+  # W93: persist totalWork in cfMeta for crash-recovery consistency.
+  batch.put(cfMeta, metaKey("totalwork"), @totalWork)
 
   # Commit atomically
   cdb.db.write(batch)
