@@ -1790,6 +1790,527 @@ suite "W71 — MIN_STANDARD_TX_NONWITNESS_SIZE gate (CVE-2017-12842)":
 
     cs.close()
 
+# ============================================================================
+# W75 — Ancestor / Descendant / Cluster limits comprehensive audit
+# ============================================================================
+# Tests all 7 gates of checkPackageLimits() against Bitcoin Core spec:
+#   G1  ancestor count   <= 25   (DEFAULT_ANCESTOR_LIMIT, policy/policy.h:76)
+#   G2  ancestor vsize   <= 101,000 vB (policy/policy.h:53-56)
+#   G3  descendant count <= 25   (DEFAULT_DESCENDANT_LIMIT, policy/policy.h:78)
+#   G4  descendant vsize <= 101,000 vB
+#   G5  EXTRA_DESCENDANT_TX_SIZE_LIMIT exception (policy/policy.h:90): if
+#       exactly 1 ancestor AND self-vsize <= 10,000 vB → skip G4 for that ancestor
+#   G6  cluster count    <= 64   (DEFAULT_CLUSTER_LIMIT, policy/policy.h:72)
+#   G7  cluster vsize    <= 101,000 vB (policy/policy.h:74)
+# ============================================================================
+
+const W75DbPath = "/tmp/nimrod_mempool_w75_test"
+
+proc cleanupW75Db() =
+  if dirExists(W75DbPath):
+    removeDir(W75DbPath)
+
+suite "W75 ancestor/descendant/cluster limits":
+  setup:
+    cleanupW75Db()
+  teardown:
+    cleanupW75Db()
+
+  # --------------------------------------------------------------------------
+  # Helpers
+  # --------------------------------------------------------------------------
+  proc makeChainInMempool(mp: var Mempool, length: int,
+                          vsizeEach: int = 100): TxId =
+    ## Insert `length` transactions into mp.entries in a linear chain.
+    ## Returns the txid of the last (deepest) tx.
+    var prevTxid: array[32, byte]
+    prevTxid[0] = 0xDD  # sentinel: first parent is a confirmed UTXO
+    var currentTxid = TxId(prevTxid)
+
+    for i in 0 ..< length:
+      var txid: array[32, byte]
+      txid[0] = byte(0xE0 + (i mod 200))
+      txid[1] = byte(i div 200)
+      txid[2] = 0xCC
+      let weight = vsizeEach * 4
+      let ac = i + 1  # ancestor count including self
+      let tx = if i == 0:
+        Transaction(version: 1, inputs: @[],
+          outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[])],
+          witnesses: @[], lockTime: 0)
+      else:
+        Transaction(version: 1,
+          inputs: @[TxIn(prevOut: OutPoint(txid: currentTxid, vout: 0),
+                         scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+          outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+          witnesses: @[], lockTime: 0)
+      mp.entries[TxId(txid)] = MempoolEntry(
+        tx: tx, txid: TxId(txid), fee: Satoshi(100), weight: weight,
+        feeRate: 1.0, timeAdded: getTime(), height: 100,
+        ancestorFee: Satoshi(100 * ac), ancestorWeight: weight * ac,
+        ancestorCount: ac, ancestorSize: vsizeEach * ac)
+      if i > 0:
+        mp.spentBy[OutPoint(txid: currentTxid, vout: 0)] = TxId(txid)
+      currentTxid = TxId(txid)
+    currentTxid
+
+  # --------------------------------------------------------------------------
+  # Constant checks
+  # --------------------------------------------------------------------------
+  test "G0 constant values match Bitcoin Core spec":
+    check DefaultAncestorLimit     == 25
+    check DefaultDescendantLimit   == 25
+    check DefaultAncestorSizeLimitKvB  == 101
+    check DefaultDescendantSizeLimitKvB == 101
+    check DefaultAncestorSizeLimit      == 101_000
+    check DefaultDescendantSizeLimit    == 101_000
+    check DefaultClusterLimit           == 64
+    check DefaultClusterSizeLimitKvB    == 101
+    check DefaultClusterSizeLimit       == 101_000
+    check ExtraDescendantTxSizeLimit    == 10_000
+
+  # --------------------------------------------------------------------------
+  # G1: accept exactly 25 ancestors (at limit)
+  # --------------------------------------------------------------------------
+  test "G1 accept chain of 25 (at ancestor-count limit)":
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    var mp = newMempool(cs, regtestParams())
+
+    # Insert 24-tx chain; next tx will be the 25th (self = 25th ancestor)
+    let tipTxid = makeChainInMempool(mp, 24)
+    let newTx = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: tipTxid, vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+
+    let res = mp.checkPackageLimits(newTx, 400)
+    check res.isOk  # exactly 25 ancestors including self → must pass
+
+
+  # --------------------------------------------------------------------------
+  # G1: reject 26th ancestor
+  # --------------------------------------------------------------------------
+  test "G1 reject 26th ancestor (ancestor count = 26)":
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    var mp = newMempool(cs, regtestParams())
+
+    # 25-tx chain already at limit
+    let tipTxid = makeChainInMempool(mp, 25)
+    let newTx = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: tipTxid, vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+
+    let res = mp.checkPackageLimits(newTx, 400)
+    check not res.isOk
+    check "exceeds ancestor limit" in res.error
+
+
+  # --------------------------------------------------------------------------
+  # G2: reject when ancestor vsize > 101,000 vB
+  # --------------------------------------------------------------------------
+  test "G2 reject when ancestor vsize exceeds 101,000 vB":
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    # Use a tiny ancestor count limit so we don't trigger G1 first;
+    # push vsize over the boundary with a single large parent.
+    var mp = newMempool(cs, regtestParams(),
+                        ancestorLimit = 25, descendantLimit = 25,
+                        ancestorSizeLimit = 100_000,
+                        descendantSizeLimit = 200_000)
+
+    # Single parent whose vsize = 99,900 vB (just under the 100k limit)
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0xA1
+    let parentTx = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 399_600,  # 99,900 vB
+      feeRate: 1.0, timeAdded: getTime(), height: 100,
+      ancestorFee: Satoshi(100), ancestorWeight: 399_600,
+      ancestorCount: 1, ancestorSize: 99_900)
+
+    # Child with weight 400 (100 vB) → ancestor vsize = 99,900 + 100 = 100,000 vB (at limit)
+    let childAtLimit = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    check mp.checkPackageLimits(childAtLimit, 400).isOk  # 100,000 == limit → accept
+
+    # Child with weight 404 (101 vB) → ancestor vsize = 99,900 + 101 = 100,001 vB → reject
+    let childOverLimit = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(898), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let res = mp.checkPackageLimits(childOverLimit, 404)
+    check not res.isOk
+    check "ancestor size limit" in res.error
+
+
+  # --------------------------------------------------------------------------
+  # G3: reject when descendant count would exceed 25
+  # --------------------------------------------------------------------------
+  test "G3 reject when descendant count would exceed 25":
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    var mp = newMempool(cs, regtestParams())
+
+    # Parent with 24 children already in mempool (total descendants including self = 25)
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0xB1
+    let parentTx = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(100_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100,
+      ancestorFee: Satoshi(100), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100)
+
+    for i in 1 .. 24:
+      var childTxid: array[32, byte]
+      childTxid[0] = byte(i)
+      childTxid[1] = 0xB2
+      let childTx = Transaction(version: 1,
+        inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                       scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+        outputs: @[TxOut(value: Satoshi(100), scriptPubKey: @[])],
+        witnesses: @[], lockTime: 0)
+      mp.entries[TxId(childTxid)] = MempoolEntry(
+        tx: childTx, txid: TxId(childTxid), fee: Satoshi(100),
+        weight: 400, feeRate: 1.0, timeAdded: getTime(), height: 100,
+        ancestorFee: Satoshi(200), ancestorWeight: 800,
+        ancestorCount: 2, ancestorSize: 200)
+
+    # parent now has 24 descendants → descendant count including self = 25 (at limit)
+    let (dc, _) = mp.calculateDescendantStats(TxId(parentTxid))
+    check dc == 25
+
+    # Another child would push it to 26 → reject
+    let child25 = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(100), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let res = mp.checkPackageLimits(child25, 400)
+    check not res.isOk
+    check "descendant limit" in res.error
+
+
+  # --------------------------------------------------------------------------
+  # G4: reject when descendant vsize would exceed 101,000 vB
+  # --------------------------------------------------------------------------
+  test "G4 reject when descendant vsize would exceed 101,000 vB":
+    ## New tx has vsize = 10,001 vB (> ExtraDescendantTxSizeLimit=10,000) so G5
+    ## does not apply. Single parent whose self-vsize = 70,000 vB; limit = 80,001 vB.
+    ##   txAtLimit  (10,001 vB): 70,000 + 10,001 = 80,001 == limit → accept
+    ##   txOverLimit (10,002 vB): 70,000 + 10,002 = 80,002 > 80,001  → reject
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    var mp = newMempool(cs, regtestParams(),
+                        ancestorSizeLimit = 200_000,
+                        descendantSizeLimit = 80_001,
+                        clusterSizeLimit = 200_000)
+
+    # Single parent whose self-vsize = 70,000 vB
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0xC1
+    let parentTx = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(100_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 280_000,  # 70,000 vB
+      feeRate: 1.0, timeAdded: getTime(), height: 100,
+      ancestorFee: Satoshi(100), ancestorWeight: 280_000,
+      ancestorCount: 1, ancestorSize: 70_000)
+
+    # Child with 10,001 vB (> ExtraDescendantTxSizeLimit → G5 inactive):
+    # parent desc vsize after add: 70,000 + 10,001 = 80,001 == limit → accept
+    let txAtLimit = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    check mp.checkPackageLimits(txAtLimit, 40_004).isOk  # 40,004 WU = 10,001 vB
+
+    # Child with 10,002 vB: 70,000 + 10,002 = 80,002 > 80,001 → reject
+    let txOverLimit = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(898), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let res = mp.checkPackageLimits(txOverLimit, 40_008)  # 10,002 vB
+    check not res.isOk
+    check "descendant size limit" in res.error
+
+
+  # --------------------------------------------------------------------------
+  # G5: EXTRA_DESCENDANT_TX_SIZE_LIMIT exception (CPFP bump through G4)
+  # --------------------------------------------------------------------------
+  test "G5 CPFP small tx bypasses descendant-vsize gate (ExtraDescendantTxSizeLimit)":
+    ## When the new tx has exactly 1 in-mempool ancestor AND its own vsize
+    ## is <= ExtraDescendantTxSizeLimit (10,000 vB), G4 is waived.
+    ## This lets small CPFP fee-bumpers slip in even if the parent is at
+    ## the descendant-vsize boundary.
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    var mp = newMempool(cs, regtestParams(),
+                        descendantSizeLimit = 10_000,
+                        clusterSizeLimit = 200_000)  # raise cluster limit to not interfere
+
+    # Single parent at the boundary: descendant vsize = 10,000 vB (itself)
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0xD1
+    let parentTx = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(100_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 40_000,  # 10,000 vB — fills the descendant-vsize limit on its own
+      feeRate: 1.0, timeAdded: getTime(), height: 100,
+      ancestorFee: Satoshi(100), ancestorWeight: 40_000,
+      ancestorCount: 1, ancestorSize: 10_000)
+
+    # Child with vsize = 5,000 vB (≤ 10,000) → G5 exception → G4 skipped → accept
+    let cpfpChild = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let res = mp.checkPackageLimits(cpfpChild, 20_000)  # 20,000 WU = 5,000 vB
+    check res.isOk  # G5 exception must fire
+
+
+  test "G5 large CPFP child (> 10,000 vB) does NOT bypass G4":
+    ## If the child's vsize exceeds ExtraDescendantTxSizeLimit, the G4
+    ## exception does not apply and the descendant-vsize gate rejects.
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    var mp = newMempool(cs, regtestParams(),
+                        descendantSizeLimit = 10_000,
+                        clusterSizeLimit = 200_000)
+
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0xD2
+    let parentTx = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(100_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 40_000, feeRate: 1.0, timeAdded: getTime(), height: 100,
+      ancestorFee: Satoshi(100), ancestorWeight: 40_000,
+      ancestorCount: 1, ancestorSize: 10_000)
+
+    # Child with vsize = 10,001 vB → exception does not apply → G4 fires → reject
+    let bigChild = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let res = mp.checkPackageLimits(bigChild, 40_004)  # 10,001 vB
+    check not res.isOk
+    check "descendant size limit" in res.error
+
+
+  # --------------------------------------------------------------------------
+  # G6: cluster count limit (64)
+  # --------------------------------------------------------------------------
+  test "G6 accept cluster of 64 (at cluster-count limit)":
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    # Lower ancestor limit so we can build a 64-tx cluster without tripping G1 first.
+    var mp = newMempool(cs, regtestParams(),
+                        ancestorLimit = 64, descendantLimit = 64,
+                        ancestorSizeLimit = 10_000_000,
+                        descendantSizeLimit = 10_000_000,
+                        clusterLimit = 64,
+                        clusterSizeLimit = 10_000_000)
+
+    # 63-tx chain; 64th tx will be the new submission
+    let tipTxid = makeChainInMempool(mp, 63, vsizeEach = 100)
+
+    let newTx = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: tipTxid, vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+
+    let res = mp.checkPackageLimits(newTx, 400)
+    check res.isOk  # cluster count = 64 → exactly at limit → accept
+
+
+  test "G6 reject cluster exceeding 64 transactions":
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    var mp = newMempool(cs, regtestParams(),
+                        ancestorLimit = 65, descendantLimit = 65,
+                        ancestorSizeLimit = 10_000_000,
+                        descendantSizeLimit = 10_000_000,
+                        clusterLimit = 64,
+                        clusterSizeLimit = 10_000_000)
+
+    # 64-tx chain → new tx would create cluster of 65
+    let tipTxid = makeChainInMempool(mp, 64, vsizeEach = 100)
+
+    let newTx = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: tipTxid, vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+
+    let res = mp.checkPackageLimits(newTx, 400)
+    check not res.isOk
+    check "too-large-cluster" in res.error
+
+
+  # --------------------------------------------------------------------------
+  # G7: cluster vsize limit (101,000 vB)
+  # --------------------------------------------------------------------------
+  test "G7 reject when cluster vsize would exceed 101,000 vB":
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    var mp = newMempool(cs, regtestParams(),
+                        ancestorLimit = 10, descendantLimit = 10,
+                        ancestorSizeLimit = 200_000,
+                        descendantSizeLimit = 200_000,
+                        clusterSizeLimit = 100_000)
+
+    # Single large parent consuming 99,900 vB of the 100,000 vB cluster limit
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0xF1
+    let parentTx = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 399_600,  # 99,900 vB
+      feeRate: 1.0, timeAdded: getTime(), height: 100,
+      ancestorFee: Satoshi(100), ancestorWeight: 399_600,
+      ancestorCount: 1, ancestorSize: 99_900)
+
+    # Child with 100 vB → cluster = 100,000 vB (at limit) → accept
+    let txAtLimit = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(900), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    check mp.checkPackageLimits(txAtLimit, 400).isOk
+
+    # Child with 101 vB → cluster = 100,001 vB → G7 reject
+    let txOver = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(898), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let res = mp.checkPackageLimits(txOver, 404)
+    check not res.isOk
+    check "too-large-cluster" in res.error
+
+
+  # --------------------------------------------------------------------------
+  # CPFP: child pays for parent (ancestor fee-rate aggregate)
+  # --------------------------------------------------------------------------
+  test "CPFP child with 2 ancestors accepted when within all limits":
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    var mp = newMempool(cs, regtestParams())
+
+    # grandparent → parent → (new child)
+    var gpTxid: array[32, byte]
+    gpTxid[0] = 0xE1
+    var pTxid: array[32, byte]
+    pTxid[0] = 0xE2
+
+    let gpTx = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(10_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let pTx = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(gpTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(9_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+
+    mp.entries[TxId(gpTxid)] = MempoolEntry(
+      tx: gpTx, txid: TxId(gpTxid), fee: Satoshi(1),
+      weight: 400, feeRate: 0.01, timeAdded: getTime(), height: 100,
+      ancestorFee: Satoshi(1), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100)
+    mp.entries[TxId(pTxid)] = MempoolEntry(
+      tx: pTx, txid: TxId(pTxid), fee: Satoshi(1),
+      weight: 400, feeRate: 0.01, timeAdded: getTime(), height: 100,
+      ancestorFee: Satoshi(2), ancestorWeight: 800,
+      ancestorCount: 2, ancestorSize: 200)
+    mp.spentBy[OutPoint(txid: TxId(gpTxid), vout: 0)] = TxId(pTxid)
+
+    # Child with high fee bumping the package
+    let child = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(pTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(8_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+
+    # ancestor count = 3 (gp + p + self), well within 25
+    let res = mp.checkPackageLimits(child, 400)
+    check res.isOk
+
+
+  # --------------------------------------------------------------------------
+  # Historical: 101 kvB ancestor/descendant size threshold
+  # --------------------------------------------------------------------------
+  test "historical 101 kvB boundary: accept at exactly 101,000 vB":
+    var cs = newChainState(W75DbPath, regtestParams())
+    defer: cs.close()
+    var mp = newMempool(cs, regtestParams())
+
+    # Build a single parent that occupies exactly 100,900 vB of ancestor budget
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0xFA
+    let parentTx = Transaction(version: 1, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(1_000_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(1_000),
+      weight: 403_600,  # 100,900 vB
+      feeRate: 10.0, timeAdded: getTime(), height: 100,
+      ancestorFee: Satoshi(1_000), ancestorWeight: 403_600,
+      ancestorCount: 1, ancestorSize: 100_900)
+
+    # Child of 100 vB: total ancestor vsize = 100,900 + 100 = 101,000 vB → exactly at limit
+    let childAtLimit = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(999_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    check mp.checkPackageLimits(childAtLimit, 400).isOk   # at boundary → accept
+
+    # Child of 101 vB: total = 101,001 vB → over limit → reject
+    let childOver = Transaction(version: 1,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[], sequence: 0xFFFFFFFF'u32)],
+      outputs: @[TxOut(value: Satoshi(998_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let res = mp.checkPackageLimits(childOver, 404)
+    check not res.isOk
+    check "ancestor size limit" in res.error
+
+
+  # --------------------------------------------------------------------------
+  # cluster.nim MaxClusterSize constant
+  # --------------------------------------------------------------------------
+  test "cluster.nim MaxClusterSize == 64 (DEFAULT_CLUSTER_LIMIT)":
+    ## Regression: was incorrectly set to 100 before W75 fix.
+    ## DefaultClusterLimit (mempool.nim) and MaxClusterSize (cluster.nim) must agree.
+    check DefaultClusterLimit == 64
+
 when isMainModule:
   # Run all tests
   discard
