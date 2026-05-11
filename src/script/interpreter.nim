@@ -1859,7 +1859,12 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
           return seInvalidStack
 
         let (locktime, ok) = toScriptNum(interp.peek(), sfMinimalData in interp.flags, 5)
-        if not ok or locktime < 0:
+        # Decode failure (overflow or non-minimal) → stack error, matching Core
+        # SCRIPT_ERR_SCRIPTNUM (caught exception in CheckLockTime, interpreter.cpp:1226).
+        if not ok:
+          return seInvalidStack
+        # Negative locktime → SCRIPT_ERR_NEGATIVE_LOCKTIME (interpreter.cpp:551-552).
+        if locktime < 0:
           return seNegativeLocktime
 
         # Check locktime type consistency
