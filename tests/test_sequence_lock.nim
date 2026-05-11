@@ -309,9 +309,11 @@ suite "BIP68 CSV activation":
     let params = mainnetParams()
     check params.csvHeight == 419328
 
-  test "regtest CSV active from genesis":
+  test "regtest CSV active from height 1":
+    # Bitcoin Core kernel/chainparams.cpp:540: consensus.CSVHeight = 1 for regtest.
+    # CSV is not active at height 0; it activates at height 1.
     let params = regtestParams()
-    check params.csvHeight == 0
+    check params.csvHeight == 1
 
   test "testnet3 CSV activation":
     let params = testnet3Params()

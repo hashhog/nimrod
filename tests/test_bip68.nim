@@ -21,10 +21,12 @@ suite "BIP68 block validation":
     let flags = getBlockScriptFlags(419328, params)
     check sfCheckSequenceVerify in flags
 
-  test "regtest has CSV from genesis":
+  test "regtest CSV not active at height 0, active at height 1":
+    # Bitcoin Core kernel/chainparams.cpp:540: consensus.CSVHeight = 1 for regtest.
+    # CSV activates at height 1, so height 0 must NOT have the flag.
     let params = regtestParams()
-    let flags = getBlockScriptFlags(0, params)
-    check sfCheckSequenceVerify in flags
+    let flags0 = getBlockScriptFlags(0, params)
+    check sfCheckSequenceVerify notin flags0
 
     let flags1 = getBlockScriptFlags(1, params)
     check sfCheckSequenceVerify in flags1
@@ -92,9 +94,10 @@ suite "BIP68 activation by network":
     let params = testnet3Params()
     check params.csvHeight == 770112
 
-  test "regtest CSV from genesis":
+  test "regtest CSV from height 1":
+    # Bitcoin Core kernel/chainparams.cpp:540: consensus.CSVHeight = 1 for regtest.
     let params = regtestParams()
-    check params.csvHeight == 0
+    check params.csvHeight == 1
 
 suite "BIP68 nLockTime semantics":
   test "lock value is last invalid value":
