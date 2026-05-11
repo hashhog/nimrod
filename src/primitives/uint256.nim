@@ -231,8 +231,12 @@ proc `shr`*(a: UInt256, bits: int): UInt256 =
 # Compact target conversion (Bitcoin nBits format)
 
 proc setCompact*(bits: uint32): UInt256 =
-  ## Convert compact target representation (nBits) to UInt256
-  ## Returns (target, isNegative, isOverflow)
+  ## Convert compact target representation (nBits) to UInt256.
+  ## Returns zero for invalid inputs: negative flag set, zero mantissa/exponent,
+  ## or overflow (mantissa would exceed 256 bits).
+  ##
+  ## Overflow conditions match Bitcoin Core arith_uint256.cpp SetCompact():
+  ##   nSize > 34, or (nWord > 0xff and nSize > 33), or (nWord > 0xffff and nSize > 32)
   let exponent = int((bits shr 24) and 0xff)
   let mantissa = bits and 0x007fffff
 
@@ -244,6 +248,16 @@ proc setCompact*(bits: uint32): UInt256 =
     return initUInt256()
 
   if mantissa == 0:
+    return initUInt256()
+
+  # Check for overflow: target would exceed 256 bits.
+  # Bitcoin Core arith_uint256.cpp:190-192 overflow conditions:
+  #   nWord != 0 && ((nSize > 34) || (nWord > 0xff && nSize > 33) || (nWord > 0xffff && nSize > 32))
+  if exponent > 34:
+    return initUInt256()
+  if mantissa > 0xff and exponent > 33:
+    return initUInt256()
+  if mantissa > 0xffff and exponent > 32:
     return initUInt256()
 
   # Target = mantissa * 2^(8*(exponent-3))

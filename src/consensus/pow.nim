@@ -71,12 +71,14 @@ proc calculateNextWorkRequired*(
   params: PowParams,
   firstBlockBits: uint32 = 0
 ): uint32 =
-  ## Calculate the next difficulty target based on the time to mine the previous period
+  ## Calculate the next difficulty target based on the time to mine the previous period.
   ##
-  ## lastIndex: The last block of the difficulty period
+  ## lastIndex:      The last block of the difficulty period (block 2015, 4031, …)
   ## firstBlockTime: Timestamp of the first block in the period
-  ## params: Network parameters
-  ## firstBlockBits: For BIP94 (testnet4), use the first block's bits instead of last
+  ## params:         Network parameters
+  ## firstBlockBits: When enforceBIP94 (testnet4), the caller passes the first block's
+  ##                 nBits here so the retarget base is anchored at the period start,
+  ##                 preventing time-warp attacks (BIP94).  Pass 0 for non-BIP94 nets.
   ##
   ## Reference: Bitcoin Core CalculateNextWorkRequired() in pow.cpp
 
@@ -88,17 +90,20 @@ proc calculateNextWorkRequired*(
   var actualTimespan = int64(lastIndex.header.timestamp) - firstBlockTime
 
   # Clamp to [targetTimespan/4, targetTimespan*4]
-  let minTimespan = int64(params.powTargetTimespan) div 4
-  let maxTimespan = int64(params.powTargetTimespan) * 4
+  # Bitcoin Core pow.cpp:57-60
+  let minTimespan = int64(params.powTargetTimespan) div 4  # 302_400
+  let maxTimespan = int64(params.powTargetTimespan) * 4    # 4_838_400
 
   if actualTimespan < minTimespan:
     actualTimespan = minTimespan
   elif actualTimespan > maxTimespan:
     actualTimespan = maxTimespan
 
-  # Get the target to adjust
-  # BIP94 (testnet4): use first block's bits to prevent time-warp attack
-  let bitsToUse = if params.enforceBIP94 and firstBlockBits != 0:
+  # Get the target to adjust.
+  # BIP94 (testnet4): use the first block's bits instead of the last block's bits
+  # to prevent time-warp attacks.  Bitcoin Core pow.cpp:67-76.
+  # NOTE: no `!= 0` guard here — the caller always passes the correct value.
+  let bitsToUse = if params.enforceBIP94:
     firstBlockBits
   else:
     lastIndex.header.bits
@@ -167,11 +172,13 @@ proc getNextWorkRequired*(
   let firstHeight = lastIndex.height - (DifficultyAdjustmentInterval - 1)
   let firstIndex = getAncestor(lastIndex, firstHeight)
 
-  # For BIP94 (testnet4), we need to use the first block's bits to prevent time-warp
+  # For BIP94 (testnet4), pass the first block's nBits so CalculateNextWorkRequired
+  # anchors the retarget at the start of the period (time-warp fix, pow.cpp:67-76).
+  # For non-BIP94 nets, pass lastIndex.header.bits (the callee uses it as the base).
   let firstBlockBits = if params.enforceBIP94:
     firstIndex.header.bits
   else:
-    0'u32
+    lastIndex.header.bits
 
   calculateNextWorkRequired(lastIndex, int64(firstIndex.header.timestamp), params, firstBlockBits)
 
