@@ -262,7 +262,7 @@ proc buildDeployments*(rpc: RpcServer, targetHash: BlockHash, targetHeight: int3
     result["active"] = %(state == tsActive)
     result["bip9"]   = bip9Obj
 
-  let testdummy = testDummyDeployment()
+  let testdummy = testDummyDeployment(rpc.params.network)
   let taproot   = taprootDeployment(rpc.params.network)
 
   result["testdummy"] = bip9Deployment(testdummy, 0)

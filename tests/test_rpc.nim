@@ -937,7 +937,7 @@ suite "RPC getdeploymentinfo":
     deployments["segwit"] = makeBuried(p.segwitHeight,  height)
 
     # BIP9 fields (type only; state machine needs a live chain)
-    let testdummyDep = testDummyDeployment()
+    let testdummyDep = testDummyDeployment(p.network)
     let taprootDep   = taprootDeployment(p.network)
 
     let tdObj = newJObject()
@@ -1030,8 +1030,8 @@ suite "RPC getdeploymentinfo":
     let dep = taprootDeployment(Regtest)
     check dep.startTime == AlwaysActive
 
-  test "testDummyDeployment is NeverActive":
-    let dep = testDummyDeployment()
+  test "testDummyDeployment is NeverActive on mainnet":
+    let dep = testDummyDeployment(Mainnet)
     check dep.startTime == NeverActive
 
 # ---------------------------------------------------------------------------

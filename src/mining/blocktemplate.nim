@@ -1,9 +1,9 @@
 ## Block template generation
 ## Creates block templates for mining with witness commitment support
 
-import std/[times, options]
+import std/[times, options, tables]
 import ../primitives/[types, serialize]
-import ../consensus/[params, validation]
+import ../consensus/[params, validation, versionbits]
 import ../mempool/mempool
 import ../crypto/hashing
 import ../storage/chainstate
@@ -441,8 +441,24 @@ proc buildBlockTemplate*(
   # accumulates each selected tx.  This matches Core m_last_block_weight.
   let totalWeight = nBlockWeight
 
+  # ComputeBlockVersion: set BIP9 top bits and set any deployment bits for
+  # deployments in STARTED or LOCKED_IN state (miners must signal).
+  # Reference: Bitcoin Core versionbits.cpp:265-279, node/miner.cpp UpdateTime.
+  # Bug fixed (W91 Bug 4): was hardcoded to 0x20000000, ignoring STARTED/LOCKED_IN
+  # deployment bits.  Miners are required to signal bits for active signaling
+  # periods (BIP-9 §3, "Upon receiving a version bits block").
+  let deployments = getDeployments(params.network)
+  var vbCaches = newSeq[Table[BlockHash, ThresholdState]]()
+  let getBlockIndexFn = proc(h: BlockHash): Option[BlockIndex] =
+    chainState.db.getBlockIndex(h)
+  let getMtpFn = proc(h: BlockHash): int64 =
+    getMtpForBlock(h, getBlockIndexFn)
+  let blockVersion = computeBlockVersion(
+    deployments, prevHash, getBlockIndexFn, getMtpFn, vbCaches
+  )
+
   let header = BlockHeader(
-    version: 0x20000000,  # BIP9 version bits
+    version: blockVersion,
     prevBlock: prevHash,
     merkleRoot: merkleRoot,
     timestamp: uint32(getTime().toUnix()),
