@@ -1,7 +1,7 @@
 ## Transaction mempool
 ## Manages unconfirmed transactions with fee/size policy, CPFP tracking, and eviction
 
-import std/[tables, algorithm, options, times, sets]
+import std/[tables, algorithm, options, times, sets, math]
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation]
 import ../storage/chainstate
@@ -44,11 +44,25 @@ type
     ## Cluster limits (Bitcoin Core cluster mempool, policy/policy.h:72-74)
     clusterLimit*: int      ## Max transactions per cluster (default 64)
     clusterSizeLimit*: int  ## Max total cluster vsize in vbytes (default 101,000)
+    ## Rolling minimum fee rate (txmempool.cpp:829-859)
+    ## Tracks the highest fee rate of evicted chunks so that new txs pay at least
+    ## as much as what was evicted.  Decays exponentially after a block is mined.
+    rollingMinimumFeeRate*: float64   ## sat/kvB; 0 = no floor; Core: rollingMinimumFeeRate
+    blockSinceLastRollingFeeBump*: bool  ## true after block, enables decay; Core: blockSinceLastRollingFeeBump
+    lastRollingFeeUpdate*: int64      ## Unix seconds of last decay step; Core: lastRollingFeeUpdate
+    incrementalRelayFeeRate*: float64 ## sat/kvB incremental relay fee; Core: m_opts.incremental_relay_feerate
+    ## Mempool expiry
+    expiryHours*: int       ## Transactions older than this are expired (default 336h = 14 days)
 
 const
   DefaultMaxMempoolSize* = 300_000_000  ## 300 MB
   DefaultMinFeeRate* = 1.0              ## 1 sat/vbyte minimum
   MaxStandardTxWeight* = 400_000        ## 400K weight units max per tx
+
+  ## Rolling fee constants (Bitcoin Core txmempool.h:212, txmempool.cpp:829-859)
+  RollingFeeHalflife* = 60 * 60 * 12   ## 12-hour halflife in seconds (Core: ROLLING_FEE_HALFLIFE)
+  DefaultIncrementalRelayFeeSatKvB* = 100.0  ## 100 sat/kvB (Core: DEFAULT_INCREMENTAL_RELAY_FEE, policy/policy.h:48)
+  DefaultMempoolExpiryHours* = 336      ## 14 days (Core: DEFAULT_MEMPOOL_EXPIRY_HOURS, kernel/mempool_options.h:23)
 
   ## Package limits (Bitcoin Core defaults)
   DefaultAncestorLimit* = 25            ## Max ancestors including self (policy/policy.h:76)
@@ -109,6 +123,8 @@ proc isRbfOptIn*(mp: Mempool, tx: Transaction): bool
 proc evictLowestFee*(mp: Mempool)
 proc calculateDescendants*(mp: Mempool, txid: TxId): HashSet[TxId]
 proc calculateAncestors*(mp: Mempool, tx: Transaction): HashSet[TxId]
+proc trackPackageRemoved*(mp: Mempool, removedFeeRateSatKvB: float64)
+proc getMinFee*(mp: Mempool): float64
 proc findConflicts*(mp: Mempool, tx: Transaction): HashSet[TxId]
 proc getAllConflictsWithDescendants*(mp: Mempool, conflicts: HashSet[TxId]): HashSet[TxId]
 proc calculateConflictFees*(mp: Mempool, allConflicts: HashSet[TxId]): (Satoshi, int)
@@ -127,7 +143,9 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
                  ancestorSizeLimit: int = DefaultAncestorSizeLimit,
                  descendantSizeLimit: int = DefaultDescendantSizeLimit,
                  clusterLimit: int = DefaultClusterLimit,
-                 clusterSizeLimit: int = DefaultClusterSizeLimit): Mempool =
+                 clusterSizeLimit: int = DefaultClusterSizeLimit,
+                 incrementalRelayFeeRate: float64 = DefaultIncrementalRelayFeeSatKvB,
+                 expiryHours: int = DefaultMempoolExpiryHours): Mempool =
   Mempool(
     entries: initTable[TxId, MempoolEntry](),
     spentBy: initTable[OutPoint, TxId](),
@@ -142,7 +160,12 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
     ancestorSizeLimit: ancestorSizeLimit,
     descendantSizeLimit: descendantSizeLimit,
     clusterLimit: clusterLimit,
-    clusterSizeLimit: clusterSizeLimit
+    clusterSizeLimit: clusterSizeLimit,
+    rollingMinimumFeeRate: 0.0,
+    blockSinceLastRollingFeeBump: false,
+    lastRollingFeeUpdate: getTime().toUnix(),
+    incrementalRelayFeeRate: incrementalRelayFeeRate,
+    expiryHours: expiryHours
   )
 
 # Basic accessors
@@ -897,9 +920,16 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
   let vsizeInt = (weight + 3) div 4
   let feeRate = float64(int64(fee)) / vbytes
 
-  # Check minimum fee rate (1 sat/vbyte)
-  if feeRate < mp.minFeeRate:
-    return err(TxId, "fee rate " & $feeRate & " below minimum " & $mp.minFeeRate)
+  # Check minimum fee rate.
+  # Gate: max(configured minFeeRate, current rolling minimum from GetMinFee).
+  # After TrimToSize eviction the rolling floor is bumped so new txs must pay
+  # more than what was just evicted.  It decays back to zero after a block.
+  # Core reference: CTxMemPool::GetMinFee, txmempool.cpp:829-851.
+  let rollingFloor = mp.getMinFee()
+  let effectiveMinFeeRate = max(mp.minFeeRate, rollingFloor)
+  if feeRate < effectiveMinFeeRate:
+    return err(TxId, "fee rate " & $feeRate & " below minimum " & $effectiveMinFeeRate &
+               " (rolling floor: " & $rollingFloor & ")")
 
   # If there are conflicts, validate RBF rules before proceeding
   if len(conflicts) > 0:
@@ -1094,9 +1124,13 @@ proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true) =
 
 # Remove transactions confirmed in a block
 proc removeForBlock*(mp: Mempool, blk: Block) =
-  ## Remove transactions that were included in a block
+  ## Remove transactions that were included in a block.
   ## Also removes any transactions that spend outputs created by block txs
-  ## (double-spend conflicts)
+  ## (double-spend conflicts).
+  ## Sets blockSinceLastRollingFeeBump = true so GetMinFee decays the rolling
+  ## floor after the next update interval.
+  ## Core reference: txmempool.cpp:426-427 (lastRollingFeeUpdate + blockSinceLastRollingFeeBump
+  ## reset happens at the end of CTxMemPool::removeForBlock).
 
   # Collect txids to remove
   var toRemove: seq[TxId]
@@ -1117,6 +1151,11 @@ proc removeForBlock*(mp: Mempool, blk: Block) =
   # Remove all collected transactions
   for txid in toRemove:
     mp.removeTransaction(txid)
+
+  # After block removal: reset rolling fee decay timer so fee floor can decay.
+  # Core sets these at the end of removeForBlock (txmempool.cpp:426-427).
+  mp.lastRollingFeeUpdate = getTime().toUnix()
+  mp.blockSinceLastRollingFeeBump = true
 
 # Re-admit transactions that came back from a disconnected block during a reorg.
 # Mirrors Bitcoin Core's `MaybeUpdateMempoolForReorg`
@@ -1175,42 +1214,170 @@ proc getTransactionsByFeeRate*(mp: Mempool, maxWeight: int): seq[MempoolEntry] =
       result.add(entry)
       totalWeight += entry.weight
 
-# Evict lowest fee rate transaction
+# ============================================================================
+# Rolling Minimum Fee Rate — CTxMemPool::GetMinFee / trackPackageRemoved
+# Bitcoin Core: txmempool.cpp:829-859
+# ============================================================================
+
+proc trackPackageRemoved*(mp: Mempool, removedFeeRateSatKvB: float64) =
+  ## Bump the rolling minimum fee when a package is evicted by TrimToSize.
+  ## Core reference: txmempool.cpp:853-859
+  ##
+  ## Gate: only bump if the removed rate exceeds the current floor.
+  ## Sets blockSinceLastRollingFeeBump = false so decay is paused until
+  ## the next block is mined.
+  if removedFeeRateSatKvB > mp.rollingMinimumFeeRate:
+    mp.rollingMinimumFeeRate = removedFeeRateSatKvB
+    mp.blockSinceLastRollingFeeBump = false
+
+proc getMinFee*(mp: Mempool): float64 =
+  ## Compute the current minimum fee rate for mempool admission (sat/kvB).
+  ## Mirrors CTxMemPool::GetMinFee(sizelimit), txmempool.cpp:829-851.
+  ##
+  ## When no eviction has bumped the floor (rollingMinimumFeeRate == 0) OR
+  ## a block has not been mined since the last bump, return the raw rolling
+  ## value immediately (no decay yet).
+  ##
+  ## Once blockSinceLastRollingFeeBump is true the fee decays exponentially
+  ## with a 12-hour halflife.  The halflife is accelerated when the pool is
+  ## less than half-full (÷2) or less than quarter-full (÷4) — this lets
+  ## the floor drop faster when there's plenty of room.
+  ##
+  ## The floor is cleared to zero when it falls below half of the configured
+  ## incrementalRelayFeeRate.  The returned value is always at least
+  ## incrementalRelayFeeRate when non-zero.
+  if not mp.blockSinceLastRollingFeeBump or mp.rollingMinimumFeeRate == 0:
+    # No block yet or no eviction floor — return raw value as sat/vbyte
+    return mp.rollingMinimumFeeRate / 1000.0
+
+  let now = getTime().toUnix()
+  if now > mp.lastRollingFeeUpdate + 10:
+    var halflife = float64(RollingFeeHalflife)
+    # Accelerate decay when pool is far below its size limit
+    if mp.currentSize < mp.maxSize div 4:
+      halflife = halflife / 4.0
+    elif mp.currentSize < mp.maxSize div 2:
+      halflife = halflife / 2.0
+
+    let elapsed = float64(now - mp.lastRollingFeeUpdate)
+    mp.rollingMinimumFeeRate = mp.rollingMinimumFeeRate / pow(2.0, elapsed / halflife)
+    mp.lastRollingFeeUpdate = now
+
+    # Clear floor when it drops below half of incrementalRelayFeeRate
+    if mp.rollingMinimumFeeRate < mp.incrementalRelayFeeRate / 2.0:
+      mp.rollingMinimumFeeRate = 0.0
+      return 0.0
+
+  # Return max(rollingMinimumFeeRate, incrementalRelayFeeRate) in sat/vbyte
+  # (rolling fee is stored in sat/kvB; divide by 1000 for sat/vbyte)
+  let rollingVbyte = mp.rollingMinimumFeeRate / 1000.0
+  let incrementalVbyte = mp.incrementalRelayFeeRate / 1000.0
+  max(rollingVbyte, incrementalVbyte)
+
+# Evict the package (tx + all descendants) with the lowest combined fee rate.
+# Mirrors CTxMemPool::TrimToSize logic: evict the "worst chunk" (lowest
+# combined/chunk feerate considering all descendants), call trackPackageRemoved
+# to bump the rolling floor, then remove all of them.
+# Core reference: txmempool.cpp:861-911.
+#
+# Crucially, Core evaluates each "chunk" (root tx + all descendants) as a
+# unit when deciding which package to evict.  A low-rate parent that has a
+# high-fee CPFP child is treated as a single package whose rate is the
+# combined (totalFee / totalVsize).  This prevents incorrectly evicting a
+# parent that a child is bumping via CPFP.
 proc evictLowestFee*(mp: Mempool) =
-  ## Remove the transaction with the lowest fee rate
+  ## Remove the package (tx + all descendants) with the lowest combined fee rate.
+  ## Calls trackPackageRemoved so subsequent txs must pay at least as much.
 
   if mp.entries.len == 0:
     return
 
-  var lowestTxid: TxId
-  var lowestRate = float64.high
-  var found = false
+  # For each "root" transaction (one with no in-mempool parents), compute the
+  # combined feerate of the root + all its descendants.  Select the root whose
+  # package has the lowest combined rate.
+  #
+  # We define a "root" as any tx that is not spent by another mempool tx —
+  # i.e. it has no in-mempool ancestor.
+  var lowestRootTxid: TxId
+  var lowestPackageRate = float64.high
+  var foundRoot = false
 
   for txid, entry in mp.entries:
-    # Don't evict if it has descendants (children in mempool)
-    var hasDescendants = false
-    for otherEntry in mp.entries.values:
-      for input in otherEntry.tx.inputs:
-        if input.prevOut.txid == txid:
-          hasDescendants = true
-          break
-      if hasDescendants:
+    # Check if this tx has any in-mempool ancestors (parents)
+    var hasParent = false
+    for input in entry.tx.inputs:
+      if input.prevOut.txid in mp.entries:
+        hasParent = true
         break
 
-    if not hasDescendants and entry.feeRate < lowestRate:
-      lowestRate = entry.feeRate
-      lowestTxid = txid
-      found = true
+    if hasParent:
+      continue  # Not a root
 
-  if found:
-    mp.removeTransaction(lowestTxid)
-  elif mp.entries.len > 0:
-    # If all have descendants, just remove the first one with lowest rate
+    # Compute combined feerate of root + all descendants
+    let descendants = mp.calculateDescendants(txid)
+    var chunkFee = int64(entry.fee)
+    var chunkWeight = entry.weight
+    for descTxid in descendants:
+      if descTxid in mp.entries:
+        let e = mp.entries[descTxid]
+        chunkFee += int64(e.fee)
+        chunkWeight += e.weight
+
+    let chunkVbytes = float64(chunkWeight) / 4.0
+    let packageRate = if chunkVbytes > 0:
+      float64(chunkFee) / chunkVbytes
+    else:
+      0.0
+
+    if packageRate < lowestPackageRate:
+      lowestPackageRate = packageRate
+      lowestRootTxid = txid
+      foundRoot = true
+
+  if not foundRoot:
+    # Fallback: no rootless tx found (all txs have parents — should not happen
+    # in a well-formed mempool, but handle it gracefully by picking the overall
+    # lowest individual fee rate entry).
     for txid, entry in mp.entries:
-      if entry.feeRate < lowestRate:
-        lowestRate = entry.feeRate
-        lowestTxid = txid
-    mp.removeTransaction(lowestTxid)
+      if entry.feeRate < lowestPackageRate:
+        lowestPackageRate = entry.feeRate
+        lowestRootTxid = txid
+        foundRoot = true
+
+  if not foundRoot or mp.entries.len == 0:
+    return
+
+  # Collect the root and all its descendants
+  let descendants = mp.calculateDescendants(lowestRootTxid)
+
+  # Compute the effective fee rate of the chunk being removed (sat/kvB).
+  # This is what we pass to trackPackageRemoved (+ incrementalRelayFeeRate).
+  var chunkFee = int64(mp.entries[lowestRootTxid].fee)
+  var chunkWeight = mp.entries[lowestRootTxid].weight
+  for descTxid in descendants:
+    if descTxid in mp.entries:
+      let e = mp.entries[descTxid]
+      chunkFee += int64(e.fee)
+      chunkWeight += e.weight
+
+  let chunkVbytes = float64(chunkWeight) / 4.0
+  let removedRateSatKvB = if chunkVbytes > 0:
+    float64(chunkFee) / chunkVbytes * 1000.0
+  else:
+    0.0
+
+  # Bump rolling floor: evicted rate + incrementalRelayFeeRate
+  # Core: removed += m_opts.incremental_relay_feerate; trackPackageRemoved(removed)
+  mp.trackPackageRemoved(removedRateSatKvB + mp.incrementalRelayFeeRate)
+
+  # Remove the root and all its descendants.
+  var toRemove: seq[TxId]
+  for descTxid in descendants:
+    toRemove.add(descTxid)
+  toRemove.add(lowestRootTxid)
+
+  for txid in toRemove:
+    mp.removeTransaction(txid, evictEphemeral = false)
 
 # Select transactions for a new block
 proc selectTransactionsForBlock*(mp: Mempool, maxWeight: int = MaxBlockWeight): seq[Transaction] =
@@ -1219,18 +1386,35 @@ proc selectTransactionsForBlock*(mp: Mempool, maxWeight: int = MaxBlockWeight): 
   for entry in entries:
     result.add(entry.tx)
 
-# Expire old transactions
-proc expire*(mp: Mempool, maxAge: Duration = initDuration(hours = 336)) =
-  ## Remove transactions older than maxAge (default 2 weeks)
-  let cutoff = getTime() - maxAge
-  var toRemove: seq[TxId]
+# Expire old transactions and their descendants.
+# Core reference: txmempool.cpp:811-827 — Expire() calls CalculateDescendants
+# on each expired tx and removes the whole stage (expired + all descendants).
+proc expire*(mp: Mempool, maxAgeOverride: int = -1) =
+  ## Remove transactions older than the configured expiry (default 336 hours = 14 days).
+  ## Also removes all descendants of expired transactions.
+  ## maxAgeOverride: if >= 0, override expiryHours for this call (for testing).
+  ## Core reference: CTxMemPool::Expire, txmempool.cpp:811-827.
+  let hours = if maxAgeOverride >= 0: maxAgeOverride else: mp.expiryHours
+  let cutoff = getTime() - initDuration(hours = hours)
 
+  # Collect directly-expired txids
+  var directlyExpired: seq[TxId]
   for txid, entry in mp.entries:
     if entry.timeAdded < cutoff:
-      toRemove.add(txid)
+      directlyExpired.add(txid)
+
+  # For each expired tx, also collect all descendants (they must go too).
+  # Use a set to deduplicate across multiple expired roots.
+  var toRemove: HashSet[TxId]
+  for txid in directlyExpired:
+    toRemove.incl(txid)
+    let descendants = mp.calculateDescendants(txid)
+    for descTxid in descendants:
+      toRemove.incl(descTxid)
 
   for txid in toRemove:
-    mp.removeTransaction(txid)
+    if txid in mp.entries:
+      mp.removeTransaction(txid, evictEphemeral = false)
 
 # Update ancestor fees after a transaction is added/removed
 proc updateDescendantFees*(mp: Mempool, txid: TxId) =
@@ -1598,19 +1782,22 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
   let packageFeerate = calculatePackageFeerate(fees, weights)
   result.packageFeerate = packageFeerate
 
-  # Check fee rate policy
+  # Check fee rate policy — must pass max(minFeeRate, rollingMinFee) gate.
+  let pkgRollingFloor = mp.getMinFee()
+  let pkgEffectiveMin = max(mp.minFeeRate, pkgRollingFloor)
+
   # When using package feerates, the combined package rate must meet the minimum
   if usePackageFeerates:
-    if packageFeerate < mp.minFeeRate:
+    if packageFeerate < pkgEffectiveMin:
       result.state = pvPolicy
-      result.error = "package fee rate " & $packageFeerate & " below minimum " & $mp.minFeeRate
+      result.error = "package fee rate " & $packageFeerate & " below minimum " & $pkgEffectiveMin
       return result
   else:
     # Check individual fee rates
     for i in 0 ..< txns.len:
       if result.txResults[i].allowed:
         let individualRate = float64(int64(fees[i])) / float64((weights[i] + 3) div 4)
-        if individualRate < mp.minFeeRate:
+        if individualRate < pkgEffectiveMin:
           result.txResults[i].allowed = false
           result.txResults[i].error = "fee rate " & $individualRate & " below minimum"
           allValid = false
