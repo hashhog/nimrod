@@ -46,6 +46,10 @@ type
     maxBlockSigopsCost*: int
     coinbaseMaturity*: int
     bip34Height*: int
+    bip34Hash*: array[32, byte]   ## Block hash at BIP34 activation height; all-zeros if not set.
+                                   ## Bitcoin Core consensus/params.h BIP34Hash.
+                                   ## Used to verify we are on the canonical chain before
+                                   ## allowing BIP34 to suppress BIP30 UTXO duplicate checks.
     bip65Height*: int
     bip66Height*: int
     csvHeight*: int      # BIP68/112/113 (CSV) activation height
@@ -152,6 +156,12 @@ proc mainnetParams*(): ConsensusParams =
   result.maxBlockSigopsCost = 80_000
   result.coinbaseMaturity = 100
   result.bip34Height = 227931
+  # Bitcoin Core kernel/chainparams.cpp:90: consensus.BIP34Hash
+  # Block hash at height 227931 — used to verify canonical chain before
+  # suppressing BIP30 checks (validation.cpp:2462).
+  result.bip34Hash = hexToBytes32(
+    "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
+  )
   result.bip65Height = 388381
   result.bip66Height = 363725
   result.csvHeight = 419328    # BIP68/112/113 activation
@@ -275,6 +285,10 @@ proc testnet3Params*(): ConsensusParams =
   result.maxBlockSigopsCost = 80_000
   result.coinbaseMaturity = 100
   result.bip34Height = 21111
+  # Bitcoin Core kernel/chainparams.cpp:213: consensus.BIP34Hash (testnet3)
+  result.bip34Hash = hexToBytes32(
+    "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
+  )
   result.bip65Height = 581885
   result.bip66Height = 330776
   result.csvHeight = 770112    # BIP68/112/113 activation on testnet3
