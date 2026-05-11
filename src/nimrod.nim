@@ -1018,6 +1018,127 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
             peer = $peer, total = msg.pkgTxns.transactions.len,
             accepted = accepted
 
+  # BIP-157 compact block filter serving
+  # Reference: bitcoin-core/src/net_processing.cpp:ProcessGetCFilters,
+  #            ProcessGetCFHeaders, ProcessGetCFCheckPt.
+  # Gates: NODE_COMPACT_FILTERS must be in our services, index must be enabled.
+  of mkGetCFilters:
+    # Serve individual compact filters for a range of blocks.
+    # Wire: getcfilters → one cfilter per block in [startHeight..stopBlock]
+    # Limit: MAX_GETCFILTERS_SIZE = 1000 blocks per request.
+    if state.blockFilterIndex == nil or not state.blockFilterIndex.enabled:
+      debug "ignoring getcfilters: blockfilterindex not enabled", peer = $peer
+    else:
+      let req = msg.getCFilters
+      let stopBlockHash = BlockHash(req.stopHash)
+      let stopIdxOpt = state.chainState.db.getBlockIndex(stopBlockHash)
+      if stopIdxOpt.isNone:
+        debug "getcfilters: unknown stop hash", peer = $peer
+      else:
+        let stopHeight = stopIdxOpt.get().height
+        let startHeight = int32(req.startHeight)
+        const MaxGetCFiltersSize = 1000'i32
+        if startHeight > stopHeight or
+           stopHeight - startHeight >= MaxGetCFiltersSize:
+          debug "getcfilters: invalid range or too large", peer = $peer,
+                start = startHeight, stop = stopHeight
+        else:
+          for h in startHeight .. stopHeight:
+            let hashOpt = state.chainState.db.getBlockHashByHeight(h)
+            if hashOpt.isNone: break
+            let bh = hashOpt.get()
+            let fOpt = state.blockFilterIndex.getFilter(h, bh)
+            if fOpt.isNone: break
+            try:
+              await peer.sendMessage(
+                newCFilter(req.filterType, array[32, byte](bh),
+                           getEncodedFilter(fOpt.get())))
+            except CatchableError as e:
+              debug "getcfilters: send failed", peer = $peer, error = e.msg
+              break
+
+  of mkGetCFHeaders:
+    # Serve compact filter headers for a range of blocks.
+    # Wire: getcfheaders → one cfheaders with hashes for [startHeight..stopBlock]
+    # Limit: MAX_GETCFHEADERS_SIZE = 2000 blocks per request.
+    if state.blockFilterIndex == nil or not state.blockFilterIndex.enabled:
+      debug "ignoring getcfheaders: blockfilterindex not enabled", peer = $peer
+    else:
+      let req = msg.getCFHeaders
+      let stopBlockHash = BlockHash(req.stopHash)
+      let stopIdxOpt = state.chainState.db.getBlockIndex(stopBlockHash)
+      if stopIdxOpt.isNone:
+        debug "getcfheaders: unknown stop hash", peer = $peer
+      else:
+        let stopHeight = stopIdxOpt.get().height
+        let startHeight = int32(req.startHeight)
+        const MaxGetCFHeadersSize = 2000'i32
+        if startHeight > stopHeight or
+           stopHeight - startHeight >= MaxGetCFHeadersSize:
+          debug "getcfheaders: invalid range or too large", peer = $peer,
+                start = startHeight, stop = stopHeight
+        else:
+          # Fetch prevFilterHeader (filter header at startHeight - 1)
+          var prevFilterHeader: array[32, byte]
+          if startHeight > 0:
+            let prevHOpt = state.blockFilterIndex.getFilterHeader(startHeight - 1)
+            if prevHOpt.isSome:
+              prevFilterHeader = prevHOpt.get()
+          # Fetch per-block filter hashes
+          var filterHashes: seq[array[32, byte]]
+          var ok = true
+          for h in startHeight .. stopHeight:
+            let fhOpt = state.blockFilterIndex.getFilterHash(h)
+            if fhOpt.isNone: ok = false; break
+            filterHashes.add(fhOpt.get())
+          if ok:
+            try:
+              await peer.sendMessage(
+                newCFHeaders(req.filterType, array[32, byte](stopBlockHash),
+                             prevFilterHeader, filterHashes))
+            except CatchableError as e:
+              debug "getcfheaders: send failed", peer = $peer, error = e.msg
+
+  of mkGetCFCheckPt:
+    # Serve compact filter checkpoints (headers at every 1000-block interval).
+    # Wire: getcfcheckpt → one cfcheckpt with filter headers at CFCHECKPT_INTERVAL
+    # heights up to and including stopBlock.
+    # Reference: bitcoin-core/src/net_processing.cpp:ProcessGetCFCheckPt
+    if state.blockFilterIndex == nil or not state.blockFilterIndex.enabled:
+      debug "ignoring getcfcheckpt: blockfilterindex not enabled", peer = $peer
+    else:
+      let req = msg.getCFCheckPt
+      let stopBlockHash = BlockHash(req.stopHash)
+      let stopIdxOpt = state.chainState.db.getBlockIndex(stopBlockHash)
+      if stopIdxOpt.isNone:
+        debug "getcfcheckpt: unknown stop hash", peer = $peer
+      else:
+        let stopHeight = stopIdxOpt.get().height
+        const CfCheckptInterval = 1000'i32
+        var headers: seq[array[32, byte]]
+        let nCheckpoints = stopHeight div CfCheckptInterval
+        var ok = true
+        for i in 1 .. nCheckpoints:
+          let cpHeight = int32(i) * CfCheckptInterval
+          let cpHashOpt = state.chainState.db.getBlockHashByHeight(cpHeight)
+          if cpHashOpt.isNone: ok = false; break
+          let cpFhOpt = state.blockFilterIndex.getFilterHeader(cpHeight)
+          if cpFhOpt.isNone: ok = false; break
+          headers.add(cpFhOpt.get())
+        if ok:
+          try:
+            await peer.sendMessage(
+              newCFCheckPt(req.filterType, array[32, byte](stopBlockHash),
+                           headers))
+          except CatchableError as e:
+            debug "getcfcheckpt: send failed", peer = $peer, error = e.msg
+
+  # BIP-157 response messages (cfilter/cfheaders/cfcheckpt) — currently
+  # received only when nimrod acts as a light-client requesting filters.
+  # No handler needed on the server-path; silently drop for now.
+  of mkCFilter, mkCFHeaders, mkCFCheckPt:
+    trace "received BIP-157 filter response", peer = $peer, kind = $msg.kind
+
   else:
     discard
 

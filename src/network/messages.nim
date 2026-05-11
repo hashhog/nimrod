@@ -22,6 +22,9 @@ const
   NodeNetwork* = 1'u64
   NodeBloom* = 4'u64           ## BIP-111 / BIP-35: served bloom filters + mempool
   NodeWitness* = 8'u64
+  NodeCompactFilters* = 64'u64 ## BIP-157: serves getcfilters / getcfheaders / getcfcheckpt
+                               ## NODE_COMPACT_FILTERS = (1 << 6)
+                               ## Reference: bitcoin-core/src/protocol.h:321-323
   NodeNetworkLimited* = 1024'u64
 
 type
@@ -92,6 +95,56 @@ type
   PkgTxnsMsg* = object
     transactions*: seq[Transaction]
 
+  ## BIP-157 getcfilters request
+  ## Wire: filter_type(1) || start_height(4 LE) || stop_hash(32)
+  ## Reference: bitcoin-core/src/net_processing.cpp:3315
+  GetCFiltersMsg* = object
+    filterType*: uint8
+    startHeight*: uint32
+    stopHash*: array[32, byte]
+
+  ## BIP-157 cfilter response
+  ## Wire: filter_type(1) || block_hash(32) || compactsize(filter_len) || filter_bytes
+  ## Reference: bitcoin-core/src/blockfilter.h:150-155 (Serialize)
+  CFilterMsg* = object
+    filterType*: uint8
+    blockHash*: array[32, byte]
+    filter*: seq[byte]        ## Encoded GCS filter bytes
+
+  ## BIP-157 getcfheaders request
+  ## Wire: filter_type(1) || start_height(4 LE) || stop_hash(32)
+  ## Reference: bitcoin-core/src/net_processing.cpp:3344
+  GetCFHeadersMsg* = object
+    filterType*: uint8
+    startHeight*: uint32
+    stopHash*: array[32, byte]
+
+  ## BIP-157 cfheaders response
+  ## Wire: filter_type(1) || stop_hash(32) || previous_filter_header(32) ||
+  ##       compactsize(filter_hashes_len) || [hash(32), ...]
+  ## Reference: bitcoin-core/src/net_processing.cpp:3379-3383
+  CFHeadersMsg* = object
+    filterType*: uint8
+    stopHash*: array[32, byte]
+    previousFilterHeader*: array[32, byte]
+    filterHashes*: seq[array[32, byte]]
+
+  ## BIP-157 getcfcheckpt request
+  ## Wire: filter_type(1) || stop_hash(32)
+  ## Reference: bitcoin-core/src/net_processing.cpp:3386
+  GetCFCheckPtMsg* = object
+    filterType*: uint8
+    stopHash*: array[32, byte]
+
+  ## BIP-157 cfcheckpt response
+  ## Wire: filter_type(1) || stop_hash(32) ||
+  ##       compactsize(filter_headers_len) || [header(32), ...]
+  ## Reference: bitcoin-core/src/net_processing.cpp:3418-3421
+  CFCheckPtMsg* = object
+    filterType*: uint8
+    stopHash*: array[32, byte]
+    filterHeaders*: seq[array[32, byte]]
+
   ## BIP330 sendtxrcncl - signal transaction reconciliation support
   SendTxRcnclMsg* = object
     version*: uint32   ## Reconciliation protocol version (currently 1)
@@ -145,6 +198,13 @@ type
     # BIP-331 package relay messages
     mkGetPkgTxns
     mkPkgTxns
+    # BIP-157 compact block filter messages
+    mkGetCFilters
+    mkCFilter
+    mkGetCFHeaders
+    mkCFHeaders
+    mkGetCFCheckPt
+    mkCFCheckPt
     # BIP330 Erlay messages
     mkSendTxRcncl
     mkReqRecon
@@ -199,6 +259,19 @@ type
       getPkgTxns*: GetPkgTxnsMsg
     of mkPkgTxns:
       pkgTxns*: PkgTxnsMsg
+    # BIP-157 compact block filter messages
+    of mkGetCFilters:
+      getCFilters*: GetCFiltersMsg
+    of mkCFilter:
+      cFilter*: CFilterMsg
+    of mkGetCFHeaders:
+      getCFHeaders*: GetCFHeadersMsg
+    of mkCFHeaders:
+      cFHeaders*: CFHeadersMsg
+    of mkGetCFCheckPt:
+      getCFCheckPt*: GetCFCheckPtMsg
+    of mkCFCheckPt:
+      cFCheckPt*: CFCheckPtMsg
     # BIP330 Erlay messages
     of mkSendTxRcncl:
       sendTxRcncl*: SendTxRcnclMsg
@@ -451,6 +524,36 @@ proc serializePayload*(msg: P2PMessage): seq[byte] =
     w.writeCompactSize(uint64(msg.pkgTxns.transactions.len))
     for tx in msg.pkgTxns.transactions:
       w.writeTransaction(tx)
+  # BIP-157 compact block filter messages
+  of mkGetCFilters:
+    w.writeUint8(msg.getCFilters.filterType)
+    w.writeUint32LE(msg.getCFilters.startHeight)
+    w.writeBytes(msg.getCFilters.stopHash)
+  of mkCFilter:
+    w.writeUint8(msg.cFilter.filterType)
+    w.writeBytes(msg.cFilter.blockHash)
+    w.writeCompactSize(uint64(msg.cFilter.filter.len))
+    w.writeBytes(msg.cFilter.filter)
+  of mkGetCFHeaders:
+    w.writeUint8(msg.getCFHeaders.filterType)
+    w.writeUint32LE(msg.getCFHeaders.startHeight)
+    w.writeBytes(msg.getCFHeaders.stopHash)
+  of mkCFHeaders:
+    w.writeUint8(msg.cFHeaders.filterType)
+    w.writeBytes(msg.cFHeaders.stopHash)
+    w.writeBytes(msg.cFHeaders.previousFilterHeader)
+    w.writeCompactSize(uint64(msg.cFHeaders.filterHashes.len))
+    for h in msg.cFHeaders.filterHashes:
+      w.writeBytes(h)
+  of mkGetCFCheckPt:
+    w.writeUint8(msg.getCFCheckPt.filterType)
+    w.writeBytes(msg.getCFCheckPt.stopHash)
+  of mkCFCheckPt:
+    w.writeUint8(msg.cFCheckPt.filterType)
+    w.writeBytes(msg.cFCheckPt.stopHash)
+    w.writeCompactSize(uint64(msg.cFCheckPt.filterHeaders.len))
+    for h in msg.cFCheckPt.filterHeaders:
+      w.writeBytes(h)
   # BIP330 Erlay messages
   of mkSendTxRcncl:
     w.writeUint32LE(msg.sendTxRcncl.version)
@@ -502,6 +605,13 @@ proc messageKindToCommand*(kind: MessageKind): string =
   # BIP-331
   of mkGetPkgTxns: "getpkgtxns"
   of mkPkgTxns: "pkgtxns"
+  # BIP-157 compact block filter messages
+  of mkGetCFilters: "getcfilters"
+  of mkCFilter: "cfilter"
+  of mkGetCFHeaders: "getcfheaders"
+  of mkCFHeaders: "cfheaders"
+  of mkGetCFCheckPt: "getcfcheckpt"
+  of mkCFCheckPt: "cfcheckpt"
   # BIP330 Erlay
   of mkSendTxRcncl: "sendtxrcncl"
   of mkReqRecon: "reqrecon"
@@ -540,6 +650,13 @@ proc commandToMessageKind*(cmd: string): MessageKind =
   # BIP-331
   of "getpkgtxns": mkGetPkgTxns
   of "pkgtxns": mkPkgTxns
+  # BIP-157 compact block filter messages
+  of "getcfilters": mkGetCFilters
+  of "cfilter": mkCFilter
+  of "getcfheaders": mkGetCFHeaders
+  of "cfheaders": mkCFHeaders
+  of "getcfcheckpt": mkGetCFCheckPt
+  of "cfcheckpt": mkCFCheckPt
   # BIP330 Erlay
   of "sendtxrcncl": mkSendTxRcncl
   of "reqrecon": mkReqRecon
@@ -712,6 +829,65 @@ proc deserializePayload*(cmd: string, payload: seq[byte]): P2PMessage =
   of "mempool":
     # BIP35: empty body, peer is requesting our mempool inv
     result = P2PMessage(kind: mkMempool)
+  # BIP-157 compact block filter messages
+  of "getcfilters":
+    let ft = r.readUint8()
+    let sh = r.readUint32LE()
+    let stopH = r.readHash()
+    result = P2PMessage(kind: mkGetCFilters,
+                        getCFilters: GetCFiltersMsg(filterType: ft,
+                                                    startHeight: sh,
+                                                    stopHash: stopH))
+  of "cfilter":
+    let ft = r.readUint8()
+    let bh = r.readHash()
+    let flen = r.readCompactSize()
+    var fdata = newSeq[byte](flen)
+    if flen > 0:
+      let fbytes = r.readBytes(int(flen))
+      for i in 0 ..< int(flen): fdata[i] = fbytes[i]
+    result = P2PMessage(kind: mkCFilter,
+                        cFilter: CFilterMsg(filterType: ft,
+                                            blockHash: bh,
+                                            filter: fdata))
+  of "getcfheaders":
+    let ft = r.readUint8()
+    let sh = r.readUint32LE()
+    let stopH = r.readHash()
+    result = P2PMessage(kind: mkGetCFHeaders,
+                        getCFHeaders: GetCFHeadersMsg(filterType: ft,
+                                                      startHeight: sh,
+                                                      stopHash: stopH))
+  of "cfheaders":
+    let ft = r.readUint8()
+    let stopH = r.readHash()
+    let prevH = r.readHash()
+    let count = r.readCompactSize()
+    var hashes: seq[array[32, byte]]
+    for _ in 0 ..< int(count):
+      hashes.add(r.readHash())
+    result = P2PMessage(kind: mkCFHeaders,
+                        cFHeaders: CFHeadersMsg(filterType: ft,
+                                                stopHash: stopH,
+                                                previousFilterHeader: prevH,
+                                                filterHashes: hashes))
+  of "getcfcheckpt":
+    let ft = r.readUint8()
+    let stopH = r.readHash()
+    result = P2PMessage(kind: mkGetCFCheckPt,
+                        getCFCheckPt: GetCFCheckPtMsg(filterType: ft,
+                                                      stopHash: stopH))
+  of "cfcheckpt":
+    let ft = r.readUint8()
+    let stopH = r.readHash()
+    let count = r.readCompactSize()
+    var headers: seq[array[32, byte]]
+    for _ in 0 ..< int(count):
+      headers.add(r.readHash())
+    result = P2PMessage(kind: mkCFCheckPt,
+                        cFCheckPt: CFCheckPtMsg(filterType: ft,
+                                                stopHash: stopH,
+                                                filterHeaders: headers))
   # BIP330 Erlay
   of "sendtxrcncl":
     result = P2PMessage(kind: mkSendTxRcncl, sendTxRcncl: SendTxRcnclMsg(
@@ -902,3 +1078,61 @@ proc newReconcilDiff*(success: bool, shortIds: seq[uint32]): P2PMessage =
 proc newReqSketchExt*(): P2PMessage =
   ## Request extended sketch (larger capacity)
   P2PMessage(kind: mkReqSketchExt)
+
+# BIP-157 compact block filter message constructors
+
+proc newGetCFilters*(filterType: uint8, startHeight: uint32,
+                     stopHash: array[32, byte]): P2PMessage =
+  ## Request compact filters for a range of blocks (BIP-157 getcfilters).
+  ## Reference: bitcoin-core/src/net_processing.cpp:3315
+  P2PMessage(kind: mkGetCFilters,
+             getCFilters: GetCFiltersMsg(filterType: filterType,
+                                         startHeight: startHeight,
+                                         stopHash: stopHash))
+
+proc newCFilter*(filterType: uint8, blockHash: array[32, byte],
+                 filter: seq[byte]): P2PMessage =
+  ## Deliver a single compact filter (BIP-157 cfilter).
+  ## Reference: bitcoin-core/src/net_processing.cpp:3340
+  P2PMessage(kind: mkCFilter,
+             cFilter: CFilterMsg(filterType: filterType,
+                                  blockHash: blockHash,
+                                  filter: filter))
+
+proc newGetCFHeaders*(filterType: uint8, startHeight: uint32,
+                      stopHash: array[32, byte]): P2PMessage =
+  ## Request compact filter headers for a range of blocks (BIP-157 getcfheaders).
+  ## Reference: bitcoin-core/src/net_processing.cpp:3344
+  P2PMessage(kind: mkGetCFHeaders,
+             getCFHeaders: GetCFHeadersMsg(filterType: filterType,
+                                            startHeight: startHeight,
+                                            stopHash: stopHash))
+
+proc newCFHeaders*(filterType: uint8, stopHash: array[32, byte],
+                   previousFilterHeader: array[32, byte],
+                   filterHashes: seq[array[32, byte]]): P2PMessage =
+  ## Deliver compact filter headers (BIP-157 cfheaders).
+  ## Reference: bitcoin-core/src/net_processing.cpp:3379-3383
+  P2PMessage(kind: mkCFHeaders,
+             cFHeaders: CFHeadersMsg(filterType: filterType,
+                                      stopHash: stopHash,
+                                      previousFilterHeader: previousFilterHeader,
+                                      filterHashes: filterHashes))
+
+proc newGetCFCheckPt*(filterType: uint8,
+                      stopHash: array[32, byte]): P2PMessage =
+  ## Request compact filter checkpoints (BIP-157 getcfcheckpt).
+  ## Reference: bitcoin-core/src/net_processing.cpp:3386
+  P2PMessage(kind: mkGetCFCheckPt,
+             getCFCheckPt: GetCFCheckPtMsg(filterType: filterType,
+                                            stopHash: stopHash))
+
+proc newCFCheckPt*(filterType: uint8, stopHash: array[32, byte],
+                   filterHeaders: seq[array[32, byte]]): P2PMessage =
+  ## Deliver compact filter checkpoints (BIP-157 cfcheckpt).
+  ## Checkpoints are filter headers at every CFCHECKPT_INTERVAL = 1000 heights.
+  ## Reference: bitcoin-core/src/net_processing.cpp:3418-3421
+  P2PMessage(kind: mkCFCheckPt,
+             cFCheckPt: CFCheckPtMsg(filterType: filterType,
+                                      stopHash: stopHash,
+                                      filterHeaders: filterHeaders))

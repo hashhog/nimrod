@@ -120,7 +120,14 @@ proc readBits*(r: var BitReader, bits: int): uint64 =
     result = result or (r.readBit() shl i)
 
 proc isEmpty*(r: BitReader): bool =
-  r.pos >= r.data.len or (r.pos == r.data.len - 1 and r.bitPos >= 8)
+  ## Returns true if all bits have been consumed (no more bits to read).
+  ## A reader is empty when pos == data.len (fully past end), OR when
+  ## pos == data.len - 1 and bitPos == 0 (positioned at start of last byte
+  ## but no bits of it have been consumed — this means the last byte is
+  ## fully available, so actually NOT empty; isEmpty should only be true
+  ## when we are past the last bit).
+  ## Corrected: empty iff pos >= data.len.
+  r.pos >= r.data.len
 
 # ============================================================================
 # Golomb-Rice encoding/decoding
@@ -181,22 +188,35 @@ proc newGCSFilter*(params: GCSParams): GCSFilter =
   result.encoded = @[]
 
 proc newGCSFilter*(params: GCSParams, elements: seq[seq[byte]]): GCSFilter =
-  ## Build a GCS filter from a set of elements
+  ## Build a GCS filter from a set of elements.
+  ## Duplicates are filtered out before computing N, so that N == number of
+  ## distinct elements, matching Bitcoin Core's use of ElementSet (unordered_set).
+  ## Reference: bitcoin-core/src/blockfilter.cpp:74-102
   result.params = params
-  result.n = uint32(elements.len)
-  if result.n > uint32(high(int32)):
-    raise newException(GCSFilterError, "N must be < 2^31")
+  # Deduplicate elements (Core uses ElementSet which auto-deduplicates)
+  var seen: HashSet[seq[byte]]
+  var unique: seq[seq[byte]]
+  for e in elements:
+    if e notin seen:
+      seen.incl(e)
+      unique.add(e)
+  let n = unique.len
+  # N must fit in uint32; Core throws if N != m_N after the cast
+  # Reference: bitcoin-core/src/blockfilter.cpp:78-81
+  if uint64(n) > uint64(high(uint32)):
+    raise newException(GCSFilterError, "N must be < 2^32")
+  result.n = uint32(n)
   result.f = uint64(result.n) * uint64(params.m)
 
-  if elements.len == 0:
-    # Empty filter: just N=0
+  if unique.len == 0:
+    # Empty filter: just CompactSize(0)
     var w = BinaryWriter()
     w.writeCompactSize(0)
     result.encoded = w.data
     return
 
-  # Build sorted hash set
-  let hashedSet = buildHashedSet(params, elements, result.f)
+  # Build sorted hash set from deduplicated elements
+  let hashedSet = buildHashedSet(params, unique, result.f)
 
   # Encode: CompactSize(N) followed by Golomb-Rice encoded deltas
   var w = BinaryWriter()
@@ -243,6 +263,32 @@ proc newGCSFilter*(params: GCSParams, encodedFilter: seq[byte], skipDecode: bool
   var bitReader = newBitReader(bitData)
   for i in 0 ..< result.n:
     discard golombRiceDecode(bitReader, params.p)
+  # Excess-data check: after decoding N elements there must be no full bytes
+  # remaining unread.  Partial padding bits within the last byte are fine
+  # (Golomb-Rice may leave 0-7 padding bits).  Mirrors Bitcoin Core's check:
+  #   if (!stream.empty()) throw std::ios_base::failure("excess data");
+  # Reference: bitcoin-core/src/blockfilter.cpp:63-71
+  #
+  # `bitReader.pos` is the current byte index; if it is strictly less than
+  # `data.len - 1`, at least one full unread byte remains → excess data.
+  # If `pos == data.len - 1` and `bitPos == 0`, the last byte was fully
+  # consumed bit-by-bit with no bits left → also excess (a whole byte
+  # of padding zeros beyond the GR stream).  The only valid terminal states
+  # are:  pos == data.len (fully consumed all bytes at a byte boundary)  OR
+  #        pos == data.len - 1 and bitPos > 0 (partial last byte in use).
+  let excessBytes =
+    if bitData.len == 0:
+      false
+    elif bitReader.pos < bitReader.data.len - 1:
+      # More than one full byte left unread after the last Golomb-Rice value
+      true
+    elif bitReader.pos == bitReader.data.len - 1 and bitReader.bitPos == 0:
+      # Sitting at start of a final unused byte (full zero-padding byte)
+      true
+    else:
+      false
+  if excessBytes:
+    raise newException(GCSFilterError, "encoded_filter contains excess data")
 
 # ============================================================================
 # GCS filter matching
@@ -328,17 +374,23 @@ proc basicFilterParams*(blockHash: BlockHash): GCSParams =
   )
 
 proc getFilterHash*(filter: BlockFilter): array[32, byte] =
-  ## Compute filter hash (SHA256 of encoded filter)
-  sha256Single(filter.filter.encoded)
+  ## Compute filter hash: double-SHA256 of encoded filter bytes.
+  ## Mirrors Bitcoin Core BlockFilter::GetHash() which calls Hash(GetEncodedFilter())
+  ## where Hash() is CHash256 = SHA256d.
+  ## Reference: bitcoin-core/src/blockfilter.cpp:248-250
+  sha256d(filter.filter.encoded)
 
 proc computeFilterHeader*(filter: BlockFilter, prevHeader: array[32, byte]): array[32, byte] =
-  ## Compute filter header: SHA256(filterHash || prevHeader)
-  ## This creates a chain of filter commitments
+  ## Compute filter header: double-SHA256(filterHash || prevHeader).
+  ## Mirrors Bitcoin Core BlockFilter::ComputeHeader() which calls
+  ## Hash(GetHash(), prev_header) — both operands written into CHash256 in
+  ## sequence, producing SHA256d(filterHash || prevHeader).
+  ## Reference: bitcoin-core/src/blockfilter.cpp:253-256
   let filterHash = getFilterHash(filter)
   var combined: array[64, byte]
   copyMem(addr combined[0], unsafeAddr filterHash[0], 32)
   copyMem(addr combined[32], unsafeAddr prevHeader[0], 32)
-  sha256Single(combined)
+  sha256d(combined)
 
 proc newBlockFilter*(filterType: BlockFilterType, blockHash: BlockHash,
                      elements: seq[seq[byte]]): BlockFilter =

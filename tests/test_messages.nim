@@ -557,5 +557,197 @@ suite "message kind mapping":
       let backToKind = commandToMessageKind(cmd)
       check backToKind == kind
 
+# W90 BIP-157 compact block filter P2P message tests
+suite "BIP-157 service flag":
+  test "NodeCompactFilters is bit 6 (= 64)":
+    ## Bitcoin Core: NODE_COMPACT_FILTERS = (1 << 6) = 64
+    ## Reference: bitcoin-core/src/protocol.h:321-323
+    check NodeCompactFilters == 64'u64
+    check (1'u64 shl 6) == NodeCompactFilters
+    # Must be distinct from NODE_WITNESS and NODE_BLOOM
+    check (NodeCompactFilters and NodeWitness) == 0'u64
+    check (NodeCompactFilters and NodeBloom) == 0'u64
+
+  test "NodeCompactFilters can compose with other service bits":
+    let full = NodeNetwork or NodeWitness or NodeCompactFilters
+    check (full and NodeCompactFilters) == NodeCompactFilters
+    check (full and NodeWitness) == NodeWitness
+    check (full and NodeNetwork) == NodeNetwork
+
+suite "BIP-157 getcfilters message":
+  test "getcfilters round-trip wire serialization":
+    ## Reference: bitcoin-core/src/net_processing.cpp:3315-3342
+    ## Wire: filter_type(1) || start_height(4 LE) || stop_hash(32)
+    var stopHash: array[32, byte]
+    for i in 0 ..< 32: stopHash[i] = byte(i)
+
+    let msg = newGetCFilters(0'u8, 100'u32, stopHash)
+    check msg.kind == mkGetCFilters
+    check msg.getCFilters.filterType == 0'u8
+    check msg.getCFilters.startHeight == 100'u32
+    check msg.getCFilters.stopHash == stopHash
+
+    let payload = serializePayload(msg)
+    # Wire: 1 + 4 + 32 = 37 bytes
+    check payload.len == 37
+
+    let decoded = deserializePayload("getcfilters", payload)
+    check decoded.kind == mkGetCFilters
+    check decoded.getCFilters.filterType == 0'u8
+    check decoded.getCFilters.startHeight == 100'u32
+    check decoded.getCFilters.stopHash == stopHash
+
+  test "getcfilters command name round-trip":
+    check messageKindToCommand(mkGetCFilters) == "getcfilters"
+    check commandToMessageKind("getcfilters") == mkGetCFilters
+
+suite "BIP-157 cfilter message":
+  test "cfilter round-trip wire serialization":
+    ## Reference: bitcoin-core/src/blockfilter.h:150-155 (Serialize)
+    ## Wire: filter_type(1) || block_hash(32) || compactsize(len) || filter_bytes
+    var blockHash: array[32, byte]
+    for i in 0 ..< 32: blockHash[i] = byte(255 - i)
+    let filterBytes = @[0x01'u8, 0x9d, 0xfc, 0xa8]  # genesis filter
+
+    let msg = newCFilter(0'u8, blockHash, filterBytes)
+    check msg.kind == mkCFilter
+    check msg.cFilter.filterType == 0'u8
+    check msg.cFilter.blockHash == blockHash
+    check msg.cFilter.filter == filterBytes
+
+    let payload = serializePayload(msg)
+    # Wire: 1 + 32 + 1 (compact size for 4 bytes) + 4 = 38 bytes
+    check payload.len == 38
+
+    let decoded = deserializePayload("cfilter", payload)
+    check decoded.kind == mkCFilter
+    check decoded.cFilter.filterType == 0'u8
+    check decoded.cFilter.blockHash == blockHash
+    check decoded.cFilter.filter == filterBytes
+
+  test "cfilter with empty filter bytes":
+    var blockHash: array[32, byte]
+    let msg = newCFilter(0'u8, blockHash, @[])
+    let payload = serializePayload(msg)
+    # Wire: 1 + 32 + 1 (compact 0) = 34 bytes
+    check payload.len == 34
+    let decoded = deserializePayload("cfilter", payload)
+    check decoded.cFilter.filter.len == 0
+
+  test "cfilter command name round-trip":
+    check messageKindToCommand(mkCFilter) == "cfilter"
+    check commandToMessageKind("cfilter") == mkCFilter
+
+suite "BIP-157 getcfheaders message":
+  test "getcfheaders round-trip wire serialization":
+    ## Reference: bitcoin-core/src/net_processing.cpp:3344-3384
+    ## Wire: filter_type(1) || start_height(4 LE) || stop_hash(32)
+    var stopHash: array[32, byte]
+    for i in 0 ..< 32: stopHash[i] = byte(i * 2)
+
+    let msg = newGetCFHeaders(0'u8, 0'u32, stopHash)
+    let payload = serializePayload(msg)
+    check payload.len == 37
+
+    let decoded = deserializePayload("getcfheaders", payload)
+    check decoded.kind == mkGetCFHeaders
+    check decoded.getCFHeaders.filterType == 0'u8
+    check decoded.getCFHeaders.startHeight == 0'u32
+    check decoded.getCFHeaders.stopHash == stopHash
+
+  test "getcfheaders command name round-trip":
+    check messageKindToCommand(mkGetCFHeaders) == "getcfheaders"
+    check commandToMessageKind("getcfheaders") == mkGetCFHeaders
+
+suite "BIP-157 cfheaders message":
+  test "cfheaders round-trip wire serialization":
+    ## Reference: bitcoin-core/src/net_processing.cpp:3379-3383
+    ## Wire: filter_type(1) || stop_hash(32) || prev_filter_header(32) ||
+    ##       compactsize(N) || [hash(32) x N]
+    var stopHash: array[32, byte]
+    var prevHeader: array[32, byte]
+    var hash1, hash2: array[32, byte]
+    stopHash[0] = 0xaa
+    prevHeader[0] = 0xbb
+    hash1[0] = 0x11
+    hash2[0] = 0x22
+
+    let msg = newCFHeaders(0'u8, stopHash, prevHeader, @[hash1, hash2])
+    let payload = serializePayload(msg)
+    # Wire: 1 + 32 + 32 + 1 (compact 2) + 32 + 32 = 130 bytes
+    check payload.len == 130
+
+    let decoded = deserializePayload("cfheaders", payload)
+    check decoded.kind == mkCFHeaders
+    check decoded.cFHeaders.filterType == 0'u8
+    check decoded.cFHeaders.stopHash == stopHash
+    check decoded.cFHeaders.previousFilterHeader == prevHeader
+    check decoded.cFHeaders.filterHashes.len == 2
+    check decoded.cFHeaders.filterHashes[0] == hash1
+    check decoded.cFHeaders.filterHashes[1] == hash2
+
+  test "cfheaders with zero filter hashes":
+    var stopHash, prevHeader: array[32, byte]
+    let msg = newCFHeaders(0'u8, stopHash, prevHeader, @[])
+    let payload = serializePayload(msg)
+    # Wire: 1 + 32 + 32 + 1 (compact 0) = 66 bytes
+    check payload.len == 66
+    let decoded = deserializePayload("cfheaders", payload)
+    check decoded.cFHeaders.filterHashes.len == 0
+
+  test "cfheaders command name round-trip":
+    check messageKindToCommand(mkCFHeaders) == "cfheaders"
+    check commandToMessageKind("cfheaders") == mkCFHeaders
+
+suite "BIP-157 getcfcheckpt message":
+  test "getcfcheckpt round-trip wire serialization":
+    ## Reference: bitcoin-core/src/net_processing.cpp:3386-3422
+    ## Wire: filter_type(1) || stop_hash(32)
+    var stopHash: array[32, byte]
+    for i in 0 ..< 32: stopHash[i] = byte(i + 1)
+
+    let msg = newGetCFCheckPt(0'u8, stopHash)
+    let payload = serializePayload(msg)
+    # Wire: 1 + 32 = 33 bytes
+    check payload.len == 33
+
+    let decoded = deserializePayload("getcfcheckpt", payload)
+    check decoded.kind == mkGetCFCheckPt
+    check decoded.getCFCheckPt.filterType == 0'u8
+    check decoded.getCFCheckPt.stopHash == stopHash
+
+  test "getcfcheckpt command name round-trip":
+    check messageKindToCommand(mkGetCFCheckPt) == "getcfcheckpt"
+    check commandToMessageKind("getcfcheckpt") == mkGetCFCheckPt
+
+suite "BIP-157 cfcheckpt message":
+  test "cfcheckpt round-trip wire serialization":
+    ## Reference: bitcoin-core/src/net_processing.cpp:3418-3421
+    ## Wire: filter_type(1) || stop_hash(32) ||
+    ##       compactsize(N) || [header(32) x N]
+    ## Checkpoints are at every CFCHECKPT_INTERVAL = 1000 heights.
+    var stopHash: array[32, byte]
+    var header1, header2, header3: array[32, byte]
+    stopHash[0] = 0xcc
+    header1[0] = 0x01; header2[0] = 0x02; header3[0] = 0x03
+
+    let msg = newCFCheckPt(0'u8, stopHash, @[header1, header2, header3])
+    let payload = serializePayload(msg)
+    # Wire: 1 + 32 + 1 (compact 3) + 3*32 = 130 bytes
+    check payload.len == 130
+
+    let decoded = deserializePayload("cfcheckpt", payload)
+    check decoded.kind == mkCFCheckPt
+    check decoded.cFCheckPt.filterType == 0'u8
+    check decoded.cFCheckPt.stopHash == stopHash
+    check decoded.cFCheckPt.filterHeaders.len == 3
+    check decoded.cFCheckPt.filterHeaders[0] == header1
+    check decoded.cFCheckPt.filterHeaders[1] == header2
+    check decoded.cFCheckPt.filterHeaders[2] == header3
+
+  test "cfcheckpt command name round-trip":
+    check messageKindToCommand(mkCFCheckPt) == "cfcheckpt"
+    check commandToMessageKind("cfcheckpt") == mkCFCheckPt
+
 when isMainModule:
   echo "Running P2P message tests..."
