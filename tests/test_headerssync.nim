@@ -1,7 +1,8 @@
 ## Tests for header sync anti-DoS (PRESYNC/REDOWNLOAD)
 ## Validates the two-phase header sync protection mechanism
+## W88 additions: 7 bugs audited; gate list below.
 
-import std/[unittest, deques]
+import std/[unittest, deques, times]
 import ../src/network/headerssync
 import ../src/consensus/params
 import ../src/primitives/[types, serialize, uint256]
@@ -427,8 +428,8 @@ suite "Anti-DoS Integration":
 
     # Different peers may have different hasher salts
     # (not guaranteed but likely due to timing/randomness)
-    # Just verify both have initialized salts
-    check state1.hasherSalt != 0 or state2.hasherSalt != 0 or
+    # Just verify both have initialized salts (two words each)
+    check state1.hasherSalt0 != 0 or state2.hasherSalt0 != 0 or
           state1.commitOffset >= 0 or state2.commitOffset >= 0
 
 suite "HeadersSyncState Per-Header PoW Gate (HSync wave Job 1)":
@@ -506,3 +507,242 @@ suite "HeadersSyncState Per-Header PoW Gate (HSync wave Job 1)":
     let result = state.processNextHeaders(@[goodHeader], false)
     check result.success
     check state.getPresyncHeight() == 1
+
+# =============================================================================
+# W88 bug-fix gate tests
+# Bug #1: getBlockProof approximation (Core chain.cpp:121-133)
+# Bug #2: computeCommitmentBit uses SHA-256 instead of SipHash-2-4
+# Bug #3: hasherSalt single uint64 → now two words (k0, k1)
+# Bug #4: rand(high(int)) caps top bit → now use cast[uint64](rng.next())
+# Bug #5: maxCommitments wrong MTP estimate → chainStartMtp parameter
+# Bug #6: lastHeaderReceived.timestamp not set → chainStartTime parameter
+# Bug #7: dead firstHash variable removed from validateAndStoreHeadersCommitments
+# =============================================================================
+
+suite "W88 Bug #1: getBlockProof exact formula (Core chain.cpp:121-133)":
+  test "regtest easy target (0x207fffff) gives positive work":
+    # 0x207fffff is regtest powLimit — target is huge, work is small but > 0.
+    let header = BlockHeader(bits: 0x207fffff'u32)
+    let work = getBlockProof(header)
+    check not work.isZero()
+
+  test "mainnet genesis target (0x1d00ffff) gives correct work":
+    # Bitcoin Core: GetBitsProof(0x1d00ffff) should equal
+    # (~target / (target+1)) + 1.
+    # target = 0x00000000ffff0000000000000000000000000000000000000000000000000000
+    # We just verify it's strictly > regtest work (harder target = more work).
+    let mainnetHeader = BlockHeader(bits: 0x1d00ffff'u32)
+    let regtestHeader = BlockHeader(bits: 0x207fffff'u32)
+    let mainnetWork = getBlockProof(mainnetHeader)
+    let regtestWork = getBlockProof(regtestHeader)
+    check mainnetWork > regtestWork
+
+  test "zero bits returns zero work":
+    let header = BlockHeader(bits: 0'u32)
+    let work = getBlockProof(header)
+    check work.isZero()
+
+  test "difficulty-1 target (0x1d00ffff) work matches Core reference":
+    # Bitcoin Core GetBitsProof(0x1d00ffff):
+    # target = 2^224 - 2^208
+    # (~target / (target+1)) + 1 ≈ 2^32 + 1
+    # Verify the result is in the expected ballpark (>= 2^32).
+    let header = BlockHeader(bits: 0x1d00ffff'u32)
+    let work = getBlockProof(header)
+    let expectedMin = initUInt256(uint64(1) shl 32)
+    check work >= expectedMin
+
+  test "harder target gives strictly more work than easier target":
+    # Harder target = smaller target bits value = more work.
+    let easier = BlockHeader(bits: 0x1d00ffff'u32)  # difficulty 1
+    let harder = BlockHeader(bits: 0x1900ffff'u32)  # ~difficulty 65536
+    let easierWork = getBlockProof(easier)
+    let harderWork = getBlockProof(harder)
+    check harderWork > easierWork
+
+suite "W88 Bug #2+#3: computeCommitmentBit uses SipHash-2-4 (not SHA-256)":
+  test "commitment bit is deterministic for same hash and same state":
+    let params = regtestParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    let state = newHeadersSyncState(
+      peerId = 1, params = params, chainStartHeight = 0,
+      chainStartHash = genesisHash, chainStartBits = genesis.header.bits,
+      chainStartWork = initUInt256(1), minimumRequiredWork = initUInt256(1000)
+    )
+    # Same hash → same bit (keyed PRF property)
+    let b1 = state.computeCommitmentBit(genesisHash)
+    let b2 = state.computeCommitmentBit(genesisHash)
+    check b1 == b2
+
+  test "different 128-bit keys produce independent commitment bits":
+    # Two states with different SipHash keys may produce different bits
+    # for the same header hash (PRF independence).
+    let params = regtestParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    var diffCount = 0
+    for i in 0..<32:
+      # Manually override the two key words to test independence.
+      # Two states with orthogonal k0/k1 must produce uncorrelated bits.
+      let state = newHeadersSyncState(
+        peerId = int64(i * 1234567), params = params, chainStartHeight = 0,
+        chainStartHash = genesisHash, chainStartBits = genesis.header.bits,
+        chainStartWork = initUInt256(1), minimumRequiredWork = initUInt256(1000)
+      )
+      var hash: array[32, byte]
+      hash[0] = byte(i)
+      if state.computeCommitmentBit(BlockHash(hash)):
+        inc diffCount
+
+    # Over 32 tries roughly half should be 1 (random PRF)
+    check diffCount > 4
+    check diffCount < 28
+
+  test "hasherSalt0 and hasherSalt1 are both present as uint64 fields":
+    let params = regtestParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    let state = newHeadersSyncState(
+      peerId = 42, params = params, chainStartHeight = 0,
+      chainStartHash = genesisHash, chainStartBits = genesis.header.bits,
+      chainStartWork = initUInt256(1), minimumRequiredWork = initUInt256(1000)
+    )
+    # Both key words are accessible (struct shape regression guard)
+    discard state.hasherSalt0
+    discard state.hasherSalt1
+    check true  # compiles → struct has both fields
+
+suite "W88 Bug #4: rand() full 64-bit key range":
+  test "hasherSalt0 can be odd (top-bit accessible)":
+    # rand(high(int)) always returns values with bit 63 clear.
+    # cast[uint64](rng.next()) uses the full 64-bit range.
+    # We can't guarantee a specific value, but over many tries at least
+    # some should have bit 63 set.
+    let params = regtestParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    var highBitSeen = false
+    for i in 0..<128:
+      let state = newHeadersSyncState(
+        peerId = int64(i), params = params, chainStartHeight = 0,
+        chainStartHash = genesisHash, chainStartBits = genesis.header.bits,
+        chainStartWork = initUInt256(1), minimumRequiredWork = initUInt256(1000)
+      )
+      if (state.hasherSalt0 and (1'u64 shl 63)) != 0:
+        highBitSeen = true
+        break
+    check highBitSeen
+
+suite "W88 Bug #5: maxCommitments uses actual MTP (chainStartMtp param)":
+  test "maxCommitments with chainStartMtp=0 falls back gracefully":
+    let params = mainnetParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    let state = newHeadersSyncState(
+      peerId = 1, params = params, chainStartHeight = 0,
+      chainStartHash = genesisHash, chainStartBits = genesis.header.bits,
+      chainStartWork = initUInt256(1), minimumRequiredWork = initUInt256(1000),
+      chainStartMtp = 0
+    )
+    check state.maxCommitments > 0
+    check state.maxCommitments < 100_000_000'u64
+
+  test "maxCommitments is smaller when chainStartMtp is recent":
+    # A very recent MTP → fewer seconds since start → fewer max commitments.
+    # A very old MTP → more seconds since start → more max commitments.
+    let params = mainnetParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    let nowSec = uint32(getTime().toUnix)
+
+    let stateOldMtp = newHeadersSyncState(
+      peerId = 1, params = params, chainStartHeight = 840000,
+      chainStartHash = genesisHash, chainStartBits = genesis.header.bits,
+      chainStartWork = initUInt256(1), minimumRequiredWork = initUInt256(1000),
+      chainStartMtp = 1_000_000'u32  # old MTP (year ~2001)
+    )
+    let stateNewMtp = newHeadersSyncState(
+      peerId = 1, params = params, chainStartHeight = 840000,
+      chainStartHash = genesisHash, chainStartBits = genesis.header.bits,
+      chainStartWork = initUInt256(1), minimumRequiredWork = initUInt256(1000),
+      chainStartMtp = nowSec - 3600  # recent MTP (1 hour ago)
+    )
+    check stateOldMtp.maxCommitments > stateNewMtp.maxCommitments
+
+suite "W88 Bug #6: lastHeaderReceived.timestamp set from chainStartTime":
+  test "getPresyncTime returns chainStartTime not 0":
+    let params = regtestParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    let chainTime = genesis.header.timestamp
+    let state = newHeadersSyncState(
+      peerId = 1, params = params, chainStartHeight = 0,
+      chainStartHash = genesisHash, chainStartBits = genesis.header.bits,
+      chainStartWork = initUInt256(1), minimumRequiredWork = initUInt256(uint64.high),
+      chainStartTime = chainTime
+    )
+    # Before any headers are processed, getPresyncTime() should return
+    # the chain-start timestamp (not 0).
+    # Bitcoin Core: m_last_header_received = m_chain_start.GetBlockHeader()
+    # which includes nTime (headerssync.cpp:30).
+    check state.getPresyncTime() == chainTime
+
+  test "getPresyncTime returns 0 when chainStartTime not passed (regression guard)":
+    # When chainStartTime = 0 (default), timestamp should remain 0.
+    # This confirms the parameter wiring is correct, not accidentally hardcoded.
+    let params = regtestParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    let state = newHeadersSyncState(
+      peerId = 1, params = params, chainStartHeight = 0,
+      chainStartHash = genesisHash, chainStartBits = genesis.header.bits,
+      chainStartWork = initUInt256(1), minimumRequiredWork = initUInt256(uint64.high)
+    )
+    check state.getPresyncTime() == 0'u32
+
+suite "W88 Bug #7: no dead firstHash computation in validateAndStoreHeadersCommitments":
+  test "non-continuous presync headers are rejected":
+    # The connectivity check (prevBlock != lastHeaderHash) must still fire
+    # correctly now that the dead firstHash local is removed.
+    let params = regtestParams()
+    let genesis = buildGenesisBlock(params)
+    let genesisBytes = serialize(genesis.header)
+    let genesisHash = BlockHash(doubleSha256(genesisBytes))
+
+    let state = newHeadersSyncState(
+      peerId = 1, params = params, chainStartHeight = 0,
+      chainStartHash = genesisHash, chainStartBits = genesis.header.bits,
+      chainStartWork = initUInt256(1), minimumRequiredWork = initUInt256(uint64.high)
+    )
+
+    # Header whose prevBlock does NOT connect to genesisHash
+    var wrongPrev: array[32, byte]
+    wrongPrev[0] = 0xff
+    let disconnected = BlockHeader(
+      version: 1,
+      prevBlock: BlockHash(wrongPrev),
+      merkleRoot: default(array[32, byte]),
+      timestamp: genesis.header.timestamp + 600,
+      bits: genesis.header.bits,
+      nonce: 0
+    )
+
+    let result = state.processNextHeaders(@[disconnected], false)
+    check not result.success

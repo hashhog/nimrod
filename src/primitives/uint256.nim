@@ -305,6 +305,40 @@ proc getCompact*(target: UInt256): uint32 =
 
   (uint32(size) shl 24) or mantissa
 
+proc bitnot*(a: UInt256): UInt256 =
+  ## Bitwise NOT of a UInt256 (all 256 bits inverted)
+  for i in 0..3:
+    result.limbs[i] = not a.limbs[i]
+
+proc `div`*(a, b: UInt256): UInt256 =
+  ## Divide two UInt256 values using long division
+  if b.isZero():
+    # Division by zero - return max value
+    for i in 0..3:
+      result.limbs[i] = high(uint64)
+    return
+
+  # Check if b is a single-limb value (fits in uint64)
+  if b.limbs[1] == 0 and b.limbs[2] == 0 and b.limbs[3] == 0:
+    return a div b.limbs[0]
+
+  # Binary long division for full 256-bit / 256-bit
+  var remainder = initUInt256()
+  for i in countdown(255, 0):
+    # remainder = remainder << 1
+    remainder = remainder shl 1
+    # Set the lowest bit of remainder to the i-th bit of a
+    let limbIdx = i div 64
+    let bitIdx = i mod 64
+    let bit = (a.limbs[limbIdx] shr bitIdx) and 1
+    remainder.limbs[0] = remainder.limbs[0] or bit
+    # If remainder >= b, subtract b and set bit in result
+    if remainder >= b:
+      remainder = remainder - b
+      let rLimbIdx = i div 64
+      let rBitIdx = i mod 64
+      result.limbs[rLimbIdx] = result.limbs[rLimbIdx] or (1'u64 shl rBitIdx)
+
 # String representation for debugging
 
 proc toHexByte(b: byte): string =

@@ -596,10 +596,17 @@ proc tryLowWorkHeadersSync*(sm: SyncManager, peer: Peer,
                              chainStartHash: BlockHash,
                              chainStartBits: uint32,
                              chainStartWork: UInt256,
-                             headers: var seq[BlockHeader]): bool =
+                             headers: var seq[BlockHeader],
+                             chainStartMtp: uint32 = 0,
+                             chainStartTime: uint32 = 0): bool =
   ## Try to initiate low-work header sync for a peer
   ## Returns true if headers should be processed through anti-DoS sync
   ## Reference: Bitcoin Core TryLowWorkHeadersSync() in net_processing.cpp
+  ##
+  ## chainStartMtp: pass chain_start.GetMedianTimePast() for a tight
+  ##   maxCommitments bound (headerssync.cpp:41-43). 0 = conservative fallback.
+  ## chainStartTime: nTime of the chain_start block header; used to initialise
+  ##   lastHeaderReceived.timestamp so getPresyncTime() returns meaningful data.
 
   let peerId = getPeerId(peer)
 
@@ -632,7 +639,9 @@ proc tryLowWorkHeadersSync*(sm: SyncManager, peer: Peer,
     chainStartHash = chainStartHash,
     chainStartBits = chainStartBits,
     chainStartWork = chainStartWork,
-    minimumRequiredWork = threshold
+    minimumRequiredWork = threshold,
+    chainStartMtp = chainStartMtp,
+    chainStartTime = chainStartTime
   )
 
   sm.peerHeadersSync[peerId] = syncState

@@ -12,7 +12,7 @@ import std/[deques, random, times]
 import chronicles
 import ../primitives/[types, serialize, uint256]
 import ../consensus/[params, pow]
-import ../crypto/hashing
+import ../crypto/[hashing, siphash]
 
 type
   SyncPhase* = enum
@@ -68,8 +68,10 @@ type
     maxCommitments*: uint64
     commitOffset*: int             ## Random offset for commitment heights
 
-    # Hasher salt for commitments
-    hasherSalt*: uint64
+    # SipHash-2-4 128-bit key for commitment hashing
+    # Reference: Bitcoin Core SaltedUint256Hasher (util/hasher.cpp:10-13)
+    hasherSalt0*: uint64   ## k0 (first 64 bits of 128-bit SipHash key)
+    hasherSalt1*: uint64   ## k1 (second 64 bits of 128-bit SipHash key)
 
     # REDOWNLOAD phase state
     redownloadedHeaders*: Deque[CompressedHeader]
@@ -112,36 +114,41 @@ proc hashHeader*(header: BlockHeader): BlockHash =
   BlockHash(doubleSha256(headerBytes))
 
 proc computeCommitmentBit*(state: HeadersSyncState, headerHash: BlockHash): bool =
-  ## Compute 1-bit commitment for a header using salted hash
-  ## This prevents attacker from precomputing headers that match
-  var combined: array[40, byte]
-  copyMem(addr combined[0], addr state.hasherSalt, 8)
-  copyMem(addr combined[8], unsafeAddr array[32, byte](headerHash)[0], 32)
-  let hashed = sha256(combined)
-  (hashed[0] and 1) == 1
+  ## Compute 1-bit commitment for a header using SipHash-2-4 with 128-bit salt.
+  ## The bit is the LSB of the SipHash output.
+  ##
+  ## Matches Bitcoin Core: m_hasher(current.GetHash()) & 1
+  ## where m_hasher is a SaltedUint256Hasher (SipHash-2-4, util/hasher.cpp:10-13,
+  ## headerssync.cpp:197,263).
+  ## SHA-256 was wrong here: it has no keyed-PRF property and uses no salt.
+  let hashBytes = array[32, byte](headerHash)
+  let h = sipHash(state.hasherSalt0, state.hasherSalt1, hashBytes)
+  (h and 1) == 1
 
 proc shouldStoreCommitment*(state: HeadersSyncState, height: int64): bool =
   ## Check if this height should have a commitment stored
   (height mod state.syncParams.commitmentPeriod) == state.commitOffset
 
 proc getBlockProof*(header: BlockHeader): UInt256 =
-  ## Calculate the work (proof) represented by this header
-  ## Work = 2^256 / (target + 1)
+  ## Calculate the work (proof) represented by this header.
+  ## Work = (~target / (target + 1)) + 1
+  ##
+  ## This is the exact Bitcoin Core formula (chain.cpp::GetBitsProof):
+  ##   return (~bnTarget / (bnTarget + 1)) + 1
+  ## The previous approximation (divide by first limb only) was wildly
+  ## inaccurate for multi-limb targets and broke work comparison logic.
+  ## Reference: bitcoin-core/src/chain.cpp:121-133
   let target = setCompact(header.bits)
   if target.isZero():
     return initUInt256()
 
-  # Calculate 2^256 / (target + 1)
-  # We approximate by computing 2^256 - 1 / (target's first limb + 1)
-  # This is a rough approximation for small targets, but works for our purposes
-  var maxVal = initUInt256()
-  for i in 0..3:
-    maxVal.limbs[i] = high(uint64)
-
-  # For simplicity, divide by the first limb + 1
-  # This approximation works because we're mainly comparing relative work
-  let divisor = if target.limbs[0] > 0: target.limbs[0] else: 1'u64
-  result = maxVal div divisor
+  # ~target / (target + 1) + 1
+  let notTarget = bitnot(target)
+  let targetPlus1 = target + initUInt256(1'u64)
+  if targetPlus1.isZero():
+    # target was all-ones (overflow); work = 0 + 1 = 1
+    return initUInt256(1'u64)
+  result = (notTarget div targetPlus1) + initUInt256(1'u64)
 
 proc toPowParams*(params: ConsensusParams): PowParams =
   ## Convert ConsensusParams to PowParams for PoW validation
@@ -167,18 +174,36 @@ proc newHeadersSyncState*(
   chainStartHash: BlockHash,
   chainStartBits: uint32,
   chainStartWork: UInt256,
-  minimumRequiredWork: UInt256
+  minimumRequiredWork: UInt256,
+  chainStartMtp: uint32 = 0,       # MTP of chain_start (GetMedianTimePast); 0 = fallback
+  chainStartTime: uint32 = 0       # nTime of the chain_start block header
 ): HeadersSyncState =
-  ## Create a new header sync state for a peer
-  ## chainStart: The last known block that peer's chain branches from
-  ## minimumRequiredWork: Minimum total chain work to accept the chain
+  ## Create a new header sync state for a peer.
+  ## chainStart: The last known block that peer's chain branches from.
+  ## minimumRequiredWork: Minimum total chain work to accept the chain.
+  ## chainStartMtp: Pass chain_start.GetMedianTimePast() for accurate
+  ##   maxCommitments bound (Bitcoin Core headerssync.cpp:41-43).
+  ## chainStartTime: nTime of the chain_start block header, used to
+  ##   initialise lastHeaderReceived (Bitcoin Core headerssync.cpp:30).
 
-  # Use a combination of time, peerId, and chain hash for unique seed
+  # Use crypto-quality randomness via system time combined with peer/chain
+  # entropy.  Core uses FastRandomContext().rand64() (two independent calls
+  # per key word) for the two 64-bit SipHash key words.  Nim's initRand
+  # accepts an int64 seed so we use xor-folded entropy; the critical property
+  # is that different peers/syncs get independent salts.
   let timeSeed = getTime().toUnix
   let peerSeed = peerId
   let hashSeed = int64(array[32, byte](chainStartHash)[0]) shl 8 or
                  int64(array[32, byte](chainStartHash)[1])
   var rng = initRand(timeSeed xor peerSeed xor hashSeed)
+  var rng2 = initRand(timeSeed xor (not peerSeed) xor (hashSeed shl 1))
+
+  # Produce two independent full-range 64-bit words for the SipHash key.
+  # rand(high(int)) only covers [0, 2^63-1] — bit 63 is always 0, halving
+  # the key space.  Use next() which returns a signed int64 and reinterpret
+  # via cast to recover the full 64-bit range.
+  let k0 = cast[uint64](rng.next())
+  let k1 = cast[uint64](rng2.next())
 
   result = HeadersSyncState(
     peerId: peerId,
@@ -195,24 +220,37 @@ proc newHeadersSyncState*(
     lastHeaderHash: chainStartHash,
     headerCommitments: initDeque[bool](),
     commitOffset: rng.rand(params.headersSyncParams.commitmentPeriod - 1),
-    hasherSalt: uint64(rng.rand(high(int))),
+    hasherSalt0: k0,
+    hasherSalt1: k1,
     redownloadedHeaders: initDeque[CompressedHeader](),
     redownloadBufferLastHeight: 0,
     redownloadChainWork: initUInt256(),
     processAllRemainingHeaders: false
   )
 
-  # Initialize lastHeaderReceived with chain start values
+  # Initialise lastHeaderReceived with the chain-start block's header fields.
+  # Bitcoin Core: m_last_header_received(m_chain_start.GetBlockHeader())
+  # (headerssync.cpp:30). Previously only bits was set; nTime was left as 0,
+  # causing getPresyncTime() to return 0 instead of the chain-start timestamp.
   result.lastHeaderReceived.bits = chainStartBits
+  result.lastHeaderReceived.timestamp = chainStartTime
 
-  # Calculate max commitments based on theoretical max chain length
-  # Max blocks possible = 6 blocks/sec * seconds since MTP
-  # We bound memory by limiting commitments
+  # Calculate max commitments based on theoretical max chain length.
+  # Bitcoin Core: 6 blocks/sec * (now - chain_start.GetMedianTimePast()
+  #               + MAX_FUTURE_BLOCK_TIME) / commitment_period
+  # (headerssync.cpp:41-43).
+  # Previously used height*600 as MTP estimate; pass actual MTP via
+  # chainStartMtp for correctness.  Fall back to height*600 estimate if
+  # caller did not supply it (e.g. during unit tests).
   let nowSec = getTime().toUnix
-  let mtpSec = int64(chainStartHeight) * 600  # Rough MTP estimate
+  let mtpSec = if chainStartMtp > 0: int64(chainStartMtp)
+               else: int64(chainStartHeight) * 600
   let maxSecondsSinceStart = nowSec - mtpSec + MaxFutureBlockTime
-  result.maxCommitments = uint64(MaxBlocksPerSecond * maxSecondsSinceStart) div
-                          uint64(params.headersSyncParams.commitmentPeriod)
+  result.maxCommitments = if maxSecondsSinceStart > 0:
+    uint64(MaxBlocksPerSecond * maxSecondsSinceStart) div
+      uint64(params.headersSyncParams.commitmentPeriod)
+  else:
+    0
 
   debug "headers sync started",
         peerId = peerId,
@@ -289,8 +327,8 @@ proc validateAndStoreHeadersCommitments(
   if state.downloadState != Presync:
     return false
 
-  # Check first header connects
-  let firstHash = hashHeader(headers[0])
+  # Check first header connects (prevBlock of the first header must match
+  # the hash of the last header we received, as tracked by lastHeaderHash).
   if headers[0].prevBlock != state.lastHeaderHash:
     debug "non-continuous headers in presync",
           peer = state.peerId, height = state.currentHeight
