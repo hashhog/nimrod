@@ -1197,8 +1197,14 @@ proc validateBlock*(
   # lock_time_cutoff = MTP-of-11 of the parent when BIP-113/CSV is active,
   # block header timestamp otherwise.
   # Reference: consensus/tx_verify.cpp:IsFinalTx, BIP-113.
+  # BIP-113: when CSV/BIP-68 is active, use MTP of previous block as the
+  # locktime cutoff for IsFinalTx.  The guard is bip68Active alone — do NOT
+  # also gate on prevBlockMtp != 0, because 0 is a legitimate MTP value on
+  # early regtest blocks and falling back to block timestamp would diverge
+  # from Core.  Reference: Bitcoin Core validation.cpp ContextualCheckBlock,
+  # LOCKTIME_MEDIAN_TIME_PAST flag.
   let lockTimeCutoffForFinal: uint32 =
-    if bip68Active and prevBlockMtp != 0: prevBlockMtp
+    if bip68Active: prevBlockMtp
     else: blk.header.timestamp
   for tx in blk.txs:
     if not isFinalTxEarly(tx, uint32(height), lockTimeCutoffForFinal):
