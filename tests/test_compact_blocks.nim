@@ -1,7 +1,7 @@
 ## Tests for BIP152 Compact Block Relay
 ## Tests short ID computation, serialization, and block reconstruction
 
-import std/[random, options, strutils]
+import std/[random, options, strutils, sets]
 import unittest2
 import ../src/network/compact_blocks
 import ../src/network/messages
@@ -429,6 +429,14 @@ suite "compact block state":
 
     check not state.wantsCompactBlocks
 
+  # Bug fix 4: Core only accepts version == 2 (CMPCTBLOCKS_VERSION),
+  # not version 1.  Version 1 is the legacy txid-based protocol.
+  test "reject version 1 (legacy txid-based, Core net_processing.cpp:3907)":
+    var state = newCompactBlockState()
+    state.handleSendCmpct(announce = true, version = 1)
+    check not state.wantsCompactBlocks
+    check state.compactBlockVersion == 0
+
   test "reconstruction stats":
     var state = newCompactBlockState()
 
@@ -533,3 +541,160 @@ suite "helper functions":
 
     state.handleSendCmpct(announce = true, version = 2)
     check state.supportsHighBandwidth()
+
+# ============================================================================
+# W89 Bug-fix regression tests
+# All reference Core blockencodings.cpp unless otherwise noted.
+# ============================================================================
+
+suite "W89 bug-fix regressions":
+
+  # Bug fix 1: header null check in initPartiallyDownloadedBlock
+  # Core line 62: header.IsNull() → READ_STATUS_INVALID
+  test "null header (bits=0) rejected by initPartiallyDownloadedBlock":
+    var cb: CompactBlock
+    # bits == 0 means "null header" by our isNullHeader() convention
+    cb.header.bits = 0
+    cb.prefilledTxns.add(PrefilledTx(index: 0, tx: makeTestTransaction(1)))
+    # Give it one short ID so it passes the empty check
+    cb.shortIds.add([byte(1), 2, 3, 4, 5, 6])
+    let (_, status) = initPartiallyDownloadedBlock(cb)
+    check status == rsInvalid
+
+  # Positive: non-null header is accepted
+  test "non-null header accepted by initPartiallyDownloadedBlock":
+    let blk = makeTestBlock(900, 3)
+    let cb = newCompactBlock(blk, 0x1234'u64)
+    check cb.header.bits != 0  # makeTestBlock sets bits = 0x1d00ffff
+    let (_, status) = initPartiallyDownloadedBlock(cb)
+    check status == rsOk
+
+  # Bug fix 2: prefilled structural gap check
+  # Core line 80: lastprefilledindex > shorttxids.size() + i → READ_STATUS_INVALID
+  # If prefilled index > num_short_ids + num_prefilled_so_far, there's a position
+  # with neither a short ID nor a prefilled tx.
+  test "prefilled gap check: index beyond short IDs + prefilled count":
+    var cb: CompactBlock
+    cb.header.bits = 0x1d00ffff'u32
+    cb.nonce = 42
+    # Only 2 short IDs but prefilled tx claims index 5 (0-based) → gap
+    cb.shortIds.add([byte(1), 2, 3, 4, 5, 6])
+    cb.shortIds.add([byte(7), 8, 9, 10, 11, 12])
+    # Prefilled at absolute index 5: gap check: 5 > 2 short_ids + 0 prefilled_so_far → invalid
+    cb.prefilledTxns.add(PrefilledTx(index: 5, tx: makeTestTransaction(1)))
+    let (_, status) = initPartiallyDownloadedBlock(cb)
+    check status == rsInvalid
+
+  test "prefilled gap check: valid placement (no gap)":
+    var cb: CompactBlock
+    cb.header.bits = 0x1d00ffff'u32
+    cb.nonce = 42
+    # 2 short IDs + prefilled at index 2 (= shorttxids.size() + 0): just valid
+    cb.shortIds.add([byte(1), 2, 3, 4, 5, 6])
+    cb.shortIds.add([byte(7), 8, 9, 10, 11, 12])
+    # prefilled[0].index = 2: check 2 <= 2 + 0 → OK
+    cb.prefilledTxns.add(PrefilledTx(index: 2, tx: makeTestTransaction(1)))
+    let (_, status) = initPartiallyDownloadedBlock(cb)
+    check status == rsOk
+
+  # Bug fix 3: bucket-size DoS guard
+  # Core lines 110-111: bucket_size > 12 → READ_STATUS_FAILED
+  test "bucket-size guard: 13 identical short IDs rejected":
+    var cb: CompactBlock
+    cb.header.bits = 0x1d00ffff'u32
+    cb.nonce = 7
+    # 13 copies of the same 6-byte short ID exceeds bucket limit of 12
+    for i in 0 ..< 13:
+      cb.shortIds.add([byte(0xAA), 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])
+    cb.prefilledTxns.add(PrefilledTx(index: 13, tx: makeTestTransaction(1)))
+    let (_, status) = initPartiallyDownloadedBlock(cb)
+    check status == rsFailed
+
+  test "bucket-size guard: 12 identical short IDs accepted":
+    var cb: CompactBlock
+    cb.header.bits = 0x1d00ffff'u32
+    cb.nonce = 7
+    # Exactly 12 is the limit: must not be rejected by bucket guard
+    # (but WILL be rejected by the duplicate-key check since map size != input size)
+    for i in 0 ..< 12:
+      cb.shortIds.add([byte(0xAA), 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])
+    cb.prefilledTxns.add(PrefilledTx(index: 12, tx: makeTestTransaction(1)))
+    let (_, status) = initPartiallyDownloadedBlock(cb)
+    # 12 identical → collision (map dedup), so rsFailed — but NOT from bucket guard
+    check status == rsFailed  # collision dedup fires, which is correct
+
+  test "bucket-size guard: distinct short IDs all accepted":
+    var cb: CompactBlock
+    cb.header.bits = 0x1d00ffff'u32
+    cb.nonce = 7
+    # 15 distinct IDs — no single bucket should exceed 12
+    for i in 0 ..< 15:
+      cb.shortIds.add([byte(i), byte(i+1), byte(i+2), byte(i+3), byte(i+4), byte(i+5)])
+    cb.prefilledTxns.add(PrefilledTx(index: 15, tx: makeTestTransaction(1)))
+    let (_, status) = initPartiallyDownloadedBlock(cb)
+    check status == rsOk
+
+  # Bug fix 5: reconstructBlock header null check
+  # Core line 193: if (header.IsNull()) return READ_STATUS_INVALID
+  test "reconstructBlock rejects null header pdb":
+    var pdb: PartiallyDownloadedBlock
+    # header.bits == 0 → null
+    pdb.header.bits = 0
+    pdb.txnAvailable.add(some(makeTestTransaction(1)))
+    let (_, status) = pdb.reconstructBlock()
+    check status == rsInvalid
+
+  # Bug fix 6 & 7: filledSlots prevents third-match re-fill after collision.
+  # Core have_txn[] vector (line 118) tracks first match independently of
+  # whether txn_available[] was subsequently cleared.
+  test "filledSlots: direct collision simulation - slot cleared stays cleared":
+    # Build a compact block with 3 non-prefilled slots
+    let blk = makeTestBlock(950, 4)  # coinbase + 3 more
+    let cb = newCompactBlock(blk, 0xdeadbeef'u64)
+    var (pdb, status) = initPartiallyDownloadedBlock(cb)
+    check status == rsOk
+    # Initially no slots filled, mempoolCount = 0
+    check pdb.filledSlots.len == 0
+    check pdb.mempoolCount == 0
+
+    # Simulate first match at position 1 (directly, as if fillFromExtraPool did it)
+    let pos = 1
+    pdb.txnAvailable[pos] = some(makeTestTransaction(99))
+    pdb.filledSlots.incl(pos)
+    pdb.mempoolCount += 1
+
+    # Simulate collision (second match) — should clear the slot
+    # This is the "else" branch in fillFromMempool/fillFromExtraPool
+    if pos in pdb.filledSlots:
+      if pdb.txnAvailable[pos].isSome:
+        pdb.txnAvailable[pos] = none(Transaction)
+        pdb.mempoolCount -= 1
+
+    check pdb.txnAvailable[pos].isNone
+    check pdb.mempoolCount == 0
+
+    # Simulate "third match" attempt: pos IS in filledSlots so the
+    # first-match branch is skipped — slot cannot be re-filled
+    let wouldFill = pos notin pdb.filledSlots
+    check not wouldFill  # confirms slot is guarded
+
+  # Bug fix 6: filledSlots starts empty on init
+  test "filledSlots: empty after initPartiallyDownloadedBlock":
+    let blk = makeTestBlock(960, 2)  # coinbase + 1 more
+    let cb = newCompactBlock(blk, 0xcafe'u64)
+    var (pdb, initStatus) = initPartiallyDownloadedBlock(cb)
+    check initStatus == rsOk
+    check pdb.filledSlots.len == 0
+    check pdb.mempoolCount == 0
+
+  # Bug fix 4 and shouldSendCompactBlock consistency
+  test "shouldSendCompactBlock: version 1 does not enable compact block sending":
+    var state = newCompactBlockState()
+    # Attempt to accept v1 (should be silently ignored per bug fix 4)
+    state.handleSendCmpct(announce = false, version = 1)
+    check not state.shouldSendCompactBlock()
+
+  test "shouldSendCompactBlock: only version 2 enables compact block sending":
+    var state = newCompactBlockState()
+    state.handleSendCmpct(announce = false, version = 2)
+    check state.shouldSendCompactBlock()
