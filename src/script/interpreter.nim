@@ -35,6 +35,8 @@ type
     seSigHashType = "invalid sighash type"
     seInvalidPubkey = "invalid public key"
     seInvalidSig = "invalid signature"
+    seSigDer = "non-DER signature (BIP66)"
+    seSigHighS = "high-S signature (LOW_S policy)"
     seSigCount = "signature count mismatch"
     sePubkeyCount = "pubkey count mismatch"
     seVerify = "OP_VERIFY failed"
@@ -458,14 +460,15 @@ proc checkSignatureEncoding*(sig: seq[byte], flags: set[ScriptFlags]): ScriptErr
 
   if (sfDERSig in flags or sfLowS in flags or sfStrictEnc in flags) and
      not isValidSignatureEncoding(sig):
-    return seInvalidSig  # SIG_DER
+    return seSigDer  # SCRIPT_ERR_SIG_DER (Core interpreter.cpp:207-208)
 
   if sfLowS in flags:
-    # isValidSignatureEncoding already passed above, so sig is valid DER
-    # Check low-S: strip hashtype byte and check
+    # isValidSignatureEncoding already passed above, so sig is valid DER.
+    # Strip the sighash byte before calling secp256k1 low-S check.
+    # Mirrors Core's IsLowDERSignature (interpreter.cpp:173-188).
     let sigWithoutHashType = sig[0 ..< sig.len - 1]
     if not isLowS(sigWithoutHashType):
-      return seInvalidSig  # SIG_HIGH_S (reusing seInvalidSig)
+      return seSigHighS  # SCRIPT_ERR_SIG_HIGH_S (Core interpreter.cpp:185)
 
   if sfStrictEnc in flags and not isDefinedHashtypeSignature(sig):
     return seSigHashType
@@ -1770,14 +1773,14 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       for i in 0 ..< int(nSigs):
         sigs.add(interp.pop())
 
-      # Pop the dummy element (off-by-one bug)
+      # Pop the dummy element (off-by-one bug in the original Bitcoin CHECKMULTISIG).
+      # Note: NULLDUMMY check is deferred until AFTER the verify loop and NULLFAIL
+      # check, matching Bitcoin Core's cleanup order (interpreter.cpp:1183-1203):
+      # Core pops items during a cleanup pass that fires NULLFAIL per-sig first,
+      # then checks NULLDUMMY on the dummy element last.
       if interp.stack.len < 1:
         return seInvalidStack
       let dummy = interp.pop()
-
-      # BIP147: dummy must be empty when NULLDUMMY is active
-      if sfNullDummy in interp.flags and dummy.len > 0:
-        return seNullDummy
 
       # Verify signatures
       var success = true
@@ -1837,11 +1840,17 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
           success = false
 
       # BIP146 NULLFAIL: if multisig failed and NULLFAIL flag is set,
-      # ALL signatures must be empty
+      # ALL signatures must be empty. Checked BEFORE NULLDUMMY to match Core's
+      # cleanup-loop order (interpreter.cpp:1186 fires before line 1201).
       if not success and sfNullFail in interp.flags:
         for sigItem in sigs:
           if sigItem.len > 0:
             return seNullFail
+
+      # BIP147 NULLDUMMY: dummy element must be empty. Checked AFTER NULLFAIL,
+      # matching Core's interpreter.cpp:1201 (fires after the cleanup loop).
+      if sfNullDummy in interp.flags and dummy.len > 0:
+        return seNullDummy
 
       if opcode == OP_CHECKMULTISIGVERIFY:
         if not success:
