@@ -1399,6 +1399,40 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     trace "received pkgtxns", peer = $peer,
           txCount = msg.pkgTxns.transactions.len
 
+  # BIP-157 compact block filter messages
+  # Requests (getcfilters / getcfheaders / getcfcheckpt) are dispatched to the
+  # higher-level NodeState handler in nimrod.nim which has access to the
+  # block-filter index.  Responses (cfilter / cfheaders / cfcheckpt) are
+  # dispatched to the requesting client's callback.
+  # Reference: bitcoin-core/src/net_processing.cpp:3315, 3344, 3386
+  of mkGetCFilters:
+    trace "received getcfilters", peer = $peer,
+          filterType = msg.getCFilters.filterType,
+          startHeight = msg.getCFilters.startHeight
+
+  of mkCFilter:
+    trace "received cfilter", peer = $peer,
+          filterType = msg.cFilter.filterType
+
+  of mkGetCFHeaders:
+    trace "received getcfheaders", peer = $peer,
+          filterType = msg.getCFHeaders.filterType,
+          startHeight = msg.getCFHeaders.startHeight
+
+  of mkCFHeaders:
+    trace "received cfheaders", peer = $peer,
+          filterType = msg.cFHeaders.filterType,
+          count = msg.cFHeaders.filterHashes.len
+
+  of mkGetCFCheckPt:
+    trace "received getcfcheckpt", peer = $peer,
+          filterType = msg.getCFCheckPt.filterType
+
+  of mkCFCheckPt:
+    trace "received cfcheckpt", peer = $peer,
+          filterType = msg.cFCheckPt.filterType,
+          count = msg.cFCheckPt.filterHeaders.len
+
   of mkSendTxRcncl:
     trace "peer supports tx reconciliation", peer = $peer
 
