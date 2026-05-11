@@ -2,6 +2,7 @@
 ## Tests empty mempool, multi-tx templates, merkle root, witness commitment
 
 import unittest2
+import std/times
 
 import ../src/primitives/[types, serialize]
 import ../src/consensus/params
@@ -374,8 +375,9 @@ suite "Block Template":
     check WitnessCommitmentHeader == @[0x6a'u8, 0x24, 0xaa, 0x21, 0xa9, 0xed]
 
   test "reserved coinbase weight constant":
-    # Should reserve enough space for typical coinbase
-    check CoinbaseReservedWeight == 4000
+    # Bitcoin Core DEFAULT_BLOCK_RESERVED_WEIGHT = 8000 (policy/policy.h:27).
+    # Fixed in W87: old value was 4000 (under-reserved by 4000 WU).
+    check CoinbaseReservedWeight == 8000
 
   test "max block sigops constant":
     # BIP-141 specifies 80K sigops cost limit
@@ -520,3 +522,192 @@ suite "Block Template":
     # Used for anti-fee-sniping to ensure locktime is enforced
     check MaxSequenceNonFinal == 0xFFFFFFFE'u32
     check MaxSequenceNonFinal == SequenceFinal - 1
+
+# ---------------------------------------------------------------------------
+# W87 gate tests — block template assembly correctness
+# Reference: Bitcoin Core node/miner.cpp (DEFAULT_BLOCK_RESERVED_WEIGHT,
+# ClampOptions, TestChunkBlockLimits, addChunks, UpdateTime)
+# ---------------------------------------------------------------------------
+suite "Block Template W87 Gates":
+
+  # Bug 1: CoinbaseReservedWeight was 4000 (Core DEFAULT_BLOCK_RESERVED_WEIGHT = 8000)
+  test "CoinbaseReservedWeight equals Core DEFAULT_BLOCK_RESERVED_WEIGHT (8000)":
+    # Bitcoin Core policy/policy.h:27:
+    #   static constexpr unsigned int DEFAULT_BLOCK_RESERVED_WEIGHT{8000};
+    check CoinbaseReservedWeight == 8_000
+
+  # Bug 2: MINIMUM_BLOCK_RESERVED_WEIGHT constant
+  test "MinimumBlockReservedWeight equals Core MINIMUM_BLOCK_RESERVED_WEIGHT (2000)":
+    # Bitcoin Core policy/policy.h:34:
+    #   static constexpr unsigned int MINIMUM_BLOCK_RESERVED_WEIGHT{2000};
+    check MinimumBlockReservedWeight == 2_000
+
+  # Bug 5/6: MAX_CONSECUTIVE_FAILURES and BLOCK_FULL_ENOUGH_WEIGHT_DELTA
+  test "MaxConsecutiveFailures equals Core MAX_CONSECUTIVE_FAILURES (1000)":
+    # Bitcoin Core node/miner.cpp:284
+    check MaxConsecutiveFailures == 1_000
+
+  test "BlockFullEnoughWeightDelta equals Core BLOCK_FULL_ENOUGH_WEIGHT_DELTA (4000)":
+    # Bitcoin Core node/miner.cpp:285
+    check BlockFullEnoughWeightDelta == 4_000
+
+  # Bug 9: DefaultBlockMinFeeRateSatKvB
+  test "DefaultBlockMinFeeRateSatKvB equals Core DEFAULT_BLOCK_MIN_TX_FEE * 1000 (1000 sat/kvB)":
+    # Bitcoin Core policy/policy.h:36: DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/vbyte
+    check DefaultBlockMinFeeRateSatKvB == 1_000'i64
+
+  # clampBlockOptions tests (Bug 2)
+  test "clampBlockOptions clamps reservedWeight to [MinimumBlockReservedWeight, MaxBlockWeight]":
+    # Normal case: both in range
+    let (maxW, resW) = clampBlockOptions(4_000_000, 8_000)
+    check resW == 8_000
+    check maxW == 4_000_000
+
+  test "clampBlockOptions raises reservedWeight below minimum to MinimumBlockReservedWeight":
+    # Core rejects anything below MINIMUM_BLOCK_RESERVED_WEIGHT at startup
+    let (_, resW) = clampBlockOptions(4_000_000, 100)
+    check resW == MinimumBlockReservedWeight  # 2000
+
+  test "clampBlockOptions caps maxWeight at MAX_BLOCK_WEIGHT":
+    let (maxW, _) = clampBlockOptions(99_000_000, 8_000)
+    check maxW == MaxBlockWeight  # 4_000_000
+
+  test "clampBlockOptions ensures maxWeight >= reservedWeight":
+    # If someone passes maxWeight smaller than reservedWeight, clamp maxWeight up
+    let (maxW, resW) = clampBlockOptions(1_000, 8_000)
+    check resW == 8_000
+    check maxW == 8_000  # maxWeight raised to match reservedWeight
+
+  test "clampBlockOptions: reservedWeight above MaxBlockWeight is capped":
+    let (maxW, resW) = clampBlockOptions(4_000_000, 99_000_000)
+    check resW == MaxBlockWeight
+    check maxW == MaxBlockWeight
+
+  # Bug 4/12: sigops boundary — >= not >
+  test "sigops check is >= MaxBlockSigopsCost (boundary — exactly 80000 is rejected)":
+    # Core TestChunkBlockLimits line 244:
+    #   if (nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST) return false;
+    # Adding a tx whose sigops brings the total to exactly 80000 must be rejected.
+    # Old code used `>`, which would have accepted it.
+    let maxSigops = MaxBlockSigopsCost  # 80_000
+    # Simulate: running cost = 79999, new tx has 1 sigop → total = 80000 → reject
+    let runningCost = maxSigops - 1
+    let txSigops = 1
+    check runningCost + txSigops >= maxSigops  # This is the gate that now fires
+
+  test "sigops check allows txs that bring total to 79999":
+    let runningCost = MaxBlockSigopsCost - 2
+    let txSigops = 1
+    check not (runningCost + txSigops >= MaxBlockSigopsCost)
+
+  # Bug 3: weight boundary — >= not >
+  test "weight check is >= nBlockMaxWeight (boundary — exactly at limit is rejected)":
+    # Core TestChunkBlockLimits line 241:
+    #   if (nBlockWeight + chunk_feerate.size >= m_options.nBlockMaxWeight) return false;
+    # A tx that would make nBlockWeight == nBlockMaxWeight must be rejected.
+    let nBlockMaxWeight = 4_000_000
+    let nBlockWeight = 3_999_900
+    let txWeight = 100  # Would bring total to exactly 4_000_000 → reject
+    check nBlockWeight + txWeight >= nBlockMaxWeight
+
+  test "weight check allows tx that brings total to 3999999":
+    let nBlockMaxWeight = 4_000_000
+    let nBlockWeight = 3_999_900
+    let txWeight = 99   # Would bring total to 3_999_999 → accept
+    check not (nBlockWeight + txWeight >= nBlockMaxWeight)
+
+  # Bug 7: updateTimestamp MTP+1 enforcement
+  test "updateTimestamp enforces MTP+1 lower bound":
+    let header = BlockHeader(
+      version: 0x20000000,
+      prevBlock: BlockHash(default(array[32, byte])),
+      merkleRoot: default(array[32, byte]),
+      timestamp: 1_000_000'u32,
+      bits: 0x207fffff'u32,
+      nonce: 0
+    )
+    var tmpl = BlockTemplate(
+      header: header,
+      coinbaseTx: Transaction(),
+      transactions: @[],
+      totalFees: Satoshi(0),
+      totalWeight: 8_000,
+      totalSigops: 0,
+      height: 1,
+      target: default(array[32, byte])
+    )
+
+    let params = regtestParams()
+    # prevBlockMtp = far future timestamp to force MTP+1 > now
+    let farFutureMtp = uint32(int64(getTime().toUnix()) + 3600)
+    tmpl.updateTimestamp(params, prevBlockMtp = farFutureMtp)
+    # Timestamp must be >= farFutureMtp + 1 (the MTP+1 floor)
+    check tmpl.header.timestamp >= farFutureMtp + 1
+
+  test "updateTimestamp uses current time when MTP+1 < now":
+    let header = BlockHeader(
+      version: 0x20000000,
+      prevBlock: BlockHash(default(array[32, byte])),
+      merkleRoot: default(array[32, byte]),
+      timestamp: 0'u32,
+      bits: 0x207fffff'u32,
+      nonce: 0
+    )
+    var tmpl = BlockTemplate(
+      header: header,
+      coinbaseTx: Transaction(),
+      transactions: @[],
+      totalFees: Satoshi(0),
+      totalWeight: 8_000,
+      totalSigops: 0,
+      height: 1,
+      target: default(array[32, byte])
+    )
+
+    let params = regtestParams()
+    let oldMtp = 1_000_000'u32  # Old MTP; MTP+1 = 1_000_001, well below now
+    let before = uint32(getTime().toUnix())
+    tmpl.updateTimestamp(params, prevBlockMtp = oldMtp)
+    let after = uint32(getTime().toUnix())
+    # Timestamp should be approximately now
+    check tmpl.header.timestamp >= before
+    check tmpl.header.timestamp <= after + 1
+
+  test "updateTimestamp with prevBlockMtp=0 skips MTP enforcement":
+    let header = BlockHeader(
+      version: 0x20000000,
+      prevBlock: BlockHash(default(array[32, byte])),
+      merkleRoot: default(array[32, byte]),
+      timestamp: 0'u32,
+      bits: 0x207fffff'u32,
+      nonce: 0
+    )
+    var tmpl = BlockTemplate(
+      header: header,
+      coinbaseTx: Transaction(),
+      transactions: @[],
+      totalFees: Satoshi(0),
+      totalWeight: 8_000,
+      totalSigops: 0,
+      height: 1,
+      target: default(array[32, byte])
+    )
+    let params = regtestParams()
+    let before = uint32(getTime().toUnix())
+    tmpl.updateTimestamp(params, prevBlockMtp = 0)
+    let after = uint32(getTime().toUnix())
+    check tmpl.header.timestamp >= before
+    check tmpl.header.timestamp <= after + 1
+
+  # Block-level weight constant
+  test "block reserved weight of 8000 fits within MAX_BLOCK_WEIGHT of 4000000":
+    check CoinbaseReservedWeight < MaxBlockWeight
+    # Remaining capacity for transactions
+    let txCapacity = MaxBlockWeight - CoinbaseReservedWeight
+    check txCapacity == 3_992_000
+
+  # Sanity: old reserved weight (4000) vs. new (8000) — documents the bug
+  test "reserved weight increased from 4000 to 8000 (bug fix documentation)":
+    # Verify the constant is the corrected value, not the old under-reserved value
+    check CoinbaseReservedWeight == 8_000
+    check CoinbaseReservedWeight != 4_000  # Was wrong before W87

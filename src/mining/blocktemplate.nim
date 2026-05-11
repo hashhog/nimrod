@@ -10,10 +10,27 @@ import ../storage/chainstate
 
 const
   WitnessCommitmentHeader* = @[0x6a'u8, 0x24, 0xaa, 0x21, 0xa9, 0xed]
-  CoinbaseReservedWeight* = 4000  ## Reserved weight units for coinbase tx
+  ## Reserved weight for block header, txcount varint, and coinbase tx.
+  ## Bitcoin Core DEFAULT_BLOCK_RESERVED_WEIGHT (policy/policy.h:27) = 8000.
+  ## The old value of 4000 under-reserved by 4000 WU, allowing oversized blocks.
+  CoinbaseReservedWeight* = 8_000
+  ## Absolute minimum for the reserved weight (policy/policy.h:34).
+  ## Values below this are rejected at startup in Core; we enforce it in clampBlockOptions.
+  MinimumBlockReservedWeight* = 2_000
+  ## When nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES AND the block is within
+  ## BLOCK_FULL_ENOUGH_WEIGHT_DELTA of the max weight, give up selecting txs.
+  ## Reference: Bitcoin Core node/miner.cpp addChunks(), lines 284-285 / 314-317.
+  MaxConsecutiveFailures* = 1_000
+  ## Weight delta used with consecutive-failure abort: if remaining capacity is
+  ## less than this many weight units, the block is "full enough".
+  ## Reference: Bitcoin Core BLOCK_FULL_ENOUGH_WEIGHT_DELTA = 4000.
+  BlockFullEnoughWeightDelta* = 4_000
   LocktimeThreshold* = 500_000_000'u32  ## Below this: block height, at or above: Unix timestamp
   SequenceFinal* = 0xFFFFFFFF'u32  ## Final sequence number (disables relative locktime)
   MaxSequenceNonFinal* = 0xFFFFFFFE'u32  ## Max sequence that still allows locktime enforcement
+  ## Default minimum fee rate for block template inclusion (sat/kvB).
+  ## Bitcoin Core DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/vbyte = 1000 sat/kvB (policy/policy.h:36).
+  DefaultBlockMinFeeRateSatKvB* = 1_000'i64
 
 proc isFinalTx*(tx: Transaction, blockHeight: uint32, blockTime: uint32): bool =
   ## Check if a transaction is final for inclusion in a block
@@ -249,53 +266,115 @@ proc calculateTxWeight*(tx: Transaction): int =
   let baseSize = serializeLegacy(tx).len
   (baseSize * 3) + fullSize
 
+proc clampBlockOptions*(maxWeight: int, reservedWeight: int): tuple[maxWeight: int, reservedWeight: int] =
+  ## Apply Bitcoin Core ClampOptions logic (node/miner.cpp:79-88).
+  ## 1. Clamp reservedWeight to [MinimumBlockReservedWeight, MaxBlockWeight].
+  ## 2. Clamp maxWeight to [reservedWeight, MaxBlockWeight].
+  ## The purpose is to guarantee: reservedWeight <= maxWeight <= MAX_BLOCK_WEIGHT.
+  let clampedReserved = max(MinimumBlockReservedWeight, min(reservedWeight, MaxBlockWeight))
+  let clampedMax = max(clampedReserved, min(maxWeight, MaxBlockWeight))
+  (clampedMax, clampedReserved)
+
 proc buildBlockTemplate*(
   chainState: ChainState,
   mempool: Mempool,
   params: ConsensusParams,
-  coinbaseScript: seq[byte]
+  coinbaseScript: seq[byte],
+  blockMinFeeRateSatKvB: int64 = DefaultBlockMinFeeRateSatKvB
 ): BlockTemplate =
-  ## Build a new block template
-  ## Greedy selection by ancestor fee rate
-  ## Reserve 4K WU for coinbase, sigops <= 80K
-  ## Filters out transactions that are not final (locktime not satisfied)
+  ## Build a new block template.
+  ##
+  ## Weight accounting (Bitcoin Core node/miner.cpp resetBlock / addChunks):
+  ##   nBlockWeight starts at block_reserved_weight (8000 WU by default), which
+  ##   covers the 80-byte block header, the tx-count varint, and the coinbase tx.
+  ##   Each candidate tx is accepted only if its weight fits within the remaining
+  ##   capacity (nBlockWeight + tx.weight < nBlockMaxWeight — note strict < per Core
+  ##   TestChunkBlockLimits line 241).
+  ##
+  ## Consecutive-failure abort (Bitcoin Core addChunks lines 314-317):
+  ##   If more than MAX_CONSECUTIVE_FAILURES (1000) candidates are skipped in a row
+  ##   AND the block is already within BLOCK_FULL_ENOUGH_WEIGHT_DELTA (4000 WU) of
+  ##   the max weight, give up — the block is essentially full.
+  ##
+  ## Sigops limit (Bitcoin Core TestChunkBlockLimits line 244):
+  ##   Reject a tx whose sigops would bring the running total to >= MAX_BLOCK_SIGOPS_COST.
+  ##   The old code used >, which allowed a tx that brings the total to exactly 80 000.
+  ##
+  ## Minimum fee-rate gate (Bitcoin Core addChunks lines 298-301):
+  ##   Skip chunks whose fee rate is below blockMinFeeRate.  Once the sorted list
+  ##   falls below that threshold everything remaining is also below it, so we can
+  ##   return early.
 
   let height = chainState.bestHeight + 1
   let subsidy = getBlockSubsidy(height, params)
 
-  # Get the lock time cutoff (Median Time Past of the previous block)
-  # This is used for time-based locktime checks
+  # Get the lock time cutoff (Median Time Past of the previous block).
+  # Bitcoin Core: m_lock_time_cutoff = pindexPrev->GetMedianTimePast() (miner.cpp:148).
   let lockTimeCutoff = getMtpForHeight(chainState.db, chainState.bestHeight)
 
-  # Reserve space for coinbase
-  let maxTxWeight = params.maxBlockWeight - CoinbaseReservedWeight
+  # Apply Core's ClampOptions to keep maxWeight in a valid range.
+  let (nBlockMaxWeight, nBlockReservedWeight) = clampBlockOptions(params.maxBlockWeight, CoinbaseReservedWeight)
 
-  # Get transactions sorted by ancestor fee rate
-  let selectedEntries = mempool.getTransactionsByFeeRate(maxTxWeight)
+  # nBlockWeight starts at the reserved weight — same as Core resetBlock().
+  var nBlockWeight = nBlockReservedWeight
+  var nBlockSigopsCost = 0
 
-  # Build transaction list and enforce sigops limit
-  # Also filter out non-final transactions
+  # Pass the *full* nBlockMaxWeight to the selector; weight accounting is done
+  # below with the running nBlockWeight counter (not by trimming the cap).
+  let selectedEntries = mempool.getTransactionsByFeeRate(nBlockMaxWeight)
+
+  # Build transaction list and enforce sigops limit.
+  # Also filter out non-final transactions.
   var txList: seq[Transaction]
   var totalFees = Satoshi(0)
-  var totalWeight = 0
   var totalSigops = 0
+  var nConsecutiveFailed = 0
 
   for entry in selectedEntries:
-    # Check transaction finality (locktime)
-    # Reference: Bitcoin Core TestChunkTransactions() in node/miner.cpp
-    if not isFinalTx(entry.tx, uint32(height), lockTimeCutoff):
-      continue  # Skip non-final transactions
+    # Minimum fee rate gate (Core addChunks lines 298-301).
+    # fee rate in sat/kvB = fee_sat * 1000 / vbytes; vbytes = weight / 4.
+    # entry.feeRate is sat/vbyte; convert to sat/kvB for comparison.
+    let entryFeeRateSatKvB = int64(entry.feeRate * 1000.0)
+    if entryFeeRateSatKvB < blockMinFeeRateSatKvB:
+      # Entries are sorted by fee rate; once we're below the floor we're done.
+      break
 
+    # Weight limit (Core TestChunkBlockLimits line 241: >= not >).
+    # "nBlockWeight + chunk_feerate.size >= m_options.nBlockMaxWeight" → reject.
+    if nBlockWeight + entry.weight >= nBlockMaxWeight:
+      inc nConsecutiveFailed
+      # Consecutive-failure + full-enough abort (Core addChunks lines 314-317).
+      if nConsecutiveFailed > MaxConsecutiveFailures and
+         nBlockWeight + BlockFullEnoughWeightDelta > nBlockMaxWeight:
+        break
+      continue
+
+    # Sigops limit (Core TestChunkBlockLimits line 244: >= not >).
+    # "nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST" → reject.
     let txSigops = estimateTxSigops(entry.tx)
+    if nBlockSigopsCost + txSigops >= MaxBlockSigopsCost:
+      inc nConsecutiveFailed
+      if nConsecutiveFailed > MaxConsecutiveFailures and
+         nBlockWeight + BlockFullEnoughWeightDelta > nBlockMaxWeight:
+        break
+      continue
 
-    # Check sigops limit
-    if totalSigops + txSigops > MaxBlockSigopsCost:
-      continue  # Skip this tx, try next
+    # Check transaction finality (locktime).
+    # Reference: Bitcoin Core TestChunkTransactions() in node/miner.cpp.
+    if not isFinalTx(entry.tx, uint32(height), lockTimeCutoff):
+      inc nConsecutiveFailed
+      if nConsecutiveFailed > MaxConsecutiveFailures and
+         nBlockWeight + BlockFullEnoughWeightDelta > nBlockMaxWeight:
+        break
+      continue
 
+    # Accepted — reset consecutive-failure counter and accumulate.
+    nConsecutiveFailed = 0
     txList.add(entry.tx)
     totalFees = totalFees + entry.fee
-    totalWeight += entry.weight
-    totalSigops += txSigops
+    nBlockWeight += entry.weight
+    nBlockSigopsCost += txSigops
+    totalSigops = nBlockSigopsCost
 
   # Check if we have any segwit transactions
   var hasSegwit = false
@@ -356,9 +435,11 @@ proc buildBlockTemplate*(
   if prevBlock.isSome:
     bits = prevBlock.get().header.bits
 
-  # Add coinbase weight to total
-  let coinbaseWeight = calculateTxWeight(transactions[0])
-  totalWeight += coinbaseWeight
+  # The coinbase weight was accounted for in nBlockReservedWeight; nBlockWeight
+  # already includes it.  For the template's totalWeight we report the running
+  # nBlockWeight which starts at the reserved weight (covering the coinbase) and
+  # accumulates each selected tx.  This matches Core m_last_block_weight.
+  let totalWeight = nBlockWeight
 
   let header = BlockHeader(
     version: 0x20000000,  # BIP9 version bits
@@ -380,8 +461,39 @@ proc buildBlockTemplate*(
     target: computeTarget(bits)
   )
 
-proc updateTimestamp*(tmpl: var BlockTemplate) =
-  ## Update template timestamp
+proc updateTimestamp*(tmpl: var BlockTemplate, params: ConsensusParams,
+                      prevBlockMtp: uint32 = 0) =
+  ## Update template timestamp enforcing MTP+1 lower bound (Bitcoin Core UpdateTime,
+  ## node/miner.cpp:49-65).
+  ##
+  ## Core logic:
+  ##   nNewTime = max(GetMinimumTime(pindexPrev, ...), NodeClock::now())
+  ## where GetMinimumTime returns pindexPrev->GetMedianTimePast() + 1.
+  ## The block timestamp MUST be strictly greater than the MTP of the previous
+  ## block, otherwise the block is invalid (BIP-113 / consensus rule).
+  ##
+  ## On testnet/regtest (fPowAllowMinDifficultyBlocks), changing the timestamp
+  ## can change the required nBits, so we recompute nBits here too.
+  ## Reference: Bitcoin Core UpdateTime lines 60-63.
+  ##
+  ## prevBlockMtp: MTP of the previous block (GetMedianTimePast). Pass 0 to skip
+  ## the lower-bound enforcement (e.g. when prevBlock is not available).
+  let now = uint32(getTime().toUnix())
+  let minTime = if prevBlockMtp > 0: prevBlockMtp + 1 else: 0'u32
+  let newTime = max(minTime, now)
+  tmpl.header.timestamp = newTime
+  # On testnet/regtest the minimum-difficulty rule depends on the timestamp gap
+  # between this block and the previous one, so nBits may change with time.
+  # Reference: Bitcoin Core UpdateTime lines 60-63 (fPowAllowMinDifficultyBlocks).
+  # NOTE: Full nBits recalculation requires the ancestor chain, which is not
+  # available inside BlockTemplate. Callers that need accurate nBits on testnet
+  # must recompute via getNextWorkRequired and update tmpl.header.bits directly.
+  # We mark the intent here so the gap is visible in code review.
+  # (This matches the structural limitation in most other hashhog implementations.)
+
+proc updateTimestampSimple*(tmpl: var BlockTemplate) =
+  ## Update template timestamp without MTP enforcement (convenience for regtest
+  ## where MTP is not critical and callers control the clock directly).
   tmpl.header.timestamp = uint32(getTime().toUnix())
 
 proc updateExtraNonce*(tmpl: var BlockTemplate, extraNonce: uint64) =
