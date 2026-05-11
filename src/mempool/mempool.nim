@@ -288,23 +288,25 @@ proc checkSingleTrucRules*(mp: Mempool, tx: Transaction, weight: int,
 
       for siblingTxid in parentChildren:
         if siblingTxid in conflicts:
-          # This sibling is being replaced by us (RBF conflict)
-          # Check if sibling has exactly 2 ancestors (self + parent) for clean eviction
-          let siblingEntry = mp.entries[siblingTxid]
-          let siblingAncestorCount = siblingEntry.ancestorCount
-          if siblingAncestorCount <= TrucAncestorLimit:
-            canEvict = true
-            siblingToEvict = siblingTxid
-            break
+          # Sibling is being RBF-replaced: child_will_be_replaced = true.
+          # Core skips the descendant limit check in this case.
+          # Reference: Core truc_policy.cpp lines 240-243
+          canEvict = true
+          siblingToEvict = siblingTxid
+          break
 
       if not canEvict:
-        # Check if there's exactly one sibling and we can do sibling eviction
-        # (even without RBF conflict - this is the v3 sibling eviction rule)
+        # Descendant limit would be exceeded and no RBF replacement is in flight.
+        # Reference: Core truc_policy.cpp lines 248-258:
+        # consider_sibling_eviction requires:
+        #   - parent has exactly 2 descendants (parent + exactly 1 child), AND
+        #   - that child has exactly 2 ancestors (child + parent, i.e. ancestorCount == 2)
+        # ancestorCount in MempoolEntry includes self, so == 2 means parent is its only ancestor.
         if parentChildren.len == 1:
           let existingSibling = parentChildren[0]
           let siblingEntry = mp.entries[existingSibling]
-          # Only allow sibling eviction if sibling has simple topology
-          if siblingEntry.ancestorCount <= TrucAncestorLimit:
+          # Core: GetAncestorCount(sibling) == 2 (exactly parent + self)
+          if siblingEntry.ancestorCount == TrucAncestorLimit:
             # Sibling can be evicted via sibling eviction rule
             return trucOk(some(existingSibling))
 
@@ -1475,10 +1477,17 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
     return result
 
   # Check TRUC (v3) package policy rules
+  # mempoolParentAncestorCount(txid): ancestor count INCLUDING self (matches Core's GetAncestorCount)
+  # mempoolParentDescendantCount(txid): descendant count INCLUDING self (matches Core's GetDescendantCount)
   let trucResult = checkPackageTrucRules(
     txns,
     proc(txid: TxId): bool = txid in mp.entries,
     proc(txid: TxId): bool = (if txid in mp.entries: mp.entries[txid].isTruc else: false),
+    proc(txid: TxId): int =
+      if txid in mp.entries:
+        # calculateAncestors returns ancestors WITHOUT self, so add 1 for self
+        mp.calculateAncestors(mp.entries[txid].tx).len + 1
+      else: 1,
     proc(txid: TxId): int = (if txid in mp.entries: mp.calculateDescendantStats(txid)[0] else: 1)
   )
   if not trucResult.isOk:

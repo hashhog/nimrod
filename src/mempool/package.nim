@@ -2,7 +2,7 @@
 ## Allows submitting packages of related transactions for CPFP fee bumping
 ## Reference: Bitcoin Core policy/packages.cpp and validation.cpp
 
-import std/[tables, algorithm, options, sets]
+import std/[tables, sets]
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 import ../consensus/validation
@@ -55,8 +55,12 @@ const
   PackageTrucVersion = 3'i32                  ## Transaction version for TRUC policy
   PackageTrucAncestorLimit = 2                ## Max ancestors including self (parent + self)
   PackageTrucDescendantLimit = 2              ## Max descendants including self (self + child)
-  PackageTrucMaxVsize = 10_000                       ## Max vsize for any v3 tx (10 kvB)
-  PackageTrucChildMaxVsize = 1_000                   ## Max vsize for v3 child of unconfirmed v3 parent
+  PackageTrucMaxVsize = 10_000               ## Max vsize for any v3 tx (10 kvB)
+  PackageTrucChildMaxVsize = 1_000           ## Max vsize for v3 child of unconfirmed v3 parent
+
+static:
+  doAssert PackageTrucAncestorLimit == 2
+  doAssert PackageTrucDescendantLimit == 2
 
 # Result type for package operations
 type
@@ -323,8 +327,8 @@ proc sortPackageTopologically*(txns: seq[Transaction]): seq[Transaction] =
 # TRUC (v3) Package Policy
 # ============================================================================
 
-proc isTruc*(tx: Transaction): bool =
-  ## Check if transaction has v3 version (TRUC policy)
+proc isTrucTx(tx: Transaction): bool {.inline.} =
+  ## Check if transaction has v3 version (TRUC policy) — package-internal helper
   tx.version == PackageTrucVersion
 
 proc findInPackageParents(txns: seq[Transaction], txIndex: int): seq[int] =
@@ -345,102 +349,139 @@ proc findInPackageParents(txns: seq[Transaction], txIndex: int): seq[int] =
 proc checkPackageTrucRules*(txns: seq[Transaction],
                             mempoolHasParent: proc(txid: TxId): bool,
                             mempoolParentIsTruc: proc(txid: TxId): bool,
+                            mempoolParentAncestorCount: proc(txid: TxId): int,
                             mempoolParentDescendantCount: proc(txid: TxId): int): PackageOpResult[void] =
-  ## Check TRUC policy rules for a package of transactions
+  ## Check TRUC policy rules for a package of transactions.
+  ## Reference: Bitcoin Core policy/truc_policy.cpp PackageTRUCChecks
+  ## BIP-431: Topologically Restricted Until Confirmation
   ##
-  ## Rules:
-  ## 1. v3 tx cannot exceed PackageTrucMaxVsize (10,000 vbytes)
-  ## 2. v3 tx can have at most 1 unconfirmed parent (from mempool OR package)
-  ## 3. v3 child (with unconfirmed parent) cannot exceed PackageTrucChildMaxVsize (1,000 vbytes)
-  ## 4. v3 parent can have at most 1 unconfirmed child
-  ## 5. v3 cannot spend from non-v3 unconfirmed; non-v3 cannot spend from v3 unconfirmed
+  ## For each tx in the package (Gates 1-6 per Core spec):
+  ## G1. v3 tx must only have v3 unconfirmed ancestors.
+  ## G2. non-v3 tx must only have non-v3 unconfirmed ancestors.
+  ## G3. v3 ancestor set including self <= TRUC_ANCESTOR_LIMIT (2).
+  ## G4. v3 descendant set including self <= TRUC_DESCENDANT_LIMIT (2).
+  ## G5. v3 child (with unconfirmed parent) <= TRUC_CHILD_MAX_VSIZE (1000 vB).
+  ## G6. v3 tx <= TRUC_MAX_VSIZE (10000 vB).
   ##
-  ## The callback functions allow checking mempool state without importing mempool module.
+  ## The callback functions allow checking mempool state without importing the
+  ## mempool module (dependency inversion).
+  ##
+  ## mempoolParentAncestorCount(txid) returns ancestor count including self
+  ## mempoolParentDescendantCount(txid) returns descendant count including self
 
   if txns.len == 0:
     return voidOk()
 
-  # Build txid set for package
+  # Build txid set for package — used to distinguish in-package vs mempool parents
   var packageTxids = initHashSet[TxId]()
-  var packageVersions = initTable[TxId, int32]()
   for tx in txns:
-    let txid = tx.txid()
-    packageTxids.incl(txid)
-    packageVersions[txid] = tx.version
+    packageTxids.incl(tx.txid())
 
   for i, tx in txns:
     let txid = tx.txid()
     let vsize = calculateTransactionVsize(tx)
-    let txIsTruc = tx.isTruc
+    let txIsTruc = tx.isTrucTx
 
-    # Find parents (both in-package and mempool)
+    # Find in-package parents (topological order guaranteed — earlier txs are parents)
     let inPackageParents = findInPackageParents(txns, i)
 
-    # Count mempool parents
-    var mempoolParentCount = 0
-    var mempoolParentTxid: TxId
+    # Collect mempool parents (inputs that are NOT in the package but ARE in mempool)
+    var mempoolParents: seq[TxId]
     for input in tx.inputs:
-      if input.prevOut.txid notin packageTxids:
-        if mempoolHasParent(input.prevOut.txid):
-          mempoolParentCount += 1
-          mempoolParentTxid = input.prevOut.txid
+      let prevTxid = input.prevOut.txid
+      if prevTxid notin packageTxids and mempoolHasParent(prevTxid):
+        if prevTxid notin mempoolParents:
+          mempoolParents.add(prevTxid)
 
-    let totalUnconfirmedParents = inPackageParents.len + mempoolParentCount
+    let totalParents = inPackageParents.len + mempoolParents.len
 
-    # Rule 5: Check version inheritance for mempool parents
-    for input in tx.inputs:
-      if input.prevOut.txid notin packageTxids:
-        if mempoolHasParent(input.prevOut.txid):
-          let parentIsTruc = mempoolParentIsTruc(input.prevOut.txid)
-          if txIsTruc and not parentIsTruc:
-            return err(void, "version=3 tx " & $txid & " cannot spend from non-version=3 tx " & $input.prevOut.txid)
-          if not txIsTruc and parentIsTruc:
-            return err(void, "non-version=3 tx " & $txid & " cannot spend from version=3 tx " & $input.prevOut.txid)
-
-    # Rule 5: Check version inheritance for in-package parents
+    # G1/G2: Version inheritance — applies to ALL txs, not just v3
+    # Reference: Core truc_policy.cpp lines 149-166 (PackageTRUCChecks non-TRUC branch)
+    #            and lines 116-119 (TRUC branch)
     for parentIdx in inPackageParents:
       let parentTxid = txns[parentIdx].txid()
-      let parentIsTruc = txns[parentIdx].isTruc
+      let parentIsTruc = txns[parentIdx].isTrucTx
       if txIsTruc and not parentIsTruc:
-        return err(void, "version=3 tx " & $txid & " cannot spend from non-version=3 tx " & $parentTxid)
+        return err(void, "version=3 tx " & $txid &
+                   " cannot spend from non-version=3 tx " & $parentTxid)
       if not txIsTruc and parentIsTruc:
-        return err(void, "non-version=3 tx " & $txid & " cannot spend from version=3 tx " & $parentTxid)
+        return err(void, "non-version=3 tx " & $txid &
+                   " cannot spend from version=3 tx " & $parentTxid)
 
-    # Remaining rules only apply to v3 transactions
+    for parentTxid in mempoolParents:
+      let parentIsTruc = mempoolParentIsTruc(parentTxid)
+      if txIsTruc and not parentIsTruc:
+        return err(void, "version=3 tx " & $txid &
+                   " cannot spend from non-version=3 tx " & $parentTxid)
+      if not txIsTruc and parentIsTruc:
+        return err(void, "non-version=3 tx " & $txid &
+                   " cannot spend from version=3 tx " & $parentTxid)
+
+    # Remaining gates only apply to v3 transactions
     if not txIsTruc:
       continue
 
-    # Rule 1: v3 tx size limit
+    # G6: v3 tx vsize limit (checked first by Core in SingleTRUCChecks, rechecked here
+    #     via Assume() in PackageTRUCChecks — we enforce it fully)
+    # Reference: Core truc_policy.cpp lines 70-74
     if vsize > PackageTrucMaxVsize:
-      return err(void, "version=3 tx " & $txid & " is too big: " & $vsize & " > " & $PackageTrucMaxVsize & " virtual bytes")
+      return err(void, "version=3 tx " & $txid & " is too big: " & $vsize &
+                 " > " & $PackageTrucMaxVsize & " virtual bytes")
 
-    # Rule 2: v3 tx can have at most 1 unconfirmed ancestor
-    if totalUnconfirmedParents > 1:
+    # G3: Ancestor set including self <= TRUC_ANCESTOR_LIMIT (2)
+    # Reference: Core truc_policy.cpp lines 76-86
+    if totalParents + 1 > PackageTrucAncestorLimit:
       return err(void, "tx " & $txid & " would have too many ancestors")
 
-    # If there's any unconfirmed parent, check child size limit
-    if totalUnconfirmedParents > 0:
-      # Rule 3: v3 child size limit
+    # Check that a mempool parent doesn't already have its own ancestors
+    # (would push the chain depth beyond limit)
+    # Reference: Core truc_policy.cpp lines 81-86
+    if mempoolParents.len > 0:
+      let mpParentAncCount = mempoolParentAncestorCount(mempoolParents[0])
+      # mpParentAncCount includes the parent itself; add in_package_parents for this tx
+      if mpParentAncCount + inPackageParents.len + 1 > PackageTrucAncestorLimit:
+        return err(void, "tx " & $txid & " would have too many ancestors")
+
+    # G4/G5: If there's any unconfirmed parent, apply child restrictions
+    # Reference: Core truc_policy.cpp lines 88-147
+    let hasParent = totalParents > 0
+    if hasParent:
+      # G5: v3 child vsize limit
+      # Reference: Core truc_policy.cpp lines 91-95
       if vsize > PackageTrucChildMaxVsize:
-        return err(void, "version=3 child tx " & $txid & " is too big: " & $vsize & " > " & $PackageTrucChildMaxVsize & " virtual bytes")
+        return err(void, "version=3 child tx " & $txid & " is too big: " & $vsize &
+                   " > " & $PackageTrucChildMaxVsize & " virtual bytes")
 
-      # Rule 4: Check that parent doesn't already have other children
+      # Determine which single parent this child has (in-package or mempool).
+      # TRUC_ANCESTOR_LIMIT == 2 means exactly 1 parent is allowed.
+      let parentTxid: TxId =
+        if inPackageParents.len > 0: txns[inPackageParents[0]].txid()
+        else: mempoolParents[0]
 
-      # Check for in-package siblings (other children of same parent)
-      for parentIdx in inPackageParents:
-        let parentTxid = txns[parentIdx].txid()
-        # Look for other txs in the package that also spend from this parent
-        for j, otherTx in txns:
-          if j != i:
-            for input in otherTx.inputs:
-              if input.prevOut.txid == parentTxid:
-                # Another tx in package is also a child of this parent
-                return err(void, "tx " & $txid & " would exceed descendant count limit")
+      # G4a: No other package tx may also be a child of the same parent (sibling check).
+      # Reference: Core truc_policy.cpp lines 122-135
+      for j, otherTx in txns:
+        if j == i: continue
+        for input in otherTx.inputs:
+          if input.prevOut.txid == parentTxid:
+            return err(void, "tx " & $parentTxid &
+                       " would exceed descendant count limit")
 
-      # Check mempool parent's existing descendants
-      if mempoolParentCount > 0:
-        let descCount = mempoolParentDescendantCount(mempoolParentTxid)
-        if descCount > 1:  # Parent + existing child = 2, adding another would exceed
-          return err(void, "tx " & $txid & " would exceed descendant count limit")
+      # G4b: This tx cannot itself have a child in the package (grandchild chain).
+      # Reference: Core truc_policy.cpp lines 136-139
+      for j, otherTx in txns:
+        if j == i: continue
+        for input in otherTx.inputs:
+          if input.prevOut.txid == txid:
+            return err(void, "tx " & $otherTx.txid() &
+                       " would have too many ancestors")
+
+      # G4c: If the parent is in the mempool, it must not already have a descendant.
+      # Reference: Core truc_policy.cpp lines 144-147
+      if mempoolParents.len > 0:
+        let descCount = mempoolParentDescendantCount(mempoolParents[0])
+        if descCount > 1:  # > 1 means parent already has a child
+          return err(void, "tx " & $parentTxid &
+                     " would exceed descendant count limit")
 
   voidOk()

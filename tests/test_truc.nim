@@ -3,7 +3,8 @@
 
 import unittest2
 import std/[os, options, tables, strutils, times, sets]
-import ../src/mempool/[mempool, package]
+import ../src/mempool/mempool
+import ../src/mempool/package
 import ../src/storage/[db, chainstate]
 import ../src/primitives/[types, serialize]
 import ../src/crypto/[hashing, secp256k1]
@@ -591,7 +592,8 @@ suite "TRUC v3 package validation":
       @[parent, child],
       proc(txid: TxId): bool = false,  # No mempool parents
       proc(txid: TxId): bool = false,
-      proc(txid: TxId): int = 1
+      proc(txid: TxId): int = 1,       # ancestor count including self
+      proc(txid: TxId): int = 1        # descendant count including self
     )
     check not result.isOk
     check "cannot spend from non-version=3" in result.error
@@ -625,6 +627,7 @@ suite "TRUC v3 package validation":
       @[parent, child],
       proc(txid: TxId): bool = false,
       proc(txid: TxId): bool = false,
+      proc(txid: TxId): int = 1,
       proc(txid: TxId): int = 1
     )
     check not result.isOk
@@ -659,6 +662,7 @@ suite "TRUC v3 package validation":
       @[parent, child],
       proc(txid: TxId): bool = false,
       proc(txid: TxId): bool = false,
+      proc(txid: TxId): int = 1,
       proc(txid: TxId): int = 1
     )
     check result.isOk
@@ -704,10 +708,286 @@ suite "TRUC v3 package validation":
       @[parent, child1, child2],
       proc(txid: TxId): bool = false,
       proc(txid: TxId): bool = false,
+      proc(txid: TxId): int = 1,
       proc(txid: TxId): int = 1
     )
     check not result.isOk
     check "descendant count limit" in result.error
+
+  # --- New gate tests added by W78 audit ---
+
+  test "v3 child cannot itself have an in-package child (grandchild chain)":
+    # G4b: tx that has a parent cannot also have a child in the same package.
+    # Reference: Core truc_policy.cpp line 136-139
+    let grandparent = Transaction(
+      version: 3,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[byte(0x00)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(3000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let parent = Transaction(
+      version: 3,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: grandparent.txid(), vout: 0),
+        scriptSig: @[byte(0x00)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(2000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let child = Transaction(
+      version: 3,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: parent.txid(), vout: 0),
+        scriptSig: @[byte(0x00)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[],
+      lockTime: 0
+    )
+    # Package [grandparent, parent, child]: parent has both a parent AND a child in package
+    let r = checkPackageTrucRules(
+      @[grandparent, parent, child],
+      proc(txid: TxId): bool = false,
+      proc(txid: TxId): bool = false,
+      proc(txid: TxId): int = 1,
+      proc(txid: TxId): int = 1
+    )
+    check not r.isOk
+    # Either "too many ancestors" (for parent tx which would have depth 3) or grandchild error
+    check ("too many ancestors" in r.error or "would have too many ancestors" in r.error)
+
+  test "mempool parent already has a descendant blocks package child":
+    # G4c: mempool parent with existing descendant cannot accept another child from package.
+    # Reference: Core truc_policy.cpp lines 144-147
+    let parent = Transaction(
+      version: 3,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[byte(0x00)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(2000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let child = Transaction(
+      version: 3,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: parent.txid(), vout: 0),
+        scriptSig: @[byte(0x00)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[],
+      lockTime: 0
+    )
+    # Simulate: parent is in mempool, and already has 1 descendant (descCount = 2)
+    let parentTxid = parent.txid()
+    let r = checkPackageTrucRules(
+      @[child],
+      proc(txid: TxId): bool = txid == parentTxid,    # parent is in mempool
+      proc(txid: TxId): bool = txid == parentTxid,    # parent is TRUC
+      proc(txid: TxId): int = 1,                       # parent has no ancestors beyond self
+      proc(txid: TxId): int = 2                        # parent already has 1 child (desc count = 2)
+    )
+    check not r.isOk
+    check "exceed descendant count limit" in r.error
+
+  test "package v3 child of mempool parent with no existing descendants passes":
+    # Positive case for G4c: mempool parent has no existing children.
+    let parent = Transaction(
+      version: 3,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[byte(0x00)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(2000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let child = Transaction(
+      version: 3,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: parent.txid(), vout: 0),
+        scriptSig: @[byte(0x00)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let parentTxid = parent.txid()
+    let r = checkPackageTrucRules(
+      @[child],
+      proc(txid: TxId): bool = txid == parentTxid,
+      proc(txid: TxId): bool = txid == parentTxid,
+      proc(txid: TxId): int = 1,   # ancestor count = 1 (only self)
+      proc(txid: TxId): int = 1    # descendant count = 1 (only self, no children)
+    )
+    check r.isOk
+
+  test "mempool parent with deep ancestors blocks v3 package child":
+    # G3 supplemental: if mempool parent itself has ancestors, adding a child would
+    # exceed the TRUC_ANCESTOR_LIMIT.
+    # Reference: Core truc_policy.cpp lines 81-86
+    let parent = Transaction(
+      version: 3,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[byte(0x00)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(2000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let child = Transaction(
+      version: 3,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: parent.txid(), vout: 0),
+        scriptSig: @[byte(0x00)],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let parentTxid = parent.txid()
+    # Simulate: parent has ancestorCount == 2 (parent + 1 grandparent).
+    # Adding child would give chain depth 3 which exceeds TRUC_ANCESTOR_LIMIT (2).
+    let r = checkPackageTrucRules(
+      @[child],
+      proc(txid: TxId): bool = txid == parentTxid,
+      proc(txid: TxId): bool = txid == parentTxid,
+      proc(txid: TxId): int = 2,   # parent's ancestor count = 2 (itself + grandparent)
+      proc(txid: TxId): int = 1
+    )
+    check not r.isOk
+    check "too many ancestors" in r.error
+
+suite "TRUC single-tx sibling eviction ancestor count":
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "sibling with ancestorCount > 2 does not trigger sibling eviction":
+    # The consider_sibling_eviction condition requires GetAncestorCount(sibling) == 2.
+    # ancestorCount > 2 means sibling has its own grandparent — not eligible.
+    # Reference: Core truc_policy.cpp line 250: pool.GetAncestorCount(**descendants.begin()) == 2
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    # Add v3 parent
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0x01
+    let parentTx = Transaction(
+      version: 3, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(2000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[], lockTime: 0
+    )
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 400, feeRate: 1.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+
+    # Add sibling with ancestorCount = 3 (has a grandparent — not 1-parent-1-child topology)
+    var siblingTxid: array[32, byte]
+    siblingTxid[0] = 0x02
+    let siblingTx = Transaction(
+      version: 3,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[byte(0x00)], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(1500), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[], lockTime: 0
+    )
+    mp.entries[TxId(siblingTxid)] = MempoolEntry(
+      tx: siblingTx, txid: TxId(siblingTxid), fee: Satoshi(500),
+      weight: 400, feeRate: 5.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(600), ancestorWeight: 800,
+      ancestorCount: 3,  # NOT 2 — sibling has its own grandparent
+      ancestorSize: 200
+    )
+
+    let newChildTx = Transaction(
+      version: 3,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[byte(0x01)], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[], lockTime: 0
+    )
+    # No conflicts — sibling is NOT being RBF-replaced
+    let trucResult = mp.checkSingleTrucRules(newChildTx, 400, initHashSet[TxId]())
+    # Must fail — sibling has ancestorCount 3, NOT eligible for sibling eviction
+    check not trucResult.isOk
+    check "exceed descendant count limit" in trucResult.error
+
+    cs.close()
+
+  test "sibling with ancestorCount == 2 triggers sibling eviction suggestion":
+    # The correct Core condition: ancestorCount == 2 (exactly 1 parent).
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+
+    var parentTxid: array[32, byte]
+    parentTxid[0] = 0x01
+    let parentTx = Transaction(
+      version: 3, inputs: @[],
+      outputs: @[TxOut(value: Satoshi(2000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[], lockTime: 0
+    )
+    mp.entries[TxId(parentTxid)] = MempoolEntry(
+      tx: parentTx, txid: TxId(parentTxid), fee: Satoshi(100),
+      weight: 400, feeRate: 1.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(100), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100
+    )
+
+    var siblingTxid: array[32, byte]
+    siblingTxid[0] = 0x02
+    let siblingTx = Transaction(
+      version: 3,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[byte(0x00)], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(1500), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[], lockTime: 0
+    )
+    mp.entries[TxId(siblingTxid)] = MempoolEntry(
+      tx: siblingTx, txid: TxId(siblingTxid), fee: Satoshi(500),
+      weight: 400, feeRate: 5.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(600), ancestorWeight: 800,
+      ancestorCount: 2,  # Exactly 2 — eligible for sibling eviction
+      ancestorSize: 200
+    )
+
+    let newChildTx = Transaction(
+      version: 3,
+      inputs: @[TxIn(prevOut: OutPoint(txid: TxId(parentTxid), vout: 0),
+                     scriptSig: @[byte(0x01)], sequence: 0)],
+      outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: makeP2PKHScript())],
+      witnesses: @[], lockTime: 0
+    )
+    let trucResult = mp.checkSingleTrucRules(newChildTx, 400, initHashSet[TxId]())
+    # Should succeed with sibling eviction suggestion
+    check trucResult.isOk
+    check trucResult.siblingToEvict.isSome
+    check trucResult.siblingToEvict.get() == TxId(siblingTxid)
+
+    cs.close()
 
 when isMainModule:
   discard
