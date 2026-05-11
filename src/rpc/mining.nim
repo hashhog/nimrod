@@ -206,12 +206,15 @@ proc generateBlockWithTxs*(
     totalWeight += entry.weight
     totalSigops += estimateTxSigops(entry.tx)
 
-  # Check weight limit
-  if totalWeight > params.maxBlockWeight - CoinbaseReservedWeight:
+  # Check weight limit.
+  # Use the clamped reserved weight (8000 WU) matching buildBlockTemplate.
+  # Comparison is >= (not >) — Core TestChunkBlockLimits line 241.
+  if CoinbaseReservedWeight + totalWeight >= params.maxBlockWeight:
     return none(BlockHash)  # Exceeds weight limit
 
-  # Check sigops limit
-  if totalSigops > MaxBlockSigopsCost:
+  # Check sigops limit.
+  # Comparison is >= (not >) — Core TestChunkBlockLimits line 244.
+  if totalSigops >= MaxBlockSigopsCost:
     return none(BlockHash)  # Exceeds sigops limit
 
   # Check if we have any segwit transactions
