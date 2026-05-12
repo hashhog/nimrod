@@ -757,13 +757,20 @@ proc saveAnchors*(pm: PeerManager) =
     pm.anchorList.save()
 
 proc broadcastTx*(pm: PeerManager, tx: Transaction) {.async.} =
-  let txBytes = serialize(tx)
-  let txHash = doubleSha256(txBytes)
-
-  let inv = @[InvVector(invType: invWitnessTx, hash: txHash)]
-  let msg = newInv(inv)
+  ## Broadcast a transaction to all ready peers.
+  ## G20 (BIP-339): wtxid-relay peers receive invWtx (MSG_WTX=5) with the
+  ## wtxid; legacy peers receive invTx (MSG_TX=1) with the txid.
+  let wtxidHash = array[32, byte](tx.wtxid())
+  let txidHash  = array[32, byte](tx.txid())
 
   for peer in pm.getReadyPeers():
+    let (itemType, itemHash) =
+      if peer.wtxidRelay:
+        (invWtx, wtxidHash)
+      else:
+        (invTx, txidHash)
+    let inv = @[InvVector(invType: itemType, hash: itemHash)]
+    let msg = newInv(inv)
     try:
       await peer.sendMessage(msg)
     except CatchableError as e:

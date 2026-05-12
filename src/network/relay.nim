@@ -258,26 +258,42 @@ proc unregisterPeer*(rm: RelayManager, peer: Peer) =
     rm.peerStates.del(key)
     debug "unregistered peer from relay", peer = $peer
 
-proc queueTxInv*(rm: RelayManager, txHash: array[32, byte],
+proc queueTxInv*(rm: RelayManager, wtxidHash: array[32, byte],
+                 txidHash: array[32, byte] = default(array[32, byte]),
                  excludePeer: Peer = nil) =
-  ## Queue a transaction for relay to all peers (except sender)
-  ## Transaction will be trickled according to per-peer schedule
+  ## Queue a transaction for relay to all peers (except sender).
+  ## Transaction will be trickled according to per-peer schedule.
+  ## G20 (BIP-339): wtxid-relay peers receive invWtx (MSG_WTX=5) with the
+  ## wtxid as the hash; legacy peers receive invTx (MSG_TX=1) with the txid.
+  ## Pass wtxidHash (always required) and optionally txidHash (defaults to
+  ## wtxidHash for non-segwit transactions where txid == wtxid).
   ## Note: This version does not check feefilter. Use queueTxInvWithFee for
   ## feefilter-aware relay.
-  let item = InvItem(invType: invWitnessTx, hash: txHash, fee: 0, vsize: 0)
+  let effectiveTxid =
+    if txidHash == default(array[32, byte]): wtxidHash else: txidHash
 
   for key, state in rm.peerStates.mpairs:
     # Skip the peer that sent us this tx
     if excludePeer != nil and state.peer == excludePeer:
       continue
 
-    # Skip if peer already knows this tx
-    if state.isKnownTx(txHash):
+    # Per-peer inv type + hash selection (BIP-339 / Core RelayTransaction).
+    # wtxid-relay peers get invWtx with the wtxid hash.
+    # Legacy peers get invTx with the txid hash.
+    let (itemType, itemHash) =
+      if state.peer.wtxidRelay:
+        (invWtx, wtxidHash)
+      else:
+        (invTx, effectiveTxid)
+
+    # Skip if peer already knows this tx (check the hash we'd send)
+    if state.isKnownTx(itemHash):
       continue
 
+    let item = InvItem(invType: itemType, hash: itemHash, fee: 0, vsize: 0)
     # Add to queue
     state.invQueue.add(item)
-    trace "queued tx inv", peer = $state.peer, hash = $txHash
+    trace "queued tx inv", peer = $state.peer, hash = $itemHash
 
 proc relayBlockImmediate*(rm: RelayManager, blockHash: array[32, byte],
                           excludePeer: Peer = nil) {.async.} =
@@ -442,23 +458,33 @@ proc clearAllQueues*(rm: RelayManager) =
     state.invQueue.setLen(0)
 
 # Convenience proc for immediate relay of transactions (bypasses trickling)
-proc relayTxImmediate*(rm: RelayManager, txHash: array[32, byte],
+proc relayTxImmediate*(rm: RelayManager, wtxidHash: array[32, byte],
+                       txidHash: array[32, byte] = default(array[32, byte]),
                        excludePeer: Peer = nil) {.async.} =
-  ## Relay a transaction immediately to all peers (bypasses trickling)
-  ## Use sparingly - normally transactions should be trickled
-  let inv = @[InvVector(invType: invWitnessTx, hash: txHash)]
-  let msg = newInv(inv)
+  ## Relay a transaction immediately to all peers (bypasses trickling).
+  ## G20 (BIP-339): per-peer inv type selection (same as queueTxInv).
+  ## Use sparingly - normally transactions should be trickled.
+  let effectiveTxid =
+    if txidHash == default(array[32, byte]): wtxidHash else: txidHash
 
   for key, state in rm.peerStates.mpairs:
     if excludePeer != nil and state.peer == excludePeer:
       continue
 
-    if state.isKnownTx(txHash):
+    let (itemType, itemHash) =
+      if state.peer.wtxidRelay:
+        (invWtx, wtxidHash)
+      else:
+        (invTx, effectiveTxid)
+
+    if state.isKnownTx(itemHash):
       continue
 
-    state.addKnownTx(txHash)
+    state.addKnownTx(itemHash)
 
     if state.peer.isConnected() and state.peer.handshakeComplete:
+      let inv = @[InvVector(invType: itemType, hash: itemHash)]
+      let msg = newInv(inv)
       try:
         await state.peer.sendMessage(msg)
       except CatchableError as e:
@@ -562,21 +588,31 @@ proc sendFeefilterToAllPeers*(rm: RelayManager) {.async.} =
 # Transaction relay with feefilter checking
 # ============================================================================
 
-proc queueTxInvWithFee*(rm: RelayManager, txHash: array[32, byte],
+proc queueTxInvWithFee*(rm: RelayManager, wtxidHash: array[32, byte],
                         fee: int64, vsize: int,
+                        txidHash: array[32, byte] = default(array[32, byte]),
                         excludePeer: Peer = nil) =
-  ## Queue a transaction for relay with fee info for feefilter checking
-  ## Transactions below peer's feefilter are skipped
+  ## Queue a transaction for relay with fee info for feefilter checking.
+  ## G20 (BIP-339): per-peer inv type selection (same as queueTxInv).
+  ## Transactions below peer's feefilter are skipped.
   let feeRate = calculateFeeRate(fee, vsize)
-  let item = InvItem(invType: invWitnessTx, hash: txHash, fee: fee, vsize: vsize)
+  let effectiveTxid =
+    if txidHash == default(array[32, byte]): wtxidHash else: txidHash
 
   for key, state in rm.peerStates.mpairs:
     # Skip the peer that sent us this tx
     if excludePeer != nil and state.peer == excludePeer:
       continue
 
+    # Per-peer inv type + hash selection (BIP-339)
+    let (itemType, itemHash) =
+      if state.peer.wtxidRelay:
+        (invWtx, wtxidHash)
+      else:
+        (invTx, effectiveTxid)
+
     # Skip if peer already knows this tx
-    if state.isKnownTx(txHash):
+    if state.isKnownTx(itemHash):
       continue
 
     # BIP133: Check peer's feefilter before queueing
@@ -589,22 +625,31 @@ proc queueTxInvWithFee*(rm: RelayManager, txHash: array[32, byte],
       continue
 
     # Add to queue
+    let item = InvItem(invType: itemType, hash: itemHash, fee: fee, vsize: vsize)
     state.invQueue.add(item)
-    trace "queued tx inv", peer = $state.peer, hash = $txHash, feeRate = feeRate
+    trace "queued tx inv", peer = $state.peer, hash = $itemHash, feeRate = feeRate
 
-proc relayTxImmediateWithFee*(rm: RelayManager, txHash: array[32, byte],
+proc relayTxImmediateWithFee*(rm: RelayManager, wtxidHash: array[32, byte],
                               fee: int64, vsize: int,
+                              txidHash: array[32, byte] = default(array[32, byte]),
                               excludePeer: Peer = nil) {.async.} =
-  ## Relay a transaction immediately with feefilter checking
+  ## Relay a transaction immediately with feefilter checking.
+  ## G20 (BIP-339): per-peer inv type selection (same as queueTxInv).
   let feeRate = calculateFeeRate(fee, vsize)
-  let inv = @[InvVector(invType: invWitnessTx, hash: txHash)]
-  let msg = newInv(inv)
+  let effectiveTxid =
+    if txidHash == default(array[32, byte]): wtxidHash else: txidHash
 
   for key, state in rm.peerStates.mpairs:
     if excludePeer != nil and state.peer == excludePeer:
       continue
 
-    if state.isKnownTx(txHash):
+    let (itemType, itemHash) =
+      if state.peer.wtxidRelay:
+        (invWtx, wtxidHash)
+      else:
+        (invTx, effectiveTxid)
+
+    if state.isKnownTx(itemHash):
       continue
 
     # BIP133: Check peer's feefilter
@@ -616,9 +661,11 @@ proc relayTxImmediateWithFee*(rm: RelayManager, txHash: array[32, byte],
             peerFilter = peerFeeFilter
       continue
 
-    state.addKnownTx(txHash)
+    state.addKnownTx(itemHash)
 
     if state.peer.isConnected() and state.peer.handshakeComplete:
+      let inv = @[InvVector(invType: itemType, hash: itemHash)]
+      let msg = newInv(inv)
       try:
         await state.peer.sendMessage(msg)
         trace "relayed tx immediately", peer = $state.peer, feeRate = feeRate

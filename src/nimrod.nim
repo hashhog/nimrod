@@ -703,8 +703,12 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
               asyncSpawn state.peerManager.broadcastTx(child.tx)
               work.add(child.txid)
             else:
+              # G27: store both txid and wtxid so the rejection filter works
+              # regardless of whether a peer re-announces via invTx or invWtx.
               if state.recentlyRejected.len < 50_000:
-                state.recentlyRejected.incl(child.txid)
+                state.recentlyRejected.incl(child.tx.txid())
+              if state.recentlyRejected.len < 50_000:
+                state.recentlyRejected.incl(child.tx.wtxid())
     elif missingInputs:
       # Hold the orphan briefly in case the parent arrives.  Capped pool
       # mirrors Core (100 txs / 100KB / peer cap).  Note we do NOT add to
@@ -713,9 +717,15 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
       if state.orphanPool != nil:
         discard state.orphanPool.addOrphan(msg.tx, orphanPeer)
     else:
-      # Track rejection to avoid re-requesting
+      # Track rejection to avoid re-requesting.
+      # G27: store both txid and wtxid so that a segwit tx rejected under its
+      # txid is also filtered when a peer later announces it by wtxid
+      # (invWtx), and vice versa.
+      let wtxid = msg.tx.wtxid()
       if state.recentlyRejected.len < 50_000:
         state.recentlyRejected.incl(txid)
+      if state.recentlyRejected.len < 50_000 and wtxid != txid:
+        state.recentlyRejected.incl(wtxid)
 
   of mkInv:
     # Request blocks we don't have
@@ -725,10 +735,27 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
       if item.invType == invBlock or item.invType == invWitnessBlock:
         # Request as witness block for segwit support
         blockInvs.add(InvVector(invType: invWitnessBlock, hash: item.hash))
-      elif item.invType == invTx or item.invType == invWitnessTx:
-        # Request unknown transactions
-        let txid = TxId(item.hash)
-        if not state.mempool.contains(txid) and txid notin state.recentlyRejected:
+      elif item.invType == invTx or item.invType == invWitnessTx or
+           item.invType == invWtx:
+        # BIP-339 per-peer inv type filter.
+        # wtxid-relay peers send invWtx (MSG_WTX=5); ignore invTx from them.
+        # Legacy peers send invTx (MSG_TX=1); ignore invWtx from them.
+        # invWitnessTx (0x40000001) is a getdata flag, not a valid inv type,
+        # but tolerate it from legacy peers as invTx equivalent.
+        if peer.wtxidRelay and item.invType == invTx:
+          continue  # wtxid-relay peer should not send invTx; skip it
+        if not peer.wtxidRelay and item.invType == invWtx:
+          continue  # legacy peer should not send invWtx; skip it
+
+        # G27: use item.hash directly as the rejection-filter key.
+        # For invTx items (txid), recentlyRejected stores the txid.
+        # For invWtx items (wtxid), recentlyRejected stores the wtxid.
+        # Both are stored on rejection (see mkTx handler), so this lookup
+        # is correct regardless of which namespace the peer uses.
+        let lookupHash = TxId(item.hash)
+        if not state.mempool.contains(lookupHash) and
+            lookupHash notin state.recentlyRejected:
+          # Request using MSG_WITNESS_TX getdata flag so we get witness data.
           txInvs.add(InvVector(invType: invWitnessTx, hash: item.hash))
     if blockInvs.len > 0:
       asyncSpawn spawnSafe(peer.sendGetData(blockInvs))
@@ -928,8 +955,15 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
       var batch: seq[InvVector] = @[]
       var sent = 0
       {.gcsafe.}:
-        for txid, _ in state.mempool.entries:
-          batch.add(InvVector(invType: invWitnessTx, hash: array[32, byte](txid)))
+        for txid, entry in state.mempool.entries:
+          # G20 (BIP-339): wtxid-relay peers get invWtx with the wtxid;
+          # legacy peers get invTx with the txid.
+          let (itemType, itemHash) =
+            if peer.wtxidRelay:
+              (invWtx, array[32, byte](entry.wtxid))
+            else:
+              (invTx, array[32, byte](txid))
+          batch.add(InvVector(invType: itemType, hash: itemHash))
           if batch.len >= MaxInvPerMsg:
             try:
               await peer.sendMessage(newInv(batch))

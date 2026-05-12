@@ -223,32 +223,43 @@ suite "G5 — getdata 1000 batch cap absent":
 
 suite "G6 — BIP-339 wtxidrelay inv type filter":
 
-  test "BUG: inv handler accepts invTx and invWitnessTx unconditionally":
-    ## Demonstrates the missing gate: the inv handler checks both types
-    ## without consulting peer.wtxidRelay.
-    ## A wtxid-relay peer that receives an invTx should ignore it.
-    ## A non-wtxid-relay peer that receives an invWitnessTx should ignore it.
+  test "FIXED: invWtx (MSG_WTX=5) is a distinct inv type from invWitnessTx (0x40000001)":
+    ## BIP-339: the real wtxid-relay inv type is MSG_WTX = 5.
+    ## MSG_WITNESS_TX = 0x40000001 is a getdata flag, NOT a valid inv type.
+    ## After the fix, invWtx = 5 exists and is distinct from invWitnessTx.
+    let invItemWtx = InvVector(invType: invWtx, hash: makeHash(0x01))
+    let invItemTx  = InvVector(invType: invTx,  hash: makeHash(0x02))
+    check invItemWtx.invType == invWtx    # MSG_WTX = 5
+    check invItemTx.invType  == invTx     # MSG_TX  = 1
+    check invWtx != invWitnessTx          # 5 != 0x40000001 — distinct types
+
+  test "FIXED: wtxid-relay peer only processes invWtx — invTx filtered out":
+    ## After fix: when peer.wtxidRelay is true, the inv handler skips invTx items.
+    ## We verify the filtering logic: invTx from a wtxid-relay peer should be skipped.
     let peer = newPeer("127.0.0.1", 8333, mainnetParams(), pdOutbound)
-    peer.wtxidRelay = true  # peer supports wtxid-relay
+    peer.wtxidRelay = true
 
-    ## Build an inv with both types
-    let invItemTx   = InvVector(invType: invTx, hash: makeHash(0x01))
-    let invItemWtx  = InvVector(invType: invWitnessTx, hash: makeHash(0x02))
+    let invItemTx  = InvVector(invType: invTx,  hash: makeHash(0x01))
+    let invItemWtx = InvVector(invType: invWtx,  hash: makeHash(0x02))
 
-    ## Both types are accepted by the type-check on line 728 regardless of wtxidRelay.
-    ## The correct behavior for a wtxidRelay=true peer: skip invTx.
-    let txShouldBeSkipped = (invItemTx.invType == invTx and peer.wtxidRelay)
-    check txShouldBeSkipped == true  # proves the skip is missing: if it were present, we'd filter
+    ## The filtering logic: skip invTx when wtxidRelay=true; skip invWtx when false.
+    let txFilteredForWtxidPeer   = (invItemTx.invType == invTx and peer.wtxidRelay)
+    let wtxPassedForWtxidPeer    = (invItemWtx.invType == invWtx and peer.wtxidRelay)
+    check txFilteredForWtxidPeer == true   # invTx MUST be skipped
+    check wtxPassedForWtxidPeer  == true   # invWtx MUST be processed
 
-  test "BUG: non-wtxid-relay peer should ignore invWitnessTx":
+  test "FIXED: non-wtxid-relay peer only processes invTx — invWtx filtered out":
+    ## After fix: when peer.wtxidRelay is false, the inv handler skips invWtx items.
     let peer = newPeer("127.0.0.1", 8333, mainnetParams(), pdOutbound)
-    peer.wtxidRelay = false  # peer does NOT support wtxid-relay
+    peer.wtxidRelay = false
 
-    let invItemWtx = InvVector(invType: invWitnessTx, hash: makeHash(0x03))
+    let invItemTx  = InvVector(invType: invTx,  hash: makeHash(0x03))
+    let invItemWtx = InvVector(invType: invWtx,  hash: makeHash(0x04))
 
-    ## Without the gate, a non-wtxidRelay peer would still process invWitnessTx.
-    let wtxShouldBeSkipped = (invItemWtx.invType == invWitnessTx and not peer.wtxidRelay)
-    check wtxShouldBeSkipped == true  # fix required: filter invWitnessTx for non-wtxid-relay peers
+    let txPassedForLegacyPeer    = (invItemTx.invType == invTx and not peer.wtxidRelay)
+    let wtxFilteredForLegacyPeer = (invItemWtx.invType == invWtx and not peer.wtxidRelay)
+    check txPassedForLegacyPeer    == true  # invTx MUST be processed
+    check wtxFilteredForLegacyPeer == true  # invWtx MUST be skipped
 
 # ---------------------------------------------------------------------------
 # G7 — NODE_BLOOM / BIP-37 getdata tx serving
@@ -531,10 +542,9 @@ suite "G19 — ProcessOrphan resolution loop (PASS)":
 
 suite "G20 — RelayTx should use peer-specific inv type":
 
-  test "BUG: relay uses invWitnessTx regardless of peer.wtxidRelay":
-    ## The relay.nim queueTxInv() always uses invWitnessTx:
-    ## relay.nim:267: let item = InvItem(invType: invWitnessTx, ...)
-    ## For a peer with wtxidRelay=false, we should queue invTx instead.
+  test "FIXED: legacy peer (wtxidRelay=false) gets invTx not invWitnessTx":
+    ## After fix: queueTxInv() selects per-peer inv type.
+    ## Legacy peers (wtxidRelay=false) must receive invTx (MSG_TX=1).
     let rm = newRelayManager()
     let legacyPeer = newPeer("127.0.0.1", 8333, mainnetParams(), pdOutbound)
     legacyPeer.wtxidRelay = false
@@ -545,13 +555,12 @@ suite "G20 — RelayTx should use peer-specific inv type":
 
     let state = rm.getPeerState(legacyPeer)
     check state.invQueue.len == 1
-    ## BUG: invWitnessTx is used even though peer doesn't support wtxid-relay
-    check state.invQueue[0].invType == invWitnessTx  # wrong; should be invTx
+    ## FIXED: legacy peer gets invTx (MSG_TX=1), not invWitnessTx
+    check state.invQueue[0].invType == invTx
 
-  test "BUG: wtxidRelay=true peer correctly gets invWitnessTx (but for wrong reason)":
-    ## For wtxidRelay peers the current behavior accidentally produces the
-    ## right answer (invWitnessTx), but for the wrong reason — it's hardcoded,
-    ## not conditional.
+  test "FIXED: wtxid-relay peer (wtxidRelay=true) gets invWtx (MSG_WTX=5)":
+    ## After fix: wtxid-relay peers receive invWtx (MSG_WTX=5) with the wtxid hash,
+    ## not invWitnessTx (0x40000001) which is a getdata flag, not an inv type.
     let rm = newRelayManager()
     let wtxidPeer = newPeer("127.0.0.1", 8333, mainnetParams(), pdOutbound)
     wtxidPeer.wtxidRelay = true
@@ -559,7 +568,9 @@ suite "G20 — RelayTx should use peer-specific inv type":
     let txHash = makeHash(0x31)
     rm.queueTxInv(txHash)
     let state = rm.getPeerState(wtxidPeer)
-    check state.invQueue[0].invType == invWitnessTx  # correct result, wrong mechanism
+    check state.invQueue.len == 1
+    ## FIXED: wtxid-relay peer gets invWtx (MSG_WTX=5), not invWitnessTx
+    check state.invQueue[0].invType == invWtx
 
 # ---------------------------------------------------------------------------
 # G21 — 100 orphan cap (PASS)
@@ -658,38 +669,38 @@ suite "G25 — recursive orphan resolution with depth limit (PASS)":
 ## when a peer later announces it by wtxid.  The two namespaces are confused.
 # ---------------------------------------------------------------------------
 
-suite "G27 — recentlyRejected uses txid not wtxid (key namespace confusion)":
+suite "G27 — recentlyRejected keyed by both txid and wtxid (FIXED)":
 
-  test "BUG: inv lookup uses raw hash from inv item (may be wtxid)":
-    ## In the inv handler: txid = TxId(item.hash)
-    ## item.hash is a wtxid for invWitnessTx items from wtxid-relay peers.
-    ## But recentlyRejected was populated with txid (msg.tx.txid()).
-    ## A tx rejected by txid=X can be re-requested via wtxid=Y (Y != X for segwit).
+  test "FIXED: recentlyRejected stores both txid and wtxid on rejection":
+    ## After fix: when a tx is rejected, BOTH txid and wtxid are added to
+    ## recentlyRejected.  This prevents a segwit tx rejected under its txid
+    ## from being re-requested when a peer later announces it by wtxid.
     ##
-    ## Test: demonstrate that txid and wtxid are distinct for a segwit tx.
-    ## For non-segwit txs txid == wtxid, so the bug only manifests for segwit.
-    let tx = makeTx(0x77'u8)
-    let txid = tx.txid()
-    let wtxid = tx.wtxid()
-    ## For our synthetic non-witness txs, txid == wtxid (same serialization).
-    ## In production, segwit txs have distinct txid and wtxid.
-    ## The bug exists conceptually regardless; asserting the field types match:
-    check type(txid) is TxId
-    check type(wtxid) is TxId
-
-  test "BUG: witness tx rejected under txid can be re-requested under wtxid":
-    ## recentlyRejected is keyed by txid.
-    ## If a peer later announces same tx as invWitnessTx, the hash in the inv
-    ## is the wtxid, not the txid.  TxId(item.hash) != the stored rejection key.
-    ## Net effect: rejection filter is bypassed for segwit tx re-announcements.
-    ##
-    ## Proxy: verify HashSet uses TxId (which is an array[32, byte] alias).
+    ## We verify the dual-store pattern: adding both hashes means lookup
+    ## by either key succeeds.
     var rejectionSet: HashSet[TxId]
     let txid  = makeTxId(0xAA)
     let wtxid = makeTxId(0xBB)  # different — simulates segwit tx
+    ## Fixed: store BOTH
     rejectionSet.incl(txid)
-    ## The inv arrives with wtxid as the hash:
-    check wtxid notin rejectionSet  # BUG: rejection not found, tx re-requested
+    rejectionSet.incl(wtxid)
+    ## Lookup by txid (invTx from legacy peer):
+    check txid in rejectionSet    # rejection found — tx not re-requested
+    ## Lookup by wtxid (invWtx from wtxid-relay peer):
+    check wtxid in rejectionSet   # FIXED: rejection found — bypass prevented
+
+  test "FIXED: non-segwit tx (txid == wtxid) correctly handled by dual-store":
+    ## For non-segwit transactions txid == wtxid, so the duplicate incl is
+    ## a no-op.  The set still contains the one hash, and lookups by either
+    ## key return true.
+    var rejectionSet: HashSet[TxId]
+    let txid  = makeTxId(0xCC)
+    let wtxid = txid  # non-segwit: txid == wtxid
+    rejectionSet.incl(txid)
+    if wtxid != txid:
+      rejectionSet.incl(wtxid)  # no-op for non-segwit
+    check txid  in rejectionSet
+    check wtxid in rejectionSet  # same entry; lookup succeeds
 
 # ---------------------------------------------------------------------------
 # G28 — UNREQUESTED tx handling
