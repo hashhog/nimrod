@@ -9,7 +9,7 @@
 ##
 ## Reference: BIP-324, Bitcoin Core bip324.cpp
 
-import std/[endians, random, tables, strutils]
+import std/[endians, random, tables, strutils, sysrand]
 import ../crypto/[secp256k1, hkdf, chacha20poly1305]
 import ../consensus/params
 
@@ -133,12 +133,11 @@ let shortMsgTypesReverse* = block:
   m
 
 proc newBIP324Cipher*(): BIP324Cipher =
-  ## Create a new BIP-324 cipher with a randomly generated private key
-  randomize()
-
-  # Generate random private key
-  for i in 0..<32:
-    result.privateKey[i] = byte(rand(255))
+  ## Create a new BIP-324 cipher with a randomly generated private key.
+  ## Uses std/sysrand (OS CSPRNG) for the 32-byte ECDH private key,
+  ## matching Bitcoin Core's GetStrongRandBytes() (src/random.cpp).
+  if not urandom(result.privateKey):
+    raise newException(IOError, "BIP-324: system entropy unavailable (urandom failed)")
 
   # Create ElligatorSwift public key
   result.ourPubKey = ellswiftCreate(result.privateKey)
