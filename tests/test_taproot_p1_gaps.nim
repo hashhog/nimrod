@@ -183,7 +183,7 @@ suite "Taproot control-block max size (Core interpreter.cpp:1970)":
     let resErr = verifyWitnessProgramWithError(
       witness2, 1, program, dummyTx, 0, Satoshi(0),
       {sfWitness, sfTaproot})
-    check resErr == seTaprootError
+    check resErr == seTaprootWrongControlSize  # W94: Core-faithful WRONG_CONTROL_SIZE
 
   test "control block of exactly 4129 bytes (max) does not fail on size":
     # 4129 - 33 = 4096 = 128*32. Allowed by Core. The taptweak check
@@ -194,10 +194,9 @@ suite "Taproot control-block max size (Core interpreter.cpp:1970)":
     let resErr = verifyWitnessProgramWithError(
       witness, 1, program, dummyTx, 0, Satoshi(0),
       {sfWitness, sfTaproot})
-    # Either seTaprootError (commitment) or seOk-equivalent path; the
-    # important thing is we don't bail at the size gate. seTaprootError
-    # is what we expect for the bogus internal pubkey.
-    check resErr == seTaprootError
+    # We expect a commitment failure (seWitnessProgramMismatch);
+    # the important thing is we don't bail at the size gate.
+    check resErr == seWitnessProgramMismatch
 
   test "control block of 32 bytes (one under min) is rejected":
     let witness = makeWitnessForControlBlockSize(32)

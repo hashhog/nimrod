@@ -54,6 +54,11 @@ type
     seTapscriptEmptyPubkey = "tapscript empty pubkey"
     seTapscriptCheckmultisig = "OP_CHECKMULTISIG(VERIFY) is not available in tapscript"
     seTapscriptValidationWeight = "tapscript validation weight exceeded"
+    seDiscourageOpSuccess = "OP_SUCCESSx discouraged by policy"
+    seDiscourageUpgradableTaprootVersion = "discourage upgradable taproot leaf version"
+    seDiscourageUpgradablePubkeyType = "discourage upgradable tapscript pubkey type"
+    seBadOpcode = "malformed opcode or push (BAD_OPCODE)"
+    seTaprootWrongControlSize = "taproot control block has wrong size"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -74,6 +79,13 @@ type
     sfMinimalIf        # Require minimal encoding for OP_IF/NOTIF (policy for witness v0)
     sfDiscourageUpgradableNops  # Discourage use of unused NOPs
     sfDiscourageUpgradableWitnessProgram  # Discourage unknown witness versions
+    sfDiscourageOpSuccess  # BIP-342: discourage OP_SUCCESSx in tapscript
+                            # (Core SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
+    sfDiscourageUpgradableTaprootVersion  # BIP-341: discourage unknown leaf versions
+                                           # (Core SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION)
+    sfDiscourageUpgradablePubkeyType  # BIP-342: discourage unknown pubkey lengths
+                                       # in tapscript CHECKSIG/CHECKSIGADD
+                                       # (Core SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE)
 
   SigVersion* = enum
     sigBase = 0        # Legacy scripts
@@ -1643,6 +1655,15 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       if ctx.sigVersion == sigTapscript and pubkey.len == 0:
         return seTapscriptEmptyPubkey
 
+      # BIP-342 / Core EvalChecksigTapscript (interpreter.cpp:367-385):
+      # the DISCOURAGE_UPGRADABLE_PUBKEYTYPE check fires on any non-empty,
+      # non-32-byte pubkey REGARDLESS of whether the sig is empty —
+      # the unknown-type branch is reached before the Schnorr check.
+      if ctx.sigVersion == sigTapscript and
+         pubkey.len != 0 and pubkey.len != 32 and
+         sfDiscourageUpgradablePubkeyType in interp.flags:
+        return seDiscourageUpgradablePubkeyType
+
       if sig.len > 0 and pubkey.len > 0:
         case ctx.sigVersion
         of sigBase:
@@ -1688,7 +1709,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             success = verifyDerLax(pubkey, sighash, sigWithoutHashType)
 
         of sigTaproot, sigTapscript:
-          # BIP342: unknown pubkey types (not 0 bytes, not 32 bytes) succeed
+          # BIP-342: unknown (non-32-byte, non-empty) pubkey types succeed
+          # for forward soft-fork compat. The DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+          # gate already fired above (and short-circuited if set), so here
+          # we simply leave `success = true` for the unknown-type path.
           if ctx.sigVersion == sigTapscript and pubkey.len != 0 and pubkey.len != 32:
             success = true
           # Taproot Schnorr signature check (BIP340)
@@ -1956,27 +1980,49 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
         if budgetErr != seOk:
           return budgetErr
 
-      var success = false
+      # Mirror Core's EvalChecksigTapscript (interpreter.cpp:347-385):
+      #   success = !sig.empty()
+      #   if pubkey.size() == 0:        SCRIPT_ERR_TAPSCRIPT_EMPTY_PUBKEY
+      #   elif pubkey.size() == 32:     Schnorr verify (success stays
+      #                                 unless verify fails)
+      #   else (unknown future type):   SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+      #                                 OR succeed with `success` unchanged.
+      # The crucial bit for CHECKSIGADD parity is that an UNKNOWN pubkey
+      # type with a non-empty sig still increments n by 1 (Core leaves
+      # `success` as `!sig.empty() == true`); a real-32-byte-bad-sig must
+      # stay 0; an empty-pubkey hard-errors.
+      if pubkey.len == 0:
+        return seTapscriptEmptyPubkey
+
+      # BIP-342 / Core EvalChecksigTapscript (interpreter.cpp:367-385):
+      # discourage-upgradable-pubkeytype fires on any non-empty,
+      # non-32-byte pubkey regardless of sig contents.
+      if pubkey.len != 32 and
+         sfDiscourageUpgradablePubkeyType in interp.flags:
+        return seDiscourageUpgradablePubkeyType
+
+      var success = sig.len > 0
       var skipDueToHashType = false
-      if sig.len > 0:
-        if pubkey.len == 32 and (sig.len == 64 or sig.len == 65):
+      if pubkey.len == 32:
+        # Defined tapscript pubkey: verify Schnorr signature.
+        if sig.len > 0 and (sig.len == 64 or sig.len == 65):
           var hashType: uint8 = SIGHASH_DEFAULT
           var sigBytes: array[64, byte]
 
           if sig.len == 65:
             hashType = sig[64]
-            # BIP-341 / Core SignatureHashSchnorr (interpreter.cpp:1516)
-            # plus the explicit-default rule (interpreter.cpp:1733).
-            # Mirrors the validation already performed in CHECKSIG
-            # (interpreter.nim:1638-1646): invalid byte ⇒ verification
-            # fails (success stays false) without computing the sighash.
+            # BIP-341 / Core SignatureHashSchnorr (interpreter.cpp:1733).
+            # Invalid sighash byte ⇒ verification fails without computing
+            # the sighash. (For 64-byte sigs, SIGHASH_DEFAULT is implied.)
             if hashType == SIGHASH_DEFAULT:
               skipDueToHashType = true
             elif not (hashType <= 0x03'u8 or
                       (hashType >= 0x81'u8 and hashType <= 0x83'u8)):
               skipDueToHashType = true
 
-          if not skipDueToHashType:
+          if skipDueToHashType:
+            success = false
+          else:
             for i in 0 ..< 64:
               sigBytes[i] = sig[i]
 
@@ -1990,6 +2036,20 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             )
 
             success = verifySchnorr(xonlyPk, @sighash, sigBytes)
+        elif sig.len > 0:
+          # Wrong-sized Schnorr signature on a 32-byte pubkey: counts
+          # as a failed verification (success stays false), matching
+          # Core's SCRIPT_ERR_SCHNORR_SIG_SIZE reject behaviour (we
+          # express this as success=false so n is unchanged).
+          success = false
+        # else sig.empty() — success stays false from initialization.
+      else:
+        # Unknown pubkey type (future soft fork). Core: relay-level
+        # reject under SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE;
+        # otherwise leave `success = !sig.empty()`.
+        if sfDiscourageUpgradablePubkeyType in interp.flags:
+          return seDiscourageUpgradablePubkeyType
+        # success stays as `sig.len > 0`.
 
       interp.push(fromScriptNum(if success: n + 1 else: n))
 
@@ -2296,6 +2356,13 @@ proc verifyWitnessProgram*(
       if witness.len != 2:
         return false
 
+      # BIP-141 / Core ExecuteWitnessScript element-size gate
+      # (interpreter.cpp:1858-1861): no initial witness item may exceed
+      # MAX_SCRIPT_ELEMENT_SIZE (520). Applies to both v0 and tapscript.
+      for item in witness:
+        if item.len > MaxScriptElementSize:
+          return false
+
       # Construct P2PKH script
       var scriptCode: seq[byte] = @[OP_DUP, OP_HASH160, 0x14'u8]
       scriptCode.add(program)
@@ -2342,6 +2409,13 @@ proc verifyWitnessProgram*(
         return false
       for i in 0 ..< 32:
         if computedHash[i] != program[i]:
+          return false
+
+      # BIP-141 / Core ExecuteWitnessScript element-size gate
+      # (interpreter.cpp:1858-1861): after the witness script is popped,
+      # every remaining initial stack item must be <= MAX_SCRIPT_ELEMENT_SIZE.
+      for i in 0 ..< witness.len - 1:
+        if witness[i].len > MaxScriptElementSize:
           return false
 
       var interp = newInterpreter(flags)
@@ -2458,15 +2532,15 @@ proc verifyWitnessProgram*(
          (controlBlock.len - 33) mod 32 != 0:
         return false
 
-      # Extract leaf version (mask with 0xFE to strip parity bit)
+      # Extract leaf version (mask with 0xFE to strip parity bit).
+      # Core: `control[0] & TAPROOT_LEAF_MASK` at interpreter.cpp:1973.
       let leafVersion = controlBlock[0] and 0xFE
 
-      # Currently only leaf version 0xC0 (tapscript) is defined
-      if leafVersion != 0xC0:
-        # Unknown leaf version - succeed for forward compatibility
-        return true
-
-      # Compute leaf hash
+      # Compute leaf hash BEFORE the leaf-version branch — Core does this
+      # before checking the leaf version (interpreter.cpp:1973) so
+      # the commitment is verified even for unknown leaf versions, and
+      # only AFTER the commitment passes do we check for the tapscript
+      # leaf version (0xC0).
       var leafData: seq[byte]
       leafData.add(leafVersion)
       var w = BinaryWriter()
@@ -2533,6 +2607,15 @@ proc verifyWitnessProgram*(
         if computedQ[i] != program[i]:
           return false
 
+      # Currently only leaf version 0xC0 (tapscript) is defined.
+      # Core interpreter.cpp:1978-1988: if the leaf is NOT tapscript and
+      # SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION is set, reject;
+      # otherwise the script is anyone-can-spend (for future soft-forks).
+      if leafVersion != 0xC0:
+        if sfDiscourageUpgradableTaprootVersion in flags:
+          return false
+        return true
+
       # BIP-342 OP_SUCCESSx pre-pass (Core ExecuteWitnessScript at
       # script/interpreter.cpp:1837-1852). If the tapscript contains
       # ANY OP_SUCCESSx opcode, the script unconditionally succeeds —
@@ -2542,14 +2625,34 @@ proc verifyWitnessProgram*(
       # bypassed (we just return true).
       let preSuccess = tapscriptOpSuccessPrePass(tapscript)
       if preSuccess == seOk:
+        # SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS (Core interpreter.cpp:1847-1849):
+        # policy flag that rejects scripts containing OP_SUCCESSx at relay/IBD.
+        # Consensus-wise such scripts still succeed, but a policy node refuses
+        # to forward them so users don't accidentally lock funds behind an
+        # opcode that may be repurposed by a future soft fork.
+        if sfDiscourageOpSuccess in flags:
+          return false
         return true
       if preSuccess == seInvalidStack:
         return false
 
+      # BIP-342 / Core ExecuteWitnessScript element-size + stack-size gates
+      # (interpreter.cpp:1854-1861). Run AFTER the OP_SUCCESS pre-pass
+      # so OP_SUCCESSx still wins, and BEFORE pushing args so any oversized
+      # initial witness item is rejected before tapscript opcodes execute.
+      # `stack` for these checks is the witness stack MINUS the control
+      # block and the leaf script (the args that we are about to push).
+      let argCount = witnessStack.len - 2
+      if argCount > MaxStackSize:
+        return false
+      for i in 0 ..< argCount:
+        if witnessStack[i].len > MaxScriptElementSize:
+          return false
+
       # Execute tapscript
       var interp = newInterpreter(flags)
       # Push witness items (except control block and script) onto stack
-      for i in 0 ..< witnessStack.len - 2:
+      for i in 0 ..< argCount:
         interp.push(witnessStack[i])
 
       # BIP-342 validation-weight budget (interpreter.cpp:1981):
@@ -2629,6 +2732,11 @@ proc verifyWitnessProgramWithError*(
       if witness.len != 2:
         return seWitnessProgramMismatch
 
+      # Core ExecuteWitnessScript element-size gate (interpreter.cpp:1858).
+      for item in witness:
+        if item.len > MaxScriptElementSize:
+          return sePushSize
+
       # Construct P2PKH script
       var scriptCode: seq[byte] = @[OP_DUP, OP_HASH160, 0x14'u8]
       scriptCode.add(program)
@@ -2672,6 +2780,11 @@ proc verifyWitnessProgramWithError*(
       for i in 0 ..< 32:
         if computedHash[i] != program[i]:
           return seWitnessProgramMismatch
+
+      # Core ExecuteWitnessScript element-size gate (interpreter.cpp:1858).
+      for i in 0 ..< witness.len - 1:
+        if witness[i].len > MaxScriptElementSize:
+          return sePushSize
 
       var interp = newInterpreter(flags)
       for i in 0 ..< witness.len - 1:
@@ -2746,15 +2859,13 @@ proc verifyWitnessProgramWithError*(
       # Reference: bitcoin-core/src/script/interpreter.cpp:1970.
       if controlBlock.len < 33 or controlBlock.len > 4129 or
          (controlBlock.len - 33) mod 32 != 0:
-        return seTaprootError
+        return seTaprootWrongControlSize
 
       let leafVersion = controlBlock[0] and 0xFE
 
-      if leafVersion != 0xC0:
-        # Unknown leaf version - succeed for forward compatibility
-        return seOk
-
-      # Compute leaf hash
+      # Compute leaf hash BEFORE the leaf-version branch — Core does this
+      # before checking the leaf version (interpreter.cpp:1973) so the
+      # commitment is verified even for unknown leaf versions.
       var leafData: seq[byte]
       leafData.add(leafVersion)
       var w = BinaryWriter()
@@ -2810,23 +2921,47 @@ proc verifyWitnessProgramWithError*(
         try:
           tweakXonlyPubkey(internalPk, taptweak)
         except Secp256k1Error:
-          return seTaprootError
+          # Core: secp256k1_xonly_pubkey_parse failure ⇒ CheckTapTweak
+          # returns false ⇒ VerifyTaprootCommitment returns false ⇒
+          # SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH (interpreter.cpp:1975).
+          return seWitnessProgramMismatch
       if computedParity != parity:
-        return seTaprootError
+        return seWitnessProgramMismatch
       for i in 0 ..< 32:
         if computedQ[i] != program[i]:
-          return seTaprootError
+          return seWitnessProgramMismatch
+
+      # After commitment passes, check the leaf version. Unknown leaf
+      # versions are anyone-can-spend (Core interpreter.cpp:1978-1988),
+      # but the discourage flag turns that into a relay-level reject.
+      if leafVersion != 0xC0:
+        if sfDiscourageUpgradableTaprootVersion in flags:
+          return seDiscourageUpgradableTaprootVersion
+        return seOk
 
       # BIP-342 OP_SUCCESSx pre-pass; see bool variant comment.
       let preSuccess = tapscriptOpSuccessPrePass(tapscript)
       if preSuccess == seOk:
+        if sfDiscourageOpSuccess in flags:
+          return seDiscourageOpSuccess
         return seOk
       if preSuccess == seInvalidStack:
-        return seInvalidStack
+        return seBadOpcode
+
+      # BIP-342 / Core ExecuteWitnessScript element-size + stack-size
+      # gates (interpreter.cpp:1854-1861). Run AFTER the OP_SUCCESS
+      # pre-pass and BEFORE pushing args so any oversized initial
+      # witness item is rejected before tapscript opcodes execute.
+      let argCount2 = witnessStack.len - 2
+      if argCount2 > MaxStackSize:
+        return seStackSize
+      for i in 0 ..< argCount2:
+        if witnessStack[i].len > MaxScriptElementSize:
+          return sePushSize
 
       # Execute tapscript
       var interp = newInterpreter(flags)
-      for i in 0 ..< witnessStack.len - 2:
+      for i in 0 ..< argCount2:
         interp.push(witnessStack[i])
 
       # BIP-342 validation-weight budget (interpreter.cpp:1981).
