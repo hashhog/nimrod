@@ -58,6 +58,7 @@ type
     veIncorrectProofOfWork = "incorrect proof of work (bad-diffbits)"
     veTimeWarpAttack = "block timestamp too early on diff adjustment block (time-timewarp-attack)"
     veTimeTooNew = "block timestamp too far in the future (time-too-new)"
+    veTooFarAhead = "block too far ahead of active tip (fTooFarAhead)"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -158,6 +159,9 @@ proc bip22String*(e: ValidationError): string =
   of veTimeTooNew: "time-too-new"
   # bad-version: obsolete block version after BIP34/66/65 activation (validation.cpp:4116)
   of veBadBlockVersion: "bad-version"
+  # fTooFarAhead: block height > ActiveHeight + MIN_BLOCKS_TO_KEEP (validation.cpp:4334)
+  # Core returns false (not an error string) for this case; map to "rejected" per BIP-22.
+  of veTooFarAhead: "rejected"
   of veOk: ""
   else: "rejected"
 
@@ -1883,7 +1887,9 @@ proc acceptBlock*(
   skipScripts: bool,
   checkPow: bool,
   getUtxo: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].},
-  crypto: CryptoEngine
+  crypto: CryptoEngine,
+  activeTipHeight: int32 = -1,
+  fRequested: bool = true
 ): ValidationResult[void] =
   ## Unified block-acceptance check pipeline (no chainstate mutation).
   ##
@@ -1894,6 +1900,23 @@ proc acceptBlock*(
   ##   - computing prevIndex (from DB or a sentinel for genesis)
   ##   - choosing the appropriate getUtxo source (getUtxo vs getUtxoIBD)
   ##   - invoking connectBlock / connectBlockIBD AFTER this returns ok
+  ##   - passing activeTipHeight (the active chain's best height) and
+  ##     fRequested (whether this block was explicitly requested from a peer)
+  ##     to enable the fTooFarAhead DoS guard.
+
+  # G19c: fTooFarAhead guard (Core validation.cpp:4325-4336).
+  # An unrequested block whose height exceeds the active tip by more than
+  # MIN_BLOCKS_TO_KEEP (288) is silently deferred — we keep it as header-only
+  # without running the expensive CheckBlock + script-verify pipeline.
+  # This prevents a hostile peer from burning CPU by sending deep-future
+  # blocks during IBD.
+  # activeTipHeight == -1 means "unknown / not provided" — skip the guard.
+  # fRequested == true means the block was explicitly requested (IBD, submitblock)
+  # — the guard applies only to unsolicited relayed blocks.
+  if not fRequested and activeTipHeight >= 0:
+    let blkHeight = prevIndex.height + 1
+    if blkHeight > activeTipHeight + int32(MinBlocksToKeep):
+      return voidErr(veTooFarAhead)
 
   # Step 1: context-free checks (PoW, merkle root, tx sanity).
   # checkBlock also verifies witness commitment (CheckWitnessMalleation).

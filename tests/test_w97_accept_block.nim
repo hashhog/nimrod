@@ -353,28 +353,108 @@ suite "W97 G9: AddToBlockIndex / best-header persistence":
       check lookup.isNone  # current behavior — proves header lost on restart
 
 # ===========================================================================
-# Suite 7: G19c — fTooFarAhead (height > ActiveHeight + 288)
+# Suite 7: G19c — fTooFarAhead (height > ActiveHeight + MIN_BLOCKS_TO_KEEP)
 # ===========================================================================
 
 suite "W97 G19c: too-far-ahead (block height > tip + 288)":
 
-  test "block 1000 ahead of tip MUST be discarded without validation (ABSENT)":
-    ## Core validation.cpp:4334 — `if (fTooFarAhead) return false` (block
-    ## stays as header-only). The MIN_BLOCKS_TO_KEEP constant is 288.
-    ## A peer claiming a block at active+1000 should NOT trigger a full
-    ## CheckBlock + ContextualCheckBlock + UTXO scan.
-    ##
-    ## nimrod has no MIN_BLOCKS_TO_KEEP constant, no gate. Every block
-    ## that survives the early checks runs the full validation pipeline
-    ## regardless of how far ahead of the active chain it is. This is a
-    ## DoS vector during IBD — a hostile peer feeds extreme-height blocks
-    ## to burn CPU on script verification.
-    when defined(w97_strict):
-      fail()  # constant + gate must exist
-    else:
-      # Documents the absence: search for MIN_BLOCKS_TO_KEEP and find
-      # nothing.
-      check true  # placeholder until gate is added
+  test "unrequested block 1000 ahead of active tip is rejected with veTooFarAhead":
+    ## Core validation.cpp:4325-4336 — `bool fTooFarAhead{pindex->nHeight >
+    ## ActiveHeight() + int(MIN_BLOCKS_TO_KEEP)};`  When !fRequested and
+    ## fTooFarAhead, AcceptBlock returns false without running CheckBlock.
+    ## nimrod gate: acceptBlock with fRequested=false and activeTipHeight set
+    ## so that blkHeight (= prevIndex.height+1) > activeTipHeight + 288.
+    let dbPath = freshDbPath()
+    defer: cleanupDb(dbPath)
+    var (cs, blks) = buildChainN(dbPath, regtestParams(), 3)
+    defer: cs.close()
+
+    let prevHash = getBlockHash(blks[2])
+    let prevIdx = cs.db.getBlockIndex(prevHash).get()
+    # prevIndex.height = 2, so blkHeight = 3.
+    # Set activeTipHeight = 3 - 1000 = -997 would be negative, so instead
+    # use activeTipHeight = 2 and blkHeight at 2 + 1 = 3 is NOT too far.
+    # Use a block whose height is prevIndex.height+1 = 3, and activeTipHeight
+    # such that 3 > activeTipHeight + 288, i.e. activeTipHeight <= -286.
+    # We want a positive activeTipHeight so pick a block much further ahead:
+    # build prevIndex at height 500, set activeTipHeight=0 → blkHeight=501 > 288.
+    let farPrevIdx = BlockIndex(hash: prevIdx.hash, height: 500'i32)
+    let candidate = makeBlk(prevHash, 501, 1_700_005_000'u32)
+    let noUtxo = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+      none(UtxoEntry)
+    let crypto = newCryptoEngine()
+    # activeTipHeight=0, blkHeight=501, 501 > 0+288 → fTooFarAhead
+    let res = acceptBlock(candidate, farPrevIdx, cs.db, regtestParams(),
+                          skipScripts = true,
+                          checkPow = false,
+                          getUtxo = noUtxo,
+                          crypto = crypto,
+                          activeTipHeight = 0'i32,
+                          fRequested = false)
+    check (not res.isOk)
+    check res.error == veTooFarAhead
+
+  test "unrequested block at exactly tip+288 is accepted (boundary: not strictly greater)":
+    ## Core: condition is `>`, not `>=`. A block at exactly tip+288 must
+    ## PASS (288 > 288 is false). Only tip+289 and beyond trigger the gate.
+    let dbPath = freshDbPath()
+    defer: cleanupDb(dbPath)
+    var (cs, blks) = buildChainN(dbPath, regtestParams(), 3)
+    defer: cs.close()
+
+    let prevHash = getBlockHash(blks[2])
+    let prevIdx = cs.db.getBlockIndex(prevHash).get()
+    # blkHeight = prevIdx.height+1 = 3. activeTipHeight = 3-288 = -285.
+    # For a positive activeTipHeight test: set activeTipHeight = 0,
+    # blkHeight = 288. prevIdx.height = 287, blkHeight = 288.
+    let atBoundaryPrev = BlockIndex(hash: prevIdx.hash, height: 287'i32)
+    let candidateAt = makeBlk(prevHash, 288, 1_700_006_000'u32)
+    let noUtxo = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+      none(UtxoEntry)
+    let crypto = newCryptoEngine()
+    # activeTipHeight=0, blkHeight=288, 288 > 0+288 is false → gate does NOT fire
+    let res = acceptBlock(candidateAt, atBoundaryPrev, cs.db, regtestParams(),
+                          skipScripts = true,
+                          checkPow = false,
+                          getUtxo = noUtxo,
+                          crypto = crypto,
+                          activeTipHeight = 0'i32,
+                          fRequested = false)
+    # The block will fail PoW (checkPow=false skips PoW in checkBlock, but
+    # validateBlockHeader still checks prevBlock linkage). Since we're using
+    # a mismatched prevBlock hash (prevHash from blks[2] but prevIdx.height=287),
+    # validateBlockHeader will reject with vePrevBlockMissing. That's fine —
+    # the point is it does NOT return veTooFarAhead (gate did not fire).
+    check res.error != veTooFarAhead
+
+  test "requested block 1000 ahead of active tip is accepted (gate bypassed)":
+    ## Core validation.cpp:4333 — `if (!fRequested) { ... if (fTooFarAhead) return false; }`.
+    ## A block that was explicitly requested (fRequested=true) bypasses the
+    ## fTooFarAhead guard entirely, even at extreme heights.
+    let dbPath = freshDbPath()
+    defer: cleanupDb(dbPath)
+    var (cs, blks) = buildChainN(dbPath, regtestParams(), 3)
+    defer: cs.close()
+
+    let prevHash = getBlockHash(blks[2])
+    let prevIdx = cs.db.getBlockIndex(prevHash).get()
+    let farPrevIdx = BlockIndex(hash: prevIdx.hash, height: 1000'i32)
+    let candidateReq = makeBlk(prevHash, 1001, 1_700_007_000'u32)
+    let noUtxo = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+      none(UtxoEntry)
+    let crypto = newCryptoEngine()
+    # activeTipHeight=0, blkHeight=1001 — would be fTooFarAhead, but fRequested=true
+    let res = acceptBlock(candidateReq, farPrevIdx, cs.db, regtestParams(),
+                          skipScripts = true,
+                          checkPow = false,
+                          getUtxo = noUtxo,
+                          crypto = crypto,
+                          activeTipHeight = 0'i32,
+                          fRequested = true)
+    # Gate does not fire when fRequested=true; block proceeds to validation.
+    # It will fail on some other check (prevBlock mismatch or similar), but
+    # NOT with veTooFarAhead.
+    check res.error != veTooFarAhead
 
 # ===========================================================================
 # Suite 8: G19d — nChainWork < MinimumChainWork (block-acceptance side)

@@ -116,6 +116,14 @@ const
   ## sigop cost to virtual bytes: vsize = ceil(max(weight, sigops*20) / 4).
   DefaultBytesPerSigop* = 20
 
+  ## Minimum blocks to keep on disk for block-relay pruning and the
+  ## fTooFarAhead guard in AcceptBlock.
+  ## Reference: bitcoin-core/src/validation.h:79 — MIN_BLOCKS_TO_KEEP.
+  ## A block whose height exceeds ActiveChainHeight + MIN_BLOCKS_TO_KEEP is
+  ## silently deferred (not validated) to prevent CPU-DoS from hostile peers
+  ## sending deep-future blocks during IBD.
+  MinBlocksToKeep* = 288
+
   # BIP68 sequence lock constants
   # Note: These are also defined in script/interpreter.nim for OP_CHECKSEQUENCEVERIFY
   # Using SequenceLock prefix to avoid name collision
