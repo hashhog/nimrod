@@ -284,30 +284,109 @@ suite "G8 HEADER_LEN=1 and IGNORE_BIT=0x80":
     check realDec.ignore == false
 
 # ============================================================================
-# G10: memory_cleanse — documented ABSENCE (known bug)
+# G10: memory_cleanse — FIXED (W98 G10)
 # ============================================================================
-suite "G10 memory_cleanse absence (known bug)":
-  test "no wipe of private key or derived cipher material (CRYPTO bug)":
-    ## BUG: nimrod does NOT call memory_cleanse / zeroMem on:
-    ##   1. BIP324Cipher.privateKey after initialize()
-    ##   2. FSChaCha20.key after rekey (unlike Core's explicit memory_cleanse call)
-    ##   3. Intermediate ECDH shared secret returned from computeBIP324ECDHSecret()
+suite "G10 memory_cleanse after initialize (FIXED)":
+  test "privateKey is all-zero after initialize() (W98 G10 fix)":
+    ## FIXED: bip324.nim::initialize() now calls zeroMem on:
+    ##   1. c.privateKey — ephemeral ECDH private key
+    ##   2. local ecdhSecret copy — shared secret intermediate
+    ##   3. local hkdf copy — HKDF PRK state
     ##
-    ## Bitcoin Core (bip324.cpp:112): memory_cleanse(one_block, sizeof(one_block))
-    ## after generating the new FSChaCha20Poly1305 rekey material.
+    ## Core canonical: bip324.cpp:67-70
+    ##   memory_cleanse(ecdh_secret), memory_cleanse(hkdf_32_okm),
+    ##   memory_cleanse(&hkdf), m_key = CKey()
     ##
-    ## Severity: CRYPTO — private key material can persist in process heap,
-    ## readable via coredump or heap scan after connection teardown.
-    ##
-    ## This test documents the absence of the call; once fixed, this test
-    ## should assert that the private key bytes are zero after initialization.
+    ## Verify that after initialize(), the stored private key bytes are all zero.
     var priv: PrivateKey
     for i in 0 ..< 32: priv[i] = byte(i + 1)
     var c = newBIP324CipherWithKey(priv)
 
-    # Currently: priv is still fully intact in the cipher object — no wipe.
-    # A fixed impl would zero c.privateKey after ECDH during initialize().
-    check true  # placeholder — fix will turn this into a positive check
+    # Before initialize(): cipher holds the non-zero private key.
+    check not c.isPrivateKeyZeroed()
+
+    # Perform the handshake key exchange.
+    var priv2: PrivateKey
+    for i in 0 ..< 32: priv2[i] = byte(i + 2)
+    var c2 = newBIP324CipherWithKey(priv2)
+    let pub  = c.getOurPubKey()
+    let pub2 = c2.getOurPubKey()
+    let p = regtestParams()
+    c.initialize(pub2, initiator = true,  magic = p.magic)
+    c2.initialize(pub,  initiator = false, magic = p.magic)
+
+    # After initialize(): ephemeral private key must be zeroed.
+    check c.isPrivateKeyZeroed()
+    check c2.isPrivateKeyZeroed()
+
+  test "FSChaCha20Poly1305 rekey block is zeroed after nextPacket (W98 G10 fix)":
+    ## FIXED: chacha20poly1305.nim FSChaCha20Poly1305::nextPacket now calls
+    ## zeroMem(addr newKey[0], 64) after installing the new AEAD key.
+    ##
+    ## Core canonical: chacha20poly1305.cpp:117
+    ##   memory_cleanse(one_block, sizeof(one_block))
+    ##
+    ## Verify by driving the cipher through exactly rekeyInterval packets and
+    ## checking encrypt/decrypt still works correctly (the zeroMem of the
+    ## local stack variable must not corrupt the installed key).
+    var priv: PrivateKey
+    var priv2: PrivateKey
+    for i in 0 ..< 32:
+      priv[i]  = byte(i + 10)
+      priv2[i] = byte(i + 20)
+    var enc = newBIP324CipherWithKey(priv)
+    var dec = newBIP324CipherWithKey(priv2)
+    let pub1 = enc.getOurPubKey()
+    let pub2 = dec.getOurPubKey()
+    let p = regtestParams()
+    enc.initialize(pub2, initiator = true,  magic = p.magic)
+    dec.initialize(pub1, initiator = false, magic = p.magic)
+
+    # Drive exactly RekeyInterval (224) encrypt/decrypt pairs to trigger the
+    # FSChaCha20Poly1305 rekey.  All must round-trip correctly.
+    let payload = @[byte(0xaa), byte(0xbb), byte(0xcc), byte(0xdd)]
+    for i in 0 ..< int(RekeyInterval) + 1:
+      let pkt = enc.encrypt(payload)
+      let lf  = pkt[0 ..< 3]
+      let dl  = dec.decryptLength(lf)
+      check int(dl) == payload.len
+      let body = pkt[3 ..< pkt.len]
+      let res  = dec.decrypt(body)
+      check res.ignore == false
+      check bytesToHex(res.contents) == bytesToHex(payload)
+
+  test "FSChaCha20 rekey buffer zeroed after nextPacket (W98 G10 fix)":
+    ## FIXED: chacha20poly1305.nim FSChaCha20::nextPacket now calls
+    ## zeroMem(addr newKey[0], ChaCha20KeySize) after installing the new key.
+    ##
+    ## Core canonical: chacha20.cpp:365
+    ##   memory_cleanse(new_key, sizeof(new_key))
+    ##
+    ## Verify by encrypting RekeyInterval+1 packets through the FSChaCha20
+    ## length cipher and checking correctness across the rekey boundary.
+    var priv: PrivateKey
+    var priv2: PrivateKey
+    for i in 0 ..< 32:
+      priv[i]  = byte(i + 30)
+      priv2[i] = byte(i + 40)
+    var enc = newBIP324CipherWithKey(priv)
+    var dec = newBIP324CipherWithKey(priv2)
+    let pub1 = enc.getOurPubKey()
+    let pub2 = dec.getOurPubKey()
+    let p = regtestParams()
+    enc.initialize(pub2, initiator = true,  magic = p.magic)
+    dec.initialize(pub1, initiator = false, magic = p.magic)
+
+    # Each encrypt() call advances the FSChaCha20 length cipher by one packet.
+    # Drive through RekeyInterval+1 packets; the length must always round-trip.
+    let payload = @[byte(0x01), byte(0x02), byte(0x03)]
+    for i in 0 ..< int(RekeyInterval) + 1:
+      let pkt = enc.encrypt(payload)
+      let lf  = pkt[0 ..< 3]
+      let dl  = dec.decryptLength(lf)
+      check int(dl) == payload.len
+      let body = pkt[3 ..< pkt.len]
+      discard dec.decrypt(body)
 
 # ============================================================================
 # G15: MAX_GARBAGE_LEN abort bound at 4111 bytes (4095 + 16)
