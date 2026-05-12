@@ -637,7 +637,7 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
   of mkBlock:
     var blockAccepted = false
     try:
-      blockAccepted = state.syncManager.processBlock(msg.blk)
+      blockAccepted = state.syncManager.processBlock(peer, msg.blk)
     except Defect as e:
       # Log but don't crash — the block will be retried
       let ht = state.syncManager.chainTipHeight

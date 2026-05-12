@@ -917,9 +917,10 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
         # Header doesn't connect - peer sent unlinked headers
         warn "received unlinked header", peer = $peer,
              expected = $prevHashOpt.get(), got = $header.prevBlock
-        # Disconnect misbehaving peer
-        sm.peerManager.banPeer(peer.address)
-        await sm.peerManager.removePeer(peer)
+        # G17 (W99): use Misbehaving framework so noBan/manual guards are
+        # respected.  Bitcoin Core: Misbehaving(peer, 100, "invalid header").
+        sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlockHeader,
+                                       "block-invalid-header-disconnected")
         sm.syncPeer = nil
         sm.state = ssIdle
         return
@@ -933,9 +934,10 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
                                         sm.params, minPowChecked = minPowChecked)
     if not valid:
       warn "invalid header", peer = $peer, height = expectedHeight, error = error
-      # Disconnect peer sending invalid headers
-      sm.peerManager.banPeer(peer.address)
-      await sm.peerManager.removePeer(peer)
+      # G17 (W99): use Misbehaving framework so noBan/manual guards are
+      # respected.  Bitcoin Core: Misbehaving(peer, 100, "invalid header received").
+      sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlockHeader,
+                                     "invalid header received")
       sm.syncPeer = nil
       sm.state = ssIdle
       return
@@ -1231,9 +1233,13 @@ proc drainBlockBuffer(sm: SyncManager) =
       warn "failed to apply buffered block", height = nextHeight
       break
 
-proc processBlock*(sm: SyncManager, blk: Block): bool =
-  ## Process a received block, returns true if valid
-  ## Buffers out-of-order blocks and processes sequentially
+proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
+  ## Process a received block, returns true if valid.
+  ## Buffers out-of-order blocks and processes sequentially.
+  ## peer is the source peer; when the block is invalid the Misbehaving
+  ## framework is invoked so noBan/manual guards are respected.
+  ## Reference: bitcoin-core/src/net_processing.cpp MaybePunishNodeForBlock +
+  ## the ProcessMessage("block") Misbehaving("mutated block") path.
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
 
@@ -1256,6 +1262,12 @@ proc processBlock*(sm: SyncManager, blk: Block): bool =
     # Block connects directly - apply it
     if not sm.applyBlock(blk, expectedHeight):
       sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+      # G16 (W99): MaybePunishNodeForBlock — BLOCK_MUTATED/BLOCK_CONSENSUS.
+      # Bitcoin Core: Misbehaving(peer, "mutated block") on BLOCK_MUTATED.
+      # Use the Misbehaving framework (not raw banPeer) so noBan/manual/local
+      # guards are respected.
+      if peer != nil:
+        sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlock, "mutated block")
       return false
     sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
     sm.lastSyncTime = getTime()  # Reset timeout on progress

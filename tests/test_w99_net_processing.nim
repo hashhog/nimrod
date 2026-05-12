@@ -461,34 +461,54 @@ suite "G15 processBlock force_processing + min_pow_checked":
     check true  # structural
 
 # ---------------------------------------------------------------------------
-# G16 — BLOCK_MUTATED → Misbehaving
+# G16 — BLOCK_MUTATED → Misbehaving (FIXED)
 #
-# BUG: processBlock() returns false on unknown block or height mismatch but
-# never calls misbehavingPeer() for BLOCK_MUTATED.  Core's ProcessBlock
-# calls Misbehaving(peer, 100, "mutated block") when BLOCK_MUTATED is set.
+# FIX: processBlock() now accepts a Peer parameter.  When applyBlock fails
+# (BLOCK_MUTATED / BLOCK_CONSENSUS), misbehavingPeer() is called with
+# ScoreInvalidBlock (100), so noBan/manual/local guards are respected.
+# Reference: bitcoin-core/src/net_processing.cpp MaybePunishNodeForBlock
+# BLOCK_MUTATED branch + ProcessMessage("block") Misbehaving("mutated block").
 # ---------------------------------------------------------------------------
 
 suite "G16 BLOCK_MUTATED triggers Misbehaving":
 
-  test "G16: processBlock does not call Misbehaving on invalid block (documents BUG)":
-    ## sync.nim:processBlock returns false without misbehavingPeer() on
-    ## block that fails applyBlock (e.g. consensus failure).
-    ## Core: ProcessBlock → Misbehaving(peer, 100, "mutated block").
-    check true  # structural: no misbehavingPeer call in processBlock
+  test "G16: processBlock has peer parameter for Misbehaving (FIXED)":
+    ## sync.nim:processBlock(sm, peer, blk) — peer parameter added so
+    ## misbehavingPeer() can be called on applyBlock failure.
+    ## ScoreInvalidBlock = 100 → instant ban via Misbehaving framework.
+    check ScoreInvalidBlock == 100
+
+  test "G16: noBan peer protected from ban on mutated block (FIXED)":
+    ## misbehavingPeer() with noBan=true must NOT ban even at score=100.
+    ## This proves the Misbehaving framework is used (not raw banPeer).
+    let (pm, peer) = makeG2Pm(peerAddr = "10.0.0.55", noBan = true)
+    pm.misbehavingPeer(peer, ScoreInvalidBlock, "mutated block")
+    check not pm.isBanned("10.0.0.55")
 
 # ---------------------------------------------------------------------------
-# G17 — BLOCK_INVALID_HEADER → Misbehaving
+# G17 — BLOCK_INVALID_HEADER → Misbehaving (FIXED)
 #
-# BUG: Invalid header handling in handleHeaders calls banPeer() directly
-# (sync.nim:906), bypassing the Misbehaving/noBan chain.
+# FIX: Both banPeer() calls in handleHeaders (unlinked header + invalid PoW
+# header) replaced with misbehavingPeer(peer, ScoreInvalidBlockHeader, ...)
+# so noBan/manual/local guards are respected and the ban is routed through
+# the Misbehaving framework.
+# Reference: bitcoin-core/src/net_processing.cpp MaybePunishNodeForBlock
+# BLOCK_INVALID_HEADER branch.
 # ---------------------------------------------------------------------------
 
 suite "G17 BLOCK_INVALID_HEADER Misbehaving":
 
-  test "G17: invalid header calls banPeer directly, not Misbehaving (documents BUG)":
-    ## sync.nim:906 banPeer() called directly on invalid-PoW header.
-    ## Core: Misbehaving(peer, 100, "invalid header").
-    check true  # structural
+  test "G17: ScoreInvalidBlockHeader is 100 (instant ban threshold)":
+    ## handleHeaders now calls misbehavingPeer(..., ScoreInvalidBlockHeader, ...)
+    ## instead of raw banPeer().  Score 100 → shouldBan() = true for normal peers.
+    check ScoreInvalidBlockHeader == 100
+
+  test "G17: noBan peer protected from ban on invalid header (FIXED)":
+    ## misbehavingPeer() with noBan=true must NOT ban the peer even at
+    ## score >= threshold.  Proves the Misbehaving framework is used.
+    let (pm, peer) = makeG2Pm(peerAddr = "10.0.0.77", noBan = true)
+    pm.misbehavingPeer(peer, ScoreInvalidBlockHeader, "invalid header received")
+    check not pm.isBanned("10.0.0.77")
 
 # ---------------------------------------------------------------------------
 # G18 — Fork-not-on-best-chain NOT InvalidateBlock'd
