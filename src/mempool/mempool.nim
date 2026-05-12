@@ -17,6 +17,7 @@ type
   MempoolEntry* = object
     tx*: Transaction
     txid*: TxId
+    wtxid*: TxId            ## Witness transaction ID (BIP141); equals txid for non-segwit txs
     fee*: Satoshi
     weight*: int            ## Transaction weight in weight units
     feeRate*: float64       ## Fee rate in sat/vbyte (fee / (weight/4))
@@ -27,8 +28,39 @@ type
     ancestorCount*: int     ## Count of ancestors including self (cached for O(1) checks)
     ancestorSize*: int      ## Total vsize of ancestors including self in vbytes (cached)
 
+  ## Optional caller-supplied knobs for acceptTransaction.  Mirrors a subset of
+  ## Bitcoin Core's `ATMPArgs` (validation.cpp:594-) — only the parts that are
+  ## exposed via single-tx submission paths (sendrawtransaction, BIP-152, p2p
+  ## relay).  Defaults preserve historical nimrod behaviour.
+  AtmpArgs* = object
+    testAccept*: bool              ## Core ATMPArgs::m_test_accept — run all
+                                   ## checks but do NOT add to the mempool.
+    bypassLimits*: bool            ## Core ATMPArgs::m_bypass_limits — used for
+                                   ## reorg replay; skip min-fee + TRUC limits.
+    allowReplacement*: bool        ## Core ATMPArgs::m_allow_replacement —
+                                   ## controls bip125-replacement-disallowed.
+    allowSiblingEviction*: bool    ## Core ATMPArgs::m_allow_sibling_eviction —
+                                   ## TRUC sibling eviction (single-tx only).
+    packageFeerates*: bool         ## Core ATMPArgs::m_package_feerates — skip
+                                   ## per-tx min-relay check (package will).
+    clientMaxFeeRateSatKvB*: float64
+                                   ## Core ATMPArgs::m_client_maxfeerate —
+                                   ## reject if effective feerate exceeds this
+                                   ## (sat/kvB).  <= 0 means "unset".
+
+  AtmpAcceptInfo* = object
+    ## Returned for test_accept / package paths so callers can introspect the
+    ## same fields Core exposes via MempoolAcceptResult.
+    txid*: TxId
+    wtxid*: TxId
+    vsize*: int
+    baseFee*: Satoshi
+    modifiedFee*: Satoshi
+    replaced*: HashSet[TxId]       ## conflicts evicted by this submission
+
   Mempool* = ref object
     entries*: Table[TxId, MempoolEntry]
+    byWtxid*: Table[TxId, TxId]      ## wtxid -> txid index (BIP141 same-txid-different-witness check)
     spentBy*: Table[OutPoint, TxId]  ## Maps spent outpoint -> spending txid for O(1) double-spend detection
     maxSize*: int           ## Maximum mempool size in bytes (default 300MB)
     currentSize*: int       ## Current mempool size in bytes
@@ -117,6 +149,19 @@ proc ok*[T](val: T): MempoolResult[T] =
 proc err*(T: typedesc, msg: string): MempoolResult[T] =
   MempoolResult[T](isOk: false, error: msg)
 
+proc defaultAtmpArgs*(): AtmpArgs =
+  ## Default ATMP args mirroring Bitcoin Core's normal sendrawtransaction path:
+  ## replacement allowed, no sibling eviction (only single tx context), no
+  ## bypass_limits, no test_accept, no client_maxfeerate.
+  AtmpArgs(
+    testAccept: false,
+    bypassLimits: false,
+    allowReplacement: true,
+    allowSiblingEviction: true,
+    packageFeerates: false,
+    clientMaxFeeRateSatKvB: 0.0,
+  )
+
 # Forward declarations
 proc signalsOptInRBF*(tx: Transaction): bool
 proc isRbfOptIn*(mp: Mempool, tx: Transaction): bool
@@ -148,6 +193,7 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
                  expiryHours: int = DefaultMempoolExpiryHours): Mempool =
   Mempool(
     entries: initTable[TxId, MempoolEntry](),
+    byWtxid: initTable[TxId, TxId](),
     spentBy: initTable[OutPoint, TxId](),
     maxSize: maxSize,
     currentSize: 0,
@@ -791,112 +837,151 @@ proc checkPackageLimits*(mp: Mempool, tx: Transaction, weight: int): MempoolResu
 
   MempoolResult[void](isOk: true)
 
+# ---------------------------------------------------------------------------
+# W96 — STANDARD_SCRIPT_VERIFY_FLAGS helper.
+#
+# Bitcoin Core MemPoolAccept calls CheckInputScripts twice:
+#   1. PolicyScriptChecks: STANDARD_SCRIPT_VERIFY_FLAGS (consensus + policy)
+#   2. ConsensusScriptChecks: GetBlockScriptFlags(tip) — what the next block
+#      will enforce; serves as cache-population.
+#
+# Previously nimrod ran *only* the consensus pass with `getBlockScriptFlags`
+# which silently let policy-only violations into the mempool
+# (NULLFAIL, MINIMALDATA, MINIMALIF, LOW_S, CLEANSTACK, STRICTENC,
+# WITNESS_PUBKEYTYPE, DISCOURAGE_*).  Reference: policy/policy.h:119-132.
+# ---------------------------------------------------------------------------
+proc standardScriptVerifyFlags*(consensusFlags: set[ScriptFlags]): set[ScriptFlags] =
+  ## Returns STANDARD_SCRIPT_VERIFY_FLAGS = consensus flags ∪ policy-only flags.
+  ## See bitcoin-core src/policy/policy.h:119.
+  result = consensusFlags
+  result.incl(sfStrictEnc)
+  result.incl(sfMinimalData)
+  result.incl(sfDiscourageUpgradableNops)
+  result.incl(sfCleanStack)
+  result.incl(sfMinimalIf)
+  result.incl(sfNullFail)
+  result.incl(sfLowS)
+  result.incl(sfDiscourageUpgradableWitnessProgram)
+  result.incl(sfWitnessPubkeyType)
+  # sfConstScriptCode — not modelled separately in nimrod interpreter (treated
+  # as mandatory under BIP-143).
+  result.incl(sfDiscourageUpgradableTaprootVersion)
+  result.incl(sfDiscourageOpSuccess)
+  result.incl(sfDiscourageUpgradablePubkeyType)
+
 # Accept a transaction into the mempool
-proc acceptTransaction*(mp: Mempool, tx: Transaction,
-                        crypto: CryptoEngine): MempoolResult[TxId] =
-  ## Validate and add transaction to mempool
-  ## Returns txid on success, error message on failure
-  ## Supports Full RBF: conflicting transactions can be replaced if fee rules are met
+proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
+                                crypto: CryptoEngine,
+                                args: AtmpArgs): MempoolResult[AtmpAcceptInfo] =
+  ## Validate (and optionally add) a single transaction.  Mirrors Bitcoin Core
+  ## MemPoolAccept::AcceptSingleTransactionInternal (validation.cpp:1317-1431),
+  ## composed from PreChecks + ReplacementChecks + PolicyScriptChecks +
+  ## ConsensusScriptChecks.  Returns AtmpAcceptInfo so callers (RPC test_accept,
+  ## package logic) can inspect vsize / fees / replaced txs without needing
+  ## another lookup.
 
-  # Compute txid
+  # === PreChecks ===========================================================
+
+  # Compute txid + wtxid.
   let txid = tx.txid()
+  let wtxid = tx.wtxid()
 
-  # Already in mempool?
-  if txid in mp.entries:
-    return err(TxId, "transaction already in mempool")
-
-  # Basic validation (structure, no duplicate inputs, valid output values)
+  # Basic structural validation (CheckTransaction).
   let basicResult = checkTransaction(tx, mp.params)
   if not basicResult.isOk:
-    return err(TxId, "invalid transaction: " & $basicResult.error)
+    return err(AtmpAcceptInfo, "invalid transaction: " & $basicResult.error)
 
-  # Coinbase transactions are only valid inside blocks, not as mempool entries.
-  # Bitcoin Core MemPoolAccept::PreChecks, validation.cpp:803-804.
+  # Coinbase txs cannot enter mempool. validation.cpp:803-804.
   if isCoinbase(tx):
-    return err(TxId, "coinbase")
+    return err(AtmpAcceptInfo, "coinbase")
 
-  # Transactions smaller than MIN_STANDARD_TX_NONWITNESS_SIZE (65 bytes)
-  # are rejected to mitigate CVE-2017-12842 (64-byte tx collision attack).
-  # Bitcoin Core MemPoolAccept::PreChecks, validation.cpp:813-814.
+  # CVE-2017-12842: reject txs < 65 non-witness bytes. validation.cpp:813-814.
   const MinStandardTxNonwitnessSize = 65
   let nonwitnessSize = serializeLegacy(tx).len
   if nonwitnessSize < MinStandardTxNonwitnessSize:
-    return err(TxId, "tx-size-small")
+    return err(AtmpAcceptInfo, "tx-size-small")
 
-  # Calculate weight and check 400K WU policy limit
+  # 400K WU policy limit.
   let weight = calculateWeight(tx)
   if weight > MaxStandardTxWeight:
-    return err(TxId, "transaction weight " & $weight & " exceeds max " & $MaxStandardTxWeight)
+    return err(AtmpAcceptInfo, "transaction weight " & $weight & " exceeds max " &
+               $MaxStandardTxWeight)
 
-  # Standardness check (Bitcoin Core IsStandardTx, policy/policy.cpp).
+  # IsStandardTx (policy/policy.cpp).
   let stdRes = isStandardTx(tx)
   if not stdRes.ok:
-    return err(TxId, "non-standard tx (" & stdRes.reason & ")")
+    return err(AtmpAcceptInfo, "non-standard tx (" & stdRes.reason & ")")
 
-  # Witness standardness check (Bitcoin Core IsWitnessStandard, policy/policy.cpp:265-351).
-  # Runs after IsStandardTx so UTXO existence is already confirmed above.
-  let witStdRes = isWitnessStandard(tx, proc(input: TxIn): seq[byte] =
-    let utxo = mp.chainState.getUtxo(input.prevOut)
-    if utxo.isSome:
-      utxo.get().output.scriptPubKey
-    else:
-      # Unconfirmed mempool parent (already validated above).
-      let parentEntry = mp.entries[input.prevOut.txid]
-      parentEntry.tx.outputs[input.prevOut.vout].scriptPubKey
-  )
-  if not witStdRes.ok:
-    return err(TxId, witStdRes.reason)
+  # W96 GAP #1: BIP-141 exists-by-wtxid / same-txid-different-wtxid duplicate
+  # detection.  Bitcoin Core validation.cpp:823-830 distinguishes:
+  #   - exact wtxid match → "txn-already-in-mempool" (same witness data)
+  #   - same txid, different wtxid → "txn-same-nonwitness-data-in-mempool"
+  # Without this an attacker can flood the mempool with re-witnessed copies
+  # of an in-mempool tx (cheap because the txid index doesn't catch them).
+  if wtxid in mp.byWtxid:
+    return err(AtmpAcceptInfo, "txn-already-in-mempool")
+  if txid in mp.entries:
+    # Same txid present but wtxid differs → witness was mutated.
+    return err(AtmpAcceptInfo, "txn-same-nonwitness-data-in-mempool")
 
-  # IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
-  # Mempool holds txs for the *next* block, so check against tipHeight+1
-  # and the current chain MTP (MEDIAN_TIME_PAST of last 11 blocks).
-  # Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckFinalTxAtTip
-  # (validation.cpp:819).
+  # IsFinalTx (BIP-113): reject non-final txs at mempool admit.
+  # NOTE: Core checks IsFinalTx BEFORE the exists check (validation.cpp:819
+  # vs 823).  Order intentionally matches Core so error messages line up
+  # with peer rejection-cache expectations.
   let tipHeight = mp.chainState.bestHeight
   let mtp = getMtpForHeight(mp.chainState.db, tipHeight)
   if not isFinalTx(tx, uint32(tipHeight + 1), mtp):
-    return err(TxId, "non-final")
+    return err(AtmpAcceptInfo, "non-final")
 
-  # Check for conflicts with mempool transactions (Full RBF)
+  # Conflict (RBF candidate) detection.  Track the conflicting outpoints so
+  # the txn-already-known check below can distinguish "we already saw this
+  # tx, output is in our cache" from "tx is missing inputs".
+  # W96 GAP #2: respect allow_replacement — Core returns
+  # "bip125-replacement-disallowed" when conflict exists but caller set
+  # m_allow_replacement=false (e.g., package-RBF disabled context).
   let conflicts = mp.findConflicts(tx)
+  if conflicts.len > 0 and not args.allowReplacement:
+    return err(AtmpAcceptInfo, "bip125-replacement-disallowed")
   var conflictsToRemove = initHashSet[TxId]()
 
-  # Check inputs exist (either in chainstate or mempool).
-  # Also enforces coinbase maturity (Gap N3): a tx spending an immature
-  # coinbase output must not enter the mempool.
-  # Mirrors Bitcoin Core CheckTxInputs (consensus/tx_verify.cpp) called from
-  # MemPoolAccept::PreChecks.
+  # Walk inputs.  Three failure modes Core distinguishes:
+  #   - txn-already-known   : any output of this tx already cached (UTXO set)
+  #   - bad-txns-inputs-missingorspent : input prevout absent
+  #   - bad-txns-premature-spend-of-coinbase (here folded into the coinbase
+  #     maturity check)
   for input in tx.inputs:
     let utxo = mp.chainState.getUtxo(input.prevOut)
     if utxo.isNone:
-      # Check mempool for unconfirmed parent
-      # But skip if it's a conflict we're replacing
       if input.prevOut.txid notin mp.entries:
-        return err(TxId, "input not found: " & $input.prevOut.txid)
+        # W96 GAP #3: txn-already-known — if our coins cache already has
+        # ANY output of this txid, it means we accepted the same tx
+        # previously and the parent isn't really missing.  Core
+        # validation.cpp:858-864.
+        var alreadyKnown = false
+        for vout in 0 ..< tx.outputs.len:
+          if mp.chainState.getUtxo(OutPoint(txid: txid, vout: uint32(vout))).isSome:
+            alreadyKnown = true
+            break
+        if alreadyKnown:
+          return err(AtmpAcceptInfo, "txn-already-known")
+        return err(AtmpAcceptInfo, "bad-txns-inputs-missingorspent: " & $input.prevOut.txid)
       let parentEntry = mp.entries[input.prevOut.txid]
       if int(input.prevOut.vout) >= parentEntry.tx.outputs.len:
-        return err(TxId, "invalid output index for mempool parent")
+        return err(AtmpAcceptInfo, "bad-txns-inputs-missingorspent: bad vout " &
+                   $input.prevOut.vout & " for mempool parent")
     else:
-      # Coinbase maturity check: a confirmed coinbase output must have
-      # at least COINBASE_MATURITY (100) confirmations before it can
-      # be spent in the mempool.
       let entry = utxo.get()
       if entry.isCoinbase:
         let age = tipHeight - entry.height
         if age < int32(mp.params.coinbaseMaturity):
-          return err(TxId, "coinbase output not yet mature: age=" & $age &
-                     " required=" & $mp.params.coinbaseMaturity)
+          return err(AtmpAcceptInfo, "bad-txns-premature-spend-of-coinbase: age=" &
+                     $age & " required=" & $mp.params.coinbaseMaturity)
 
-  # BIP-68 sequence locks: reject txs whose relative-locktime constraints
-  # are not satisfied at the next block.  Uses per-input UTXO heights from
-  # the chainstate.  Mirrors Bitcoin Core MemPoolAccept::PreChecks →
-  # CheckSequenceLocksAtTip (validation.cpp:887).
+  # BIP-68 sequence locks (CheckSequenceLocksAtTip, validation.cpp:887).
   proc lookupForSeqLock(op: OutPoint): Option[UtxoEntry] =
     let confirmed = mp.chainState.getUtxo(op)
     if confirmed.isSome:
       return confirmed
-    # Unconfirmed mempool parent: synthesize a UtxoEntry at tipHeight+1
-    # (same convention as Bitcoin Core's CalculateLockPointsAtTip).
     if op.txid in mp.entries:
       return some(UtxoEntry(output: TxOut(), height: int32(tipHeight + 1), isCoinbase: false))
     none(UtxoEntry)
@@ -906,73 +991,112 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
   let seqResult = checkSequenceLocksForTx(
     tx, lookupForSeqLock, tipHeight + 1, mtp, getMtpAt, mp.params)
   if not seqResult.isOk:
-    return err(TxId, "non-BIP68-final: " & $seqResult.error)
+    return err(AtmpAcceptInfo, "non-BIP68-final: " & $seqResult.error)
 
-  # Calculate fee
+  # CheckTxInputs — amounts in-range, accumulated MoneyRange, fee computation.
+  # nimrod's calculateFee performs all three but does not surface the
+  # individual error strings; preserve the message Core uses (validation.cpp
+  # CheckTxInputs paths feed back through the state object).
   let feeOpt = calculateFee(tx, mp)
   if feeOpt.isNone:
-    return err(TxId, "unable to calculate fee")
+    return err(AtmpAcceptInfo, "bad-txns-in-belowout / bad-txns-fee-outofrange")
   let fee = feeOpt.get()
 
-  # Calculate fee rate (sat/vbyte)
-  # vbytes = weight / 4
-  let vbytes = float64(weight) / 4.0
-  let vsizeInt = (weight + 3) div 4
-  let feeRate = float64(int64(fee)) / vbytes
+  # IsWitnessStandard (policy/policy.cpp:265-351).  Core orders this AFTER
+  # CheckTxInputs because it walks the m_view cache for the prevouts.
+  let witStdRes = isWitnessStandard(tx, proc(input: TxIn): seq[byte] =
+    let utxo = mp.chainState.getUtxo(input.prevOut)
+    if utxo.isSome:
+      utxo.get().output.scriptPubKey
+    else:
+      let parentEntry = mp.entries[input.prevOut.txid]
+      parentEntry.tx.outputs[input.prevOut.vout].scriptPubKey
+  )
+  if not witStdRes.ok:
+    return err(AtmpAcceptInfo, "bad-witness-nonstandard: " & witStdRes.reason)
 
-  # Check minimum fee rate.
-  # Gate: max(configured minFeeRate, current rolling minimum from GetMinFee).
-  # After TrimToSize eviction the rolling floor is bumped so new txs must pay
-  # more than what was just evicted.  It decays back to zero after a block.
-  # Core reference: CTxMemPool::GetMinFee, txmempool.cpp:829-851.
-  let rollingFloor = mp.getMinFee()
-  let effectiveMinFeeRate = max(mp.minFeeRate, rollingFloor)
-  if feeRate < effectiveMinFeeRate:
-    return err(TxId, "fee rate " & $feeRate & " below minimum " & $effectiveMinFeeRate &
-               " (rolling floor: " & $rollingFloor & ")")
+  # W96 GAP #4: ValidateInputsStandardness — Bitcoin Core policy/policy.cpp:214
+  # enforces per-input "input non-standard" rules.  Two consequences relevant
+  # in nimrod:
+  #   (a) Bare NONSTANDARD inputs are rejected ("input X script unknown").
+  #   (b) WITNESS_UNKNOWN inputs (well-formed witness program of unknown
+  #       version, length 2..40 with version 2..16 or version 1 len != 32)
+  #       are flagged early as bad-txns-nonstandard-inputs.
+  #   (c) P2SH redeemscript sigops cap (MAX_P2SH_SIGOPS=15) — refuse if the
+  #       redeemscript contains more than 15 sigops to prevent quadratic
+  #       sighashing.
+  for inputIdx, input in tx.inputs:
+    var prevSpk: seq[byte]
+    let confirmed = mp.chainState.getUtxo(input.prevOut)
+    if confirmed.isSome:
+      prevSpk = confirmed.get().output.scriptPubKey
+    else:
+      let parentEntry = mp.entries[input.prevOut.txid]
+      prevSpk = parentEntry.tx.outputs[int(input.prevOut.vout)].scriptPubKey
+    let kind = classifyStdTxout(prevSpk)
+    if kind == stxNonStandard:
+      return err(AtmpAcceptInfo,
+                 "bad-txns-nonstandard-inputs: input " & $inputIdx & " script unknown")
+    if kind == stxWitnessUnknown:
+      return err(AtmpAcceptInfo,
+                 "bad-txns-nonstandard-inputs: input " & $inputIdx & " witness program is undefined")
+    if kind == stxP2SH:
+      # Parse scriptSig as a push-only sequence.  Last push is the redeemScript.
+      let pushed = evalScriptSigPushes(input.scriptSig)
+      if not pushed.ok:
+        return err(AtmpAcceptInfo,
+                   "bad-txns-nonstandard-inputs: p2sh scriptsig malformed (input " &
+                   $inputIdx & ")")
+      if pushed.stack.len == 0:
+        return err(AtmpAcceptInfo,
+                   "bad-txns-nonstandard-inputs: input " & $inputIdx &
+                   " P2SH redeemscript missing")
+      # MAX_P2SH_SIGOPS = 15; mirrors Core consensus/consensus.h.
+      let redeem = pushed.stack[^1]
+      const MaxP2shSigops = 15
+      var sigops = 0
+      var i = 0
+      var lastOp: uint8 = 0
+      while i < redeem.len:
+        let op = redeem[i]
+        if op == 0xac or op == 0xad:  # OP_CHECKSIG / OP_CHECKSIGVERIFY
+          inc sigops
+          inc i
+          lastOp = op
+        elif op == 0xae or op == 0xaf:  # OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY
+          # Accurate variant: previous opcode 0x51..0x60 (OP_1..OP_16) gives N.
+          if lastOp >= 0x51 and lastOp <= 0x60:
+            sigops += int(lastOp - 0x50)
+          else:
+            sigops += 20  # MAX_PUBKEYS_PER_MULTISIG fallback
+          inc i
+          lastOp = op
+        elif op >= 0x01 and op <= 0x4b:
+          # Direct push
+          i += 1 + int(op)
+          lastOp = op
+        elif op == 0x4c and i + 1 < redeem.len:
+          let len1 = int(redeem[i + 1])
+          i += 2 + len1
+          lastOp = op
+        elif op == 0x4d and i + 2 < redeem.len:
+          let len2 = int(redeem[i + 1]) or (int(redeem[i + 2]) shl 8)
+          i += 3 + len2
+          lastOp = op
+        elif op == 0x4e and i + 4 < redeem.len:
+          let len4 = int(redeem[i + 1]) or (int(redeem[i + 2]) shl 8) or
+                     (int(redeem[i + 3]) shl 16) or (int(redeem[i + 4]) shl 24)
+          i += 5 + len4
+          lastOp = op
+        else:
+          inc i
+          lastOp = op
+      if sigops > MaxP2shSigops:
+        return err(AtmpAcceptInfo,
+                   "bad-txns-nonstandard-inputs: p2sh redeemscript sigops exceed limit (input " &
+                   $inputIdx & ": " & $sigops & " > " & $MaxP2shSigops & ")")
 
-  # If there are conflicts, validate RBF rules before proceeding
-  if len(conflicts) > 0:
-    let rbfResult = mp.checkRbfRules(tx, fee, vsizeInt, conflicts)
-    if not rbfResult.isOk:
-      return err(TxId, rbfResult.error)
-    conflictsToRemove = rbfResult.value
-
-  # Check TRUC (v3) policy rules
-  var trucSiblingToEvict: Option[TxId] = none(TxId)
-  let trucResult = mp.checkSingleTrucRules(tx, weight, conflicts)
-  if not trucResult.isOk:
-    return err(TxId, trucResult.error)
-
-  # Handle TRUC sibling eviction if applicable
-  if trucResult.siblingToEvict.isSome:
-    let siblingTxid = trucResult.siblingToEvict.get()
-    # Check sibling eviction rules (must pay at least sibling's fee)
-    let siblingEvictionResult = mp.checkTrucSiblingEviction(tx, fee, siblingTxid)
-    if not siblingEvictionResult.isOk:
-      return err(TxId, siblingEvictionResult.error)
-    trucSiblingToEvict = some(siblingTxid)
-    # Add sibling to conflicts for removal
-    conflictsToRemove.incl(siblingTxid)
-
-  # Check ephemeral dust policy for standalone transactions
-  # A tx with dust outputs must have 0-fee (to prevent incentive to mine standalone)
-  # Note: transactions submitted as packages are checked differently in acceptPackage
-  let ephemeralPreCheck = preCheckEphemeralTx(tx, fee)
-  if not ephemeralPreCheck.isOk:
-    return err(TxId, ephemeralPreCheck.error)
-
-  # For standalone tx with ephemeral dust, reject unless submitted via package relay
-  # The parent with ephemeral dust needs a child to spend those outputs
-  # Since this is a new tx being added alone, no child can exist yet
-  if hasEphemeralDust(tx):
-    return err(TxId, "tx has ephemeral dust output but no child spending it; use package relay")
-
-  # Sigop cost check: reject txs that exceed per-tx policy limit.
-  # Bitcoin Core MemPoolAccept::PreChecks, validation.cpp:908-942:
-  #   nSigOpsCost = GetTransactionSigOpCost(tx, view, STANDARD_SCRIPT_VERIFY_FLAGS)
-  #   if nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST → "bad-txns-too-many-sigops"
-  # MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST / 5 = 16_000 (policy/policy.h:44).
+  # Sigop cost (validation.cpp:908).
   proc lookupForSigops(op: OutPoint): Option[UtxoEntry] =
     let confirmed = mp.chainState.getUtxo(op)
     if confirmed.isSome:
@@ -990,73 +1114,224 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
   let sigopResult = getTransactionSigOpCost(tx, lookupForSigops, useP2SH = true, useWitness = true)
   if sigopResult.isOk:
     if sigopResult.value > MaxStandardTxSigopsCost:
-      return err(TxId, "bad-txns-too-many-sigops")
+      return err(AtmpAcceptInfo, "bad-txns-too-many-sigops")
 
-  # Verify scripts for each input
-  let scriptFlags = getBlockScriptFlags(mp.chainState.bestHeight, mp.params)
+  # W96 GAP #5: modified-fee aware vsize.  Core computes m_modified_fees from
+  # m_base_fees plus PrioritiseTransaction deltas (Core validation.cpp:930).
+  # nimrod has no PrioritiseTransaction, so modified == base — but expose the
+  # value separately so the per-tx max_feerate guard below behaves the same
+  # as Core if the field is ever wired up.
+  let baseFee = fee
+  let modifiedFee = fee
+  let vbytes = float64(weight) / 4.0
+  let vsizeInt = (weight + 3) div 4
+  let feeRate = float64(int64(modifiedFee)) / vbytes
+  let feeRateSatKvB = feeRate * 1000.0  # convert sat/vB -> sat/kvB (Core unit)
 
-  for inputIdx, input in tx.inputs:
-    # Get the UTXO being spent
-    var scriptPubKey: seq[byte]
-    var amount: Satoshi
+  # PreCheckEphemeralTx — relay-only.  Core validation.cpp:935 gates this on
+  # require_standard.  nimrod always runs in require_standard=true equivalent.
+  let ephemeralPreCheck = preCheckEphemeralTx(tx, baseFee, modifiedFee)
+  if not ephemeralPreCheck.isOk:
+    return err(AtmpAcceptInfo, ephemeralPreCheck.error)
 
-    let utxo = mp.chainState.getUtxo(input.prevOut)
-    if utxo.isSome:
-      scriptPubKey = utxo.get().output.scriptPubKey
-      amount = utxo.get().output.value
-    else:
-      # From mempool parent
-      let parentEntry = mp.entries[input.prevOut.txid]
-      let parentOutput = parentEntry.tx.outputs[input.prevOut.vout]
-      scriptPubKey = parentOutput.scriptPubKey
-      amount = parentOutput.value
+  # W96 GAP #6: min-fee gate honours bypass_limits + package_feerates.
+  # validation.cpp:948: `if (!bypass_limits && !args.m_package_feerates &&
+  # !CheckFeeRate(...)) return false;`
+  if not args.bypassLimits and not args.packageFeerates:
+    let rollingFloor = mp.getMinFee()
+    let effectiveMinFeeRate = max(mp.minFeeRate, rollingFloor)
+    if feeRate < effectiveMinFeeRate:
+      return err(AtmpAcceptInfo, "mempool min fee not met: feerate " & $feeRate &
+                 " < min " & $effectiveMinFeeRate &
+                 " (rolling floor: " & $rollingFloor & ")")
 
-    # Get witness for this input
-    var witness: seq[seq[byte]] = @[]
-    if inputIdx < tx.witnesses.len:
-      witness = tx.witnesses[inputIdx]
+  # W96 GAP #7: client_maxfeerate (validation.cpp:1368).
+  # Core compares the effective feerate against the caller-supplied max
+  # (e.g., -maxtxfee on sendrawtransaction).  Units are sat/kvB.
+  if args.clientMaxFeeRateSatKvB > 0.0 and feeRateSatKvB > args.clientMaxFeeRateSatKvB:
+    return err(AtmpAcceptInfo,
+               "max feerate exceeded: tx feerate " & $feeRateSatKvB &
+               " sat/kvB > caller max " & $args.clientMaxFeeRateSatKvB & " sat/kvB")
 
-    # Verify the script
-    let verified = verifyScript(
-      input.scriptSig,
-      scriptPubKey,
-      tx,
-      inputIdx,
-      amount,
-      scriptFlags,
-      witness
-    )
+  # W96 GAP #8: bypass_limits also disables TRUC checks (validation.cpp:954).
+  var trucSiblingToEvict: Option[TxId] = none(TxId)
+  if not args.bypassLimits:
+    let trucResult = mp.checkSingleTrucRules(tx, weight, conflicts)
+    if not trucResult.isOk:
+      return err(AtmpAcceptInfo, "TRUC-violation: " & trucResult.error)
+    if trucResult.siblingToEvict.isSome:
+      let siblingTxid = trucResult.siblingToEvict.get()
+      if not args.allowSiblingEviction or not args.allowReplacement:
+        return err(AtmpAcceptInfo, "TRUC-violation: sibling-eviction-disallowed")
+      let siblingEvictionResult = mp.checkTrucSiblingEviction(tx, modifiedFee, siblingTxid)
+      if not siblingEvictionResult.isOk:
+        return err(AtmpAcceptInfo, "TRUC-violation: " & siblingEvictionResult.error)
+      trucSiblingToEvict = some(siblingTxid)
+      conflictsToRemove.incl(siblingTxid)
 
-    if not verified:
-      return err(TxId, "script verification failed for input " & $inputIdx)
+  # === ReplacementChecks ====================================================
+  # (Core's MemPoolAccept::ReplacementChecks, validation.cpp:984.)
 
-  # Remove conflicts before calculating ancestor stats (for RBF)
-  if len(conflictsToRemove) > 0:
+  if conflicts.len > 0:
+    let rbfResult = mp.checkRbfRules(tx, modifiedFee, vsizeInt, conflicts)
+    if not rbfResult.isOk:
+      return err(AtmpAcceptInfo, "replacement-failed: " & rbfResult.error)
+    for c in rbfResult.value:
+      conflictsToRemove.incl(c)
+
+    # W96 GAP #9: EntriesAndTxidsDisjoint for single-tx submission.
+    # validation.cpp:1349-1361 — after collecting `all_conflicts`, Core
+    # asserts that the tx's ancestor set is disjoint from the to-be-replaced
+    # set.  Otherwise the tx would depend on something it conflicts with
+    # (consensus-bad inconsistency).  This is *additional* to Rule #2 (which
+    # checks direct inputs); the ancestor-disjoint check covers transitive
+    # spend chains.
+    let txAncestors = mp.calculateAncestors(tx)
+    for ancestor in txAncestors:
+      if ancestor in conflictsToRemove:
+        return err(AtmpAcceptInfo,
+                   "bad-txns-spends-conflicting-tx: ancestor " & $ancestor &
+                   " is also being replaced")
+
+  # === Cluster size guard ===================================================
+  # Core's AcceptSingleTransactionInternal:1342 — even when no RBF, the new
+  # tx (+ conflicts staged) must not push any cluster past the size limit.
+  # checkPackageLimits handles cluster count + vsize for the new entry.
+  # Defer the call until after conflicts are staged so the cluster shape is
+  # accurate.
+
+  # === PolicyScriptChecks ===================================================
+  # Run with STANDARD_SCRIPT_VERIFY_FLAGS.  validation.cpp:1135.
+  let consensusFlags = getBlockScriptFlags(mp.chainState.bestHeight, mp.params)
+  let policyFlags = standardScriptVerifyFlags(consensusFlags)
+
+  proc verifyAt(flags: set[ScriptFlags]): MempoolResult[void] =
+    for inputIdx, input in tx.inputs:
+      var scriptPubKey: seq[byte]
+      var amount: Satoshi
+      let utxo = mp.chainState.getUtxo(input.prevOut)
+      if utxo.isSome:
+        scriptPubKey = utxo.get().output.scriptPubKey
+        amount = utxo.get().output.value
+      else:
+        let parentEntry = mp.entries[input.prevOut.txid]
+        let parentOutput = parentEntry.tx.outputs[input.prevOut.vout]
+        scriptPubKey = parentOutput.scriptPubKey
+        amount = parentOutput.value
+      var witness: seq[seq[byte]] = @[]
+      if inputIdx < tx.witnesses.len:
+        witness = tx.witnesses[inputIdx]
+      let verified = verifyScript(
+        input.scriptSig, scriptPubKey, tx, inputIdx, amount, flags, witness)
+      if not verified:
+        return MempoolResult[void](isOk: false,
+          error: "script verification failed for input " & $inputIdx)
+    MempoolResult[void](isOk: true)
+
+  let policyVer = verifyAt(policyFlags)
+  if not policyVer.isOk:
+    # W96 GAP #10: TX_WITNESS_STRIPPED detection (validation.cpp:1148).
+    # If the tx HAS NO witness data but spends a non-anchor witness program,
+    # this is almost certainly witness-stripped relay corruption; surface a
+    # distinct error so p2p rejection caching matches Core.
+    var anyWitnessSpend = false
+    var hasWitness = false
+    for w in tx.witnesses:
+      if w.len > 0:
+        hasWitness = true
+        break
+    if not hasWitness:
+      for input in tx.inputs:
+        let utxo = mp.chainState.getUtxo(input.prevOut)
+        var spk: seq[byte]
+        if utxo.isSome:
+          spk = utxo.get().output.scriptPubKey
+        elif input.prevOut.txid in mp.entries:
+          spk = mp.entries[input.prevOut.txid].tx.outputs[input.prevOut.vout].scriptPubKey
+        let kind = classifyStdTxout(spk)
+        if kind in {stxP2WPKH, stxP2WSH, stxWitnessUnknown}:
+          # Note: P2TR (witness v1, BIP-340) is anchor-spendable for some
+          # paths (key-spend with empty witness is invalid; treat as
+          # witness-stripped also).
+          anyWitnessSpend = true
+          break
+        if kind == stxP2TR:
+          anyWitnessSpend = true
+          break
+    if anyWitnessSpend:
+      return err(AtmpAcceptInfo, "witness-stripped: " & policyVer.error)
+    return err(AtmpAcceptInfo, "non-mandatory-script-verify-flag: " & policyVer.error)
+
+  # === ConsensusScriptChecks ================================================
+  # Re-verify with the current block's flags (consensus only).  validation.cpp
+  # :1158.  If this differs from policy verification (e.g., a policy-flag
+  # bug accepted a tx that consensus rejects), we have a serious bug; Core
+  # logs "BUG! PLEASE REPORT THIS!" and asserts.  Here we surface a hard
+  # error.
+  let consensusVer = verifyAt(consensusFlags)
+  if not consensusVer.isOk:
+    return err(AtmpAcceptInfo,
+               "mandatory-script-verify-flag-failed: " & consensusVer.error)
+
+  # === Submission ===========================================================
+
+  # Stage conflict removal BEFORE checkPackageLimits so cluster shape is
+  # post-replacement (Core's changeset behaviour: validation.cpp:1196-1239).
+  if conflictsToRemove.len > 0:
     mp.removeConflicts(conflictsToRemove)
 
-  # Calculate ancestor fees and weight for CPFP
-  let (ancestorFee, ancestorWeight) = mp.calculateAncestorFeesAndWeight(tx, fee, weight)
-
-  # Check package limits (ancestor/descendant count and size)
+  # Package + cluster limits.
   let packageLimitsResult = mp.checkPackageLimits(tx, weight)
   if not packageLimitsResult.isOk:
-    return err(TxId, "package limits exceeded: " & packageLimitsResult.error)
+    return err(AtmpAcceptInfo, "too-large-cluster: " & packageLimitsResult.error)
 
-  # Calculate ancestor stats for caching
+  let (ancestorFee, ancestorWeight) = mp.calculateAncestorFeesAndWeight(tx, modifiedFee, weight)
   let (ancestorCount, ancestorSize) = mp.calculateAncestorStats(tx, vsizeInt)
 
-  # Check mempool size limit - evict if needed
+  # Standalone-ephemeral guard (validation.cpp:1375 — CheckEphemeralSpends).
+  # A single-tx submission with an ephemeral dust output cannot satisfy the
+  # "must be spent by a child in the same package" invariant, so reject.
+  if hasEphemeralDust(tx):
+    return err(AtmpAcceptInfo,
+               "ephemeral-dust-must-be-spent: standalone tx has ephemeral dust output but no child spending it; use package relay")
+
+  let info = AtmpAcceptInfo(
+    txid: txid,
+    wtxid: wtxid,
+    vsize: vsizeInt,
+    baseFee: baseFee,
+    modifiedFee: modifiedFee,
+    replaced: conflictsToRemove,
+  )
+
+  # W96 GAP #11: m_test_accept — return AFTER all checks pass but BEFORE
+  # any state mutation (validation.cpp:1388).
+  if args.testAccept:
+    return ok[AtmpAcceptInfo](info)
+
+  # Check mempool size limit - evict if needed.
   let txSize = serialize(tx).len
   while mp.currentSize + txSize > mp.maxSize:
     mp.evictLowestFee()
     if mp.entries.len == 0:
       break
 
-  # Create entry
+  # W96 GAP #12: post-eviction "mempool full" check (validation.cpp:1402-
+  # 1406).  After TrimToSize, our own tx may have been evicted (its feerate
+  # is no longer above the new rolling floor).  Core returns
+  # TX_RECONSIDERABLE / "mempool full" so the package layer can retry.
+  let rollingFloorAfter = mp.getMinFee()
+  let effectiveMinFeeRateAfter = max(mp.minFeeRate, rollingFloorAfter)
+  if not args.bypassLimits and feeRate < effectiveMinFeeRateAfter:
+    return err(AtmpAcceptInfo,
+               "mempool full: post-eviction floor " & $effectiveMinFeeRateAfter &
+               " > tx feerate " & $feeRate)
+
   let entry = MempoolEntry(
     tx: tx,
     txid: txid,
-    fee: fee,
+    wtxid: wtxid,
+    fee: baseFee,
     weight: weight,
     feeRate: feeRate,
     timeAdded: getTime(),
@@ -1067,15 +1342,24 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
     ancestorSize: ancestorSize
   )
 
-  # Add to mempool
   mp.entries[txid] = entry
+  mp.byWtxid[wtxid] = txid
   mp.currentSize += txSize
 
-  # Track spent outpoints
   for input in tx.inputs:
     mp.spentBy[input.prevOut] = txid
 
-  ok(txid)
+  ok[AtmpAcceptInfo](info)
+
+# Convenience wrapper for the historical signature — preserves callers that
+# expect `MempoolResult[TxId]` and don't care about the extra info.
+proc acceptTransaction*(mp: Mempool, tx: Transaction,
+                        crypto: CryptoEngine,
+                        args: AtmpArgs = defaultAtmpArgs()): MempoolResult[TxId] =
+  let res = acceptTransactionWithArgs(mp, tx, crypto, args)
+  if res.isOk:
+    return ok[TxId](res.value.txid)
+  return err(TxId, res.error)
 
 # Remove a transaction from the mempool
 proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true) =
@@ -1100,6 +1384,10 @@ proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true) =
   let txSize = serialize(entry.tx).len
   mp.currentSize -= txSize
 
+  # W96: drop wtxid index entry as well (BIP141 same-txid-different-witness
+  # exists-check requires keeping byWtxid in sync with entries).
+  if mp.byWtxid.getOrDefault(entry.wtxid, TxId(default(array[32, byte]))) == txid:
+    mp.byWtxid.del(entry.wtxid)
   mp.entries.del(txid)
 
   # Cascade eviction for ephemeral dust parents
@@ -1905,9 +2193,11 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
         break
 
     # Create entry
+    let wtxid = tx.wtxid()
     let entry = MempoolEntry(
       tx: tx,
       txid: txid,
+      wtxid: wtxid,
       fee: fee,
       weight: weight,
       feeRate: feeRate,
@@ -1921,6 +2211,7 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
 
     # Add to mempool
     mp.entries[txid] = entry
+    mp.byWtxid[wtxid] = txid
     mp.currentSize += txSize
 
     # Track spent outpoints

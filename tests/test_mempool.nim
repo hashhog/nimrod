@@ -168,7 +168,9 @@ suite "Mempool transaction acceptance":
 
     let result = mp.acceptTransaction(tx, crypto)
     check not result.isOk
-    check "input not found" in result.error
+    # W96: Bitcoin Core uses "bad-txns-inputs-missingorspent" for this case
+    # (validation.cpp:866).
+    check "bad-txns-inputs-missingorspent" in result.error
 
     cs.close()
 
@@ -317,7 +319,11 @@ suite "Mempool fee policy":
     # Fee = 1 sat, weight ~= 400, vbytes ~= 100, rate ~= 0.01 sat/vbyte
     let result = mp.acceptTransaction(tx, crypto)
     check not result.isOk
-    check "fee rate" in result.error or "script" in result.error
+    # W96: rephrased to match Core "mempool min fee not met" path
+    # (validation.cpp:948 CheckFeeRate).
+    check "min fee not met" in result.error or
+          "fee rate" in result.error or
+          "script" in result.error
 
     cs.close()
 
