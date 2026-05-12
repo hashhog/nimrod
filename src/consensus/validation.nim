@@ -162,6 +162,9 @@ proc bip22String*(e: ValidationError): string =
   # fTooFarAhead: block height > ActiveHeight + MIN_BLOCKS_TO_KEEP (validation.cpp:4334)
   # Core returns false (not an error string) for this case; map to "rejected" per BIP-22.
   of veTooFarAhead: "rejected"
+  # too-little-chainwork: header accepted before PRESYNC verified chain meets
+  # nMinimumChainWork (validation.cpp:4229, BLOCK_HEADER_LOW_WORK).
+  of veInsufficientChainWork: "too-little-chainwork"
   of veOk: ""
   else: "rejected"
 
@@ -765,17 +768,41 @@ proc validateBlockHeader*(
   header: BlockHeader,
   prevIndex: BlockIndex,
   params: ConsensusParams,
-  checkPow: bool = true
+  checkPow: bool = true,
+  minPowChecked: bool = true
 ): ValidationResult[void] =
   ## Validate block header against consensus rules.
   ##
   ## Checks: PoW hash meets nBits target, timestamp not too far in future,
   ## and prevBlock hash matches.
   ##
+  ## minPowChecked: true if the PRESYNC/REDOWNLOAD anti-DoS pipeline has
+  ##   already verified that the claimed chain work meets minimumChainWork.
+  ##   Pass false for headers received directly from a random peer before
+  ##   PRESYNC completes.  When false and params.minimumChainWork is non-zero,
+  ##   the header is rejected immediately with veInsufficientChainWork.
+  ##   Reference: validation.cpp:4229 — `if (!min_pow_checked) return
+  ##   state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork")`.
+  ##
   ## NOTE: This proc does NOT have access to the chain DB, so it cannot
   ## enforce MTP (time-too-old), bad-diffbits, bad-version, or
   ## time-timewarp-attack. Those contextual checks are performed by
   ## contextualCheckBlockHeader (called from validateBlock).
+
+  # G8 (W97): too-little-chainwork gate.
+  # Reject headers from peers that have not passed PRESYNC work validation,
+  # unless the network has no minimum work requirement (regtest / all-zero).
+  # Core validation.cpp:4220-4229 — AcceptBlockHeader calls this immediately
+  # after the prevBlock lookup; only the PRESYNC-validated path sets
+  # min_pow_checked=true.
+  if not minPowChecked:
+    var isZeroMinWork = true
+    for b in params.minimumChainWork:
+      if b != 0:
+        isZeroMinWork = false
+        break
+    if not isZeroMinWork:
+      return voidErr(veInsufficientChainWork)
 
   # Check proof of work — hash must be <= target encoded by nBits.
   # Core validation.cpp CheckBlockHeader: just the hash-meets-target gate.

@@ -410,8 +410,26 @@ proc validateDifficultyRetarget*(header: BlockHeader, hc: HeaderChain,
   header.bits == expectedBits
 
 proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
-                     params: ConsensusParams): tuple[valid: bool, error: string] =
+                     params: ConsensusParams,
+                     minPowChecked: bool = true): tuple[valid: bool, error: string] =
   ## Full header validation
+  ##
+  ## minPowChecked: true if the PRESYNC anti-DoS pipeline has already
+  ##   confirmed that the claimed chain work meets params.minimumChainWork.
+  ##   Pass false for headers from random peers before PRESYNC completes.
+  ##   Reference: validation.cpp:4229 — `if (!min_pow_checked)`.
+
+  # G8 (W97): too-little-chainwork gate.
+  # Reject if PRESYNC has not validated the work AND the network has a
+  # non-zero minimumChainWork threshold (regtest sets it to all-zeros).
+  if not minPowChecked:
+    var isZeroMinWork = true
+    for b in params.minimumChainWork:
+      if b != 0:
+        isZeroMinWork = false
+        break
+    if not isZeroMinWork:
+      return (false, "too-little-chainwork")
 
   # Check proof of work
   if not validateHeaderPoW(header):
@@ -786,9 +804,17 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
   # Make a mutable copy for anti-DoS processing
   var headersToProcess = headers
 
+  # G8 (W97): track whether cumulative chain work has been verified by
+  # the PRESYNC/REDOWNLOAD anti-DoS pipeline.  Headers that arrive through
+  # PRESYNC/REDOWNLOAD have already proven work >= minimumChainWork;
+  # direct headers from a random peer have not.
+  # Reference: validation.cpp:4220-4229 (min_pow_checked flag).
+  var minPowChecked = false
+
   # Check if this is a continuation of an active low-work header sync
   if sm.isContinuationOfLowWorkHeadersSync(peer, headersToProcess):
-    # Headers were processed through anti-DoS sync
+    # Headers were processed through anti-DoS sync — work is validated.
+    minPowChecked = true
     if headersToProcess.len == 0:
       # All headers consumed by presync phase, request more
       if getPeerId(peer) in sm.peerHeadersSync:
@@ -898,8 +924,13 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
         sm.state = ssIdle
         return
 
-    # Validate the header
-    let (valid, error) = validateHeader(header, sm.headerChain, expectedHeight, sm.params)
+    # Validate the header.
+    # G8 (W97): pass minPowChecked so validateHeader rejects headers whose
+    # claimed chain work has not been verified via PRESYNC/REDOWNLOAD when
+    # params.minimumChainWork is non-zero.  Raw direct-peer headers arrive
+    # with minPowChecked=false; PRESYNC-validated batches arrive with true.
+    let (valid, error) = validateHeader(header, sm.headerChain, expectedHeight,
+                                        sm.params, minPowChecked = minPowChecked)
     if not valid:
       warn "invalid header", peer = $peer, height = expectedHeight, error = error
       # Disconnect peer sending invalid headers
