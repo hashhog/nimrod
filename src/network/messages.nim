@@ -40,6 +40,15 @@ type
     invBlock = 2
     invFilteredBlock = 3
     invCmpctBlock = 4
+    ## BIP-339 MSG_WTX: the real wtxid-relay inv type (value 5).
+    ## Used in inv messages between wtxid-relay peers.
+    ## NOT to be confused with MSG_WITNESS_TX (0x40000001) which is a
+    ## getdata flag used to request witness data, not an inv type.
+    invWtx = 5
+    ## Legacy getdata flag for requesting witness-serialized transactions.
+    ## This value (0x40000001) should NOT appear in inv messages from peers;
+    ## only invWtx (5) is a valid BIP-339 inv type.  Kept for wire
+    ## compatibility with older peers / non-BIP-339 messages.
     invWitnessTx = 0x40000001
     invWitnessBlock = 0x40000002
 
@@ -353,6 +362,7 @@ proc readInvVector*(r: var BinaryReader): InvVector =
   of 2: result.invType = invBlock
   of 3: result.invType = invFilteredBlock
   of 4: result.invType = invCmpctBlock
+  of 5: result.invType = invWtx  # BIP-339 MSG_WTX — wtxid-relay inv type
   of 0x40000001'u32: result.invType = invWitnessTx
   of 0x40000002'u32: result.invType = invWitnessBlock
   else: result.invType = invError
