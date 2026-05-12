@@ -111,7 +111,7 @@ suite "BIP-341 taproot commitment check (script-path)":
     let resErr = verifyWitnessProgramWithError(
       witness, 1, program, dummyTx, 0, Satoshi(0),
       {sfWitness, sfTaproot})
-    check resErr == seTaprootError
+    check resErr == seWitnessProgramMismatch  # W94: Core-faithful SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH
 
   test "wrong witness program (Q mismatch) is rejected":
     # Same control block, but flip a byte in the program. The recomputed
@@ -129,7 +129,7 @@ suite "BIP-341 taproot commitment check (script-path)":
     let resErr = verifyWitnessProgramWithError(
       witness, 1, bogusProgram, dummyTx, 0, Satoshi(0),
       {sfWitness, sfTaproot})
-    check resErr == seTaprootError
+    check resErr == seWitnessProgramMismatch  # W94: Core-faithful SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH
 
   test "control block with unrelated internal pubkey is rejected":
     # Adversary's control block uses internalPk derived from a
@@ -149,7 +149,7 @@ suite "BIP-341 taproot commitment check (script-path)":
     let resErr = verifyWitnessProgramWithError(
       witness, 1, program, dummyTx, 0, Satoshi(0),
       {sfWitness, sfTaproot})
-    check resErr == seTaprootError
+    check resErr == seWitnessProgramMismatch  # W94: Core-faithful SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH
 
   test "WithError variant rejects fake merkle path (1-step)":
     # Pre-fix the WithError variant did NOT walk the merkle path at
@@ -169,7 +169,7 @@ suite "BIP-341 taproot commitment check (script-path)":
     let resErr = verifyWitnessProgramWithError(
       witness, 1, program, dummyTx, 0, Satoshi(0),
       {sfWitness, sfTaproot})
-    check resErr == seTaprootError
+    check resErr == seWitnessProgramMismatch  # W94: Core-faithful SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH
 
     let res = verifyWitnessProgram(
       witness, 1, program, dummyTx, 0, Satoshi(0),
