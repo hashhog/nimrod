@@ -374,7 +374,7 @@ proc pruneToHeight*(p: Pruner, requestedTarget: int32): int32 =
     return p.pruneHeight
 
   # Apply Core's safety floors.
-  var ceiling = min(requestedTarget, tip - int32(MinBlocksToKeep))
+  var ceiling = min(requestedTarget, tip - int32(params.MinBlocksToKeep))
   let auFloor = p.assumeUtxoFloor()
   if auFloor >= 0 and ceiling > auFloor:
     # Honor assumeutxo: never prune blocks at or above the snapshot floor
@@ -435,7 +435,7 @@ proc autoPruneIfNeeded*(p: Pruner) =
   let tip = p.chainState.bestHeight
   if tip < 0:
     return
-  let safeCeiling = tip - int32(MinBlocksToKeep)
+  let safeCeiling = tip - int32(params.MinBlocksToKeep)
   if safeCeiling < 0:
     return
 
