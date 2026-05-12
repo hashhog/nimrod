@@ -385,7 +385,7 @@ suite "BlockFailureFlags":
     check flags.hasFlag(BLOCK_FAILED_CHILD)
 
     flags.clearFlag(BLOCK_FAILED_VALID)
-    check flags.isFailed()  # Still has FAILED_CHILD
+    check not flags.isFailed()  # BUG-02 fix: BLOCK_FAILED_CHILD alone is not a failure (Core v25+ unused flag)
     check not flags.hasFlag(BLOCK_FAILED_VALID)
     check flags.hasFlag(BLOCK_FAILED_CHILD)
 

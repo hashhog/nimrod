@@ -285,8 +285,8 @@ proc isBlockOnCheckpointChain*(state: CheckpointState,
 # ============================================================================
 # Reference: Bitcoin Core validation.cpp InvalidateBlock, ReconsiderBlock, PreciousBlock
 
-import std/deques
 import ../storage/chainstate
+import ../storage/db as chaindb
 
 type
   ChainManagementError* = enum
@@ -310,126 +310,124 @@ proc chainMgmtOk*(): ChainManagementResult =
 proc chainMgmtErr*(e: ChainManagementError): ChainManagementResult =
   ChainManagementResult(isOk: false, error: e)
 
+proc getAncestorAtHeight(cs: ChainState, startIdx: BlockIndex, targetHeight: int32): Option[BlockHash] =
+  ## Walk the prevHash chain from startIdx up to targetHeight.
+  ## Returns the block hash at targetHeight, or none if the chain is too short
+  ## or any link is missing.
+  ## Reference: Bitcoin Core CBlockIndex::GetAncestor (chain.cpp:83)
+  if startIdx.height < targetHeight:
+    return none(BlockHash)
+  if startIdx.height == targetHeight:
+    return some(startIdx.hash)
+  var current = startIdx
+  while current.height > targetHeight:
+    let prevOpt = cs.db.getBlockIndex(current.prevHash)
+    if prevOpt.isNone:
+      return none(BlockHash)
+    current = prevOpt.get()
+  some(current.hash)
+
 proc setBlockFailureFlags*(
   cs: var ChainState,
   invalidBlock: BlockIndex
 ) =
-  ## Mark all descendants of invalidBlock as BLOCK_FAILED_CHILD
-  ## Reference: Bitcoin Core's SetBlockFailureFlags
+  ## Mark all descendants of invalidBlock as BLOCK_FAILED_VALID.
+  ## Reference: Bitcoin Core's SetBlockFailureFlags (validation.cpp:3699)
   ##
-  ## Uses BFS to find all descendants and mark them
+  ## Core iterates the entire m_block_index and for every block whose ancestor
+  ## at invalidBlock.nHeight equals invalidBlock, sets BLOCK_FAILED_VALID.
+  ## This covers off-chain / side-branch descendants, not just main-chain blocks.
+  ##
+  ## BUG-01 fix: iterate ALL block index entries via cfBlockIndex scan (32-byte
+  ## hash keys), not just main-chain heights via getBlockHashByHeight.
+  ## BUG-02 fix: mark descendants BLOCK_FAILED_VALID (not BLOCK_FAILED_CHILD) to
+  ## match Core v25+ which uses only BLOCK_FAILED_VALID for candidate filtering.
 
-  var queue = initDeque[BlockHash]()
-  var visited = initTable[string, bool]()
+  # Collect all block index hashes from the DB scan first, then write.
+  # 32-byte keys are block-by-hash entries; 4-byte keys are height->hash mappings.
+  var toMark: seq[BlockHash]
 
-  # Start with all blocks at height > invalidBlock.height
-  # We need to check if they descend from invalidBlock
-  for h in (invalidBlock.height + 1) .. cs.bestHeight:
-    let hashOpt = cs.db.getBlockHashByHeight(h)
-    if hashOpt.isSome:
-      queue.addLast(hashOpt.get())
-
-  while queue.len > 0:
-    let currentHash = queue.popFirst()
-    let hashStr = $array[32, byte](currentHash)
-
-    if hashStr in visited:
+  for (key, value) in chaindb.iterCf(cs.db.db, chaindb.cfBlockIndex):
+    if key.len != 32:
+      continue  # Skip height->hash mapping entries (4-byte keys)
+    if value.len == 0:
       continue
-    visited[hashStr] = true
+    let candidate = deserializeBlockIndex(value)
+    if candidate.hash == invalidBlock.hash:
+      continue  # Don't mark the invalid block itself
+    if candidate.height <= invalidBlock.height:
+      continue  # Cannot be a descendant if at or below target height
+    # Check if this candidate's ancestor at invalidBlock.height == invalidBlock
+    let ancestorOpt = cs.getAncestorAtHeight(candidate, invalidBlock.height)
+    if ancestorOpt.isSome and ancestorOpt.get() == invalidBlock.hash:
+      toMark.add(candidate.hash)
 
-    let idxOpt = cs.db.getBlockIndex(currentHash)
+  for h in toMark:
+    let idxOpt = cs.db.getBlockIndex(h)
     if idxOpt.isNone:
       continue
-
     var idx = idxOpt.get()
-
-    # Check if this block descends from invalidBlock
-    # A block descends from invalidBlock if:
-    # 1. Its prevHash is invalidBlock's hash, OR
-    # 2. Its prevHash is a descendant of invalidBlock
-    var isDescendant = false
-    if idx.prevHash == invalidBlock.hash:
-      isDescendant = true
-    else:
-      # Check if prevHash is already marked as failed
-      let prevIdxOpt = cs.db.getBlockIndex(idx.prevHash)
-      if prevIdxOpt.isSome:
-        let prevIdx = prevIdxOpt.get()
-        if prevIdx.failureFlags.hasFlag(BLOCK_FAILED_VALID) or
-           prevIdx.failureFlags.hasFlag(BLOCK_FAILED_CHILD):
-          isDescendant = true
-
-    if isDescendant:
-      # Mark as BLOCK_FAILED_CHILD
-      idx.failureFlags.setFlag(BLOCK_FAILED_CHILD)
-      cs.db.putBlockIndex(idx)
+    idx.failureFlags.setFlag(BLOCK_FAILED_VALID)
+    cs.db.putBlockIndexHashOnly(idx)
 
 proc resetBlockFailureFlags*(
   cs: var ChainState,
   pindex: BlockIndex
 ) =
-  ## Clear failure flags from a block and all its ancestors/descendants
-  ## Reference: Bitcoin Core's ResetBlockFailureFlags
+  ## Clear BLOCK_FAILED_VALID from pindex and all its ancestors/descendants.
+  ## Reference: Bitcoin Core's ResetBlockFailureFlags (validation.cpp:3711)
   ##
-  ## Note: This function directly clears the flag from the block itself,
-  ## plus walks ancestors and descendants to clear their flags too.
+  ## Core iterates the entire m_block_index and clears BLOCK_FAILED_VALID from
+  ## any entry where:
+  ##   candidate.GetAncestor(pindex.height) == pindex   (candidate is a descendant)
+  ##   OR pindex.GetAncestor(candidate.height) == candidate (candidate is an ancestor)
+  ##
+  ## BUG-03 fix: iterate ALL block index entries (not just main-chain heights) so
+  ## side-branch descendants are also cleared.
+  ## Also removed the old ancestor-walk that unconditionally cleared flags on every
+  ## ancestor — Core only clears where the combined ancestor/descendant check passes.
 
   let targetHeight = pindex.height
 
-  # First, always clear the flags from the target block itself
-  var targetIdx = pindex
-  if targetIdx.failureFlags.isFailed():
-    targetIdx.failureFlags.clearFlag(BLOCK_FAILED_VALID)
-    targetIdx.failureFlags.clearFlag(BLOCK_FAILED_CHILD)
-    cs.db.putBlockIndex(targetIdx)
+  var toClear: seq[BlockHash]
 
-  # Walk ancestors (blocks that pindex descends from) and clear their flags
-  var current = pindex
-  while current.height > 0:
-    let prevOpt = cs.db.getBlockIndex(current.prevHash)
-    if prevOpt.isNone:
-      break
-    var ancestor = prevOpt.get()
-    if ancestor.failureFlags.isFailed():
-      ancestor.failureFlags.clearFlag(BLOCK_FAILED_VALID)
-      ancestor.failureFlags.clearFlag(BLOCK_FAILED_CHILD)
-      cs.db.putBlockIndex(ancestor)
-    current = ancestor
-
-  # Walk descendants (blocks at greater heights that descend from pindex)
-  # We need to iterate through all blocks at heights > pindex.height and check
-  # if they descend from pindex
-  #
-  # Note: In the current implementation, we only track blocks on the main chain
-  # via getBlockHashByHeight. Blocks not on the main chain would need separate
-  # tracking. For simplicity, we iterate by hash from the active chain.
-  for h in (targetHeight + 1) .. cs.bestHeight:
-    let hashOpt = cs.db.getBlockHashByHeight(h)
-    if hashOpt.isNone:
+  for (key, value) in chaindb.iterCf(cs.db.db, chaindb.cfBlockIndex):
+    if key.len != 32:
+      continue  # Skip height->hash entries
+    if value.len == 0:
       continue
+    let candidate = deserializeBlockIndex(value)
+    if not candidate.failureFlags.hasFlag(BLOCK_FAILED_VALID):
+      continue  # Only clear blocks that have BLOCK_FAILED_VALID
 
-    let idxOpt = cs.db.getBlockIndex(hashOpt.get())
+    # Check: is candidate a descendant of pindex?
+    # i.e. candidate.GetAncestor(targetHeight) == pindex
+    let isDescendant =
+      if candidate.height >= targetHeight:
+        let ancestorOpt = cs.getAncestorAtHeight(candidate, targetHeight)
+        ancestorOpt.isSome and ancestorOpt.get() == pindex.hash
+      else:
+        false
+
+    # Check: is candidate an ancestor of pindex?
+    # i.e. pindex.GetAncestor(candidate.height) == candidate
+    let isAncestor =
+      if pindex.height >= candidate.height:
+        let ancestorOpt = cs.getAncestorAtHeight(pindex, candidate.height)
+        ancestorOpt.isSome and ancestorOpt.get() == candidate.hash
+      else:
+        false
+
+    if isDescendant or isAncestor:
+      toClear.add(candidate.hash)
+
+  for h in toClear:
+    let idxOpt = cs.db.getBlockIndex(h)
     if idxOpt.isNone:
       continue
-
     var idx = idxOpt.get()
-
-    # Skip blocks without failure flags
-    if not idx.failureFlags.isFailed():
-      continue
-
-    # Check if this block descends from pindex
-    var desc = idx
-    while desc.height > targetHeight:
-      let prevOpt = cs.db.getBlockIndex(desc.prevHash)
-      if prevOpt.isNone:
-        break
-      desc = prevOpt.get()
-
-    if desc.hash == pindex.hash:
-      idx.failureFlags.clearFlag(BLOCK_FAILED_VALID)
-      idx.failureFlags.clearFlag(BLOCK_FAILED_CHILD)
-      cs.db.putBlockIndex(idx)
+    idx.failureFlags.clearFlag(BLOCK_FAILED_VALID)
+    cs.db.putBlockIndexHashOnly(idx)
 
 proc invalidateBlock*(
   cs: var ChainState,

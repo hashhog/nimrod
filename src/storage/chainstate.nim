@@ -50,8 +50,11 @@ proc clearFlag*(flags: var BlockFailureFlags, flag: BlockFailureFlags) =
   flags = BlockFailureFlags(uint8(flags) and (not uint8(flag)))
 
 proc isFailed*(flags: BlockFailureFlags): bool =
-  ## Check if block has any failure flag set
-  uint8(flags) != 0
+  ## Check if block has the BLOCK_FAILED_VALID flag set.
+  ## Reference: Bitcoin Core v25+ uses only BLOCK_FAILED_VALID for candidate
+  ## filtering (validation.cpp:3139, chain.h — BLOCK_FAILED_CHILD is unused).
+  ## BUG-02 fix: only BLOCK_FAILED_VALID constitutes a failure for chain selection.
+  flags.hasFlag(BLOCK_FAILED_VALID)
 
 type
   BlockIndex* = object
