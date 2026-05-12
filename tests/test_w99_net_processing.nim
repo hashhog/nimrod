@@ -358,23 +358,90 @@ suite "G13 orphan recursive resolution":
     check pool.takeChildrenOf(TxId(default(array[32, byte]))).len == 0
 
 # ---------------------------------------------------------------------------
-# G14 — Orphan pool keyed by WTxId
+# G14 — Orphan pool keyed by WTxId (FIXED)
 #
-# BUG: orphan.nim uses TxId (not WTxId) as the lookup key.  The comment at
-# line 60 explicitly says "txid (not wtxid) is the lookup key".  Bitcoin Core
-# (since PR #28196) keys the orphanage by wtxid so segwit orphans are not
-# evicted incorrectly.  Nimrod's txid key causes collisions between txid and
-# wtxid for segwit transactions.
+# FIX: orphan.nim now uses wtxid as the primary key (BIP-339 / Core PR #28196).
+# A secondary txidIndex (txid → wtxid) is maintained for child-lookup keyed
+# on prevout.txid and for confirming-block eviction.
 # ---------------------------------------------------------------------------
 
 suite "G14 orphan pool keyed by WTxId":
 
-  test "G14: orphan pool is keyed by txid NOT wtxid (documents BUG)":
-    ## orphan.nim:60: "txid (not wtxid) is the lookup key"
-    ## Core keys by wtxid since PR #28196.  Nimrod deviates.
+  test "G14: orphan pool primary key is wtxid (FIXED)":
+    ## orphan.nim: entries table is keyed by wtxid; txidIndex provides
+    ## txid → wtxid secondary lookup.  BIP-339 / Core PR #28196.
     let pool = newOrphanPool()
-    # entries table is Table[TxId, ...], not Table[WTxId, ...]
-    check pool.entries.len == 0  # type check evidence: compiles with TxId key
+    let peer: OrphanPeerId = ("1.2.3.4", 8333'u16)
+    let tx = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[0x01'u8],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(0), scriptPubKey: @[0x6a'u8])],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let txid = tx.txid()
+    let wtxid = tx.wtxid()
+    check pool.addOrphan(tx, peer) == true
+    # Primary key must be wtxid
+    check wtxid in pool.entries
+    # Secondary index must map txid → wtxid
+    check pool.txidIndex[txid] == wtxid
+    # contains() uses wtxid (primary key)
+    check pool.contains(wtxid) == true
+    # containsByTxid() uses txidIndex (secondary key)
+    check pool.containsByTxid(txid) == true
+    # For non-segwit txs, txid == wtxid so both lookups agree
+    check txid == wtxid
+
+  test "G14: wtxid dedup — same wtxid not added twice (FIXED)":
+    ## Even if the same transaction is relayed by two different peers,
+    ## the wtxid-keyed dedup prevents a duplicate entry.
+    let pool = newOrphanPool()
+    let peerA: OrphanPeerId = ("10.0.0.1", 8333'u16)
+    let peerB: OrphanPeerId = ("10.0.0.2", 8333'u16)
+    let tx = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 1),
+        scriptSig: @[0x02'u8],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(0), scriptPubKey: @[0x6a'u8])],
+      witnesses: @[],
+      lockTime: 0
+    )
+    check pool.addOrphan(tx, peerA) == true
+    # Second add by a different peer with the same tx (same wtxid) → rejected
+    check pool.addOrphan(tx, peerB) == false
+    check pool.count == 1
+
+  test "G14: txidIndex populated and cleaned up on remove (FIXED)":
+    ## After remove(), both entries and txidIndex must be cleared.
+    let pool = newOrphanPool()
+    let peer: OrphanPeerId = ("1.2.3.4", 8333'u16)
+    let tx = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 2),
+        scriptSig: @[0x03'u8],
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(0), scriptPubKey: @[0x6a'u8])],
+      witnesses: @[],
+      lockTime: 0
+    )
+    let txid = tx.txid()
+    let wtxid = tx.wtxid()
+    check pool.addOrphan(tx, peer) == true
+    check pool.txidIndex.len == 1
+    check pool.remove(wtxid) == true
+    check pool.entries.len == 0
+    check pool.txidIndex.len == 0
+    check pool.containsByTxid(txid) == false
 
 # ---------------------------------------------------------------------------
 # G15 — ProcessBlock: force_processing + min_pow_checked
