@@ -1788,11 +1788,9 @@ proc writeFakeCoinSnapshotRaw(path: string, networkMagic: array[4, byte],
 
 suite "W102 AssumeUTXO per-coin validation gates":
 
-  test "B1: loadSnapshot accepts coin with height > base_height (missing guard)":
+  test "B1: loadSnapshot rejects coin with height > base_height":
     # Bitcoin Core validation.cpp:5814 rejects coins where coin.nHeight >
-    # base_height. nimrod has no such check — a snapshot with a coin at
-    # height 999999 (above any current assumeutxo entry) is accepted.
-    # BUG: loadSnapshot should return (false, ...) here.
+    # base_height. Guard added in W102 fix.
     let testDir = getTempDir() / "nimrod_w102_b1"
     createDir(testDir)
     defer:
@@ -1818,17 +1816,13 @@ suite "W102 AssumeUTXO per-coin validation gates":
                           mainnet.assumeutxoData[0].blockhash, coin)
 
     let res = loadSnapshot(snapPath, cs, mainnet, mainnet.assumeutxoData)
-    # BUG: currently succeeds (res.success == true) because the guard is absent.
-    # A conforming implementation must reject with an error about bad snapshot data.
-    # When the bug is fixed, change this check to:
-    #   check res.success == false
-    #   check "Bad snapshot data" in res.error  (Core's exact phrase)
-    check res.success == true  # documents the current (buggy) behaviour
+    # Fixed: guard now rejects with "Bad snapshot data" (Core's exact phrase).
+    check res.success == false
+    check "Bad snapshot data" in res.error
 
-  test "B2: loadSnapshot accepts coin with negative value (missing MoneyRange)":
+  test "B2: loadSnapshot rejects coin with negative value (MoneyRange)":
     # Bitcoin Core validation.cpp:5820-5822 rejects coins with value outside
-    # [0, MAX_MONEY]. nimrod has no MoneyRange check during load.
-    # BUG: loadSnapshot should return (false, ...) for value < 0.
+    # [0, MAX_MONEY]. Guard added in W102 fix.
     let testDir = getTempDir() / "nimrod_w102_b2"
     createDir(testDir)
     defer:
@@ -1855,19 +1849,15 @@ suite "W102 AssumeUTXO per-coin validation gates":
                           mainnet.assumeutxoData[0].blockhash, coin)
 
     let res = loadSnapshot(snapPath, cs, mainnet, mainnet.assumeutxoData)
-    # BUG: nimrod accepts because there is no MoneyRange check.
-    # When fixed: check res.success == false
-    # For now we document the buggy acceptance (the hash check catches it
-    # at the end, but the coin has already been stored by then).
-    # The correct check is:
-    #   check res.success == false
-    #   check "bad tx out value" in res.error  (Core's exact phrase at 5821)
-    discard res  # no assertion — coin is stored and hash check fails last
+    # Fixed: MoneyRange guard now rejects before any coin is stored.
+    # Core's exact phrase at 5821: "bad tx out value"
+    check res.success == false
+    check "bad tx out value" in res.error
 
-  test "B3: vout=UINT32_MAX is NOT rejected during load (missing overflow guard)":
+  test "B3: vout=UINT32_MAX is rejected during load (overflow guard)":
     # Bitcoin Core validation.cpp:5815-5816 rejects outpoint.n == UINT32_MAX
     # to avoid integer wrap-around in coinstats.cpp ApplyHash (ApplyHash uses
-    # (outpoint.n + 1) which overflows for UINT32_MAX). nimrod has no guard.
+    # (outpoint.n + 1) which overflows for UINT32_MAX). Guard added in W102 fix.
     let testDir = getTempDir() / "nimrod_w102_b3"
     createDir(testDir)
     defer:
@@ -1891,9 +1881,9 @@ suite "W102 AssumeUTXO per-coin validation gates":
                           mainnet.assumeutxoData[0].blockhash, coin)
 
     let res = loadSnapshot(snapPath, cs, mainnet, mainnet.assumeutxoData)
-    # BUG: nimrod does not reject vout == UINT32_MAX.
-    # When fixed: check res.success == false
-    discard res  # no assertion — documents missing guard
+    # Fixed: vout == UINT32_MAX now rejected with "Bad snapshot data" (Core phrase).
+    check res.success == false
+    check "Bad snapshot data" in res.error
 
   test "B4: coins_per_txid overflow: group larger than coins_left not rejected":
     # Bitcoin Core validation.cpp:5804-5806 rejects when the compactsize
@@ -1939,13 +1929,10 @@ suite "W102 AssumeUTXO per-coin validation gates":
     defer: cs.close()
 
     let res = loadSnapshot(path, cs, mainnet, mainnet.assumeutxoData)
-    # nimrod reads coinsCount (=1) coins from the file, sees the group's
-    # compactsize is 2, reads coin A, then stops (coinsRead==coinsCount).
-    # The inconsistency between the group compactsize (2) and the header count
-    # (1) is silently ignored. Core would have rejected with
-    # "Mismatch in coins count in snapshot metadata and actual snapshot data"
-    # BUG: should return (false, ...)
-    discard res  # documents missing guard
+    # Fixed: the B4 guard in readCoin now rejects when coins_per_txid > coins_left.
+    # Core's exact phrase: "Mismatch in coins count in snapshot metadata and actual snapshot data"
+    check res.success == false
+    check "Mismatch in coins count" in res.error
 
   test "B5: trailing bytes after all coins are silently ignored (missing exhaustion check)":
     # Bitcoin Core validation.cpp:5872-5882 attempts to read one extra byte
@@ -1981,13 +1968,49 @@ suite "W102 AssumeUTXO per-coin validation gates":
     f.close()
 
     # Attempt to load: the metadata fails first (regtest has no assumeutxo
-    # entries), but the file-format check (trailing bytes) is distinct from
-    # the whitelist check. We document the absence of a trailing-bytes check.
+    # entries) before trailing bytes are checked. This case correctly reports
+    # the whitelist error. The trailing-bytes guard (B5 fix) would fire if a
+    # valid whitelisted hash were used with a snapshot that has extra data after
+    # all declared coins.
     let res = loadSnapshot(path, cs, regtest, regtest.assumeutxoData)
-    # Correctly fails due to whitelist, but does NOT fail due to trailing bytes.
-    # If we used a valid whitelisted hash, it would succeed despite the garbage.
     check res.success == false
-    check "not recognized" in res.error  # whitelist error, NOT trailing-bytes error
+    check "not recognized" in res.error  # whitelist check fires before trailing-bytes check
+
+  test "B5b: trailing bytes after all coins rejected when whitelisted hash used":
+    # Part 2: use a mainnet whitelisted blockhash with a zero-coin snapshot
+    # that has garbage appended. The B5 trailing-bytes guard must fire and
+    # reject with "coins left over" (Core's exact phrase at validation.cpp:5881).
+    let testDir = getTempDir() / "nimrod_w102_b5b"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let mainnet = mainnetParams()
+    var cs = newChainState(dbDir, mainnet)
+    defer: cs.close()
+
+    # Build a zero-coin mainnet snapshot (coinsCount=0) + trailing garbage bytes.
+    let path = testDir / "trailing-mainnet.dat"
+    let meta = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: mainnet.networkMagic,
+      baseBlockhash: mainnet.assumeutxoData[0].blockhash,
+      coinsCount: 0
+    )
+    var w = BinaryWriter()
+    w.writeSnapshotMetadata(meta)
+    let f = open(path, fmWrite)
+    discard f.writeBytes(w.data, 0, w.data.len)
+    let garbage = @[0xDE'u8, 0xAD, 0xBE, 0xEF]
+    discard f.writeBytes(garbage, 0, garbage.len)
+    f.close()
+
+    let res = loadSnapshot(path, cs, mainnet, mainnet.assumeutxoData)
+    # Fixed: B5 guard detects extra bytes and rejects with Core's exact phrase.
+    check res.success == false
+    check "coins left over" in res.error
 
   test "B6: validateSnapshot marks auValidated without computing background UTXO hash":
     # Bitcoin Core validation.cpp:6033-6072 recomputes ComputeUTXOStats
@@ -2032,10 +2055,10 @@ suite "W102 AssumeUTXO per-coin validation gates":
     # without UTXO hash verification:
     check snapshotChain.assumeutxo == auUnvalidated  # unchanged = stub's limitation
 
-  test "B7: activateSnapshot has no double-activation guard":
+  test "B7: activateSnapshot double-activation guard fires before file I/O":
     # Bitcoin Core validation.cpp:5600-5601 returns an error if a
     # snapshot-based chainstate already exists ("Can't activate a snapshot-based
-    # chainstate more than once"). nimrod's activateSnapshot has no such guard.
+    # chainstate more than once"). Guard added in W102 fix.
     let testDir = getTempDir() / "nimrod_w102_b7"
     createDir(testDir)
     defer:
@@ -2053,28 +2076,18 @@ suite "W102 AssumeUTXO per-coin validation gates":
     scs.snapshotBlockhash = some(BlockHash(mkHashWith([0xB7'u8])))
 
     # Attempt a second activation on the same SnapshotChainState.
-    # There is no snapshot file to open, but the guard should fire BEFORE
-    # any file I/O. Core would return "Can't activate a snapshot-based
-    # chainstate more than once" immediately.
-    # BUG: nimrod proceeds to open the (non-existent) file.
+    # The guard fires BEFORE any file I/O — the bogus path is never opened.
     let bogusPath = testDir / "does-not-exist.dat"
     let res2 = activateSnapshot(scs, bogusPath, regtest, regtest.assumeutxoData)
-    # We expect failure — but from the file-not-found OSError, NOT from a guard.
-    # When the guard is added, the error should be explicit about double-activation.
-    check res2.success == false  # fails, but for the wrong reason (OSError)
+    # Fixed: guard returns the Core-exact error before touching the file.
+    check res2.success == false
+    check "Can't activate a snapshot-based chainstate more than once" in res2.error
 
-  test "B8: work-exceeds-active-chainstate pre-check is absent in loadSnapshot":
+  test "B8: work-exceeds-active-chainstate pre-check rejects when active chain is at/past snapshot height":
     # Bitcoin Core PopulateAndValidateSnapshot (validation.cpp:5787-5788)
     # pre-checks that the snapshot block's work exceeds the active chain tip.
-    # nimrod's loadSnapshot has no such check. Loading a very old/low-work
-    # snapshot on an already-synced chain would succeed and corrupt the state.
-    #
-    # We document the absence rather than triggering it (replicating the
-    # actual work comparison would require a full PoW chain). The test
-    # verifies that a snapshot at height 840000 (which has more work than
-    # a fresh regtest chain) is accepted — the pre-check is implicitly not
-    # preventing valid snapshots, but we note that the reverse case (snapshot
-    # has LESS work than active tip) is also not prevented.
+    # W102 fix: nimrod approximates this via height comparison since AssumeutxoData
+    # does not store chainwork. A chain already at or past the snapshot height is rejected.
     let testDir = getTempDir() / "nimrod_w102_b8"
     createDir(testDir)
     defer:
@@ -2082,14 +2095,12 @@ suite "W102 AssumeUTXO per-coin validation gates":
     let dbDir = testDir / "cs"
     createDir(dbDir)
 
-    # The actual work pre-check requires block-index work fields nimrod does
-    # not populate from chainstate.nim. We verify the architectural gap:
-    # loadSnapshot succeeds for a whitelisted hash regardless of chain state.
     let mainnet = mainnetParams()
     var cs = newChainState(dbDir, mainnet)
     defer: cs.close()
 
-    # Craft a snapshot with a valid blockhash but zero coins (hash mismatch).
+    # Part 1: fresh chain (bestHeight=0) — guard does NOT fire; snapshot proceeds
+    # to fail at hash check (zero coins != expected hash).
     let path = testDir / "low-work.dat"
     let meta = SnapshotMetadata(
       version: SnapshotVersion,
@@ -2104,11 +2115,21 @@ suite "W102 AssumeUTXO per-coin validation gates":
     f.close()
 
     let res = loadSnapshot(path, cs, mainnet, mainnet.assumeutxoData)
-    # Passes the whitelist gate, then fails only at the hash check.
-    # A real active chain with more work should have been rejected earlier.
+    # Fresh chain: work guard does not fire (bestHeight=0); fails at hash check.
     check res.success == false
-    # Fails because zero-coin hash does not match — NOT because of work check.
     check "Bad snapshot content hash" in res.error
+
+    # Part 2: simulate an active chain that is already AT the snapshot height.
+    # The guard must reject before reading any coins.
+    let dbDir2 = testDir / "cs2"
+    createDir(dbDir2)
+    var cs2 = newChainState(dbDir2, mainnet)
+    defer: cs2.close()
+    cs2.bestHeight = mainnet.assumeutxoData[0].height  # = 840000
+
+    let res2 = loadSnapshot(path, cs2, mainnet, mainnet.assumeutxoData)
+    check res2.success == false
+    check "Work does not exceed active chainstate" in res2.error
 
   test "B9: validateSnapshotMetadata reports height=0 for all unknown hashes":
     # Bitcoin Core's ActivateSnapshot error message includes the actual height

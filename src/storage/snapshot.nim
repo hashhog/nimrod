@@ -491,6 +491,13 @@ proc readCoin*(sf: SnapshotFile): Option[SnapshotCoin] =
     sf.pendingRemaining = readCompactSizeStream(sf.file)
     if sf.pendingRemaining == 0:
       raise newException(SnapshotError, "snapshot txid group with zero coins")
+    # B4: coins_per_txid > coins_left group overcount detection
+    # (bitcoin-core/src/validation.cpp:5804-5806).
+    # Reject if a single txid group claims more coins than remain in the header count.
+    let coinsLeft = sf.metadata.coinsCount - sf.coinsRead
+    if sf.pendingRemaining > coinsLeft:
+      raise newException(SnapshotError,
+        "Mismatch in coins count in snapshot metadata and actual snapshot data")
   let coin = sf.readCoinStream(sf.pendingTxid)
   dec sf.pendingRemaining
   inc sf.coinsRead
@@ -688,6 +695,17 @@ proc loadSnapshot*(
     return (false, 0'u64, validation.error)
   let assumeData = validation.data.get()
 
+  # B8: Work-exceeds-active-chainstate pre-check
+  # (bitcoin-core/src/validation.cpp:5787-5788, PopulateAndValidateSnapshot).
+  # Reject if the active chain is already at or past the snapshot height — in
+  # that case the snapshot's work cannot exceed the active tip's work, so
+  # loading it would corrupt the state. We approximate with height since
+  # AssumeutxoData does not store chainwork.
+  if targetCs.bestHeight > 0 and targetCs.bestHeight >= assumeData.height:
+    return (false, 0'u64, "Work does not exceed active chainstate")
+
+  let baseHeight = assumeData.height
+
   var coinsLoaded: uint64 = 0
   # Stream every loaded coin's canonical `TxOutSer` bytes through a
   # `HashWriter` (SHA256d) so we can verify the snapshot's `hash_serialized`
@@ -695,29 +713,67 @@ proc loadSnapshot*(
   # This is the `CoinStatsHashType::HASH_SERIALIZED` branch — NOT MuHash3072.
   # We must NOT mark the chain tip valid until the digest matches au_data.
   var hw = initHashWriter()
-  while true:
-    let coinOpt = sf.readCoin()
-    if coinOpt.isNone:
-      break
-    let coin = coinOpt.get()
-    let entry = UtxoEntry(
-      output: coin.output,
-      height: coin.height,
-      isCoinbase: coin.isCoinbase
-    )
-    targetCs.putUtxoCache(coin.outpoint, entry)
-    targetCs.db.putUtxo(coin.outpoint, entry)
-    let coinBytes = serializeCoinForHash(
-      coin.outpoint, int64(coin.output.value), coin.output.scriptPubKey,
-      coin.height, coin.isCoinbase
-    )
-    hw.update(coinBytes)
-    inc coinsLoaded
+  # Wrap the streaming loop: SnapshotError from readCoin (including B4
+  # group-overcount) surfaces as a structured failure rather than an exception.
+  try:
+    while true:
+      let coinOpt = sf.readCoin()
+      if coinOpt.isNone:
+        break
+      let coin = coinOpt.get()
+
+      # B1: coin.nHeight > base_height guard
+      # (bitcoin-core/src/validation.cpp:5814).
+      if coin.height > baseHeight:
+        return (false, coinsLoaded,
+                "Bad snapshot data after deserializing " & $coinsLoaded & " coins")
+
+      # B3: vout == UINT32_MAX coinstats overflow guard
+      # (bitcoin-core/src/validation.cpp:5815-5816 — avoids integer wrap-around
+      # in coinstats.cpp::ApplyHash which uses outpoint.n + 1).
+      if coin.outpoint.vout >= 0xFFFFFFFF'u32:
+        return (false, coinsLoaded,
+                "Bad snapshot data after deserializing " & $coinsLoaded & " coins")
+
+      # B2: per-coin MoneyRange check
+      # (bitcoin-core/src/validation.cpp:5820-5822).
+      let coinValue = int64(coin.output.value)
+      if coinValue < 0 or coinValue > int64(MaxMoney):
+        return (false, coinsLoaded,
+                "Bad snapshot data after deserializing " & $coinsLoaded &
+                " coins - bad tx out value")
+
+      let entry = UtxoEntry(
+        output: coin.output,
+        height: coin.height,
+        isCoinbase: coin.isCoinbase
+      )
+      targetCs.putUtxoCache(coin.outpoint, entry)
+      targetCs.db.putUtxo(coin.outpoint, entry)
+      let coinBytes = serializeCoinForHash(
+        coin.outpoint, int64(coin.output.value), coin.output.scriptPubKey,
+        coin.height, coin.isCoinbase
+      )
+      hw.update(coinBytes)
+      inc coinsLoaded
+  except SnapshotError as e:
+    return (false, coinsLoaded, e.msg)
 
   if coinsLoaded != sf.metadata.coinsCount:
     return (false, coinsLoaded,
             "coin count mismatch: expected " & $sf.metadata.coinsCount &
             ", got " & $coinsLoaded)
+
+  # B5: Trailing-bytes exhaustion check
+  # (bitcoin-core/src/validation.cpp:5872-5882).
+  # After all declared coins have been consumed, attempt to read one more byte.
+  # If the read SUCCEEDS (returns data), the file has extra garbage bytes — reject.
+  # If it raises an exception / returns 0 (EOF), we're exactly out of data — accept.
+  var trailingBuf = newSeq[byte](1)
+  let trailingGot = sf.file.readBytes(trailingBuf, 0, 1)
+  if trailingGot > 0:
+    return (false, coinsLoaded,
+            "Bad snapshot - coins left over after deserializing " & $coinsLoaded & " coins")
 
   # Strict assumeutxo content-hash check, matching Bitcoin Core verbatim
   # (`bitcoin-core/src/validation.cpp:5912-5914`):
@@ -769,6 +825,12 @@ proc activateSnapshot*(
     params: ConsensusParams,
     assumeutxoData: seq[AssumeutxoData]
 ): tuple[success: bool, error: string] =
+  # B7: Double-activation guard
+  # (bitcoin-core/src/validation.cpp:5600-5601).
+  # "Can't activate a snapshot-based chainstate more than once."
+  if snapshotCs.assumeutxo == auUnvalidated:
+    return (false, "Can't activate a snapshot-based chainstate more than once")
+
   let res = loadSnapshot(
     snapshotPath, snapshotCs.chainState, params, assumeutxoData
   )
