@@ -84,6 +84,10 @@ suite "Taproot key-path hash_type whitelist (Core interpreter.cpp:1516)":
 
 suite "Taproot CHECKSIGADD hash_type whitelist (mirrors CHECKSIG)":
   ## Same allowlist as key-path; pre-fix CHECKSIGADD did not validate.
+  ##
+  ## W95 update: an invalid hash_type byte is a HARD error in tapscript
+  ## (Core SCRIPT_ERR_SCHNORR_SIG_HASHTYPE) — `runCheckSigAdd` returns
+  ## -1 to indicate the eval failed, rather than 0 for a soft fail.
 
   proc makeTapCtx(): SigCheckContext =
     var dummyTx = Transaction()
@@ -136,23 +140,25 @@ suite "Taproot CHECKSIGADD hash_type whitelist (mirrors CHECKSIG)":
     if not ok: return -1
     int64(top)
 
-  test "0x04 invalid hashType: signature counted as failed (n stays 0)":
-    # Pre-fix: nimrod called computeSighashTaproot with the bogus byte,
-    # which would either produce a valid sighash (still fails Schnorr)
-    # or crash. Post-fix: skip Schnorr; accumulator stays at 0.
-    check runCheckSigAdd(0x04'u8) == 0'i64
+  test "0x04 invalid hashType: HARD error (Core SCHNORR_SIG_HASHTYPE)":
+    # W95: per Core's CheckSchnorrSignature (interpreter.cpp:1733-1740),
+    # an out-of-allowlist hash_type byte is a hard error, not a soft
+    # accumulator-unchanged fail. EvalChecksig returns false → the
+    # CHECKSIGADD opcode returns false → eval terminates with
+    # seSchnorrSigHashtype.
+    check runCheckSigAdd(0x04'u8) == -1'i64
 
-  test "0x00 explicit SIGHASH_DEFAULT on 65-byte sig: counted as failed":
-    check runCheckSigAdd(0x00'u8) == 0'i64
+  test "0x00 explicit SIGHASH_DEFAULT on 65-byte sig: HARD error":
+    check runCheckSigAdd(0x00'u8) == -1'i64
 
-  test "0x84 (above 0x83 band): counted as failed":
-    check runCheckSigAdd(0x84'u8) == 0'i64
+  test "0x84 (above 0x83 band): HARD error":
+    check runCheckSigAdd(0x84'u8) == -1'i64
 
-  test "0x80 (lone ANYONECANPAY): counted as failed":
-    check runCheckSigAdd(0x80'u8) == 0'i64
+  test "0x80 (lone ANYONECANPAY): HARD error":
+    check runCheckSigAdd(0x80'u8) == -1'i64
 
-  test "0xfe: counted as failed":
-    check runCheckSigAdd(0xfe'u8) == 0'i64
+  test "0xfe: HARD error":
+    check runCheckSigAdd(0xfe'u8) == -1'i64
 
 suite "Taproot control-block max size (Core interpreter.cpp:1970)":
   ## Control block size must be in [33, 4129] = [33, 33+32*128].
