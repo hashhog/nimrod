@@ -279,23 +279,15 @@ suite "W97 G7: contextualCheckBlockHeader invoked with prev pindex":
 
 suite "W97 G8: too-little-chainwork (header chain below minChainWork)":
 
-  test "headers below minimumChainWork MUST be rejected (CURRENTLY ABSENT)":
-    ## Core validation.cpp:4220 — `if (!min_pow_checked) return
+  test "minPowChecked=false + non-zero minimumChainWork → veInsufficientChainWork":
+    ## Core validation.cpp:4220-4229 — `if (!min_pow_checked) return
     ## state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK,
-    ## "too-little-chainwork")`.  The `min_pow_checked` flag is set by
-    ## the headerssync presync logic when claimed work crosses the
-    ## minimumChainWork threshold.
-    ##
-    ## nimrod's `minimumChainWork` is defined in params.nim:71 and feeds
-    ## chainstate.nim's `meetsMinimumWork`, but the result is ONLY
-    ## consulted in the assumevalid skip-scripts decision
-    ## (consensus/assumevalid.nim:151-153). Neither
-    ## validateBlockHeader nor validateBlock nor handleHeaders cross-
-    ## references the header chain's cumulative work against this
-    ## threshold. A low-work tip-extending header is silently accepted.
+    ## "too-little-chainwork")`.  The flag is false when a peer feeds
+    ## headers that have not been validated by the PRESYNC anti-DoS
+    ## pipeline.  W97 G8 fix: validateBlockHeader now enforces this gate.
     var p = regtestParams()
-    # Force a non-trivial minimumChainWork (2 ^ 240, well above any
-    # plausible regtest cumulative work).
+    # Set a non-trivial minimumChainWork (2^240 — well above any
+    # plausible regtest cumulative work so the gate always fires).
     p.minimumChainWork[30] = 1'u8
 
     let dbPath = freshDbPath()
@@ -307,13 +299,60 @@ suite "W97 G8: too-little-chainwork (header chain below minChainWork)":
     let prevIdx = cs.db.getBlockIndex(prevHash).get()
 
     let candidate = makeBlk(prevHash, 3, 1_700_005_000'u32)
+    # minPowChecked=false → PRESYNC has NOT validated work; must reject.
     let res = validateBlockHeader(candidate.header, prevIdx, p,
-                                  checkPow = false)
-    when defined(w97_strict):
-      check (not res.isOk)
-      check res.error == veInsufficientChainWork
-    else:
-      check res.isOk  # current (buggy) accept
+                                  checkPow = false, minPowChecked = false)
+    check (not res.isOk)
+    check res.error == veInsufficientChainWork
+
+  test "minPowChecked=true + non-zero minimumChainWork → gate bypassed (PRESYNC approved)":
+    ## When minPowChecked=true the PRESYNC pipeline has already verified that
+    ## the claimed chain work meets minimumChainWork; validateBlockHeader must
+    ## NOT re-check and must accept the header on this gate.
+    var p = regtestParams()
+    p.minimumChainWork[30] = 1'u8  # Same non-trivial threshold as above
+
+    let dbPath = freshDbPath()
+    defer: cleanupDb(dbPath)
+    var (cs, blks) = buildChainN(dbPath, p, 3)
+    defer: cs.close()
+
+    let prevHash = getBlockHash(blks[2])
+    let prevIdx = cs.db.getBlockIndex(prevHash).get()
+
+    let candidate = makeBlk(prevHash, 3, 1_700_005_000'u32)
+    # minPowChecked=true → PRESYNC already approved; gate must not fire.
+    let res = validateBlockHeader(candidate.header, prevIdx, p,
+                                  checkPow = false, minPowChecked = true)
+    # Gate passes; block is valid (timestamps + prevBlock OK on regtest).
+    check res.isOk
+
+  test "minPowChecked=false + zero minimumChainWork (regtest default) → gate silent":
+    ## On regtest minimumChainWork is all-zeros (no minimum), so the gate
+    ## must NOT fire even when minPowChecked=false.  This validates that the
+    ## fix does not break regtest / networks with no work threshold.
+    let p = regtestParams()
+    # Confirm regtest has zero minimumChainWork (all bytes 0).
+    var allZero = true
+    for b in p.minimumChainWork:
+      if b != 0:
+        allZero = false
+        break
+    check allZero  # Sanity: regtest threshold really is zero
+
+    let dbPath = freshDbPath()
+    defer: cleanupDb(dbPath)
+    var (cs, blks) = buildChainN(dbPath, p, 3)
+    defer: cs.close()
+
+    let prevHash = getBlockHash(blks[2])
+    let prevIdx = cs.db.getBlockIndex(prevHash).get()
+
+    let candidate = makeBlk(prevHash, 3, 1_700_005_000'u32)
+    # minPowChecked=false but minimumChainWork=0 → gate is silent.
+    let res = validateBlockHeader(candidate.header, prevIdx, p,
+                                  checkPow = false, minPowChecked = false)
+    check res.isOk
 
 # ===========================================================================
 # Suite 6: G9 — AddToBlockIndex (header persistence)
