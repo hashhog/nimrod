@@ -59,6 +59,14 @@ type
     seDiscourageUpgradablePubkeyType = "discourage upgradable tapscript pubkey type"
     seBadOpcode = "malformed opcode or push (BAD_OPCODE)"
     seTaprootWrongControlSize = "taproot control block has wrong size"
+    # BIP-340 / BIP-342 hard Schnorr errors in tapscript. Mirror Core's
+    # SCRIPT_ERR_SCHNORR_SIG_SIZE / _HASHTYPE / _SIG (interpreter.cpp:1726,
+    # :1733, :1737-1740). In tapscript, any non-empty signature on a
+    # 32-byte (defined) pubkey that fails verification MUST hard-error;
+    # there is no NULLFAIL fall-through.
+    seSchnorrSigSize = "schnorr signature length must be 64 or 65 (BIP-340)"
+    seSchnorrSigHashtype = "invalid schnorr sighash byte (BIP-341)"
+    seSchnorrSig = "schnorr signature verification failed (BIP-340)"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -1712,26 +1720,54 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
           # BIP-342: unknown (non-32-byte, non-empty) pubkey types succeed
           # for forward soft-fork compat. The DISCOURAGE_UPGRADABLE_PUBKEYTYPE
           # gate already fired above (and short-circuited if set), so here
-          # we simply leave `success = true` for the unknown-type path.
+          # we leave `success = true` for the unknown-type path (mirrors
+          # Core leaving `success = !sig.empty()` unchanged).
           if ctx.sigVersion == sigTapscript and pubkey.len != 0 and pubkey.len != 32:
             success = true
-          # Taproot Schnorr signature check (BIP340)
-          elif pubkey.len == 32 and (sig.len == 64 or sig.len == 65):
+          # Taproot Schnorr signature check (BIP340).
+          # In tapscript (sigTapscript), a non-empty sig on a 32-byte
+          # pubkey that fails ANY of these gates is a HARD error per
+          # Core's CheckSchnorrSignature (interpreter.cpp:1721-1741):
+          #   * sig.size() != 64 && != 65   -> SCRIPT_ERR_SCHNORR_SIG_SIZE
+          #   * explicit SIGHASH_DEFAULT byte in 65-byte sig
+          #                                 -> SCRIPT_ERR_SCHNORR_SIG_HASHTYPE
+          #   * hash_type byte out of {0x01,0x02,0x03,0x81,0x82,0x83}
+          #                                 -> SCRIPT_ERR_SCHNORR_SIG_HASHTYPE
+          #   * Schnorr verify returns false -> SCRIPT_ERR_SCHNORR_SIG
+          # There is no NULLFAIL fall-through here; the failures are
+          # hard errors regardless of the NULLFAIL flag (which is a
+          # legacy/segwit-v0 concept; BIP-342 NULLFAIL is implied via
+          # the hard-error path).
+          elif pubkey.len == 32:
+            # Hard-size-gate. Only reached with sig.len > 0 because the
+            # outer `if sig.len > 0 and pubkey.len > 0` admitted us.
+            if sig.len != 64 and sig.len != 65:
+              if ctx.sigVersion == sigTapscript:
+                return seSchnorrSigSize
+              # sigTaproot inside EvalScript is dead code (key-path verify
+              # happens in verifyWitnessProgram), but mirror Core's
+              # CheckSchnorrSignature: non-{64,65} is always an error.
+              return seSchnorrSigSize
+
             var hashType: uint8 = SIGHASH_DEFAULT
             var sigBytes: array[64, byte]
 
             if sig.len == 65:
               hashType = sig[64]
-              # Validate hashType
-              if hashType != SIGHASH_DEFAULT and hashType != SIGHASH_ALL and
-                 hashType != SIGHASH_NONE and hashType != SIGHASH_SINGLE and
-                 hashType != (SIGHASH_ALL or SIGHASH_ANYONECANPAY) and
-                 hashType != (SIGHASH_NONE or SIGHASH_ANYONECANPAY) and
-                 hashType != (SIGHASH_SINGLE or SIGHASH_ANYONECANPAY):
-                if opcode == OP_CHECKSIGVERIFY:
-                  return seCheckSigVerify
-                interp.push(@[])
-                continue
+              # Explicit SIGHASH_DEFAULT byte is invalid (BIP-341): the
+              # 64-byte form is the canonical encoding of SIGHASH_DEFAULT.
+              if hashType == SIGHASH_DEFAULT:
+                if ctx.sigVersion == sigTapscript:
+                  return seSchnorrSigHashtype
+                return seSchnorrSigHashtype
+              # Validate hashType against the BIP-341 allowed set
+              # {0x01, 0x02, 0x03, 0x81, 0x82, 0x83}. Equivalent to
+              # `hashType <= 0x03 or (0x81 <= hashType <= 0x83)`.
+              if not (hashType <= 0x03'u8 or
+                      (hashType >= 0x81'u8 and hashType <= 0x83'u8)):
+                if ctx.sigVersion == sigTapscript:
+                  return seSchnorrSigHashtype
+                return seSchnorrSigHashtype
 
             for i in 0 ..< 64:
               sigBytes[i] = sig[i]
@@ -1745,8 +1781,21 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
               ctx.tx, ctx.inputIndex, ctx.amounts, ctx.scriptPubKeys,
               hashType, extFlag, ctx.annex, ctx.tapleafHash, ctx.codesepPos
             )
+            # SIGHASH_SINGLE out-of-range output: computeSighashTaproot
+            # returns the all-zero sentinel; treat as hard hashtype error
+            # to match Core's `if (in_pos >= tx_to.vout.size()) return
+            # false;` -> SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.
+            let baseType = (if hashType == 0x00: SIGHASH_ALL else: hashType) and 0x1f
+            if baseType == SIGHASH_SINGLE and ctx.inputIndex >= ctx.tx.outputs.len:
+              if ctx.sigVersion == sigTapscript:
+                return seSchnorrSigHashtype
 
             success = verifySchnorr(xonlyPk, @sighash, sigBytes)
+            # In tapscript, a non-empty Schnorr sig that fails verify is
+            # a HARD error (Core: SCRIPT_ERR_SCHNORR_SIG). Skip NULLFAIL
+            # fall-through entirely for tapscript Schnorr.
+            if not success and ctx.sigVersion == sigTapscript:
+              return seSchnorrSig
 
       # BIP146 NULLFAIL: if signature check failed and NULLFAIL flag is set,
       # the signature must be empty
@@ -2002,47 +2051,52 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
         return seDiscourageUpgradablePubkeyType
 
       var success = sig.len > 0
-      var skipDueToHashType = false
       if pubkey.len == 32:
         # Defined tapscript pubkey: verify Schnorr signature.
-        if sig.len > 0 and (sig.len == 64 or sig.len == 65):
+        # In tapscript, ANY failure on a non-empty signature with a
+        # 32-byte pubkey is a HARD error per Core's
+        # CheckSchnorrSignature (interpreter.cpp:1721-1741).
+        if sig.len > 0:
+          # SCRIPT_ERR_SCHNORR_SIG_SIZE (BIP-340).
+          if sig.len != 64 and sig.len != 65:
+            return seSchnorrSigSize
+
           var hashType: uint8 = SIGHASH_DEFAULT
           var sigBytes: array[64, byte]
 
           if sig.len == 65:
             hashType = sig[64]
-            # BIP-341 / Core SignatureHashSchnorr (interpreter.cpp:1733).
-            # Invalid sighash byte ⇒ verification fails without computing
-            # the sighash. (For 64-byte sigs, SIGHASH_DEFAULT is implied.)
+            # BIP-341: explicit SIGHASH_DEFAULT byte in 65-byte sig is
+            # invalid (the canonical encoding is the 64-byte form).
             if hashType == SIGHASH_DEFAULT:
-              skipDueToHashType = true
-            elif not (hashType <= 0x03'u8 or
-                      (hashType >= 0x81'u8 and hashType <= 0x83'u8)):
-              skipDueToHashType = true
+              return seSchnorrSigHashtype
+            # SIGHASH range gate: {0x01, 0x02, 0x03, 0x81, 0x82, 0x83}.
+            if not (hashType <= 0x03'u8 or
+                    (hashType >= 0x81'u8 and hashType <= 0x83'u8)):
+              return seSchnorrSigHashtype
 
-          if skipDueToHashType:
-            success = false
-          else:
-            for i in 0 ..< 64:
-              sigBytes[i] = sig[i]
+          for i in 0 ..< 64:
+            sigBytes[i] = sig[i]
 
-            var xonlyPk: array[32, byte]
-            for i in 0 ..< 32:
-              xonlyPk[i] = pubkey[i]
+          var xonlyPk: array[32, byte]
+          for i in 0 ..< 32:
+            xonlyPk[i] = pubkey[i]
 
-            let sighash = computeSighashTaproot(
-              ctx.tx, ctx.inputIndex, ctx.amounts, ctx.scriptPubKeys,
-              hashType, 1, ctx.annex, ctx.tapleafHash, ctx.codesepPos
-            )
+          let sighash = computeSighashTaproot(
+            ctx.tx, ctx.inputIndex, ctx.amounts, ctx.scriptPubKeys,
+            hashType, 1, ctx.annex, ctx.tapleafHash, ctx.codesepPos
+          )
+          # SIGHASH_SINGLE out-of-range output: Core returns false from
+          # SignatureHashSchnorr -> SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.
+          let baseType = (if hashType == 0x00: SIGHASH_ALL else: hashType) and 0x1f
+          if baseType == SIGHASH_SINGLE and ctx.inputIndex >= ctx.tx.outputs.len:
+            return seSchnorrSigHashtype
 
-            success = verifySchnorr(xonlyPk, @sighash, sigBytes)
-        elif sig.len > 0:
-          # Wrong-sized Schnorr signature on a 32-byte pubkey: counts
-          # as a failed verification (success stays false), matching
-          # Core's SCRIPT_ERR_SCHNORR_SIG_SIZE reject behaviour (we
-          # express this as success=false so n is unchanged).
-          success = false
-        # else sig.empty() — success stays false from initialization.
+          success = verifySchnorr(xonlyPk, @sighash, sigBytes)
+          if not success:
+            return seSchnorrSig
+        # else sig.empty() — success stays false from initialization
+        #                   (n unchanged when pushed below).
       else:
         # Unknown pubkey type (future soft fork). Core: relay-level
         # reject under SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE;
@@ -2505,6 +2559,13 @@ proc verifyWitnessProgram*(
           else:
             taprootAmounts.add(Satoshi(0))
             taprootScriptPubKeys.add(@[])
+
+      # BIP-341 / Core SignatureHashSchnorr (interpreter.cpp:1550):
+      # SIGHASH_SINGLE with input_index out-of-range for outputs makes
+      # the sighash computation fail. Reject before invoking Schnorr.
+      let baseType = (if hashType == 0x00: SIGHASH_ALL else: hashType) and 0x1f
+      if baseType == SIGHASH_SINGLE and inputIndex >= tx.outputs.len:
+        return false
 
       let sighash = computeSighashTaproot(
         tx, inputIndex, taprootAmounts, taprootScriptPubKeys, hashType, 0, annex
