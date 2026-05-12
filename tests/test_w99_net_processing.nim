@@ -46,31 +46,23 @@ proc readyPeer(ip: string = "10.0.0.1", port: uint16 = 8333,
 
 suite "G1 Misbehaving single-event discourage":
 
-  test "G1: score-accumulation model still in use (BUG: should be single-event)":
-    ## Core post-2022 Misbehaving() discourages on the *first* call regardless
-    ## of how-much.  Nimrod accumulates — a small-score call does NOT set
-    ## shouldDisconnect.  This test documents the deviation.
+  test "G1: single small-score call immediately sets shouldDisconnect (FIXED)":
+    ## Core post-2022 PR #25974: any Misbehaving call → shouldDiscourage = true.
+    ## Fixed: first call regardless of howmuch sets shouldDisconnect = true.
     var peer = makePeer()
-    # In Core: any Misbehaving call → peer.ShouldDiscourage() = true
-    # In nimrod: only when score reaches 100
     misbehaving(peer, 10, "small violation")
-    # BUG: shouldDisconnect should be true but is false (score only 10/100)
-    check peer.shouldDisconnect == false   # documents the deviation
-    check peer.misbehaviorScore == 10      # score-accumulation evidence
+    check peer.shouldDisconnect == true    # FIXED: single-event discourage
 
-  test "G1: multiple sub-threshold events accumulate without disconnect":
+  test "G1: first of multiple sub-threshold events immediately discourages (FIXED)":
+    ## Even the very first 10-point call must set shouldDisconnect.
     var peer = makePeer()
-    for i in 0 ..< 9:
-      misbehaving(peer, 10, "violation")
-    # After 9 × 10 = 90 points, still no disconnect in nimrod
-    check peer.misbehaviorScore == 90
-    check peer.shouldDisconnect == false   # BUG vs Core single-event model
+    misbehaving(peer, 10, "violation")
+    check peer.shouldDisconnect == true    # FIXED: single-event on first call
 
   test "G1: score capped at threshold (100)":
     var peer = makePeer()
     misbehaving(peer, 50, "half")
     misbehaving(peer, 50, "other half")
-    check peer.misbehaviorScore == 100
     check peer.shouldDisconnect == true
 
   test "G1: instant ban with score >= 100":

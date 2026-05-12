@@ -1535,25 +1535,22 @@ const
   ScoreUnrequestedData* = 5'u32       # Sending unrequested data
 
 proc misbehaving*(peer: var Peer, howmuch: uint32, message: string) =
-  ## Add misbehavior points to a peer. At 100 points, peer is flagged for disconnect.
-  ## Match Bitcoin Core's Misbehaving() behavior from net_processing.cpp
-  let oldScore = peer.misbehaviorScore
-  peer.misbehaviorScore = min(peer.misbehaviorScore + howmuch, MisbehaviorThreshold)
+  ## Single-event discourage: any Misbehaving call immediately flags the peer
+  ## for disconnect, regardless of howmuch.
+  ## Reference: Bitcoin Core 2022 PR #25974 — score-accumulation removed;
+  ## Misbehaving() now sets m_should_discourage = true unconditionally.
+  peer.shouldDisconnect = true
 
   let messagePart = if message.len > 0: ": " & message else: ""
-  warn "peer misbehaving", peer = $peer, score = howmuch,
-       total = peer.misbehaviorScore, reason = messagePart
-
-  if peer.misbehaviorScore >= MisbehaviorThreshold and oldScore < MisbehaviorThreshold:
-    peer.shouldDisconnect = true
-    warn "peer exceeded misbehavior threshold, flagged for ban", peer = $peer
+  warn "peer misbehaving — flagged for discourage", peer = $peer,
+       score = howmuch, reason = messagePart
 
 proc shouldBan*(peer: Peer): bool =
-  ## Check if peer should be banned (score >= threshold)
-  peer.misbehaviorScore >= MisbehaviorThreshold
+  ## Check if peer should be discouraged/banned (any Misbehaving call sets this)
+  peer.shouldDisconnect
 
 proc resetMisbehavior*(peer: var Peer) =
-  ## Reset misbehavior score (used during testing)
+  ## Reset misbehavior state (used during testing)
   peer.misbehaviorScore = 0
   peer.shouldDisconnect = false
 
