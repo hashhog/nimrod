@@ -47,6 +47,7 @@ type
     pctFullRelay       # Full-relay outbound (8 slots)
     pctBlockRelayOnly  # Block-relay-only outbound (2 slots)
     pctInbound         # Inbound
+    pctManual          # Manual/addnode — always noBan, never counted against limits
 
   ExtendedPeer* = ref object
     ## Extended peer info for eclipse protection
@@ -283,12 +284,46 @@ proc cleanupBans(pm: PeerManager) =
   pm.banManager.sweepExpired()
 
 proc misbehavingPeer*(pm: PeerManager, peer: Peer, score: uint32, message: string) =
+  ## Apply misbehavior score and, if the threshold is reached, ban + disconnect
+  ## the peer.  Mirrors Bitcoin Core net_processing.cpp Misbehaving():
+  ##   if HasPermission(NoBan) → return (no ban, no disconnect)
+  ##   if IsManualConn()       → return (no ban, no disconnect)
+  ##   if addr.IsLocal()       → disconnect-only (no ban entry)
+  ##   else                    → Discourage (24h ban) + disconnect
   var p = peer
   misbehaving(p, score, message)
 
-  if p.shouldBan():
-    pm.banPeer(peer.address, BanDuration, brMisbehaving)
-    asyncSpawn pm.removePeer(peer)
+  if not p.shouldBan():
+    return
+
+  # Look up extended peer info for connection-type + noBan checks.
+  # Key format is "address:port" (peerKey).
+  let key = peerKey(peer.address, peer.port)
+  if key in pm.extendedPeers:
+    let ext = pm.extendedPeers[key]
+
+    # G2 guard 1: NoBan permission (whitelist / whitebind / addnode).
+    if ext.noBan:
+      debug "misbehavingPeer: skip ban — noBan peer", peer = key, message = message
+      return
+
+    # G2 guard 2: manual connection (addnode).
+    if ext.connType == pctManual:
+      debug "misbehavingPeer: skip ban — manual peer", peer = key, message = message
+      return
+
+    # G2 guard 3: local address → disconnect-only, no ban entry.
+    try:
+      let ip = parseIpAddr(peer.address)
+      if ip.isLocal():
+        debug "misbehavingPeer: local peer — disconnect only", peer = key, message = message
+        asyncSpawn pm.removePeer(peer)
+        return
+    except CatchableError:
+      discard  # unparseable address → fall through to normal ban path
+
+  pm.banPeer(peer.address, BanDuration, brMisbehaving)
+  asyncSpawn pm.removePeer(peer)
 
 proc listBanned*(pm: PeerManager): seq[BanEntry] =
   pm.banManager.listBanned()
@@ -346,7 +381,7 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
       debug "skipping peer due to netgroup collision", address = address, netgroup = $ng
       return false
 
-  # Check connection limits
+  # Check connection limits (manual peers bypass slot limits)
   case connType
   of pctFullRelay:
     if pm.outboundFullRelayCount >= pm.maxOutboundFullRelay:
@@ -357,6 +392,8 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
   of pctInbound:
     if pm.inboundCount >= pm.maxInbound:
       return false
+  of pctManual:
+    discard  # manual/addnode peers bypass slot limits
 
   let peer = newPeer(address, port, pm.params, pdOutbound)
   # BIP-324: if this address has previously failed a v2 probe, skip v2
@@ -384,7 +421,8 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
         minPingTime: initDuration(seconds = 60),
         netGroup: ng,
         keyedNetGroup: getKeyedNetGroup(ip, pm.netgroupKey),
-        noBan: false
+        # Manual/addnode peers get NoBan permission (Core: HasPermission(NoBan))
+        noBan: connType == pctManual
       )
       pm.extendedPeers[key] = ext
 
@@ -436,6 +474,12 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
 proc connectToPeer*(pm: PeerManager, address: string, port: uint16): Future[bool] {.async.} =
   ## Connect to a peer (full-relay outbound)
   return await pm.connectToPeerWithType(address, port, pctFullRelay)
+
+proc connectManualPeer*(pm: PeerManager, address: string, port: uint16): Future[bool] {.async.} =
+  ## Connect to a manually-added peer (addnode / whitebind).
+  ## Manual peers bypass slot limits and receive NoBan permission —
+  ## they will never be banned by misbehavingPeer().
+  return await pm.connectToPeerWithType(address, port, pctManual)
 
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.} =
   let key = peerKey(peer)

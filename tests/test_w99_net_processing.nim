@@ -9,6 +9,7 @@ import ../src/network/messages
 import ../src/network/banman
 import ../src/network/peermanager
 import ../src/network/sync
+import ../src/network/netgroup
 import ../src/mempool/orphan
 import ../src/consensus/params
 import ../src/primitives/[types, serialize]
@@ -78,34 +79,74 @@ suite "G1 Misbehaving single-event discourage":
     check peer.shouldBan() == true
 
 # ---------------------------------------------------------------------------
-# G2 — Misbehaving: noban/manual/outbound-relay protections
+# G2 — Misbehaving: noban/manual/local/regular guards (FIXED)
 #
-# BUG: noBan field exists on ExtendedPeer but the misbehavingPeer() call in
-# peermanager.nim does NOT consult it before calling banPeer().  Core's
-# Misbehaving() checks HasPermission(NetPermissionFlags::NoBan) and skips the
-# ban; nimrod omits this check.
+# FIX: misbehavingPeer() now consults ExtendedPeer before calling banPeer():
+#   if ext.noBan          → return (no ban, no disconnect)
+#   if ext.connType==pctManual → return (no ban, no disconnect)
+#   if addr.IsLocal()     → disconnect-only (no ban entry)
+#   else                  → ban + disconnect  (regular inbound)
+# Reference: bitcoin-core/src/net_processing.cpp:5083
 # ---------------------------------------------------------------------------
 
-suite "G2 noban protection missing in misbehavingPeer":
+# Helper: build a PeerManager with a pre-populated ExtendedPeer entry so
+# misbehavingPeer() has an ExtendedPeer to consult.
+proc makeG2Pm(peerAddr: string = "10.0.0.1", port: uint16 = 8333,
+              connType: PeerConnectionType = pctInbound,
+              noBan: bool = false): tuple[pm: PeerManager, peer: Peer] =
+  let params = mainnetParams()
+  let pm = newPeerManager(params, 8, 2, 117, "/tmp")
+  let peer = newPeer(peerAddr, port, params, pdInbound)
+  pm.peers[peerAddr & ":" & $port] = peer
+  let ip = parseIpAddr(peerAddr)
+  let ng = getNetGroup(ip)
+  let ext = ExtendedPeer(
+    peer: peer,
+    connType: connType,
+    connectedTime: getTime(),
+    lastBlockTime: Time(),
+    lastTxTime: Time(),
+    minPingTime: initDuration(seconds = 60),
+    netGroup: ng,
+    keyedNetGroup: 0'u64,
+    noBan: noBan
+  )
+  pm.extendedPeers[peerAddr & ":" & $port] = ext
+  result = (pm: pm, peer: peer)
 
-  test "G2: noBan field exists on ExtendedPeer":
-    ## Documents that the field exists but is unused in ban decision.
-    let params = mainnetParams()
-    let pm = newPeerManager(params, 8, 2, 117, "/tmp")
-    # ExtendedPeer has noBan bool — always hardcoded false on construction
-    # and never checked in misbehavingPeer()
-    check true  # structural check: noBan defined but never guards ban path
+suite "G2 noban/manual/local/regular guards in misbehavingPeer":
 
-  test "G2: misbehavingPeer has no noBan guard (documents BUG)":
-    ## In Core, manually-added peers (addnode / whitebind / whitelist) receive
-    ## NoBan permission and are never banned by Misbehaving().  Nimrod's
-    ## misbehavingPeer() always calls banPeer() when score >= 100, with no
-    ## exemption.  We document this by verifying the implementation path:
-    ## shouldBan() returns true with no noBan check anywhere.
-    var peer = makePeer()
+  test "G2a: noBan peer — misbehavingPeer skips ban":
+    ## Core: HasPermission(NoBan) → return.  Peer with noBan=true must not
+    ## be added to banlist even when misbehavior score reaches threshold.
+    let (pm, peer) = makeG2Pm(noBan = true)
     peer.misbehaviorScore = 99
-    misbehaving(peer, 1, "reaches threshold")
-    check peer.shouldBan() == true  # no noBan guard → will be banned
+    pm.misbehavingPeer(peer, 1, "noban test")
+    # Ban must NOT have been recorded
+    check not pm.isBanned(peer.address)
+
+  test "G2b: manual peer — misbehavingPeer skips ban":
+    ## Core: IsManualConn() → return.  pctManual connection must never be banned.
+    let (pm, peer) = makeG2Pm(connType = pctManual)
+    peer.misbehaviorScore = 99
+    pm.misbehavingPeer(peer, 1, "manual test")
+    check not pm.isBanned(peer.address)
+
+  test "G2c: local peer — disconnect-only, no ban entry":
+    ## Core: addr.IsLocal() → disconnect-only (no Discourage call).
+    ## 127.0.0.1 is a loopback address; misbehavingPeer should not add a ban.
+    let (pm, peer) = makeG2Pm(peerAddr = "127.0.0.1")
+    peer.misbehaviorScore = 99
+    pm.misbehavingPeer(peer, 1, "local test")
+    check not pm.isBanned("127.0.0.1")
+
+  test "G2d: regular inbound peer — banned + disconnected":
+    ## Regular inbound peer (not noBan, not manual, not local) must be banned
+    ## when misbehavior score reaches threshold.
+    let (pm, peer) = makeG2Pm(peerAddr = "203.0.113.1", connType = pctInbound, noBan = false)
+    peer.misbehaviorScore = 99
+    pm.misbehavingPeer(peer, 1, "regular test")
+    check pm.isBanned("203.0.113.1")
 
 # ---------------------------------------------------------------------------
 # G3 — Discourage persists across restarts
@@ -247,13 +288,13 @@ suite "G8 unconnecting headers limit":
 
 suite "G9 NoBan protection for headers Misbehaving":
 
-  test "G9: misbehavingPeer does not guard banPeer with noBan check":
-    ## noBan is hardcoded false at connection time and never checked.
-    ## A manually-added peer with noBan=true (if that were set) would still
-    ## get banned via misbehavingPeer() → banPeer().
-    let params = mainnetParams()
-    let bm = newBanManager("/tmp/w99-g9-test")
-    check true  # structural: misbehavingPeer has no noBan guard
+  test "G9: misbehavingPeer guards banPeer with noBan check (FIXED)":
+    ## After the G2 fix, misbehavingPeer() checks ext.noBan before calling
+    ## banPeer().  A whitelisted peer that sends bad headers must not be banned.
+    let (pm, peer) = makeG2Pm(peerAddr = "10.0.0.99", noBan = true)
+    peer.misbehaviorScore = 99
+    pm.misbehavingPeer(peer, 1, "bad headers")
+    check not pm.isBanned("10.0.0.99")
 
 # ---------------------------------------------------------------------------
 # G10 — Empty headers = "no more" (no Misbehaving)
