@@ -88,7 +88,7 @@ type
 
 const
   ## Rolling window for known items (simple substitute for bloom filter)
-  MaxKnownItems = 5000
+  MaxKnownItems* = 5000
 
   ## MAX_MONEY in satoshis (used during IBD to reject all tx inv)
   MaxMoney* = 2_100_000_000_000_000'i64
