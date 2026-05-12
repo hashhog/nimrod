@@ -188,10 +188,11 @@ suite "W101 BUG-01 setBlockFailureFlags misses off-chain descendants":
   teardown:
     cleanupTestDb()
 
-  test "off-chain descendant of invalidated block NOT marked FAILED_CHILD":
-    ## Core's SetBlockFailureFlags iterates entire block_index; nimrod only
-    ## walks main-chain heights. A side-branch descendant should be marked
-    ## BLOCK_FAILED_CHILD but is NOT.
+  test "off-chain descendant of invalidated block IS marked BLOCK_FAILED_VALID":
+    ## BUG-01 FIXED: setBlockFailureFlags now iterates the entire block index
+    ## (all 32-byte hash keys in cfBlockIndex) and marks every block whose
+    ## ancestor at invalidBlock.height == invalidBlock with BLOCK_FAILED_VALID.
+    ## Reference: Bitcoin Core SetBlockFailureFlags (validation.cpp:3699-3708).
     var cs = newChainState(TestDbPath, regtestParams())
     defer: cs.close()
 
@@ -219,16 +220,12 @@ suite "W101 BUG-01 setBlockFailureFlags misses off-chain descendants":
     let res = cs.invalidateBlock(sideForkHash)
     check res.isOk
 
-    # BUG-01: sideDescHash should be marked BLOCK_FAILED_CHILD but is NOT
-    # because nimrod only iterates main-chain heights
+    # BUG-01 FIXED: sideDescHash must be marked BLOCK_FAILED_VALID because
+    # setBlockFailureFlags now walks all block index entries, not just
+    # main-chain heights. Matches Core's SetBlockFailureFlags behaviour.
     let descFlags = cs.getBlockFailureStatus(sideDescHash)
-    # This test documents the ABSENCE of correct behavior:
-    # In a correct impl, descFlags.get().hasFlag(BLOCK_FAILED_CHILD) should be true
-    if descFlags.isSome and descFlags.get().hasFlag(BLOCK_FAILED_CHILD):
-      discard  # BUG FIXED — this should not happen currently
-    else:
-      # BUG IS PRESENT: side-branch descendant not marked BLOCK_FAILED_CHILD
-      check true  # Document bug presence
+    check descFlags.isSome
+    check descFlags.get().hasFlag(BLOCK_FAILED_VALID)
 
   test "invalidating main-chain block marks main-chain descendants BLOCK_FAILED_VALID":
     ## This should work correctly — BUG-01 only affects side-branch descendants
@@ -267,27 +264,27 @@ suite "W101 BUG-02 BLOCK_FAILED_CHILD semantics diverge from Core":
   teardown:
     cleanupTestDb()
 
-  test "Core only uses BLOCK_FAILED_VALID for chain rejection; nimrod uses BLOCK_FAILED_CHILD":
-    ## Core's FindMostWorkChain equivalent tests `nStatus & BLOCK_FAILED_VALID` only.
-    ## Nimrod propagates BLOCK_FAILED_CHILD and tests it in setBlockFailureFlags
-    ## as a signal for ancestry. Core v25+ chain.h marks BLOCK_FAILED_CHILD as
-    ## "Unused flag". This test verifies that a block marked only BLOCK_FAILED_CHILD
-    ## (not BLOCK_FAILED_VALID) is incorrectly considered "failed" by nimrod's isFailed().
+  test "isFailed uses BLOCK_FAILED_VALID only; BLOCK_FAILED_CHILD alone is not a failure":
+    ## BUG-02 FIXED: isFailed() now only tests BLOCK_FAILED_VALID, matching
+    ## Bitcoin Core v25+ which marks BLOCK_FAILED_CHILD as "Unused flag" in chain.h
+    ## and uses only nStatus & BLOCK_FAILED_VALID in FindMostWorkChain
+    ## (validation.cpp:3139). A block with only BLOCK_FAILED_CHILD set is a valid
+    ## candidate in Core and must be a valid candidate in nimrod too.
     let flags = BLOCK_FAILED_CHILD
-    # Core would NOT consider this block failed (only tests BLOCK_FAILED_VALID)
-    # Nimrod's isFailed() returns true for any non-zero flag value
-    check flags.isFailed()  # nimrod says "failed"
-    # The bug: nimrod treats BLOCK_FAILED_CHILD as a failure flag during
-    # candidate selection, Core does not. A block with only BLOCK_FAILED_CHILD
-    # should be a valid candidate in Core but nimrod rejects it.
-    check not flags.hasFlag(BLOCK_FAILED_VALID)  # NOT a Core-level failure
+    # Post-fix: BLOCK_FAILED_CHILD alone is NOT a failure — matches Core v25+
+    check not flags.isFailed()
+    check not flags.hasFlag(BLOCK_FAILED_VALID)
+    # BLOCK_FAILED_VALID is still a failure
+    check BLOCK_FAILED_VALID.isFailed()
+    # Combined flags: failure only if BLOCK_FAILED_VALID is set
+    let combined = BlockFailureFlags(uint8(BLOCK_FAILED_CHILD) or uint8(BLOCK_FAILED_VALID))
+    check combined.isFailed()
 
-  test "setBlockFailureFlags marks descendants BLOCK_FAILED_CHILD not BLOCK_FAILED_VALID":
-    ## Core's SetBlockFailureFlags marks blocks BLOCK_FAILED_VALID (validation.cpp:3705).
-    ## Nimrod's setBlockFailureFlags marks them BLOCK_FAILED_CHILD (chain.nim:364).
-    ## BUG: a descendant marked only BLOCK_FAILED_CHILD will have isFailed()=true
-    ## in nimrod but nStatus&BLOCK_FAILED_VALID == 0 from Core's perspective,
-    ## causing divergent candidate set behavior.
+  test "setBlockFailureFlags marks descendants BLOCK_FAILED_VALID not BLOCK_FAILED_CHILD":
+    ## BUG-02 FIXED: setBlockFailureFlags now marks descendants BLOCK_FAILED_VALID,
+    ## matching Core's SetBlockFailureFlags (validation.cpp:3705).
+    ## Previously nimrod used BLOCK_FAILED_CHILD for descendants; now BLOCK_FAILED_VALID
+    ## is used throughout to align with Core v25+ candidate filtering.
     var cs = newChainState(TestDbPath, regtestParams())
     defer: cs.close()
 
@@ -299,22 +296,21 @@ suite "W101 BUG-02 BLOCK_FAILED_CHILD semantics diverge from Core":
     let blk1Hash = blockHash(blk1)
     discard cs.connectBlock(blk1, 1)
 
-    let blk2 = makeW101Block(blk1Hash, 2)
-    let blk2Hash = blockHash(blk2)
-    discard cs.connectBlock(blk2, 2)
+    # Create a side-branch block at height 2 to test setBlockFailureFlags directly
+    let sideFork2 = makeW101Block(blk1Hash, 2, nonce = 4321)
+    let sideFork2Hash = blockHash(sideFork2)
+    storeBlockIndexHashOnly(cs, sideFork2Hash, 2, blk1Hash, sideFork2.header,
+                            default(array[32, byte]))
 
-    # After invalidating blk1, blk2 should be marked ...
+    # Invalidate blk1 — sideFork2 is a descendant of blk1 on a side branch
     discard cs.invalidateBlock(blk1Hash)
 
-    # Check how blk2 is marked — in Core it would NOT exist as a candidate
-    # but would have BLOCK_FAILED_VALID set on connected blocks that were
-    # disconnected. In nimrod, the connected blocks get BLOCK_FAILED_VALID (correct)
-    # but side-branch descendants would get BLOCK_FAILED_CHILD (wrong per Core).
-    let flags2 = cs.getBlockFailureStatus(blk2Hash)
-    # blk2 was on active chain — should be BLOCK_FAILED_VALID (not BLOCK_FAILED_CHILD)
-    # nimrod does mark active-chain blocks BLOCK_FAILED_VALID in invalidateBlock loop
-    # This is actually correct for active-chain blocks
+    # BUG-02 FIXED: side-branch descendant should be marked BLOCK_FAILED_VALID
+    # (not BLOCK_FAILED_CHILD) — matches Core's SetBlockFailureFlags
+    let flags2 = cs.getBlockFailureStatus(sideFork2Hash)
     check flags2.isSome
+    check flags2.get().hasFlag(BLOCK_FAILED_VALID)
+    check not flags2.get().hasFlag(BLOCK_FAILED_CHILD)
 
 # ============================================================================
 # BUG-04: resetBlockFailureFlags incorrectly clears ancestor flags
