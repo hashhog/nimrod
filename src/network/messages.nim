@@ -10,7 +10,7 @@ export addr
 import std/options
 
 const
-  MaxMessagePayload* = 33_554_432  # 32 MiB
+  MaxMessagePayload* = 4_000_000   # 4 MB per Core MAX_PROTOCOL_MESSAGE_LENGTH (net.h:65)
   MaxHeadersPerMsg* = 2000
   MaxInvPerMsg* = 50_000
   MaxLocatorSz* = 101              # BIP0152: max getheaders/getblocks locator entries
