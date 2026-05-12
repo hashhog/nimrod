@@ -528,23 +528,22 @@ suite "G22 service flags":
   # BUG: NODE_P2P_V2 service flag missing
 
 # ---------------------------------------------------------------------------
-# G23 — MAX_PROTOCOL_MESSAGE_LENGTH = 4 MiB
+# G23 — MAX_PROTOCOL_MESSAGE_LENGTH = 4 MB (FIXED W99 G23)
 #
-# BUG: MaxMessagePayload in messages.nim is 32 MiB (33_554_432).
-# Bitcoin Core MAX_PROTOCOL_MESSAGE_LENGTH = 4 MiB (4_194_304).
-# Nimrod accepts messages 8× larger than Core, a potential DoS vector.
+# FIXED: MaxMessagePayload in messages.nim is now 4_000_000 (4 MB).
+# Bitcoin Core net.h:65: MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000.
+# Was: 33_554_432 (32 MiB) — 8× too large (DoS vector).
 # ---------------------------------------------------------------------------
 
 suite "G23 MAX_PROTOCOL_MESSAGE_LENGTH":
 
-  test "G23: MaxMessagePayload is 32 MiB — BUG, Core limit is 4 MiB":
-    ## Bitcoin Core net_processing.cpp line 1: MAX_PROTOCOL_MESSAGE_LENGTH = 4*1024*1024
-    ## Nimrod messages.nim: MaxMessagePayload = 33_554_432  (32 MiB)
-    ## Difference: 8× too large — DOS vector for memory exhaustion on large message.
-    check MaxMessagePayload == 33_554_432    # documents the actual value
-    # The expected/correct value:
-    const CorrectLimit = 4 * 1024 * 1024
-    check MaxMessagePayload != CorrectLimit  # confirms the bug
+  test "G23: MaxMessagePayload equals Core limit of 4 MB (FIXED)":
+    ## FIXED: MaxMessagePayload = 4_000_000 per Core net.h:65.
+    ## Bitcoin Core net.h:65: MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 = 4_000_000.
+    ## Was: 33_554_432 (32 MiB) — 8× too large; DoS memory amplifier.
+    const CorrectLimit = 4 * 1000 * 1000  # Core net.h:65 exact value
+    check MaxMessagePayload == CorrectLimit   # FIXED: matches Core exactly
+    check MaxMessagePayload == 4_000_000      # FIXED: explicit value check
 
 # ---------------------------------------------------------------------------
 # G24 — Unknown msg_type → log+ignore, NOT Misbehaving

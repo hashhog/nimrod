@@ -26,6 +26,7 @@ import std/[os, strutils, tables, sets]
 import ../src/crypto/chacha20poly1305
 import ../src/crypto/secp256k1
 import ../src/network/bip324
+import ../src/network/messages
 import ../src/consensus/params
 
 proc bytesToHex(data: openArray[byte]): string =
@@ -534,26 +535,18 @@ suite "G23 reserved short ID acceptance (known CORRECTNESS bug)":
       check enc[0] == 0x00'u8  # long-form indicator
 
 # ============================================================================
-# G24: Max plaintext vs Core (32 MiB vs 4 MB — known DoS bug)
+# G24: Max plaintext vs Core (32 MiB → 4 MB — FIXED W98 G24)
 # ============================================================================
-suite "G24 max plaintext limit (known DoS bug)":
-  test "MaxMessagePayload is larger than Bitcoin Core's limit (documented bug)":
-    ## BUG: peer.nim:416 checks contentsLen > MaxMessagePayload (32 MiB).
+suite "G24 max plaintext limit (FIXED)":
+  test "MaxMessagePayload matches Bitcoin Core's limit":
+    ## FIXED: MaxMessagePayload = 4_000_000 (4 MB) per Core net.h:65.
     ## Bitcoin Core net.h:65: MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 = 4 MB.
-    ## Nimrod admits packets 8x larger than Core allows before disconnecting.
-    ## An adversary can force nimrod to allocate ~32 MiB per packet per peer.
-    ##
-    ## Severity: DoS — memory amplifier on each connected v2 peer.
-    ##
-    ## Core limit: 4_000_000 bytes.  Nimrod limit: 33_554_432 bytes.
-    ## Fix: change MaxMessagePayload check in readMessageV2 to 4_000_000.
+    ## Was: 33_554_432 (32 MiB) — 8x too large (DoS memory amplifier).
+    ## Fix: messages.nim MaxMessagePayload changed to 4_000_000.
 
-    # Document the current (wrong) value.
     const coreLimit = 4_000_000
-    const nimrodLimit = 33_554_432  # 32 MiB
-    check nimrodLimit > coreLimit   # known bug: nimrod is too permissive
-    # Once fixed, the next line should hold instead:
-    # check nimrodLimit <= coreLimit
+    check MaxMessagePayload == coreLimit   # FIXED: matches Core exactly
+    check MaxMessagePayload <= coreLimit   # FIXED: no longer over-permissive
 
 # ============================================================================
 # G25: Initiator garbage bound rand(32) vs spec rand(4095) (known anonymity bug)
