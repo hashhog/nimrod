@@ -175,6 +175,13 @@ proc getRecvGarbageTerminator*(c: BIP324Cipher): array[GarbageTerminatorLen, byt
     raise newException(BIP324Error, "cipher not initialized")
   c.recvGarbageTerminator
 
+proc isPrivateKeyZeroed*(c: BIP324Cipher): bool =
+  ## Test accessor: returns true iff the ephemeral private key has been wiped.
+  ## After initialize(), the key must be all-zero (W98 G10 memory_cleanse fix).
+  for b in c.privateKey:
+    if b != 0: return false
+  true
+
 proc initialize*(c: var BIP324Cipher, theirPubKey: EllSwiftPubKey,
                  initiator: bool, magic: array[4, byte]) =
   ## Initialize the cipher after receiving the peer's public key
@@ -236,6 +243,15 @@ proc initialize*(c: var BIP324Cipher, theirPubKey: EllSwiftPubKey,
   let sessionKey = hkdf.expand32("session_id")
   for i in 0..<SessionIdLen:
     c.sessionId[i] = sessionKey[i]
+
+  # Core bip324.cpp:67-70: wipe all material that could re-derive session keys.
+  # memory_cleanse(ecdh_secret), memory_cleanse(hkdf_32_okm), memory_cleanse(&hkdf),
+  # m_key = CKey() (destructor-zeroed ephemeral private key).
+  var ecdhSecretMut = ecdhSecret  # local mutable copy to zero
+  zeroMem(addr ecdhSecretMut[0], ecdhSecretMut.len)
+  var hkdfMut = hkdf              # local mutable copy of HKDF state (contains PRK)
+  zeroMem(addr hkdfMut, sizeof(hkdfMut))
+  zeroMem(addr c.privateKey[0], c.privateKey.len)
 
   c.initialized = true
 

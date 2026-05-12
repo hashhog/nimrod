@@ -557,6 +557,10 @@ proc nextPacket(f: var FSChaCha20) =
     # new epoch nonce (rekey_counter has been bumped).
     f.keystreamUsed = ChaCha20BlockSize
     f.blockCounter = 0
+    # Core chacha20.cpp:365: memory_cleanse(new_key, sizeof(new_key))
+    # Wipe the rekey buffer — a copy is now in f.key but the stack slot
+    # should not persist in heap/coredumps.
+    zeroMem(addr newKey[0], ChaCha20KeySize)
 
 proc crypt*(f: var FSChaCha20, input: openArray[byte], output: var openArray[byte]) =
   ## Encrypt/decrypt one chunk with forward secrecy.  Consumes
@@ -596,6 +600,9 @@ proc nextPacket(f: var FSChaCha20Poly1305) =
     f.aead.setKey(newKey[0..<32])
     f.packetCounter = 0
     inc f.rekeyCounter
+    # Core chacha20poly1305.cpp:117: memory_cleanse(one_block, sizeof(one_block))
+    # Wipe the 64-byte rekey keystream block after the new key is installed.
+    zeroMem(addr newKey[0], 64)
 
 proc encrypt*(f: var FSChaCha20Poly1305, header: byte, contents: openArray[byte],
               aad: openArray[byte], output: var openArray[byte]) =
