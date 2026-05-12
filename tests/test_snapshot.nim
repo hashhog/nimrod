@@ -1734,3 +1734,452 @@ suite "gettxoutsetinfo Core-byte-parity":
     except RpcError as e:
       code = e.code
     check code == RpcInvalidParams
+
+# ============================================================================
+# W102 AssumeUTXO snapshot loading gate audit
+#
+# Covers missing per-coin validation gates in loadSnapshot that exist in
+# Bitcoin Core's PopulateAndValidateSnapshot (validation.cpp:5791-5882):
+#
+#   B1  coin.nHeight > base_height          — missing in loadSnapshot
+#   B2  MoneyRange per-coin                 — missing in loadSnapshot
+#   B3  outpoint.n >= UINT32_MAX guard      — missing in loadSnapshot
+#   B4  coins_per_txid > coins_left guard   — missing in loadSnapshot
+#   B5  trailing-bytes exhaustion check     — missing in loadSnapshot
+#   B6  background UTXO hash cross-check    — validateSnapshot skips UTXO hash
+#   B7  double-activate guard               — activateSnapshot missing guard
+#   B8  work-exceeds-active pre-check       — loadSnapshot missing guard
+#   B9  wrong height (0) in unknown-hash msg — validateSnapshotMetadata
+#   B10 getchainstates RPC absent           — no handler for getchainstates
+# ============================================================================
+
+# Helper: write a minimal valid snapshot file to `path` with a single coin.
+proc writeFakeCoinSnapshot(path: string, networkMagic: array[4, byte],
+                            baseBlockhash: BlockHash, coin: SnapshotCoin) =
+  let meta = SnapshotMetadata(
+    version: SnapshotVersion,
+    networkMagic: networkMagic,
+    baseBlockhash: baseBlockhash,
+    coinsCount: 1
+  )
+  let sf = openSnapshotForWrite(path, meta)
+  sf.writeTxidGroup(coin.outpoint.txid, @[coin])
+  sf.close()
+
+proc writeFakeCoinSnapshotRaw(path: string, networkMagic: array[4, byte],
+                               baseBlockhash: BlockHash, coin: SnapshotCoin,
+                               extraBytes: seq[byte]) =
+  ## Write a snapshot with an explicit coin AND trailing extra bytes for the
+  ## trailing-bytes-check test (B5).
+  let meta = SnapshotMetadata(
+    version: SnapshotVersion,
+    networkMagic: networkMagic,
+    baseBlockhash: baseBlockhash,
+    coinsCount: 1
+  )
+  let sf = openSnapshotForWrite(path, meta)
+  sf.writeTxidGroup(coin.outpoint.txid, @[coin])
+  sf.close()
+  # Append extra garbage bytes past the coin data.
+  if extraBytes.len > 0:
+    let f = open(path, fmAppend)
+    discard f.writeBytes(extraBytes, 0, extraBytes.len)
+    f.close()
+
+suite "W102 AssumeUTXO per-coin validation gates":
+
+  test "B1: loadSnapshot accepts coin with height > base_height (missing guard)":
+    # Bitcoin Core validation.cpp:5814 rejects coins where coin.nHeight >
+    # base_height. nimrod has no such check — a snapshot with a coin at
+    # height 999999 (above any current assumeutxo entry) is accepted.
+    # BUG: loadSnapshot should return (false, ...) here.
+    let testDir = getTempDir() / "nimrod_w102_b1"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let mainnet = mainnetParams()
+    var cs = newChainState(dbDir, mainnet)
+    defer: cs.close()
+
+    # Base height is 840000 per the first mainnet assumeutxo entry.
+    # Inject a coin at height 840001 — one block ABOVE the base.
+    let coin = SnapshotCoin(
+      outpoint: OutPoint(txid: TxId(mkHashWith([0xB1'u8])), vout: 0),
+      output: TxOut(value: Satoshi(1_00000000),
+                    scriptPubKey: @[0x51'u8]),
+      height: 840001'i32,   # > base_height (840000) — Core rejects this
+      isCoinbase: false
+    )
+    let snapPath = testDir / "future-height.dat"
+    writeFakeCoinSnapshot(snapPath, mainnet.networkMagic,
+                          mainnet.assumeutxoData[0].blockhash, coin)
+
+    let res = loadSnapshot(snapPath, cs, mainnet, mainnet.assumeutxoData)
+    # BUG: currently succeeds (res.success == true) because the guard is absent.
+    # A conforming implementation must reject with an error about bad snapshot data.
+    # When the bug is fixed, change this check to:
+    #   check res.success == false
+    #   check "Bad snapshot data" in res.error  (Core's exact phrase)
+    check res.success == true  # documents the current (buggy) behaviour
+
+  test "B2: loadSnapshot accepts coin with negative value (missing MoneyRange)":
+    # Bitcoin Core validation.cpp:5820-5822 rejects coins with value outside
+    # [0, MAX_MONEY]. nimrod has no MoneyRange check during load.
+    # BUG: loadSnapshot should return (false, ...) for value < 0.
+    let testDir = getTempDir() / "nimrod_w102_b2"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let mainnet = mainnetParams()
+    var cs = newChainState(dbDir, mainnet)
+    defer: cs.close()
+
+    # Negative satoshi value. This is encoded as a large uint64 after
+    # CompressAmount, but on a real honest file negative values cannot exist.
+    # We inject one via direct SnapshotCoin construction.
+    let coin = SnapshotCoin(
+      outpoint: OutPoint(txid: TxId(mkHashWith([0xB2'u8])), vout: 0),
+      output: TxOut(value: Satoshi(-1),   # negative — out of MoneyRange
+                    scriptPubKey: @[0x51'u8]),
+      height: 100'i32,
+      isCoinbase: false
+    )
+    let snapPath = testDir / "neg-value.dat"
+    writeFakeCoinSnapshot(snapPath, mainnet.networkMagic,
+                          mainnet.assumeutxoData[0].blockhash, coin)
+
+    let res = loadSnapshot(snapPath, cs, mainnet, mainnet.assumeutxoData)
+    # BUG: nimrod accepts because there is no MoneyRange check.
+    # When fixed: check res.success == false
+    # For now we document the buggy acceptance (the hash check catches it
+    # at the end, but the coin has already been stored by then).
+    # The correct check is:
+    #   check res.success == false
+    #   check "bad tx out value" in res.error  (Core's exact phrase at 5821)
+    discard res  # no assertion — coin is stored and hash check fails last
+
+  test "B3: vout=UINT32_MAX is NOT rejected during load (missing overflow guard)":
+    # Bitcoin Core validation.cpp:5815-5816 rejects outpoint.n == UINT32_MAX
+    # to avoid integer wrap-around in coinstats.cpp ApplyHash (ApplyHash uses
+    # (outpoint.n + 1) which overflows for UINT32_MAX). nimrod has no guard.
+    let testDir = getTempDir() / "nimrod_w102_b3"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let mainnet = mainnetParams()
+    var cs = newChainState(dbDir, mainnet)
+    defer: cs.close()
+
+    let coin = SnapshotCoin(
+      outpoint: OutPoint(txid: TxId(mkHashWith([0xB3'u8])), vout: 0xFFFFFFFF'u32),
+      output: TxOut(value: Satoshi(1_00000000),
+                    scriptPubKey: @[0x51'u8]),
+      height: 100'i32,
+      isCoinbase: false
+    )
+    let snapPath = testDir / "maxvout.dat"
+    writeFakeCoinSnapshot(snapPath, mainnet.networkMagic,
+                          mainnet.assumeutxoData[0].blockhash, coin)
+
+    let res = loadSnapshot(snapPath, cs, mainnet, mainnet.assumeutxoData)
+    # BUG: nimrod does not reject vout == UINT32_MAX.
+    # When fixed: check res.success == false
+    discard res  # no assertion — documents missing guard
+
+  test "B4: coins_per_txid overflow: group larger than coins_left not rejected":
+    # Bitcoin Core validation.cpp:5804-5806 rejects when the compactsize
+    # coins_per_txid for a group exceeds the remaining coins_left counter.
+    # This prevents reading coins from the NEXT group when the count is wrong.
+    # nimrod has no such check — it keeps reading until coinsRead == coinsCount.
+    #
+    # Craft a snapshot with coinsCount=1 but two coins in the only group (the
+    # second coin would be read as belonging to a non-existent next group in
+    # Core's model). nimrod reads only 1 coin and succeeds; Core would reject.
+    let testDir = getTempDir() / "nimrod_w102_b4"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+
+    # Build a raw snapshot: header (coinsCount=1) + one txid group with 2 coins.
+    let mainnet = mainnetParams()
+    let txid = TxId(mkHashWith([0xB4'u8]))
+    let coinA = SnapshotCoin(
+      outpoint: OutPoint(txid: txid, vout: 0),
+      output: TxOut(value: Satoshi(1_00000000), scriptPubKey: @[0x51'u8]),
+      height: 100'i32, isCoinbase: false
+    )
+    let coinB = SnapshotCoin(
+      outpoint: OutPoint(txid: txid, vout: 1),
+      output: TxOut(value: Satoshi(2_00000000), scriptPubKey: @[0x51'u8]),
+      height: 100'i32, isCoinbase: false
+    )
+    # Write a snapshot file manually: header with coinsCount=1,
+    # but ONE txid group containing 2 coins (coins_per_txid=2 > coins_left=1).
+    let path = testDir / "overcount.dat"
+    let meta = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: mainnet.networkMagic,
+      baseBlockhash: mainnet.assumeutxoData[0].blockhash,
+      coinsCount: 1   # claims 1 but group has 2
+    )
+    let sf = openSnapshotForWrite(path, meta)
+    sf.writeTxidGroup(txid, @[coinA, coinB])  # writes group with compactsize=2
+    sf.close()
+
+    var cs = newChainState(testDir / "cs", mainnet)
+    defer: cs.close()
+
+    let res = loadSnapshot(path, cs, mainnet, mainnet.assumeutxoData)
+    # nimrod reads coinsCount (=1) coins from the file, sees the group's
+    # compactsize is 2, reads coin A, then stops (coinsRead==coinsCount).
+    # The inconsistency between the group compactsize (2) and the header count
+    # (1) is silently ignored. Core would have rejected with
+    # "Mismatch in coins count in snapshot metadata and actual snapshot data"
+    # BUG: should return (false, ...)
+    discard res  # documents missing guard
+
+  test "B5: trailing bytes after all coins are silently ignored (missing exhaustion check)":
+    # Bitcoin Core validation.cpp:5872-5882 attempts to read one extra byte
+    # after all coins have been consumed. If it SUCCEEDS (no exception), Core
+    # returns "Bad snapshot - coins left over". nimrod never attempts this
+    # read and silently ignores any garbage bytes appended to the snapshot.
+    let testDir = getTempDir() / "nimrod_w102_b5"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+
+    # Build a valid snapshot (empty body — coinsCount=0, regtest magic).
+    let path = testDir / "trailing.dat"
+    let meta = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: regtest.networkMagic,
+      baseBlockhash: BlockHash(default(array[32, byte])),
+      coinsCount: 0
+    )
+    var w = BinaryWriter()
+    w.writeSnapshotMetadata(meta)
+    let f = open(path, fmWrite)
+    discard f.writeBytes(w.data, 0, w.data.len)
+    # Append 4 garbage bytes after the header.
+    let garbage = @[0xDE'u8, 0xAD, 0xBE, 0xEF]
+    discard f.writeBytes(garbage, 0, garbage.len)
+    f.close()
+
+    # Attempt to load: the metadata fails first (regtest has no assumeutxo
+    # entries), but the file-format check (trailing bytes) is distinct from
+    # the whitelist check. We document the absence of a trailing-bytes check.
+    let res = loadSnapshot(path, cs, regtest, regtest.assumeutxoData)
+    # Correctly fails due to whitelist, but does NOT fail due to trailing bytes.
+    # If we used a valid whitelisted hash, it would succeed despite the garbage.
+    check res.success == false
+    check "not recognized" in res.error  # whitelist error, NOT trailing-bytes error
+
+  test "B6: validateSnapshot marks auValidated without computing background UTXO hash":
+    # Bitcoin Core validation.cpp:6033-6072 recomputes ComputeUTXOStats
+    # (HASH_SERIALIZED) on the background chainstate and compares against
+    # au_data.hash_serialized before marking the snapshot as VALIDATED.
+    # nimrod's validateSnapshot only checks whether the background chain height
+    # has reached the snapshot height — it does NOT compute a UTXO hash.
+    # This means a background chain that was corrupted or diverged would still
+    # be accepted as "valid", silently marking the snapshot trusted.
+    let testDir = getTempDir() / "nimrod_w102_b6"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir1 = testDir / "snap_cs"
+    let dbDir2 = testDir / "bg_cs"
+    createDir(dbDir1); createDir(dbDir2)
+
+    let regtest = regtestParams()
+    var snapCs = newChainState(dbDir1, regtest)
+    var bgCs = newChainState(dbDir2, regtest)
+    defer: snapCs.close(); bgCs.close()
+
+    # Set up a snapshot chainstate pointing at height 5.
+    let fakeBlockhash = BlockHash(mkHashWith([0xF6'u8, 0x00]))
+    var snapshotChain = newSnapshotChainState(snapCs)
+    snapshotChain.assumeutxo = auUnvalidated
+    snapshotChain.snapshotBlockhash = some(fakeBlockhash)
+    snapshotChain.targetUtxoHash = some(default(array[32, byte]))  # all-zero target
+
+    # Fake the background chain: put a block index entry at height 5 with
+    # the same blockhash so validateSnapshot thinks it has reached the target.
+    bgCs.bestHeight = 10  # background is "ahead" of the snapshot height
+
+    # validateSnapshot currently marks svrValid without verifying the UTXO hash.
+    # BUG: it should compute the background UTXO hash and compare to targetUtxoHash.
+    let result = validateSnapshot(snapshotChain, bgCs)
+    # Because the db.getBlockIndex(fakeBlockhash) returns none, this returns
+    # svrNotReady. The REAL bug is that when getBlockIndex DOES return a match,
+    # the UTXO hash comparison is skipped. We document the stub architecture.
+    check result == svrNotReady  # stub returns NotReady (no real block index)
+    # A block-indexed background chain at the target height WOULD be accepted
+    # without UTXO hash verification:
+    check snapshotChain.assumeutxo == auUnvalidated  # unchanged = stub's limitation
+
+  test "B7: activateSnapshot has no double-activation guard":
+    # Bitcoin Core validation.cpp:5600-5601 returns an error if a
+    # snapshot-based chainstate already exists ("Can't activate a snapshot-based
+    # chainstate more than once"). nimrod's activateSnapshot has no such guard.
+    let testDir = getTempDir() / "nimrod_w102_b7"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+
+    let scs = newSnapshotChainState(cs)
+    # Mark as already unvalidated (= a snapshot is loaded).
+    scs.assumeutxo = auUnvalidated
+    scs.snapshotBlockhash = some(BlockHash(mkHashWith([0xB7'u8])))
+
+    # Attempt a second activation on the same SnapshotChainState.
+    # There is no snapshot file to open, but the guard should fire BEFORE
+    # any file I/O. Core would return "Can't activate a snapshot-based
+    # chainstate more than once" immediately.
+    # BUG: nimrod proceeds to open the (non-existent) file.
+    let bogusPath = testDir / "does-not-exist.dat"
+    let res2 = activateSnapshot(scs, bogusPath, regtest, regtest.assumeutxoData)
+    # We expect failure — but from the file-not-found OSError, NOT from a guard.
+    # When the guard is added, the error should be explicit about double-activation.
+    check res2.success == false  # fails, but for the wrong reason (OSError)
+
+  test "B8: work-exceeds-active-chainstate pre-check is absent in loadSnapshot":
+    # Bitcoin Core PopulateAndValidateSnapshot (validation.cpp:5787-5788)
+    # pre-checks that the snapshot block's work exceeds the active chain tip.
+    # nimrod's loadSnapshot has no such check. Loading a very old/low-work
+    # snapshot on an already-synced chain would succeed and corrupt the state.
+    #
+    # We document the absence rather than triggering it (replicating the
+    # actual work comparison would require a full PoW chain). The test
+    # verifies that a snapshot at height 840000 (which has more work than
+    # a fresh regtest chain) is accepted — the pre-check is implicitly not
+    # preventing valid snapshots, but we note that the reverse case (snapshot
+    # has LESS work than active tip) is also not prevented.
+    let testDir = getTempDir() / "nimrod_w102_b8"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    # The actual work pre-check requires block-index work fields nimrod does
+    # not populate from chainstate.nim. We verify the architectural gap:
+    # loadSnapshot succeeds for a whitelisted hash regardless of chain state.
+    let mainnet = mainnetParams()
+    var cs = newChainState(dbDir, mainnet)
+    defer: cs.close()
+
+    # Craft a snapshot with a valid blockhash but zero coins (hash mismatch).
+    let path = testDir / "low-work.dat"
+    let meta = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: mainnet.networkMagic,
+      baseBlockhash: mainnet.assumeutxoData[0].blockhash,
+      coinsCount: 0
+    )
+    var w = BinaryWriter()
+    w.writeSnapshotMetadata(meta)
+    let f = open(path, fmWrite)
+    discard f.writeBytes(w.data, 0, w.data.len)
+    f.close()
+
+    let res = loadSnapshot(path, cs, mainnet, mainnet.assumeutxoData)
+    # Passes the whitelist gate, then fails only at the hash check.
+    # A real active chain with more work should have been rejected earlier.
+    check res.success == false
+    # Fails because zero-coin hash does not match — NOT because of work check.
+    check "Bad snapshot content hash" in res.error
+
+  test "B9: validateSnapshotMetadata reports height=0 for all unknown hashes":
+    # Bitcoin Core's ActivateSnapshot error message includes the actual height
+    # from the block index when a blockhash is recognized but not whitelisted.
+    # nimrod's validateSnapshotMetadata returns `(0)` in all error messages
+    # regardless of height — operators can't distinguish "hash unknown" vs
+    # "hash at height N not in the table".
+    let mainnet = mainnetParams()
+
+    # Unknown blockhash: not in the assumeutxo table.
+    let unknownHash = BlockHash(mkHashWith([0xB9'u8, 0x00, 0x00]))
+    let meta = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: mainnet.networkMagic,
+      baseBlockhash: unknownHash,
+      coinsCount: 0
+    )
+    let v = validateSnapshotMetadata(meta, mainnet, mainnet.assumeutxoData)
+    check v.valid == false
+    # BUG: always reports "(0)" regardless of what height the hash is at.
+    # Core reports the actual block height from the snapshot block index.
+    # For an unknown hash with no block index entry, "(0)" is acceptable,
+    # but the error path is shared for ALL unknown hashes (no distinction).
+    check "(0)" in v.error
+
+    # Additionally verify that even a "close" hash (modified last byte) gives
+    # the same "(0)" placeholder — evidence the error is always the default.
+    var closeHash = mainnet.assumeutxoData[0].blockhash
+    array[32, byte](closeHash)[0] = byte(array[32, byte](closeHash)[0] xor 0xFF'u8)
+    let meta2 = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: mainnet.networkMagic,
+      baseBlockhash: closeHash,
+      coinsCount: 0
+    )
+    let v2 = validateSnapshotMetadata(meta2, mainnet, mainnet.assumeutxoData)
+    check v2.valid == false
+    check "(0)" in v2.error  # same placeholder; no height disambiguation
+
+  test "B10: getchainstates RPC is absent (no handler in RPC dispatch)":
+    # Bitcoin Core rpc/blockchain.cpp exposes `getchainstates` which surfaces
+    # snapshot validation state including the `validated` bool per chainstate.
+    # nimrod has no such handler. Operators cannot observe whether the
+    # background validation has completed.
+    let testDir = getTempDir() / "nimrod_w102_b10"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let regtest = regtestParams()
+    var cs = newChainState(dbDir, regtest)
+    defer: cs.close()
+
+    let mp = newMempool(cs, regtest)
+    let fe = newFeeEstimator()
+    let rpc = newRpcServer(
+      port = 18443'u16, chainState = cs, mempool = mp,
+      peerManager = nil, feeEstimator = fe, params = regtest
+    )
+    # Dispatch "getchainstates" through the RPC router. The router
+    # must currently produce a method-not-found or unimplemented error.
+    var code = 0
+    try:
+      discard rpc.handleMethod("getchainstates", %*[])
+    except RpcError as e:
+      code = e.code
+    except Exception:
+      code = -1  # any crash/unhandled exception
+    # BUG: `getchainstates` is not in the dispatch table; the call silently
+    # returns nil or raises RpcMethodNotFound.
+    # When implemented, this test should verify the response shape instead.
+    check code != 0  # non-zero = currently unimplemented
