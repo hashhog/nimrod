@@ -3323,10 +3323,45 @@ proc handleGetBlockTemplate(rpc: RpcServer, params: JsonNode): JsonNode =
       "weight": validation.calculateTransactionWeight(tx)
     })
 
+  # BUG-22 fix: compute rules array dynamically.
+  # Bitcoin Core mining.cpp:950-958: always "csv"; if segwit active add "!segwit"
+  # and "taproot" when taproot is active at this height.
+  # Taproot is a buried deployment — check taprootHeight directly.
+  let taprootActive = tmpl.height > rpc.params.taprootHeight
+  var rulesArr = newJArray()
+  rulesArr.add(%"csv")
+  # segwit is active on all supported networks at practical heights
+  if rpc.params.segwitHeight < tmpl.height:
+    rulesArr.add(%"!segwit")
+  if taprootActive:
+    rulesArr.add(%"taproot")
+
+  # BUG-2 fix: build vbavailable from STARTED and LOCKED_IN versionbits deployments.
+  # Bitcoin Core mining.cpp:965-983: iterate gbtstatus.signalling + locked_in.
+  # Only live BIP-9 versionbits deployments are in getDeployments(); taproot is buried.
+  let deployments = getDeployments(rpc.params.network)
+  let getBlockIndexFn = proc(h: BlockHash): Option[BlockIndex] =
+    rpc.chainState.db.getBlockIndex(h)
+  let getMtpFn = proc(h: BlockHash): int64 =
+    getMtpForBlock(h, getBlockIndexFn)
+  var vbCaches = newSeq[Table[BlockHash, ThresholdState]]()
+  var vbavailableObj = newJObject()
+  for i, dep in deployments:
+    if i >= vbCaches.len:
+      vbCaches.add(initTable[BlockHash, ThresholdState]())
+    let state = getStateFor(dep, tmpl.header.prevBlock, getBlockIndexFn, getMtpFn, vbCaches[i])
+    if state == tsStarted or state == tsLockedIn:
+      vbavailableObj[dep.name] = %dep.bit
+
+  # BUG-3 fix: vbrequired — Bitcoin Core always emits 0 (mining.cpp:996).
+  let vbrequired = 0
+
   %*{
     "capabilities": ["proposal"],
     "version": tmpl.header.version,
-    "rules": ["csv", "segwit"],
+    "rules": rulesArr,
+    "vbavailable": vbavailableObj,
+    "vbrequired": vbrequired,
     "previousblockhash": reverseHex(toHex(array[32, byte](tmpl.header.prevBlock))),
     "transactions": txs,
     "coinbaseaux": %*{},
