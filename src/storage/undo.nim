@@ -61,9 +61,12 @@ proc align(s: string, width: int, fill: char): string =
 
 proc serializeSpentOutput*(w: var BinaryWriter, spent: SpentOutput) =
   ## Serialize a spent output in Bitcoin Core compatible format
-  ## Format: (height * 2 + isCoinbase) as varint, version dummy if height > 0, compressed txout
+  ## Format: VARINT(height * 2 + isCoinbase), version dummy if height > 0, compressed txout
+  ## NOTE: Core uses Bitcoin VARINT (WriteVarInt), NOT CompactSize, for the code
+  ## field (bitcoin-core/src/undo.h::TxInUndoFormatter::Ser).  The two encodings
+  ## diverge for code >= 128 (i.e. height >= 64).
   let code = uint64(spent.height) * 2 + (if spent.isCoinbase: 1'u64 else: 0'u64)
-  w.writeCompactSize(code)
+  w.writeVarInt(code)
 
   # Required for compatibility with older undo format
   if spent.height > 0:
@@ -74,7 +77,9 @@ proc serializeSpentOutput*(w: var BinaryWriter, spent: SpentOutput) =
 
 proc deserializeSpentOutput*(r: var BinaryReader): SpentOutput =
   ## Deserialize a spent output from Bitcoin Core compatible format
-  let code = r.readCompactSize()
+  ## NOTE: code field is Bitcoin VARINT (not CompactSize) — matches
+  ## bitcoin-core/src/undo.h::TxInUndoFormatter::Unser.
+  let code = r.readVarInt()
   result.height = cast[int32](code shr 1)
   result.isCoinbase = (code and 1) == 1
 

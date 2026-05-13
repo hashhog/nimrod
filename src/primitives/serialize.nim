@@ -125,6 +125,50 @@ proc readVarBytes*(r: var BinaryReader): seq[byte] =
   let length = r.readCompactSize()
   r.readBytes(int(length))
 
+# ============================================================================
+# Bitcoin VARINT (NOT CompactSize) — bitcoin-core/src/serialize.h WriteVarInt
+# ============================================================================
+# This is a distinct encoding from CompactSize: 7 data bits per byte,
+# MSB=continuation bit on all bytes except the last.  Used by the undo
+# serialization format (TxInUndoFormatter) and the snapshot coin format
+# (TxOutCompression).  For code >= 128 the two encodings diverge:
+#   CompactSize(128) = [0x80]           (1 byte)
+#   WriteVarInt(128) = [0x80, 0x00]     (2 bytes)
+
+proc writeVarInt*(w: var BinaryWriter, n: uint64) =
+  ## Bitcoin VARINT: 7 data bits per byte, big-endian-ish chain,
+  ## MSB=continuation bit on all but the last byte.
+  ## Matches bitcoin-core/src/serialize.h::WriteVarInt.
+  var tmp: array[10, byte]
+  var len = 0
+  var v = n
+  while true:
+    tmp[len] = byte(v and 0x7F) or (if len > 0: 0x80'u8 else: 0x00'u8)
+    if v <= 0x7F:
+      break
+    v = (v shr 7) - 1
+    inc len
+  while true:
+    w.writeUint8(tmp[len])
+    if len == 0:
+      break
+    dec len
+
+proc readVarInt*(r: var BinaryReader): uint64 =
+  ## Inverse of writeVarInt.  Matches bitcoin-core/src/serialize.h::ReadVarInt.
+  var n: uint64 = 0
+  while true:
+    let ch = r.readUint8()
+    if n > (high(uint64) shr 7):
+      raise newException(SerializationError, "VARINT overflow")
+    n = (n shl 7) or uint64(ch and 0x7F)
+    if (ch and 0x80) != 0:
+      if n == high(uint64):
+        raise newException(SerializationError, "VARINT overflow")
+      inc n
+    else:
+      return n
+
 # High-level serialization for Bitcoin types
 
 proc writeTxId*(w: var BinaryWriter, txid: TxId) =
