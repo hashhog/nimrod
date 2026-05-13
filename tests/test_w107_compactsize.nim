@@ -28,6 +28,14 @@ proc roundtripCompact(v: uint64): uint64 =
   var r = BinaryReader(data: w.data, pos: 0)
   r.readCompactSize()
 
+proc roundtripCompactNoCheck(v: uint64): uint64 =
+  ## Like roundtripCompact but with range_check=false — for pure encoding tests
+  ## that use values exceeding MAX_SIZE (e.g. G4/G19/G29/G30 boundary coverage).
+  var w = BinaryWriter()
+  w.writeCompactSize(v)
+  var r = BinaryReader(data: w.data, pos: 0)
+  r.readCompactSize(range_check = false)
+
 proc roundtripVarInt(v: uint64): uint64 =
   ## Uses snapshot.nim's writeVarInt / readVarInt (Bitcoin VARINT, not CompactSize)
   var w = BinaryWriter()
@@ -89,7 +97,8 @@ suite "G3 WriteCompactSize 5-byte range":
 
   test "5-byte range round-trip":
     check roundtripCompact(0x10000) == 0x10000
-    check roundtripCompact(0xFFFFFFFF'u64) == 0xFFFFFFFF'u64
+    ## 0xFFFFFFFF > MAX_SIZE; use range_check=false for pure encoding coverage.
+    check roundtripCompactNoCheck(0xFFFFFFFF'u64) == 0xFFFFFFFF'u64
 
 # ===========================================================================
 # G4 — WriteCompactSize 9-byte range (>0xFFFFFFFF)
@@ -102,8 +111,11 @@ suite "G4 WriteCompactSize 9-byte range":
     check w.data.len == 9
 
   test "9-byte range round-trip":
-    check roundtripCompact(0x100000000'u64) == 0x100000000'u64
-    check roundtripCompact(0xFFFFFFFFFFFFFFFF'u64) == 0xFFFFFFFFFFFFFFFF'u64
+    ## Values > MAX_SIZE use range_check=false: these are pure encoding tests,
+    ## not container-length reads.  MAX_SIZE enforcement is correct; we just
+    ## need to verify the wire encoding round-trips for all 9-byte values.
+    check roundtripCompactNoCheck(0x100000000'u64) == 0x100000000'u64
+    check roundtripCompactNoCheck(0xFFFFFFFFFFFFFFFF'u64) == 0xFFFFFFFFFFFFFFFF'u64
 
 # ===========================================================================
 # G5 — ReadCompactSize non-canonical rejection
@@ -115,29 +127,28 @@ suite "G4 WriteCompactSize 9-byte range":
 ## bitcoin-core/src/serialize.h:343-356
 # ===========================================================================
 suite "G5 ReadCompactSize non-canonical rejection (BUG-1)":
-  test "BUG-1: 2-byte form with value < 253 should raise but does not":
-    ## 0xFD 0x01 0x00 = non-canonical encoding of 1 (should use single byte)
+  test "2-byte form with value < 253 raises SerializationError":
+    ## 0xFD 0x01 0x00 = non-canonical encoding of 1 (must use single byte)
+    ## Core: "non-canonical ReadCompactSize()"  bitcoin-core/src/serialize.h:343-356
     let data = @[0xFD'u8, 0x01'u8, 0x00'u8]
     var r = BinaryReader(data: data, pos: 0)
-    ## Core rejects this; nimrod silently accepts
-    ## When fixed, this should raise SerializationError
-    let v = r.readCompactSize()
-    check v == 1  # documents current (wrong) behaviour
+    expect SerializationError:
+      discard r.readCompactSize()
 
-  test "BUG-1: 4-byte form with value < 0x10000 should raise but does not":
+  test "4-byte form with value < 0x10000 raises SerializationError":
     ## 0xFE 0xFF 0xFF 0x00 0x00 = non-canonical encoding of 0xFFFF
     let data = @[0xFE'u8, 0xFF'u8, 0xFF'u8, 0x00'u8, 0x00'u8]
     var r = BinaryReader(data: data, pos: 0)
-    let v = r.readCompactSize()
-    check v == 0xFFFF  # documents current (wrong) behaviour
+    expect SerializationError:
+      discard r.readCompactSize()
 
-  test "BUG-1: 8-byte form with value < 0x100000000 should raise but does not":
-    ## 0xFF followed by 0x01 0x00 0x00 0x00 0x00 0x00 0x00 0x00 = non-canonical 1
+  test "8-byte form with value < 0x100000000 raises SerializationError":
+    ## 0xFF 0x01 0x00 ... = non-canonical encoding of 1
     let data = @[0xFF'u8, 0x01'u8, 0x00'u8, 0x00'u8, 0x00'u8,
                  0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8]
     var r = BinaryReader(data: data, pos: 0)
-    let v = r.readCompactSize()
-    check v == 1  # documents current (wrong) behaviour
+    expect SerializationError:
+      discard r.readCompactSize()
 
 # ===========================================================================
 # G6 — ReadCompactSize MAX_SIZE range check
@@ -149,16 +160,15 @@ suite "G5 ReadCompactSize non-canonical rejection (BUG-1)":
 ## bitcoin-core/src/serialize.h:358-360
 # ===========================================================================
 suite "G6 ReadCompactSize MAX_SIZE enforcement (BUG-2)":
-  const MAX_SIZE = 0x02000000'u64  # 33554432 per Core
+  ## Core MAX_SIZE = 0x02000000 (33554432).  bitcoin-core/src/serialize.h:358-360
 
-  test "BUG-2: value just above MAX_SIZE should raise but does not":
+  test "value just above MAX_SIZE raises SerializationError":
     ## Encode MAX_SIZE + 1 = 0x02000001 using 5-byte form
     var w = BinaryWriter()
     w.writeCompactSize(MAX_SIZE + 1)
     var r = BinaryReader(data: w.data, pos: 0)
-    ## Core throws "ReadCompactSize(): size too large" here
-    let v = r.readCompactSize()
-    check v == MAX_SIZE + 1  # documents current (wrong) behaviour
+    expect SerializationError:
+      discard r.readCompactSize()
 
   test "value at MAX_SIZE is accepted":
     ## Core accepts exactly MAX_SIZE
@@ -167,12 +177,12 @@ suite "G6 ReadCompactSize MAX_SIZE enforcement (BUG-2)":
     var r = BinaryReader(data: w.data, pos: 0)
     check r.readCompactSize() == MAX_SIZE
 
-  test "BUG-2: large 8-byte value accepted without MAX_SIZE gate":
+  test "large 8-byte value exceeding MAX_SIZE raises SerializationError":
     var w = BinaryWriter()
     w.writeCompactSize(0xFFFFFFFFFFFFFFFF'u64)
     var r = BinaryReader(data: w.data, pos: 0)
-    let v = r.readCompactSize()
-    check v == 0xFFFFFFFFFFFFFFFF'u64  # should have been rejected
+    expect SerializationError:
+      discard r.readCompactSize()
 
 # ===========================================================================
 # G7 — readVarBytes allocates without MAX_SIZE guard
@@ -514,16 +524,25 @@ suite "G18 VarInt one-to-one encoding":
 # G19 — CompactSize write/read round-trip across all boundary values
 # ===========================================================================
 suite "G19 CompactSize full boundary round-trip":
-  test "boundary values round-trip correctly":
+  test "boundary values at or below MAX_SIZE round-trip correctly":
+    ## Values within the MAX_SIZE range use the standard range_check=true path.
     let boundaries = [
       0'u64, 1, 252, 253, 254, 255,
       0xFFFE'u64, 0xFFFF'u64, 0x10000'u64, 0x10001'u64,
-      0xFFFFFFFE'u64, 0xFFFFFFFF'u64,
-      0x100000000'u64, 0x100000001'u64,
-      0x02000000'u64  # MAX_SIZE
+      0x02000000'u64  # MAX_SIZE exactly
     ]
     for v in boundaries:
       check roundtripCompact(v) == v
+
+  test "boundary values above MAX_SIZE round-trip with range_check=false":
+    ## Pure encoding coverage for the 5-byte and 9-byte forms beyond MAX_SIZE.
+    ## range_check=false because these values are not valid container lengths.
+    let largeValues = [
+      0xFFFFFFFE'u64, 0xFFFFFFFF'u64,
+      0x100000000'u64, 0x100000001'u64
+    ]
+    for v in largeValues:
+      check roundtripCompactNoCheck(v) == v
 
 # ===========================================================================
 # G20 — CompactSize discriminator byte correctness
@@ -766,18 +785,28 @@ suite "G28 ScriptCompression VarInt tag encoding":
 # G29 — readCompactSize handles 0xFF discriminator correctly for uint64
 # ===========================================================================
 suite "G29 readCompactSize 8-byte form correctness":
-  test "8-byte form decodes max uint64 correctly":
+  test "8-byte form decodes max uint64 correctly (range_check=false)":
+    ## 0xFFFFFFFFFFFFFFFF far exceeds MAX_SIZE; this is a pure wire-encoding
+    ## test.  range_check=false matches service-bits / raw-encoding paths.
     let expected = 0xFFFFFFFFFFFFFFFF'u64
     var w = BinaryWriter()
     w.writeCompactSize(expected)
     check w.data[0] == 0xFF'u8
     check w.data.len == 9
     var r = BinaryReader(data: w.data, pos: 0)
-    check r.readCompactSize() == expected
+    check r.readCompactSize(range_check = false) == expected
 
-  test "8-byte form at 0x100000000 (4GB + 1)":
+  test "8-byte form at 0x100000000 (4GB + 1) raises with range_check=true":
+    ## 0x100000000 > MAX_SIZE — must be rejected on the default path.
+    var w = BinaryWriter()
+    w.writeCompactSize(0x100000000'u64)
+    var r = BinaryReader(data: w.data, pos: 0)
+    expect SerializationError:
+      discard r.readCompactSize()
+
+  test "8-byte form at 0x100000000 round-trips with range_check=false":
     let v = 0x100000000'u64
-    check roundtripCompact(v) == v
+    check roundtripCompactNoCheck(v) == v
 
 # ===========================================================================
 # G30 — BinaryWriter data integrity (no extra bytes, no missing bytes)
