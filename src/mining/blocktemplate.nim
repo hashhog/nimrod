@@ -74,31 +74,40 @@ type
     target*: array[32, byte]
 
 proc encodeBip34Height*(height: int32): seq[byte] =
-  ## Encode block height for coinbase scriptSig per BIP-34
-  ## Uses minimal push encoding
-  if height < 0:
-    # Should not happen, but handle gracefully
-    return @[0x01'u8, 0x00]
-  elif height == 0:
-    # OP_0 (0x00) represents 0
-    return @[0x01'u8, 0x00]
+  ## Encode block height for coinbase scriptSig per BIP-34.
+  ##
+  ## Mirrors Bitcoin Core's CScript() << int64_t(nHeight):
+  ##   h = 0        → OP_0     = [0x00]            (1 byte)
+  ##   h = 1..16    → OP_n     = [0x50 + h]        (1 byte, opcodes 0x51..0x60)
+  ##   h = 17..127  → CScriptNum minimal: [0x01, byte(h)]    (2 bytes, no sign bit needed)
+  ##   h = 128..255 → MSB set: [0x02, byte(h), 0x00]         (sign-bit padding)
+  ##   h = 256..32767 → [0x02, low, high]           (2 bytes, high < 0x80)
+  ##   h = 32768..8388607 → [0x03, b0, b1, b2] with optional 0x00 padding if b2 >= 0x80
+  ##   etc.
+  ##
+  ## Reference: bitcoin-core/src/script/script.h CScript::operator<<(int64_t)
+  ##            bitcoin-core/src/script/script.h CScriptNum::serialize()
+  if height <= 0:
+    # OP_0 (0x00) for zero.  Negative heights should not occur (guarded by caller).
+    return @[0x00'u8]
   elif height <= 16:
-    # Could use OP_1..OP_16, but BIP-34 specifies push encoding
-    return @[0x01'u8, byte(height)]
-  elif height < 128:
-    # 1-byte push
-    return @[0x01'u8, byte(height)]
-  elif height < 32768:
-    # 2-byte push (little-endian)
-    return @[0x02'u8, byte(height and 0xff), byte((height shr 8) and 0xff)]
-  elif height < 8388608:
-    # 3-byte push (little-endian)
-    return @[0x03'u8, byte(height and 0xff), byte((height shr 8) and 0xff),
-             byte((height shr 16) and 0xff)]
+    # OP_1 (0x51) .. OP_16 (0x60)
+    return @[byte(0x50 + height)]
   else:
-    # 4-byte push (little-endian)
-    return @[0x04'u8, byte(height and 0xff), byte((height shr 8) and 0xff),
-             byte((height shr 16) and 0xff), byte((height shr 24) and 0xff)]
+    # CScriptNum::serialize path: little-endian, minimal encoding with sign-bit
+    # padding byte appended when the most-significant data byte has bit 7 set.
+    var data: seq[byte]
+    var v = height
+    while v > 0:
+      data.add(byte(v and 0xff))
+      v = v shr 8
+    # If the high byte has bit 7 set we need a 0x00 sign-extension byte so that
+    # the value is not misread as negative (CScriptNum sign convention).
+    if (data[^1] and 0x80) != 0:
+      data.add(0x00'u8)
+    # Prefix with the length byte (script data-push)
+    result = @[byte(data.len)]
+    result.add(data)
 
 proc computeWitnessCommitment*(txs: seq[Transaction]): array[32, byte] =
   ## Compute witness commitment for a block

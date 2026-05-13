@@ -221,42 +221,69 @@ suite "W108 GBT gate G9 — proposal mode not implemented":
 #
 # A nimrod-mined block at any height 1..16 will be rejected by every other
 # node on the network with "bad-cb-height" — consensus-divergent.
-suite "W108 GBT gate G10 — BIP-34 height encoding wrong for heights 0–16":
-  test "BUG-10a: height 0 — Core expects [0x00] (OP_0), nimrod returns [0x01, 0x00]":
+suite "W108 GBT gate G10 — BIP-34 height encoding (fixed: OP_n + CScriptNum sign-bit)":
+  # Fixed: encodeBip34Height now mirrors Core's CScript() << int64_t(nHeight).
+  # h=0      → OP_0  [0x00]        (was [0x01, 0x00])
+  # h=1..16  → OP_n  [0x51..0x60]  (was [0x01, byte(h)])
+  # h=17+    → CScriptNum minimal with sign-bit padding where needed
+
+  test "height 0 — Core expects [0x00] (OP_0)":
     let enc = encodeBip34Height(0)
-    # Current (wrong) encoding:
-    check enc == @[0x01'u8, 0x00]  # 2-byte data push — documents current bug
-    # Correct encoding matching Core's CScript() << 0:
-    let coreExpected = @[0x00'u8]   # OP_0
-    check enc != coreExpected        # proves divergence
+    check enc == @[0x00'u8]   # OP_0
 
-  test "BUG-10b: height 1 — Core expects [0x51] (OP_1), nimrod returns [0x01, 0x01]":
+  test "height 1 — Core expects [0x51] (OP_1)":
     let enc = encodeBip34Height(1)
-    check enc == @[0x01'u8, 0x01]   # 2-byte data push — current bug
-    let coreExpected = @[0x51'u8]   # OP_1
-    check enc != coreExpected
+    check enc == @[0x51'u8]   # OP_1
 
-  test "BUG-10c: height 16 — Core expects [0x60] (OP_16), nimrod returns [0x01, 0x10]":
+  test "height 2 — Core expects [0x52] (OP_2)":
+    let enc = encodeBip34Height(2)
+    check enc == @[0x52'u8]
+
+  test "height 9 — Core expects [0x59] (OP_9)":
+    let enc = encodeBip34Height(9)
+    check enc == @[0x59'u8]
+
+  test "height 16 — Core expects [0x60] (OP_16)":
     let enc = encodeBip34Height(16)
-    check enc == @[0x01'u8, 0x10]   # 2-byte data push — current bug
-    let coreExpected = @[0x60'u8]   # OP_16
-    check enc != coreExpected
+    check enc == @[0x60'u8]   # OP_16
 
-  test "BUG-10d: height 17 (first unaffected) — both produce [0x01, 0x11]":
-    # CScript() << 17 → CScriptNum::serialize(17) → [0x11], then push as [0x01, 0x11]
-    # nimrod: height > 16 and < 128 → [0x01, byte(height)] = [0x01, 0x11]
+  test "height 17 (first CScriptNum path) — Core expects [0x01, 0x11]":
+    # CScript() << 17 → CScriptNum::serialize(17) → [0x11], push → [0x01, 0x11]
     let enc = encodeBip34Height(17)
-    check enc == @[0x01'u8, 0x11]  # correct for this range
+    check enc == @[0x01'u8, 0x11]
 
-  test "BUG-10e: height 127 — both produce [0x01, 0x7f]":
+  test "height 127 — Core expects [0x01, 0x7f]":
     let enc = encodeBip34Height(127)
-    check enc == @[0x01'u8, 0x7f]  # correct
+    check enc == @[0x01'u8, 0x7f]
 
-  test "BUG-10f: height 128 — nimrod returns [0x02, 0x80, 0x00], Core returns [0x02, 0x80, 0x00]":
-    # At height 128: CScriptNum::serialize(128) = [0x80, 0x00] (sign-extension byte added)
-    # then pushed as [0x02, 0x80, 0x00] — nimrod matches
+  test "height 128 — sign-bit padding: Core expects [0x02, 0x80, 0x00]":
+    # CScriptNum::serialize(128): data=[0x80]; bit7 set → append 0x00 → [0x80,0x00]
+    # push → [0x02, 0x80, 0x00]
     let enc = encodeBip34Height(128)
-    check enc == @[0x02'u8, 0x80, 0x00]  # matches Core
+    check enc == @[0x02'u8, 0x80, 0x00]
+
+  test "height 255 — sign-bit padding: Core expects [0x02, 0xff, 0x00]":
+    let enc = encodeBip34Height(255)
+    check enc == @[0x02'u8, 0xff, 0x00]
+
+  test "height 256 — no padding needed: Core expects [0x02, 0x00, 0x01]":
+    # CScriptNum::serialize(256): data=[0x00, 0x01]; high byte=0x01, bit7 clear → no pad
+    let enc = encodeBip34Height(256)
+    check enc == @[0x02'u8, 0x00, 0x01]
+
+  test "height 32767 — Core expects [0x02, 0xff, 0x7f]":
+    let enc = encodeBip34Height(32767)
+    check enc == @[0x02'u8, 0xff, 0x7f]
+
+  test "height 32768 — sign-bit padding: Core expects [0x03, 0x00, 0x80, 0x00]":
+    # data=[0x00, 0x80]; high byte=0x80, bit7 set → append 0x00 → [0x00,0x80,0x00]
+    let enc = encodeBip34Height(32768)
+    check enc == @[0x03'u8, 0x00, 0x80, 0x00]
+
+  test "height 840000 (recent mainnet) — Core expects [0x03, 0x40, 0xd1, 0x0c]":
+    # 840000 = 0x0CD140; data=[0x40, 0xd1, 0x0c]; high=0x0c, bit7 clear → no pad
+    let enc = encodeBip34Height(840000)
+    check enc == @[0x03'u8, 0x40, 0xd1, 0x0c]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G11  DefaultBlockMinFeeRateSatKvB must be 1 sat/kvB (Core default)
