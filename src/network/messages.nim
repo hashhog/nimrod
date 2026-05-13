@@ -221,12 +221,20 @@ type
     mkSketch
     mkReconcilDiff
     mkReqSketchExt
+    # BIP-37 bloom filter messages — parsed but immediately rejected
+    # (BIP-111: disconnect when NODE_BLOOM not advertised)
+    mkFilterLoad
+    mkFilterAdd
+    mkFilterClear
+    # merkleblock — server→client; log + drop if received unexpectedly
+    mkMerkleBlock
 
   P2PMessage* = object
     case kind*: MessageKind
     of mkVersion:
       version*: VersionMsg
-    of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2, mkSendPackages, mkReqSketchExt, mkMempool:
+    of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2, mkSendPackages, mkReqSketchExt, mkMempool,
+       mkFilterLoad, mkFilterAdd, mkFilterClear, mkMerkleBlock:
       discard
     of mkPing:
       pingNonce*: uint64
@@ -478,8 +486,9 @@ proc serializePayload*(msg: P2PMessage): seq[byte] =
   case msg.kind
   of mkVersion:
     w.writeVersionMsg(msg.version)
-  of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2, mkSendPackages, mkMempool:
-    discard  # Empty payload
+  of mkVerack, mkGetAddr, mkSendHeaders, mkWtxidRelay, mkSendAddrV2, mkSendPackages, mkMempool,
+     mkFilterLoad, mkFilterAdd, mkFilterClear, mkMerkleBlock:
+    discard  # Empty payload (bloom messages never sent by nimrod)
   of mkPing:
     w.writeUint64LE(msg.pingNonce)
   of mkPong:
@@ -629,6 +638,11 @@ proc messageKindToCommand*(kind: MessageKind): string =
   of mkSketch: "sketch"
   of mkReconcilDiff: "reconcildiff"
   of mkReqSketchExt: "reqsketchext"
+  # BIP-37 bloom (received-only — nimrod never sends these)
+  of mkFilterLoad: "filterload"
+  of mkFilterAdd: "filteradd"
+  of mkFilterClear: "filterclear"
+  of mkMerkleBlock: "merkleblock"
 
 proc commandToMessageKind*(cmd: string): MessageKind =
   case cmd
@@ -674,6 +688,11 @@ proc commandToMessageKind*(cmd: string): MessageKind =
   of "sketch": mkSketch
   of "reconcildiff": mkReconcilDiff
   of "reqsketchext": mkReqSketchExt
+  # BIP-37 bloom filter messages (received-only — nimrod never sends these)
+  of "filterload": mkFilterLoad
+  of "filteradd": mkFilterAdd
+  of "filterclear": mkFilterClear
+  of "merkleblock": mkMerkleBlock
   else:
     raise newException(SerializationError, "unknown command: " & cmd)
 
@@ -930,6 +949,19 @@ proc deserializePayload*(cmd: string, payload: seq[byte]): P2PMessage =
     ))
   of "reqsketchext":
     result = P2PMessage(kind: mkReqSketchExt)
+  # BIP-37 bloom filter messages — body is NOT parsed (CBloomFilter not implemented,
+  # W110 BUG-01).  We return a sentinel P2PMessage so peer.handleMessage can issue
+  # the BIP-111 disconnect without raising SerializationError.
+  # Reference: bitcoin-core/src/net_processing.cpp:4963-5033
+  of "filterload":
+    result = P2PMessage(kind: mkFilterLoad)   # body skipped — will disconnect
+  of "filteradd":
+    result = P2PMessage(kind: mkFilterAdd)    # body skipped — will disconnect
+  of "filterclear":
+    result = P2PMessage(kind: mkFilterClear)  # body skipped — will disconnect
+  # merkleblock — server→client message; we skip the body and log-drop it.
+  of "merkleblock":
+    result = P2PMessage(kind: mkMerkleBlock)  # body skipped — unexpected, log+drop
   else:
     raise newException(SerializationError, "unknown command: " & cmd)
 
