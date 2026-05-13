@@ -153,13 +153,13 @@ suite "peer feature flags":
 
     check peer.feeFilterRate == 0
 
-suite "NODE_BLOOM advertisement gate (BIP-35)":
-  # Mirrors bitcoin-core/src/net_processing.cpp:4852-4863:
-  #   if (!(peer.m_our_services & NODE_BLOOM) && !HasPermission(Mempool))
-  #     drop + disconnect (unless NoBan).
-  # We have no per-peer permission system, so the local advertisement
-  # flag IS the gate.  Default (no env var) must be OFF, matching
-  # DEFAULT_PEERBLOOMFILTERS = false in net_processing.h:44.
+suite "BIP-35 mempool gate / NIMROD_PEER_BLOOM_FILTERS env var":
+  # FIX-35: peerBloomFiltersEnabled() no longer controls NODE_BLOOM
+  # advertisement (BIP-111 forbids advertising without bloom subsystem —
+  # W110 BUG-01).  It now solely gates BIP-35 `mempool` message handling
+  # (nimrod.nim: if not peerBloomFiltersEnabled(): drop mempool request).
+  # Default OFF mirrors Core's DEFAULT_PEERBLOOMFILTERS = false
+  # (net_processing.h:44).
   test "default (env unset) is OFF":
     delEnv("NIMROD_PEER_BLOOM_FILTERS")
     check peerBloomFiltersEnabled() == false
@@ -175,7 +175,7 @@ suite "NODE_BLOOM advertisement gate (BIP-35)":
       check peerBloomFiltersEnabled() == false
     delEnv("NIMROD_PEER_BLOOM_FILTERS")
 
-  test "'1' / 'true' / 'yes' / 'on' are ON":
+  test "'1' / 'true' / 'yes' / 'on' are ON (mempool gate only — not NODE_BLOOM advertisement)":
     for v in ["1", "true", "yes", "on", "TRUE", "On"]:
       putEnv("NIMROD_PEER_BLOOM_FILTERS", v)
       check peerBloomFiltersEnabled() == true

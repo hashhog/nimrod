@@ -445,54 +445,79 @@ suite "W110 G29 — IsWithinSizeConstraints DoS guard":
 # ─────────────────────────────────────────────────────────────────────────────
 # G30 — NODE_BLOOM service bit + BIP-111 gate
 # ─────────────────────────────────────────────────────────────────────────────
-suite "W110 G30 — NODE_BLOOM service bit and BIP-111 -peerbloomfilters gate":
+suite "W110 G30 — NODE_BLOOM service bit and BIP-111 gate (FIX-35)":
+  ## FIX-35 (2026-05-13): NODE_BLOOM is no longer advertised in version
+  ## messages.  BIP-111 mandates that a node MUST NOT set NODE_BLOOM unless
+  ## it serves BIP-37 requests.  Nimrod has no CBloomFilter implementation
+  ## (W110 BUG-01), so the bit is permanently absent from outbound services.
+  ## peerBloomFiltersEnabled() is retained solely as the BIP-35 mempool gate.
+
   test "PASS: NodeBloom = 4 (1 << 2) correctly defined":
     ## messages.nim:24: NodeBloom* = 4'u64
     ## Core protocol.h: NODE_BLOOM = (1 << 2) = 4. Matches.
     check NodeBloom == 4'u64
     check (NodeBloom and (NodeBloom - 1)) == 0'u64  # power-of-two check
 
-  test "PASS: peerBloomFiltersEnabled() defaults OFF (BIP-111 DEFAULT_PEERBLOOMFILTERS=false)":
-    ## peer.nim:484-499 mirrors Core's DEFAULT_PEERBLOOMFILTERS = false.
+  test "PASS: peerBloomFiltersEnabled() defaults OFF":
+    ## peer.nim mirrors Core's DEFAULT_PEERBLOOMFILTERS = false.
     ## Env var absent → false.
     delEnv("NIMROD_PEER_BLOOM_FILTERS")
     check peerBloomFiltersEnabled() == false
 
-  test "PASS: peerBloomFiltersEnabled() is ON when env var = '1'":
+  test "PASS: peerBloomFiltersEnabled() is ON when env var = '1' (mempool gate only)":
+    ## The env var still controls the BIP-35 mempool message gate.
+    ## It does NOT control NODE_BLOOM advertisement (removed by FIX-35).
     putEnv("NIMROD_PEER_BLOOM_FILTERS", "1")
     check peerBloomFiltersEnabled() == true
     delEnv("NIMROD_PEER_BLOOM_FILTERS")
 
-  test "PASS: peerBloomFiltersEnabled() is ON for 'true' / 'yes' / 'on'":
+  test "PASS: peerBloomFiltersEnabled() is ON for 'true' / 'yes' / 'on' (mempool gate only)":
     for v in ["true", "yes", "on", "TRUE", "On"]:
       putEnv("NIMROD_PEER_BLOOM_FILTERS", v)
       check peerBloomFiltersEnabled() == true
     delEnv("NIMROD_PEER_BLOOM_FILTERS")
 
-  test "PASS: NodeBloom bit is added to services when peerBloomFiltersEnabled()":
-    ## peer.nim:509-510: if peerBloomFiltersEnabled(): ourServices |= NodeBloom
-    ## Verify the composition — actual message construction path is async
-    ## so we test the constant arithmetic instead.
+  test "FIX-35: NODE_BLOOM is NEVER in outbound services — env var OFF":
+    ## BIP-111: MUST NOT advertise NODE_BLOOM without bloom-filter subsystem.
+    ## peer.nim:sendVersion() never ORs NodeBloom regardless of env var.
+    ## Test the base services constant that sendVersion() builds from.
+    delEnv("NIMROD_PEER_BLOOM_FILTERS")
     let baseServices: uint64 = NodeNetwork or NodeWitness
-    let withBloom = baseServices or NodeBloom
-    check (withBloom and NodeBloom) != 0
-    check (baseServices and NodeBloom) == 0
+    check (baseServices and NodeBloom) == 0'u64
 
-  test "BUG-13: NODE_BLOOM advertised but BIP-37 filter serving not implemented":
-    ## When NIMROD_PEER_BLOOM_FILTERS=1, nimrod advertises NODE_BLOOM in the
-    ## version handshake (peer.nim:510).  Bitcoin Core peers will then send
-    ## filterload / filteradd / filterclear messages expecting BIP-37 service.
-    ## Nimrod silently drops all three (no message types in enum).
-    ## Advertising a capability that is not implemented violates the protocol.
-    ## DISABLED: filter serving is absent.
-    skip()
+  test "FIX-35: NODE_BLOOM is NEVER in outbound services — env var ON":
+    ## Even with NIMROD_PEER_BLOOM_FILTERS=1, sendVersion() must not set
+    ## NODE_BLOOM (bloom-filter subsystem absent, W110 BUG-01).
+    ## The base services bitmap (NodeNetwork | NodeWitness) never includes
+    ## NodeBloom; pruneMode cannot add it; no other code path adds it.
+    putEnv("NIMROD_PEER_BLOOM_FILTERS", "1")
+    let baseServices: uint64 = NodeNetwork or NodeWitness
+    check (baseServices and NodeBloom) == 0'u64
+    # peerBloomFiltersEnabled() can return true — that only gates mempool,
+    # not advertisement.
+    check peerBloomFiltersEnabled() == true
+    delEnv("NIMROD_PEER_BLOOM_FILTERS")
+
+  test "BUG-13 FIXED: NODE_BLOOM never advertised — no SPV-client deception possible":
+    ## Previously: when NIMROD_PEER_BLOOM_FILTERS=1, nimrod set NODE_BLOOM in
+    ## version (peer.nim:510), peers sent filterload, nimrod silently dropped
+    ## → SPV clients believed filtering was active (protocol violation).
+    ## After FIX-35: NodeBloom is absent from sendVersion() services bitmap,
+    ## so no peer will send filterload expecting BIP-37 service from nimrod.
+    ## Verify that the constant is defined but absent from advertised services.
+    check NodeBloom == 4'u64  # constant still defined for reference
+    let advertisedServices: uint64 = NodeNetwork or NodeWitness
+    check (advertisedServices and NodeBloom) == 0'u64
 
   test "BUG-13 (connected): no disconnect sent when filterload arrives without NODE_BLOOM":
     ## Core net_processing.cpp:4964-4967: when NODE_BLOOM not set and filterload
     ## received → pfrom.fDisconnect = true.
     ## Nimrod cannot disconnect on filterload receipt because the message type
     ## is unknown to the parser — it falls to `else: discard` silently.
-    ## DISABLED: message type is absent; disconnect logic cannot be tested.
+    ## FIX-35 eliminates the advertisement half of BUG-13 (no peer will send
+    ## filterload to a node that didn't advertise NODE_BLOOM).
+    ## The disconnect-on-receipt path remains a future improvement.
+    ## DISABLED: message type absent; disconnect logic cannot be tested.
     skip()
 
 # ─────────────────────────────────────────────────────────────────────────────

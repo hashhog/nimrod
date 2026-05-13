@@ -482,16 +482,18 @@ proc pruneModeAdvertiseEnabled*(): bool =
   pruneModeAdvertise
 
 proc peerBloomFiltersEnabled*(): bool =
-  ## Gate for advertising NODE_BLOOM (service bit 1<<2) and for accepting
-  ## inbound BIP-35 `mempool` messages.  Mirrors Bitcoin Core's
-  ## `-peerbloomfilters` knob (`DEFAULT_PEERBLOOMFILTERS = false`,
-  ## net_processing.h:44): default OFF, opt-in via
-  ## `NIMROD_PEER_BLOOM_FILTERS=1` (or "true"/"yes"/"on").
+  ## Gate for accepting inbound BIP-35 `mempool` messages (nimrod.nim).
+  ## Mirrors Bitcoin Core's `-peerbloomfilters` knob
+  ## (`DEFAULT_PEERBLOOMFILTERS = false`, net_processing.h:44): default OFF,
+  ## opt-in via `NIMROD_PEER_BLOOM_FILTERS=1` (or "true"/"yes"/"on").
   ##
-  ## Nimrod doesn't actually serve BIP-37 bloom filters — but the bit
-  ## ALSO governs BIP-35 `mempool` per net_processing.cpp:4852-4863, and
-  ## that flow we DO support.  Operators who want to expose mempool inv
-  ## to peers flip this on.
+  ## NOTE: This flag NO LONGER controls NODE_BLOOM advertisement.  BIP-111
+  ## mandates that a node MUST NOT advertise NODE_BLOOM unless it actually
+  ## serves BIP-37 bloom-filter requests (filterload / filteradd /
+  ## filterclear).  Nimrod has no CBloomFilter implementation (W110 BUG-01),
+  ## so NODE_BLOOM is never set in outbound version messages regardless of
+  ## this env var.  The flag is kept solely to allow operators to expose
+  ## BIP-35 `mempool` inv to peers via the NIMROD_PEER_BLOOM_FILTERS knob.
   let v = getEnv("NIMROD_PEER_BLOOM_FILTERS", "")
   if v.len == 0:
     return false
@@ -500,14 +502,12 @@ proc peerBloomFiltersEnabled*(): bool =
 
 proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
   ## Send version message
-  # Match Bitcoin Core's NODE_BLOOM gating (BIP-35/BIP-111): advertise the
-  # bit only when the operator has explicitly opted in via
-  # NIMROD_PEER_BLOOM_FILTERS.  The same flag gates inbound `mempool`
-  # message handling in nimrod.nim, so the two stay in sync — peers learn
-  # whether we'll honour `mempool` purely from the version services bits.
+  # BIP-111: NODE_BLOOM MUST NOT be advertised unless the node actually serves
+  # BIP-37 bloom-filter requests (filterload / filteradd / filterclear).
+  # Nimrod has no CBloomFilter implementation (W110 BUG-01), so NODE_BLOOM is
+  # intentionally absent from outbound services regardless of any env var.
+  # See also: peerBloomFiltersEnabled() above for the mempool-only gate.
   var ourServices = NodeNetwork or NodeWitness
-  if peerBloomFiltersEnabled():
-    ourServices = ourServices or NodeBloom
   # BIP-159: signal limited-archive serving when prune mode is enabled.
   # Core advertises NODE_NETWORK alongside NODE_NETWORK_LIMITED in the
   # auto-prune case (the node still has the recent-288 window), so we
