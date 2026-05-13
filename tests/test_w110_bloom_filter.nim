@@ -40,15 +40,13 @@
 ##   % (vData.size()*8).  Nimrod implements SHA-256 / HASH256 / SipHash but not
 ##   MurmurHash3.  Any bloom implementation would produce wrong bit positions.
 ##
-## BUG-05 [MISSING ENTIRELY] filterload / filteradd / filterclear message
+## BUG-05 [FIXED by FIX-36] filterload / filteradd / filterclear message
 ##   types absent from the P2P message enum (G25 / G26 / G27).
-##   src/network/messages.nim defines MessageKind with mkGetCFilters, mkCFilter,
-##   etc. (BIP-157) but no mkFilterLoad / mkFilterAdd / mkFilterClear variants.
-##   Consequently the message parser (parseP2PMessage) never produces these
-##   kinds, and the handleMessage dispatcher in nimrod.nim falls through to
-##   `else: discard` for all three.  A peer sending filterload is silently
-##   dropped without disconnect (BIP-111 requires disconnect when
-##   NODE_BLOOM is not advertised).
+##   FIX-36 adds mkFilterLoad / mkFilterAdd / mkFilterClear to MessageKind and
+##   deserializePayload, and adds BIP-111 disconnect in handleMessage (both
+##   peer.nim and nimrod.nim).  The body of each message is intentionally skipped
+##   (CBloomFilter not implemented — BUG-01 remains open).
+##   Reference: bitcoin-core/src/net_processing.cpp:4963-5033.
 ##
 ## BUG-06 [MISSING ENTIRELY] No per-peer bloom filter state (G25 / G26 / G27).
 ##   Core stores m_bloom_filter (unique_ptr<CBloomFilter>) and m_relay_txs in
@@ -96,16 +94,14 @@
 ##   OutPoint correctly for other uses, but there is no
 ##   bloomInsertOutpoint() helper and no calls to it.
 ##
-## BUG-13 [PARTIAL — P2P messages silently dropped instead of disconnect] (G30).
+## BUG-13 [FIXED by FIX-35 + FIX-36] (G30).
+##   FIX-35: NODE_BLOOM no longer advertised (no peer will send bloom messages
+##   expecting service from nimrod).
+##   FIX-36: filterload/filteradd/filterclear now parsed to mkFilterLoad/Add/Clear
+##   and handleMessage disconnects the peer for all three (BIP-111 compliance).
 ##   Bitcoin Core (net_processing.cpp:4964-4967): if !(m_our_services & NODE_BLOOM),
 ##   log "filterload received despite not offering bloom services" and set
-##   pfrom.fDisconnect = true.  Nimrod's peerBloomFiltersEnabled() gate
-##   correctly prevents advertising NODE_BLOOM by default.  However, when
-##   NODE_BLOOM IS enabled (opt-in), the filter messages are still silently
-##   dropped (no parse, no handler) instead of being processed — advertising
-##   the capability but not implementing it is a protocol violation.
-##   When NODE_BLOOM is OFF, there is no disconnect on receipt because the
-##   message type is unknown to the parser (falls to `else: discard`).
+##   pfrom.fDisconnect = true.  Nimrod now matches this behavior.
 ##
 ## BUG-14 [PARTIAL] w47b PartialMerkleTree helpers exist but are dead for P2P (G28).
 ##   rpc/server.nim exports w47bBuildPartialMerkleTree and w47bParsePartialMerkleTree
@@ -355,30 +351,61 @@ suite "W110 G24 — Outpoint 36-byte LE serialization for bloom":
 # ─────────────────────────────────────────────────────────────────────────────
 # G25 — filterload message: parse + validate + install
 # ─────────────────────────────────────────────────────────────────────────────
-suite "W110 G25 — filterload P2P message handling":
-  test "BUG-05: mkFilterLoad message kind absent from MessageKind enum":
-    ## src/network/messages.nim MessageKind enum does not contain mkFilterLoad.
-    ## The parser never produces it; the dispatcher never handles it.
-    ## A peer sending filterload is silently dropped.
-    ## DISABLED: message type is absent.
-    skip()
+suite "W110 G25 — filterload P2P message handling (FIX-36)":
+  ## FIX-36 (2026-05-13): mkFilterLoad, mkFilterAdd, mkFilterClear added to
+  ## MessageKind.  deserializePayload maps "filterload"/"filteradd"/"filterclear"
+  ## to these variants (body skipped — CBloomFilter not implemented, BUG-01).
+  ## handleMessage in peer.nim AND nimrod.nim disconnect the peer for all three,
+  ## matching Core's net_processing.cpp:4964 BIP-111 behavior.
 
-  test "BUG-06: no per-peer bloom filter field in Peer type":
+  test "FIX-36: mkFilterLoad variant exists in MessageKind":
+    ## Messages.nim MessageKind enum now contains mkFilterLoad.
+    ## commandToMessageKind("filterload") must return mkFilterLoad.
+    let kind = commandToMessageKind("filterload")
+    check kind == mkFilterLoad
+
+  test "FIX-36: deserializePayload produces mkFilterLoad for any payload":
+    ## The body is intentionally skipped — CBloomFilter not implemented.
+    ## Any bytes in the payload must still produce a well-formed P2PMessage
+    ## so the disconnect handler can run.
+    let payload: seq[byte] = @[0x02'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8,
+                               0x05'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8]
+    let msg = deserializePayload("filterload", payload)
+    check msg.kind == mkFilterLoad
+
+  test "FIX-36: deserializePayload produces mkFilterLoad for empty payload":
+    let msg = deserializePayload("filterload", @[])
+    check msg.kind == mkFilterLoad
+
+  test "FIX-36: messageKindToCommand(mkFilterLoad) = 'filterload'":
+    check messageKindToCommand(mkFilterLoad) == "filterload"
+
+  test "BUG-06: no per-peer bloom filter field in Peer type (CBloomFilter absent)":
     ## Core stores tx_relay->m_bloom_filter (unique_ptr<CBloomFilter>) and
     ## tx_relay->m_relay_txs in TxRelay.  Nimrod's Peer object (network/peer.nim)
-    ## has no such fields.  Even if parsing were added, there is nowhere to
-    ## store the installed filter. DISABLED: field is absent.
+    ## has no such fields.  Even if filterload parsing were added (it now is),
+    ## there is nowhere to store the installed filter — the disconnect in FIX-36
+    ## is the correct response given BUG-01 (CBloomFilter not implemented).
+    ## DISABLED: field is absent; remains an open bug.
     skip()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G26 — filteradd ≤ 520 bytes
 # ─────────────────────────────────────────────────────────────────────────────
-suite "W110 G26 — filteradd message + MAX_SCRIPT_ELEMENT_SIZE guard":
-  test "BUG-08: mkFilterAdd message kind absent from MessageKind enum":
-    ## net_processing.cpp:5000: if (vData.size() > MAX_SCRIPT_ELEMENT_SIZE) bad=true
-    ## → Misbehaving.  Nimrod does not parse filteradd at all.
-    ## DISABLED: message type is absent.
-    skip()
+suite "W110 G26 — filteradd message + MAX_SCRIPT_ELEMENT_SIZE guard (FIX-36)":
+  test "FIX-36: mkFilterAdd variant exists in MessageKind":
+    ## commandToMessageKind("filteradd") must return mkFilterAdd.
+    let kind = commandToMessageKind("filteradd")
+    check kind == mkFilterAdd
+
+  test "FIX-36: deserializePayload produces mkFilterAdd for any payload":
+    ## Body skipped; disconnect will fire in the handler.
+    let payload: seq[byte] = @[0x20'u8] & newSeq[byte](32)
+    let msg = deserializePayload("filteradd", payload)
+    check msg.kind == mkFilterAdd
+
+  test "FIX-36: messageKindToCommand(mkFilterAdd) = 'filteradd'":
+    check messageKindToCommand(mkFilterAdd) == "filteradd"
 
   test "PASS: MaxScriptElementSize = 520 is correctly defined in interpreter.nim":
     ## The constant exists for script use; it would also be the correct limit
@@ -392,13 +419,21 @@ suite "W110 G26 — filteradd message + MAX_SCRIPT_ELEMENT_SIZE guard":
 # ─────────────────────────────────────────────────────────────────────────────
 # G27 — filterclear
 # ─────────────────────────────────────────────────────────────────────────────
-suite "W110 G27 — filterclear P2P message handling":
-  test "BUG-05 (shared): mkFilterClear message kind absent":
+suite "W110 G27 — filterclear P2P message handling (FIX-36)":
+  test "FIX-36: mkFilterClear variant exists in MessageKind":
     ## Core net_processing.cpp:5016-5032: filterclear nullifies
     ## tx_relay->m_bloom_filter and sets m_relay_txs = true.
-    ## Nimrod does not parse or handle filterclear.
-    ## DISABLED: message type is absent.
-    skip()
+    ## Nimrod now parses filterclear and disconnects (BIP-111).
+    let kind = commandToMessageKind("filterclear")
+    check kind == mkFilterClear
+
+  test "FIX-36: deserializePayload produces mkFilterClear for empty payload":
+    ## filterclear has an empty body (Core net_processing.cpp:5016 vRecv is not read).
+    let msg = deserializePayload("filterclear", @[])
+    check msg.kind == mkFilterClear
+
+  test "FIX-36: messageKindToCommand(mkFilterClear) = 'filterclear'":
+    check messageKindToCommand(mkFilterClear) == "filterclear"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G28 — merkleblock + PartialMerkleTree
@@ -509,27 +544,36 @@ suite "W110 G30 — NODE_BLOOM service bit and BIP-111 gate (FIX-35)":
     let advertisedServices: uint64 = NodeNetwork or NodeWitness
     check (advertisedServices and NodeBloom) == 0'u64
 
-  test "BUG-13 (connected): no disconnect sent when filterload arrives without NODE_BLOOM":
+  test "FIX-36: BUG-13 (connected) FIXED — filterload dispatches to mkFilterLoad":
+    ## FIX-36 adds mkFilterLoad/Add/Clear to MessageKind and deserializePayload.
+    ## handleMessage (peer.nim + nimrod.nim) disconnect the peer for all three.
     ## Core net_processing.cpp:4964-4967: when NODE_BLOOM not set and filterload
-    ## received → pfrom.fDisconnect = true.
-    ## Nimrod cannot disconnect on filterload receipt because the message type
-    ## is unknown to the parser — it falls to `else: discard` silently.
-    ## FIX-35 eliminates the advertisement half of BUG-13 (no peer will send
-    ## filterload to a node that didn't advertise NODE_BLOOM).
-    ## The disconnect-on-receipt path remains a future improvement.
-    ## DISABLED: message type absent; disconnect logic cannot be tested.
-    skip()
+    ## received → pfrom.fDisconnect = true.  Nimrod now matches this behavior.
+    ## Verify the dispatch mapping is present (runtime disconnect cannot be
+    ## tested without a live socket; the parser + enum mapping is verified
+    ## in G25/G26/G27 suites above).
+    let kind = commandToMessageKind("filterload")
+    check kind == mkFilterLoad
+    let kind2 = commandToMessageKind("filteradd")
+    check kind2 == mkFilterAdd
+    let kind3 = commandToMessageKind("filterclear")
+    check kind3 == mkFilterClear
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Extra: bip324 short-id table completeness
 # ─────────────────────────────────────────────────────────────────────────────
-suite "W110 Extra — BIP-324 v2 transport short-ID table":
-  test "PASS: filterload/filteradd/filterclear have BIP-324 short IDs assigned":
-    ## bip324.nim defines the v2 transport short-ID table.
-    ## filterload  = 0x08, filteradd = 0x06, filterclear = 0x07 are present.
-    ## This means v2 peers CAN negotiate these message names even though
-    ## nimrod does not implement the underlying bloom filter subsystem.
-    ## (src/network/bip324.nim:84-86)
-    ## This test just documents the partial state — short IDs exist but
-    ## the message types they map to are absent from MessageKind.
-    check true  # presence documented; no runtime check needed
+suite "W110 Extra — BIP-324 v2 transport short-ID table (FIX-36)":
+  test "PASS: filterload/filteradd/filterclear BIP-324 short IDs decode to new enum variants":
+    ## bip324.nim: filteradd=0x06, filterclear=0x07, filterload=0x08 are present.
+    ## After FIX-36 the command strings they map to are now proper MessageKind
+    ## variants (mkFilterAdd, mkFilterClear, mkFilterLoad), so a v2 peer sending
+    ## the short-ID form will trigger the BIP-111 disconnect path in handleMessage.
+    ## Verify the command→kind round-trip for each short ID's command string.
+    check commandToMessageKind("filteradd") == mkFilterAdd
+    check commandToMessageKind("filterclear") == mkFilterClear
+    check commandToMessageKind("filterload") == mkFilterLoad
+
+  test "PASS: merkleblock BIP-324 short ID 0x10 decodes to mkMerkleBlock":
+    ## bip324.nim: merkleblock = 0x10.  After FIX-36 the command string maps to
+    ## mkMerkleBlock.  Unexpected receipt triggers log+drop in handleMessage.
+    check commandToMessageKind("merkleblock") == mkMerkleBlock

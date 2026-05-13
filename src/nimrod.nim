@@ -1181,6 +1181,30 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
   of mkCFilter, mkCFHeaders, mkCFCheckPt:
     trace "received BIP-157 filter response", peer = $peer, kind = $msg.kind
 
+  # BIP-37 bloom filter messages — BIP-111 requires disconnect when NODE_BLOOM is
+  # not advertised.  Nimrod never advertises NODE_BLOOM (W110 BUG-01 / FIX-35),
+  # so all three always trigger disconnect.
+  # Reference: bitcoin-core/src/net_processing.cpp:4963-5033
+  of mkFilterLoad:
+    warn "filterload received despite not offering bloom services — disconnecting",
+         peer = $peer
+    await peer.disconnect("filterload received — NODE_BLOOM not advertised (BIP-111)")
+
+  of mkFilterAdd:
+    warn "filteradd received despite not offering bloom services — disconnecting",
+         peer = $peer
+    await peer.disconnect("filteradd received — NODE_BLOOM not advertised (BIP-111)")
+
+  of mkFilterClear:
+    warn "filterclear received despite not offering bloom services — disconnecting",
+         peer = $peer
+    await peer.disconnect("filterclear received — NODE_BLOOM not advertised (BIP-111)")
+
+  # merkleblock — server→client message; we would not normally receive one.
+  # Log and drop; do not disconnect.
+  of mkMerkleBlock:
+    warn "unexpected merkleblock received — dropping", peer = $peer
+
   else:
     discard
 
