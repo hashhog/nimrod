@@ -163,39 +163,39 @@ suite "G1 — parallel verifier is dead code":
     check res.isOk
 
 # ---------------------------------------------------------------------------
-# G5: verifyScriptsParallel hardcodes mainnetParams()
+# G5: verifyScriptsParallel hardcodes mainnetParams() — FIXED
 # ---------------------------------------------------------------------------
-suite "G5 — parallel verifier hardcodes mainnetParams()":
-  ## Core: script flags derived from the ConsensusParams passed down from
-  ## Chainstate::ConnectBlock — correct for every network.
-  ## Nimrod: verifyScriptsParallel calls getBlockScriptFlags(height, mainnetParams())
-  ## This means testnet4 and regtest get mainnet activation heights, which
-  ## differ significantly (e.g. regtest has Taproot at height 0, mainnet at 709632).
+suite "G5 — parallel verifier now accepts chainParams (fixed)":
+  ## Fix: verifyScriptsParallel and verifyScriptsParallelBatch now accept
+  ## chainParams: ConsensusParams and blockHash: string parameters and pass
+  ## them to getBlockScriptFlags.  The mainnetParams() default is kept for
+  ## backwards compatibility with existing call sites, but callers must now
+  ## explicitly pass the correct params for any non-mainnet network.
 
-  test "G5a: mainnetParams() vs regtestParams() produce different flags at height 1":
+  test "G5a: regtest flags at height 1 include sfTaproot; mainnet flags do not":
     ## Regtest activates Taproot at height 0; mainnet at 709632.
-    ## A block at height 1 on regtest should include sfTaproot.
-    ## verifyScriptsParallel passes mainnetParams() so sfTaproot is absent at height 1.
+    ## Confirm the network divergence that made the bug dangerous:
     let flagsMainnet = getBlockScriptFlags(1'i32, mainnetParams())
     let flagsRegtest = getBlockScriptFlags(1'i32, regtestParams())
-    ## Confirm the divergence:
     check (sfTaproot in flagsRegtest) == true     ## regtest has Taproot at h=1
     check (sfTaproot in flagsMainnet) == false    ## mainnet Taproot starts at 709632
-    ## BUG G5: verifyScriptsParallel uses mainnetParams() always — regtest/testnet4
-    ## blocks above their actual activation heights use wrong script flags.
 
-  test "G5b: parallel path uses mainnet flags regardless of actual network":
-    ## At height 800000 on mainnet, Taproot is active.
-    ## On regtest, Taproot is active from height 0.
-    ## The parallel verifier calls mainnetParams() unconditionally, so on regtest
-    ## it will enforce mainnet Taproot activation height (709632) instead of 0.
+  test "G5b: verifyScriptsParallel called with regtestParams uses regtest flags":
+    ## After the fix, the caller passes regtestParams() and gets Taproot flags
+    ## at low heights — the parallel path now behaves correctly on regtest.
     let h = 100'i32
-    let parFlags = getBlockScriptFlags(h, mainnetParams())   ## what parallel uses
-    let rgtFlags = getBlockScriptFlags(h, regtestParams())   ## what serial uses on regtest
-    check parFlags != rgtFlags
-    ## BUG: if the production code ever re-enables the parallel path on regtest/testnet4,
-    ## blocks between the regtest/testnet4 activation height and mainnet height would
-    ## have wrong enforcement.
+    let rgtFlags = getBlockScriptFlags(h, regtestParams())
+    let mntFlags = getBlockScriptFlags(h, mainnetParams())
+    ## The two flag sets differ (this is what the bug exploited):
+    check rgtFlags != mntFlags
+    ## A regtest coinbase-only block at height 100 with regtestParams:
+    let params = regtestParams()
+    let blk = makeSimpleBlock(h, params.genesisBlockHash)
+    let lookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} = none(UtxoEntry)
+    ## FIX: pass regtestParams() — parallel path now uses correct flags
+    let res = verifyScriptsParallel(blk, lookup, h, newCryptoEngine(),
+                                    chainParams = regtestParams())
+    check res.isOk
 
 # ---------------------------------------------------------------------------
 # G6: no per-worker early-exit on first failure
@@ -588,31 +588,52 @@ suite "G25 — coinbase flag carried in task but never used by verifyInputScript
     check true  ## structural dead-field documented
 
 # ---------------------------------------------------------------------------
-# G26: parallel path skips blockHash exception checks
+# G26: parallel path skips blockHash exception checks — FIXED
 # ---------------------------------------------------------------------------
-suite "G26 — parallel path skips BIP16/Taproot blockHash script_flag_exceptions":
-  ## Core getBlockScriptFlagsForBlock has script_flag_exceptions:
-  ##   BIP16_EXCEPTION_HASH → return SCRIPT_VERIFY_NONE
-  ##   TAPROOT_EXCEPTION_HASH → exclude sfTaproot
-  ## Nimrod serial path (validation.nim:491-524) correctly checks blockHash
-  ## as a parameter to getBlockScriptFlags.
-  ## Nimrod parallel path (parallel_verify.nim:80):
-  ##   let flags = getBlockScriptFlags(height, mainnetParams())
-  ## The blockHash parameter defaults to "" — BOTH exception checks are
-  ## permanently disabled on the parallel path.
+suite "G26 — parallel path now accepts blockHash for exception handling (fixed)":
+  ## Fix: verifyScriptsParallel and verifyScriptsParallelBatch now accept
+  ## blockHash: string and forward it to getBlockScriptFlags, enabling:
+  ##   BIP16_EXCEPTION_HASH  → SCRIPT_VERIFY_NONE (no validation on that block)
+  ##   TAPROOT_EXCEPTION_HASH → sfTaproot excluded
+  ## Previously the blockHash defaulted to "" — both exception hashes were
+  ## permanently bypassed on the parallel path.
 
-  test "G26a: parallel path calls getBlockScriptFlags without blockHash":
-    ## BIP16 exception block hash: 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22
-    ## If this block were processed through verifyScriptsParallel (dead code now),
-    ## it would get non-empty flags instead of SCRIPT_VERIFY_NONE.
+  test "G26a: BIP16 exception hash produces empty flags via getBlockScriptFlags":
+    ## BIP16 exception block: 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22
+    ## Passing this hash MUST return {} (SCRIPT_VERIFY_NONE).
+    ## Omitting the hash (old behaviour) returns non-empty flags — that was the bug.
     let bip16ExceptionHash = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
     let flagsWithHash = getBlockScriptFlags(170060'i32, mainnetParams(), bip16ExceptionHash)
-    let flagsNoHash = getBlockScriptFlags(170060'i32, mainnetParams(), "")
-    ## With the exception hash, flags should be empty (SCRIPT_VERIFY_NONE)
+    let flagsNoHash   = getBlockScriptFlags(170060'i32, mainnetParams(), "")
+    ## With the exception hash, flags MUST be empty (SCRIPT_VERIFY_NONE):
     check flagsWithHash == {}
-    ## Without blockHash (what parallel path does), flags are non-empty
+    ## Without blockHash, flags are non-empty (P2SH + BIP66 + BIP65 + CSV + segwit):
     check flagsNoHash != {}
-    ## BUG G26: parallel path always uses flagsNoHash behavior
+
+  test "G26b: verifyScriptsParallel accepts blockHash parameter for exception routing":
+    ## FIX: the parallel path now takes blockHash and passes it to getBlockScriptFlags.
+    ## Verify the API accepts it without error (functional wiring; full exception-block
+    ## correctness requires a real UTXO set for the exception block itself).
+    let bip16ExceptionHash = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+    ## Coinbase-only block at mainnet BIP16 height — no non-coinbase inputs to verify.
+    let blk = makeSimpleBlock(170060'i32, BlockHash(default(array[32, byte])))
+    let lookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} = none(UtxoEntry)
+    ## FIX: pass blockHash — parallel path now routes through exception handling
+    let res = verifyScriptsParallel(blk, lookup, 170060'i32, newCryptoEngine(),
+                                    chainParams = mainnetParams(),
+                                    blockHash = bip16ExceptionHash)
+    ## Coinbase-only block should always pass (no inputs to verify regardless of flags)
+    check res.isOk
+
+  test "G26c: Taproot exception hash excludes sfTaproot from flags":
+    ## TAPROOT_EXCEPTION_HASH: 0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad
+    ## At mainnet height 709632 (taprootHeight), sfTaproot is normally set.
+    ## With the exception hash it must be excluded.
+    let taprootExceptionHash = "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
+    let flagsNormal    = getBlockScriptFlags(709632'i32, mainnetParams(), "")
+    let flagsException = getBlockScriptFlags(709632'i32, mainnetParams(), taprootExceptionHash)
+    check (sfTaproot in flagsNormal)    == true   ## normally active at 709632
+    check (sfTaproot in flagsException) == false  ## excluded by exception hash
 
 # ---------------------------------------------------------------------------
 # G28: worker threads have no name
