@@ -1489,7 +1489,9 @@ proc verifyScripts*(
   # Verify scripts for non-coinbase transactions
   for i in 1 ..< blk.txs.len:
     let tx = blk.txs[i]
-    let txidBytes = array[32, byte](tx.txid())
+    # Use wtxid (witness transaction ID) as the cache key so witness-malleated
+    # variants of the same txid map to distinct cache entries (W105 G7 fix).
+    let txidBytes = array[32, byte](tx.wtxid())
 
     # Pre-collect ALL input UTXOs for this tx (needed for BIP341 taproot sighash)
     var allAmounts: seq[Satoshi] = @[]

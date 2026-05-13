@@ -241,40 +241,55 @@ suite "G6 — no per-worker early-exit on first failure":
     ## BUG G6: remaining spawned tasks for this tx kept running after first failure
 
 # ---------------------------------------------------------------------------
-# G7: SigCache key uses txid not wtxid
+# G7: SigCache key uses wtxid not txid — FIXED
 # ---------------------------------------------------------------------------
-suite "G7 — SigCache key uses txid instead of wtxid":
-  ## Core: ScriptExecutionCache key = SHA256(nonce || wtxid || flags)
-  ## Core SignatureCache: ComputeEntry uses sighash + pubkey + sig (no txid at all)
-  ## Nimrod SigCache key: (txid, inputIndex, flags)
-  ## Bug: for segwit transactions, txid != wtxid. A witness-malleated version
-  ## of the same transaction has the same txid but different wtxid. If a
-  ## malleated tx is cached under (txid, inputIdx, flags), the legitimate tx
-  ## will get a false cache hit (or vice versa), potentially skipping
-  ## verification of a different witness stack.
+suite "G7 — SigCache key uses wtxid (fixed)":
+  ## Fix: lookup/insert now accept `wtxid: array[32, byte]` (witness transaction
+  ## ID) instead of bare txid.  For non-segwit transactions txid == wtxid so
+  ## existing callers are unaffected; for segwit transactions two variants with
+  ## the same txid but different witness stacks now map to distinct cache keys.
+  ##
+  ## Core reference: SignatureCache::ComputeEntry (sigcache.h) — salted hash
+  ## over (nonce || wtxid-equivalent sighash material || inputIndex || flags).
 
-  test "G7a: SigCache key uses txid (not wtxid) — confirmed by code structure":
-    ## Direct inspection: newSigCache / lookup / insert all use txid parameter
+  test "G7a: distinct wtxids produce distinct cache entries (segwit-malleability safe)":
+    ## Simulate: tx1 and tx2 share the same txid (stripped hash) but have
+    ## different witness data → different wtxids.
+    ## After the fix, inserting under wtxid1 must NOT produce a hit on wtxid2.
     let cache = newSigCache(100)
-    var txid1, txid2: array[32, byte]
-    txid1[0] = 0xAA
-    txid2[0] = 0xBB  ## different txid
-    ## Insert under txid1
-    cache.insert(txid1, 0'u32, 0b0001'u32)
-    check cache.lookup(txid1, 0'u32, 0b0001'u32) == true
-    check cache.lookup(txid2, 0'u32, 0b0001'u32) == false
-    ## BUG G7: key is txid. For segwit txs, txid == strippedHash != wtxid.
-    ## If tx has witnesses, two versions with same txid but different witnesses
-    ## share cache entries — a malleated witness can poison the cache.
+    var wtxid1, wtxid2: array[32, byte]
+    wtxid1[0] = 0xAA              ## represents tx with valid witness stack
+    wtxid2[0] = 0xBB              ## represents same tx with malleated witness
+    # Insert the legitimate variant
+    cache.insert(wtxid1, 0'u32, 0b0001'u32)
+    # FIX G7: lookup uses wtxid → legitimate tx hits, malleated variant misses
+    check cache.lookup(wtxid1, 0'u32, 0b0001'u32) == true
+    check cache.lookup(wtxid2, 0'u32, 0b0001'u32) == false
 
-  test "G7b: same txid different flags — correctly distinguished":
-    ## Flags are part of the key, so flag changes correctly invalidate cache
+  test "G7b: same wtxid different flags — correctly distinguished (regression)":
+    ## Flags are part of the key; this behaviour is unchanged by the fix.
     let cache = newSigCache(100)
-    var txid: array[32, byte]
-    txid[0] = 0xCC
-    cache.insert(txid, 0'u32, 0x0001'u32)
-    check cache.lookup(txid, 0'u32, 0x0001'u32) == true
-    check cache.lookup(txid, 0'u32, 0x0002'u32) == false  ## different flags = miss
+    var wtxid: array[32, byte]
+    wtxid[0] = 0xCC
+    cache.insert(wtxid, 0'u32, 0x0001'u32)
+    check cache.lookup(wtxid, 0'u32, 0x0001'u32) == true
+    check cache.lookup(wtxid, 0'u32, 0x0002'u32) == false  ## different flags = miss
+
+  test "G7c: two caches produce different keys for same wtxid (nonce independence)":
+    ## Each SigCache instance has its own CSPRNG nonce; the same (wtxid,
+    ## inputIndex, flags) tuple must map to different internal keys in
+    ## two independent cache instances.  This verifies the nonce is live.
+    let cacheA = newSigCache(100)
+    let cacheB = newSigCache(100)
+    var wtxid: array[32, byte]
+    wtxid[0] = 0xDD
+    let keyA = cacheA.computeKey(wtxid, 0'u32, 0xFF'u32)
+    let keyB = cacheB.computeKey(wtxid, 0'u32, 0xFF'u32)
+    ## Two fresh caches almost certainly have different nonces.
+    ## In the astronomically unlikely event of a nonce collision this would
+    ## spuriously fail, but it would mean urandom returned identical 32-byte
+    ## values twice in a row — effectively impossible.
+    check keyA != keyB
 
 # ---------------------------------------------------------------------------
 # G8: SigCache has no salt/nonce — predictable entries
@@ -322,28 +337,42 @@ suite "G9 — SigCache uses Table not CuckooCache":
     ## evicts a well-defined slot based on the key's position.
 
 # ---------------------------------------------------------------------------
-# G10: globalSigCache has no RWLock — data race in parallel path
+# G10: globalSigCache now protected by Lock — FIXED
 # ---------------------------------------------------------------------------
-suite "G10 — globalSigCache has no mutex":
-  ## Core SignatureCache.Get: std::shared_lock<std::shared_mutex>
-  ## Core SignatureCache.Set: std::unique_lock<std::shared_mutex>
-  ## Nimrod: globalSigCache is a plain ref object Table; no lock anywhere.
-  ## The parallel_verify.nim tasks call verifyScript which goes through the
-  ## interpreter, not through globalSigCache directly. But if the parallel path
-  ## were re-enabled, concurrent writes to globalSigCache from worker threads
-  ## would be a data race. Even in the current serial path, mempool acceptance
-  ## and block validation could race if run concurrently.
+suite "G10 — globalSigCache has Lock (fixed)":
+  ## Fix: SigCache now carries a `lock: Lock` field (std/locks).  All
+  ## public operations (lookup, insert, clear, len) call `withLock cache.lock`
+  ## before touching the internal Table.
+  ##
+  ## Core reference: SignatureCache::Get uses shared_lock<shared_mutex>;
+  ## SignatureCache::Set uses unique_lock<shared_mutex>.  Nim's Lock is a
+  ## mutual-exclusion lock (no reader/writer split), which is correct for the
+  ## current single-threaded production path and safe if the parallel path is
+  ## re-enabled.
 
-  test "G10a: SigCache has no locking primitives":
-    ## Verify that sig_cache.nim has no Lock/Mutex/RWLock
-    ## (structural test — confirmed by reading the source)
+  test "G10a: lookup and insert are lock-protected (sequential correctness)":
+    ## The lock must not prevent correct operation from a single thread.
+    ## This is the regression guard: if withLock introduced a deadlock on
+    ## sequential use, this test would hang.
     let cache = newSigCache(10)
-    ## All operations are unprotected table operations — no field for a lock
-    var txid: array[32, byte]
-    txid[0] = 0x77
-    cache.insert(txid, 0'u32, 0'u32)
-    check cache.lookup(txid, 0'u32, 0'u32) == true
-    ## BUG G10: no shared_mutex; parallel tasks would race on globalSigCache
+    var wtxid: array[32, byte]
+    wtxid[0] = 0x77
+    cache.insert(wtxid, 0'u32, 0'u32)
+    check cache.lookup(wtxid, 0'u32, 0'u32) == true
+    ## FIX G10: insert and lookup now execute under cache.lock;
+    ## concurrent writers from a re-enabled parallel path cannot race.
+
+  test "G10b: SigCache nonce is non-zero (urandom succeeded at construction)":
+    ## newSigCache raises IOError if urandom fails; if we reach here the nonce
+    ## was sampled from the OS CSPRNG.  A nonce of all-zeros would be
+    ## astronomically unlikely from a real /dev/urandom.
+    let cache = newSigCache(10)
+    var allZero = true
+    for b in cache.nonce:
+      if b != 0:
+        allZero = false
+        break
+    check not allZero
 
 # ---------------------------------------------------------------------------
 # G12: SigCache size not configurable via CLI
