@@ -174,6 +174,8 @@ suite "G4 no IsTerrible quality-based eviction":
   test "old address never expires in nimrod flat list":
     let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
     var na = NetAddress()
+    na.ip[10] = 0xFF; na.ip[11] = 0xFF  # IPv4-mapped prefix
+    na.ip[12] = 1; na.ip[13] = 2; na.ip[14] = 3; na.ip[15] = 4  # 1.2.3.4
     na.port = 8333
     pm.addKnownAddress(na)
     # Address stays forever; no expiry check
@@ -202,7 +204,8 @@ suite "G5 no GetChance weighted random selection":
     let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
     for i in 0..<5:
       var na = NetAddress()
-      na.ip[15] = byte(i + 1)
+      na.ip[10] = 0xFF; na.ip[11] = 0xFF  # IPv4-mapped prefix
+      na.ip[12] = 1; na.ip[13] = 2; na.ip[14] = 3; na.ip[15] = byte(i + 1)
       na.port = 8333
       pm.addKnownAddress(na)
     let addrs = pm.getKnownAddresses()
@@ -312,6 +315,8 @@ suite "G11 no stochastic nRefCount cap":
   test "nimrod allows address to appear any number of times":
     let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
     var na = NetAddress()
+    na.ip[10] = 0xFF; na.ip[11] = 0xFF  # IPv4-mapped prefix
+    na.ip[12] = 8; na.ip[13] = 8; na.ip[14] = 8; na.ip[15] = 8  # 8.8.8.8
     na.port = 8333
     # Same address can be added many times without any cap
     for _ in 0..20:
@@ -373,6 +378,8 @@ suite "G14 no maximum address capacity":
     let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
     for i in 0 ..< 100:
       var na = NetAddress()
+      na.ip[10] = 0xFF; na.ip[11] = 0xFF  # IPv4-mapped prefix
+      na.ip[12] = 1; na.ip[13] = 2
       na.ip[14] = byte(i shr 8); na.ip[15] = byte(i and 0xff)
       na.port = 8333
       pm.addKnownAddress(na)
@@ -393,6 +400,8 @@ suite "G15 no 30-day horizon expiry":
   test "stale addresses accumulate in nimrod":
     let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
     var na = NetAddress()
+    na.ip[10] = 0xFF; na.ip[11] = 0xFF  # IPv4-mapped prefix
+    na.ip[12] = 5; na.ip[13] = 6; na.ip[14] = 7; na.ip[15] = 8  # 5.6.7.8
     na.port = 9999
     pm.addKnownAddress(na)
     check pm.knownAddresses.len == 1
@@ -411,7 +420,8 @@ suite "G16 relay sends first N not random 23pct sample":
     let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
     for i in 1 .. 20:
       var na = NetAddress()
-      na.ip[15] = byte(i)
+      na.ip[10] = 0xFF; na.ip[11] = 0xFF  # IPv4-mapped prefix
+      na.ip[12] = 1; na.ip[13] = 2; na.ip[14] = 3; na.ip[15] = byte(i)
       na.port = 8333
       pm.addKnownAddress(na)
     let addrs = pm.getKnownAddresses()
@@ -441,7 +451,8 @@ suite "G17 getaddr not filtered":
     let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
     for i in 1..5:
       var na = NetAddress()
-      na.ip[15] = byte(i)
+      na.ip[10] = 0xFF; na.ip[11] = 0xFF  # IPv4-mapped prefix
+      na.ip[12] = 1; na.ip[13] = 2; na.ip[14] = 3; na.ip[15] = byte(i)
       na.port = 8333
       pm.addKnownAddress(na)
     let addrs = pm.getKnownAddresses()
@@ -632,6 +643,8 @@ suite "G27 no SetServices update":
   test "service bits in knownAddresses are never refreshed":
     let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
     var na = NetAddress()
+    na.ip[10] = 0xFF; na.ip[11] = 0xFF  # IPv4-mapped prefix
+    na.ip[12] = 9; na.ip[13] = 9; na.ip[14] = 9; na.ip[15] = 9  # 9.9.9.9
     na.services = NodeNetwork
     na.port = 8333
     pm.addKnownAddress(na)
@@ -701,7 +714,9 @@ suite "G30 no MAX_ADDRMAN_SIZE guard":
     # Add 200 distinct addresses — all accepted, no eviction
     for i in 0 ..< 200:
       var na = NetAddress()
-      na.ip[13] = byte(i shr 8); na.ip[14] = byte(i and 0xff); na.ip[15] = 1
+      na.ip[10] = 0xFF; na.ip[11] = 0xFF  # IPv4-mapped prefix
+      na.ip[12] = 1; na.ip[13] = byte(i shr 8); na.ip[14] = byte(i and 0xff)
+      na.ip[15] = 1
       na.port = 8333
       pm.addKnownAddress(na)
     check pm.knownAddresses.len == 200
@@ -713,6 +728,79 @@ suite "G30 no MAX_ADDRMAN_SIZE guard":
     # nimrod: unconditional append — addr message with 1000 entries per
     # message × unlimited messages = unbounded growth.
     check true  # BUG: G30
+
+# ---------------------------------------------------------------------------
+# IsRoutable filter at addKnownAddress entry point
+# Fixed in W104: non-routable addresses (RFC1918, loopback, link-local,
+# 169.254/16, 100.64/10, documentation ranges) are now silently dropped.
+# Reference: Bitcoin Core CNetAddr::IsRoutable() in netaddress.cpp
+# ---------------------------------------------------------------------------
+suite "IsRoutable filter at addKnownAddress":
+
+  proc makeIPv4Addr(a, b, c, d: byte): NetAddress =
+    ## Build a NetAddress from an IPv4 address in IPv4-mapped IPv6 form.
+    ## Bytes 0-9 = 0x00, bytes 10-11 = 0xFF, bytes 12-15 = IPv4 octets.
+    result.ip[10] = 0xFF; result.ip[11] = 0xFF
+    result.ip[12] = a; result.ip[13] = b; result.ip[14] = c; result.ip[15] = d
+    result.port = 8333
+
+  test "public IPv4 address is accepted":
+    let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
+    pm.addKnownAddress(makeIPv4Addr(1, 2, 3, 4))
+    check pm.knownAddresses.len == 1
+
+  test "RFC1918 10.0.0.0/8 is rejected":
+    let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
+    pm.addKnownAddress(makeIPv4Addr(10, 0, 0, 1))
+    check pm.knownAddresses.len == 0
+
+  test "RFC1918 192.168.0.0/16 is rejected":
+    let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
+    pm.addKnownAddress(makeIPv4Addr(192, 168, 1, 1))
+    check pm.knownAddresses.len == 0
+
+  test "RFC1918 172.16.0.0/12 is rejected":
+    let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
+    pm.addKnownAddress(makeIPv4Addr(172, 20, 0, 1))
+    check pm.knownAddresses.len == 0
+
+  test "loopback 127.0.0.1 is rejected":
+    let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
+    pm.addKnownAddress(makeIPv4Addr(127, 0, 0, 1))
+    check pm.knownAddresses.len == 0
+
+  test "link-local 169.254.0.1 is rejected (RFC 3927)":
+    let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
+    pm.addKnownAddress(makeIPv4Addr(169, 254, 0, 1))
+    check pm.knownAddresses.len == 0
+
+  test "shared address space 100.64.0.1 is rejected (RFC 6598)":
+    let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
+    pm.addKnownAddress(makeIPv4Addr(100, 64, 0, 1))
+    check pm.knownAddresses.len == 0
+
+  test "benchmarking 198.18.0.1 is rejected (RFC 2544)":
+    let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
+    pm.addKnownAddress(makeIPv4Addr(198, 18, 0, 1))
+    check pm.knownAddresses.len == 0
+
+  test "documentation 192.0.2.1 is rejected (RFC 5737 TEST-NET-1)":
+    let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
+    pm.addKnownAddress(makeIPv4Addr(192, 0, 2, 1))
+    check pm.knownAddresses.len == 0
+
+  test "only routable addresses pass through gossip ingestion":
+    ## Simulates handleAddrInternal receiving a mix of addresses.
+    ## Only the single public address should land in knownAddresses.
+    let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
+    pm.addKnownAddress(makeIPv4Addr(8, 8, 8, 8))       # public — ACCEPT
+    pm.addKnownAddress(makeIPv4Addr(10, 0, 0, 1))      # RFC1918 — DROP
+    pm.addKnownAddress(makeIPv4Addr(192, 168, 0, 1))   # RFC1918 — DROP
+    pm.addKnownAddress(makeIPv4Addr(172, 16, 5, 1))    # RFC1918 — DROP
+    pm.addKnownAddress(makeIPv4Addr(127, 0, 0, 1))     # loopback — DROP
+    pm.addKnownAddress(makeIPv4Addr(169, 254, 1, 1))   # link-local — DROP
+    check pm.knownAddresses.len == 1
+    check pm.knownAddresses[0].ip[12] == 8  # 8.8.8.8
 
 # ---------------------------------------------------------------------------
 # Summary assertions — bucket/capacity constants match Core
