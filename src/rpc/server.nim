@@ -3129,13 +3129,12 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
   # Build localservices bitfield from the same flags `sendVersion` uses,
   # so the RPC view matches what we actually advertise on the wire (BIP-159
   # parity: NODE_NETWORK_LIMITED appears here iff prune mode is on).
+  # NODE_BLOOM is intentionally omitted: BIP-111 forbids advertising it
+  # without a functional bloom-filter subsystem (W110 BUG-01 / FIX-35).
   var localServicesBits: uint64 = NodeNetwork or NodeWitness
   var localServicesNames = newJArray()
   localServicesNames.add(%"NETWORK")
   localServicesNames.add(%"WITNESS")
-  if peerBloomFiltersEnabled():
-    localServicesBits = localServicesBits or NodeBloom
-    localServicesNames.add(%"BLOOM")
   if pruneModeAdvertiseEnabled():
     localServicesBits = localServicesBits or NodeNetworkLimited
     localServicesNames.add(%"NETWORK_LIMITED")
