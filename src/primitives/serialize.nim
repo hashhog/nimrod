@@ -110,16 +110,31 @@ proc readHash*(r: var BinaryReader): array[32, byte] =
   copyMem(addr result[0], addr r.data[r.pos], 32)
   r.pos += 32
 
-proc readCompactSize*(r: var BinaryReader): uint64 =
+const MAX_SIZE* = 0x02000000'u64  ## Maximum serialized object size (Core MAX_SIZE)
+
+proc readCompactSize*(r: var BinaryReader, range_check: bool = true): uint64 =
+  ## Read a CompactSize-encoded integer.
+  ## Raises SerializationError on non-canonical encoding (matches Core behaviour).
+  ## When range_check=true (default), also raises if the value exceeds MAX_SIZE.
+  ## Set range_check=false only for service-bits / raw-encoding paths where
+  ## values are not used as container lengths.
   let first = r.readUint8()
   if first < 0xFD:
     result = uint64(first)
   elif first == 0xFD:
     result = uint64(r.readUint16LE())
+    if result < 0xFD'u64:
+      raise newException(SerializationError, "non-canonical ReadCompactSize()")
   elif first == 0xFE:
     result = uint64(r.readUint32LE())
+    if result < 0x10000'u64:
+      raise newException(SerializationError, "non-canonical ReadCompactSize()")
   else:
     result = r.readUint64LE()
+    if result < 0x100000000'u64:
+      raise newException(SerializationError, "non-canonical ReadCompactSize()")
+  if range_check and result > MAX_SIZE:
+    raise newException(SerializationError, "ReadCompactSize(): size too large")
 
 proc readVarBytes*(r: var BinaryReader): seq[byte] =
   let length = r.readCompactSize()
