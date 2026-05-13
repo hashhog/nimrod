@@ -14,6 +14,7 @@ const
   MaxHeadersPerMsg* = 2000
   MaxInvPerMsg* = 50_000
   MaxLocatorSz* = 101              # BIP0152: max getheaders/getblocks locator entries
+  MaxGetDataSize* = 1000            # protocol.h:482 MAX_GETDATA_SZ — max items per outgoing getdata
   MaxGetBlocksInvCount* = 500      # net_processing.cpp:4217 nLimit
   MaxGetAddrCount* = 1000          # Cap for getaddr response (matches Bitcoin Core)
   MaxPkgTxnsCount* = 25            # BIP-331: max txs per pkgtxns (== mempool ancestor limit)

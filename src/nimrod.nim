@@ -760,7 +760,15 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     if blockInvs.len > 0:
       asyncSpawn spawnSafe(peer.sendGetData(blockInvs))
     if txInvs.len > 0:
-      asyncSpawn spawnSafe(peer.sendGetData(txInvs))
+      # G5: cap outgoing getdata at MAX_GETDATA_SZ=1000 items per message.
+      # Core: net_processing.cpp:6207 flushes vGetData when it reaches 1000.
+      # A peer may send up to MAX_INV_SZ=50000 items in a single inv; without
+      # batching we would send a single getdata with up to 50000 items.
+      var i = 0
+      while i < txInvs.len:
+        let batch = txInvs[i ..< min(i + MaxGetDataSize, txInvs.len)]
+        asyncSpawn spawnSafe(peer.sendGetData(batch))
+        i += MaxGetDataSize
 
   of mkGetData:
     # Handle data requests - serve blocks and transactions to peers.
