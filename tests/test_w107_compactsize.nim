@@ -11,6 +11,7 @@ import std/strutils
 import unittest2
 import ../src/primitives/[types, serialize]
 import ../src/storage/snapshot
+import ../src/storage/undo
 
 # ===========================================================================
 # Helpers
@@ -283,7 +284,8 @@ suite "G10 ReadVarInt overflow protection":
     let data = @[0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8,
                  0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8, 0xFF'u8]
     var r = BinaryReader(data: data, pos: 0)
-    expect SnapshotError:
+    ## readVarInt now lives in serialize.nim and raises SerializationError
+    expect SerializationError:
       discard r.readVarInt()
 
 # ===========================================================================
@@ -323,27 +325,31 @@ suite "G11 VarInt vs CompactSize are distinct (BUG-4 undo.nim)":
 
     check wCS.data != wVI.data
 
-  test "BUG-4: undo serializeSpentOutput uses CompactSize for code field":
-    ## Documents incorrect behaviour: a SpentOutput with height=64 (code=128)
-    ## should serialize the `code` field as VARINT [0x80 0x00] but currently
-    ## emits CompactSize [0x80] — 1 byte instead of 2.
-    ##
-    ## To confirm: reconstruct what the undo encoder actually emits for code.
-    ## We compare against what writeVarInt would produce.
-    let height: int32 = 64
-    let isCoinbase = false
-    let code = uint64(height) * 2 + (if isCoinbase: 1'u64 else: 0'u64)
-    # code = 128
+  test "serializeSpentOutput uses VARINT for code field (BUG-4 fixed)":
+    ## Regression test: a SpentOutput with height=64 (code=128) must serialize
+    ## the `code` field as Bitcoin VARINT [0x80 0x00], NOT CompactSize [0x80].
+    ## Core: bitcoin-core/src/undo.h::TxInUndoFormatter::Ser uses
+    ## VARINT(txout.nHeight * 2 + txout.fCoinBase).
+    ## The two encodings diverge for code >= 128 (height >= 64).
+    let spent = SpentOutput(
+      output: TxOut(value: Satoshi(5_000_000_000'i64), scriptPubKey: @[0x51'u8]),
+      height: 64'i32,
+      isCoinbase: false
+    )
+    # code = 64 * 2 + 0 = 128
+    var w = BinaryWriter()
+    w.serializeSpentOutput(spent)
+    # First 2 bytes must be VARINT(128) = [0x80, 0x00]
+    check w.data.len >= 2
+    check w.data[0] == 0x80'u8
+    check w.data[1] == 0x00'u8
 
-    var wWrong = BinaryWriter()  # what undo.nim currently does
-    wWrong.writeCompactSize(code)
-
-    var wRight = BinaryWriter()  # what Core expects
-    wRight.writeVarInt(code)
-
-    check wWrong.data == @[0x80'u8]        # 1 byte (current wrong)
-    check wRight.data == @[0x80'u8, 0x00'u8]  # 2 bytes (correct per Core)
-    check wWrong.data != wRight.data  # they diverge
+    # Also verify round-trip: deserialize produces the same SpentOutput
+    # (height=64, isCoinbase=false)
+    var r = BinaryReader(data: w.data, pos: 0)
+    let decoded = r.deserializeSpentOutput()
+    check decoded.height == 64'i32
+    check decoded.isCoinbase == false
 
 # ===========================================================================
 # G12 — GetSizeOfCompactSize correctness
