@@ -1,5 +1,11 @@
 ## Parallel script verification for IBD optimization
 ## Uses threadpool to distribute signature verification across CPU cores
+##
+## NOTE: This path is currently DISABLED (reverted at mainnet block 821384;
+## see src/network/sync.nim:1092).  The fix in this module (passing chainParams
+## and blockHash through to getBlockScriptFlags) is the prerequisite for
+## re-enabling the path correctly in a future ROUND-3 pass.  Do NOT re-enable
+## without also addressing G2/G3/G4/G6/G19/G21/G24 (see test_w105_checkqueue.nim).
 
 import std/[cpuinfo, options, threadpool, times]
 import ../primitives/[types, serialize]
@@ -71,13 +77,21 @@ proc verifyScriptsParallel*(
   blk: Block,
   utxoLookup: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.},
   height: int32,
-  crypto: CryptoEngine
+  crypto: CryptoEngine,
+  chainParams: ConsensusParams = mainnetParams(),
+  blockHash: string = ""
 ): ValidationResult[void] =
   ## Verify all scripts in a block using parallel execution
   ## Partitions inputs across min(cpuCount, 16) threads
   ## Each thread has its own CryptoEngine; results collected via FlowVar
+  ##
+  ## chainParams and blockHash must match the block being validated so that
+  ## getBlockScriptFlags returns activation heights and exception handling
+  ## correct for this network (regtest/testnet4/mainnet).  Callers MUST pass
+  ## the actual chain params — the mainnetParams() default is kept for
+  ## backwards-compatible call sites that only exist in tests.
 
-  let flags = getBlockScriptFlags(height, mainnetParams())
+  let flags = getBlockScriptFlags(height, chainParams, blockHash)
 
   # Track intra-block UTXOs for transactions that spend outputs created earlier in same block
   var intraBlockUtxos: seq[tuple[txid: TxId, vout: uint32, entry: UtxoEntry]]
@@ -165,18 +179,23 @@ proc verifyScriptsParallelBatch*(
   utxoLookup: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.},
   height: int32,
   crypto: CryptoEngine,
-  batchSize: int = 0
+  batchSize: int = 0,
+  chainParams: ConsensusParams = mainnetParams(),
+  blockHash: string = ""
 ): ValidationResult[void] =
   ## Batch-oriented parallel verification
   ## Groups inputs into batches and processes each batch in parallel
   ## batchSize = 0 uses auto-tuning based on CPU count
+  ##
+  ## chainParams and blockHash must match the block being validated — see
+  ## verifyScriptsParallel for rationale.
 
   let effectiveBatchSize = if batchSize == 0:
     max(16, countProcessors() * 4)
   else:
     batchSize
 
-  let flags = getBlockScriptFlags(height, mainnetParams())
+  let flags = getBlockScriptFlags(height, chainParams, blockHash)
 
   # Collect all verification tasks across the block
   var allTasks: seq[InputVerificationTask]
