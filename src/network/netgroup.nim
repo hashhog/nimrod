@@ -179,26 +179,105 @@ proc isLocal*(ip: IpAddr): bool =
     return ip.v4[0] == 127 or (ip.v4[0] == 0 and ip.v4[1] == 0 and
                                ip.v4[2] == 0 and ip.v4[3] == 0)
 
+proc isRFC1918*(v4: array[4, byte]): bool {.inline.} =
+  ## RFC 1918 private IPv4 ranges:
+  ##   10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12
+  ## Reference: Bitcoin Core CNetAddr::IsRFC1918()
+  v4[0] == 10 or
+  (v4[0] == 192 and v4[1] == 168) or
+  (v4[0] == 172 and v4[1] >= 16 and v4[1] <= 31)
+
+proc isRFC2544*(v4: array[4, byte]): bool {.inline.} =
+  ## 198.18.0.0/15 — benchmarking (RFC 2544)
+  v4[0] == 198 and (v4[1] == 18 or v4[1] == 19)
+
+proc isRFC3927*(v4: array[4, byte]): bool {.inline.} =
+  ## 169.254.0.0/16 — link-local (RFC 3927)
+  v4[0] == 169 and v4[1] == 254
+
+proc isRFC6598*(v4: array[4, byte]): bool {.inline.} =
+  ## 100.64.0.0/10 — shared address space (RFC 6598)
+  v4[0] == 100 and v4[1] >= 64 and v4[1] <= 127
+
+proc isRFC5737*(v4: array[4, byte]): bool {.inline.} =
+  ## Documentation ranges: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+  (v4[0] == 192 and v4[1] == 0 and v4[2] == 2) or
+  (v4[0] == 198 and v4[1] == 51 and v4[2] == 100) or
+  (v4[0] == 203 and v4[1] == 0 and v4[2] == 113)
+
 proc isRoutable*(ip: IpAddr): bool =
-  ## Check if this IP is publicly routable
-  ## Note: Private addresses (10.x, 192.168.x, 172.16-31.x) are considered
-  ## "routable" for netgroup purposes - they just route within private networks.
-  ## Only truly unroutable addresses (0.0.0.0, loopback) return false.
+  ## Check if this IP is publicly routable on the global internet.
+  ## Reference: Bitcoin Core CNetAddr::IsRoutable()
+  ## Rejects: RFC1918, RFC2544, RFC3927, RFC6598, RFC5737, loopback,
+  ##          RFC4862 (IPv6 link-local), RFC4193 (IPv6 ULA), plus
+  ##          unspecified (0.0.0.0 / ::).
   if ip.isV6:
     if ip.isIPv4Mapped():
       let v4 = ip.extractIPv4()
-      if v4[0] == 0: return false  # 0.0.0.0
-      if v4[0] >= 224: return false  # Multicast and reserved
-      # Private ranges are still "routable" for our purposes
+      if ip.isLocal(): return false             # 127.x.x.x / 0.0.0.0
+      if v4[0] >= 224: return false             # multicast + reserved
+      if v4.isRFC1918(): return false
+      if v4.isRFC2544(): return false
+      if v4.isRFC3927(): return false
+      if v4.isRFC6598(): return false
+      if v4.isRFC5737(): return false
       return true
-    # IPv6 - loopback is not routable
-    if ip.isLocal(): return false
+    if ip.isLocal(): return false               # ::1
+    # IPv6 link-local (fe80::/10) — RFC 4862
+    if ip.v6[0] == 0xFE and (ip.v6[1] and 0xC0'u8) == 0x80'u8: return false
+    # IPv6 ULA (fc00::/7) — RFC 4193
+    if (ip.v6[0] and 0xFE'u8) == 0xFC'u8: return false
+    # Unspecified ::
+    var allZero = true
+    for b in ip.v6:
+      if b != 0: allZero = false; break
+    if allZero: return false
     return true
   else:
-    # IPv4
-    if ip.v4[0] == 0: return false  # 0.0.0.0
-    if ip.v4[0] >= 224: return false  # Multicast and reserved
-    # 127.x.x.x is handled by isLocal()
+    # Direct IPv4 (non-mapped)
+    if ip.v4[0] == 127 or ip.v4[0] == 0: return false
+    if ip.v4[0] >= 224: return false            # multicast + reserved
+    if ip.v4.isRFC1918(): return false
+    if ip.v4.isRFC2544(): return false
+    if ip.v4.isRFC3927(): return false
+    if ip.v4.isRFC6598(): return false
+    if ip.v4.isRFC5737(): return false
+    return true
+
+proc isRoutable*(ip: array[16, byte]): bool =
+  ## isRoutable overload for the 16-byte IPv4-mapped format used by NetAddress.ip.
+  ## Bytes 0-9 must be 0, bytes 10-11 must be 0xFF for an IPv4-mapped address.
+  ## Reference: Bitcoin Core CNetAddr::IsRoutable()
+  var isV4Mapped = true
+  for i in 0..<10:
+    if ip[i] != 0: isV4Mapped = false; break
+  if isV4Mapped and (ip[10] != 0xFF or ip[11] != 0xFF):
+    isV4Mapped = false
+  if isV4Mapped:
+    let v4: array[4, byte] = [ip[12], ip[13], ip[14], ip[15]]
+    if v4[0] == 127 or v4[0] == 0: return false
+    if v4[0] >= 224: return false
+    if v4.isRFC1918(): return false
+    if v4.isRFC2544(): return false
+    if v4.isRFC3927(): return false
+    if v4.isRFC6598(): return false
+    if v4.isRFC5737(): return false
+    return true
+  else:
+    # Native IPv6
+    var allZero = true
+    for b in ip:
+      if b != 0: allZero = false; break
+    if allZero: return false
+    # loopback ::1
+    var isLoopback = true
+    for i in 0..<15:
+      if ip[i] != 0: isLoopback = false; break
+    if isLoopback and ip[15] == 1: return false
+    # IPv6 link-local fe80::/10
+    if ip[0] == 0xFE and (ip[1] and 0xC0'u8) == 0x80'u8: return false
+    # IPv6 ULA fc00::/7
+    if (ip[0] and 0xFE'u8) == 0xFC'u8: return false
     return true
 
 proc isTor*(ip: IpAddr): bool =

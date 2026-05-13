@@ -966,6 +966,12 @@ proc stop*(pm: PeerManager) =
   pm.outboundNetGroups.clear()
 
 proc addKnownAddress*(pm: PeerManager, address: NetAddress) =
+  ## Add address to the known-address pool.
+  ## Non-routable addresses (RFC1918 private, loopback, link-local, etc.)
+  ## are silently dropped — mirroring Bitcoin Core's IsRoutable() filter
+  ## applied before CAddrMan::Add() in net_processing.cpp.
+  if not isRoutable(address.ip):
+    return
   pm.knownAddresses.add(address)
 
 proc getKnownAddresses*(pm: PeerManager): seq[NetAddress] =
