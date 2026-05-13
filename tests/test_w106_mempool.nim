@@ -989,27 +989,24 @@ suite "G19 RBF Rule 1 — non-signaling conflict rejected in standard mode":
 # Core 27+) is deferred; cluster tracking required." The cluster.nim code exists but
 # is NOT wired into checkRbfRules.
 # ===========================================================================
-suite "G20 BUG — Rule 8 ImprovesFeerateDiagram absent in single-tx RBF path":
+suite "G20 — Rule 8 ImprovesFeerateDiagram wired into single-tx RBF path":
   setup:
     cleanupTestDb()
 
-  test "G20a: FAIL-EXPECTED — ImprovesFeerateDiagram not called in checkRbfRules":
-    ## This is a documentation test that asserts the known gap.
-    ## Core 27+ requires ImprovesFeerateDiagram for ALL RBF replacements.
-    ## Nimrod's checkRbfRules has an explicit comment stating this is deferred.
-    ## We assert the known call-path gap: checkRbfRules does NOT invoke
-    ## validateRbfDiagram or checkRbfImprovesDiagram.
+  test "G20a: diagram-degrading replacement is rejected by checkRbfRules":
+    ## FIX: validateRbfDiagram / improvesFeerateDiagram is now wired into checkRbfRules
+    ## after Rule #4.  A replacement that satisfies Rules #3/#4 (absolute fee checks)
+    ## but degrades the feerate diagram must be rejected.
     ##
     ## Scenario: high-feerate conflict (666 sat/vB) replaced by huge low-feerate tx (11 sat/vB).
-    ## Core 27+ ImprovesFeerateDiagram would REJECT (feerate diagram degrades).
-    ## Nimrod's checkRbfRules only applies Rules #3 and #4 (absolute fee checks), so it ACCEPTS.
+    ## Core 27+ ImprovesFeerateDiagram rejects this; nimrod now does too.
     ##
-    ## Fee arithmetic to satisfy Rules #3 and #4 while demonstrating the gap:
+    ## Fee arithmetic:
     ##   conflict fee = 100,000 sats, vsize = 150 → feerate = 666 sat/vB
     ##   replacement vsize = 10,000, fee = 110,001 sats → feerate = 11 sat/vB
     ##   Rule #3: 110,001 >= 100,000 ✓
     ##   Rule #4: additional = 10,001 >= relay_fee(1) * 10,000 = 10,000 ✓
-    ##   ImprovesFeerateDiagram: 11 sat/vB vs 666 sat/vB → WORSE → Core would REJECT
+    ##   ImprovesFeerateDiagram: 11 sat/vB vs 666 sat/vB → WORSE → REJECT
     let mp = makeTestMempool(TestDbPath & "_g20a")
     let prevTxid = makeTxid(0x90)
     ## High-feerate conflict (100,000 sats, 150 vbytes = 666 sat/vB), signals RBF
@@ -1021,13 +1018,13 @@ suite "G20 BUG — Rule 8 ImprovesFeerateDiagram absent in single-tx RBF path":
     mp.spentBy[makeOutpoint(prevTxid)] = conflictTxid
     let conflicts = toHashSet([conflictTxid])
     ## Replacement: fee = 110,001 sats, vsize = 10,000 → feerate = 11 sat/vB (much worse than 666)
-    ## Rule #3: 110,001 > 100,000 ✓  Rule #4: 10,001 >= 1*10,000 ✓ → nimrod accepts
+    ## Rule #3: 110,001 > 100,000 ✓  Rule #4: 10,001 >= 1*10,000 ✓
+    ## Rule #8: 11 sat/vB does NOT improve diagram vs 666 sat/vB → REJECT
     let res = mp.checkRbfRules(makeSpend(prevTxid, 0, 8_889_999, 0x00000000'u32),
                                 Satoshi(110_001), 10_000, conflicts)
-    ## BUG: nimrod accepts this (Rules #3/#4 satisfied) even though feerate diagram degrades.
-    ## Core 27+ would reject it via ImprovesFeerateDiagram.
-    check res.isOk  ## confirms the gap — nimrod accepts what Core should reject
-    ## This test documents the known missing gate.
+    ## FIX ASSERTED: nimrod now rejects this via ImprovesFeerateDiagram, matching Core 27+.
+    check not res.isOk
+    check res.error.contains("feerate diagram")
 
 # ===========================================================================
 # G21 — TRUC (v3) single-tx: version check, size limits

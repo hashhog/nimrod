@@ -9,6 +9,7 @@ import ../crypto/secp256k1
 import ../script/interpreter
 import ./package
 import ./standard
+import ./cluster
 export package, standard
 
 type
@@ -1810,7 +1811,7 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
   ## Rule #3 — replacement fees >= original fees (>= not >; equal is allowed).
   ## Rule #4 — additional fees >= min_relay_fee * replacement_vsize (pays for bandwidth).
   ##
-  ## NOTE: Rule #8 (ImprovesFeerateDiagram, Core 27+) is deferred; cluster tracking required.
+  ## Rule #8 — ImprovesFeerateDiagram (Core 27+): replacement must strictly improve feerate diagram.
 
   # Gate 1 + Gate 2: BIP-125 opt-in signaling (skipped in fullRbf mode).
   # In standard mode, at least one directly-conflicting tx must be replaceable —
@@ -1868,6 +1869,33 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
   if additionalFee < requiredAdditionalFee:
     return err(HashSet[TxId], "rejecting replacement: not enough additional fees to relay (" &
                $additionalFee & " < " & $requiredAdditionalFee & " sats)")
+
+  # Rule #8 (ImprovesFeerateDiagram, Core 27+): the replacement must strictly improve
+  # the feerate diagram vs. the evicted set.
+  # Reference: Bitcoin Core src/policy/rbf.cpp ImprovesFeerateDiagram() (line 127-140).
+  # We build a simple per-tx diagram for each evicted entry (treating each as its own
+  # chunk — sufficient for the single-tx path where no cluster structure is tracked),
+  # then compare against a single-chunk diagram for the replacement.
+  block:
+    var originalChunks: seq[FeeFrac]
+    for evictedTxid in allConflicts:
+      if evictedTxid in mp.entries:
+        let e = mp.entries[evictedTxid]
+        let vsize = (e.weight + 3) div 4
+        if vsize > 0:
+          originalChunks.add(FeeFrac(fee: int64(e.fee), size: vsize))
+    # Sort descending by feerate so the diagram is non-increasing (canonical form).
+    originalChunks.sort(proc(a, b: FeeFrac): int =
+      if a > b: -1
+      elif b > a: 1
+      else: 0
+    )
+    let originalDiagram = buildFeerateDiagram(originalChunks)
+    # Replacement is a single chunk.
+    let replacementChunks = @[FeeFrac(fee: int64(txFee), size: txVsize)]
+    let replacementDiagram = buildFeerateDiagram(replacementChunks)
+    if not improvesFeerateDiagram(originalDiagram, replacementDiagram):
+      return err(HashSet[TxId], "rejecting replacement: insufficient feerate: does not improve feerate diagram")
 
   ok(allConflicts)
 
