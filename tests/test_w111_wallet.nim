@@ -13,8 +13,10 @@
 ##   G29-G30 PSBT (BIP-174 v0 round-trip; BIP-370 v2 absent)
 ##
 ## BUGs found:
-##   BUG-1  (HIGH)  G14 / G28: tr() script-tree expansion is a stub (TODO comment) —
-##                  key-path only, no merkle tweak for script-path spending.
+##   BUG-1  (HIGH)  G14: tr() expandNode used raw x-only key as output with no
+##                  TapTweak — BIP-341 §4.2 empty-tree tweak missing.
+##                  FIXED in FIX-38: walletTaggedHash("TapTweak",xonly) +
+##                  tweakXonlyPubkey applied in descriptor.nim expandNode DKTr.
 ##   BUG-2  (HIGH)  G28: P2TR key-path signing raises WalletError — no
 ##                  secp256k1_schnorrsig_sign32 FFI binding, so any P2TR UTXO
 ##                  silently blocks signTransaction.
@@ -33,6 +35,7 @@
 ##                  is encountered inside the tree arg, depth is incremented but
 ##                  pos is NOT, so the loop spins forever on that '('. Any
 ##                  descriptor with tr(KEY,something(...)) hangs the parser.
+##                  FIXED in FIX-38: inc pos added alongside inc depth for '('.
 
 import std/[unittest, strutils, tables, options, base64]
 import ../src/wallet/wallet
@@ -300,8 +303,13 @@ suite "G11-G16 Descriptors":
     check expanded.addresses.len == 1
     check expanded.addresses[0].kind == P2SH
 
-  test "G14 tr() key-path descriptor generates P2TR script":
-    # Only x-only (32-byte hex) key path tr() tested — script-tree is BUG-1
+  test "G14 tr() key-path descriptor applies TapTweak (FIX-38 BUG-1)":
+    ## BIP-341 §4.2: output_key = internal_key + int(hashTapTweak(P))*G
+    ## For key-path-only tr() the merkle root is empty so the tweak input is
+    ## just the 32-byte x-only internal pubkey.
+    ## BIP-86 test vector (12-abandon+about, m/86'/0'/0'/0/0):
+    ##   internal_pubkey = cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115
+    ##   tweaked output  = a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c
     let desc = parseDescriptor("tr(cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115)")
     let expanded = expandNode(desc.node, 0)
     check expanded.scripts.len == 1
@@ -309,24 +317,25 @@ suite "G11-G16 Descriptors":
     check expanded.scripts[0][0] == 0x51'u8  # OP_1
     check expanded.scripts[0][1] == 0x20'u8  # PUSH32
     check expanded.scripts[0].len == 34
+    # Output key must be the TapTweaked key, not the raw internal key
+    let outputKey = expanded.scripts[0][2 ..^ 1]
+    check bytesToHex(outputKey) ==
+      "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c"
+    check expanded.addresses[0].kind == P2TR
+    check bytesToHex(expanded.addresses[0].taprootKey) ==
+      "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c"
 
-  test "G14 BUG-1/BUG-5: tr() script-tree expansion is stub (documents bug)":
-    ## BIP-341 requires merkle-tweaked output key when a script tree is present.
-    ## nimrod's expandNode for DKTr has a TODO comment and uses key-path only
-    ## (no merkle root tweak). Also: the parser's tree-skip loop has an infinite
-    ## loop bug on '(' (pos not incremented when depth incremented) — so we
-    ## cannot even call parseDescriptor with a script tree without hanging.
-    ## We test the key-path-only case and verify the script count is 1 (key path).
-    ## A correct BIP-341 tr(KEY,TREE) would have a different output key than tr(KEY).
-    let keyPathDesc = parseDescriptor("tr(cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115)")
-    check keyPathDesc.node.kind == DKTr
-    let exp = expandNode(keyPathDesc.node, 0)
-    check exp.scripts.len == 1  # key-path only
-    # The output key is the raw x-only key with NO TapTweak applied — this is also
-    # wrong for descriptors (BIP-341 requires tweaking even for key-path-only tr()
-    # to commit to no scripts). Documents BUG-1.
+  test "G14 BUG-6 fixed: tr() with nested script-tree parses without hanging":
+    ## Before FIX-38, the tree-skip loop did not increment pos when incrementing
+    ## depth on '(' — any tr(KEY,foo(...)) descriptor hung the parser forever.
+    ## The fix adds `inc pos` alongside `inc depth` so balanced parens are consumed.
+    ## BUG-5 note: the tree arg is still silently discarded (TODO for a later wave);
+    ## the output key is the key-path tweak of the internal key.
+    let desc = parseDescriptor("tr(cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115,pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798))")
+    check desc.node.kind == DKTr
+    let exp = expandNode(desc.node, 0)
+    check exp.scripts.len == 1
     check exp.scripts[0][0] == 0x51'u8  # OP_1
-    check exp.scripts[0][1] == 0x20'u8  # PUSH32
 
   test "G15 multi descriptor parses threshold and keys":
     let desc = parseDescriptor("multi(2,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)")

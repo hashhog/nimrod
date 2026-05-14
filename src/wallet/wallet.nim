@@ -91,7 +91,7 @@ proc addAccount*(wallet: var Wallet, purpose: uint32 = 84, accountIndex: uint32 
 # BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data).
 # Duplicated locally (also in script/interpreter.nim) to keep the wallet
 # free of any interpreter dep.
-proc walletTaggedHash(tag: string, data: openArray[byte]): array[32, byte] =
+proc walletTaggedHash*(tag: string, data: openArray[byte]): array[32, byte] =
   let tagHash = sha256(cast[seq[byte]](tag))
   var preimage = newSeq[byte](64 + data.len)
   for i in 0 ..< 32: preimage[i] = tagHash[i]
