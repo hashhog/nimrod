@@ -1,5 +1,8 @@
 ## Fee estimation using histogram-based confirmation tracking
 ## Tracks transactions across fee-rate buckets and measures confirmation times
+## Three-horizon design matching Bitcoin Core's CBlockPolicyEstimator:
+##   SHORT (decay=0.962, scale=1, 12 periods), MED (decay=0.9952, scale=2, 24 periods),
+##   LONG (decay=0.99931, scale=24, 42 periods).
 
 import std/[tables, math, json, os]
 import ../primitives/types
@@ -14,9 +17,31 @@ const
 
   NumBuckets* = 22  ## Length of FeeRateBuckets
   ConfirmationThreshold* = 0.85  ## 85% confirmation threshold
-  DecayFactor* = 0.998  ## Exponential decay factor for older data
+  # Legacy single-decay kept for backward compatibility (equals MED_DECAY)
+  DecayFactor* = 0.998
+
+  ## Per-horizon decay factors matching Bitcoin Core's CBlockPolicyEstimator
+  SHORT_DECAY* = 0.962     ## SHORT horizon decay  (Core: SHORT_DECAY)
+  MED_DECAY*   = 0.9952    ## MEDIUM horizon decay (Core: MED_DECAY)
+  LONG_DECAY*  = 0.99931   ## LONG horizon decay   (Core: LONG_DECAY)
+
+  ## Per-horizon period counts (Core: SHORT/MED/LONG_BLOCK_PERIODS)
+  SHORT_PERIODS* = 12      ## Track 12 periods
+  MED_PERIODS*   = 24      ## Track 24 periods
+  LONG_PERIODS*  = 42      ## Track 42 periods
+
+  ## Per-horizon scale factors — number of blocks per period
+  SHORT_SCALE* = 1         ## SHORT: 1 block per period  → 12 blocks max
+  MED_SCALE*   = 2         ## MED:   2 blocks per period → 48 blocks max
+  LONG_SCALE*  = 24        ## LONG:  24 blocks per period → 1008 blocks max
+
+  ## Derived horizon block horizons
+  SHORT_MAX_TARGET* = SHORT_PERIODS * SHORT_SCALE   ## 12
+  MED_MAX_TARGET*   = MED_PERIODS   * MED_SCALE     ## 48
+  LONG_MAX_TARGET*  = LONG_PERIODS  * LONG_SCALE    ## 1008
+
   FallbackFeeRate* = 10.0  ## Fallback fee rate when insufficient data (sat/vbyte)
-  MinDataPoints* = 10  ## Minimum data points required for estimation
+  MinDataPoints* = 10      ## Minimum data points required for estimation
 
 type
   TrackedTx* = object
@@ -30,15 +55,38 @@ type
     avgFeeRate*: float64  ## Average fee rate of transactions in bucket
     feeRateSum*: float64  ## Running sum for average calculation
 
+  ## Per-horizon tracking state (one per SHORT/MED/LONG)
+  HorizonStats* = object
+    decay*: float64        ## Exponential decay factor for this horizon
+    scale*: int            ## Number of blocks per period
+    numPeriods*: int       ## Number of periods tracked
+    buckets*: array[NumBuckets, BucketStats]
+
   FeeEstimator* = ref object
+    ## Three independent TxConfirmStats instances, one per horizon
+    shortHorizon*: HorizonStats
+    medHorizon*:   HorizonStats
+    longHorizon*:  HorizonStats
+    ## Legacy single-horizon view (points at medHorizon.buckets for compatibility)
     bucketStats*: array[NumBuckets, BucketStats]
     trackedTxs*: Table[TxId, TrackedTx]
 
+proc initHorizonStats(decay: float64, scale: int, numPeriods: int): HorizonStats =
+  HorizonStats(
+    decay: decay,
+    scale: scale,
+    numPeriods: numPeriods,
+    buckets: default(array[NumBuckets, BucketStats])
+  )
+
 proc newFeeEstimator*(): FeeEstimator =
-  ## Create a new fee estimator
+  ## Create a new fee estimator with three independent horizons
   result = FeeEstimator(
-    bucketStats: default(array[NumBuckets, BucketStats]),
-    trackedTxs: initTable[TxId, TrackedTx]()
+    shortHorizon: initHorizonStats(SHORT_DECAY, SHORT_SCALE, SHORT_PERIODS),
+    medHorizon:   initHorizonStats(MED_DECAY,   MED_SCALE,   MED_PERIODS),
+    longHorizon:  initHorizonStats(LONG_DECAY,  LONG_SCALE,  LONG_PERIODS),
+    bucketStats:  default(array[NumBuckets, BucketStats]),
+    trackedTxs:   initTable[TxId, TrackedTx]()
   )
 
 proc getBucketIndex*(feeRate: float64): int =
@@ -50,21 +98,26 @@ proc getBucketIndex*(feeRate: float64): int =
   # Fee rate higher than all buckets - use highest bucket
   return NumBuckets - 1
 
-proc applyDecay*(fe: FeeEstimator) =
-  ## Apply exponential decay to all bucket statistics
-  ## Called periodically to reduce influence of older data
+proc applyDecayToHorizon(hs: var HorizonStats) =
+  ## Apply exponential decay to all bucket statistics for one horizon
   for i in 0..<NumBuckets:
-    fe.bucketStats[i].totalSeen *= DecayFactor
-    fe.bucketStats[i].feeRateSum *= DecayFactor
+    hs.buckets[i].totalSeen *= hs.decay
+    hs.buckets[i].feeRateSum *= hs.decay
     for j in 0..<MaxTargetBlocks:
-      fe.bucketStats[i].totalConfirmed[j] *= DecayFactor
-
-    # Recalculate average
-    if fe.bucketStats[i].totalSeen > 0:
-      fe.bucketStats[i].avgFeeRate =
-        fe.bucketStats[i].feeRateSum / fe.bucketStats[i].totalSeen
+      hs.buckets[i].totalConfirmed[j] *= hs.decay
+    if hs.buckets[i].totalSeen > 0:
+      hs.buckets[i].avgFeeRate =
+        hs.buckets[i].feeRateSum / hs.buckets[i].totalSeen
     else:
-      fe.bucketStats[i].avgFeeRate = 0
+      hs.buckets[i].avgFeeRate = 0
+
+proc applyDecay*(fe: FeeEstimator) =
+  ## Apply exponential decay to all horizons (called once per block)
+  applyDecayToHorizon(fe.shortHorizon)
+  applyDecayToHorizon(fe.medHorizon)
+  applyDecayToHorizon(fe.longHorizon)
+  # Keep legacy bucketStats in sync with medHorizon
+  fe.bucketStats = fe.medHorizon.buckets
 
 proc trackTransaction*(fe: FeeEstimator, txid: TxId, feeRate: float64, height: int32) =
   ## Start tracking a transaction for fee estimation
@@ -83,17 +136,21 @@ proc trackTransaction*(fe: FeeEstimator, txid: TxId, feeRate: float64, height: i
     entryHeight: height
   )
 
-  # Update bucket stats
-  fe.bucketStats[bucketIdx].totalSeen += 1
-  fe.bucketStats[bucketIdx].feeRateSum += feeRate
-  fe.bucketStats[bucketIdx].avgFeeRate =
-    fe.bucketStats[bucketIdx].feeRateSum / fe.bucketStats[bucketIdx].totalSeen
+  # Update all three horizon bucket stats
+  for hs in [addr fe.shortHorizon, addr fe.medHorizon, addr fe.longHorizon]:
+    hs.buckets[bucketIdx].totalSeen += 1
+    hs.buckets[bucketIdx].feeRateSum += feeRate
+    hs.buckets[bucketIdx].avgFeeRate =
+      hs.buckets[bucketIdx].feeRateSum / hs.buckets[bucketIdx].totalSeen
+
+  # Keep legacy bucketStats in sync with medHorizon
+  fe.bucketStats = fe.medHorizon.buckets
 
 proc processBlock*(fe: FeeEstimator, height: int32, confirmedTxids: seq[TxId]) =
   ## Process a confirmed block, updating confirmation statistics
   ## Called when a new block is connected
 
-  # Apply decay first (once per block)
+  # Apply decay first (once per block, to all horizons)
   fe.applyDecay()
 
   for txid in confirmedTxids:
@@ -101,86 +158,114 @@ proc processBlock*(fe: FeeEstimator, height: int32, confirmedTxids: seq[TxId]) =
       continue
 
     let tracked = fe.trackedTxs[txid]
-    let blocksToConfirm = height - tracked.entryHeight
+    let blocksToConfirm = int(height) - int(tracked.entryHeight)
 
-    # Only track confirmations within our target range
-    if blocksToConfirm >= 0 and blocksToConfirm < MaxTargetBlocks:
-      fe.bucketStats[tracked.bucketIdx].totalConfirmed[blocksToConfirm] += 1
+    # Core rejects same-block (blocksToConfirm <= 0)
+    if blocksToConfirm <= 0:
+      fe.trackedTxs.del(txid)
+      continue
+
+    # Record in each horizon using period-scaled indexing
+    # SHORT: slot = (blocksToConfirm - 1) / scale = blocksToConfirm - 1 (scale=1)
+    # MED:   slot = (blocksToConfirm - 1) / 2
+    # LONG:  slot = (blocksToConfirm - 1) / 24
+    for hs in [addr fe.shortHorizon, addr fe.medHorizon, addr fe.longHorizon]:
+      let period = (blocksToConfirm - 1) div hs.scale
+      if period >= 0 and period < hs.numPeriods:
+        hs.buckets[tracked.bucketIdx].totalConfirmed[period] += 1
 
     # Remove from tracking
     fe.trackedTxs.del(txid)
+
+  # Keep legacy bucketStats in sync with medHorizon
+  fe.bucketStats = fe.medHorizon.buckets
 
 proc removeTransaction*(fe: FeeEstimator, txid: TxId) =
   ## Remove a transaction from tracking (e.g., if evicted from mempool)
   if txid in fe.trackedTxs:
     let tracked = fe.trackedTxs[txid]
-    # Decrement the seen count (but keep it non-negative)
-    if fe.bucketStats[tracked.bucketIdx].totalSeen > 0:
-      fe.bucketStats[tracked.bucketIdx].totalSeen -= 1
-      fe.bucketStats[tracked.bucketIdx].feeRateSum -= tracked.feeRate
-      if fe.bucketStats[tracked.bucketIdx].totalSeen > 0:
-        fe.bucketStats[tracked.bucketIdx].avgFeeRate =
-          fe.bucketStats[tracked.bucketIdx].feeRateSum / fe.bucketStats[tracked.bucketIdx].totalSeen
-      else:
-        fe.bucketStats[tracked.bucketIdx].avgFeeRate = 0
+    # Decrement the seen count across all horizons
+    for hs in [addr fe.shortHorizon, addr fe.medHorizon, addr fe.longHorizon]:
+      if hs.buckets[tracked.bucketIdx].totalSeen > 0:
+        hs.buckets[tracked.bucketIdx].totalSeen -= 1
+        hs.buckets[tracked.bucketIdx].feeRateSum -= tracked.feeRate
+        if hs.buckets[tracked.bucketIdx].totalSeen > 0:
+          hs.buckets[tracked.bucketIdx].avgFeeRate =
+            hs.buckets[tracked.bucketIdx].feeRateSum /
+              hs.buckets[tracked.bucketIdx].totalSeen
+        else:
+          hs.buckets[tracked.bucketIdx].avgFeeRate = 0
     fe.trackedTxs.del(txid)
+  # Keep legacy bucketStats in sync with medHorizon
+  fe.bucketStats = fe.medHorizon.buckets
 
-proc getConfirmationRate*(fe: FeeEstimator, bucketIdx: int, targetBlocks: int): float64 =
-  ## Calculate confirmation rate for a bucket within target blocks
-  ## Returns the percentage of transactions confirmed within the target
-
+proc getConfirmationRateForHorizon*(hs: HorizonStats, bucketIdx: int,
+                                    targetBlocks: int): float64 =
+  ## Calculate confirmation rate for a bucket within target blocks for a given horizon.
+  ## Uses period-scaled indexing matching the horizon's scale.
   if bucketIdx < 0 or bucketIdx >= NumBuckets:
     return 0.0
-
-  let stats = fe.bucketStats[bucketIdx]
+  let stats = hs.buckets[bucketIdx]
   if stats.totalSeen < 1:
     return 0.0
-
-  # Sum confirmed within target blocks
+  # Number of periods that cover targetBlocks under this horizon's scale
+  let maxPeriod = min((targetBlocks + hs.scale - 1) div hs.scale, hs.numPeriods)
   var confirmed = 0.0
-  for i in 0..<min(targetBlocks, MaxTargetBlocks):
+  for i in 0..<maxPeriod:
     confirmed += stats.totalConfirmed[i]
-
   confirmed / stats.totalSeen
 
+proc getConfirmationRate*(fe: FeeEstimator, bucketIdx: int, targetBlocks: int): float64 =
+  ## Calculate confirmation rate using the MED horizon (legacy compatibility)
+  getConfirmationRateForHorizon(fe.medHorizon, bucketIdx, targetBlocks)
+
+proc estimateFeeForHorizon*(hs: HorizonStats, targetBlocks: int): float64 =
+  ## Estimate fee for a specific horizon. Scans low→high to find lowest bucket
+  ## achieving >= ConfirmationThreshold within target blocks.
+  ## Returns 0.0 if insufficient data.
+  var totalData = 0.0
+  for i in 0..<NumBuckets:
+    totalData += hs.buckets[i].totalSeen
+  if totalData < float64(MinDataPoints):
+    return 0.0
+
+  for i in 0..<NumBuckets:
+    let rate = getConfirmationRateForHorizon(hs, i, targetBlocks)
+    if hs.buckets[i].totalSeen >= 1 and rate >= ConfirmationThreshold:
+      if hs.buckets[i].avgFeeRate > 0:
+        return hs.buckets[i].avgFeeRate
+      else:
+        return FeeRateBuckets[i]
+
+  # No bucket meets threshold — return highest available
+  for i in countdown(NumBuckets - 1, 0):
+    if hs.buckets[i].totalSeen >= 1:
+      if hs.buckets[i].avgFeeRate > 0:
+        return hs.buckets[i].avgFeeRate
+      else:
+        return FeeRateBuckets[i]
+
+  return 0.0
+
 proc estimateFee*(fe: FeeEstimator, targetBlocks: int): float64 =
-  ## Estimate the fee rate (sat/vbyte) needed to confirm within targetBlocks
-  ## Uses the lowest bucket that achieves >= 85% confirmation rate
-  ## Returns fallback rate (10 sat/vbyte) if insufficient data
+  ## Estimate the fee rate (sat/vbyte) needed to confirm within targetBlocks.
+  ## Dispatches to SHORT (<= 12), MED (<= 48), or LONG (<= 1008) horizon.
+  ## Returns FallbackFeeRate if insufficient data.
 
   let target = min(max(targetBlocks, 1), MaxTargetBlocks)
 
-  # Check if we have enough data
-  var totalData = 0.0
-  for i in 0..<NumBuckets:
-    totalData += fe.bucketStats[i].totalSeen
+  # Select the appropriate horizon
+  let rate =
+    if target <= SHORT_MAX_TARGET:
+      estimateFeeForHorizon(fe.shortHorizon, target)
+    elif target <= MED_MAX_TARGET:
+      estimateFeeForHorizon(fe.medHorizon, target)
+    else:
+      estimateFeeForHorizon(fe.longHorizon, target)
 
-  if totalData < float64(MinDataPoints):
+  if rate <= 0.0:
     return FallbackFeeRate
-
-  # Find the lowest bucket with >= 85% confirmation rate
-  for i in 0..<NumBuckets:
-    let rate = fe.getConfirmationRate(i, target)
-
-    # Need some data in this bucket and meet threshold
-    if fe.bucketStats[i].totalSeen >= 1 and rate >= ConfirmationThreshold:
-      # Return the bucket's fee rate (use average if available, else bucket boundary)
-      if fe.bucketStats[i].avgFeeRate > 0:
-        return fe.bucketStats[i].avgFeeRate
-      else:
-        return FeeRateBuckets[i]
-
-  # No bucket meets the threshold - use the highest bucket rate or fallback
-  for i in countdown(NumBuckets - 1, 0):
-    if fe.bucketStats[i].totalSeen >= 1:
-      # Return highest fee rate we've seen
-      if fe.bucketStats[i].avgFeeRate > 0:
-        return fe.bucketStats[i].avgFeeRate
-      else:
-        return FeeRateBuckets[i]
-
-  # No data at all - return fallback
-  return FallbackFeeRate
+  rate
 
 proc estimateFeeForPriority*(fe: FeeEstimator, priority: int): float64 =
   ## Estimate fee for common priority levels
@@ -196,9 +281,16 @@ proc getTrackedCount*(fe: FeeEstimator): int =
   fe.trackedTxs.len
 
 proc getBucketStats*(fe: FeeEstimator, bucketIdx: int): BucketStats =
-  ## Get statistics for a specific bucket
+  ## Get statistics for a specific bucket (MED horizon)
   if bucketIdx >= 0 and bucketIdx < NumBuckets:
-    fe.bucketStats[bucketIdx]
+    fe.medHorizon.buckets[bucketIdx]
+  else:
+    default(BucketStats)
+
+proc getHorizonBucketStats*(hs: HorizonStats, bucketIdx: int): BucketStats =
+  ## Get statistics for a specific bucket within a horizon
+  if bucketIdx >= 0 and bucketIdx < NumBuckets:
+    hs.buckets[bucketIdx]
   else:
     default(BucketStats)
 
@@ -206,29 +298,40 @@ proc clear*(fe: FeeEstimator) =
   ## Clear all tracked data and statistics
   fe.trackedTxs.clear()
   for i in 0..<NumBuckets:
-    fe.bucketStats[i] = default(BucketStats)
+    fe.shortHorizon.buckets[i] = default(BucketStats)
+    fe.medHorizon.buckets[i]   = default(BucketStats)
+    fe.longHorizon.buckets[i]  = default(BucketStats)
+    fe.bucketStats[i]          = default(BucketStats)
 
 proc saveFeeEstimates*(fe: FeeEstimator, path: string) =
   ## Save fee estimator bucket statistics to a JSON file.
-  ## Only persists bucket stats, not tracked transactions (those are ephemeral).
-  var bucketsArr = newJArray()
-  for i in 0..<NumBuckets:
-    let stats = fe.bucketStats[i]
-    var confirmedArr = newJArray()
-    for j in 0..<MaxTargetBlocks:
-      confirmedArr.add(%stats.totalConfirmed[j])
-    let bucket = %*{
-      "totalSeen": stats.totalSeen,
-      "avgFeeRate": stats.avgFeeRate,
-      "feeRateSum": stats.feeRateSum,
-      "totalConfirmed": confirmedArr
+  ## Persists all three horizons. Only bucketStats (not tracked transactions) are saved.
+  proc horizonToJson(hs: HorizonStats): JsonNode =
+    var bucketsArr = newJArray()
+    for i in 0..<NumBuckets:
+      let stats = hs.buckets[i]
+      var confirmedArr = newJArray()
+      for j in 0..<MaxTargetBlocks:
+        confirmedArr.add(%stats.totalConfirmed[j])
+      bucketsArr.add(%*{
+        "totalSeen": stats.totalSeen,
+        "avgFeeRate": stats.avgFeeRate,
+        "feeRateSum": stats.feeRateSum,
+        "totalConfirmed": confirmedArr
+      })
+    %*{
+      "decay":      hs.decay,
+      "scale":      hs.scale,
+      "numPeriods": hs.numPeriods,
+      "buckets":    bucketsArr
     }
-    bucketsArr.add(bucket)
 
   let state = %*{
-    "version": 1,
+    "version":    2,
     "numBuckets": NumBuckets,
-    "buckets": bucketsArr
+    "short":      horizonToJson(fe.shortHorizon),
+    "medium":     horizonToJson(fe.medHorizon),
+    "long":       horizonToJson(fe.longHorizon)
   }
 
   let tmpPath = path & ".tmp"
@@ -240,38 +343,51 @@ proc saveFeeEstimates*(fe: FeeEstimator, path: string) =
 
 proc loadFeeEstimates*(fe: FeeEstimator, path: string) =
   ## Load fee estimator bucket statistics from a JSON file.
-  ## Silently returns if file doesn't exist or is invalid.
+  ## Supports version 2 (three-horizon) and version 1 (single-horizon, loaded into MED).
   if not fileExists(path):
     return
 
-  try:
-    let contents = readFile(path)
-    let state = parseJson(contents)
-
-    if state.kind != JObject:
-      return
-
-    let bucketsNode = state{"buckets"}
+  proc loadHorizon(node: JsonNode, hs: var HorizonStats) =
+    let bucketsNode = node{"buckets"}
     if bucketsNode.isNil or bucketsNode.kind != JArray:
       return
-
     if bucketsNode.len != NumBuckets:
       return
-
     for i in 0..<NumBuckets:
       let bucket = bucketsNode[i]
       if bucket.kind != JObject:
         continue
-
-      fe.bucketStats[i].totalSeen = bucket{"totalSeen"}.getFloat()
-      fe.bucketStats[i].avgFeeRate = bucket{"avgFeeRate"}.getFloat()
-      fe.bucketStats[i].feeRateSum = bucket{"feeRateSum"}.getFloat()
-
+      hs.buckets[i].totalSeen  = bucket{"totalSeen"}.getFloat()
+      hs.buckets[i].avgFeeRate = bucket{"avgFeeRate"}.getFloat()
+      hs.buckets[i].feeRateSum = bucket{"feeRateSum"}.getFloat()
       let confirmedNode = bucket{"totalConfirmed"}
       if confirmedNode.isNil or confirmedNode.kind != JArray:
         continue
-
       for j in 0..<min(confirmedNode.len, MaxTargetBlocks):
-        fe.bucketStats[i].totalConfirmed[j] = confirmedNode[j].getFloat()
+        hs.buckets[i].totalConfirmed[j] = confirmedNode[j].getFloat()
+
+  try:
+    let contents = readFile(path)
+    let state = parseJson(contents)
+    if state.kind != JObject:
+      return
+
+    let version = state{"version"}.getInt()
+    if version == 2:
+      # Three-horizon format
+      let shortNode = state{"short"}
+      let medNode   = state{"medium"}
+      let longNode  = state{"long"}
+      if not shortNode.isNil: loadHorizon(shortNode, fe.shortHorizon)
+      if not medNode.isNil:   loadHorizon(medNode,   fe.medHorizon)
+      if not longNode.isNil:  loadHorizon(longNode,  fe.longHorizon)
+    else:
+      # Version 1: single-horizon — load into medHorizon for compatibility
+      let bucketsNode = state{"buckets"}
+      if not bucketsNode.isNil:
+        loadHorizon(state, fe.medHorizon)
+
+    # Keep legacy bucketStats in sync
+    fe.bucketStats = fe.medHorizon.buckets
   except CatchableError:
     discard

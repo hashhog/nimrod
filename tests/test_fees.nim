@@ -67,8 +67,8 @@ suite "Fee Estimation":
 
     # Due to decay, totalSeen is slightly less than 10
     check stats.totalSeen > 9.0
-    # Confirmed in 1 block (index 1 since blocksToConfirm = 101 - 100 = 1)
-    check stats.totalConfirmed[1] > 9.0
+    # Confirmed in 1 block. MED scale=2: period=(1-1)/2=0 → slot 0
+    check stats.totalConfirmed[0] > 9.0
 
   test "fallback on empty data":
     let fe = newFeeEstimator()
