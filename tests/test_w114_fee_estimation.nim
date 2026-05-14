@@ -89,30 +89,67 @@ suite "G2 bucket scheme":
 # ─────────────────────────────────────────────────────────────────────────────
 # Gate G3 — three-horizon tracking (SHORT/MED/LONG)
 # Core: three TxConfirmStats with different decays and period counts
-# BUG-2: nimrod has a single-histogram estimator
+# FIX-48: BUG-2 + BUG-3 closed — nimrod now has three independent horizons
 # ─────────────────────────────────────────────────────────────────────────────
 suite "G3 three-horizon split":
-  test "Core SHORT_DECAY=0.962 absent in nimrod [BUG-3]":
-    check abs(DecayFactor - 0.962) > 0.001  # nimrod uses 0.998
+  test "SHORT_DECAY=0.962 present [FIX-48 BUG-3]":
+    check abs(SHORT_DECAY - 0.962) < 0.0001
 
-  test "Core MED_DECAY=0.9952 absent in nimrod [BUG-3]":
-    check abs(DecayFactor - 0.9952) > 0.0001
+  test "MED_DECAY=0.9952 present [FIX-48 BUG-3]":
+    check abs(MED_DECAY - 0.9952) < 0.0001
 
-  test "Core LONG_DECAY=0.99931 absent in nimrod [BUG-3]":
-    check abs(DecayFactor - 0.99931) > 0.0001
+  test "LONG_DECAY=0.99931 present [FIX-48 BUG-3]":
+    check abs(LONG_DECAY - 0.99931) < 0.00001
 
-  test "nimrod has single decay factor not matching any Core horizon [BUG-2,3]":
-    # DecayFactor=0.998 does not match SHORT(0.962)/MED(0.9952)/LONG(0.99931)
-    let coreDecays = [0.962, 0.9952, 0.99931]
-    var anyMatch = false
-    for d in coreDecays:
-      if abs(DecayFactor - d) < 0.001:
-        anyMatch = true
-    check not anyMatch
+  test "three distinct decay values exported [FIX-48 BUG-2]":
+    # All three must differ from each other
+    check abs(SHORT_DECAY - MED_DECAY) > 0.001
+    check abs(MED_DECAY - LONG_DECAY) > 0.0001
+    check abs(SHORT_DECAY - LONG_DECAY) > 0.001
 
-  test "Core SHORT_BLOCK_PERIODS=12 scale=1 absent [BUG-2]":
-    # nimrod has MaxTargetBlocks=1008 flat array, not period-scaled tracking
-    check MaxTargetBlocks == 1008  # documents flat design
+  test "FeeEstimator exposes three HorizonStats instances [FIX-48 BUG-2]":
+    let fe = newFeeEstimator()
+    check abs(fe.shortHorizon.decay - SHORT_DECAY) < 0.0001
+    check abs(fe.medHorizon.decay   - MED_DECAY)   < 0.0001
+    check abs(fe.longHorizon.decay  - LONG_DECAY)  < 0.00001
+
+  test "horizons have correct scale values [FIX-48 BUG-2]":
+    let fe = newFeeEstimator()
+    check fe.shortHorizon.scale == SHORT_SCALE   # 1
+    check fe.medHorizon.scale   == MED_SCALE     # 2
+    check fe.longHorizon.scale  == LONG_SCALE    # 24
+
+  test "horizons have correct period counts [FIX-48 BUG-2]":
+    let fe = newFeeEstimator()
+    check fe.shortHorizon.numPeriods == SHORT_PERIODS   # 12
+    check fe.medHorizon.numPeriods   == MED_PERIODS     # 24
+    check fe.longHorizon.numPeriods  == LONG_PERIODS    # 42
+
+  test "SHORT horizon max target = 12 blocks [FIX-48 BUG-2]":
+    check SHORT_MAX_TARGET == 12
+
+  test "MED horizon max target = 48 blocks [FIX-48 BUG-2]":
+    check MED_MAX_TARGET == 48
+
+  test "LONG horizon max target = 1008 blocks [FIX-48 BUG-2]":
+    check LONG_MAX_TARGET == 1008
+
+  test "SHORT and LONG horizons track independently [FIX-48 BUG-2]":
+    # After adding txs, SHORT decays much faster than LONG
+    let fe = newFeeEstimator()
+    for i in 0..<20:
+      fe.trackTransaction(makeTxId(i), 10.0, 100)
+    # Process 30 empty blocks — SHORT decay 0.962^30 ≈ 0.30, LONG decay 0.99931^30 ≈ 0.979
+    for h in 101..130:
+      fe.processBlock(int32(h), @[])
+    let shortSeen = fe.shortHorizon.buckets[getBucketIndex(10.0)].totalSeen
+    let longSeen  = fe.longHorizon.buckets[getBucketIndex(10.0)].totalSeen
+    # SHORT should retain ~30% (≈6), LONG should retain ~97.9% (≈19.6)
+    check longSeen > shortSeen * 2.0  # LONG retains substantially more data
+
+  test "Core SHORT_BLOCK_PERIODS=12 scale=1 present [FIX-48 BUG-2]":
+    check SHORT_PERIODS == 12
+    check SHORT_SCALE == 1
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gate G4 — processTransaction / trackTransaction wiring
@@ -183,32 +220,30 @@ suite "G5 processBlock height guard":
 # BUG-8: same-block (delta=0) is accepted by nimrod, recorded at index 0
 # ─────────────────────────────────────────────────────────────────────────────
 suite "G6 blocksToConfirm same-block edge case":
-  test "Core rejects blocksToConfirm=0 (same block); nimrod accepts it [BUG-8]":
+  test "same-block confirmation (delta=0) is rejected [FIX-48 collateral BUG-8]":
+    # Core rejects blocksToConfirm <= 0; FIX-48 adds the same guard
     let fe = newFeeEstimator()
     let txid = makeTxId(99)
     let entryHeight: int32 = 500
     fe.trackTransaction(txid, 10.0, entryHeight)
-    # Confirm at same height — delta=0
+    # Confirm at same height — delta=0, should be rejected
     fe.processBlock(entryHeight, @[txid])
-    # Core would reject (blocksToConfirm <= 0) — tx should NOT contribute to stats
-    # Nimrod records it at slot 0
     let idx = getBucketIndex(10.0)
     let stats = fe.getBucketStats(idx)
-    # In nimrod this is non-zero (bug), in correct impl it should be 0
-    check stats.totalConfirmed[0] > 0.0  # documents the BUG-8 divergence
+    # Same-block tx is discarded — no confirmation recorded
+    check stats.totalConfirmed[0] == 0.0  # correctly rejected
 
-  test "Core 1-based: first valid slot is index 0 for 1-block confirmation":
-    # Core Record: periodsToConfirm = (blocksToConfirm + scale - 1) / scale
-    # For SHORT (scale=1), 1-block confirmation → period=1 → confAvg[0] incremented
-    # In nimrod: blocksToConfirm = height - entryHeight = 101 - 100 = 1 → slot 1
+  test "1-block confirmation stored at period 0 (MED scale=2, period=(1-1)/2=0)":
+    # With period-scaled indexing (MED scale=2): period = (blocksToConfirm - 1) / scale
+    # blocksToConfirm=1 → period=(1-1)/2=0 → slot 0
     let fe = newFeeEstimator()
     let txid = makeTxId(100)
     fe.trackTransaction(txid, 10.0, 100)
     fe.processBlock(101, @[txid])  # 1 block to confirm
     let idx = getBucketIndex(10.0)
     let stats = fe.getBucketStats(idx)
-    # nimrod stores at index 1 (documents off-by-one vs Core's period-based indexing)
-    check stats.totalConfirmed[1] > 0.0
+    # MED horizon (getBucketStats) stores at slot 0 for 1-block confirmation
+    check stats.totalConfirmed[0] > 0.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gate G7 — failAvg: evicted transaction failure tracking
@@ -462,18 +497,20 @@ suite "G18 mempool-parents gate":
 # Gate G19 — decay applied correctly per block (once per processBlock)
 # ─────────────────────────────────────────────────────────────────────────────
 suite "G19 decay application":
-  test "decay applied exactly once per processBlock call":
+  test "decay applied exactly once per processBlock call (MED horizon)":
+    # getBucketStats returns medHorizon; verify MED_DECAY=0.9952 applied each block
     let fe = newFeeEstimator()
     fe.trackTransaction(makeTxId(1), 10.0, 100)
     fe.processBlock(101, @[makeTxId(1)])
     let idx = getBucketIndex(10.0)
     let afterOne = fe.getBucketStats(idx).totalSeen
-    # After one more empty block, decay applied once more
+    # After one more empty block, MED decay applied once more
     fe.processBlock(102, @[])
     let afterTwo = fe.getBucketStats(idx).totalSeen
-    check abs(afterTwo / afterOne - DecayFactor) < 0.001
+    check abs(afterTwo / afterOne - MED_DECAY) < 0.001
 
-  test "decay factor 0.998 produces ~20% reduction over 100 blocks":
+  test "MED decay 0.9952 produces ~39% reduction over 100 blocks":
+    # 0.9952^100 ≈ 0.619 (more than 20% reduction)
     let fe = newFeeEstimator()
     fe.trackTransaction(makeTxId(1), 10.0, 100)
     fe.processBlock(101, @[makeTxId(1)])
@@ -481,26 +518,38 @@ suite "G19 decay application":
     for h in 102..201:
       fe.processBlock(int32(h), @[])
     let finalSeen = fe.getBucketStats(getBucketIndex(10.0)).totalSeen
-    # 0.998^100 ≈ 0.819
-    check finalSeen < initial * 0.85
+    # 0.9952^100 ≈ 0.619 → more than 30% reduction
+    check finalSeen < initial * 0.75
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gate G20 — estimateRawFee horizon structure
 # Core: returns short/medium/long horizons with feerate/decay/scale/pass/fail
-# nimrod: returns all three with same single-estimator data (BUG-2 consequence)
+# FIX-48: BUG-2 closed — three independent horizons with correct decays
 # ─────────────────────────────────────────────────────────────────────────────
 suite "G20 estimateRawFee horizon output":
-  test "Core requires different decay per horizon in output [BUG-2]":
-    # Core short: decay=0.962, scale=1
-    # Core medium: decay=0.9952, scale=2
-    # Core long: decay=0.99931, scale=24
-    # nimrod returns DecayFactor for all three horizons
-    let shortDecay = 0.962
-    let medDecay = 0.9952
-    let longDecay = 0.99931
-    check abs(DecayFactor - shortDecay) > 0.001
-    check abs(DecayFactor - medDecay) > 0.0001
-    check abs(DecayFactor - longDecay) > 0.00001
+  test "SHORT horizon decay = 0.962 [FIX-48 BUG-2]":
+    let fe = newFeeEstimator()
+    check abs(fe.shortHorizon.decay - 0.962) < 0.0001
+
+  test "MED horizon decay = 0.9952 [FIX-48 BUG-2]":
+    let fe = newFeeEstimator()
+    check abs(fe.medHorizon.decay - 0.9952) < 0.0001
+
+  test "LONG horizon decay = 0.99931 [FIX-48 BUG-2]":
+    let fe = newFeeEstimator()
+    check abs(fe.longHorizon.decay - 0.99931) < 0.00001
+
+  test "horizons have distinct bucket data after tracking [FIX-48 BUG-2]":
+    # After many empty blocks, SHORT decays much faster — bucket data diverges
+    let fe = newFeeEstimator()
+    for i in 0..<20:
+      fe.trackTransaction(makeTxId(i), 10.0, 100)
+    for h in 101..150:
+      fe.processBlock(int32(h), @[])
+    let shortSeen = fe.shortHorizon.buckets[getBucketIndex(10.0)].totalSeen
+    let longSeen  = fe.longHorizon.buckets[getBucketIndex(10.0)].totalSeen
+    # SHORT 0.962^50 ≈ 0.137, LONG 0.99931^50 ≈ 0.966 — clearly different
+    check abs(longSeen - shortSeen) > 1.0  # demonstrably different data
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gate G21 — pass/fail bucket fields in estimateRawFee
@@ -608,8 +657,9 @@ suite "G24 MinDataPoints threshold":
 
   test "returns non-fallback when totalSeen >= MinDataPoints=10":
     let fe = newFeeEstimator()
+    # Use fee rate 25.0 (distinct from FallbackFeeRate=10.0) to avoid coincidence
     for i in 0..<15:
-      fe.trackTransaction(makeTxId(i), 10.0, 100)
+      fe.trackTransaction(makeTxId(i), 25.0, 100)
       fe.processBlock(101, @[makeTxId(i)])
     check fe.estimateFee(6) != FallbackFeeRate
 
@@ -657,15 +707,15 @@ suite "G25b decay-before-record rate overflow":
     var confirmed: seq[TxId]
     for i in 0..<20:
       confirmed.add(makeTxId(i))
-    fe.processBlock(101, confirmed)  # blocksToConfirm = 101 - 100 = 1 → slot[1]
+    fe.processBlock(101, confirmed)  # blocksToConfirm=1, MED scale=2: period=(1-1)/2=0 → slot[0]
     let idx = getBucketIndex(10.0)
     let stats = fe.getBucketStats(idx)
     if stats.totalSeen > 0:
-      # confirmed[1] = 20.0 (undecayed) but totalSeen = 20 * 0.998 ≈ 19.96
-      # getConfirmationRate(idx, 2) sums [0]+[1] = 0+20 = 20, divided by 19.96 > 1
+      # confirmed[0] = 20.0 (undecayed) but totalSeen = 20 * MED_DECAY ≈ 19.904
+      # getConfirmationRate(idx, 2) with MED scale=2: maxPeriod=1, sums [0]=20, rate≈1.005
       let rate = fe.getConfirmationRate(idx, 2)
       # Rate should be ≤ 1.0 in a correct implementation
-      # In nimrod it exceeds 1.0 because totalSeen was decayed before confirmed[1]++
+      # In nimrod it exceeds 1.0 because totalSeen was decayed before confirmed[0]++
       check rate > 1.0  # documents BUG-19: > 1.0 is wrong
 
 # ─────────────────────────────────────────────────────────────────────────────

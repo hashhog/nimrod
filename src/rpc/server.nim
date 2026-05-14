@@ -3937,24 +3937,23 @@ proc handleEstimateRawFee(rpc: RpcServer, params: JsonNode): JsonNode =
   if threshold < 0 or threshold > 1:
     raise newRpcError(RpcInvalidParams, "Invalid threshold")
 
-  proc horizonResult(rpc: RpcServer, target: int, decay: float64,
-                     scale: int): JsonNode =
+  proc horizonResult(rpc: RpcServer, hs: HorizonStats, target: int): JsonNode =
+    ## Build one horizon's estimaterawfee result using its own bucket data.
     if rpc.feeEstimator == nil:
       return %*{
-        "decay": decay,
-        "scale": scale,
+        "decay": hs.decay,
+        "scale": hs.scale,
         "errors": ["fee estimator unavailable"]
       }
-    let feeRate = rpc.feeEstimator.estimateFee(target)
+    let feeRate = estimateFeeForHorizon(hs, target)
     if feeRate <= 0.0:
       return %*{
-        "decay": decay,
-        "scale": scale,
+        "decay": hs.decay,
+        "scale": hs.scale,
         "errors": ["Insufficient data or no feerate found which meets threshold"]
       }
     let feeBtcPerKb = feeRate * 1000.0 / 100000000.0
-    # Walk buckets until we cross the threshold to populate "pass"/"fail"
-    # using whatever totals our histogram tracks.
+    # Walk this horizon's buckets to populate "pass"/"fail" ranges
     var passStart = 0.0
     var passEnd = 0.0
     var passWithin = 0.0
@@ -3965,11 +3964,11 @@ proc handleEstimateRawFee(rpc: RpcServer, params: JsonNode): JsonNode =
     var failConfirmed = 0.0
     var prevRate = 0.0
     for i in 0 ..< NumBuckets:
-      let stats = rpc.feeEstimator.getBucketStats(i)
+      let stats = getHorizonBucketStats(hs, i)
       if stats.totalSeen <= 0:
         prevRate = FeeRateBuckets[i]
         continue
-      let rate = rpc.feeEstimator.getConfirmationRate(i, target)
+      let rate = getConfirmationRateForHorizon(hs, i, target)
       let bucketEnd = FeeRateBuckets[i]
       if rate >= threshold:
         passStart = prevRate
@@ -3985,8 +3984,8 @@ proc handleEstimateRawFee(rpc: RpcServer, params: JsonNode): JsonNode =
       prevRate = bucketEnd
     var horizon = %*{
       "feerate": feeBtcPerKb,
-      "decay": decay,
-      "scale": scale,
+      "decay": hs.decay,
+      "scale": hs.scale,
       "pass": {
         "startrange": passStart,
         "endrange": passEnd,
@@ -4007,12 +4006,14 @@ proc handleEstimateRawFee(rpc: RpcServer, params: JsonNode): JsonNode =
       }
     horizon
 
-  # Match Core's three-horizon shape so clients can index by name.
-  # nimrod's estimator uses a single decay factor, surfaced uniformly.
+  # Three independent horizons — each uses its own decay/scale/bucket data
+  if rpc.feeEstimator == nil:
+    let errNode = %*{"errors": ["fee estimator unavailable"]}
+    return %*{"short": errNode, "medium": errNode, "long": errNode}
   result = %*{
-    "short":  horizonResult(rpc, confTarget, DecayFactor, 1),
-    "medium": horizonResult(rpc, confTarget, DecayFactor, 1),
-    "long":   horizonResult(rpc, confTarget, DecayFactor, 1)
+    "short":  horizonResult(rpc, rpc.feeEstimator.shortHorizon, confTarget),
+    "medium": horizonResult(rpc, rpc.feeEstimator.medHorizon,   confTarget),
+    "long":   horizonResult(rpc, rpc.feeEstimator.longHorizon,  confTarget)
   }
 
 # Address validation RPC
