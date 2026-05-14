@@ -10,6 +10,7 @@ import ../script/interpreter
 import ./package
 import ./standard
 import ./cluster
+import ../mining/fees
 export package, standard
 
 type
@@ -86,6 +87,10 @@ type
     incrementalRelayFeeRate*: float64 ## sat/kvB incremental relay fee; Core: m_opts.incremental_relay_feerate
     ## Mempool expiry
     expiryHours*: int       ## Transactions older than this are expired (default 336h = 14 days)
+    ## Fee estimator (optional; wired by the node after newFeeEstimator).
+    ## When non-nil, acceptTransactionWithArgs calls trackTransaction on success
+    ## and removeTransaction calls feeEstimator.removeTransaction on eviction.
+    feeEstimator*: FeeEstimator
 
 const
   DefaultMaxMempoolSize* = 300_000_000  ## 300 MB
@@ -1350,6 +1355,11 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   for input in tx.inputs:
     mp.spentBy[input.prevOut] = txid
 
+  # BUG-1 fix (W114 FIX-47): wire fee estimator on successful accept.
+  # feeRate here is sat/vbyte; bestHeight is the chain tip height at entry time.
+  if mp.feeEstimator != nil:
+    mp.feeEstimator.trackTransaction(txid, feeRate, mp.chainState.bestHeight)
+
   ok[AtmpAcceptInfo](info)
 
 # Convenience wrapper for the historical signature — preserves callers that
@@ -1390,6 +1400,10 @@ proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true) =
   if mp.byWtxid.getOrDefault(entry.wtxid, TxId(default(array[32, byte]))) == txid:
     mp.byWtxid.del(entry.wtxid)
   mp.entries.del(txid)
+
+  # BUG-12 fix (W114 FIX-47): notify fee estimator of eviction/removal.
+  if mp.feeEstimator != nil:
+    mp.feeEstimator.removeTransaction(txid)
 
   # Cascade eviction for ephemeral dust parents
   if evictEphemeral:
