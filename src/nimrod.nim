@@ -1850,6 +1850,9 @@ proc startNode*(config: NimrodConfig) {.async.} =
   state.feeEstimator = newFeeEstimator()
   let feeEstimatesPath = networkDir / "fee_estimates.json"
   state.feeEstimator.loadFeeEstimates(feeEstimatesPath)
+  # BUG-1 fix (W114 FIX-47): wire feeEstimator into mempool so that
+  # acceptTransactionWithArgs calls trackTransaction on every successful accept.
+  state.mempool.feeEstimator = state.feeEstimator
 
   # 5. Initialize peer manager
   info "initializing peer manager"
