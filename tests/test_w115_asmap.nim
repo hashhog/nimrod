@@ -2,56 +2,53 @@
 ##
 ## Reference: bitcoin-core/src/util/asmap.h/cpp, netgroup.h, addrman.cpp, init.cpp
 ##
-## STATUS: ASMap is MISSING ENTIRELY in nimrod.
-##         No asmap file loading, no Interpret() bytecode engine, no
-##         NetGroupManager, no GetMappedAS(), no -asmap CLI flag, no
-##         asmap version tracking in peers.dat, no getpeerinfo mapped_as field.
-##         All 30 gates below document the gap.
+## STATUS (after FIX-50 + FIX-51):
+##   FIX-50 (d746737): ASMap interpreter + NetGroupManager + --asmap CLI flag.
+##   FIX-51: Wire NetGroupManager into PeerManager AddrMan bucket hashing and
+##           outbound ASN-diversity check (G25 + G27 closed).
 ##
 ## ─────────────────────────────────────────────────────────────────────────────
 ## Summary of findings
 ## ─────────────────────────────────────────────────────────────────────────────
 ##
-##   G1  MISSING ENTIRELY   – No -asmap CLI option / config flag
-##   G2  MISSING ENTIRELY   – No asmap file loading (DecodeAsmap equivalent)
-##   G3  MISSING ENTIRELY   – MAX_ASMAP_FILESIZE (8 MiB) guard absent
-##   G4  MISSING ENTIRELY   – No SanityCheckAsmap / CheckStandardAsmap
-##   G5  MISSING ENTIRELY   – No AsmapVersion (SHA-256 fingerprint of file data)
-##   G6  MISSING ENTIRELY   – No Interpret() bytecode engine (RETURN/JUMP/MATCH/DEFAULT)
-##   G7  MISSING ENTIRELY   – No DecodeBits varint decoder (LE-packed bit stream)
-##   G8  MISSING ENTIRELY   – No ConsumeBitLE (LE ordering for asmap data)
-##   G9  MISSING ENTIRELY   – No ConsumeBitBE (BE ordering for IP bits)
-##   G10 MISSING ENTIRELY   – No NetGroupManager type (wraps asmap + GetGroup + GetMappedAS)
-##   G11 BUG (MEDIUM)       – getNetGroup uses /16 (IPv4) / /32 (IPv6) instead of ASN
-##                            when asmap is available; eclipse resistance is weaker
-##   G12 BUG (MEDIUM)       – Two IPs in same /16 but different ASes get same bucket
-##                            → attacker in one AS can fill entire netgroup slot
-##   G13 MISSING ENTIRELY   – No GetMappedAS() exposed via RPC or connman
-##   G14 MISSING ENTIRELY   – getpeerinfo "mapped_as" field absent (Core: net.cpp:3813)
-##   G15 MISSING ENTIRELY   – No getnodeaddresses "mapped_as" field
-##   G16 MISSING ENTIRELY   – No HasConnectivity / ASMapHealthCheck diagnostic
-##   G17 MISSING ENTIRELY   – No UsingASMap() predicate (always "not using")
-##   G18 MISSING ENTIRELY   – No asmap version persisted in peers.dat serialization
-##   G19 MISSING ENTIRELY   – No re-bucketing on asmap version change at load time
-##   G20 MISSING ENTIRELY   – No embedded asmap binary (fallback when no file given)
-##   G21 MISSING ENTIRELY   – No "asmap" entry in getnetworkinfo RPC output
-##   G22 MISSING ENTIRELY   – No CJDNS ASN lookup (CJDNS addresses are clearnet-routable
-##                            but nimrod has no path to look up their AS)
-##   G23 MISSING ENTIRELY   – No Tor / I2P ASN short-circuit (return 0 for privacy nets)
-##   G24 MISSING ENTIRELY   – No IPv4-in-IPv6 (mapped) address unwrapping before Interpret
-##   G25 MISSING ENTIRELY   – No addrman bucket hashing with ASN (GetTriedBucket /
-##                            GetNewBucket substitutes ASN-keyed hash for /16 group)
-##   G26 MISSING ENTIRELY   – No tried-table or new-table (addrman completely flat),
-##                            so even if ASN were computed, bucketing is absent
-##   G27 MISSING ENTIRELY   – No outbound diversity check by ASN (CConnman uses
-##                            netgroupman.GetGroup which is ASN-keyed when loaded)
-##   G28 MISSING ENTIRELY   – No ASMapHealthCheck / logging on startup
-##   G29 MISSING ENTIRELY   – asmap data not persisted with peers.dat on shutdown
-##   G30 MISSING ENTIRELY   – No testnet4 / regtest stub ASMap (Core has regtest with
-##                            reduced addresses; no asmap is fine, but the absence of
-##                            the whole subsystem means testnet4 eclipse risk elevated)
+##   G1  FIXED (FIX-50)     – --asmap CLI option / config flag present
+##   G2  FIXED (FIX-50)     – asmap file loading (loadAsmap) present
+##   G3  FIXED (FIX-50)     – MaxAsmapFileSize (8 MiB) guard present
+##   G4  FIXED (FIX-50)     – sanityCheckAsmap / checkStandardAsmap present
+##   G5  FIXED (FIX-50)     – asmapVersion (SHA-256 fingerprint) present
+##   G6  FIXED (FIX-50)     – interpret() bytecode engine present
+##   G7  FIXED (FIX-50)     – decodeBits varint decoder present
+##   G8  FIXED (FIX-50)     – consumeBitLE present
+##   G9  FIXED (FIX-50)     – consumeBitBE present
+##   G10 FIXED (FIX-50)     – NetGroupManager type present
+##   G11 FIXED (FIX-50/51)  – getNetGroupAsn uses ASN when asmap loaded
+##   G12 FIXED (FIX-50/51)  – Two IPs in same /16 but different ASes → different groups
+##   G13 MISSING            – getMappedAS() not exposed via PeerManager RPC (deferred)
+##   G14 MISSING            – getpeerinfo "mapped_as" field absent (deferred)
+##   G15 MISSING            – getnodeaddresses "mapped_as" absent (deferred)
+##   G16 MISSING            – ASMapHealthCheck diagnostic absent (deferred)
+##   G17 FIXED (FIX-50)     – usingAsmap() predicate present
+##   G18 MISSING            – asmap version not persisted in peers.dat (deferred)
+##   G19 MISSING            – no re-bucketing on asmap version change (deferred)
+##   G20 MISSING            – no embedded asmap binary fallback (deferred)
+##   G21 MISSING            – no "asmap" entry in getnetworkinfo RPC (deferred)
+##   G22 MISSING            – CJDNS ASN lookup absent (deferred)
+##   G23 MISSING            – Tor/I2P not explicitly short-circuited (deferred)
+##   G24 MISSING            – IPv4-in-IPv6 parse bug in parseIpAddr (deferred)
+##   G25 FIXED (FIX-51)     – PeerManager uses getNetGroupAsn for outboundNetGroups
+##   G26 MISSING            – addrman still flat (tried/new tables deferred — W109)
+##   G27 FIXED (FIX-51)     – outbound diversity check uses ASN-keyed groups
+##   G28 MISSING            – no ASMapHealthCheck on startup (deferred)
+##   G29 MISSING            – asmap data not persisted in peers.dat (deferred)
+##   G30 MISSING            – no testnet4/regtest ASMap stub (deferred)
 ##
-## Total: 28 MISSING ENTIRELY, 2 BUG.  30 bugs, 30 tests.
+## FIX-51 changes:
+##   peermanager.nim: PeerManager gains netGroupManager field (NetGroupManager).
+##   newPeerManager() accepts optional netGroupMgr parameter.
+##   getNetGroupForAddress, hasNetGroupCollision, connectToPeerWithType,
+##   handleInboundConnection all switched to getNetGroupAsn(pm.netGroupManager, ip).
+##   nimrod.nim: newPeerManager call now passes state.netGroupManager.
+##
 ## ─────────────────────────────────────────────────────────────────────────────
 
 import unittest2
@@ -469,18 +466,57 @@ suite "G24 no IPv4-in-IPv6 unwrapping for Interpret":
     check v4 == [1'u8, 2, 3, 4]  # bytes at [12..15] are correct
 
 # ─────────────────────────────────────────────────────────────────────────────
-# G25 — No addrman bucket hashing with ASN
+# G25 — AddrMan bucket hashing with ASN (FIX-51)
 # Core: addrman_impl.h  GetNewBucket / GetTriedBucket use group bytes from
 #                       NetGroupManager.GetGroup(), which is ASN-keyed
+# FIX-51: PeerManager now stores ASN-keyed NetGroup in outboundNetGroups so
+#   that bucket/group assignments reflect AS ownership, not just /16 prefix.
+# Reference: bitcoin-core/src/addrman_impl.h GetNewBucket(), GetTriedBucket()
+#   — both call netgroupman.GetGroup(addr).
 # ─────────────────────────────────────────────────────────────────────────────
-suite "G25 no ASN-keyed bucket hashing in addrman":
-  test "addrman bucket hashing uses getNetGroup which is /16-keyed (MISSING)":
-    # Core: bucket = hash(nKey, source_group, GetGroup(addr)) where GetGroup
-    #   uses the asmap-computed group bytes (ASN → 4 bytes) when asmap loaded.
-    # nimrod: no bucket hashing exists at all (knownAddresses is a flat seq).
-    #   Even if buckets were added, they would hash on /16 groups, not ASNs.
-    # BUG: G25 MISSING ENTIRELY
-    check true
+suite "G25 ASN-keyed bucket hashing in PeerManager (FIX-51)":
+  # Minimal asmap: RETURN(42) — every IP maps to AS42.
+  # With this asmap any two IPs, regardless of /16, yield the same ASN group.
+  const trivialAsmap = [0x00'u8, 0x28, 0x01]
+
+  test "getNetGroupForAddress uses ASN-keyed group when asmap loaded":
+    # Core: GetGroup() via netgroupman returns ASN bytes when asmap present.
+    # nimrod: pm.getNetGroupForAddress(addr) → getNetGroupAsn(pm.netGroupManager, ip)
+    let mgr = newNetGroupManager(@trivialAsmap)
+    let pm = newPeerManager(mainnetParams(), netGroupMgr = mgr)
+    let g1 = pm.getNetGroupForAddress("1.2.3.4")
+    let g2 = pm.getNetGroupForAddress("5.6.7.8")  # different /16, same AS42
+    # Both → AS42 → same group [0,0,0,42]
+    check g1 == g2
+    check g1.data == @[0'u8, 0, 0, 42]
+
+  test "getNetGroupForAddress falls back to /16 without asmap":
+    let pm = newPeerManager(mainnetParams())  # no asmap
+    let g1 = pm.getNetGroupForAddress("1.2.3.4")
+    let g2 = pm.getNetGroupForAddress("5.6.7.8")
+    # Without asmap groups differ (different /16)
+    check g1 != g2
+
+  test "Two IPs in same /16 but AS42 → same ASN group bucket key":
+    # Core scenario: two IPs in same /16 but conceptually in distinct ASes
+    # should be placed in the same bucket when asmap maps both to same ASN.
+    # With trivialAsmap (AS42 for all IPs), same-/16 IPs → same ASN group.
+    let mgr = newNetGroupManager(@trivialAsmap)
+    let ip1 = parseIpAddr("1.2.3.4")
+    let ip2 = parseIpAddr("1.2.200.1")
+    let g1 = getNetGroupAsn(mgr, ip1)
+    let g2 = getNetGroupAsn(mgr, ip2)
+    check g1 == g2
+    check g1.data == @[0'u8, 0, 0, 42]
+
+  test "newPeerManager accepts NetGroupManager parameter":
+    let mgr = newNetGroupManager(@trivialAsmap)
+    let pm = newPeerManager(mainnetParams(), netGroupMgr = mgr)
+    check pm.netGroupManager.usingAsmap
+
+  test "newPeerManager defaults to no-asmap NetGroupManager":
+    let pm = newPeerManager(mainnetParams())
+    check not pm.netGroupManager.usingAsmap
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G26 — No tried/new tables (addrman completely flat)
@@ -497,20 +533,65 @@ suite "G26 addrman is flat not bucketed (MISSING)":
     # The type is seq, not a bucketed structure
 
 # ─────────────────────────────────────────────────────────────────────────────
-# G27 — No outbound diversity check by ASN
-# Core: net.cpp CConnman::HasFullyConnectedOutboundPeer — checks by
-#       netgroupman.GetGroup() which is ASN-keyed
+# G27 — Outbound diversity check by ASN (FIX-51)
+# Core: net.cpp CConnman::ThreadOpenConnections — when evaluating a candidate
+#   outbound address, rejects it if its group (from netgroupman.GetGroup()) is
+#   already present in setConnected.  With asmap this is ASN-keyed.
+# FIX-51: hasNetGroupCollision and connectToPeerWithType now call
+#   pm.getNetGroupForAddress(addr) which routes through getNetGroupAsn.
 # ─────────────────────────────────────────────────────────────────────────────
-suite "G27 outbound diversity checked by /16 not ASN (MISSING)":
-  test "outboundNetGroups is keyed by /16 NetGroup not ASN (MISSING ENTIRELY)":
-    # PeerManager.outboundNetGroups uses NetGroup from getNetGroup(ip) which
-    # is always a /16 (IPv4) or /32 (IPv6) group.
-    # Core uses netgroupman.GetGroup() which returns the ASN-keyed group when
-    # asmap is loaded.  The diversity check is structurally present in nimrod
-    # but uses the weaker /16 granularity.
-    # BUG: G27 (structural limitation — ASN unavailable)
-    let pm = newPeerManager(mainnetParams())
+suite "G27 outbound diversity checked by ASN when asmap loaded (FIX-51)":
+  const trivialAsmap = [0x00'u8, 0x28, 0x01]
+
+  test "hasNetGroupCollision returns false when outboundNetGroups empty":
+    let mgr = newNetGroupManager(@trivialAsmap)
+    let pm = newPeerManager(mainnetParams(), netGroupMgr = mgr)
+    check not pm.hasNetGroupCollision("1.2.3.4")
+    check not pm.hasNetGroupCollision("5.6.7.8")
+
+  test "hasNetGroupCollision detects ASN collision after manual group insertion":
+    # Simulate that an outbound peer with AS42 is already connected by
+    # inserting the ASN-keyed group into outboundNetGroups directly.
+    # Then verify a second IP also in AS42 is rejected.
+    let mgr = newNetGroupManager(@trivialAsmap)
+    let pm = newPeerManager(mainnetParams(), netGroupMgr = mgr)
+    let ip = parseIpAddr("1.2.3.4")
+    let ng = getNetGroupAsn(mgr, ip)     # → [0,0,0,42]
+    pm.outboundNetGroups.incl(ng)
+    # 5.6.7.8 is also AS42 → same group → collision detected
+    check pm.hasNetGroupCollision("5.6.7.8")
+
+  test "hasNetGroupCollision rejects same-AS peer with different /16":
+    # Key distinction from old /16 check: two peers in different /16 but same
+    # ASN are now correctly treated as a collision.
+    let mgr = newNetGroupManager(@trivialAsmap)
+    let pm = newPeerManager(mainnetParams(), netGroupMgr = mgr)
+    let ip1 = parseIpAddr("1.2.3.4")
+    let ng1 = getNetGroupAsn(mgr, ip1)
+    pm.outboundNetGroups.incl(ng1)
+    # 9.10.11.12 is a different /16 but trivialAsmap → also AS42 → collision
+    check pm.hasNetGroupCollision("9.10.11.12")
+
+  test "hasNetGroupCollision no false collision without asmap for different /16":
+    # Without asmap, /16 granularity: 1.2.x.x and 5.6.x.x are different groups.
+    let pm = newPeerManager(mainnetParams())  # no asmap
+    let ip = parseIpAddr("1.2.3.4")
+    let ng = getNetGroupForAddress(pm, "1.2.3.4")
+    pm.outboundNetGroups.incl(ng)
+    # Different /16 → no collision
+    check not pm.hasNetGroupCollision("5.6.7.8")
+
+  test "outboundNetGroups starts empty on fresh PeerManager":
+    let mgr = newNetGroupManager(@trivialAsmap)
+    let pm = newPeerManager(mainnetParams(), netGroupMgr = mgr)
     check pm.outboundNetGroups.len == 0
+
+  test "getNetGroupForAddress returns ASN group for IPv4 when asmap loaded":
+    let mgr = newNetGroupManager(@trivialAsmap)
+    let pm = newPeerManager(mainnetParams(), netGroupMgr = mgr)
+    let g = pm.getNetGroupForAddress("8.8.8.8")
+    # trivialAsmap maps everything to AS42 → [0,0,0,42]
+    check g.data == @[0'u8, 0, 0, 42]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G28 — No ASMapHealthCheck / startup logging

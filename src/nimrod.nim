@@ -1890,7 +1890,16 @@ proc startNode*(config: NimrodConfig) {.async.} =
   else:
     state.netGroupManager = newNetGroupManager()  # no asmap
 
-  state.peerManager = newPeerManager(params, maxOut = config.maxConnections div 16, maxIn = config.maxConnections - config.maxConnections div 16, dataDir = networkDir)
+  # FIX-51 (W115 G27): pass state.netGroupManager into PeerManager so that
+  # outbound diversity checks (hasNetGroupCollision) and bucket-group storage
+  # use ASN-keyed groups when an asmap file is loaded.
+  # Reference: bitcoin-core/src/net.cpp CConnman constructor — m_netgroupman ref.
+  state.peerManager = newPeerManager(
+    params,
+    maxOutFullRelay = config.maxConnections div 16,
+    maxIn = config.maxConnections - config.maxConnections div 16,
+    dataDir = networkDir,
+    netGroupMgr = state.netGroupManager)
   state.peerManager.updateHeight(state.chainState.bestHeight)
   state.peerManager.setMessageCallback(messageCallback(state))
 
