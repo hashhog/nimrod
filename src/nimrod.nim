@@ -145,6 +145,9 @@ type
                                           ## (non-asmap) manager when no file is
                                           ## given.  Wired into peerManager and
                                           ## the getpeerinfo RPC handler.
+    lastAsmapHealthCheck*: int64          ## Unix timestamp of last ASMapHealthCheck.
+                                          ## 0 = never run.  Checked every heartbeat;
+                                          ## re-runs every 3600 s.
 
 # Global for signal handling
 var globalNodeState*: NodeState = nil
@@ -2115,6 +2118,13 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # 11. Start peer manager main loop
   asyncSpawn state.peerManager.mainLoop()
 
+  # 11a. Startup ASMapHealthCheck (G16/G28 FIX-52).
+  # Logs unique ASNs / mapped / unmapped across the initial known-address pool.
+  # Reference: bitcoin-core/src/init.cpp — calls netgroupman.ASMapHealthCheck()
+  # after loading peers.dat.
+  state.peerManager.runAsmapHealthCheck()
+  state.lastAsmapHealthCheck = getTime().toUnix()
+
   # Main loop - keep running until shutdown
   while state.running:
     # Update peer manager with our height
@@ -2131,6 +2141,15 @@ proc startNode*(config: NimrodConfig) {.async.} =
         state.pruner.autoPruneIfNeeded()
       except CatchableError as e:
         warn "auto-prune failed; will retry next heartbeat", error = e.msg
+
+    # Periodic ASMapHealthCheck — every 3600 s.
+    # Reference: bitcoin-core/src/netgroup.cpp ASMapHealthCheck() is also
+    # called from addrman's periodic logic.  Here we mirror the 1-hour cadence
+    # described in the audit (W115 G16/G28).
+    let nowUnix = getTime().toUnix()
+    if nowUnix - state.lastAsmapHealthCheck >= 3600:
+      state.peerManager.runAsmapHealthCheck()
+      state.lastAsmapHealthCheck = nowUnix
 
     await sleepAsync(10000)  # 10 second heartbeat
 

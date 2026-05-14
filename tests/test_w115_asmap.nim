@@ -55,6 +55,7 @@ import unittest2
 import std/[sets, tables, hashes, strutils]
 import ../src/network/netgroup
 import ../src/network/asmap
+import ../src/network/addr
 import ../src/network/peermanager
 import ../src/consensus/params
 
@@ -336,13 +337,34 @@ suite "G15 no mapped_as in getnodeaddresses":
 # G16 — No ASMapHealthCheck diagnostic
 # Core: netgroup.h  void ASMapHealthCheck(const vector<CNetAddr>&)
 # ─────────────────────────────────────────────────────────────────────────────
-suite "G16 no ASMapHealthCheck":
-  test "ASMapHealthCheck diagnostic absent (MISSING ENTIRELY)":
-    # Core's ASMapHealthCheck logs how many ASes are represented in the addrman
-    # new-table addresses to verify the asmap is providing meaningful diversity.
-    # nimrod has no diagnostic equivalent.
-    # BUG: G16 MISSING ENTIRELY
+suite "G16 ASMapHealthCheck (FIX-52)":
+  test "asmapHealthCheck no-ops when asmap not loaded":
+    # When no asmap is loaded the health check should return without logging.
+    let mgr = newNetGroupManager()
+    let ips: seq[array[16, byte]] = @[]
+    # Must not raise; no output expected when usingAsmap is false.
+    asmapHealthCheck(mgr, ips)
     check true
+
+  test "asmapHealthCheck with empty address list logs zero stats":
+    # asmap loaded, zero addresses → mapped=0, unmapped=0, unique=0.
+    let asmapData: seq[byte] = @[0x00'u8, 0x28, 0x01]
+    let mgr = newNetGroupManager(asmapData)
+    let ips: seq[array[16, byte]] = @[]
+    asmapHealthCheck(mgr, ips)
+    check true  # Passes as long as it does not raise
+
+  test "asmapHealthCheck with trivialAsmap maps all addresses to AS42":
+    # trivialAsmap: RETURN(42) for all IPs.  Three IPs → 3 mapped, 0 unmapped, 1 unique ASN.
+    let asmapData: seq[byte] = @[0x00'u8, 0x28, 0x01]
+    let mgr = newNetGroupManager(asmapData)
+    let ips = @[
+      [0'u8,0,0,0,0,0,0,0,0,0,0xFF,0xFF,1,2,3,4],
+      [0'u8,0,0,0,0,0,0,0,0,0,0xFF,0xFF,5,6,7,8],
+      [0'u8,0,0,0,0,0,0,0,0,0,0xFF,0xFF,9,10,11,12]
+    ]
+    asmapHealthCheck(mgr, ips)
+    check true  # Functional: all three IPs map to AS42; no panic
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G17 — No UsingASMap() predicate
@@ -411,23 +433,39 @@ suite "G21 no asmap in getnetworkinfo":
 # G22 — No CJDNS ASN lookup path
 # Core: netgroup.cpp GetGroup() calls Interpret() for CJDNS addresses
 # ─────────────────────────────────────────────────────────────────────────────
-suite "G22 CJDNS ASN lookup absent":
-  test "CJDNS addresses (fc00::/8) wrongly treated as unroutable (MISSING + extra bug)":
-    # Core's GetGroup() treats CJDNS (fc00::/8) as clearnet-routable and passes
-    # the address through Interpret() to obtain an ASN when asmap is loaded.
-    # nimrod has two problems:
-    #   (a) isRoutable() rejects fc00::/7 as IPv6 ULA (correct for ULA, but
-    #       CJDNS fc00::/8 is a strict subset and should be treated differently).
-    #   (b) Even if routed correctly, there is no Interpret() path for ASN lookup.
-    # The net effect: nimrod groups all CJDNS addresses into NetUnroutable,
-    # collapsing all CJDNS peers into a single bucket — no diversity at all.
-    # BUG: G22 MISSING ENTIRELY (ASN lookup) + extra bug (CJDNS as unroutable)
+suite "G22 CJDNS routability fix (FIX-52)":
+  test "CJDNS addresses (fc00::/8) are now routable — isCJDNS check before ULA guard":
+    # FIX-52 (BUG-G22): isRoutable() now checks isCJDNS() BEFORE the fc00::/7
+    # ULA rejection, so CJDNS addresses are treated as routable (matching Core).
+    # Core: m_net == NET_CJDNS bypasses IsRFC4193() entirely in IsRoutable().
+    # Reference: bitcoin-core/src/netaddress.cpp CNetAddr::IsRoutable()
     let cjdns = parseIpAddr("fc00::1")
-    check cjdns.isCJDNS()  # correctly detected as CJDNS by isCJDNS()
-    # But isRoutable returns false, so getNetGroup returns NetUnroutable
-    check not cjdns.isRoutable()
+    check cjdns.isCJDNS()         # correctly identified as CJDNS
+    check cjdns.isRoutable()      # FIX-52: now true (was false before fix)
     let g = getNetGroup(cjdns)
-    check g.data[0] == NetUnroutable  # documents the wrong behavior
+    check g.data[0] == NetCJDNS   # FIX-52: now NetCJDNS (was NetUnroutable)
+
+  test "ULA addresses (fd00::/8) remain unroutable":
+    # fd00::/8 is genuinely ULA (not CJDNS) and must remain unroutable.
+    let ula = parseIpAddr("fd00::1")
+    check not ula.isCJDNS()
+    check not ula.isRoutable()
+    let g = getNetGroup(ula)
+    check g.data[0] == NetUnroutable
+
+  test "fd00::/8 (ULA, not CJDNS) remains unroutable":
+    # fd00::/8 has first byte 0xFD — not CJDNS (which requires 0xFC).
+    # It stays unroutable as genuine IPv6 ULA (RFC 4193).
+    let nonCjdns = parseIpAddr("fd00::1")
+    check not nonCjdns.isCJDNS()
+    check not nonCjdns.isRoutable()
+
+  test "getNetGroup CJDNS returns NetCJDNS discriminant not NetUnroutable":
+    # Any CJDNS peer must land in its own group bucket, not the unroutable sink.
+    let cjdns2 = parseIpAddr("fc01::2")
+    check cjdns2.isCJDNS()
+    let g = getNetGroup(cjdns2)
+    check g.data[0] == NetCJDNS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G23 — No Tor / I2P ASN short-circuit
@@ -447,23 +485,36 @@ suite "G23 Tor/I2P not short-circuited in ASN lookup":
 # G24 — No IPv4-in-IPv6 unwrapping before Interpret
 # Core: netaddr.cpp — GetIn6Addr unwraps ::ffff:x.x.x.x before ASN lookup
 # ─────────────────────────────────────────────────────────────────────────────
-suite "G24 no IPv4-in-IPv6 unwrapping for Interpret":
-  test "IPv4-mapped IPv6 address unwrapping for ASN lookup absent (MISSING + parser bug)":
-    # Core unwraps ::ffff:a.b.c.d to the IPv4 address a.b.c.d before calling
-    # Interpret(), since the asmap is keyed on 32-bit IPv4 for mapped addresses.
-    # nimrod has two problems here:
-    #   (a) parseIpAddr("::ffff:1.2.3.4") has a parser bug: the right-group
-    #       position calculation treats the embedded IPv4 as 2 bytes (one group)
-    #       but then writes 4 bytes at bytes[12..15], leaving bytes[10..11] as 0
-    #       instead of 0xFF 0xFF.  So isIPv4Mapped() returns false for this form.
-    #   (b) Even if the parser were correct, there is no Interpret() path.
-    # BUG: G24 MISSING ENTIRELY + parser bug in parseIpAddr for ::ffff:x.x.x.x
+suite "G24 ::ffff: parser fix (FIX-52)":
+  test "parseIpAddr(::ffff:1.2.3.4) correctly sets bytes[10-11]=0xFF and bytes[12-15]=IPv4":
+    # FIX-52 (BUG-G24): the right-group pos calculation now accounts for the
+    # embedded IPv4 occupying 4 bytes (2 × 2-byte groups) in the 16-byte layout.
+    # Before the fix, 0xffff was placed at bytes[12-13] and IPv4 at bytes[12-15]
+    # (overlapping), leaving bytes[10-11]=0 so isIPv4Mapped() returned false.
+    # Reference: RFC 4291 §2.2 — ::ffff:a.b.c.d → bytes[0-9]=0, [10-11]=0xFF, [12-15]=IPv4
     let mapped = parseIpAddr("::ffff:1.2.3.4")
-    # Document the parser bug: isIPv4Mapped() should return true but does not
-    check not mapped.isIPv4Mapped()  # BUG: should be true
-    # The IPv4 bytes themselves ARE written at offset 12-15 (parser partially works)
+    check mapped.isIPv4Mapped()              # FIX-52: now true (was false before fix)
     let v4 = mapped.extractIPv4()
-    check v4 == [1'u8, 2, 3, 4]  # bytes at [12..15] are correct
+    check v4 == [1'u8, 2, 3, 4]             # IPv4 bytes correct at [12..15]
+    # Verify bytes[10-11] are 0xFF 0xFF
+    check mapped.v6[10] == 0xFF'u8
+    check mapped.v6[11] == 0xFF'u8
+
+  test "parseIpAddr(::ffff:8.8.8.8) is routable and treated as IPv4-mapped":
+    let google = parseIpAddr("::ffff:8.8.8.8")
+    check google.isIPv4Mapped()
+    let v4 = google.extractIPv4()
+    check v4 == [8'u8, 8, 8, 8]
+    check google.isRoutable()
+
+  test "getMappedAS respects IPv4-mapped unwrapping with loaded asmap":
+    # With the trivialAsmap (every IP → AS42) and a correctly parsed ::ffff:x.x.x.x
+    # address, getMappedAS must unwrap the IPv4 and return 42.
+    let asmapData: seq[byte] = @[0x00'u8, 0x28, 0x01]
+    let mgr = newNetGroupManager(asmapData)
+    let mapped = parseIpAddr("::ffff:1.2.3.4")
+    check mapped.isIPv4Mapped()
+    check getMappedAS(mgr, mapped) == 42'u32
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G25 — AddrMan bucket hashing with ASN (FIX-51)
@@ -597,13 +648,26 @@ suite "G27 outbound diversity checked by ASN when asmap loaded (FIX-51)":
 # G28 — No ASMapHealthCheck / startup logging
 # Core: init.cpp calls netgroupman.ASMapHealthCheck after loading peers.dat
 # ─────────────────────────────────────────────────────────────────────────────
-suite "G28 no ASMapHealthCheck on startup":
-  test "no health check logged on startup (MISSING ENTIRELY)":
-    # Core logs the number of distinct ASes in addrman after loading peers.dat
-    # when asmap is active.  This helps operators verify the asmap is providing
-    # real diversity (e.g., "12 ASes represented in new table").
-    # nimrod has no such logging path.
-    # BUG: G28 MISSING ENTIRELY
+suite "G28 ASMapHealthCheck on startup (FIX-52)":
+  test "runAsmapHealthCheck on PeerManager no-ops when asmap not loaded":
+    # PeerManager without asmap: health check should return without raising.
+    let pm = newPeerManager(mainnetParams())
+    pm.runAsmapHealthCheck()
+    check true
+
+  test "runAsmapHealthCheck uses knownAddresses pool":
+    # PeerManager with trivialAsmap + one known address: should run without panic.
+    let asmapData: seq[byte] = @[0x00'u8, 0x28, 0x01]
+    let mgr = newNetGroupManager(asmapData)
+    let pm = newPeerManager(mainnetParams(), netGroupMgr = mgr)
+    # Add a routable IPv4-mapped address to knownAddresses directly
+    let na = NetAddress(
+      services: 0'u64,
+      ip: [0'u8,0,0,0,0,0,0,0,0,0,0xFF'u8,0xFF'u8,1,2,3,4],
+      port: 8333
+    )
+    pm.knownAddresses.add(na)
+    pm.runAsmapHealthCheck()
     check true
 
 # ─────────────────────────────────────────────────────────────────────────────

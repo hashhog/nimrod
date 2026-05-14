@@ -1076,6 +1076,18 @@ proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage) =
   else:
     discard
 
+proc runAsmapHealthCheck*(pm: PeerManager) =
+  ## Run the ASMap health-check diagnostic against the known-address pool.
+  ## Logs unique ASNs, mapped count, and unmapped count.
+  ## Reference: bitcoin-core/src/netgroup.cpp NetGroupManager::ASMapHealthCheck()
+  ## Call once at startup and then every ~3600 s from the main loop.
+  if not pm.netGroupManager.usingAsmap:
+    return
+  var ips: seq[array[16, byte]]
+  for na in pm.knownAddresses:
+    ips.add(na.ip)
+  asmapHealthCheck(pm.netGroupManager, ips)
+
 proc setMessageCallback*(pm: PeerManager, callback: PeerCallback) =
   pm.onMessage = callback
 
