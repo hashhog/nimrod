@@ -10,7 +10,7 @@
 ##   - 4 instructions: RETURN=[0], JUMP=[1,0], MATCH=[1,1,0], DEFAULT=[1,1,1]
 ##   - Variable-length integers for ASNs, jump offsets, and match patterns
 
-import std/[os, strutils]
+import std/[os, strutils, tables]
 import chronicles
 import ../crypto/hashing
 
@@ -349,3 +349,37 @@ proc getAsmapVersionHex*(mgr: NetGroupManager): string =
   for b in mgr.version:
     s.add toHex(b.int, 2).toLowerAscii
   s
+
+# ---------------------------------------------------------------------------
+# ASMapHealthCheck
+# ---------------------------------------------------------------------------
+
+proc asmapHealthCheck*(mgr: NetGroupManager, addrs: openArray[array[16, byte]]) =
+  ## Log ASMap health statistics: total mapped, unique ASNs, unmapped count.
+  ## Matches Bitcoin Core NetGroupManager::ASMapHealthCheck().
+  ## Reference: bitcoin-core/src/netgroup.cpp:109
+  ##
+  ## Call periodically (every ~3600 s) and once at startup after loading peers.
+  ## Only logs meaningful output when asmap is loaded; silently no-ops otherwise.
+  if not mgr.usingAsmap:
+    return
+
+  var asnSet: Table[uint32, bool]
+  var unmappedCount = 0
+
+  for ip in addrs:
+    let asn = interpret(mgr.asmapData, ip)
+    if asn == 0:
+      inc unmappedCount
+    else:
+      asnSet[asn] = true
+
+  let totalCount = addrs.len
+  let mappedCount = totalCount - unmappedCount
+  let uniqueCount = asnSet.len
+
+  info "ASMap health check",
+       total    = totalCount,
+       mapped   = mappedCount,
+       unmapped = unmappedCount,
+       uniqueAsns = uniqueCount

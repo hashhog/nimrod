@@ -113,21 +113,38 @@ proc parseIpAddr*(s: string): IpAddr =
           bytes[pos + 1] = byte(val and 0xFF)
           pos += 2
 
-      # Fill right side from end
-      pos = 16 - rightGroups.len * 2
+      # BUG-G24 FIX: compute the right-side start position correctly.
+      # An embedded IPv4 group (contains '.') occupies 4 bytes = 2 groups
+      # in the 16-byte IPv6 layout, but counts as only 1 element in
+      # rightGroups.  Without accounting for this, the position calculation
+      # `16 - rightGroups.len * 2` underestimates the true byte footprint,
+      # placing 0xffff at bytes[12-13] instead of bytes[10-11].
+      # Fix: count each IPv4-containing element as 2 groups (4 bytes).
+      # Reference: RFC 4291 §2.2, ::ffff:a.b.c.d → bytes[10-11]=0xFF, [12-15]=IPv4
+      var effectiveGroupCount = 0
+      for group in rightGroups:
+        if group.contains('.'):
+          effectiveGroupCount += 2  # IPv4 counts as 2 × 2-byte groups
+        else:
+          effectiveGroupCount += 1
+      pos = 16 - effectiveGroupCount * 2
+
       for group in rightGroups:
         if group.len > 0:
-          # Check for embedded IPv4 (::ffff:192.168.1.1)
+          # Check for embedded IPv4 (e.g. ::ffff:192.168.1.1)
           if group.contains('.'):
             let v4Parts = group.split('.')
             if v4Parts.len == 4:
               for i, part in v4Parts:
-                bytes[12 + i] = byte(parseInt(part))
+                bytes[pos + i] = byte(parseInt(part))
+            pos += 4  # advance by 4 bytes for the embedded IPv4
           else:
             let val = parseHexInt(group)
             bytes[pos] = byte((val shr 8) and 0xFF)
             bytes[pos + 1] = byte(val and 0xFF)
-        pos += 2
+            pos += 2
+        else:
+          pos += 2
 
       return IpAddr(isV6: true, v6: bytes)
   except ValueError, CatchableError:
@@ -209,13 +226,38 @@ proc isRFC5737*(v4: array[4, byte]): bool {.inline.} =
   (v4[0] == 198 and v4[1] == 51 and v4[2] == 100) or
   (v4[0] == 203 and v4[1] == 0 and v4[2] == 113)
 
+proc isTor*(ip: IpAddr): bool =
+  ## Check if this might be a Tor-encoded address
+  ## Bitcoin Core uses special .onion encoding
+  false  # Not implemented - would need onion address support
+
+proc isI2P*(ip: IpAddr): bool =
+  ## Check if this might be an I2P address
+  false  # Not implemented
+
+proc isCJDNS*(ip: IpAddr): bool =
+  ## Check if this is a CJDNS address (fc00::/8)
+  if ip.isV6:
+    return ip.v6[0] == 0xFC
+  false
+
 proc isRoutable*(ip: IpAddr): bool =
   ## Check if this IP is publicly routable on the global internet.
   ## Reference: Bitcoin Core CNetAddr::IsRoutable()
   ## Rejects: RFC1918, RFC2544, RFC3927, RFC6598, RFC5737, loopback,
   ##          RFC4862 (IPv6 link-local), RFC4193 (IPv6 ULA), plus
   ##          unspecified (0.0.0.0 / ::).
+  ##
+  ## BUG-G22 FIX: CJDNS (fc00::/8) must be checked BEFORE the ULA
+  ## (fc00::/7) rejection.  fc00::/8 is a strict subset of fc00::/7 so
+  ## without this early return the ULA guard would reject all CJDNS
+  ## addresses, collapsing every CJDNS peer into NetUnroutable.
+  ## Reference: bitcoin-core/src/netaddress.cpp CNetAddr::IsRoutable()
+  ## — Core treats NET_CJDNS as routable by keeping it out of the
+  ## !IsRFC4193() rejection path via the m_net dispatch.
   if ip.isV6:
+    # CJDNS (fc00::/8) is routable — check BEFORE the ULA (fc00::/7) guard.
+    if ip.isCJDNS(): return true
     if ip.isIPv4Mapped():
       let v4 = ip.extractIPv4()
       if ip.isLocal(): return false             # 127.x.x.x / 0.0.0.0
@@ -229,7 +271,7 @@ proc isRoutable*(ip: IpAddr): bool =
     if ip.isLocal(): return false               # ::1
     # IPv6 link-local (fe80::/10) — RFC 4862
     if ip.v6[0] == 0xFE and (ip.v6[1] and 0xC0'u8) == 0x80'u8: return false
-    # IPv6 ULA (fc00::/7) — RFC 4193
+    # IPv6 ULA (fc00::/7) — RFC 4193 (fd00::/8 and remaining fc00::/7 that is NOT CJDNS)
     if (ip.v6[0] and 0xFE'u8) == 0xFC'u8: return false
     # Unspecified ::
     var allZero = true
@@ -283,21 +325,6 @@ proc isRoutable*(ip: array[16, byte]): bool =
     # IPv6 ULA fc00::/7
     if (ip[0] and 0xFE'u8) == 0xFC'u8: return false
     return true
-
-proc isTor*(ip: IpAddr): bool =
-  ## Check if this might be a Tor-encoded address
-  ## Bitcoin Core uses special .onion encoding
-  false  # Not implemented - would need onion address support
-
-proc isI2P*(ip: IpAddr): bool =
-  ## Check if this might be an I2P address
-  false  # Not implemented
-
-proc isCJDNS*(ip: IpAddr): bool =
-  ## Check if this is a CJDNS address (fc00::/8)
-  if ip.isV6:
-    return ip.v6[0] == 0xFC
-  false
 
 proc getNetGroup*(ip: IpAddr): NetGroup =
   ## Get the network group for this IP address
