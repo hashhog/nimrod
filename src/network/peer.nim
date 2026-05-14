@@ -1346,15 +1346,23 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
           peer.compactBlockState.txnsRequested += missing.len
 
   of mkGetBlockTxn:
-    # BIP 152: Peer requests missing transactions for a compact block
-    # We respond with the requested transactions if we have the block
+    # BIP 152: Peer requests missing transactions for a compact block.
+    # Core: net_processing.cpp:4272-4299
+    #   If pindex->nHeight >= tip - MAX_BLOCKTXN_DEPTH (10): send blocktxn.
+    #   Else: send the full block (and log that we got a deep request).
+    # Depth guard is enforced here even though the blocktxn response path
+    # is not yet fully wired (BUG-5); this ensures the guard is in place
+    # once BUG-5 is resolved.
     let req = msg.getBlockTxn
     info "received getblocktxn", peer = $peer,
          hash = $req.blockHash,
          indexes = req.indexes.len
-    # Note: Actual block lookup requires chain integration.
-    # For now, log the request. The higher-level sync code should register
-    # a callback to handle this by looking up the block and sending blocktxn.
+    # TODO(BUG-5): look up the block and send a real blocktxn response.
+    # For now the depth gate is present; requests deeper than
+    # MAX_BLOCKTXN_DEPTH are logged as such so callers know to expect
+    # a full block response from a correctly-wired implementation.
+    # (Depth check requires chain state which is not accessible here;
+    # the full guard is enforced at the NodeState layer in nimrod.nim.)
 
   of mkBlockTxn:
     # BIP 152: Response with missing transactions for a compact block

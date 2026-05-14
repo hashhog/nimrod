@@ -9,7 +9,7 @@ import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
 import ./storage/[db, chainstate, snapshot, blockstore, pruner, undo]
 import ./storage/indexes/[blockfilterindex, gcs]
-import ./network/[peer, peermanager, sync, messages]
+import ./network/[peer, peermanager, sync, messages, compact_blocks]
 import ./mempool/[mempool, persist, orphan]
 import ./mining/fees
 import ./rpc/server
@@ -807,6 +807,42 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
             debug "failed to serve block", peer = $peer, error = e.msg
         else:
           notFound.add(item)
+      elif item.invType == invCmpctBlock:
+        # getdata(MSG_CMPCTBLOCK): serve a compact block if the requested block
+        # is within MAX_CMPCTBLOCK_DEPTH (5) of the chain tip; otherwise fall
+        # back to serving the full block.
+        # Reference: Bitcoin Core net_processing.cpp:2466
+        #   if (can_direct_fetch && pindex->nHeight >= tip->nHeight - MAX_CMPCTBLOCK_DEPTH)
+        let blockOpt = state.chainState.db.getBlock(BlockHash(item.hash))
+        if blockOpt.isSome:
+          let blk = blockOpt.get()
+          let idxOpt = state.chainState.db.getBlockIndex(BlockHash(item.hash))
+          let tipHeight = state.chainState.bestHeight
+          let blockHeight = if idxOpt.isSome: idxOpt.get().height else: tipHeight
+          if cmpctBlockDepthOk(blockHeight, tipHeight):
+            # Within depth limit — send compact block
+            let nonce = urandom(8)
+            var nonceVal: uint64
+            for i in 0 ..< 8: nonceVal = nonceVal or (uint64(nonce[i]) shl (i * 8))
+            let cb = newCompactBlock(blk, nonceVal)
+            let cmpctMsg = newCmpctBlockMsg(cb)
+            try:
+              await peer.sendMessage(cmpctMsg)
+              servedBlocks.inc
+            except CatchableError as e:
+              debug "failed to serve cmpctblock", peer = $peer, error = e.msg
+          else:
+            # Too deep — fall back to full block
+            debug "cmpctblock depth exceeded, serving full block",
+                  peer = $peer, blockHeight = blockHeight, tipHeight = tipHeight
+            let blkMsg = newBlockMsg(blk)
+            try:
+              await peer.sendMessage(blkMsg)
+              servedBlocks.inc
+            except CatchableError as e:
+              debug "failed to serve block (cmpct fallback)", peer = $peer, error = e.msg
+        else:
+          notFound.add(item)
       elif item.invType == invTx or item.invType == invWitnessTx:
         let txid = TxId(item.hash)
         let entryOpt = if state.mempool != nil: state.mempool.get(txid)
@@ -821,7 +857,7 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
         else:
           notFound.add(item)
       else:
-        # Unknown / unsupported inv type (compact-block, filtered-block, ...)
+        # Unknown / unsupported inv type (filtered-block, etc.)
         notFound.add(item)
     if servedBlocks > 0 or servedTxs > 0:
       debug "served getdata", peer = $peer,

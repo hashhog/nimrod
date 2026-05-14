@@ -27,6 +27,19 @@ const
   ## giving 66_666 and leaving the guard too tight.
   MaxBlockTxns* = MaxBlockWeight div MinSerializableTransactionWeight  # = 100_000
 
+  ## Maximum depth (from the chain tip) at which we serve compact blocks
+  ## in response to getdata(invCmpctBlock).  Beyond this depth we fall back
+  ## to serving a full block instead.
+  ## Reference: Bitcoin Core net_processing.cpp:138
+  ##   static const int MAX_CMPCTBLOCK_DEPTH = 5;
+  MaxCmpctBlockDepth* = 5
+
+  ## Maximum depth at which we respond to a getblocktxn with a blocktxn
+  ## message.  Beyond this depth we send a full block instead.
+  ## Reference: Bitcoin Core net_processing.cpp:140
+  ##   static const int MAX_BLOCKTXN_DEPTH = 10;
+  MaxBlocktxnDepth* = 10
+
 type
   ## Status codes for compact block operations
   ReadStatus* = enum
@@ -633,6 +646,22 @@ proc shouldSendCompactBlock*(state: CompactBlockState): bool =
 proc supportsHighBandwidth*(state: CompactBlockState): bool =
   ## Check if peer wants high-bandwidth mode (immediate cmpctblock without inv)
   state.highBandwidthMode
+
+proc cmpctBlockDepthOk*(blockHeight: int32, tipHeight: int32): bool =
+  ## Return true iff blockHeight is within MaxCmpctBlockDepth of tipHeight,
+  ## i.e. we are allowed to serve a compact block for this block rather than
+  ## falling back to a full block.
+  ## Reference: Bitcoin Core net_processing.cpp:2466
+  ##   if (can_direct_fetch && pindex->nHeight >= tip->nHeight - MAX_CMPCTBLOCK_DEPTH)
+  blockHeight >= tipHeight - MaxCmpctBlockDepth
+
+proc blocktxnDepthOk*(blockHeight: int32, tipHeight: int32): bool =
+  ## Return true iff blockHeight is within MaxBlocktxnDepth of tipHeight,
+  ## i.e. we should respond to getblocktxn with a blocktxn message rather than
+  ## falling back to sending a full block.
+  ## Reference: Bitcoin Core net_processing.cpp:4276
+  ##   if (pindex->nHeight >= m_chainman.ActiveChain().Height() - MAX_BLOCKTXN_DEPTH)
+  blockHeight >= tipHeight - MaxBlocktxnDepth
 
 proc createBlockTxnRequest*(blockHash: BlockHash, missingIndexes: seq[uint16]): BlockTxnRequest =
   ## Create a getblocktxn request for missing transactions
