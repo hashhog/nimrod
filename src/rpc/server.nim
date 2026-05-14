@@ -12,7 +12,7 @@ import ../storage/[chainstate, blockstore, snapshot, pruner]
 import ../storage/indexes/blockfilterindex
 import ../mempool/[mempool, package, persist]
 import ../crypto/[hashing, secp256k1, address, signmessage]
-import ../network/[peer, peermanager, banman, messages]
+import ../network/[peer, peermanager, banman, messages, asmap, netgroup]
 import ../mining/[fees, blocktemplate]
 import ../wallet/wallet
 import ../wallet/descriptor
@@ -57,6 +57,9 @@ type
     filterIndex*: BlockFilterIndex       ## Optional BIP-157 basic block-filter index;
                                          ## populated alongside connectBlock in submitblock.
                                          ## Wired by startNode when --blockfilterindex is set.
+    netGroupManager*: NetGroupManager    ## Optional ASMap manager; nil / empty = /16 fallback.
+                                         ## Wired by startNode when --asmap is given.
+                                         ## Used by getpeerinfo to populate mapped_as.
 
   RpcRequest = object
     jsonrpc: string
@@ -3202,6 +3205,15 @@ proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
       else:
         0.0
 
+      # G14 (W115 FIX-50): compute mapped_as via ASMap when available.
+      # Core: net.cpp:3813  vstats.back().m_mapped_as = GetMappedAS(pnode->addr)
+      let mappedAs: uint32 =
+        if rpc.netGroupManager != nil and rpc.netGroupManager.usingAsmap:
+          let ip = parseIpAddr(peer.address)
+          getMappedAS(rpc.netGroupManager, ip)
+        else:
+          0'u32
+
       peers.add(%*{
         "id": id,
         "addr": peer.address & ":" & $peer.port,
@@ -3237,7 +3249,8 @@ proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
         "bytesrecv_per_msg": newJObject(),
         "connection_type": (if peer.direction == pdInbound: "inbound" else: "outbound-full-relay"),
         "transport_protocol_type": "v1",
-        "session_id": ""
+        "session_id": "",
+        "mapped_as": mappedAs
       })
       inc id
 

@@ -9,7 +9,7 @@ import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
 import ./storage/[db, chainstate, snapshot, blockstore, pruner, undo]
 import ./storage/indexes/[blockfilterindex, gcs]
-import ./network/[peer, peermanager, sync, messages, compact_blocks]
+import ./network/[peer, peermanager, sync, messages, compact_blocks, asmap, netgroup]
 import ./mempool/[mempool, persist, orphan]
 import ./mining/fees
 import ./rpc/server
@@ -85,6 +85,10 @@ type
                             ## return data; without it those endpoints
                             ## report "Index is not enabled for filtertype
                             ## basic" (HTTP 400) — same as Core.
+    asmapFile*: string      ## --asmap=<file>: ASMap binary file for ASN-keyed
+                            ## eclipse-resistance bucketing.  Empty = disabled
+                            ## (fallback to /16 / /32 groups).
+                            ## Reference: bitcoin-core/src/init.cpp -asmap arg.
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -135,6 +139,12 @@ type
                                           ## isolation from main-thread
                                           ## verifyScripts batches; see
                                           ## rpc_thread.nim).
+    netGroupManager*: NetGroupManager     ## ASMap-aware network group manager.
+                                          ## Loaded from config.asmapFile at
+                                          ## startup; nil-replaced with an empty
+                                          ## (non-asmap) manager when no file is
+                                          ## given.  Wired into peerManager and
+                                          ## the getpeerinfo RPC handler.
 
 # Global for signal handling
 var globalNodeState*: NodeState = nil
@@ -166,7 +176,8 @@ proc defaultConfig*(): NimrodConfig =
     loadSnapshot: "",
     restEnabled: false,
     restPort: 0,            # 0 = derive from rpcPort (rpcPort + 1000)
-    blockfilterindex: false
+    blockfilterindex: false,
+    asmapFile: ""           # empty = ASMap disabled
   )
 
 proc loadConfigFile*(config: var NimrodConfig) =
@@ -268,6 +279,8 @@ proc loadConfigFile*(config: var NimrodConfig) =
         config.blockfilterindex = true
       elif v in ["0", "false", "no"]:
         config.blockfilterindex = false
+    of "asmap":
+      config.asmapFile = value
     else:
       discard
 
@@ -332,6 +345,11 @@ Operational:
                          for the /rest/blockfilter[headers] endpoints to
                          return data. Mirrors Bitcoin Core
                          -blockfilterindex=basic.
+  --asmap=FILE           Load an ASMap binary file for ASN-keyed eclipse-
+                         resistance bucketing.  When loaded, outbound peer
+                         diversity is measured by Autonomous System Number
+                         rather than /16 prefix.  Mirrors Bitcoin Core
+                         -asmap=<file>.  W115 FIX-50.
 
   -h, --help             Show this help
   -v, --version          Show version
@@ -518,6 +536,8 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           echo "Invalid --blockfilterindex value: " & p.val &
                " (use 1 / 0 / basic)"
           quit(1)
+      of "asmap":
+        result.config.asmapFile = p.val
       of "help", "h":
         showHelp()
         quit(0)
@@ -1856,6 +1876,20 @@ proc startNode*(config: NimrodConfig) {.async.} =
 
   # 5. Initialize peer manager
   info "initializing peer manager"
+  # 5a. Load ASMap (W115 FIX-50): if --asmap=<file> was given, load the
+  # binary trie and validate it.  On any failure loadAsmap returns an empty
+  # seq and we fall back to /16 / /32 bucketing silently (Core behaviour).
+  if config.asmapFile.len > 0:
+    let asmapData = loadAsmap(config.asmapFile)
+    state.netGroupManager = newNetGroupManager(asmapData)
+    if state.netGroupManager.usingAsmap:
+      info "ASMap loaded", file = config.asmapFile,
+           version = state.netGroupManager.getAsmapVersionHex()
+    else:
+      warn "ASMap load failed, using /16 bucketing", file = config.asmapFile
+  else:
+    state.netGroupManager = newNetGroupManager()  # no asmap
+
   state.peerManager = newPeerManager(params, maxOut = config.maxConnections div 16, maxIn = config.maxConnections - config.maxConnections div 16, dataDir = networkDir)
   state.peerManager.updateHeight(state.chainState.bestHeight)
   state.peerManager.setMessageCallback(messageCallback(state))
@@ -2011,6 +2045,10 @@ proc startNode*(config: NimrodConfig) {.async.} =
     # Wire the BIP-157 filter index so submitblock populates it alongside
     # the live P2P sync path.  nil when --blockfilterindex is OFF.
     state.rpcServer.filterIndex = state.blockFilterIndex
+    # Wire the ASMap manager so getpeerinfo can populate mapped_as.
+    # W115 FIX-50: netGroupManager is always non-nil after step 5a above;
+    # usingAsmap() returns false when no file was given / load failed.
+    state.rpcServer.netGroupManager = state.netGroupManager
     # Run RPC on a dedicated OS thread with its own chronos event loop so that
     # CPU-heavy block validation on the main thread does not block RPC accept
     # or response. See src/rpc/rpc_thread.nim for rationale and known v1 caveats.
