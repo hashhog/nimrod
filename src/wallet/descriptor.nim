@@ -632,14 +632,18 @@ proc expandNode*(node: DescriptorNode, pos: int = 0): ExpandedDescriptor =
     result.addresses.add(Address(kind: P2WSH, wsh: scriptHash))
 
   of DKTr:
-    let xonly = node.internalKey.getXonlyPubKey(pos)
-    # For now, simple key-path only (no script tree)
-    # tr(KEY) = OP_1 <32 bytes>
-    # TODO: Implement taproot tree building with merkle root tweak
+    let internalXonly = node.internalKey.getXonlyPubKey(pos)
+    # BIP-341 §4.2: output_key = internal_key + int(hashTapTweak(P || m))*G
+    # For key-path-only (no script tree) the merkle root m is empty, so the
+    # tweak input is just the 32-byte x-only internal pubkey.
+    # Reference: bitcoin-core/src/pubkey.cpp XOnlyPubKey::ComputeTaprootCommitment
+    let tweak = walletTaggedHash("TapTweak", internalXonly)
+    let (outputKey, parity) = tweakXonlyPubkey(internalXonly, tweak)
+    discard parity  # parity used by signers (BIP-341 §4.3), not needed for scriptPubKey
     var script = @[0x51'u8, 0x20]
-    script.add(@xonly)
+    script.add(@outputKey)
     result.scripts.add(script)
-    result.addresses.add(Address(kind: P2TR, taprootKey: xonly))
+    result.addresses.add(Address(kind: P2TR, taprootKey: outputKey))
 
   of DKRawTr:
     let xonly = node.key.getXonlyPubKey(pos)
@@ -953,16 +957,20 @@ proc parseDescriptorNode(s: string, pos: var int, ctx: ParseContext): Descriptor
     # Check for script tree
     if pos < s.len and s[pos] == ',':
       inc pos
-      # TODO: Parse taproot script tree
-      # For now, skip to closing paren
+      # TODO: Parse taproot script tree (BUG-5: tree arg silently discarded)
+      # Skip the script-tree arg, balancing parentheses to find the closing ')'.
+      # FIX-38 (BUG-6): always inc pos — including when incrementing depth on
+      # '(' and when the final ')' closes the tr() itself (depth → 0).
+      # Without the latter inc the closing tr ')' was left un-consumed and
+      # parseDescriptor raised "unexpected characters after descriptor".
       var depth = 1
       while pos < s.len and depth > 0:
         if s[pos] == '(':
           inc depth
+          inc pos
         elif s[pos] == ')':
           dec depth
-          if depth > 0:
-            inc pos
+          inc pos  # always consume, even the final tr() closing ')'
         else:
           inc pos
     else:
