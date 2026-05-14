@@ -121,19 +121,17 @@ suite "G3 MaxBlockTxns constant":
 #         getblocktxn responds for blocks beyond depth 10 (G18).
 # ============================================================================
 suite "G4/G5 depth constants (BUG-1)":
-  test "BUG-1 MAX_CMPCTBLOCK_DEPTH constant missing - depth limit not enforced":
+  test "MAX_CMPCTBLOCK_DEPTH equals 5 (Core net_processing.cpp:138)":
     # Core: static const int MAX_CMPCTBLOCK_DEPTH = 5
-    # nimrod: no equivalent constant defined anywhere in src/
-    # When serving a getdata(MSG_CMPCTBLOCK) for a block at height < tip - 5,
-    # Core sends the full block instead of a compact block.
-    # nimrod has no such constant and thus no such gate.
-    skip()  # marker: constant absent, behavior is undefined
+    # When serving getdata(MSG_CMPCTBLOCK), only respond with a compact block
+    # if block height >= tip - 5; otherwise fall back to full block.
+    check MaxCmpctBlockDepth == 5
 
-  test "BUG-1 MAX_BLOCKTXN_DEPTH constant missing - getblocktxn serves any depth":
+  test "MAX_BLOCKTXN_DEPTH equals 10 (Core net_processing.cpp:140)":
     # Core: static const int MAX_BLOCKTXN_DEPTH = 10
-    # When getblocktxn requests a block at height < tip - 10, Core falls back to
-    # sending the full block. nimrod has no constant and no depth guard.
-    skip()  # marker: constant absent, behavior is undefined
+    # When serving getblocktxn, only respond with blocktxn if
+    # block height >= tip - 10; otherwise serve the full block.
+    check MaxBlocktxnDepth == 10
 
 # ============================================================================
 # G6: sendcmpct sent after handshake with version=2
@@ -726,10 +724,29 @@ suite "G24 reconstructBlock":
 #         underlying issue is that the cmpctblock serving path is absent.
 # ============================================================================
 suite "G25 MAX_CMPCTBLOCK_DEPTH serving guard (BUG-7)":
-  test "BUG-7 no depth guard for getdata(invCmpctBlock) responses":
-    # Core: only respond with cmpctblock if pindex->nHeight >= tip - MAX_CMPCTBLOCK_DEPTH (5)
-    # nimrod: no cmpctblock serving path at all in response to getdata
-    skip()  # marker: serving path absent, depth guard absent
+  test "cmpctBlockDepthOk: block at tip allowed":
+    # Block exactly at tip — always within depth
+    check cmpctBlockDepthOk(100'i32, 100'i32)
+
+  test "cmpctBlockDepthOk: block 5 below tip allowed (boundary)":
+    # tip=100, block=95: 95 >= 100 - 5 → allowed
+    check cmpctBlockDepthOk(95'i32, 100'i32)
+
+  test "cmpctBlockDepthOk: block 6 below tip rejected":
+    # tip=100, block=94: 94 < 100 - 5 → fall back to full block
+    check not cmpctBlockDepthOk(94'i32, 100'i32)
+
+  test "cmpctBlockDepthOk: block deep in chain rejected":
+    # tip=800000, block=100: well beyond depth 5
+    check not cmpctBlockDepthOk(100'i32, 800_000'i32)
+
+  test "blocktxnDepthOk: block 10 below tip allowed (boundary)":
+    # tip=100, block=90: 90 >= 100 - 10 → allowed
+    check blocktxnDepthOk(90'i32, 100'i32)
+
+  test "blocktxnDepthOk: block 11 below tip rejected":
+    # tip=100, block=89: 89 < 100 - 10 → serve full block instead
+    check not blocktxnDepthOk(89'i32, 100'i32)
 
 # ============================================================================
 # G26: No compact blocks during IBD/blocksonly
