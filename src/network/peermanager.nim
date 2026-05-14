@@ -89,6 +89,11 @@ type
     # Eclipse protection state
     outboundNetGroups*: HashSet[NetGroup]  # Network groups of current outbound peers
     netgroupKey*: uint64
+    # ASN-aware eclipse protection (FIX-51 / W115 G25+G27)
+    # When an asmap file is loaded this manager yields ASN-keyed groups instead
+    # of /16 or /32 prefixes, mirroring Bitcoin Core's CConnman::m_netgroupman.
+    # Reference: bitcoin-core/src/net.h CConnman::m_netgroupman
+    netGroupManager*: NetGroupManager
     # Stale tip detection state (Bitcoin Core net_processing.cpp)
     lastTipUpdate*: chronos.Moment          # When we last received a new block
     staleTipCheckTime*: chronos.Moment      # When we next check for stale tip
@@ -139,7 +144,8 @@ proc newPeerManager*(params: ConsensusParams,
                      maxOutFullRelay: int = DefaultMaxOutboundFullRelay,
                      maxOutBlockRelay: int = DefaultMaxOutboundBlockRelay,
                      maxIn: int = DefaultMaxInbound,
-                     dataDir: string = "."): PeerManager =
+                     dataDir: string = ".",
+                     netGroupMgr: NetGroupManager = nil): PeerManager =
   randomize()
   let now = chronos.Moment.now()
   result = PeerManager(
@@ -161,6 +167,9 @@ proc newPeerManager*(params: ConsensusParams,
     dataDir: dataDir,
     outboundNetGroups: initHashSet[NetGroup](),
     netgroupKey: NetgroupKey,
+    # Use provided NetGroupManager or a no-asmap fallback.
+    # Reference: bitcoin-core/src/net.cpp CConnman constructor passes m_netgroupman
+    netGroupManager: if netGroupMgr != nil: netGroupMgr else: newNetGroupManager(),
     # Stale tip detection
     lastTipUpdate: now,
     staleTipCheckTime: now + chronos.minutes(StaleTipCheckIntervalSec div 60),
@@ -332,13 +341,19 @@ proc clearBanned*(pm: PeerManager) =
   pm.banManager.clearBanned()
 
 proc getNetGroupForAddress*(pm: PeerManager, address: string): NetGroup =
-  ## Get network group for an address
-  getNetGroup(address)
+  ## Get network group for an address, using ASN-keyed groups when an asmap
+  ## is loaded in pm.netGroupManager.
+  ## Reference: bitcoin-core/src/net.cpp CConnman::GetGroup() — delegates to
+  ##   m_netgroupman.GetGroup(addr) which is ASN-keyed when asmap present.
+  let ip = parseIpAddr(address)
+  getNetGroupAsn(pm.netGroupManager, ip)
 
 proc hasNetGroupCollision*(pm: PeerManager, address: string): bool =
   ## Check if connecting to this address would cause a netgroup collision
-  ## with existing outbound peers (eclipse protection)
-  let ng = getNetGroup(address)
+  ## with existing outbound peers (eclipse protection).
+  ## Uses ASN-keyed groups when asmap is loaded (G25/G27 FIX-51).
+  ## Reference: bitcoin-core/src/net.cpp CConnman::FindNode + ThreadOpenConnections
+  let ng = pm.getNetGroupForAddress(address)
   ng in pm.outboundNetGroups
 
 proc resolveDnsSeeds*(pm: PeerManager): Future[seq[string]] {.async.} =
@@ -374,9 +389,12 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
   if key in pm.peers:
     return false
 
-  # Check netgroup diversity for outbound connections
+  # Check netgroup diversity for outbound connections.
+  # FIX-51 (W115 G27): use ASN-keyed group via pm.netGroupManager when asmap
+  # is loaded, mirroring Core's CConnman::ThreadOpenConnections which calls
+  # m_netgroupman.GetGroup(addr) for the collision check.
   if connType in {pctFullRelay, pctBlockRelayOnly}:
-    let ng = getNetGroup(address)
+    let ng = pm.getNetGroupForAddress(address)
     if ng in pm.outboundNetGroups:
       debug "skipping peer due to netgroup collision", address = address, netgroup = $ng
       return false
@@ -409,9 +427,12 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
     try:
       await peer.performHandshake(pm.ourHeight)
 
-      # Create extended peer info
+      # Create extended peer info.
+      # FIX-51 (W115 G25): store the ASN-keyed group so outboundNetGroups
+      # uses ASN granularity when asmap is loaded.
+      # Reference: bitcoin-core/src/net.cpp CConnman::CreateNodeFromAcceptedSocket
       let ip = parseIpAddr(address)
-      let ng = getNetGroup(ip)
+      let ng = getNetGroupAsn(pm.netGroupManager, ip)
       let ext = ExtendedPeer(
         peer: peer,
         connType: connType,
@@ -654,9 +675,11 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
   try:
     await peer.performHandshake(pm.ourHeight)
 
-    # Create extended peer info
+    # Create extended peer info.
+    # FIX-51: use ASN-keyed group for inbound peers too so eviction's
+    # keyedNetGroup reflects the same grouping as the outbound diversity check.
     let ip = parseIpAddr(address)
-    let ng = getNetGroup(ip)
+    let ng = getNetGroupAsn(pm.netGroupManager, ip)
     let ext = ExtendedPeer(
       peer: peer,
       connType: pctInbound,
