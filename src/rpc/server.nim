@@ -3024,6 +3024,15 @@ proc handleSubmitPackage(rpc: RpcServer, params: JsonNode): JsonNode =
     except CatchableError as e:
       raise newRpcError(RpcInvalidParams, "TX " & $i & " decode failed: " & e.msg)
 
+  # Enforce child-with-parents-tree topology before submitting.
+  # Reference: Bitcoin Core rpc/mempool.cpp:1395
+  #   if (txns.size() > 1 && !IsChildWithParentsTree(txns))
+  #     throw JSONRPCTransactionError(TransactionError::INVALID_PACKAGE,
+  #       "package topology disallowed. not child-with-parents or parents depend on each other.")
+  if txns.len > 1 and not isChildWithParentsTree(txns):
+    raise newRpcError(RpcTransactionRejected,
+      "package topology disallowed. not child-with-parents or parents depend on each other.")
+
   # Validate and submit package
   var mp = rpc.mempool
   let pkgResult = mp.acceptPackage(txns, rpc.crypto, usePackageFeerates = true)
