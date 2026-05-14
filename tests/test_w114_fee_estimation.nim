@@ -25,6 +25,7 @@
 ## BUG-19 (MEDIUM):         Decay applied before recording → rate > 1.0 possible
 ##                          (processBlock decays totalSeen THEN records confirmed[i]+1,
 ##                           so confirmed/totalSeen can exceed 1.0 on the same block)
+##                          FIXED: FIX-49 — record confirmations first, then applyDecay
 
 import unittest2
 import std/[math, json, os, tempfiles, strutils]
@@ -685,9 +686,8 @@ suite "G25 confirmation rate denominator":
     if stats.totalSeen >= 1.0:
       let rate = fe.getConfirmationRate(idx, 6)
       check rate > 0.0
-      # BUG-19: rate can exceed 1.0 — decay applied before recording
-      # totalSeen is decayed first (smaller denominator), then confirmed[i] is
-      # incremented (+1 on undecayed numerator) → confirmed/totalSeen > 1.0
+      # FIX-49: decay applied after recording (Core order) → rate ≤ 1.0
+      check rate <= 1.0
     else:
       skip()  # totalSeen < 1 after decay — documents MinDataPoints fragility
 
@@ -698,25 +698,33 @@ suite "G25 confirmation rate denominator":
 #         confirmed[i] is incremented → rate = confirmed / totalSeen > 1.0
 # ─────────────────────────────────────────────────────────────────────────────
 suite "G25b decay-before-record rate overflow":
-  test "confirmation rate can exceed 1.0 due to decay applied before recording [BUG-19]":
+  test "confirmation rate never exceeds 1.0 — record before decay (FIX-49 BUG-19)":
+    # FIX-49: processBlock now records confirmed txs BEFORE calling applyDecay.
+    # Core order: Record current-block confirmations first, then UpdateMovingAverages.
+    # With 20 txs tracked and all confirmed in the same block:
+    #   confirmed[0] = 20.0 (recorded before decay)
+    #   totalSeen    = 20.0 * MED_DECAY ≈ 19.904 (decayed after recording)
+    # Prior buggy order gave confirmed[0]/totalSeen ≈ 20/19.904 ≈ 1.005 (> 1.0).
+    # Correct order: totalSeen is still 20.0 when recording, decayed afterwards,
+    # so rate = 20.0 / 19.904 — but because getConfirmationRate reads the final
+    # (post-decay) totalSeen as denominator, rate = confirmed[0] / totalSeen_decayed.
+    # The key invariant is: confirmed[i] is also decayed by the same factor in the
+    # same applyDecay call → confirmed[0] = 20.0 * MED_DECAY, totalSeen = 20 * MED_DECAY
+    # → rate = (20 * MED_DECAY) / (20 * MED_DECAY) = 1.0 exactly (for all-confirmed case).
     let fe = newFeeEstimator()
-    # Track 20 txs at same height
     for i in 0..<20:
       fe.trackTransaction(makeTxId(i), 10.0, 100)
-    # Confirm all in same block (processBlock decays totalSeen first, then records)
     var confirmed: seq[TxId]
     for i in 0..<20:
       confirmed.add(makeTxId(i))
-    fe.processBlock(101, confirmed)  # blocksToConfirm=1, MED scale=2: period=(1-1)/2=0 → slot[0]
+    fe.processBlock(101, confirmed)  # blocksToConfirm=1, MED scale=2: period=(1-1)/2=0
     let idx = getBucketIndex(10.0)
     let stats = fe.getBucketStats(idx)
     if stats.totalSeen > 0:
-      # confirmed[0] = 20.0 (undecayed) but totalSeen = 20 * MED_DECAY ≈ 19.904
-      # getConfirmationRate(idx, 2) with MED scale=2: maxPeriod=1, sums [0]=20, rate≈1.005
       let rate = fe.getConfirmationRate(idx, 2)
-      # Rate should be ≤ 1.0 in a correct implementation
-      # In nimrod it exceeds 1.0 because totalSeen was decayed before confirmed[0]++
-      check rate > 1.0  # documents BUG-19: > 1.0 is wrong
+      # After FIX-49: decay applied after recording, so both confirmed[0] and
+      # totalSeen are scaled by MED_DECAY — rate must be ≤ 1.0
+      check rate <= 1.0  # FIX-49: rate must not exceed 1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gate G26 — clear() resets estimator state
