@@ -149,9 +149,9 @@ proc trackTransaction*(fe: FeeEstimator, txid: TxId, feeRate: float64, height: i
 proc processBlock*(fe: FeeEstimator, height: int32, confirmedTxids: seq[TxId]) =
   ## Process a confirmed block, updating confirmation statistics
   ## Called when a new block is connected
-
-  # Apply decay first (once per block, to all horizons)
-  fe.applyDecay()
+  ## Core order: record confirmed txs FIRST, then apply decay (UpdateMovingAverages).
+  ## Decay-before-record shrinks totalSeen before confirmed[i] is incremented,
+  ## which allows getConfirmationRate to return > 1.0 (BUG-19, FIX-49).
 
   for txid in confirmedTxids:
     if txid notin fe.trackedTxs:
@@ -176,6 +176,9 @@ proc processBlock*(fe: FeeEstimator, height: int32, confirmedTxids: seq[TxId]) =
 
     # Remove from tracking
     fe.trackedTxs.del(txid)
+
+  # Apply decay AFTER recording (Core: UpdateMovingAverages called after Record)
+  fe.applyDecay()
 
   # Keep legacy bucketStats in sync with medHorizon
   fe.bucketStats = fe.medHorizon.buckets
