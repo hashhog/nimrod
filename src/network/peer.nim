@@ -1267,18 +1267,19 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     trace "peer prefers headers", peer = $peer
 
   of mkSendCmpct:
-    # BIP 152: Handle sendcmpct negotiation
+    # BIP 152: Handle sendcmpct negotiation.
+    # Core net_processing.cpp:3907 — drop entirely if version != 2, no state update.
     let version = msg.sendCmpct.version
     let announce = msg.sendCmpct.announce
-    if version >= 1 and version <= 2:
+    if version != 2:
+      trace "peer sent unsupported compact block version, ignoring", peer = $peer,
+            version = version
+    else:
       peer.peerCmpctVersion = version
       peer.peerHighBandwidth = announce
       peer.compactBlockState.handleSendCmpct(announce, version)
       info "peer supports compact blocks", peer = $peer,
            version = version, highBandwidth = announce
-    else:
-      trace "peer sent unsupported compact block version", peer = $peer,
-            version = version
 
   of mkFeeFilter:
     peer.feeFilterRate = msg.feeRate

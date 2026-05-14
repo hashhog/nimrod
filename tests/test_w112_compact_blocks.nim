@@ -5,8 +5,8 @@
 ## Bugs found (see each gate for details):
 ##
 ##  BUG-1  (G4/G5)  MAX_CMPCTBLOCK_DEPTH=5 and MAX_BLOCKTXN_DEPTH=10 constants absent
-##  BUG-2  (G8)     peer.nim sendcmpct handler accepts version 1 (sets peerCmpctVersion=1)
-##                  but handleSendCmpct silently ignores v1 → inconsistent peer state
+##  BUG-2  (G8)     FIXED (FIX-43): peer.nim sendcmpct handler now gates on version==2;
+##                  any version!=2 is discarded with no state update (matches Core)
 ##  BUG-3  (G9/G29/G30) HB peer list (lNodesAnnouncingHeaderAndIDs) + 3-peer cap MISSING ENTIRELY
 ##  BUG-4  (G11)    cmpctblock header not validated (no prev_block check, no PoW check,
 ##                  no ProcessNewBlockHeaders call) before InitData
@@ -167,10 +167,9 @@ suite "G7 sendcmpct announce default false":
 # ============================================================================
 # G8: sendcmpct version filter — only version=2 accepted
 # Core: net_processing.cpp:3907 — if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;
-# BUG-2 (MINOR): peer.nim mkSendCmpct handler accepts version range 1-2 and sets
-#   peerCmpctVersion=1 even for v1, but handleSendCmpct ignores v1.
-#   Result: wantsCompactBlocks=false for v1 (correct) but peerCmpctVersion=1 (inconsistent).
-#   Core simply ignores any version != 2 without updating any state.
+# BUG-2 FIXED (FIX-43): peer.nim mkSendCmpct handler now gates on version == 2 only.
+#   Any version != 2 is discarded before any state update (no peerCmpctVersion set,
+#   no handleSendCmpct call), matching Core exactly.
 # ============================================================================
 suite "G8 sendcmpct version filter":
   test "version 2 accepted — wantsCompactBlocks becomes true":
@@ -195,16 +194,16 @@ suite "G8 sendcmpct version filter":
     state.handleSendCmpct(announce = true, version = 3)
     check not state.wantsCompactBlocks
 
-  test "BUG-2 peer.nim accepts v1 range setting peerCmpctVersion (inconsistent with handleSendCmpct)":
-    # peer.nim mkSendCmpct handler condition: "if version >= 1 and version <= 2:"
-    # This means version=1 triggers peer.peerCmpctVersion=1 and peerHighBandwidth=announce
-    # but then handleSendCmpct returns early, so wantsCompactBlocks stays false.
-    # Core: any version != 2 is ignored with no state update.
-    # The fix is for peer.nim to only call handleSendCmpct for version == 2,
-    # and not set peerCmpctVersion for v1 (or to check version == 2 at the outer gate).
-    # Marking as KNOWN BUG: not safety-critical since wantsCompactBlocks=false prevents
-    # compact block delivery, but peerCmpctVersion=1 could mislead diagnostics.
-    skip()  # marker: documented inconsistency; wantsCompactBlocks correctly stays false
+  test "BUG-2 FIXED — sendcmpct v1 leaves CompactBlockState fully unchanged (Core behaviour)":
+    # Fix: peer.nim mkSendCmpct handler now gates on version == 2 exclusively.
+    # Version != 2 is dropped before any state update (mirrors Core net_processing.cpp:3907).
+    # peerCmpctVersion is NOT set for v1; handleSendCmpct is NOT called.
+    # We verify via CompactBlockState that calling handleSendCmpct(version=1) leaves
+    # wantsCompactBlocks=false and compactBlockVersion=0 (unchanged from initial state).
+    var state = newCompactBlockState()
+    state.handleSendCmpct(announce = true, version = 1)
+    check not state.wantsCompactBlocks
+    check state.compactBlockVersion == 0
 
 # ============================================================================
 # G9/G29/G30: HB peer list management (lNodesAnnouncingHeaderAndIDs) MISSING ENTIRELY
