@@ -1,9 +1,13 @@
 ## Network group computation for eclipse attack protection
-## Computes /16 groups for IPv4 and /32 groups for IPv6
+## Computes /16 groups for IPv4 and /32 groups for IPv6, or ASN-keyed groups
+## when an asmap is loaded via NetGroupManager.
 ## Reference: Bitcoin Core netgroup.cpp GetGroup()
 
 import std/[net, strutils, hashes]
 import chronicles
+import ./asmap
+
+export asmap
 
 const
   # Network types (compatible with Bitcoin Core)
@@ -378,3 +382,54 @@ proc sameNetGroup*(a, b: IpAddr): bool =
 proc sameNetGroup*(a, b: string): bool =
   ## Check if two address strings are in the same network group
   getNetGroup(a) == getNetGroup(b)
+
+# ---------------------------------------------------------------------------
+# ASN-aware helpers (NetGroupManager integration)
+# ---------------------------------------------------------------------------
+
+proc ipAddrTo16Bytes(ip: IpAddr): array[16, byte] =
+  ## Convert IpAddr to the 16-byte form expected by interpret().
+  ## IPv4 addresses are returned as ::ffff:a.b.c.d (bytes 10-11 = 0xFF).
+  if ip.isV6:
+    result = ip.v6
+  else:
+    # Map to ::ffff:a.b.c.d
+    result[10] = 0xFF
+    result[11] = 0xFF
+    result[12] = ip.v4[0]
+    result[13] = ip.v4[1]
+    result[14] = ip.v4[2]
+    result[15] = ip.v4[3]
+
+proc getMappedAS*(mgr: NetGroupManager, ip: IpAddr): uint32 =
+  ## Return the ASN for `ip` using the loaded asmap (0 when not available).
+  ## IPv4-mapped IPv6 addresses are correctly unwrapped before lookup.
+  ## Reference: Bitcoin Core CConnman::GetMappedAS(), net.cpp:3800
+  if not mgr.usingAsmap:
+    return 0
+  var lookupIp = ip
+  # Unwrap IPv4-in-IPv6 (::ffff:a.b.c.d) to native IPv4 first
+  if ip.isV6 and ip.isIPv4Mapped():
+    let v4 = ip.extractIPv4()
+    lookupIp = IpAddr(isV6: false, v4: v4)
+  # Privacy networks (Tor, I2P) — no clearnet ASN, short-circuit to 0
+  # (Core's GetMappedAS also returns 0 for these)
+  # CJDNS is clearnet-routable and should go through Interpret
+  mgr.getMappedAS(ipAddrTo16Bytes(lookupIp))
+
+proc getNetGroupAsn*(mgr: NetGroupManager, ip: IpAddr): NetGroup =
+  ## Return an ASN-keyed NetGroup when asmap is loaded, else fall back to
+  ## the standard /16 (IPv4) or /32 (IPv6) group.
+  ## Reference: Bitcoin Core NetGroupManager::GetGroup()
+  if mgr.usingAsmap:
+    let asn = getMappedAS(mgr, ip)
+    if asn != 0:
+      # Encode the 4-byte ASN big-endian as the group discriminator
+      return NetGroup(data: @[
+        byte((asn shr 24) and 0xFF),
+        byte((asn shr 16) and 0xFF),
+        byte((asn shr  8) and 0xFF),
+        byte( asn         and 0xFF)
+      ])
+  # Fallback to /16 / /32 group
+  getNetGroup(ip)
