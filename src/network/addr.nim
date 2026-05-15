@@ -28,13 +28,16 @@ const
 
 type
   NetworkId* = enum
-    ## BIP155 network identifiers (internal enum, wire values are different)
-    ## TorV2 is deprecated and should be ignored
-    netIPv4 = 0
-    netIPv6 = 1
-    netTorV2 = 2  # Deprecated, ignore
+    ## BIP155 network identifiers (internal enum; 0-based for Nim case objects).
+    ## Wire IDs are obtained via `networkIdToWire(id)`.
+    ## BUG-1 FIX (W117): the original code used `uint8(ord(networkId))` as the
+    ## wire byte, but Nim enum ordinals (0-5) differ from BIP-155 wire IDs (1-6).
+    ## `writeNetAddressV2` now calls `networkIdToWire` to get the correct byte.
+    netIPv4  = 0
+    netIPv6  = 1
+    netTorV2 = 2  # Deprecated, should be ignored on receipt
     netTorV3 = 3
-    netI2P = 4
+    netI2P   = 4
     netCJDNS = 5
 
   NetAddressV2* = object
@@ -71,6 +74,21 @@ const
   Bip155TorV3* = 4'u8
   Bip155I2P* = 5'u8
   Bip155CJDNS* = 6'u8
+
+proc networkIdToWire*(id: NetworkId): uint8 =
+  ## BUG-1 FIX (W117): return the correct BIP-155 wire byte for a NetworkId.
+  ## Nim enum ordinals (0-5) differ from BIP-155 wire IDs (1-6); this mapping
+  ## corrects the off-by-one.  Previously `writeNetAddressV2` emitted
+  ## `uint8(ord(id))` which sent 0 for IPv4 (wire must be 1), 1 for IPv6
+  ## (wire must be 2), etc., making every addrv2 message unreadable by Core
+  ## and other compliant implementations.
+  case id
+  of netIPv4:  Bip155IPv4    # 1
+  of netIPv6:  Bip155IPv6    # 2
+  of netTorV2: Bip155TorV2   # 3
+  of netTorV3: Bip155TorV3   # 4
+  of netI2P:   Bip155I2P     # 5
+  of netCJDNS: Bip155CJDNS   # 6
 
 type
   TimestampedAddrV2* = object
@@ -181,7 +199,9 @@ proc fromIPv6Mapped*(ip: array[16, byte]): NetAddressV2 =
 
 proc writeNetAddressV2*(w: var BinaryWriter, addr2: NetAddressV2) =
   ## Serialize a NetAddressV2 (network ID + length + address bytes)
-  w.writeUint8(uint8(ord(addr2.networkId)))
+  ## BUG-1 FIX (W117): use networkIdToWire() instead of ord() to get the
+  ## correct BIP-155 wire byte (enum ordinals 0-5 ≠ wire IDs 1-6).
+  w.writeUint8(networkIdToWire(addr2.networkId))
 
   case addr2.networkId
   of netIPv4:

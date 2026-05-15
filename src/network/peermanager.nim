@@ -76,6 +76,10 @@ type
     params*: ConsensusParams
     localVersion*: VersionMsg
     knownAddresses*: seq[NetAddress]
+    ## BUG-4 FIX (W117): store Tor v3, I2P, and CJDNS addresses received in
+    ## addrv2 messages here (they cannot be represented in the legacy 16-byte
+    ## NetAddress format).  Relayed as addrv2 to peers that signaled wantsAddrV2.
+    knownAddressesV2*: seq[TimestampedAddrV2]
     banManager*: BanManager
     anchorList*: AnchorList
     listener*: StreamServer
@@ -157,6 +161,7 @@ proc newPeerManager*(params: ConsensusParams,
     maxInbound: maxIn,
     networkMagic: params.magic,
     knownAddresses: @[],
+    knownAddressesV2: @[],
     banManager: newBanManager(dataDir),
     anchorList: newAnchorList(dataDir),
     seedNodes: @[],
@@ -1001,7 +1006,11 @@ proc getKnownAddresses*(pm: PeerManager): seq[NetAddress] =
   pm.knownAddresses
 
 proc relayAddresses(pm: PeerManager, source: Peer) =
-  ## Relay addresses to up to 2 random peers (not back to source)
+  ## Relay addresses to up to 2 random peers (not back to source).
+  ## BUG-7 FIX (W117): peers that signaled wantsAddrV2 receive addrv2;
+  ## others receive the legacy addr message.  Mirrors Core's
+  ## CConnman::RelayAddress() which calls PushAddress with CAddress → addrv2 or
+  ## addr depending on the peer's SENDADDRV2 negotiation state.
   var candidates: seq[Peer]
   for _, p in pm.peers:
     if p != source and p.isConnected() and not p.closing:
@@ -1010,7 +1019,10 @@ proc relayAddresses(pm: PeerManager, source: Peer) =
     return
   shuffle(candidates)
   let n = min(2, candidates.len)
+
+  # Build legacy addr payload (IPv4/IPv6 only)
   let addrCount = min(10, pm.knownAddresses.len)
+  var legacyMsg: P2PMessage
   if addrCount > 0:
     var timestamped: seq[TimestampedAddr]
     for i in 0..<addrCount:
@@ -1019,9 +1031,35 @@ proc relayAddresses(pm: PeerManager, source: Peer) =
         timestamp: uint32(epochTime().int),
         address: a
       ))
-    let msg = newAddr(timestamped)
-    for i in 0..<n:
-      asyncSpawn spawnSafe(candidates[i].sendMessage(msg))
+    legacyMsg = newAddr(timestamped)
+
+  # Build addrv2 payload (all network types: IPv4/IPv6 + Tor/I2P/CJDNS)
+  let v2Count = min(10, pm.knownAddressesV2.len + pm.knownAddresses.len)
+  var v2Msg: P2PMessage
+  if v2Count > 0:
+    var v2addrs: seq[TimestampedAddrV2]
+    # Add Tor/I2P/CJDNS addresses first
+    let privCount = min(10, pm.knownAddressesV2.len)
+    for i in 0..<privCount:
+      v2addrs.add(pm.knownAddressesV2[i])
+    # Fill remaining slots from IPv4/IPv6
+    let ipCount = min(10 - v2addrs.len, pm.knownAddresses.len)
+    for i in 0..<ipCount:
+      v2addrs.add(toTimestampedAddrV2(
+        TimestampedAddr(
+          timestamp: uint32(epochTime().int),
+          address: pm.knownAddresses[i]
+        )
+      ))
+    if v2addrs.len > 0:
+      v2Msg = newAddrV2(v2addrs)
+
+  for i in 0..<n:
+    let p = candidates[i]
+    if p.wantsAddrV2 and v2Msg.kind == mkAddrV2:
+      asyncSpawn spawnSafe(p.sendMessage(v2Msg))
+    elif addrCount > 0:
+      asyncSpawn spawnSafe(p.sendMessage(legacyMsg))
 
 proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage) =
   ## Process addr/addrv2/getaddr/feefilter messages internally.
@@ -1042,20 +1080,47 @@ proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage) =
     if msg.addresses.len <= 1000 and msg.addresses.len > 0:
       pm.relayAddresses(peer)
   of mkAddrV2:
-    # Add addrv2 addresses (extract IPv4/IPv6 only for now)
+    # BUG-4 FIX (W117): store all valid addrv2 addresses.  IPv4/IPv6 go into
+    # knownAddresses (legacy pool); Tor v3, I2P, and CJDNS go into
+    # knownAddressesV2 so they can be relayed as addrv2 to peers that want it.
+    # Previously only IPv4/IPv6 were stored; Tor/I2P/CJDNS were silently dropped.
     let count = min(msg.addressesV2.len, 1000)
     for i in 0..<count:
       let ta = msg.addressesV2[i]
+      if not ta.address.isValid():
+        continue
       let legacy = toLegacyTimestampedAddr(ta)
       if legacy.isSome:
+        # IPv4 or IPv6 — store in legacy pool
         let la = legacy.get()
+        if isRoutable(la.address.ip):
+          var found = false
+          for ka in pm.knownAddresses:
+            if ka.ip == la.address.ip and ka.port == la.address.port:
+              found = true
+              break
+          if not found:
+            pm.knownAddresses.add(la.address)
+      else:
+        # Tor v3, I2P, or CJDNS — store in v2 pool
         var found = false
-        for ka in pm.knownAddresses:
-          if ka.ip == la.address.ip and ka.port == la.address.port:
-            found = true
-            break
+        for ka in pm.knownAddressesV2:
+          if ka.address.networkId == ta.address.networkId and ka.port == ta.port:
+            # Simple duplicate check by network type + port; deep byte comparison
+            # below avoids false negatives.
+            case ta.address.networkId
+            of netTorV3:
+              if ka.address.torv3 == ta.address.torv3:
+                found = true; break
+            of netI2P:
+              if ka.address.i2p == ta.address.i2p:
+                found = true; break
+            of netCJDNS:
+              if ka.address.cjdns == ta.address.cjdns:
+                found = true; break
+            else: discard
         if not found:
-          pm.knownAddresses.add(la.address)
+          pm.knownAddressesV2.add(ta)
     if msg.addressesV2.len <= 1000 and msg.addressesV2.len > 0:
       pm.relayAddresses(peer)
   of mkGetAddr:
