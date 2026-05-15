@@ -106,6 +106,18 @@ type
                             ## requires the operator to opt-in because the host
                             ## must already have a CJDNS route.  Mirrors Core's
                             ## `-cjdnsreachable`.  W117 FIX-56.
+    rpcTlsCert*: string     ## --rpc-tls-cert=<path>: PEM-encoded X.509
+                            ## certificate served by the REST listener.
+                            ## When set together with `--rpc-tls-key`, the
+                            ## listener becomes HTTPS (TLS 1.2+).  Empty by
+                            ## default — listener stays plaintext HTTP for
+                            ## backward compatibility.  Required for clearnet
+                            ## BIP-78 PayJoin per §Protocol.  W119 + FIX-64.
+    rpcTlsKey*: string      ## --rpc-tls-key=<path>: PKCS#8 PEM private key
+                            ## paired with `--rpc-tls-cert`.  Must be
+                            ## unencrypted (BearSSL/chronos requirement).
+                            ## Setting one without the other is a hard error
+                            ## at startup — no silent downgrade.
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -202,7 +214,10 @@ proc defaultConfig*(): NimrodConfig =
     proxy: "",
     onionProxy: "",
     i2psam: "",
-    cjdnsReachable: false
+    cjdnsReachable: false,
+    # W119 + FIX-64 REST/TLS termination (default off — plaintext)
+    rpcTlsCert: "",
+    rpcTlsKey: ""
   )
 
 proc loadConfigFile*(config: var NimrodConfig) =
@@ -317,6 +332,12 @@ proc loadConfigFile*(config: var NimrodConfig) =
       config.i2psam = value
     of "cjdnsreachable":
       config.cjdnsReachable = value.toLowerAscii() in ["", "1", "true", "yes"]
+    of "rpc-tls-cert", "rpctlscert":
+      # W119 + FIX-64: PEM-encoded X.509 cert for the REST listener.
+      config.rpcTlsCert = value
+    of "rpc-tls-key", "rpctlskey":
+      # W119 + FIX-64: PKCS#8 PEM key paired with rpc-tls-cert.
+      config.rpcTlsKey = value
     else:
       discard
 
@@ -398,6 +419,13 @@ Operational:
   --cjdnsreachable       Allow outbound to CJDNS addresses (fc00::/8).
                          Default off; the host must have a CJDNS route.
                          Mirrors Bitcoin Core -cjdnsreachable.  W117 FIX-56.
+  --rpc-tls-cert=PATH    PEM-encoded X.509 cert for the REST listener.
+                         Pair with --rpc-tls-key to enable HTTPS (TLS 1.2+).
+                         Required for clearnet BIP-78 PayJoin.  W119 + FIX-64.
+  --rpc-tls-key=PATH     PKCS#8 PEM private key paired with --rpc-tls-cert.
+                         Must be unencrypted (BearSSL/chronos requirement).
+                         Setting only one of the pair is a hard startup error
+                         — no silent downgrade to plaintext.
 
   -h, --help             Show this help
   -v, --version          Show version
@@ -608,6 +636,14 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           result.config.cjdnsReachable = true
         else:
           result.config.cjdnsReachable = p.val.toLowerAscii() in ["1", "true", "yes"]
+      of "rpc-tls-cert", "rpctlscert":
+        # W119 + FIX-64: --rpc-tls-cert=<path> — PEM X.509 cert served by
+        # the REST listener.  Pair with --rpc-tls-key to enable HTTPS.
+        result.config.rpcTlsCert = p.val
+      of "rpc-tls-key", "rpctlskey":
+        # W119 + FIX-64: --rpc-tls-key=<path> — PKCS#8 PEM key paired with
+        # --rpc-tls-cert.  Must be unencrypted (BearSSL requirement).
+        result.config.rpcTlsKey = p.val
       of "help", "h":
         showHelp()
         quit(0)
@@ -2208,15 +2244,26 @@ proc startNode*(config: NimrodConfig) {.async.} =
     let restPort =
       if config.restPort != 0: config.restPort
       else: uint16(int(config.rpcPort) + 1000)
-    info "starting REST server", port = restPort
-    state.restServer = newRestServer(
-      restPort,
-      state.chainState,
-      state.mempool,
-      params,
-      txIndex = nil,
-      filterIndex = state.blockFilterIndex
-    )
+    info "starting REST server", port = restPort,
+      tls = (config.rpcTlsCert.len > 0 and config.rpcTlsKey.len > 0)
+    try:
+      state.restServer = newRestServer(
+        restPort,
+        state.chainState,
+        state.mempool,
+        params,
+        txIndex = nil,
+        filterIndex = state.blockFilterIndex,
+        tlsCertPath = config.rpcTlsCert,
+        tlsKeyPath = config.rpcTlsKey
+      )
+    except CatchableError as e:
+      # W119 + FIX-64: misconfigured TLS (missing file, bad cert, only one
+      # of cert/key set) must be fatal so the operator notices instead of
+      # the listener silently dropping to plaintext or failing to start.
+      fatal "REST/TLS configuration error", error = e.msg,
+        cert = config.rpcTlsCert, key = config.rpcTlsKey
+      quit(1)
     # Same OS-thread model as the RPC server: each chronos dispatcher is
     # thread-local, so the REST listener gets its own event loop and is
     # not blocked by main-thread verifyScripts batches. Keep the thread
