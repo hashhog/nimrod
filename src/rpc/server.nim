@@ -18,6 +18,7 @@ import ../wallet/wallet
 import ../wallet/descriptor
 import ../wallet/manager
 import ../wallet/psbt
+import ../wallet/feebumper
 import ./zmq
 import ./mining
 
@@ -6801,6 +6802,181 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
     "changepos": changePos
   }
 
+# ---------------------------------------------------------------------------
+# bumpfee / psbtbumpfee (BIP-125 fee bumping)
+# ---------------------------------------------------------------------------
+#
+# W118 G22 BUG-1 closure (FIX-61). nimrod is the MODEL impl for the fleet's
+# universal "bumpfee MISSING" finding: the mempool already has correct BIP-125
+# replacement (sequence 0xfffffffd, four-gate signal check, see
+# mempool/mempool.nim:1750-1922) and createTransaction emits the opt-in
+# sequence on every outgoing tx (wallet/wallet.nim:965). The only thing the
+# audit found absent was the user-facing wallet RPC. This is the textbook
+# "dead-helper-at-RPC-boundary" shape (machinery correct, dispatch entry
+# missing) — fixing it requires almost no new business logic, just the call
+# into wallet/feebumper.nim plus the JSON shape matching Core
+# (wallet/rpc/spend.cpp:bumpfee_helper).
+
+proc parseBumpFeeRequest(rpc: RpcServer, params: JsonNode): BumpFeeRequest =
+  ## Shared argument parsing for bumpfee + psbtbumpfee.
+  ##
+  ## Core's option shape (wallet/rpc/spend.cpp:1048-1086):
+  ##   options.confTarget / options.conf_target — int, default 6
+  ##   options.fee_rate                          — sat/vB
+  ##   options.replaceable                       — bool, default true
+  ##   options.estimate_mode                     — accepted, ignored (we
+  ##                                                 always use the live
+  ##                                                 estimator)
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing txid parameter")
+  let txidHex = params[0].getStr()
+  if txidHex.len != 64:
+    raise newRpcError(RpcInvalidAddressOrKey, "invalid txid length")
+
+  result = BumpFeeRequest(
+    txid: parseTxId(txidHex),
+    feeRate: 0.0,         # 0 = use estimator
+    confTarget: 6,
+    replaceable: true
+  )
+
+  if params.len >= 2 and params[1].kind == JObject:
+    let opts = params[1]
+    if opts.hasKey("conf_target"):
+      result.confTarget = opts["conf_target"].getInt()
+    elif opts.hasKey("confTarget"):
+      result.confTarget = opts["confTarget"].getInt()
+    if opts.hasKey("fee_rate"):
+      let v = opts["fee_rate"]
+      result.feeRate =
+        if v.kind == JFloat: v.getFloat() else: float64(v.getInt())
+    if opts.hasKey("replaceable") and opts["replaceable"].kind == JBool:
+      result.replaceable = opts["replaceable"].getBool()
+    # estimate_mode is accepted-but-ignored (we only have one estimator path).
+
+proc bumpFeeKindToRpcCode(kind: BumpFeeErrorKind): int =
+  case kind
+  of bfeInvalidAddressOrKey: RpcInvalidAddressOrKey
+  of bfeInvalidParameter:    RpcInvalidParams
+  of bfeWalletError:         RpcWalletError
+  of bfeMiscError:           RpcMiscError
+
+proc doBumpFee(rpc: RpcServer, req: BumpFeeRequest,
+               wantPsbt: bool): BumpFeeOutcome =
+  ## Common backbone for bumpfee + psbtbumpfee: run the wallet/feebumper.nim
+  ## algorithm and translate BumpFeeError → RpcError. `wantPsbt=true` flips
+  ## `require_mine` off (Core's psbtbumpfee permits foreign inputs that the
+  ## caller will subsequently sign via PSBT).
+  var w = rpc.getTargetWallet()
+
+  # Unlock guard (Core's EnsureWalletIsUnlocked in bumpfee_helper:1094).
+  if w.isEncrypted and w.isLocked:
+    raise newRpcError(RpcMiscError,
+      "wallet is locked; use walletpassphrase to unlock")
+
+  # Pull min-relay / incremental rates from the live mempool (BIP-125 Rule 4).
+  let minRelayFeeSatVb = rpc.mempool.minFeeRate
+  let incrementalRelayFeeSatVb =
+    rpc.mempool.incrementalRelayFeeRate / 1000.0  # sat/kvB → sat/vB
+
+  # Determine estimator feerate (sat/vB) at confTarget. Mirrors the
+  # estimator/fallback fork in handleSendToAddress (server.nim:5571).
+  var estimatorFeeRate: float64
+  if rpc.feeEstimator != nil:
+    estimatorFeeRate = rpc.feeEstimator.estimateFee(req.confTarget)
+  else:
+    estimatorFeeRate = FallbackFeeRate
+
+  try:
+    return createRateBumpTransaction(
+      w, rpc.mempool, rpc.chainState, req,
+      requireMine = not wantPsbt,
+      estimatorFeeRate = estimatorFeeRate,
+      minRelayFeeSatVb = minRelayFeeSatVb,
+      incrementalRelayFeeSatVb = incrementalRelayFeeSatVb
+    )
+  except BumpFeeError as e:
+    let (kind, text) = parseBfeKind(e.msg)
+    raise newRpcError(bumpFeeKindToRpcCode(kind), text)
+
+proc handleBumpFee(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## bumpfee txid ( options )
+  ##
+  ## Replaces an unconfirmed BIP-125-replaceable wallet transaction with a
+  ## higher-fee one. Returns { txid, origfee, fee, errors } per Core
+  ## wallet/rpc/spend.cpp:1124-1156.
+  let req = parseBumpFeeRequest(rpc, params)
+  let outcome = doBumpFee(rpc, req, wantPsbt = false)
+
+  # Sign the replacement.
+  var w = rpc.getTargetWallet()
+  var newTx = outcome.newTx
+  try:
+    if not w.signTransaction(newTx, outcome.inputUtxos):
+      raise newRpcError(RpcWalletError, "Can't sign transaction.")
+  except WalletError as e:
+    raise newRpcError(RpcWalletError, "signing error: " & e.msg)
+
+  # Submit (replaces the original via the existing mempool BIP-125 path).
+  let acceptResult = rpc.mempool.acceptTransaction(newTx, rpc.crypto)
+  if not acceptResult.isOk:
+    raise newRpcError(RpcTransactionRejected,
+      "Mempool rejected replacement: " & acceptResult.error)
+
+  # Update wallet UTXO bookkeeping. The original tx's inputs are already
+  # absent from wallet.utxos (sendtoaddress consumed them), but the original
+  # tx's outputs (if any were ours) are about to be ejected from the mempool
+  # by the replacement. They were never in wallet.utxos either (mempool
+  # outputs are not yet UTXOs from the chain's perspective). So the only
+  # bookkeeping needed is to (a) re-discover any change output of the new tx
+  # so a subsequent bumpfee can find it again, and (b) optionally broadcast.
+  let newTxid = newTx.txid()
+  for voutIdx, output in newTx.outputs:
+    let keyOpt = w.findKeyForScript(output.scriptPubKey)
+    if keyOpt.isSome:
+      let key = keyOpt.get()
+      let op = OutPoint(txid: newTxid, vout: uint32(voutIdx))
+      let isInternal = key.path.contains("/1/")
+      # Height 0 = unconfirmed mempool output (matches sendtoaddress path).
+      w.addUtxo(op, output, 0, key.path, isInternal, false)
+
+  # Broadcast to peers (best-effort; matches handleSendToAddress).
+  if rpc.peerManager != nil:
+    asyncSpawn rpc.peerManager.broadcastTx(newTx)
+
+  let txidHex = reverseHex(toHex(array[32, byte](newTxid)))
+  %*{
+    "txid": txidHex,
+    "origfee": float64(int64(outcome.oldFee)) / 100_000_000.0,
+    "fee": float64(int64(outcome.newFee)) / 100_000_000.0,
+    "errors": newJArray()
+  }
+
+proc handlePsbtBumpFee(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## psbtbumpfee txid ( options )
+  ##
+  ## Same as bumpfee but returns a PSBT for an external signer instead of
+  ## signing/broadcasting. Core wallet/rpc/spend.cpp:1138-1147.
+  let req = parseBumpFeeRequest(rpc, params)
+  let outcome = doBumpFee(rpc, req, wantPsbt = true)
+
+  # Build PSBT around the unsigned replacement.
+  var psbtObj = createPsbt(outcome.newTx)
+  for i, inp in outcome.newTx.inputs:
+    # Populate witnessUtxo from our pre-collected wallet/chain prev outputs.
+    if i < outcome.inputUtxos.len:
+      try:
+        psbtObj.updateInput(i, outcome.inputUtxos[i].output, isWitness = true)
+      except CatchableError:
+        discard  # best-effort
+
+  %*{
+    "psbt": psbtObj.toBase64(),
+    "origfee": float64(int64(outcome.oldFee)) / 100_000_000.0,
+    "fee": float64(int64(outcome.newFee)) / 100_000_000.0,
+    "errors": newJArray()
+  }
+
 proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Decode a PSBT and return its contents
   ## Reference: Bitcoin Core rpc/rawtransaction.cpp decodepsbt
@@ -7873,6 +8049,12 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleAnalyzePsbt(params)
   of "walletcreatefundedpsbt":
     rpc.handleWalletCreateFundedPsbt(params)
+
+  # Fee bumping (BIP-125) — FIX-61 W118 G22 closure
+  of "bumpfee":
+    rpc.handleBumpFee(params)
+  of "psbtbumpfee":
+    rpc.handlePsbtBumpFee(params)
 
   # Wallet signing
   of "signrawtransactionwithwallet":
