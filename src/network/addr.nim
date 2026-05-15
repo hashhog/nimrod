@@ -90,6 +90,22 @@ proc networkIdToWire*(id: NetworkId): uint8 =
   of netI2P:   Bip155I2P     # 5
   of netCJDNS: Bip155CJDNS   # 6
 
+proc wireToNetworkId*(b: uint8): Option[NetworkId] =
+  ## BUG-1 FIX (W117) mirror: decode a BIP-155 wire ID byte (1-6) into the
+  ## internal NetworkId enum.  Returns `none(NetworkId)` for unknown / future
+  ## wire IDs so the caller can silent-skip the address entry per BIP-155
+  ## §"Receiver behaviour" (skip unknown network IDs without aborting the
+  ## addrv2 message).  Symmetric with `networkIdToWire`: every byte produced
+  ## by the encoder round-trips through this decoder back to the same enum.
+  case b
+  of Bip155IPv4:   some(netIPv4)
+  of Bip155IPv6:   some(netIPv6)
+  of Bip155TorV2:  some(netTorV2)
+  of Bip155TorV3:  some(netTorV3)
+  of Bip155I2P:    some(netI2P)
+  of Bip155CJDNS:  some(netCJDNS)
+  else:            none(NetworkId)
+
 type
   TimestampedAddrV2* = object
     ## Address with timestamp and services for addrv2 message
@@ -225,16 +241,32 @@ proc writeNetAddressV2*(w: var BinaryWriter, addr2: NetAddressV2) =
 
 proc readNetAddressV2*(r: var BinaryReader): Option[NetAddressV2] =
   ## Deserialize a NetAddressV2
-  ## Returns none for unknown network IDs (from future)
+  ## Returns none for unknown / deprecated network IDs (silent-skip per BIP-155
+  ## "Receiver behaviour": unknown entries must NOT abort the addrv2 message).
+  ##
+  ## BUG-1 FIX (W117): use `wireToNetworkId` instead of bare wire-byte literals
+  ## so encode and decode share a single source of truth for the
+  ## NetworkId <-> wire-byte mapping.  Previously the encoder used
+  ## `uint8(ord(id))` (off-by-one) while the decoder used 1..6 literals; the
+  ## existing round-trip test passed only because *both* sides were wrong in
+  ## opposite directions and cancelled out.  After this fix, any byte
+  ## produced by `writeNetAddressV2` decodes back to the same enum, and
+  ## any byte from a BIP-155-compliant peer (incl. Core) is correctly
+  ## interpreted on this end.
   let netIdByte = r.readUint8()
   let addrLen = r.readCompactSize()
 
   if addrLen > MaxAddrV2Size:
     raise newException(AddrV2Error, "address too long: " & $addrLen)
 
-  # Validate network ID and address length
-  case netIdByte
-  of 1: # IPv4
+  let netIdOpt = wireToNetworkId(netIdByte)
+  if netIdOpt.isNone:
+    # Unknown wire ID (future network type) — consume bytes, skip entry.
+    discard r.readBytes(int(addrLen))
+    return none(NetAddressV2)
+
+  case netIdOpt.get()
+  of netIPv4:
     if addrLen != AddrIPv4Size:
       raise newException(AddrV2Error, "IPv4 address with invalid length: " & $addrLen)
     var addr2 = NetAddressV2(networkId: netIPv4)
@@ -243,7 +275,7 @@ proc readNetAddressV2*(r: var BinaryReader): Option[NetAddressV2] =
       addr2.ipv4[i] = bytes[i]
     return some(addr2)
 
-  of 2: # IPv6
+  of netIPv6:
     if addrLen != AddrIPv6Size:
       raise newException(AddrV2Error, "IPv6 address with invalid length: " & $addrLen)
     var addr2 = NetAddressV2(networkId: netIPv6)
@@ -252,12 +284,12 @@ proc readNetAddressV2*(r: var BinaryReader): Option[NetAddressV2] =
       addr2.ipv6[i] = bytes[i]
     return some(addr2)
 
-  of 3: # TorV2 (deprecated)
-    # Skip but don't error - just consume the bytes
+  of netTorV2:
+    # Deprecated — silent-skip per BIP-155 (receivers SHOULD ignore TORv2).
     discard r.readBytes(int(addrLen))
     return none(NetAddressV2)
 
-  of 4: # TorV3
+  of netTorV3:
     if addrLen != AddrTorV3Size:
       raise newException(AddrV2Error, "TorV3 address with invalid length: " & $addrLen)
     var addr2 = NetAddressV2(networkId: netTorV3)
@@ -266,7 +298,7 @@ proc readNetAddressV2*(r: var BinaryReader): Option[NetAddressV2] =
       addr2.torv3[i] = bytes[i]
     return some(addr2)
 
-  of 5: # I2P
+  of netI2P:
     if addrLen != AddrI2PSize:
       raise newException(AddrV2Error, "I2P address with invalid length: " & $addrLen)
     var addr2 = NetAddressV2(networkId: netI2P)
@@ -275,7 +307,7 @@ proc readNetAddressV2*(r: var BinaryReader): Option[NetAddressV2] =
       addr2.i2p[i] = bytes[i]
     return some(addr2)
 
-  of 6: # CJDNS
+  of netCJDNS:
     if addrLen != AddrCJDNSSize:
       raise newException(AddrV2Error, "CJDNS address with invalid length: " & $addrLen)
     var addr2 = NetAddressV2(networkId: netCJDNS)
@@ -286,12 +318,6 @@ proc readNetAddressV2*(r: var BinaryReader): Option[NetAddressV2] =
     if addr2.cjdns[0] != CJDNSPrefix:
       raise newException(AddrV2Error, "CJDNS address with invalid prefix")
     return some(addr2)
-
-  else:
-    # Unknown network ID - skip the address bytes and return none
-    # This allows forward compatibility with future network types
-    discard r.readBytes(int(addrLen))
-    return none(NetAddressV2)
 
 proc writeTimestampedAddrV2*(w: var BinaryWriter, ta: TimestampedAddrV2) =
   ## Serialize a timestamped address for addrv2 message
