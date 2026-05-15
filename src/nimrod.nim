@@ -1100,24 +1100,35 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           debug "pkgtxns send failed", peer = $peer, error = e.msg
 
   of mkPkgTxns:
-    # BIP-331: peer delivered an ancestor package. Try to accept each tx in
-    # order (parents first); skip-don't-fail on individual errors.
+    # BIP-331: peer delivered an ancestor package.  Pass the full sequence to
+    # acceptPackage so that CPFP fee-rate aggregation is applied (a parent with
+    # a below-minimum individual fee rate can be accepted when the child's fee
+    # covers the shortfall).  Calling acceptTransaction per-tx would break CPFP
+    # because each tx is evaluated in isolation without the package fee rate.
+    # Reference: Bitcoin Core net_processing.cpp ProcessPackage / acceptPackage.
     if state.mempool == nil:
       trace "pkgtxns before mempool init", peer = $peer
     else:
+      let txns = msg.pkgTxns.transactions
+      var pkgResult: PackageResult
+      {.gcsafe.}:
+        try:
+          pkgResult = state.mempool.acceptPackage(txns, state.crypto,
+                                                  usePackageFeerates = true)
+        except CatchableError as e:
+          debug "pkgtxns acceptPackage exception", peer = $peer, error = e.msg
+        except Exception as e:
+          debug "pkgtxns acceptPackage fatal", peer = $peer, error = e.msg
       var accepted = 0
-      for tx in msg.pkgTxns.transactions:
-        {.gcsafe.}:
-          try:
-            let r = state.mempool.acceptTransaction(tx, state.crypto)
-            if r.isOk: inc accepted
-          except CatchableError:
-            discard
-          except Exception:
-            discard
+      for txr in pkgResult.txResults:
+        if txr.allowed:
+          inc accepted
+        else:
+          debug "pkgtxns tx rejected", peer = $peer,
+                txid = $txr.txid, reason = txr.error
       debug "processed pkgtxns",
-            peer = $peer, total = msg.pkgTxns.transactions.len,
-            accepted = accepted
+            peer = $peer, total = txns.len,
+            accepted = accepted, pkgValid = pkgResult.valid
 
   # BIP-157 compact block filter serving
   # Reference: bitcoin-core/src/net_processing.cpp:ProcessGetCFilters,
