@@ -147,6 +147,7 @@ import std/[unittest, options, strutils]
 import ../src/wallet/psbt
 import ../src/wallet/feebumper
 import ../src/wallet/wallet
+import ../src/wallet/bip21
 import ../src/rpc/rest
 import ../src/mempool/mempool
 
@@ -509,18 +510,36 @@ suite "W119 G26-G27 RPC surface":
 # ---------------------------------------------------------------------------
 suite "W119 G28-G29 BIP-21 pj= / pjos= parser":
 
-  test "G28 BUG-4 — no BIP-21 pj= parser":
-    ## BIP-21 `pj=<URL>` extension param SHOULD be parsed and exposed
-    ## as the discovery channel for PayJoin endpoints. No parser.
-    check not compiles(parseBip21Uri)
-    check not compiles(parseBip21PayJoinParam)
-    check not compiles(Bip21Uri)
+  test "G28 BUG-4 (CLOSED by FIX-62) — pj= parsed":
+    ## BIP-21 `pj=<URL>` extension param now parsed via
+    ## `src/wallet/bip21.nim` (FIX-62). The earlier `check not compiles`
+    ## assertions are invalidated and the symbols are exercised live.
+    let u = parseBip21Uri(
+      "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa" &
+      "?pj=https%3A%2F%2Fexample.com%2Fpj")
+    check u.isSome
+    check u.get.pj.isSome
+    check u.get.pj.get == "https://example.com/pj"
+    let pj = parseBip21PayJoinParam(
+      "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa" &
+      "?pj=https%3A%2F%2Fexample.com%2Fpj")
+    check pj.isSome and pj.get == "https://example.com/pj"
 
-  test "G29 BUG-4 — no BIP-21 pjos= parser":
+  test "G29 BUG-4 (CLOSED by FIX-62) — pjos= parsed":
     ## BIP-21 `pjos=0|1` extension toggles
-    ## `disableoutputsubstitution`. Tied to BUG-4; no parser exists.
-    check not compiles(parseBip21OutputSubstitution)
-    check not compiles(payjoinOutputSubstitutionFlag)
+    ## `disableoutputsubstitution`. Now parsed via FIX-62. The earlier
+    ## `check not compiles` assertions are invalidated.
+    let u1 = parseBip21Uri(
+      "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?pjos=1")
+    let u0 = parseBip21Uri(
+      "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?pjos=0")
+    check u1.isSome and u1.get.pjos.get == true
+    check u0.isSome and u0.get.pjos.get == false
+    check payjoinOutputSubstitutionFlag(u1.get) == true
+    check payjoinOutputSubstitutionFlag(u0.get) == false
+    let helper = parseBip21OutputSubstitution(
+      "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?pjos=1")
+    check helper.isSome and helper.get == true
 
 # ---------------------------------------------------------------------------
 # G30  Replay protection on success path
