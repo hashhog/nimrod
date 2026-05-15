@@ -2,7 +2,7 @@
 ## TCP connection with message framing, version handshake, and ping/pong
 ## Uses chronos for async networking
 
-import std/[strformat, random, hashes, tables, os, strutils]
+import std/[strformat, random, hashes, tables, os, strutils, options]
 import std/times as stdtimes
 import chronos
 import chronos/timer as ctimer
@@ -14,6 +14,7 @@ import ../mempool/mempool as mempool_mod
 import ./messages
 import ./compact_blocks
 import ./bip324
+import ./proxy as proxy_mod
 
 export chronicles
 
@@ -141,6 +142,14 @@ type
     peerHighBandwidth*: bool               # Peer wants high-bandwidth mode
     # Mempool reference for compact block reconstruction
     mempool*: mempool_mod.Mempool          # May be nil during IBD
+    # W117 BUG-3 FIX (FIX-56): optional proxy manager wired in by
+    # PeerManager.connectToPeerWithType when --proxy/--onion/--i2psam is
+    # configured.  When non-nil, Peer.connect() dispatches outbound
+    # connections through proxy_mod.connectThroughProxy() (Tor SOCKS5,
+    # I2P SAM, or clearnet SOCKS5 with optional stream isolation).
+    # Reference: bitcoin-core/src/net.cpp CConnman::ConnectNode delegating
+    # to ConnectThroughProxy() / ConnectThroughI2P() based on m_net.
+    proxyManager*: proxy_mod.ProxyManager  # nil = direct connect
 
   PeerError* = object of CatchableError
 
@@ -199,18 +208,35 @@ proc isConnected*(peer: Peer): bool =
     peer.transport != nil and not peer.transport.closed
 
 proc connect*(peer: Peer): Future[bool] {.async.} =
-  ## Connect to the peer (outbound connection)
+  ## Connect to the peer (outbound connection).
+  ##
+  ## W117 BUG-3 FIX (FIX-56): when `peer.proxyManager` is non-nil, the
+  ## outbound connection is dispatched based on the address type:
+  ##   - `.onion`     → SOCKS5 to the configured onion proxy (Tor) with
+  ##                    optional stream isolation per circuit.
+  ##   - `.i2p`       → I2P SAM session (STREAM CONNECT).
+  ##   - IPv4 / IPv6  → direct TCP, or SOCKS5 to the clearnet proxy if
+  ##                    one was configured (--proxy).
+  ##   - CJDNS (fc00::/8) is treated as clearnet (direct/SOCKS5) — Core
+  ##                    treats CJDNS as routable and does not proxy it.
+  ## Reference: bitcoin-core/src/net.cpp CConnman::ConnectNode dispatch
+  ## via ConnectThroughProxy / ConnectThroughI2P based on m_net.
   if peer.state != psDisconnected:
     return false
 
   peer.state = psConnecting
 
   try:
-    let ta = initTAddress(peer.address, Port(peer.port))
-    peer.transport = await connect(ta)
+    if peer.proxyManager != nil:
+      peer.transport = await proxy_mod.connectThroughProxy(
+        peer.proxyManager, peer.address, peer.port)
+    else:
+      let ta = initTAddress(peer.address, Port(peer.port))
+      peer.transport = await connect(ta)
     peer.state = psConnected
     peer.lastSeen = stdtimes.getTime()
-    info "connected to peer", peer = $peer
+    info "connected to peer", peer = $peer,
+         viaProxy = (peer.proxyManager != nil)
     return true
   except CatchableError as e:
     error "failed to connect", peer = $peer, error = e.msg
