@@ -322,7 +322,13 @@ proc isRoutable*(ip: array[16, byte]): bool =
     if isLoopback and ip[15] == 1: return false
     # IPv6 link-local fe80::/10
     if ip[0] == 0xFE and (ip[1] and 0xC0'u8) == 0x80'u8: return false
-    # IPv6 ULA fc00::/7
+    # BUG-2 FIX (W117): CJDNS (fc00::/8) is routable — must be checked BEFORE
+    # the ULA (fc00::/7) rejection, matching the IpAddr overload behaviour and
+    # Core's CNetAddr::IsRoutable() which exempts NET_CJDNS from the !IsRFC4193()
+    # rejection path.  Without this guard, addKnownAddress drops every CJDNS
+    # peer address silently because fc00::/8 ⊂ fc00::/7.
+    if ip[0] == 0xFC'u8: return true  # CJDNS fc00::/8 — routable
+    # IPv6 ULA fc00::/7 (fd00::/8 + remaining non-CJDNS fc bits)
     if (ip[0] and 0xFE'u8) == 0xFC'u8: return false
     return true
 

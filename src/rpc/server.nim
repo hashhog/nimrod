@@ -3329,7 +3329,10 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
   let inCount = if rpc.peerManager != nil: rpc.peerManager.inboundCount() else: 0
   let outCount = if rpc.peerManager != nil: rpc.peerManager.outboundCount() else: 0
 
-  # Build networks array
+  # Build networks array.
+  # BUG-5 FIX (W117): i2p and cjdns entries were missing. Core reports all 5
+  # network types (ipv4/ipv6/onion/i2p/cjdns) in getnetworkinfo.
+  # Reference: bitcoin-core/src/rpc/net.cpp GetNetworksInfo()
   let networks = %*[
     {
       "name": "ipv4",
@@ -3347,6 +3350,20 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
     },
     {
       "name": "onion",
+      "limited": true,
+      "reachable": false,
+      "proxy": "",
+      "proxy_randomize_credentials": false
+    },
+    {
+      "name": "i2p",
+      "limited": true,
+      "reachable": false,
+      "proxy": "",
+      "proxy_randomize_credentials": false
+    },
+    {
+      "name": "cjdns",
       "limited": true,
       "reachable": false,
       "proxy": "",

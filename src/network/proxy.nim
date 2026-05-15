@@ -7,6 +7,7 @@
 ## RFC 1928 (SOCKS5), RFC 1929 (SOCKS5 username/password)
 
 import std/[strformat, strutils, random, tables, base64, options, os]
+import nimcrypto/sha2
 import chronos
 import chronicles
 
@@ -610,13 +611,18 @@ proc i2pBase64Encode*(data: openArray[byte]): string =
 
 proc i2pBase64Decode*(data: string): seq[byte] =
   ## Decode from I2P Base64
+  ## BUG-6 FIX (W117): std/base64.decode returns string, not seq[byte].
+  ## Cast the returned string to seq[byte] via explicit conversion.
   var std = ""
   for c in data:
     case c
     of '-': std.add('+')
     of '~': std.add('/')
     else: std.add(c)
-  result = decode(std)
+  let s = decode(std)
+  result = newSeq[byte](s.len)
+  for i in 0 ..< s.len:
+    result[i] = byte(s[i])
 
 proc i2pSamSendRequest*(transport: StreamTransport, request: string): Future[void] {.async.} =
   ## Send a SAM request (terminated by newline)
@@ -691,7 +697,6 @@ proc i2pSamDestGenerate*(transport: StreamTransport): Future[tuple[pub: string, 
 proc i2pDestinationToAddress*(dest: openArray[byte]): string =
   ## Convert I2P destination to .b32.i2p address
   ## The address is Base32(SHA256(destination)).b32.i2p
-  import nimcrypto/sha2
 
   var ctx: sha256
   ctx.init()
