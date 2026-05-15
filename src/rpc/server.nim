@@ -2966,6 +2966,222 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   except CatchableError as e:
     raise newRpcError(RpcInvalidParams, "TX decode failed: " & e.msg)
 
+proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Dry-run mempool acceptance check for one or more raw transactions.
+  ## Reference: Bitcoin Core testmempoolaccept RPC (rpc/mempool.cpp)
+  ##
+  ## Params:
+  ## [0] rawtxs   - Array of hex-encoded raw transactions (1..25)
+  ## [1] maxfeerate - (optional) Maximum fee rate in BTC/kvB (default 0.10)
+  ##
+  ## Returns: JSON array with one entry per transaction:
+  ##   { "txid": hex, "wtxid": hex,
+  ##     "allowed": true, "vsize": N,
+  ##       "fees": { "base": BTC, "effective-feerate": sat/vB,
+  ##                 "effective-includes": [wtxid, ...] }
+  ##   }
+  ##   or on rejection:
+  ##   { "txid": hex, "wtxid": hex, "allowed": false, "reject-reason": str }
+  ##
+  ## Single tx  → acceptTransactionWithArgs(testAccept=true)  (no mutation)
+  ## Multi tx   → acceptPackage(usePackageFeerates=true) then rollback
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing rawtxs array parameter")
+  if params[0].kind != JArray:
+    raise newRpcError(RpcInvalidParams, "rawtxs must be an array of hex strings")
+
+  let rawTxsArray = params[0]
+  if rawTxsArray.len == 0:
+    raise newRpcError(RpcInvalidParams, "rawtxs array must not be empty")
+  if rawTxsArray.len > MaxPackageCount:
+    raise newRpcError(RpcInvalidParams,
+      "too many transactions in package: " & $rawTxsArray.len &
+      " > " & $MaxPackageCount)
+
+  # Parse maxfeerate (BTC/kvB, default 0.10; 0 = unlimited)
+  var maxFeeRate = DefaultMaxFeeRate
+  if params.len >= 2 and params[1].kind != JNull:
+    if params[1].kind == JFloat:
+      maxFeeRate = params[1].getFloat()
+    elif params[1].kind == JInt:
+      maxFeeRate = float64(params[1].getInt())
+    elif params[1].kind == JString:
+      try:
+        maxFeeRate = parseFloat(params[1].getStr())
+      except ValueError:
+        raise newRpcError(RpcInvalidParams, "invalid maxfeerate")
+  if maxFeeRate > 1.0:
+    raise newRpcError(RpcInvalidParams, "maxfeerate cannot exceed 1 BTC/kvB")
+
+  # Decode all transactions
+  var txns: seq[Transaction]
+  for i, rawTxNode in rawTxsArray:
+    if rawTxNode.kind != JString:
+      raise newRpcError(RpcInvalidParams,
+        "rawtxs[" & $i & "] must be a hex string")
+    let txHex = rawTxNode.getStr()
+    try:
+      let txBytes = hexToBytes(txHex)
+      let tx = deserializeTransaction(txBytes)
+      txns.add(tx)
+    except CatchableError as e:
+      raise newRpcError(RpcInvalidParams,
+        "TX " & $i & " decode failed: " & e.msg)
+
+  var resultArr = newJArray()
+
+  if txns.len == 1:
+    # ── Single-tx path ──────────────────────────────────────────────────────
+    # Use testAccept=true so no mempool mutation occurs.
+    let tx = txns[0]
+    let txid    = tx.txid()
+    let wtxid   = tx.wtxid()
+    let txidHex  = reverseHex(toHex(array[32, byte](txid)))
+    let wtxidHex = reverseHex(toHex(array[32, byte](wtxid)))
+
+    # Core CHECK_NONFATAL: already-in-mempool txns are not "allowed" for
+    # testmempoolaccept (rpc/mempool.cpp:370).
+    if rpc.mempool.contains(txid):
+      var entry = %*{
+        "txid": txidHex,
+        "wtxid": wtxidHex,
+        "allowed": false,
+        "reject-reason": "txn-already-in-mempool"
+      }
+      resultArr.add(entry)
+      return resultArr
+
+    var mp = rpc.mempool
+    let args = AtmpArgs(
+      testAccept: true,
+      bypassLimits: false,
+      allowReplacement: true,
+      allowSiblingEviction: false,
+      packageFeerates: false,
+      clientMaxFeeRateSatKvB: 0.0
+    )
+    let res = mp.acceptTransactionWithArgs(tx, rpc.crypto, args)
+
+    var txEntry = %*{ "txid": txidHex, "wtxid": wtxidHex }
+
+    if res.isOk:
+      let info = res.value
+      let vsize = info.vsize
+      let feeBtc = float64(int64(info.baseFee)) / 100_000_000.0
+      let feeSatPerVb = if vsize > 0: float64(int64(info.baseFee)) / float64(vsize)
+                        else: 0.0
+
+      # maxfeerate check (per-tx, before any state commit — testAccept=true
+      # guarantees nothing was mutated above)
+      if maxFeeRate > 0:
+        let maxFeeRateSatPerVb = maxFeeRate * 100_000_000.0 / 1000.0
+        if feeSatPerVb > maxFeeRateSatPerVb:
+          txEntry["allowed"] = %false
+          txEntry["reject-reason"] = %("max-fee-exceeded")
+          resultArr.add(txEntry)
+          return resultArr
+
+      txEntry["allowed"] = %true
+      txEntry["vsize"] = %vsize
+      txEntry["fees"] = %*{
+        "base": feeBtc,
+        "effective-feerate": feeSatPerVb,
+        "effective-includes": %*[wtxidHex]
+      }
+    else:
+      txEntry["allowed"] = %false
+      txEntry["reject-reason"] = %res.error
+
+    resultArr.add(txEntry)
+
+  else:
+    # ── Multi-tx (package) path ─────────────────────────────────────────────
+    # Run full package validation (usePackageFeerates=true for CPFP), then
+    # roll back all newly-added entries so the mempool is not mutated.
+    var mp = rpc.mempool
+
+    # Record which txids are in the mempool before we call acceptPackage so we
+    # can remove anything that was freshly inserted.
+    var preExisting: seq[TxId]
+    for tx in txns:
+      if mp.contains(tx.txid()):
+        preExisting.add(tx.txid())
+
+    let pkgResult = mp.acceptPackage(txns, rpc.crypto, usePackageFeerates = true)
+
+    # Rollback: remove every tx that acceptPackage added (was not pre-existing).
+    for tx in txns:
+      let txid = tx.txid()
+      var wasPreExisting = false
+      for pe in preExisting:
+        if pe == txid:
+          wasPreExisting = true
+          break
+      if not wasPreExisting and mp.contains(txid):
+        mp.removeTransaction(txid)
+
+    # Build per-tx results
+    let maxFeeRateSatPerVb = if maxFeeRate > 0:
+                               maxFeeRate * 100_000_000.0 / 1000.0
+                             else: 0.0
+
+    # If the package-level validation failed before we got per-tx results,
+    # mark all txs as rejected with the package error.
+    if pkgResult.txResults.len == 0:
+      for tx in txns:
+        let txid    = tx.txid()
+        let wtxid   = tx.wtxid()
+        let txidHex  = reverseHex(toHex(array[32, byte](txid)))
+        let wtxidHex = reverseHex(toHex(array[32, byte](wtxid)))
+        resultArr.add(%*{
+          "txid": txidHex,
+          "wtxid": wtxidHex,
+          "allowed": false,
+          "reject-reason": pkgResult.error
+        })
+      return resultArr
+
+    for txResult in pkgResult.txResults:
+      let txidHex  = reverseHex(toHex(array[32, byte](txResult.txid)))
+      let wtxidHex = reverseHex(toHex(array[32, byte](txResult.wtxid)))
+
+      var txEntry = %*{ "txid": txidHex, "wtxid": wtxidHex }
+
+      # Core: already-in-mempool is not "allowed" for testmempoolaccept
+      var rejectedAlreadyInMempool = false
+      for pe in preExisting:
+        if pe == txResult.txid:
+          rejectedAlreadyInMempool = true
+          break
+
+      if rejectedAlreadyInMempool:
+        txEntry["allowed"] = %false
+        txEntry["reject-reason"] = %"txn-already-in-mempool"
+      elif txResult.allowed:
+        let vsize = txResult.vsize
+        let feeBtc = float64(int64(txResult.fees)) / 100_000_000.0
+        let feeSatPerVb = if vsize > 0: float64(int64(txResult.fees)) / float64(vsize)
+                          else: 0.0
+
+        if maxFeeRate > 0 and feeSatPerVb > maxFeeRateSatPerVb:
+          txEntry["allowed"] = %false
+          txEntry["reject-reason"] = %"max-fee-exceeded"
+        else:
+          txEntry["allowed"] = %true
+          txEntry["vsize"] = %vsize
+          txEntry["fees"] = %*{
+            "base": feeBtc,
+            "effective-feerate": pkgResult.packageFeerate,
+            "effective-includes": newJArray()
+          }
+      else:
+        txEntry["allowed"] = %false
+        txEntry["reject-reason"] = %txResult.error
+
+      resultArr.add(txEntry)
+
+  resultArr
+
 proc handleSubmitPackage(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Submit a package of raw transactions to the network (CPFP support)
   ## Reference: Bitcoin Core submitpackage RPC
@@ -7506,6 +7722,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleDecodeScript(params)
   of "sendrawtransaction":
     rpc.handleSendRawTransaction(params)
+  of "testmempoolaccept":
+    rpc.handleTestMempoolAccept(params)
   of "submitpackage":
     rpc.handleSubmitPackage(params)
 
