@@ -184,9 +184,14 @@ proc newSocks5Proxy*(host: string, port: uint16,
     streamIsolationCounter: 0
   )
 
-proc generateStreamIsolationCredentials*(proxy: var Socks5Proxy): ProxyCredentials =
+proc generateStreamIsolationCredentials*(proxy: Socks5Proxy): ProxyCredentials =
   ## Generate unique credentials for Tor stream isolation
-  ## Each unique credential pair creates a new Tor circuit
+  ## Each unique credential pair creates a new Tor circuit.
+  ##
+  ## W117 FIX-56 compile fix: `Socks5Proxy` is a `ref object`, so mutations
+  ## propagate without `var`.  The `var` qualifier was incompatible with
+  ## async-closure capture (chronos uses closures internally), so callers
+  ## with `var` parameters couldn't `await` from inside this proc.
   inc proxy.streamIsolationCounter
   let suffix = $proxy.streamIsolationCounter
   ProxyCredentials(
@@ -313,10 +318,15 @@ proc socks5Connect*(transport: StreamTransport, host: string, port: uint16): Fut
 
   debug "SOCKS5 connect successful", host = host, port = port
 
-proc connectThroughSocks5*(proxy: var Socks5Proxy, host: string, port: uint16,
+proc connectThroughSocks5*(proxy: Socks5Proxy, host: string, port: uint16,
                             timeout: Duration = Socks5ConnectTimeout): Future[StreamTransport] {.async.} =
   ## Connect to a remote host through the SOCKS5 proxy
   ## Returns a connected StreamTransport ready for use
+  ##
+  ## W117 FIX-56 compile fix: dropped `var` qualifier — `Socks5Proxy` is
+  ## already a `ref object`, so mutation propagates; `var` was incompatible
+  ## with the async closure capture this proc relies on (chronos generated
+  ## a "cannot be captured" compile error on the `var` form).
 
   # Connect to the proxy
   let proxyAddr = initTAddress(proxy.config.host, Port(proxy.config.port))
@@ -337,9 +347,12 @@ proc connectThroughSocks5*(proxy: var Socks5Proxy, host: string, port: uint16,
     await transport.closeWait()
     raise
 
-proc connectThroughSocks5IPv4*(proxy: var Socks5Proxy, ip: array[4, byte], port: uint16,
+proc connectThroughSocks5IPv4*(proxy: Socks5Proxy, ip: array[4, byte], port: uint16,
                                 timeout: Duration = Socks5ConnectTimeout): Future[StreamTransport] {.async.} =
-  ## Connect to an IPv4 address through the SOCKS5 proxy
+  ## Connect to an IPv4 address through the SOCKS5 proxy.
+  ##
+  ## W117 FIX-56 compile fix: dropped `var` qualifier — see
+  ## `connectThroughSocks5` for the same reasoning.
 
   let proxyAddr = initTAddress(proxy.config.host, Port(proxy.config.port))
   let transport = await connect(proxyAddr).wait(timeout)
@@ -573,15 +586,19 @@ proc newTorHiddenService*(config: TorControlConfig): TorHiddenService =
     reconnectTimeout: 1.0
   )
 
-proc connectTorControl*(service: var TorHiddenService): Future[void] {.async.} =
-  ## Connect to Tor control port
+proc connectTorControl*(service: TorHiddenService): Future[void] {.async.} =
+  ## Connect to Tor control port.
+  ##
+  ## W117 FIX-56 compile fix: `TorHiddenService` is a `ref object`, so
+  ## mutation propagates without `var`.  `var` was incompatible with
+  ## async-closure capture (chronos generates closures internally).
   let torAddr = initTAddress(service.config.host, Port(service.config.port))
   service.controlSock = await connect(torAddr)
   await torControlAuthenticate(service.controlSock,
                                 service.config.password,
                                 service.config.cookieFile)
 
-proc createHiddenService*(service: var TorHiddenService,
+proc createHiddenService*(service: TorHiddenService,
                            targetHost: string, targetPort: uint16,
                            virtualPort: uint16): Future[string] {.async.} =
   ## Create a hidden service and return the .onion address
@@ -740,13 +757,17 @@ proc i2pExtractPublicDestination*(privateKey: openArray[byte]): seq[byte] =
 
   result = @privateKey[0 ..< destLen]
 
-proc connectSam*(session: var I2PSession): Future[void] {.async.} =
-  ## Connect to I2P SAM bridge
+proc connectSam*(session: I2PSession): Future[void] {.async.} =
+  ## Connect to I2P SAM bridge.
+  ##
+  ## W117 FIX-56 compile fix: `I2PSession` is a `ref object`, so mutation
+  ## propagates without `var`.  `var` was incompatible with async-closure
+  ## capture in chronos's generated code.
   let samAddr = initTAddress(session.config.host, Port(session.config.port))
   session.controlSock = await connect(samAddr)
   await i2pSamHello(session.controlSock)
 
-proc createSession*(session: var I2PSession): Future[void] {.async.} =
+proc createSession*(session: I2PSession): Future[void] {.async.} =
   ## Create an I2P streaming session
   randomize()
   session.sessionId = "nimrod" & $rand(999999)
@@ -799,9 +820,12 @@ proc createSession*(session: var I2PSession): Future[void] {.async.} =
 
   info "I2P session created", sessionId = session.sessionId, address = session.myAddr
 
-proc i2pConnect*(session: var I2PSession, destination: string): Future[StreamTransport] {.async.} =
+proc i2pConnect*(session: I2PSession, destination: string): Future[StreamTransport] {.async.} =
   ## Connect to an I2P destination through SAM
-  ## Destination should be a .b32.i2p address
+  ## Destination should be a .b32.i2p address.
+  ##
+  ## W117 FIX-56 compile fix: dropped `var` qualifier — see `connectSam`
+  ## for reasoning.
 
   # First, need a new socket for the stream
   let samAddr = initTAddress(session.config.host, Port(session.config.port))
@@ -842,9 +866,11 @@ proc i2pConnect*(session: var I2PSession, destination: string): Future[StreamTra
     await streamSock.closeWait()
     raise
 
-proc i2pAccept*(session: var I2PSession): Future[tuple[sock: StreamTransport, peer: string]] {.async.} =
+proc i2pAccept*(session: I2PSession): Future[tuple[sock: StreamTransport, peer: string]] {.async.} =
   ## Accept an incoming I2P connection
-  ## Returns the socket and the peer's .b32.i2p address
+  ## Returns the socket and the peer's .b32.i2p address.
+  ##
+  ## W117 FIX-56 compile fix: dropped `var` qualifier — see `connectSam`.
 
   # Need a new socket for accepting
   let samAddr = initTAddress(session.config.host, Port(session.config.port))

@@ -20,6 +20,7 @@ import ./netgroup
 import ./eviction
 import ./anchors
 import ./addr
+import ./proxy as proxy_mod
 import ../consensus/params
 import ../primitives/[types, serialize]
 import ../crypto/hashing
@@ -112,6 +113,16 @@ type
     # order is implementation-defined).  Mirrors clearbit's
     # `v2_fallback_set` (peer.zig:1759).
     v2FallbackSet*: HashSet[string]
+    # W117 BUG-3 FIX (FIX-56): proxy / onion / I2P / CJDNS configuration.
+    # Wires the previously dead-helper src/network/proxy.nim subsystems
+    # (SOCKS5, Tor control, I2P SAM, ProxyManager, stream isolation) into
+    # the outbound connect path.  Built from CLI flags --proxy / --onion /
+    # --i2psam / --cjdnsreachable in src/nimrod.nim.  nil = no proxy
+    # configured (direct connect, .onion/.i2p outbound rejected).
+    # Reference: bitcoin-core/src/init.cpp -proxy / -onion / -i2psam /
+    # -cjdnsreachable; CConnman::m_proxy_for_net.
+    proxyManager*: proxy_mod.ProxyManager
+    cjdnsReachable*: bool
 
 # Forward declarations
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
@@ -124,6 +135,75 @@ proc peerKey(host: string, port: uint16): string =
 
 proc peerKey(peer: Peer): string =
   peerKey(peer.address, peer.port)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# W117 BUG-3 FIX (FIX-56): proxy/network-type configuration helpers.
+# These wire CLI flags (--proxy / --onion / --i2psam / --cjdnsreachable) into
+# the dead-helper src/network/proxy.nim subsystems (SOCKS5, Tor control, I2P
+# SAM, ProxyManager) so that outbound connect dispatch in
+# `connectToPeerWithType` can route .onion through Tor, .i2p through SAM, and
+# clearnet through SOCKS5 (or direct).
+# Reference: bitcoin-core/src/init.cpp -proxy / -onion / -i2psam /
+# -cjdnsreachable; CConnman::m_proxy_for_net dispatch in ConnectNode.
+proc ensureProxyManager(pm: PeerManager) =
+  ## Lazily allocate the ProxyManager when the first --proxy/--onion/--i2psam
+  ## flag is wired in.
+  if pm.proxyManager == nil:
+    pm.proxyManager = proxy_mod.newProxyManager()
+
+proc configureProxy*(pm: PeerManager, host: string, port: uint16,
+                     username: string = "", password: string = "") =
+  ## Configure the clearnet SOCKS5 proxy (used for IPv4/IPv6 outbound).
+  ## Mirrors Core's `-proxy=host:port` flag.
+  ensureProxyManager(pm)
+  let auth =
+    if username.len > 0 or password.len > 0:
+      some(proxy_mod.ProxyCredentials(username: username, password: password))
+    else:
+      none(proxy_mod.ProxyCredentials)
+  pm.proxyManager.configureProxy(host, port, auth)
+  info "configured clearnet SOCKS5 proxy", host = host, port = port,
+       auth = (username.len > 0)
+
+proc configureOnionProxy*(pm: PeerManager, host: string, port: uint16,
+                          randomizeCredentials: bool = true) =
+  ## Configure the Tor SOCKS5 proxy used for .onion connections.  Stream
+  ## isolation is enabled by default so each outbound .onion connect gets a
+  ## fresh Tor circuit (mirrors Core's per-destination credentials).
+  ## Mirrors Core's `-onion=host:port` flag.
+  ensureProxyManager(pm)
+  pm.proxyManager.configureOnionProxy(host, port, randomizeCredentials)
+  info "configured Tor SOCKS proxy", host = host, port = port,
+       streamIsolation = randomizeCredentials
+
+proc configureI2PSam*(pm: PeerManager, host: string, port: uint16,
+                      privateKeyFile: string = "", transient: bool = false) =
+  ## Configure the I2P SAM bridge used for .i2p connections.
+  ## Mirrors Core's `-i2psam=host:port` flag.
+  ensureProxyManager(pm)
+  pm.proxyManager.configureI2P(host, port, privateKeyFile, transient)
+  info "configured I2P SAM bridge", host = host, port = port,
+       transient = transient
+
+proc setCjdnsReachable*(pm: PeerManager, reachable: bool) =
+  ## Mirrors Core's `-cjdnsreachable` flag.  When false (default), CJDNS
+  ## peers (fc00::/8) are skipped on outbound — Core's policy is "we don't
+  ## have a CJDNS route so don't try".  When true, CJDNS addresses are
+  ## directly dialed (CJDNS exposes a TCP-over-mesh socket locally).
+  pm.cjdnsReachable = reachable
+
+proc isOnionHost(host: string): bool {.inline.} =
+  host.endsWith(".onion")
+
+proc isI2pHost(host: string): bool {.inline.} =
+  host.endsWith(".i2p")
+
+proc isCjdnsHost(host: string): bool {.inline.} =
+  ## CJDNS uses native IPv6 fc00::/8.  Detect by parsing the host as IPv6
+  ## and checking the fc00::/8 prefix (the same predicate netgroup.nim
+  ## isCJDNS uses for routability classification).
+  let ip = parseIpAddr(host)
+  ip.isV6 and ip.isCJDNS()
 
 proc markV1Only*(pm: PeerManager, address: string, port: uint16) =
   ## BIP-324: mark `address:port` as v1-only.  Subsequent outbound
@@ -182,7 +262,12 @@ proc newPeerManager*(params: ConsensusParams,
     tryNewOutboundPeer: false,
     initialSyncFinished: false,
     blockStallingTimeout: chronos.seconds(BlockStallingTimeoutDefaultSec),
-    v2FallbackSet: initHashSet[string]()
+    v2FallbackSet: initHashSet[string](),
+    # W117 BUG-3 FIX (FIX-56): proxy fields default to nil/false — the
+    # caller (src/nimrod.nim startNode) wires them after construction
+    # when --proxy / --onion / --i2psam / --cjdnsreachable are set.
+    proxyManager: nil,
+    cjdnsReachable: false
   )
 
   # Load existing ban list and anchors
@@ -394,6 +479,48 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
   if key in pm.peers:
     return false
 
+  # W117 BUG-3 FIX (FIX-56): network-type gating + routability gate for
+  # automatic outbound dials.  Manual peers (addnode) bypass these so an
+  # operator can always force-dial a specific peer for debugging.
+  # Reference: bitcoin-core/src/net.cpp CConnman::ConnectNode early
+  # return on !IsReachable(addr.GetNetwork()).
+  if connType in {pctFullRelay, pctBlockRelayOnly}:
+    let onion = isOnionHost(address)
+    let i2p   = isI2pHost(address)
+    let cjdns = (not onion and not i2p) and isCjdnsHost(address)
+
+    if onion:
+      # .onion requires either the onion proxy (--onion) or the clearnet
+      # SOCKS5 proxy (--proxy, fallback) configured.
+      if pm.proxyManager == nil or
+         (pm.proxyManager.onionProxy.isNone and pm.proxyManager.clearnetProxy.isNone):
+        debug "skipping .onion peer: no Tor SOCKS proxy configured",
+              address = address
+        return false
+    elif i2p:
+      # .i2p requires an active I2P SAM session (--i2psam).
+      if pm.proxyManager == nil or pm.proxyManager.i2pSession.isNone:
+        debug "skipping .i2p peer: no I2P SAM configured",
+              address = address
+        return false
+    elif cjdns:
+      if not pm.cjdnsReachable:
+        debug "skipping CJDNS peer: --cjdnsreachable not set",
+              address = address
+        return false
+    else:
+      # IPv4 / IPv6 routability check (mirrors Core's IsRoutable() gate
+      # in ThreadOpenConnections + AddrMan::Select_).  Skip RFC1918 / loopback
+      # / link-local / RFC6598 etc.  Manual peers (above) bypass this.
+      try:
+        let ip = parseIpAddr(address)
+        if not isRoutable(ip):
+          debug "skipping unroutable address", address = address
+          return false
+      except CatchableError:
+        debug "skipping unparseable address", address = address
+        return false
+
   # Check netgroup diversity for outbound connections.
   # FIX-51 (W115 G27): use ASN-keyed group via pm.netGroupManager when asmap
   # is loaded, mirroring Core's CConnman::ThreadOpenConnections which calls
@@ -426,6 +553,10 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
   # branch.
   if pm.isV1Only(address, port):
     peer.v2OutboundDisabled = true
+  # W117 BUG-3 FIX (FIX-56): hand the configured ProxyManager (if any) to
+  # the Peer so Peer.connect() dispatches based on address type
+  # (.onion → Tor SOCKS, .i2p → SAM, IPv4/IPv6 → direct/SOCKS5).
+  peer.proxyManager = pm.proxyManager
   pm.peers[key] = peer
 
   if await peer.connect():

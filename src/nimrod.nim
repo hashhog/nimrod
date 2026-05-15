@@ -89,6 +89,23 @@ type
                             ## eclipse-resistance bucketing.  Empty = disabled
                             ## (fallback to /16 / /32 groups).
                             ## Reference: bitcoin-core/src/init.cpp -asmap arg.
+    proxy*: string          ## --proxy=host:port: SOCKS5 proxy for IPv4/IPv6
+                            ## clearnet outbound connections (and .onion when
+                            ## --onion is not set separately).  Mirrors
+                            ## Bitcoin Core `-proxy=host:port`.  W117 FIX-56.
+    onionProxy*: string     ## --onion=host:port: dedicated SOCKS5 proxy for
+                            ## .onion outbound (typically the Tor SOCKS port,
+                            ## 127.0.0.1:9050). When set, .onion peers use this
+                            ## instead of the clearnet --proxy. Mirrors Core's
+                            ## `-onion=host:port`.  W117 FIX-56.
+    i2psam*: string         ## --i2psam=host:port: I2P SAM bridge endpoint for
+                            ## .i2p outbound (default SAM port is 7656).
+                            ## Mirrors Core's `-i2psam=host:port`.  W117 FIX-56.
+    cjdnsReachable*: bool   ## --cjdnsreachable: allow outbound connections to
+                            ## CJDNS addresses (fc00::/8).  Default off — Core
+                            ## requires the operator to opt-in because the host
+                            ## must already have a CJDNS route.  Mirrors Core's
+                            ## `-cjdnsreachable`.  W117 FIX-56.
 
   NodeState* = ref object
     config*: NimrodConfig
@@ -180,7 +197,12 @@ proc defaultConfig*(): NimrodConfig =
     restEnabled: false,
     restPort: 0,            # 0 = derive from rpcPort (rpcPort + 1000)
     blockfilterindex: false,
-    asmapFile: ""           # empty = ASMap disabled
+    asmapFile: "",          # empty = ASMap disabled
+    # W117 FIX-56 proxy flags (all default off)
+    proxy: "",
+    onionProxy: "",
+    i2psam: "",
+    cjdnsReachable: false
   )
 
 proc loadConfigFile*(config: var NimrodConfig) =
@@ -284,6 +306,17 @@ proc loadConfigFile*(config: var NimrodConfig) =
         config.blockfilterindex = false
     of "asmap":
       config.asmapFile = value
+    of "proxy":
+      # W117 FIX-56: SOCKS5 proxy for clearnet (and .onion fallback)
+      config.proxy = value
+    of "onion":
+      # W117 FIX-56: dedicated Tor SOCKS5 proxy for .onion
+      config.onionProxy = value
+    of "i2psam":
+      # W117 FIX-56: I2P SAM bridge endpoint for .i2p
+      config.i2psam = value
+    of "cjdnsreachable":
+      config.cjdnsReachable = value.toLowerAscii() in ["", "1", "true", "yes"]
     else:
       discard
 
@@ -353,6 +386,18 @@ Operational:
                          diversity is measured by Autonomous System Number
                          rather than /16 prefix.  Mirrors Bitcoin Core
                          -asmap=<file>.  W115 FIX-50.
+  --proxy=HOST:PORT      SOCKS5 proxy for clearnet (IPv4/IPv6) outbound and
+                         .onion fallback.  Mirrors Bitcoin Core -proxy.
+                         W117 FIX-56.
+  --onion=HOST:PORT      Dedicated Tor SOCKS5 proxy for .onion outbound.
+                         Stream isolation per circuit.  Mirrors Bitcoin Core
+                         -onion.  W117 FIX-56.
+  --i2psam=HOST:PORT     I2P SAM bridge endpoint for .i2p outbound (default
+                         SAM port is 7656).  Mirrors Bitcoin Core -i2psam.
+                         W117 FIX-56.
+  --cjdnsreachable       Allow outbound to CJDNS addresses (fc00::/8).
+                         Default off; the host must have a CJDNS route.
+                         Mirrors Bitcoin Core -cjdnsreachable.  W117 FIX-56.
 
   -h, --help             Show this help
   -v, --version          Show version
@@ -541,6 +586,28 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           quit(1)
       of "asmap":
         result.config.asmapFile = p.val
+      of "proxy":
+        # W117 FIX-56: --proxy=host:port — SOCKS5 proxy for clearnet outbound
+        # (and .onion when --onion is not separately configured).  Mirrors
+        # Bitcoin Core's -proxy=host:port.  Empty value disables.
+        result.config.proxy = p.val
+      of "onion":
+        # W117 FIX-56: --onion=host:port — dedicated Tor SOCKS5 proxy for
+        # .onion outbound.  Stream isolation is enabled by default so each
+        # .onion connect gets a fresh Tor circuit.  Mirrors Core's -onion.
+        result.config.onionProxy = p.val
+      of "i2psam":
+        # W117 FIX-56: --i2psam=host:port — I2P SAM bridge endpoint for
+        # .i2p outbound (default SAM port is 7656).  Mirrors Core's -i2psam.
+        result.config.i2psam = p.val
+      of "cjdnsreachable":
+        # W117 FIX-56: --cjdnsreachable — opt-in flag that allows outbound
+        # to CJDNS addresses (fc00::/8).  Default off — the host must have a
+        # CJDNS route.  Mirrors Core's -cjdnsreachable.
+        if p.val.len == 0:
+          result.config.cjdnsReachable = true
+        else:
+          result.config.cjdnsReachable = p.val.toLowerAscii() in ["1", "true", "yes"]
       of "help", "h":
         showHelp()
         quit(0)
@@ -1916,6 +1983,54 @@ proc startNode*(config: NimrodConfig) {.async.} =
     netGroupMgr = state.netGroupManager)
   state.peerManager.updateHeight(state.chainState.bestHeight)
   state.peerManager.setMessageCallback(messageCallback(state))
+
+  # 5c. W117 BUG-3 FIX (FIX-56): wire the dead-helper src/network/proxy.nim
+  # subsystems (SOCKS5 / Tor control / I2P SAM / ProxyManager) into the
+  # outbound connect path based on --proxy / --onion / --i2psam /
+  # --cjdnsreachable.
+  # Reference: bitcoin-core/src/init.cpp AppInitMain calls SetProxy() and
+  # SetReachable() from these arguments.
+  proc parseHostPort(spec: string): Option[tuple[host: string, port: uint16]] =
+    let colon = spec.rfind(':')
+    if colon <= 0 or colon == spec.high:
+      return none(tuple[host: string, port: uint16])
+    let host = spec[0 ..< colon]
+    try:
+      let portVal = parseInt(spec[colon + 1 .. ^1])
+      if portVal < 1 or portVal > 65535:
+        return none(tuple[host: string, port: uint16])
+      return some((host: host, port: uint16(portVal)))
+    except ValueError:
+      return none(tuple[host: string, port: uint16])
+
+  if config.proxy.len > 0:
+    let parsed = parseHostPort(config.proxy)
+    if parsed.isSome:
+      let hp = parsed.get()
+      state.peerManager.configureProxy(hp.host, hp.port)
+    else:
+      warn "invalid --proxy value, expected host:port", value = config.proxy
+  if config.onionProxy.len > 0:
+    let parsed = parseHostPort(config.onionProxy)
+    if parsed.isSome:
+      let hp = parsed.get()
+      state.peerManager.configureOnionProxy(hp.host, hp.port,
+                                            randomizeCredentials = true)
+    else:
+      warn "invalid --onion value, expected host:port", value = config.onionProxy
+  if config.i2psam.len > 0:
+    let parsed = parseHostPort(config.i2psam)
+    if parsed.isSome:
+      let hp = parsed.get()
+      let keyFile = networkDir / "i2p_private.key"
+      state.peerManager.configureI2PSam(hp.host, hp.port,
+                                        privateKeyFile = keyFile,
+                                        transient = false)
+    else:
+      warn "invalid --i2psam value, expected host:port", value = config.i2psam
+  if config.cjdnsReachable:
+    state.peerManager.setCjdnsReachable(true)
+    info "CJDNS outbound enabled"
 
   # 5b. Optional BIP-157 basic block-filter index.  Created BEFORE the sync
   # manager so we can pass it down — the SyncManager fans every successful
