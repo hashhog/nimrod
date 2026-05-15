@@ -25,7 +25,7 @@
 ##   Fee bumping      G19 BIP-125 MAX_BIP125_RBF_SEQUENCE constant
 ##                    G20 signalsOptInRBF predicate matches sequence threshold
 ##                    G21 createTransaction emits RBF-signaling sequence
-##                    G22 bumpfee / psbtbumpfee RPC absent (BUG: MISSING)
+##                    G22 bumpfee / psbtbumpfee RPC present (FIX-61 closure)
 ##
 ##   Send             G23 createTransaction balance / change accounting
 ##                    G24 signTransaction round-trip for P2WPKH
@@ -38,15 +38,15 @@
 ##                    G30 Knapsack stochastic fallback
 ##
 ## BUGs found (this audit):
-##   BUG-1 (HIGH)  G22  bumpfee / psbtbumpfee RPC entirely missing. The
-##                      mempool implements BIP-125 RBF replacement, the
-##                      wallet emits the RBF sequence on outgoing txs, and
-##                      `signalsOptInRBF` is wired through mempool/policy,
-##                      but the user-facing `bumpfee` / `psbtbumpfee` RPCs
-##                      (Core wallet/rpc/wallet.cpp) are not registered.
-##                      grep -i 'bump.*fee' src/rpc/ returns no matches.
-##                      Operator has no way to re-fee a stuck wallet tx
-##                      short of hand-crafting the replacement.
+##   BUG-1 (HIGH)  G22  bumpfee / psbtbumpfee RPC entirely missing.
+##                      CLOSED in FIX-61 (2026-05-15) — see commit message.
+##                      New wallet/feebumper.nim hosts the algorithm; new
+##                      handleBumpFee / handlePsbtBumpFee procs (rpc/server.nim)
+##                      sign+broadcast and PSBT-package respectively. This is
+##                      the textbook "dead-helper-at-RPC-boundary" shape:
+##                      mempool RBF was already correct (sequence 0xfffffffd,
+##                      four-gate BIP-125 replacement), only the user-facing
+##                      RPC dispatch was missing.
 ##   BUG-2 (MED)   G18  PSBT_HIGHEST_VERSION = 0 — BIP-370 v2 (per-input
 ##                      locktime, sequence, output index, fallback locktime)
 ##                      not implemented. Carried over from W111 BUG-3,
@@ -75,13 +75,16 @@
 ##     transactions through createTransaction's 0xfffffffd sequence, so
 ##     no fresh two-pipeline closure is needed in this wave.
 
-import std/[unittest, strutils, options, tables]
+import std/[unittest, strutils, options, tables, os, times, sets]
 import ../src/wallet/wallet
 import ../src/wallet/descriptor
 import ../src/wallet/psbt
 import ../src/wallet/coinselection
+import ../src/wallet/feebumper
 import ../src/mempool/mempool
-import ../src/primitives/types
+import ../src/primitives/[types, serialize]
+import ../src/storage/chainstate
+import ../src/consensus/[params, validation]
 import ../src/crypto/[hashing, address, secp256k1]
 
 # ---------------------------------------------------------------------------
@@ -420,24 +423,330 @@ suite "W118 G19-G22 Fee bumping":
         check inp.sequence == 0xfffffffd'u32
       check signalsOptInRBF(tx)
 
-  test "G22 BUG-1 (HIGH): bumpfee / psbtbumpfee RPC absent":
-    ## The RBF policy machinery is wired through `mempool/mempool.nim`
-    ## (signalsOptInRBF, isRbfOptIn, findConflicts, MaxBip125RbfSequence,
-    ## MaxReplacementCandidates) and createTransaction emits the opt-in
-    ## sequence (G21). However, the user-facing wallet RPCs `bumpfee` and
-    ## `psbtbumpfee` (Core: wallet/rpc/wallet.cpp) are NOT registered.
-    ## This test documents the gap — there is no procedural way to
-    ## express "increase the fee on an existing in-mempool wallet tx".
-    ##
-    ## Indirect runtime check: the mempool-side constants are present
-    ## (correct) but no `bumpFee` symbol is declared on the wallet API.
-    ## The Nim `compiles(...)` macro evaluates a call-site without
-    ## emitting code — false ⇒ symbol is missing.
+  test "G22 BUG-1 (HIGH) CLOSED: createRateBumpTransaction symbol present":
+    ## Audit-flip: pre-FIX-61 nimrod had no `bumpfee` symbol at all
+    ## (the W118 audit test was `check not compiles(bumpfee)`).
+    ## FIX-61 introduced wallet/feebumper.nim exporting
+    ## createRateBumpTransaction + BumpFeeRequest / BumpFeeOutcome /
+    ## BumpFeeError. The mempool-side BIP-125 invariants
+    ## (MaxBip125RbfSequence + MaxReplacementCandidates) remain pinned
+    ## as a regression guard.
     check MaxBip125RbfSequence == 0xfffffffd'u32
     check MaxReplacementCandidates == 100
-    check not compiles(bumpFee)
-    check not compiles(bumpfee)
-    check not compiles(psbtbumpfee)
+    check compiles(createRateBumpTransaction)
+    check compiles(BumpFeeRequest)
+    check compiles(BumpFeeOutcome)
+    check compiles(BumpFeeError)
+
+# ---------------------------------------------------------------------------
+# G22 round-trip + reject-path tests (FIX-61)
+#
+# Exercises wallet/feebumper.nim end-to-end against a real wallet +
+# real chainstate + real mempool entry. The RPC dispatch layer
+# (rpc/server.nim:handleBumpFee / handlePsbtBumpFee) is a thin wrapper
+# over createRateBumpTransaction — same Bumper helper, plus signing
+# (bumpfee) / PSBT packaging (psbtbumpfee). The protocol shape is
+# covered separately by the higher-level RPC harness.
+# ---------------------------------------------------------------------------
+when defined(useSystemSecp256k1):
+
+  const G22DbBase = "/tmp/nimrod_w118_g22_test"
+
+  proc g22Cleanup() =
+    if dirExists(G22DbBase):
+      removeDir(G22DbBase)
+
+  proc g22Setup(dbPath: string): tuple[w: Wallet, cs: ChainState, mp: Mempool] =
+    ## Build a wallet with a single P2WPKH UTXO already on-chain (in
+    ## chainState's UTXO cache) and an empty mempool sharing the same
+    ## chainstate.
+    let cs = newChainState(dbPath, regtestParams())
+    let mp = newMempool(cs, regtestParams(), fullRbf = false)
+    let m = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    var wallet = newWallet(m)
+    wallet.addAccount(84, 0, 5)
+    (wallet, cs, mp)
+
+  proc g22InjectFundingUtxo(wallet: var Wallet, cs: var ChainState,
+                            value: int64, height: int32 = 100): OutPoint =
+    ## Drop a single P2WPKH UTXO into chainState whose scriptPubKey
+    ## belongs to wallet's first external key. Returns the outpoint.
+    let key = wallet.accounts[0].externalKeys[0]
+    let spk = scriptPubKeyForAddress(key.address)
+    var idArr: array[32, byte]
+    for i in 0 ..< 32: idArr[i] = byte((i + 7) and 0xff)
+    let op = OutPoint(txid: TxId(idArr), vout: 0'u32)
+    cs.putUtxoCache(op, UtxoEntry(
+      output: TxOut(value: Satoshi(value), scriptPubKey: spk),
+      height: height,
+      isCoinbase: false
+    ))
+    # ALSO add to wallet — createTransaction reads from wallet.utxos.
+    wallet.addUtxo(op,
+      TxOut(value: Satoshi(value), scriptPubKey: spk),
+      height = height, keyPath = key.path,
+      isInternal = false, isCoinbase = false)
+    op
+
+  proc g22InjectMempool(mp: Mempool, tx: Transaction, fee: Satoshi) =
+    ## Manually splice a transaction into the mempool without going
+    ## through full acceptTransaction (which requires script/script
+    ## validation against UTXOs we haven't fully populated). Mirrors
+    ## the entry shape the real acceptTransaction would have produced.
+    let txid = tx.txid()
+    let weight = validation.calculateTransactionWeight(tx)
+    let vsize = (weight + 3) div 4
+    let feeRate = if vsize <= 0: 0.0 else: float64(int64(fee)) / float64(vsize)
+    let entry = MempoolEntry(
+      tx: tx, txid: txid, wtxid: txid, fee: fee,
+      weight: weight, feeRate: feeRate,
+      timeAdded: getTime(), height: 0'i32,
+      ancestorFee: fee, ancestorWeight: weight,
+      ancestorCount: 1, ancestorSize: vsize
+    )
+    mp.entries[txid] = entry
+    mp.byWtxid[txid] = txid
+    mp.currentSize += weight
+    for input in tx.inputs:
+      mp.spentBy[input.prevOut] = txid
+
+  suite "W118 G22 bumpfee round-trip (FIX-61)":
+
+    test "G22 round-trip: createRateBumpTransaction raises new fee, reduces change":
+      g22Cleanup()
+      var (wallet, cs, mp) = g22Setup(G22DbBase & "_rt")
+      let _ = g22InjectFundingUtxo(wallet, cs, 1_000_000)
+
+      # Build & enqueue an outgoing tx at feeRate=2 sat/vB.
+      let toKey = wallet.accounts[0].externalKeys[1]
+      let toSpk = scriptPubKeyForAddress(toKey.address)
+      let outputs = @[TxOut(value: Satoshi(100_000), scriptPubKey: toSpk)]
+      let origTx = wallet.createTransaction(outputs, feeRate = 2.0,
+                                            useAdvancedCoinSelection = false)
+      # Remove the funding UTXO from wallet (acceptTransaction would do this).
+      for inp in origTx.inputs:
+        wallet.removeUtxo(inp.prevOut)
+      # Splice into mempool with fee = totalIn - totalOut.
+      var outSum = Satoshi(0)
+      for o in origTx.outputs: outSum = outSum + o.value
+      let origFee = Satoshi(1_000_000) - outSum
+      g22InjectMempool(mp, origTx, origFee)
+
+      # Sanity: original tx is BIP-125 opt-in.
+      check signalsOptInRBF(origTx)
+
+      # Now bump it at 10 sat/vB.
+      let req = BumpFeeRequest(
+        txid: origTx.txid(),
+        feeRate: 10.0, confTarget: 6, replaceable: true)
+      let outcome = createRateBumpTransaction(
+        wallet, mp, cs, req,
+        requireMine = true,
+        estimatorFeeRate = 1.0,
+        minRelayFeeSatVb = 1.0,
+        incrementalRelayFeeSatVb = 1.0)
+
+      # New fee strictly higher.
+      check int64(outcome.newFee) > int64(outcome.oldFee)
+      check int64(outcome.oldFee) == int64(origFee)
+      # New tx still BIP-125 opt-in (replaceable=true → 0xfffffffd).
+      for inp in outcome.newTx.inputs:
+        check inp.sequence == 0xfffffffd'u32
+      check signalsOptInRBF(outcome.newTx)
+      # Same input set.
+      check outcome.newTx.inputs.len == origTx.inputs.len
+      check outcome.newTx.inputs[0].prevOut == origTx.inputs[0].prevOut
+      # Output count unchanged (recipient preserved, change reduced).
+      check outcome.newTx.outputs.len == origTx.outputs.len
+
+    test "G22 reject: tx not in mempool → bfeInvalidAddressOrKey":
+      g22Cleanup()
+      var (wallet, cs, mp) = g22Setup(G22DbBase & "_nf")
+      let _ = g22InjectFundingUtxo(wallet, cs, 1_000_000)
+      var bogusTxid: array[32, byte]
+      for i in 0 ..< 32: bogusTxid[i] = byte(0xCC)
+      let req = BumpFeeRequest(txid: TxId(bogusTxid),
+                               feeRate: 10.0, confTarget: 6, replaceable: true)
+      var caught = false
+      try:
+        discard createRateBumpTransaction(wallet, mp, cs, req,
+          requireMine = true,
+          estimatorFeeRate = 1.0,
+          minRelayFeeSatVb = 1.0,
+          incrementalRelayFeeSatVb = 1.0)
+      except BumpFeeError as e:
+        caught = true
+        check parseBfeKind(e.msg).kind == bfeInvalidAddressOrKey
+      check caught
+
+    test "G22 reject: new fee rate not higher than incremental floor":
+      g22Cleanup()
+      var (wallet, cs, mp) = g22Setup(G22DbBase & "_lowfee")
+      let _ = g22InjectFundingUtxo(wallet, cs, 1_000_000)
+      let toSpk = scriptPubKeyForAddress(wallet.accounts[0].externalKeys[1].address)
+      let outputs = @[TxOut(value: Satoshi(100_000), scriptPubKey: toSpk)]
+      let origTx = wallet.createTransaction(outputs, feeRate = 5.0,
+                                            useAdvancedCoinSelection = false)
+      for inp in origTx.inputs:
+        wallet.removeUtxo(inp.prevOut)
+      var outSum = Satoshi(0)
+      for o in origTx.outputs: outSum = outSum + o.value
+      let origFee = Satoshi(1_000_000) - outSum
+      g22InjectMempool(mp, origTx, origFee)
+
+      # Request 5 sat/vB — same as the original. Must reject.
+      let req = BumpFeeRequest(txid: origTx.txid(),
+                               feeRate: 1.0,  # below original feerate
+                               confTarget: 6, replaceable: true)
+      var caught = false
+      try:
+        discard createRateBumpTransaction(wallet, mp, cs, req,
+          requireMine = true,
+          estimatorFeeRate = 1.0,
+          minRelayFeeSatVb = 1.0,
+          incrementalRelayFeeSatVb = 1.0)
+      except BumpFeeError as e:
+        caught = true
+        check parseBfeKind(e.msg).kind == bfeInvalidParameter
+      check caught
+
+    test "G22 reject: tx without BIP-125 opt-in → bfeWalletError":
+      g22Cleanup()
+      var (wallet, cs, mp) = g22Setup(G22DbBase & "_norbf")
+      let funding = g22InjectFundingUtxo(wallet, cs, 1_000_000)
+      # Hand-craft a tx with sequence=0xffffffff (NOT opt-in).
+      let toSpk = scriptPubKeyForAddress(wallet.accounts[0].externalKeys[1].address)
+      let nonRbf = Transaction(
+        version: 2'i32,
+        inputs: @[TxIn(prevOut: funding,
+                       scriptSig: @[], sequence: 0xffffffff'u32)],
+        outputs: @[TxOut(value: Satoshi(900_000), scriptPubKey: toSpk)],
+        witnesses: @[@[newSeq[byte](0)]],
+        lockTime: 0)
+      let origFee = Satoshi(100_000)
+      g22InjectMempool(mp, nonRbf, origFee)
+      check not signalsOptInRBF(nonRbf)
+
+      let req = BumpFeeRequest(txid: nonRbf.txid(),
+                               feeRate: 10.0,
+                               confTarget: 6, replaceable: true)
+      var caught = false
+      try:
+        discard createRateBumpTransaction(wallet, mp, cs, req,
+          requireMine = true,
+          estimatorFeeRate = 1.0,
+          minRelayFeeSatVb = 1.0,
+          incrementalRelayFeeSatVb = 1.0)
+      except BumpFeeError as e:
+        caught = true
+        check parseBfeKind(e.msg).kind == bfeWalletError
+      check caught
+
+    test "G22 reject: tx has in-mempool descendant → bfeInvalidParameter":
+      g22Cleanup()
+      var (wallet, cs, mp) = g22Setup(G22DbBase & "_desc")
+      let _ = g22InjectFundingUtxo(wallet, cs, 1_000_000)
+      let toSpk = scriptPubKeyForAddress(wallet.accounts[0].externalKeys[1].address)
+      let outputs = @[TxOut(value: Satoshi(100_000), scriptPubKey: toSpk)]
+      let origTx = wallet.createTransaction(outputs, feeRate = 2.0,
+                                            useAdvancedCoinSelection = false)
+      for inp in origTx.inputs:
+        wallet.removeUtxo(inp.prevOut)
+      var outSum = Satoshi(0)
+      for o in origTx.outputs: outSum = outSum + o.value
+      let origFee = Satoshi(1_000_000) - outSum
+      g22InjectMempool(mp, origTx, origFee)
+
+      # Forge a descendant that spends origTx vout 0.
+      let descendant = Transaction(
+        version: 2'i32,
+        inputs: @[TxIn(prevOut: OutPoint(txid: origTx.txid(), vout: 0'u32),
+                       scriptSig: @[], sequence: 0xfffffffd'u32)],
+        outputs: @[TxOut(value: Satoshi(50_000), scriptPubKey: toSpk)],
+        witnesses: @[@[newSeq[byte](0)]],
+        lockTime: 0)
+      g22InjectMempool(mp, descendant, Satoshi(50_000))
+
+      let req = BumpFeeRequest(txid: origTx.txid(),
+                               feeRate: 10.0,
+                               confTarget: 6, replaceable: true)
+      var caught = false
+      try:
+        discard createRateBumpTransaction(wallet, mp, cs, req,
+          requireMine = true,
+          estimatorFeeRate = 1.0,
+          minRelayFeeSatVb = 1.0,
+          incrementalRelayFeeSatVb = 1.0)
+      except BumpFeeError as e:
+        caught = true
+        check parseBfeKind(e.msg).kind == bfeInvalidParameter
+      check caught
+
+    test "G22 reject: change too small to absorb fee delta → bfeWalletError":
+      ## Construct an outgoing tx whose change is just above dust; the
+      ## bump's delta exceeds the change, so the algorithm refuses
+      ## (it does not yet add new inputs).
+      g22Cleanup()
+      var (wallet, cs, mp) = g22Setup(G22DbBase & "_dust")
+      # Tiny funding amount so change is small after the recipient + fee.
+      let _ = g22InjectFundingUtxo(wallet, cs, 102_000)
+      let toSpk = scriptPubKeyForAddress(wallet.accounts[0].externalKeys[1].address)
+      let outputs = @[TxOut(value: Satoshi(100_000), scriptPubKey: toSpk)]
+      let origTx = wallet.createTransaction(outputs, feeRate = 1.0,
+                                            useAdvancedCoinSelection = false)
+      for inp in origTx.inputs:
+        wallet.removeUtxo(inp.prevOut)
+      var outSum = Satoshi(0)
+      for o in origTx.outputs: outSum = outSum + o.value
+      let origFee = Satoshi(102_000) - outSum
+      g22InjectMempool(mp, origTx, origFee)
+
+      # Bump to 100 sat/vB — vastly exceeds remaining change capacity.
+      let req = BumpFeeRequest(txid: origTx.txid(),
+                               feeRate: 100.0,
+                               confTarget: 6, replaceable: true)
+      var caught = false
+      try:
+        discard createRateBumpTransaction(wallet, mp, cs, req,
+          requireMine = true,
+          estimatorFeeRate = 1.0,
+          minRelayFeeSatVb = 1.0,
+          incrementalRelayFeeSatVb = 1.0)
+      except BumpFeeError as e:
+        caught = true
+        check parseBfeKind(e.msg).kind == bfeWalletError
+      check caught
+
+    test "G22 replaceable=false → new tx uses sequence 0xfffffffe":
+      g22Cleanup()
+      var (wallet, cs, mp) = g22Setup(G22DbBase & "_fe")
+      let _ = g22InjectFundingUtxo(wallet, cs, 1_000_000)
+      let toSpk = scriptPubKeyForAddress(wallet.accounts[0].externalKeys[1].address)
+      let outputs = @[TxOut(value: Satoshi(100_000), scriptPubKey: toSpk)]
+      let origTx = wallet.createTransaction(outputs, feeRate = 2.0,
+                                            useAdvancedCoinSelection = false)
+      for inp in origTx.inputs:
+        wallet.removeUtxo(inp.prevOut)
+      var outSum = Satoshi(0)
+      for o in origTx.outputs: outSum = outSum + o.value
+      let origFee = Satoshi(1_000_000) - outSum
+      g22InjectMempool(mp, origTx, origFee)
+
+      let req = BumpFeeRequest(txid: origTx.txid(),
+                               feeRate: 10.0, confTarget: 6,
+                               replaceable: false)
+      let outcome = createRateBumpTransaction(
+        wallet, mp, cs, req,
+        requireMine = true,
+        estimatorFeeRate = 1.0,
+        minRelayFeeSatVb = 1.0,
+        incrementalRelayFeeSatVb = 1.0)
+      for inp in outcome.newTx.inputs:
+        check inp.sequence == 0xfffffffe'u32
+      # not BIP-125 opt-in anymore (final-1 = 0xfffffffe > 0xfffffffd).
+      check not signalsOptInRBF(outcome.newTx)
+
+  g22Cleanup()
 
 # ---------------------------------------------------------------------------
 # G23-G26: Send
