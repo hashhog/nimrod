@@ -4,9 +4,17 @@
 ## No authentication required (read-only)
 ##
 ## Reference: Bitcoin Core rest.cpp
+##
+## Transport: defaults to plaintext HTTP for backward compatibility.  When
+## `--rpc-tls-cert` and `--rpc-tls-key` are both set, the listener wraps
+## each accepted connection in a `chronos/streams/tlsstream` TLS server
+## session (HTTPS).  The PEM-encoded cert and PKCS#8 PEM key are loaded
+## once at startup; failures abort the listener immediately rather than
+## silently fall back to plaintext.  W119 + FIX-64.
 
-import std/[json, strutils, tables, options, times]
+import std/[json, strutils, tables, options, times, os]
 import chronos
+import chronos/streams/[asyncstream, tlsstream]
 import chronicles
 import ../primitives/[types, serialize]
 import ../consensus/params
@@ -35,6 +43,14 @@ type
     running*: bool
     txIndex*: TxIndex  ## Optional: for tx lookup
     filterIndex*: BlockFilterIndex  ## Optional: BIP-157 cfilter / cfheader lookup
+    # ---- TLS termination (W119 + FIX-64) ----
+    tlsEnabled*: bool             ## True when both cert+key were loaded.
+                                  ## When false, the listener is plaintext
+                                  ## HTTP (backward-compatible default).
+    tlsCertPath*: string          ## On-disk PEM cert path (informational).
+    tlsKeyPath*: string           ## On-disk PKCS#8 PEM key path (informational).
+    tlsPrivateKey*: TLSPrivateKey ## Loaded once at startup; reused per accept.
+    tlsCertificate*: TLSCertificate ## Loaded once at startup; reused per accept.
 
 const
   MaxGetUtxosOutpoints* = 15  ## Max outpoints per getutxos request
@@ -43,23 +59,93 @@ const
 proc newRestError(msg: string): ref RestError =
   newException(RestError, msg)
 
+proc loadTlsMaterial(certPath, keyPath: string):
+    tuple[cert: TLSCertificate, key: TLSPrivateKey] =
+  ## Load and parse the PEM cert + PKCS#8 PEM key from disk.
+  ##
+  ## Returns the parsed pair on success; raises `RestError` with a
+  ## descriptive message on any failure (missing file, bad encoding,
+  ## unsupported key type).  Callers MUST treat any exception as fatal
+  ## and refuse to start the listener — silently falling back to
+  ## plaintext when TLS was requested would defeat BIP-78 §Protocol's
+  ## HTTPS requirement.
+  if certPath.len == 0:
+    raise newRestError("TLS cert path is empty")
+  if keyPath.len == 0:
+    raise newRestError("TLS key path is empty")
+  if not fileExists(certPath):
+    raise newRestError("TLS cert file not found: " & certPath)
+  if not fileExists(keyPath):
+    raise newRestError("TLS key file not found: " & keyPath)
+
+  let certPem =
+    try: readFile(certPath)
+    except IOError as e:
+      raise newRestError("failed to read TLS cert " & certPath & ": " & e.msg)
+  let keyPem =
+    try: readFile(keyPath)
+    except IOError as e:
+      raise newRestError("failed to read TLS key " & keyPath & ": " & e.msg)
+
+  let cert =
+    try: TLSCertificate.init(certPem)
+    except TLSStreamProtocolError as e:
+      raise newRestError("invalid TLS cert " & certPath & ": " & e.msg)
+  let key =
+    try: TLSPrivateKey.init(keyPem)
+    except TLSStreamProtocolError as e:
+      raise newRestError("invalid TLS key " & keyPath & ": " & e.msg)
+
+  (cert: cert, key: key)
+
 proc newRestServer*(
   port: uint16,
   chainState: ChainState,
   mempool: Mempool,
   params: ConsensusParams,
   txIndex: TxIndex = nil,
-  filterIndex: BlockFilterIndex = nil
+  filterIndex: BlockFilterIndex = nil,
+  tlsCertPath: string = "",
+  tlsKeyPath: string = ""
 ): RestServer =
-  RestServer(
+  ## Construct a REST server.
+  ##
+  ## TLS is enabled iff BOTH `tlsCertPath` and `tlsKeyPath` are non-empty.
+  ## Passing exactly one of the two is an operator mistake and raises
+  ## `RestError` so the caller can fail fast at startup instead of
+  ## silently downgrading to HTTP.  Pass both empty (the default) to keep
+  ## the existing plaintext behaviour.  W119 + FIX-64.
+  let tlsRequested = tlsCertPath.len > 0 or tlsKeyPath.len > 0
+  let tlsBothSet = tlsCertPath.len > 0 and tlsKeyPath.len > 0
+  if tlsRequested and not tlsBothSet:
+    raise newRestError(
+      "--rpc-tls-cert and --rpc-tls-key must both be set (or both empty); " &
+      "got cert='" & tlsCertPath & "', key='" & tlsKeyPath & "'")
+
+  var srv = RestServer(
     port: port,
     chainState: chainState,
     mempool: mempool,
     params: params,
     running: false,
     txIndex: txIndex,
-    filterIndex: filterIndex
+    filterIndex: filterIndex,
+    tlsEnabled: false,
+    tlsCertPath: "",
+    tlsKeyPath: "",
+    tlsPrivateKey: nil,
+    tlsCertificate: nil
   )
+
+  if tlsBothSet:
+    let (cert, key) = loadTlsMaterial(tlsCertPath, tlsKeyPath)
+    srv.tlsEnabled = true
+    srv.tlsCertPath = tlsCertPath
+    srv.tlsKeyPath = tlsKeyPath
+    srv.tlsCertificate = cert
+    srv.tlsPrivateKey = key
+
+  srv
 
 # ============================================================================
 # Utility functions
@@ -977,14 +1063,20 @@ proc formatHttpResponse(resp: RestResponse): string =
   "Access-Control-Allow-Origin: *\r\n" &
   "\r\n" & resp.body
 
-proc processRestClient(rest: RestServer, transp: StreamTransport) {.async.} =
-  ## Handle a single REST client connection
+proc processStream(rest: RestServer,
+                   reader: AsyncStreamReader,
+                   writer: AsyncStreamWriter) {.async.} =
+  ## Generic HTTP/1.1 mini-parser working over any chronos AsyncStream
+  ## pair.  Used for both the plaintext path (reader/writer wrap the raw
+  ## transport directly) and the HTTPS path (reader/writer are the TLS
+  ## stream halves and have already completed the handshake before the
+  ## first call).
   var inHeaders = true
   var path = ""
 
-  while not transp.closed:
+  while not reader.atEof():
     try:
-      let line = await transp.readLine()
+      let line = await reader.readLine()
 
       if inHeaders:
         if line.len == 0:
@@ -1000,7 +1092,7 @@ proc processRestClient(rest: RestServer, transp: StreamTransport) {.async.} =
                 resp = restError(Http500, "Internal error: " & e.msg)
 
             let httpResponse = formatHttpResponse(resp)
-            discard await transp.write(httpResponse)
+            await writer.write(httpResponse)
 
           # Reset for keep-alive
           inHeaders = true
@@ -1017,15 +1109,85 @@ proc processRestClient(rest: RestServer, transp: StreamTransport) {.async.} =
     except CatchableError:
       break
 
-  await transp.closeWait()
+proc processRestClient(rest: RestServer, transp: StreamTransport) {.async.} =
+  ## Handle a single REST client connection.
+  ##
+  ## Plaintext path: wrap the transport in a chronos AsyncStream pair so
+  ##   the protocol loop is shared with the TLS path.
+  ## TLS path: wrap the transport, layer a `newTLSServerAsyncStream` on
+  ##   top, run the TLS handshake, then hand the encrypted halves to the
+  ##   shared loop.  The protocol on the wire is identical (HTTP/1.1);
+  ##   the bytes on the socket are TLS records.
+  let mainReader = newAsyncStreamReader(transp)
+  let mainWriter = newAsyncStreamWriter(transp)
+
+  if rest.tlsEnabled:
+    var tlsStream: TLSAsyncStream
+    try:
+      tlsStream = newTLSServerAsyncStream(
+        mainReader, mainWriter,
+        rest.tlsPrivateKey,
+        rest.tlsCertificate,
+        minVersion = TLSVersion.TLS12)
+    except TLSStreamError as e:
+      error "REST/TLS stream init failed", error = e.msg
+      await mainReader.closeWait()
+      await mainWriter.closeWait()
+      await transp.closeWait()
+      return
+
+    try:
+      await handshake(tlsStream)
+    except CatchableError as e:
+      # Handshake failure is expected for probes / mismatched clients;
+      # log at debug level and drop the connection cleanly.
+      debug "REST/TLS handshake failed", error = e.msg
+      try: await AsyncStreamReader(tlsStream.reader).closeWait()
+      except CatchableError: discard
+      try: await AsyncStreamWriter(tlsStream.writer).closeWait()
+      except CatchableError: discard
+      await mainReader.closeWait()
+      await mainWriter.closeWait()
+      await transp.closeWait()
+      return
+
+    try:
+      await rest.processStream(
+        AsyncStreamReader(tlsStream.reader),
+        AsyncStreamWriter(tlsStream.writer))
+    finally:
+      try: await AsyncStreamReader(tlsStream.reader).closeWait()
+      except CatchableError: discard
+      try: await AsyncStreamWriter(tlsStream.writer).closeWait()
+      except CatchableError: discard
+      await mainReader.closeWait()
+      await mainWriter.closeWait()
+      await transp.closeWait()
+  else:
+    try:
+      await rest.processStream(mainReader, mainWriter)
+    finally:
+      await mainReader.closeWait()
+      await mainWriter.closeWait()
+      await transp.closeWait()
 
 proc start*(rest: RestServer) {.async.} =
-  ## Start the REST server
+  ## Start the REST server.
+  ##
+  ## The socket-level listener is identical for HTTP and HTTPS — the
+  ## per-connection accept handler chooses whether to layer TLS based on
+  ## `rest.tlsEnabled`.  This matches Bitcoin Core's libevent+OpenSSL
+  ## pattern in `src/httpserver.cpp` (single listener, per-bufferevent
+  ## SSL wrap).
   let ta = initTAddress("127.0.0.1", Port(rest.port))
   let server = createStreamServer(ta, flags = {ReuseAddr})
 
   rest.running = true
-  info "REST server started", port = rest.port
+  if rest.tlsEnabled:
+    info "REST server started (HTTPS)",
+      port = rest.port, cert = rest.tlsCertPath
+  else:
+    info "REST server started (HTTP, no TLS)", port = rest.port
 
   while rest.running:
     try:
