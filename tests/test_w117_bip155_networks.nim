@@ -573,5 +573,187 @@ suite "G30 I2P Base64 encoding":
     expect I2PSamError:
       discard i2pExtractPublicDestination(shortKey)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-57  Encode/decode symmetry via networkIdToWire / wireToNetworkId
+# (BUG-1 P0-CDIV completion: ensure wire byte ∈ [1,6] for every NetworkId
+#  and that bytes produced by this impl decode cleanly via a fresh decoder.)
+
+suite "FIX-57 BIP-155 wire-ID symmetry (BUG-1 closure)":
+  test "every NetworkId encodes to wire byte in [1,6] (never 0-based ordinal)":
+    ## Pre-fix: enum ordinal 0..5 was emitted directly.  Post-fix: every wire
+    ## byte must be ≥1 and ≤6 (the valid BIP-155 wire-ID range), and must
+    ## equal ord(id)+1 (catches a regression that reverts to uint8(ord(id))).
+    for id in NetworkId:
+      let wire = networkIdToWire(id)
+      check wire >= 1'u8
+      check wire <= 6'u8
+      check int(wire) == ord(id) + 1
+
+  test "wireToNetworkId is the inverse of networkIdToWire for every enum":
+    ## Round-trip property: ∀ id ∈ NetworkId,
+    ##     wireToNetworkId(networkIdToWire(id)) == some(id)
+    for id in NetworkId:
+      let wire = networkIdToWire(id)
+      let decoded = wireToNetworkId(wire)
+      check decoded.isSome
+      check decoded.get() == id
+
+  test "wireToNetworkId returns none for unknown wire IDs (forward compat)":
+    ## BIP-155 "Receiver behaviour": receivers MUST silent-skip unknown
+    ## network types — they should be passed up as `none`, not raise.
+    check wireToNetworkId(0'u8).isNone
+    check wireToNetworkId(7'u8).isNone
+    check wireToNetworkId(99'u8).isNone
+    check wireToNetworkId(255'u8).isNone
+
+  test "writeNetAddressV2 wire byte matches networkIdToWire for every type":
+    ## Direct evidence the encoder uses the new mapping for every variant.
+    ## Each constructed NetAddressV2 must serialise with first byte == the
+    ## BIP-155 wire ID (not the Nim enum ordinal).
+    block ipv4:
+      var a = NetAddressV2(networkId: netIPv4)
+      a.ipv4 = [1'u8, 2, 3, 4]
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      check w.data[0] == networkIdToWire(netIPv4)
+      check w.data[0] == 1'u8
+    block ipv6:
+      var a = NetAddressV2(networkId: netIPv6)
+      for i in 0 ..< 16: a.ipv6[i] = byte(i)
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      check w.data[0] == networkIdToWire(netIPv6)
+      check w.data[0] == 2'u8
+    block torv2:
+      var a = NetAddressV2(networkId: netTorV2)
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      check w.data[0] == networkIdToWire(netTorV2)
+      check w.data[0] == 3'u8
+    block torv3:
+      var a = NetAddressV2(networkId: netTorV3)
+      for i in 0 ..< 32: a.torv3[i] = byte(i + 1)
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      check w.data[0] == networkIdToWire(netTorV3)
+      check w.data[0] == 4'u8
+    block i2p:
+      var a = NetAddressV2(networkId: netI2P)
+      for i in 0 ..< 32: a.i2p[i] = byte(i + 1)
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      check w.data[0] == networkIdToWire(netI2P)
+      check w.data[0] == 5'u8
+    block cjdns:
+      var a = NetAddressV2(networkId: netCJDNS)
+      a.cjdns[0] = 0xFC
+      for i in 1 ..< 16: a.cjdns[i] = byte(i)
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      check w.data[0] == networkIdToWire(netCJDNS)
+      check w.data[0] == 6'u8
+
+  test "cross-decode: every NetAddressV2 round-trips through a fresh decoder":
+    ## Build one NetAddressV2 of each non-TorV2 variant, encode with this
+    ## impl, decode into a *separate* BinaryReader, and verify the recovered
+    ## NetworkId matches.  Pre-fix this would only have worked by accident
+    ## (encoder and decoder both off by one in opposite directions); post-fix
+    ## it has to hold under a clean reader.
+    block ipv4:
+      var a = NetAddressV2(networkId: netIPv4)
+      a.ipv4 = [8'u8, 8, 8, 8]
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      var r = BinaryReader(data: w.data, pos: 0)
+      let got = r.readNetAddressV2()
+      check got.isSome
+      check got.get().networkId == netIPv4
+      check got.get().ipv4 == a.ipv4
+    block ipv6:
+      var a = NetAddressV2(networkId: netIPv6)
+      for i in 0 ..< 16: a.ipv6[i] = byte(i + 0x40)
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      var r = BinaryReader(data: w.data, pos: 0)
+      let got = r.readNetAddressV2()
+      check got.isSome
+      check got.get().networkId == netIPv6
+      check got.get().ipv6 == a.ipv6
+    block torv3:
+      var a = NetAddressV2(networkId: netTorV3)
+      for i in 0 ..< 32: a.torv3[i] = byte(i + 0x10)
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      var r = BinaryReader(data: w.data, pos: 0)
+      let got = r.readNetAddressV2()
+      check got.isSome
+      check got.get().networkId == netTorV3
+      check got.get().torv3 == a.torv3
+    block i2p:
+      var a = NetAddressV2(networkId: netI2P)
+      for i in 0 ..< 32: a.i2p[i] = byte(i + 0x20)
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      var r = BinaryReader(data: w.data, pos: 0)
+      let got = r.readNetAddressV2()
+      check got.isSome
+      check got.get().networkId == netI2P
+      check got.get().i2p == a.i2p
+    block cjdns:
+      var a = NetAddressV2(networkId: netCJDNS)
+      a.cjdns[0] = 0xFC
+      for i in 1 ..< 16: a.cjdns[i] = byte(i + 0x30)
+      var w = BinaryWriter()
+      w.writeNetAddressV2(a)
+      var r = BinaryReader(data: w.data, pos: 0)
+      let got = r.readNetAddressV2()
+      check got.isSome
+      check got.get().networkId == netCJDNS
+      check got.get().cjdns == a.cjdns
+
+  test "external Core-shape bytes decode correctly (wire-ID 1..6 hand-built)":
+    ## Hand-build the exact byte sequence a BIP-155-compliant peer would emit
+    ## (i.e. NOT what the buggy pre-fix encoder produced) and verify the
+    ## decoder recovers the right NetworkId.  This is the asymmetric-bug
+    ## guard the prompt calls out — the old roundtrip test could not catch a
+    ## sender that disagreed with the receiver.
+    block ipv4:
+      let data = @[1'u8, 4, 192, 0, 2, 1]
+      var r = BinaryReader(data: data, pos: 0)
+      let got = r.readNetAddressV2()
+      check got.isSome
+      check got.get().networkId == netIPv4
+    block ipv6:
+      let data = @[2'u8, 16] & newSeq[byte](16)
+      var r = BinaryReader(data: data, pos: 0)
+      let got = r.readNetAddressV2()
+      check got.isSome
+      check got.get().networkId == netIPv6
+    block torv3:
+      var payload = newSeq[byte](32)
+      for i in 0 ..< 32: payload[i] = 0xA0'u8
+      let data = @[4'u8, 32] & payload
+      var r = BinaryReader(data: data, pos: 0)
+      let got = r.readNetAddressV2()
+      check got.isSome
+      check got.get().networkId == netTorV3
+    block i2p:
+      var payload = newSeq[byte](32)
+      for i in 0 ..< 32: payload[i] = 0xB0'u8
+      let data = @[5'u8, 32] & payload
+      var r = BinaryReader(data: data, pos: 0)
+      let got = r.readNetAddressV2()
+      check got.isSome
+      check got.get().networkId == netI2P
+    block cjdns:
+      var bytes = newSeq[byte](16)
+      bytes[0] = 0xFC
+      for i in 1 ..< 16: bytes[i] = byte(i)
+      let data = @[6'u8, 16] & bytes
+      var r = BinaryReader(data: data, pos: 0)
+      let got = r.readNetAddressV2()
+      check got.isSome
+      check got.get().networkId == netCJDNS
+
 when isMainModule:
   echo "W117 BIP-155 tests done."
