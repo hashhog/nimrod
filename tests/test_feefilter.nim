@@ -93,7 +93,8 @@ suite "Fee rate calculation":
 suite "Incremental relay fee":
   test "checkIncrementalRelayFee passes for valid replacement":
     # Original: 1000 sats, Replacement: 2000 sats, 200 vbytes
-    # Additional fee: 1000 sats >= 1000 sat/kvB * 200 / 1000 = 200 sats
+    # FIX-69: default incremental = 100 sat/kvB; required = 100 * 200 / 1000 = 20 sats.
+    # Additional fee: 1000 sats >= 20 sats → passes.
     let (ok, error) = checkIncrementalRelayFee(1000, 2000, 200)
     check ok == true
     check error == ""
@@ -101,7 +102,7 @@ suite "Incremental relay fee":
   test "checkIncrementalRelayFee: equal fees pass Rule #3 but fail Rule #4":
     # Original: 1000 sats, Replacement: 1000 sats.
     # Rule #3: replacement_fees >= original_fees → 1000 >= 1000 → passes (Core uses <, not <=).
-    # Rule #4: additional_fee = 0 < required (200 vbytes * 1 sat/vB) → fails.
+    # FIX-69: Rule #4 required = 100 * 200 / 1000 = 20 sats; additional = 0 < 20 → fails.
     # BIP-125 / Bitcoin Core src/policy/rbf.cpp PaysForRBF() line 109.
     let (ok, error) = checkIncrementalRelayFee(1000, 1000, 200)
     check ok == false
@@ -114,8 +115,9 @@ suite "Incremental relay fee":
     check "less than" in error
 
   test "checkIncrementalRelayFee fails if additional fee too low":
-    # Original: 1000 sats, Replacement: 1001 sats, 200 vbytes
-    # Additional fee: 1 sat < 200 sats required
+    # Original: 1000 sats, Replacement: 1001 sats, 200 vbytes.
+    # FIX-69: default incremental 100 sat/kvB → required = 100 * 200 / 1000 = 20 sats.
+    # Additional fee: 1 sat < 20 sats required → rejected.
     let (ok, error) = checkIncrementalRelayFee(1000, 1001, 200)
     check ok == false
     check "additional fee" in error
@@ -133,12 +135,16 @@ suite "Incremental relay fee":
 
   test "checkIncrementalRelayFee with large transaction":
     # Large tx: 10000 vbytes
-    # Required additional: 1000 * 10000 / 1000 = 10000 sats
+    # FIX-69: default 100 sat/kvB → required = 100 * 10000 / 1000 = 1000 sats.
+    # First call: additional = 15000 >> 1000 → accepted.
     let (ok, error) = checkIncrementalRelayFee(5000, 20000, 10000)
-    check ok == true  # 15000 > 10000
+    check ok == true  # 15000 > 1000
 
-    let (ok2, error2) = checkIncrementalRelayFee(5000, 10000, 10000)
-    check ok2 == false  # 5000 < 10000
+    # Second call: additional = 5000 >> 1000 → also accepted under
+    # FIX-69 defaults. To force rejection on a 10000-vbyte tx we pass a
+    # higher incremental rate explicitly.
+    let (ok2, error2) = checkIncrementalRelayFee(5000, 5500, 10000)
+    check ok2 == false  # additional 500 < required 1000
 
 suite "RelayManager feefilter state":
   test "new relay manager has default fee rate":
@@ -249,8 +255,10 @@ suite "Feefilter constants":
   test "default min relay fee is 1000 sat/kvB":
     check DefaultMinRelayFee == 1000
 
-  test "default incremental relay fee is 1000 sat/kvB":
-    check DefaultIncrementalRelayFee == 1000
+  test "default incremental relay fee is 100 sat/kvB (FIX-69 W120 BUG-1)":
+    ## Core: src/policy/policy.h:48 DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB.
+    ## Was 1000 sat/kvB pre-FIX-69 (10x Core).
+    check DefaultIncrementalRelayFee == 100
 
   test "feefilter interval is 10 minutes":
     check AvgFeefilterBroadcastInterval == 600.0

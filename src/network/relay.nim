@@ -38,7 +38,10 @@ const
 
   ## Fee rate constants (in sat/kvB, 1000 sat/kvB = 1 sat/vB)
   DefaultMinRelayFee* = 1000'i64          ## 1000 sat/kvB = 1 sat/vB
-  DefaultIncrementalRelayFee* = 1000'i64  ## 1000 sat/kvB = 1 sat/vB
+  DefaultIncrementalRelayFee* = 100'i64   ## 100 sat/kvB = 0.1 sat/vB
+                                          ## Matches Core's DEFAULT_INCREMENTAL_RELAY_FEE
+                                          ## (policy/policy.h:48). FIX-69: was 1000 sat/kvB
+                                          ## (10x Core). See W120 BUG-1 / BUG-10.
 
   ## FeeFilterRounder privacy constants
   MaxFilterFeeRate* = 10_000_000.0  ## 10^7 sat/kvB max for fee filter buckets

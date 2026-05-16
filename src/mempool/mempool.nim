@@ -125,7 +125,11 @@ const
   ## RBF constants (Bitcoin Core: util/rbf.h, policy/rbf.h)
   MaxBip125RbfSequence* = 0xfffffffd'u32  ## nSequence threshold: any input <= this signals opt-in RBF
   MaxReplacementCandidates* = 100         ## Max transactions (conflicts + descendants) evicted per RBF
-  DefaultIncrementalRelayFee* = 1.0       ## Incremental relay fee in sat/vbyte
+  DefaultIncrementalRelayFee* = 0.1       ## Incremental relay fee in sat/vbyte
+                                          ## (100 sat/kvB ÷ 1000 = 0.1 sat/vB).
+                                          ## Matches Core's DEFAULT_INCREMENTAL_RELAY_FEE
+                                          ## (policy/policy.h:48 = 100 sat/kvB).
+                                          ## FIX-69: was 1.0 sat/vB (10x Core). See W120 BUG-1.
 
   ## TRUC (v3) policy constants (BIP-431)
   TrucVersion* = 3'i32                  ## Transaction version for TRUC policy
@@ -1179,7 +1183,12 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # (Core's MemPoolAccept::ReplacementChecks, validation.cpp:984.)
 
   if conflicts.len > 0:
-    let rbfResult = mp.checkRbfRules(tx, modifiedFee, vsizeInt, conflicts)
+    # FIX-69 (W120 BUG-2): pass mempool's configured incrementalRelayFeeRate
+    # (sat/kvB → sat/vB via /1000) instead of relying on the static default.
+    # Core: validation.cpp:1011 passes m_pool.m_opts.incremental_relay_feerate.
+    let incrementalRelayFeeSatVb = mp.incrementalRelayFeeRate / 1000.0
+    let rbfResult = mp.checkRbfRules(tx, modifiedFee, vsizeInt, conflicts,
+                                     incrementalRelayFeeSatVb)
     if not rbfResult.isOk:
       return err(AtmpAcceptInfo, "replacement-failed: " & rbfResult.error)
     for c in rbfResult.value:

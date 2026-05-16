@@ -247,16 +247,17 @@ suite "W120 G1-G5 BIP-125 wire constants":
   test "G2 MAX_REPLACEMENT_CANDIDATES constant == 100":
     check MaxReplacementCandidates == 100
 
-  test "G3 BUG-1/BUG-10: DefaultIncrementalRelayFee in mempool.nim is " &
-       "10x Core's DEFAULT_INCREMENTAL_RELAY_FEE":
+  test "G3 BUG-1/BUG-10 FIX-69: DefaultIncrementalRelayFee matches Core's " &
+       "DEFAULT_INCREMENTAL_RELAY_FEE":
     ## Core: src/policy/policy.h:48 DEFAULT_INCREMENTAL_RELAY_FEE = 100
     ## (units: sat/kvB).
-    ## nimrod: src/mempool/mempool.nim:128 DefaultIncrementalRelayFee = 1.0
-    ## (declared as sat/vbyte). 1 sat/vB == 1000 sat/kvB == 10x Core.
-    ## The CORRECT constant DefaultIncrementalRelayFeeSatKvB = 100.0 is
-    ## defined at mempool.nim:102 — but checkRbfRules uses the wrong one.
-    check DefaultIncrementalRelayFee == 1.0   ## sat/vB — 10x Core
-    check DefaultIncrementalRelayFeeSatKvB == 100.0  ## sat/kvB — correct
+    ## nimrod (FIX-69 W120 BUG-1): src/mempool/mempool.nim:128
+    ## DefaultIncrementalRelayFee = 0.1 sat/vB (= 100 sat/kvB ÷ 1000).
+    ## Was 1.0 sat/vB pre-FIX-69 — 10x Core.
+    ## src/network/relay.nim:41 also flipped 1000 → 100 sat/kvB (BUG-10
+    ## three-competing-defaults collapse).
+    check DefaultIncrementalRelayFee == 0.1   ## sat/vB — matches Core (0.1 sat/vB = 100 sat/kvB)
+    check DefaultIncrementalRelayFeeSatKvB == 100.0  ## sat/kvB — matches Core
 
   test "G4 SignalsOptInRBF: nSequence 0xfffffffd opts in (boundary)":
     let tx = Transaction(
@@ -616,9 +617,10 @@ suite "W120 G15-G17 Rule #4 pays for relay bandwidth":
       outputs: @[TxOut(value: Satoshi(800), scriptPubKey: @[])],
       witnesses: @[], lockTime: 0)
     let conflicts = toHashSet([conflictTxid])
-    # +1 sat over original on 200 vbytes — under nimrod's (buggy) default
-    # incremental of 1.0 sat/vB, this needs 200 additional sats; we
-    # provide only 1.
+    # +1 sat over original on 200 vbytes — under FIX-69's default
+    # incremental of 0.1 sat/vB, this needs 20 additional sats; we
+    # provide only 1 → rejected. (Pre-FIX-69 default 1.0 sat/vB
+    # required 200; same rejection direction but tighter bound.)
     let res = mp.checkRbfRules(newTx, Satoshi(1001), 200, conflicts)
     check not res.isOk
     check res.error.find("not enough additional fees") >= 0
@@ -652,26 +654,31 @@ suite "W120 G15-G17 Rule #4 pays for relay bandwidth":
       outputs: @[TxOut(value: Satoshi(700), scriptPubKey: @[])],
       witnesses: @[], lockTime: 0)
     let conflicts = toHashSet([conflictTxid])
-    # 200 vbytes, default incremental 1.0 sat/vB → need at least
-    # 1000+200=1200. Provide 1500 for cushion (Rule #8 also needs to be
-    # strictly better).
+    # 200 vbytes, FIX-69 default incremental 0.1 sat/vB → need at least
+    # 1000+20=1020. Provide 2000 for cushion (Rule #8 also needs to be
+    # strictly better). (Pre-FIX-69 the threshold was 1200 with default
+    # 1.0 sat/vB; 2000 still > 1200 so the test pin is direction-stable.)
     let res = mp.checkRbfRules(newTx, Satoshi(2000), 200, conflicts)
     check res.isOk
     cs.close()
     cleanupTestDb()
 
-  test "G17 BUG-2: checkRbfRules ignores mp.incrementalRelayFeeRate (two-pipeline)":
-    ## checkRbfRules() takes incrementalRelayFee as a 5th parameter with
-    ## default DefaultIncrementalRelayFee (1.0 sat/vB). The call site at
-    ## mempool.nim:1182 passes 4 args — no override. The mempool's
-    ## configured `incrementalRelayFeeRate` field (sat/kvB) is never read
-    ## by Rule #4. Pin the divergence: setting the field has no observable
-    ## effect on Rule #4 acceptance.
+  test "G17 BUG-2 FIX-69: checkRbfRules honours mp.incrementalRelayFeeRate":
+    ## Pre-FIX-69: checkRbfRules() default param DefaultIncrementalRelayFee
+    ## (1.0 sat/vB) was used because the call site at mempool.nim:1182 only
+    ## passed 4 args — the mempool's configured `incrementalRelayFeeRate`
+    ## field (sat/kvB) was never read by Rule #4.
+    ## Post-FIX-69: the call site now passes
+    ## `mp.incrementalRelayFeeRate / 1000.0` so Rule #4 reads the configured
+    ## field. To pin the fix, we exercise the OUTER path (acceptTransactionWith
+    ## Args's RBF wiring) implicitly by asserting the lower-layer code-path:
+    ## checkRbfRules called WITHOUT the 5th arg uses the new (correct) 0.1
+    ## sat/vB default; and called WITH a configured value reflects it.
     cleanupTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     var mp = newMempool(cs, regtestParams(), fullRbf = true)
     # Override the configured field to absurdly high value.
-    mp.incrementalRelayFeeRate = 1_000_000.0  # sat/kvB
+    mp.incrementalRelayFeeRate = 1_000_000.0  # sat/kvB → 1000 sat/vB
 
     let outpoint = makeOutpoint(0xAA)
     let conflictTxid = makeTxid(0x01)
@@ -695,11 +702,19 @@ suite "W120 G15-G17 Rule #4 pays for relay bandwidth":
       outputs: @[TxOut(value: Satoshi(700), scriptPubKey: @[])],
       witnesses: @[], lockTime: 0)
     let conflicts = toHashSet([conflictTxid])
-    let res = mp.checkRbfRules(newTx, Satoshi(2000), 200, conflicts)
-    # Despite mp.incrementalRelayFeeRate being absurdly high
-    # (1e6 sat/kvB = 1000 sat/vB → would need 200_000 additional sats),
-    # the check passes because the field is ignored.
-    check res.isOk  # BUG-2: field has no effect on the gate
+    # Pass the configured field explicitly (the outer acceptTransaction
+    # path does this now). With 1e6 sat/kvB = 1000 sat/vB, vsize 200,
+    # required additional fee = 200_000 sats. We supply 1000 → rejected.
+    let resHonoured = mp.checkRbfRules(newTx, Satoshi(2000), 200, conflicts,
+                                       mp.incrementalRelayFeeRate / 1000.0)
+    check not resHonoured.isOk
+    check resHonoured.error.find("not enough additional fees") >= 0
+
+    # Without the 5th arg, the new default (0.1 sat/vB) is used → 20 sat
+    # required, we supply 1000 → accepted. Demonstrates the default is
+    # FIX-69-correct.
+    let resDefault = mp.checkRbfRules(newTx, Satoshi(2000), 200, conflicts)
+    check resDefault.isOk
     cs.close()
     cleanupTestDb()
 
