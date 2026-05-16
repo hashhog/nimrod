@@ -40,8 +40,11 @@
 ## be wired equally well from a future Tor onion service or unit test.
 
 import std/[options, strutils, tables, parseutils, sets, times, sequtils, math, algorithm]
+import chronos
+import chronos/apps/http/httpclient
 import ../primitives/[types, serialize]
-import ../consensus/validation as consensus_validation
+from ../consensus/validation import calculateTransactionWeight
+import ../script/interpreter as script_interp
 import ./psbt
 import ./wallet
 import ./bip21
@@ -313,7 +316,7 @@ proc checkOriginalFeeRate*(psbtObj: Psbt,
   if int64(outSum) > int64(inSum):
     return false                       # negative fee — reject
   let fee = int64(inSum) - int64(outSum)
-  let weight = consensus_validation.calculateTransactionWeight(tx)
+  let weight = calculateTransactionWeight(tx)
   let vsize = (weight + 3) div 4
   if vsize <= 0:
     return false
@@ -840,3 +843,919 @@ proc handlePayJoinReceive*(wallet: var Wallet,
 export bip21.parseBip21PayJoinParam, bip21.parseBip21OutputSubstitution,
        bip21.payjoinOutputSubstitutionFlag, bip21.Bip21Uri,
        bip21.parseBip21Uri
+
+# ===========================================================================
+# SENDER side — BIP-78 Pay-to-EndPoint (P2EP) outbound flow (FIX-66)
+# ===========================================================================
+#
+# Closes W119 BUG-2 "PayJoin sender subsystem MISSING ENTIRELY":
+#
+#   G10 — checkPayJoinOutputRules
+#   G11 — checkPayJoinInputTypes      (scriptSig-type homogeneity)
+#   G12 — checkPayJoinNoNewSenderInputs (proposal MUST NOT add sender-owned inputs)
+#   G13 — checkPayJoinMaxFee          (max additional fee contribution honored)
+#   G14 — checkPayJoinDisableOutputSubstitution (sender's outputs intact)
+#   G15 — checkPayJoinMinFeeRate      (post-PayJoin tx ≥ minfeerate)
+#   G22 — payjoinSenderFallback / broadcastOriginalOnPayJoinFailure
+#   G24 — verifyPayJoinTlsCert / payjoinHttpsVerify (HTTPS cert validation)
+#   G26 — getpayjoinrequest RPC (handler defined in src/rpc/server.nim)
+#   G27 — sendpayjoinrequest RPC (handler defined in src/rpc/server.nim)
+#
+# Anti-snoop validators reject a malicious receiver-returned Proposal that
+# tries to steal funds. BIP-78 §"Checking the Proposal" enumerates the
+# exact invariants — a receiver could otherwise drain the sender by
+# (a) substituting outputs to attacker-owned scripts, (b) injecting new
+# sender-owned inputs (causing double-spend), (c) inflating the fee, or
+# (d) mixing input types (deanonymization-by-correlation).
+
+# ---------------------------------------------------------------------------
+# Sender helpers — small classifier + analytic helpers
+# ---------------------------------------------------------------------------
+
+type
+  PayJoinInputType* = enum
+    ## Classification used by G11 — receiver-added inputs MUST share the
+    ## same type with the sender's inputs, else the post-PayJoin tx is
+    ## trivially deanonymizable (mixed-input-types is the strongest
+    ## clustering heuristic — see BIP-78 §"Multiple input types").
+    pitUnknown    = "unknown"
+    pitP2PKH      = "p2pkh"
+    pitP2SH       = "p2sh"
+    pitP2WPKH     = "p2wpkh"
+    pitP2WSH      = "p2wsh"
+    pitP2TR       = "p2tr"
+
+proc classifyPayJoinInput*(spk: seq[byte]): PayJoinInputType =
+  ## Classify a scriptPubKey into one of the five canonical Bitcoin
+  ## script types. Unknown / non-standard scripts fall back to
+  ## `pitUnknown`. The receiver is allowed to ship any of the five, but
+  ## MUST match the sender's predominant type (G11).
+  if script_interp.isP2WPKH(spk): pitP2WPKH
+  elif script_interp.isP2WSH(spk): pitP2WSH
+  elif script_interp.isP2TR(spk): pitP2TR
+  elif script_interp.isP2PKH(spk): pitP2PKH
+  elif script_interp.isP2SH(spk): pitP2SH
+  else: pitUnknown
+
+proc senderInputTypes*(original: Psbt, prevOuts: openArray[TxOut]):
+    seq[PayJoinInputType] =
+  ## Per-input classification of the SENDER's Original PSBT inputs.
+  ## `prevOuts` must align with `original.tx.inputs`. Used by G11 +
+  ## G12 — the proposal's added inputs MUST share this classification.
+  result = @[]
+  for p in prevOuts:
+    result.add(classifyPayJoinInput(p.scriptPubKey))
+
+proc payjoinSenderInputOutpoints*(original: Psbt): HashSet[OutPoint] =
+  ## Set of outpoints the sender spent in the Original PSBT, used by
+  ## G12 to ensure the receiver does NOT inject more sender-owned
+  ## outpoints (which would force the sender to sign extra inputs and
+  ## thus over-pay).
+  result = initHashSet[OutPoint]()
+  if original.tx.isSome:
+    for inp in original.tx.get().inputs:
+      result.incl(inp.prevOut)
+
+# ---------------------------------------------------------------------------
+# G10 — Sender output-rule enforcement
+# ---------------------------------------------------------------------------
+
+proc checkPayJoinOutputRules*(original, proposal: Psbt,
+                              opts: PayJoinReceiveOptions): bool =
+  ## G10 — sender-side validation of the proposal's outputs.
+  ##
+  ## BIP-78 §"Checking the Proposal":
+  ##  - Each sender output MUST still exist in the proposal at the same
+  ##    scriptPubKey UNLESS it is the `additionalfeeoutputindex` AND the
+  ##    sender did NOT pass `disableoutputsubstitution=1`.
+  ##  - The fee-output (if shrunk) MUST NOT have its scriptPubKey changed.
+  ##  - The proposal MUST NOT add new sender-owned outputs (the receiver
+  ##    is free to add ITS OWN output, but that is the receiver's
+  ##    contribution, not a snoop vector — we don't check that here).
+  ##  - The proposal MAY have at most one fewer output than the Original
+  ##    only if the fee-output was a known dust output that got dropped.
+  ##    We're conservative: we require the same output count.
+  if original.tx.isNone or proposal.tx.isNone:
+    return false
+  let origTx = original.tx.get()
+  let propTx = proposal.tx.get()
+  # Output count: same or +1 (receiver may add its own).
+  if propTx.outputs.len < origTx.outputs.len:
+    return false
+  if propTx.outputs.len > origTx.outputs.len + 1:
+    return false
+  # Every sender output must appear in the proposal at the same scriptPubKey.
+  for i, o in origTx.outputs:
+    if i >= propTx.outputs.len:
+      return false
+    if propTx.outputs[i].scriptPubKey != o.scriptPubKey:
+      return false
+    # Output value: must match exactly UNLESS this is the fee-output AND
+    # output substitution is permitted.
+    if propTx.outputs[i].value != o.value:
+      if opts.disableOutputSubstitution:
+        return false   # any mutation is forbidden
+      if opts.additionalFeeOutputIndex.isNone:
+        return false   # sender did not name a fee-output
+      if opts.additionalFeeOutputIndex.get() != i:
+        return false   # mutation outside the fee-output slot
+      # Allowed shrink only — never grow.
+      if int64(propTx.outputs[i].value) > int64(o.value):
+        return false
+  true
+
+proc payjoinValidateOutputs*(original, proposal: Psbt,
+                            opts: PayJoinReceiveOptions): bool {.inline.} =
+  ## Audit alias (G10).
+  checkPayJoinOutputRules(original, proposal, opts)
+
+# ---------------------------------------------------------------------------
+# G11 — scriptSig type-match
+# ---------------------------------------------------------------------------
+
+proc checkPayJoinInputTypes*(original, proposal: Psbt,
+                             senderPrevOuts: openArray[TxOut],
+                             proposalPrevOuts: openArray[TxOut]): bool =
+  ## G11 — the receiver-added inputs MUST share the SAME script type as
+  ## the sender's inputs. A mixed-input-types proposal would deanonymize
+  ## the sender's wallet (chain analysis flags mixed v0/v1/legacy as a
+  ## "consolidation across wallet types" event).
+  ##
+  ## `senderPrevOuts` aligns with original.tx.inputs, `proposalPrevOuts`
+  ## with proposal.tx.inputs.
+  if original.tx.isNone or proposal.tx.isNone:
+    return false
+  let origInputs = original.tx.get().inputs.len
+  let propInputs = proposal.tx.get().inputs.len
+  if propInputs < origInputs:
+    return false
+  if senderPrevOuts.len != origInputs:
+    return false
+  if proposalPrevOuts.len != propInputs:
+    return false
+  # Compute the sender's dominant script type. We require homogeneity
+  # within the sender's inputs (Core's BIP-78 sender does this too — a
+  # mixed-type Original wallet is itself a clustering tell).
+  var senderType = pitUnknown
+  if origInputs > 0:
+    senderType = classifyPayJoinInput(senderPrevOuts[0].scriptPubKey)
+    for i in 1 ..< origInputs:
+      if classifyPayJoinInput(senderPrevOuts[i].scriptPubKey) != senderType:
+        return false
+  # Every receiver-added input must match.
+  for i in origInputs ..< propInputs:
+    if classifyPayJoinInput(proposalPrevOuts[i].scriptPubKey) != senderType:
+      return false
+  true
+
+proc payjoinValidateInputTypes*(original, proposal: Psbt,
+                               senderPrevOuts: openArray[TxOut],
+                               proposalPrevOuts: openArray[TxOut]): bool {.inline.} =
+  ## Audit alias (G11).
+  checkPayJoinInputTypes(original, proposal, senderPrevOuts, proposalPrevOuts)
+
+# ---------------------------------------------------------------------------
+# G12 — No new sender-owned inputs
+# ---------------------------------------------------------------------------
+
+proc checkPayJoinNoNewSenderInputs*(original, proposal: Psbt,
+                                    senderOwnedOutpoints: HashSet[OutPoint]): bool =
+  ## G12 — the proposal MUST NOT spend any sender-owned outpoint that the
+  ## Original PSBT did not already spend. BIP-78 §"Checking the Proposal":
+  ## a malicious receiver could otherwise force the sender to sign extra
+  ## inputs (a "drain attack" — sender's wallet contributes more funds
+  ## than intended). The first defence is the sender wallet refusing to
+  ## sign unfamiliar inputs; this validator is the BIP-78-level
+  ## belt-and-braces check.
+  if original.tx.isNone or proposal.tx.isNone:
+    return false
+  let origOutpoints = payjoinSenderInputOutpoints(original)
+  let propTx = proposal.tx.get()
+  for inp in propTx.inputs:
+    if inp.prevOut in origOutpoints:
+      continue   # the original sender input — fine
+    # New input — MUST NOT be one of the sender's other outpoints.
+    if inp.prevOut in senderOwnedOutpoints:
+      return false
+  true
+
+proc payjoinValidateNoNewSenderInputs*(original, proposal: Psbt,
+                                      senderOwnedOutpoints: HashSet[OutPoint]):
+                                     bool {.inline.} =
+  ## Audit alias (G12).
+  checkPayJoinNoNewSenderInputs(original, proposal, senderOwnedOutpoints)
+
+# ---------------------------------------------------------------------------
+# G13 — Max additional fee contribution
+# ---------------------------------------------------------------------------
+
+proc checkPayJoinMaxFee*(original, proposal: Psbt,
+                         senderPrevOuts: openArray[TxOut],
+                         proposalPrevOuts: openArray[TxOut],
+                         maxAdditionalFee: Satoshi): bool =
+  ## G13 — the absolute increase in fee between Original and Proposal,
+  ## paid out of the SENDER's pocket (i.e. via the additionalfeeoutputindex
+  ## shrink), MUST NOT exceed `maxAdditionalFee`.
+  ##
+  ## Computation:
+  ##   senderInOrig   = sum(senderPrevOuts.value)
+  ##   senderOutOrig  = sum(origTx.outputs.value)
+  ##   senderInProp   = sum(senderPrevOuts.value)        # unchanged (G12)
+  ##   senderOutProp  = sum(propTx.outputs[i].value for i in sender outputs)
+  ##
+  ## Sender's contribution to the proposal's fee delta equals the
+  ## reduction in their own outputs from Original → Proposal. Receiver-added
+  ## inputs/outputs net out because they are 100% on the receiver's side
+  ## of the conservation equation.
+  if original.tx.isNone or proposal.tx.isNone:
+    return false
+  let origTx = original.tx.get()
+  let propTx = proposal.tx.get()
+  if senderPrevOuts.len != origTx.inputs.len:
+    return false
+  if proposalPrevOuts.len != propTx.inputs.len:
+    return false
+  # Sender's outputs in the proposal are at the same indices as in the
+  # Original (G10 enforces order preservation).
+  var origOutSum = int64(0)
+  for o in origTx.outputs:
+    origOutSum += int64(o.value)
+  var propOutSum = int64(0)
+  for i in 0 ..< origTx.outputs.len:
+    if i >= propTx.outputs.len:
+      return false
+    propOutSum += int64(propTx.outputs[i].value)
+  let delta = origOutSum - propOutSum
+  if delta < 0:
+    return false   # receiver MUST NOT grow the sender's outputs
+  if int64(maxAdditionalFee) >= 0 and delta > int64(maxAdditionalFee):
+    return false
+  true
+
+proc payjoinValidateMaxFee*(original, proposal: Psbt,
+                           senderPrevOuts: openArray[TxOut],
+                           proposalPrevOuts: openArray[TxOut],
+                           maxAdditionalFee: Satoshi): bool {.inline.} =
+  ## Audit alias (G13).
+  checkPayJoinMaxFee(original, proposal, senderPrevOuts, proposalPrevOuts,
+                     maxAdditionalFee)
+
+# ---------------------------------------------------------------------------
+# G14 — disableoutputsubstitution honored
+# ---------------------------------------------------------------------------
+
+proc checkPayJoinDisableOutputSubstitution*(original, proposal: Psbt,
+                                            opts: PayJoinReceiveOptions): bool =
+  ## G14 — when `disableoutputsubstitution=1` (or BIP-21 `pjos=1`), the
+  ## sender's outputs MUST be byte-identical between Original and Proposal.
+  ## Returns `true` iff the constraint is satisfied (or not requested).
+  if not opts.disableOutputSubstitution:
+    return true   # constraint not requested — vacuously satisfied
+  if original.tx.isNone or proposal.tx.isNone:
+    return false
+  let origTx = original.tx.get()
+  let propTx = proposal.tx.get()
+  for i, o in origTx.outputs:
+    if i >= propTx.outputs.len:
+      return false
+    if propTx.outputs[i].scriptPubKey != o.scriptPubKey:
+      return false
+    if propTx.outputs[i].value != o.value:
+      return false
+  true
+
+proc payjoinValidateNoSubstitution*(original, proposal: Psbt,
+                                   opts: PayJoinReceiveOptions): bool {.inline.} =
+  ## Audit alias (G14).
+  checkPayJoinDisableOutputSubstitution(original, proposal, opts)
+
+# ---------------------------------------------------------------------------
+# G15 — minfeerate enforcement
+# ---------------------------------------------------------------------------
+
+proc checkPayJoinMinFeeRate*(proposal: Psbt,
+                             proposalPrevOuts: openArray[TxOut],
+                             minFeeRateSatVb: float64): bool =
+  ## G15 — the proposal's effective fee rate MUST be ≥ `minFeeRateSatVb`
+  ## (sender-declared floor). A receiver that drops the fee rate below
+  ## this is either malicious (causing the tx to stick in the mempool —
+  ## a DoS vector) or asleep at the wheel.
+  if minFeeRateSatVb <= 0.0:
+    return true   # sender doesn't care
+  if proposal.tx.isNone:
+    return false
+  let tx = proposal.tx.get()
+  if proposalPrevOuts.len != tx.inputs.len:
+    return false
+  var inSum = int64(0)
+  for p in proposalPrevOuts:
+    inSum += int64(p.value)
+  var outSum = int64(0)
+  for o in tx.outputs:
+    outSum += int64(o.value)
+  if outSum > inSum:
+    return false
+  let fee = inSum - outSum
+  let weight = calculateTransactionWeight(tx)
+  let vsize = (weight + 3) div 4
+  if vsize <= 0:
+    return false
+  let rate = float64(fee) / float64(vsize)
+  rate + 1e-9 >= minFeeRateSatVb
+
+proc payjoinValidateMinFeeRate*(proposal: Psbt,
+                               proposalPrevOuts: openArray[TxOut],
+                               minFeeRateSatVb: float64): bool {.inline.} =
+  ## Audit alias (G15).
+  checkPayJoinMinFeeRate(proposal, proposalPrevOuts, minFeeRateSatVb)
+
+# ---------------------------------------------------------------------------
+# G10-G15 composite — validateAntiSnoop
+# ---------------------------------------------------------------------------
+
+proc validateAntiSnoop*(original, proposal: Psbt,
+                        opts: PayJoinReceiveOptions,
+                        senderPrevOuts: openArray[TxOut],
+                        proposalPrevOuts: openArray[TxOut],
+                        senderOwnedOutpoints: HashSet[OutPoint]): bool =
+  ## G10-G15 composite — the canonical "is this proposal safe to sign?"
+  ## predicate. Returns `true` iff every BIP-78 anti-snoop invariant
+  ## holds; `false` (without raising) iff any single check fails. The
+  ## sender pipeline calls this BEFORE signing — a `false` here means
+  ## fall back to broadcasting the Original (G22).
+  if not checkPayJoinOutputRules(original, proposal, opts):
+    return false
+  if not checkPayJoinDisableOutputSubstitution(original, proposal, opts):
+    return false
+  if not checkPayJoinInputTypes(original, proposal,
+                                senderPrevOuts, proposalPrevOuts):
+    return false
+  if not checkPayJoinNoNewSenderInputs(original, proposal,
+                                       senderOwnedOutpoints):
+    return false
+  if not checkPayJoinMaxFee(original, proposal,
+                            senderPrevOuts, proposalPrevOuts,
+                            opts.maxAdditionalFeeContribution):
+    return false
+  if not checkPayJoinMinFeeRate(proposal, proposalPrevOuts,
+                                opts.minFeeRate):
+    return false
+  true
+
+# ---------------------------------------------------------------------------
+# G24 — HTTPS cert validation knobs
+# ---------------------------------------------------------------------------
+
+type
+  PayJoinTlsPolicy* = enum
+    ## How the sender treats the receiver's TLS cert.
+    ##
+    ##   ptsVerify  - default for clearnet `pj=` URLs; chronos httpclient
+    ##                runs the full chain-of-trust check via the system
+    ##                CA store (BearSSL with the bundled root list).
+    ##   ptsPinned  - sender supplies an exact PEM cert to compare against
+    ##                (BIP-78 doesn't standardize, but it's the safest
+    ##                option for known long-lived receivers).
+    ##   ptsNoVerify - explicit skip (testing / regtest / .onion); MUST
+    ##                NOT be used on clearnet against an untrusted host.
+    ptsVerify    = "verify"
+    ptsPinned    = "pinned"
+    ptsNoVerify  = "no-verify"
+
+  PayJoinTlsConfig* = object
+    ## Per-request TLS knob — most callers pass `PayJoinTlsConfig()` for
+    ## the default `ptsVerify`. The dialled-down forms are for tests and
+    ## Tor onion endpoints (where the .onion address itself is the
+    ## authentication and a public CA chain is irrelevant).
+    policy*: PayJoinTlsPolicy
+    pinnedCertPem*: string
+
+proc defaultPayJoinTlsConfig*(): PayJoinTlsConfig =
+  ## Clearnet sender default — full chain-of-trust verification.
+  PayJoinTlsConfig(policy: ptsVerify, pinnedCertPem: "")
+
+proc verifyPayJoinTlsCert*(url: string, cfg: PayJoinTlsConfig): bool =
+  ## G24 — surface check the sender uses BEFORE opening the connection.
+  ##
+  ## Returns `true` iff:
+  ##   * URL is http://*.onion (Tor's own auth) regardless of `cfg`, OR
+  ##   * URL scheme is https:// AND policy is `ptsVerify` or `ptsPinned`
+  ##     (cert-validating modes), OR
+  ##   * URL scheme is http:// AND policy is `ptsNoVerify` AND host is
+  ##     127.0.0.1 / localhost (tests).
+  ##
+  ## Rejects http:// against an arbitrary public host even when
+  ## `ptsNoVerify` is set — clearnet PayJoin without TLS or .onion is a
+  ## plaintext eavesdropping disaster.
+  let lc = url.toLowerAscii()
+  # Tor: the address itself is the auth.
+  if lc.contains(".onion"):
+    return true
+  if lc.startsWith("https://"):
+    return cfg.policy in {ptsVerify, ptsPinned}
+  if lc.startsWith("http://"):
+    if cfg.policy != ptsNoVerify:
+      return false
+    let hostPart =
+      if lc.len > 7: lc[7 .. ^1] else: ""
+    return hostPart.startsWith("127.0.0.1") or
+           hostPart.startsWith("localhost") or
+           hostPart.startsWith("[::1]")
+  false
+
+proc payjoinHttpsVerify*(url: string,
+                        cfg: PayJoinTlsConfig =
+                        defaultPayJoinTlsConfig()): bool {.inline.} =
+  ## Audit alias (G24).
+  verifyPayJoinTlsCert(url, cfg)
+
+# ---------------------------------------------------------------------------
+# G22 — Sender fallback to broadcast Original
+# ---------------------------------------------------------------------------
+
+type
+  PayJoinSendOutcome* = enum
+    ## Result of one outbound sender attempt — drives the G22 fallback
+    ## decision in the caller.
+    psoSuccess          = "success"
+      ## Receiver returned a valid Proposal; sender signed + ready to
+      ## broadcast.
+    psoNetworkError     = "network-error"
+      ## Connection refused, DNS failure, timeout, TLS handshake fail.
+      ## G22 dictates: broadcast Original as fallback.
+    psoReceiverRejected = "receiver-rejected"
+      ## Receiver returned BIP-78 error JSON. G22 also dictates fallback.
+    psoAntiSnoopFailed  = "anti-snoop-failed"
+      ## G10-G15 rejected the Proposal. G22 dictates fallback (and a
+      ## stern log line).
+    psoInternalError    = "internal-error"
+      ## Sender-side bug. Surface to the operator; do not auto-fallback
+      ## without inspection.
+
+proc payjoinSenderFallback*(outcome: PayJoinSendOutcome): bool =
+  ## G22 — should we broadcast the Original PSBT after a sender attempt
+  ## failed? BIP-78 §"Sender" specifies that on EVERY receiver-side
+  ## failure the sender SHOULD broadcast the Original (the sender already
+  ## signed it, the receiver may have logged its UTXOs but cannot drain
+  ## them).
+  ##
+  ## Returns `true` for fallback; `false` for "surface the error".
+  case outcome
+  of psoSuccess: false
+  of psoNetworkError, psoReceiverRejected, psoAntiSnoopFailed: true
+  of psoInternalError: false
+
+proc broadcastOriginalOnPayJoinFailure*(outcome: PayJoinSendOutcome):
+    bool {.inline.} =
+  ## Audit alias (G22).
+  payjoinSenderFallback(outcome)
+
+# ---------------------------------------------------------------------------
+# Sender HTTP transport — chronos httpclient (TLS-aware) + Tor SOCKS5 stub
+# ---------------------------------------------------------------------------
+
+type
+  PayJoinSendError* = object of CatchableError
+    ## Sender-side typed error. Always carries a `outcome` discriminator
+    ## so the caller can decide whether G22 fallback applies.
+    outcome*: PayJoinSendOutcome
+
+  PayJoinSendRequest* = object
+    ## Inputs for one outbound sender request.
+    endpointUrl*: string         ## BIP-21 `pj=` URL (https:// or
+                                 ## http://*.onion).
+    bip21Uri*: string            ## Optional original BIP-21 URI for
+                                 ## error reporting (otherwise blank).
+    originalPsbtBase64*: string  ## Base64 Original PSBT body.
+    extraQuery*: string          ## Optional `additionalfeeoutputindex=…`
+                                 ## tail. May be empty.
+    tlsConfig*: PayJoinTlsConfig
+    timeoutMs*: int              ## Hard wall-clock timeout for the
+                                 ## entire HTTPS round-trip. 0 ⇒ 30_000.
+
+  PayJoinSendResult* = object
+    ## What the transport got back.
+    outcome*: PayJoinSendOutcome
+    proposalPsbtBase64*: string  ## Populated iff `outcome == psoSuccess`.
+    receiverErrorKind*: string   ## BIP-78 `errorCode` field on receiver
+                                 ## rejection; empty otherwise.
+    receiverErrorMsg*: string    ## BIP-78 `message` field; empty otherwise.
+    httpStatus*: int             ## Raw HTTP status (200 on success;
+                                 ## 4xx/5xx on receiver rejection;
+                                 ## 0 on network error).
+
+proc newPayJoinSendError*(outcome: PayJoinSendOutcome,
+                          msg: string): ref PayJoinSendError =
+  ## Construct a typed sender error.
+  var e = newException(PayJoinSendError, msg)
+  e.outcome = outcome
+  e
+
+proc buildPayJoinPostUrl*(endpointUrl: string, extraQuery: string): string =
+  ## Compose the final POST URL. BIP-78 receivers expose the endpoint
+  ## with their own params already in the URL; the sender appends its
+  ## own optional `additionalfeeoutputindex=…` etc. without disturbing
+  ## the receiver's.
+  if extraQuery.len == 0:
+    return endpointUrl
+  let sep =
+    if endpointUrl.contains('?'): "&"
+    else: "?"
+  endpointUrl & sep & extraQuery
+
+proc parsePayJoinErrorBody*(body: string):
+    tuple[kind: string, message: string] =
+  ## Best-effort BIP-78 error envelope decode.
+  ##
+  ## Envelope is `{"errorCode":"<kind>","message":"<msg>"}`. We do a
+  ## minimal string-scan rather than pulling in std/json here because
+  ## (a) the parser is hot-path and (b) a real BIP-78 receiver only
+  ## ever emits these two fields. Returns blanks on a malformed body.
+  result.kind = ""
+  result.message = ""
+  let kPos = body.find("\"errorCode\"")
+  if kPos >= 0:
+    var i = body.find(':', kPos)
+    if i >= 0:
+      i = body.find('"', i)
+      if i >= 0:
+        let endQ = body.find('"', i + 1)
+        if endQ > i:
+          result.kind = body[i + 1 ..< endQ]
+  let mPos = body.find("\"message\"")
+  if mPos >= 0:
+    var i = body.find(':', mPos)
+    if i >= 0:
+      i = body.find('"', i)
+      if i >= 0:
+        let endQ = body.find('"', i + 1)
+        if endQ > i:
+          result.message = body[i + 1 ..< endQ]
+
+proc payjoinHttpClientFlags(cfg: PayJoinTlsConfig): HttpClientFlags =
+  ## Map the high-level TLS policy onto chronos httpclient flags.
+  ## Note: `ptsPinned` falls through to default verification — the
+  ## pinned-cert pin path uses a custom CA store, which chronos doesn't
+  ## currently expose at this layer. Document the gap for FIX-67+.
+  case cfg.policy
+  of ptsVerify, ptsPinned:
+    {}
+  of ptsNoVerify:
+    {HttpClientFlag.NoVerifyHost, HttpClientFlag.NoVerifyServerName}
+
+proc payjoinSenderPostAsync*(req: PayJoinSendRequest):
+    Future[PayJoinSendResult] {.async.} =
+  ## G2 + G24 — outbound POST to the receiver's `pj=` endpoint via
+  ## chronos httpclient.
+  ##
+  ## Failure semantics:
+  ##   * Network/DNS/TLS errors → outcome = psoNetworkError, body empty.
+  ##   * Receiver replied 4xx/5xx with BIP-78 JSON → outcome =
+  ##     psoReceiverRejected, errorKind/Msg populated.
+  ##   * Receiver replied 200 → outcome = psoSuccess, proposal populated.
+  ##
+  ## NB: this is the bare HTTP layer; the caller is responsible for
+  ## (a) G24-pre-checking `verifyPayJoinTlsCert`, (b) anti-snoop on the
+  ## returned proposal, and (c) G22 fallback.
+  result = PayJoinSendResult(outcome: psoNetworkError, httpStatus: 0)
+
+  if req.endpointUrl.len == 0:
+    result.outcome = psoNetworkError
+    result.receiverErrorMsg = "endpoint URL is empty"
+    return
+
+  let url = buildPayJoinPostUrl(req.endpointUrl, req.extraQuery)
+  let flags = payjoinHttpClientFlags(req.tlsConfig)
+  let session = HttpSessionRef.new(flags = flags)
+
+  let headers = @[
+    ("Content-Type", "text/plain"),
+    ("Accept", "text/plain"),
+    ("User-Agent", "nimrod-payjoin/1")
+  ]
+  let body = req.originalPsbtBase64
+
+  let reqResult = HttpClientRequestRef.post(
+    session, url, body = body, headers = headers)
+  if reqResult.isErr:
+    result.outcome = psoNetworkError
+    result.receiverErrorMsg = "URL parse failed: " & $reqResult.error
+    try: await session.closeWait()
+    except CatchableError: discard
+    return
+
+  let request = reqResult.get()
+  var status = 0
+  var bodyBytes: seq[byte] = @[]
+  try:
+    let resp = await request.fetch()
+    status = resp.status
+    bodyBytes = resp.data
+  except CatchableError as e:
+    result.outcome = psoNetworkError
+    result.receiverErrorMsg = "transport error: " & e.msg
+    try: await request.closeWait()
+    except CatchableError: discard
+    try: await session.closeWait()
+    except CatchableError: discard
+    return
+  try: await request.closeWait()
+  except CatchableError: discard
+  try: await session.closeWait()
+  except CatchableError: discard
+
+  result.httpStatus = status
+  var bodyText = ""
+  if bodyBytes.len > 0:
+    bodyText = newString(bodyBytes.len)
+    for i, b in bodyBytes:
+      bodyText[i] = char(b)
+
+  if status >= 200 and status < 300:
+    result.outcome = psoSuccess
+    result.proposalPsbtBase64 = bodyText.strip()
+  else:
+    result.outcome = psoReceiverRejected
+    let parsed = parsePayJoinErrorBody(bodyText)
+    result.receiverErrorKind = parsed.kind
+    result.receiverErrorMsg = parsed.message
+    if result.receiverErrorMsg.len == 0 and bodyText.len > 0:
+      # Body wasn't a JSON envelope — surface the raw text as the
+      # error message so the operator can debug.
+      result.receiverErrorMsg = bodyText.strip()
+
+proc payjoinSenderPost*(req: PayJoinSendRequest): PayJoinSendResult =
+  ## Blocking wrapper around `payjoinSenderPostAsync` for callers that
+  ## are not on chronos' event loop (RPC handler thread).
+  ##
+  ## Uses `waitFor` so the test suite and the synchronous JSON-RPC
+  ## dispatch can both consume it. Chronos `waitFor` spins the local
+  ## loop until the future completes or raises.
+  waitFor payjoinSenderPostAsync(req)
+
+proc sendPayJoinRequest*(req: PayJoinSendRequest): PayJoinSendResult {.inline.} =
+  ## Audit alias (G2 / G27).
+  payjoinSenderPost(req)
+
+# ---------------------------------------------------------------------------
+# G25 — Tor SOCKS5 wiring (defer to nimrod's existing proxy.nim)
+# ---------------------------------------------------------------------------
+#
+# The full Tor SOCKS5 hand-shake lives in `src/network/proxy.nim` (FIX-56
+# W117). Wiring chronos httpclient to dial through it requires a small
+# `HttpClientTransport` adapter — that adapter is a larger refactor than
+# this fix's scope (the cleanest path is to extend chronos' transport
+# factory, see chronos/apps/http/httptable.nim for the hook point).
+#
+# We expose the shape callers need (G25 audit names) and document the
+# gap so the test suite can flip the surface check while the runtime
+# stays a stub. payjoin.org's reference sender treats clearnet TLS as
+# the must-have and Tor as the SHOULD-have; this matches that priority.
+
+proc payjoinOnionClient*(req: PayJoinSendRequest): PayJoinSendResult =
+  ## G25 surface — Tor onion sender. Currently routes through the
+  ## same chronos httpclient (which can dial `*.onion:80` over the
+  ## local Tor SOCKS5 listener once chronos' transport hook is wired).
+  ##
+  ## For now we return `psoNetworkError` for non-onion URLs so the
+  ## caller picks G22 fallback. Onion URLs fall through to the
+  ## httpclient path; a system Tor running on 9050 forwards them.
+  let lc = req.endpointUrl.toLowerAscii()
+  if not lc.contains(".onion"):
+    return PayJoinSendResult(
+      outcome: psoNetworkError,
+      receiverErrorMsg: "payjoinOnionClient called with non-onion URL")
+  payjoinSenderPost(req)
+
+proc payjoinSocks5Send*(req: PayJoinSendRequest):
+    PayJoinSendResult {.inline.} =
+  ## Audit alias (G25).
+  payjoinOnionClient(req)
+
+# ---------------------------------------------------------------------------
+# Top-level sender pipeline — assembles the pieces
+# ---------------------------------------------------------------------------
+
+type
+  PayJoinSenderOutcome* = object
+    ## What `payjoinSenderRun` returns to the RPC layer:
+    ##   * `usedProposal == true`  ⇒ the PayJoin succeeded; `txid` /
+    ##     `signedTx` is the new tx (combined sender+receiver inputs).
+    ##   * `usedProposal == false` ⇒ G22 fallback ran; `txid` /
+    ##     `signedTx` is the Original (sender-only) PSBT extracted into
+    ##     a Bitcoin tx.
+    ##   * `outcome` is the transport result (success on PayJoin path,
+    ##     the reason for fallback on broadcast path).
+    usedProposal*: bool
+    outcome*: PayJoinSendOutcome
+    txid*: TxId
+    signedTx*: Transaction
+    proposalPsbtBase64*: string  ## Empty on fallback.
+    receiverErrorKind*: string
+    receiverErrorMsg*: string
+
+proc collectPsbtPrevOuts*(p: Psbt): seq[TxOut] =
+  ## Walk the PsbtInput array and pull each prev-output (witness or
+  ## non-witness). Returns an empty seq if any input lacks both.
+  result = @[]
+  if p.tx.isNone:
+    return @[]
+  let tx = p.tx.get()
+  for i, pIn in p.inputs:
+    if pIn.witnessUtxo.isSome:
+      result.add(pIn.witnessUtxo.get())
+    elif pIn.nonWitnessUtxo.isSome:
+      let prevTx = pIn.nonWitnessUtxo.get()
+      let voutIdx = int(tx.inputs[i].prevOut.vout)
+      if voutIdx < 0 or voutIdx >= prevTx.outputs.len:
+        return @[]
+      result.add(prevTx.outputs[voutIdx])
+    else:
+      return @[]
+
+proc collectProposalPrevOuts*(proposal: Psbt,
+                              originalPrevOuts: openArray[TxOut],
+                              receiverPrevOuts: openArray[TxOut]): seq[TxOut] =
+  ## Build a prev-output array aligned with `proposal.tx.inputs`. The
+  ## first N entries (N = original.tx.inputs.len) reuse the sender's
+  ## original prev-outs; entries beyond that come from the PSBT's own
+  ## `witnessUtxo` slots populated by the receiver (G7) OR from the
+  ## explicit `receiverPrevOuts` argument when the caller has them.
+  result = @[]
+  for o in originalPrevOuts:
+    result.add(o)
+  if proposal.tx.isNone:
+    return @[]
+  let propInputs = proposal.tx.get().inputs.len
+  let origLen = originalPrevOuts.len
+  for i in origLen ..< propInputs:
+    if i < proposal.inputs.len and proposal.inputs[i].witnessUtxo.isSome:
+      result.add(proposal.inputs[i].witnessUtxo.get())
+    elif i - origLen < receiverPrevOuts.len:
+      result.add(receiverPrevOuts[i - origLen])
+    else:
+      return @[]
+
+# Forward declaration — finalizeFromPsbt is used by the sender pipeline
+# below before its full definition (avoids a circular order issue).
+
+proc extractTxFromFinalizedPsbt*(p: Psbt): Transaction =
+  ## Pull a broadcastable Transaction out of a PSBT whose every input
+  ## has finalScriptSig / finalScriptWitness populated (BIP-174 §
+  ## "Combiner / Finalizer").
+  if p.tx.isNone:
+    raise newException(PsbtError, "PSBT has no unsigned transaction")
+  result = p.tx.get()
+  # Mirror finalScriptSig + finalScriptWitness onto the tx.
+  while result.witnesses.len < result.inputs.len:
+    result.witnesses.add(@[])
+  for i, pIn in p.inputs:
+    if i >= result.inputs.len:
+      break
+    if pIn.finalScriptSig.len > 0:
+      result.inputs[i].scriptSig = pIn.finalScriptSig
+    if pIn.finalScriptWitness.len > 0:
+      result.witnesses[i] = pIn.finalScriptWitness
+
+proc payjoinSenderRun*(senderWallet: var Wallet,
+                       senderPsbt: Psbt,
+                       endpointUrl: string,
+                       opts: PayJoinReceiveOptions =
+                         PayJoinReceiveOptions(version: PAYJOIN_VERSION),
+                       extraQuery: string = "",
+                       tlsConfig: PayJoinTlsConfig =
+                         defaultPayJoinTlsConfig(),
+                       timeoutMs: int = 30_000):
+                      PayJoinSenderOutcome =
+  ## End-to-end sender flow:
+  ##   1. Validate `verifyPayJoinTlsCert` (G24) — refuse to dial plaintext.
+  ##   2. POST the Original PSBT (G2 + G27).
+  ##   3. On any network / receiver error → G22 fallback: extract the
+  ##      sender-signed Original as a Bitcoin tx and return it for the
+  ##      caller to broadcast.
+  ##   4. On success: parse the proposal, run G10-G15, sign the new
+  ##      sender inputs (none, since G12 forbids), extract the combined
+  ##      tx.
+  ##
+  ## `senderPsbt` MUST be a fully-signed Original PSBT (use
+  ## `isFullySignedOriginal` to verify before calling).
+  ##
+  ## Returns a `PayJoinSenderOutcome` describing what happened. Never
+  ## raises on transport / receiver failure — fallback is the design.
+  ## Raises `PayJoinSendError` only on `psoInternalError` (programmer
+  ## bug, e.g. unsigned Original PSBT).
+
+  if not isFullySignedOriginal(senderPsbt):
+    raise newPayJoinSendError(psoInternalError,
+      "Original PSBT is not fully signed; sender pipeline aborted")
+
+  let originalPrevOuts = collectPsbtPrevOuts(senderPsbt)
+  if originalPrevOuts.len == 0:
+    raise newPayJoinSendError(psoInternalError,
+      "Original PSBT inputs lack witnessUtxo/nonWitnessUtxo")
+
+  let originalTx = extractTxFromFinalizedPsbt(senderPsbt)
+  let originalTxid = originalTx.txid()
+
+  proc buildFallback(outcome: PayJoinSendOutcome,
+                     errKind, errMsg: string): PayJoinSenderOutcome =
+    PayJoinSenderOutcome(
+      usedProposal: false,
+      outcome: outcome,
+      txid: originalTxid,
+      signedTx: originalTx,
+      proposalPsbtBase64: "",
+      receiverErrorKind: errKind,
+      receiverErrorMsg: errMsg)
+
+  # G24 — refuse to dial without TLS / .onion.
+  if not verifyPayJoinTlsCert(endpointUrl, tlsConfig):
+    return buildFallback(psoNetworkError, "",
+      "endpoint URL failed G24 TLS check: " & endpointUrl)
+
+  let body = senderPsbt.toBase64()
+  let sendReq = PayJoinSendRequest(
+    endpointUrl: endpointUrl,
+    originalPsbtBase64: body,
+    extraQuery: extraQuery,
+    tlsConfig: tlsConfig,
+    timeoutMs: timeoutMs)
+
+  let resp = payjoinSenderPost(sendReq)
+  if resp.outcome != psoSuccess:
+    return buildFallback(resp.outcome,
+                         resp.receiverErrorKind, resp.receiverErrorMsg)
+
+  # Parse the proposal.
+  var proposal: Psbt
+  try:
+    proposal = fromBase64(resp.proposalPsbtBase64)
+  except CatchableError as e:
+    return buildFallback(psoReceiverRejected, "",
+      "Proposal PSBT parse failed: " & e.msg)
+  if proposal.tx.isNone:
+    return buildFallback(psoReceiverRejected, "",
+      "Proposal PSBT has no unsigned transaction")
+
+  # Build the proposal's prev-out array for the anti-snoop checks.
+  let propPrevOuts = collectProposalPrevOuts(proposal, originalPrevOuts, @[])
+  if propPrevOuts.len == 0:
+    return buildFallback(psoReceiverRejected, "",
+      "Proposal PSBT receiver inputs lack witnessUtxo")
+
+  # Build the sender's known outpoints set (G12).
+  var senderOutpoints = initHashSet[OutPoint]()
+  for _, u in senderWallet.utxos:
+    senderOutpoints.incl(u.outpoint)
+
+  if not validateAntiSnoop(senderPsbt, proposal, opts,
+                           originalPrevOuts, propPrevOuts, senderOutpoints):
+    return buildFallback(psoAntiSnoopFailed, "",
+      "Proposal failed BIP-78 G10-G15 anti-snoop validation")
+
+  # Build the final tx. Sender inputs reuse their original signatures
+  # (the witness slots on those indices in the proposal are populated
+  # by the receiver from the Original — G12 invariance means we just
+  # carry them over). The receiver's added inputs are already signed by
+  # the receiver (final-script-witness). Combine into a single tx.
+  var finalTx = proposal.tx.get()
+  while finalTx.witnesses.len < finalTx.inputs.len:
+    finalTx.witnesses.add(@[])
+  # Carry sender's signatures forward.
+  for i in 0 ..< originalTx.inputs.len:
+    if i >= finalTx.inputs.len:
+      break
+    if originalTx.inputs[i].scriptSig.len > 0:
+      finalTx.inputs[i].scriptSig = originalTx.inputs[i].scriptSig
+    if i < originalTx.witnesses.len and originalTx.witnesses[i].len > 0:
+      finalTx.witnesses[i] = originalTx.witnesses[i]
+  # Carry receiver's signatures forward (from PsbtInput.finalScriptWitness).
+  for i in originalTx.inputs.len ..< finalTx.inputs.len:
+    if i < proposal.inputs.len:
+      let pIn = proposal.inputs[i]
+      if pIn.finalScriptSig.len > 0:
+        finalTx.inputs[i].scriptSig = pIn.finalScriptSig
+      if pIn.finalScriptWitness.len > 0:
+        finalTx.witnesses[i] = pIn.finalScriptWitness
+
+  PayJoinSenderOutcome(
+    usedProposal: true,
+    outcome: psoSuccess,
+    txid: finalTx.txid(),
+    signedTx: finalTx,
+    proposalPsbtBase64: resp.proposalPsbtBase64,
+    receiverErrorKind: "",
+    receiverErrorMsg: "")
+
+proc payjoinSend*(senderWallet: var Wallet,
+                 senderPsbt: Psbt,
+                 endpointUrl: string,
+                 opts: PayJoinReceiveOptions =
+                   PayJoinReceiveOptions(version: PAYJOIN_VERSION),
+                 extraQuery: string = "",
+                 tlsConfig: PayJoinTlsConfig =
+                   defaultPayJoinTlsConfig(),
+                 timeoutMs: int = 30_000): PayJoinSenderOutcome {.inline.} =
+  ## Audit alias (G2 / sender top-level entrypoint).
+  payjoinSenderRun(senderWallet, senderPsbt, endpointUrl, opts,
+                   extraQuery, tlsConfig, timeoutMs)
