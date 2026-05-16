@@ -77,6 +77,7 @@ tests/test_regtest
 tests/test_softforks_bridge
 tests/test_versionbits
 tests/bench_flush
+tests/test_fix68_bip125_rpc
 src/mempool/cluster
 src/rpc/rest
 

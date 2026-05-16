@@ -1182,7 +1182,7 @@ proc handlePreciousBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   newJNull()
 
 # Mempool RPCs
-proc handleGetMempoolInfo(rpc: RpcServer): JsonNode =
+proc handleGetMempoolInfo*(rpc: RpcServer): JsonNode =
   let minFee = rpc.mempool.minFeeRate / 100000000.0  # Convert sat/vbyte to BTC/kB
   # Calculate total fees
   var totalFeeSat: int64 = 0
@@ -1199,7 +1199,13 @@ proc handleGetMempoolInfo(rpc: RpcServer): JsonNode =
     "minrelaytxfee": minFee,
     "incrementalrelayfee": 0.00001,
     "unbroadcastcount": 0,
-    "fullrbf": true
+    # FIX-68 (W120 BUG-8): reflect the mempool's actual fullRbf field, not
+    # a hardcoded literal.  An operator who configured mempoolfullrbf=0
+    # must observe `false` here.  Core master removed the option and
+    # hardcodes true, but nimrod still gates on the field so the RPC must
+    # mirror the actual configuration.
+    # Reference: src/mempool/mempool.nim Mempool.fullRbf field.
+    "fullrbf": rpc.mempool.fullRbf
   }
 
 proc parseTxidParam(hexStr: string): TxId =
@@ -1212,7 +1218,7 @@ proc parseTxidParam(hexStr: string): TxId =
     bytes[i] = byte(parseHexInt(reversed[i*2 .. i*2+1]))
   TxId(bytes)
 
-proc mempoolEntryJson(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNode =
+proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNode =
   ## Canonical per-entry object for getmempoolentry, getrawmempool (verbose),
   ## getmempoolancestors (verbose), getmempooldescendants (verbose).
   ## Reference: bitcoin-core/src/rpc/mempool.cpp entryToJSON (Core 31.99).
@@ -1250,7 +1256,13 @@ proc mempoolEntryJson(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNode
   obj["fees"]             = feesObj
   obj["depends"]          = newJArray()
   obj["spentby"]          = newJArray()
-  obj["bip125-replaceable"] = %true
+  # FIX-68 (W120 BUG-3): bip125-replaceable must reflect the tx's actual
+  # opt-in state.  Walks the tx itself (Gate 1: any input <= 0xfffffffd)
+  # AND walks all unconfirmed in-mempool ancestors (Gate 2: inherited
+  # signaling).  In full-RBF mode every mempool tx is replaceable.
+  # Reference: bitcoin-core/src/rpc/mempool.cpp entryToJSON
+  # → IsRBFOptIn(tx, pool) at line 560.
+  obj["bip125-replaceable"] = %rpc.mempool.isBip125Replaceable(txid)
   obj["unbroadcast"]      = %false
   obj
 
