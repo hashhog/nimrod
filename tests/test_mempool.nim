@@ -1234,7 +1234,9 @@ suite "Mempool package_limit combined tests":
 suite "Mempool RBF constants":
   test "RBF constants are correct":
     check MaxReplacementCandidates == 100
-    check DefaultIncrementalRelayFee == 1.0  # 1 sat/vbyte
+    ## FIX-69 (W120 BUG-1): was 1.0 sat/vB (10x Core); now 0.1 sat/vB
+    ## (= Core's 100 sat/kvB ÷ 1000). Core ref: policy/policy.h:48.
+    check DefaultIncrementalRelayFee == 0.1  # 0.1 sat/vbyte = 100 sat/kvB
 
 suite "Mempool RBF conflict detection":
   setup:
