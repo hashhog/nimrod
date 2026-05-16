@@ -6141,9 +6141,41 @@ proc handleCreatePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 2:
     raise newRpcError(RpcInvalidParams, "missing required parameters: inputs, outputs")
 
-  # Parse inputs
+  # Parse outputs first because Core's AddInputs needs nLockTime already set
+  # to choose 0xfffffffe vs 0xffffffff in the !rbf branch — but locktime in
+  # nimrod params is index 2, so parse it before walking inputs.
   if params[0].kind != JArray:
     raise newRpcError(RpcInvalidParams, "inputs must be an array")
+  if params[1].kind != JArray:
+    raise newRpcError(RpcInvalidParams, "outputs must be an array")
+
+  # Parse locktime
+  var locktime = 0'u32
+  if params.len >= 3 and params[2].kind != JNull:
+    locktime = uint32(params[2].getInt())
+
+  # Parse replaceable flag (BIP-125 opt-in RBF).
+  # FIX-70 / W120 BUG-2 Core parity: AddInputs() in
+  # bitcoin-core/src/rpc/rawtransaction_util.cpp uses
+  #   rbf.value_or(true)  // default TRUE when caller omits replaceable
+  # so the wallet default for createpsbt is RBF-signaling
+  # (MAX_BIP125_RBF_SEQUENCE = 0xfffffffd). Previously nimrod treated the
+  # absence of `replaceable` as `false`, which silently emitted
+  # 0xffffffff (SEQUENCE_FINAL) — non-RBF, non-locktime-enforcing. Core's
+  # `CWallet::m_signal_rbf` has defaulted to true since v23.
+  var replaceable = true  # Core default (DEFAULT_WALLET_RBF / rbf.value_or(true))
+  if params.len >= 4 and params[3].kind != JNull:
+    replaceable = params[3].getBool()
+
+  # Per-input default sequence — mirrors Core's AddInputs():
+  #   rbf  → MAX_BIP125_RBF_SEQUENCE   = 0xfffffffd
+  #   !rbf && locktime → MAX_SEQUENCE_NONFINAL = 0xfffffffe
+  #   !rbf && !locktime → SEQUENCE_FINAL = 0xffffffff
+  # Explicit "sequence" field on a per-input basis always overrides.
+  let defaultSequence: uint32 =
+    if replaceable: 0xfffffffd'u32
+    elif locktime > 0: 0xfffffffe'u32
+    else: 0xffffffff'u32
 
   var txInputs: seq[TxIn]
   for inputObj in params[0]:
@@ -6160,8 +6192,7 @@ proc handleCreatePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     let txid = parseTxId(txidHex)
     let vout = uint32(inputObj["vout"].getInt())
 
-    # Default sequence: 0xffffffff unless replaceable or locktime set
-    var sequence = 0xffffffff'u32
+    var sequence = defaultSequence
     if inputObj.hasKey("sequence"):
       sequence = uint32(inputObj["sequence"].getInt())
 
@@ -6172,9 +6203,6 @@ proc handleCreatePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     ))
 
   # Parse outputs
-  if params[1].kind != JArray:
-    raise newRpcError(RpcInvalidParams, "outputs must be an array")
-
   var txOutputs: seq[TxOut]
   for outputObj in params[1]:
     if outputObj.kind != JObject:
@@ -6211,22 +6239,6 @@ proc handleCreatePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
           txOutputs.add(TxOut(value: amountSat, scriptPubKey: scriptPubKey))
         except AddressError as e:
           raise newRpcError(RpcInvalidAddressOrKey, "invalid address: " & e.msg)
-
-  # Parse locktime
-  var locktime = 0'u32
-  if params.len >= 3 and params[2].kind != JNull:
-    locktime = uint32(params[2].getInt())
-
-  # Parse replaceable flag
-  var replaceable = false
-  if params.len >= 4 and params[3].kind != JNull:
-    replaceable = params[3].getBool()
-
-  # Apply RBF if replaceable or locktime > 0
-  if replaceable or locktime > 0:
-    for i in 0 ..< txInputs.len:
-      if txInputs[i].sequence == 0xffffffff'u32:
-        txInputs[i].sequence = 0xfffffffd'u32  # RBF-able sequence
 
   # Create unsigned transaction
   let tx = Transaction(
@@ -6630,6 +6642,28 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
   if params[1].kind != JArray:
     raise newRpcError(RpcInvalidParams, "outputs must be an array")
 
+  # ---- locktime (parsed early so AddInputs-equivalent can pick the right
+  # default sequence for the !rbf branch) ----
+  var locktimeEarly = 0'u32
+  if params.len >= 3 and params[2].kind != JNull:
+    locktimeEarly = uint32(params[2].getInt())
+
+  # ---- Resolve replaceable upfront so per-input default sequence matches
+  # Core's AddInputs() (rbf=MAX_BIP125_RBF_SEQUENCE 0xfffffffd, !rbf+lt=
+  # MAX_SEQUENCE_NONFINAL 0xfffffffe, !rbf+!lt=SEQUENCE_FINAL 0xffffffff).
+  # Core walletcreatefundedpsbt: rbf = options.replaceable ?? m_signal_rbf,
+  # and DEFAULT_WALLET_RBF=true. We mirror that — replaceable defaults true.
+  var replaceableEarly = true
+  if params.len >= 4 and params[3].kind == JObject:
+    let optsEarly = params[3]
+    if optsEarly.hasKey("replaceable") and optsEarly["replaceable"].kind == JBool:
+      replaceableEarly = optsEarly["replaceable"].getBool()
+
+  let defaultPreInputSequence: uint32 =
+    if replaceableEarly: 0xfffffffd'u32
+    elif locktimeEarly > 0: 0xfffffffe'u32
+    else: 0xffffffff'u32
+
   # ---- Parse pre-selected inputs (may be empty → auto-fund) ----
   var preInputs: seq[TxIn]
   for inputObj in params[0]:
@@ -6642,7 +6676,13 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
       raise newRpcError(RpcInvalidAddressOrKey, "invalid txid length")
     let txid = parseTxId(txidHex)
     let vout = uint32(inputObj["vout"].getInt())
-    var sequence = 0xffffffff'u32
+    # FIX-70 / W120 BUG-2: default to BIP-125-signaling sequence unless
+    # caller explicitly disabled replaceable or set a non-default sequence.
+    # Previously this defaulted to 0xffffffff and relied on the post-loop
+    # upgrade — that upgrade was correct for the common case but flipped
+    # 0xffffffff → 0xfffffffd even when caller asked for !rbf + locktime,
+    # silently dropping into BIP-125 territory.
+    var sequence = defaultPreInputSequence
     if inputObj.hasKey("sequence"):
       sequence = uint32(inputObj["sequence"].getInt())
     preInputs.add(TxIn(
@@ -6685,14 +6725,13 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
           raise newRpcError(RpcInvalidAddressOrKey,
             "invalid address: " & e.msg)
 
-  # ---- locktime ----
-  var locktime = 0'u32
-  if params.len >= 3 and params[2].kind != JNull:
-    locktime = uint32(params[2].getInt())
+  # ---- locktime / replaceable (already parsed early for pre-input default
+  # sequence; re-bind to the names used by the rest of the body) ----
+  let locktime = locktimeEarly
+  let replaceable = replaceableEarly
 
-  # ---- options ----
+  # ---- remaining options ----
   var feeRate = 0.0  # 0 means "use estimator"
-  var replaceable = true
   var changeAddrOverride = ""
   if params.len >= 4 and params[3].kind == JObject:
     let opts = params[3]
@@ -6702,8 +6741,6 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
     elif opts.hasKey("feeRate"):
       # BTC/kvB → sat/vB
       feeRate = opts["feeRate"].getFloat() * 100_000_000.0 / 1000.0
-    if opts.hasKey("replaceable") and opts["replaceable"].kind == JBool:
-      replaceable = opts["replaceable"].getBool()
     if opts.hasKey("changeAddress"):
       changeAddrOverride = opts["changeAddress"].getStr()
 
@@ -6764,11 +6801,25 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
       changeOutputCount = 1
 
   # ---- Apply locktime/replaceable RBF semantics ----
+  # FIX-70 / W120 BUG-2 Core parity: mirror AddInputs() — for any input that
+  # the wallet/caller left at the "unset" sentinel (0xffffffff), pick the
+  # appropriate default. For the auto-fund path, wallet.createTransaction
+  # already emits 0xfffffffd; if caller explicitly passed replaceable=false,
+  # walk RBF-signaling inputs back to the Core default (0xfffffffe if
+  # locktime>0, else 0xffffffff). Pre-set non-final sequences are left alone.
   fundedTx.lockTime = locktime
-  if replaceable or locktime > 0:
+  if replaceable:
     for i in 0 ..< fundedTx.inputs.len:
       if fundedTx.inputs[i].sequence == 0xffffffff'u32:
         fundedTx.inputs[i].sequence = 0xfffffffd'u32
+  else:
+    # caller explicitly opted out of RBF — undo wallet.createTransaction's
+    # default 0xfffffffd so the on-the-wire tx truly does not signal opt-in.
+    let nonRbfDefault: uint32 =
+      if locktime > 0: 0xfffffffe'u32 else: 0xffffffff'u32
+    for i in 0 ..< fundedTx.inputs.len:
+      if fundedTx.inputs[i].sequence == 0xfffffffd'u32:
+        fundedTx.inputs[i].sequence = nonRbfDefault
 
   # ---- Optional changeAddress override (rebuild change output) ----
   if changeOutputCount == 1 and changeAddrOverride.len > 0:
