@@ -507,6 +507,45 @@ proc pruneModeAdvertiseEnabled*(): bool =
   ## True when we should advertise NODE_NETWORK_LIMITED in the version handshake.
   pruneModeAdvertise
 
+# BIP-157 NODE_COMPACT_FILTERS advertisement gate.  W121 G15 / FIX-71.
+# Set from `nimrod.nim` at daemon startup, computed as
+# `config.peerblockfilters and config.blockfilterindex`.  When true,
+# `sendVersion` ORs `NodeCompactFilters` (1<<6 = 64) into the outbound
+# `services` bitfield so light clients know nimrod will respond to
+# `getcfilters` / `getcfheaders` / `getcfcheckpt` for the BASIC filter
+# type.  Mirrors Core's `init.cpp:992-999`:
+#     if (args.GetBoolArg("-peerblockfilters", DEFAULT_PEERBLOCKFILTERS)) {
+#         if (!g_enabled_filter_types.contains(BlockFilterType::BASIC)) {
+#             return InitError(_("Cannot set -peerblockfilters without -blockfilterindex."));
+#         }
+#         g_local_services = ServiceFlags(g_local_services | NODE_COMPACT_FILTERS);
+#     }
+# Default OFF: matches `DEFAULT_PEERBLOCKFILTERS = false`
+# (net_processing.h:45) — operators must opt in even when the index is
+# enabled.  Advertisement is _not_ gated on `BaseIndex.IsSynced()`; Core
+# emits the version handshake before the index has caught up and relies
+# on the request handlers in `nimrod.nim` to bail out cleanly when the
+# index has no entry for the requested height (they already do).
+var compactFiltersAdvertise: bool = false
+
+proc setCompactFiltersAdvertise*(enabled: bool) =
+  ## Toggle BIP-157 NODE_COMPACT_FILTERS advertisement.  Idempotent.
+  compactFiltersAdvertise = enabled
+
+proc advertiseCompactFiltersService*(): bool =
+  ## True when we should OR `NodeCompactFilters` into the version-handshake
+  ## services bitfield.  Set by `nimrod.nim` at daemon startup based on
+  ## `config.peerblockfilters and config.blockfilterindex`.
+  compactFiltersAdvertise
+
+proc peerBlockFiltersEnabled*(): bool =
+  ## True when nimrod advertises NODE_COMPACT_FILTERS and will serve
+  ## BIP-157 `getcfilters`/`getcfheaders`/`getcfcheckpt` to peers.
+  ## Alias of `advertiseCompactFiltersService()` — kept as a separate
+  ## symbol so callers reading like Core's `args.GetBoolArg(
+  ## "-peerblockfilters", ...)` flag-test stay legible.  W121 G29 / FIX-71.
+  compactFiltersAdvertise
+
 proc peerBloomFiltersEnabled*(): bool =
   ## Gate for accepting inbound BIP-35 `mempool` messages (nimrod.nim).
   ## Mirrors Bitcoin Core's `-peerbloomfilters` knob
@@ -540,6 +579,11 @@ proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
   # keep NODE_NETWORK set as well.
   if pruneModeAdvertiseEnabled():
     ourServices = ourServices or NodeNetworkLimited
+  # BIP-157: signal compact-filter serving when --peerblockfilters AND
+  # --blockfilterindex are both on.  W121 G15 / FIX-71.  Reference:
+  # bitcoin-core/src/init.cpp:992-999.
+  if advertiseCompactFiltersService():
+    ourServices = ourServices or NodeCompactFilters
   let msg = newVersionMsg(
     version = ProtocolVersion,
     services = ourServices,

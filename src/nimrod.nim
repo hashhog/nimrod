@@ -85,6 +85,17 @@ type
                             ## return data; without it those endpoints
                             ## report "Index is not enabled for filtertype
                             ## basic" (HTTP 400) — same as Core.
+    peerblockfilters*: bool ## --peerblockfilters: serve BIP-157 compact
+                            ## filters to peers and advertise
+                            ## NODE_COMPACT_FILTERS (1<<6 = 64) in our
+                            ## version handshake.  Default OFF, matching
+                            ## Core's `DEFAULT_PEERBLOCKFILTERS = false`
+                            ## (net_processing.h:45).  Requires
+                            ## `--blockfilterindex`: setting this flag
+                            ## without the index is a hard startup error
+                            ## (matches Core init.cpp:993-996 "Cannot set
+                            ## -peerblockfilters without -blockfilterindex").
+                            ## W121 G15 / FIX-71.
     asmapFile*: string      ## --asmap=<file>: ASMap binary file for ASN-keyed
                             ## eclipse-resistance bucketing.  Empty = disabled
                             ## (fallback to /16 / /32 groups).
@@ -209,6 +220,7 @@ proc defaultConfig*(): NimrodConfig =
     restEnabled: false,
     restPort: 0,            # 0 = derive from rpcPort (rpcPort + 1000)
     blockfilterindex: false,
+    peerblockfilters: false,  # Core parity: DEFAULT_PEERBLOCKFILTERS = false
     asmapFile: "",          # empty = ASMap disabled
     # W117 FIX-56 proxy flags (all default off)
     proxy: "",
@@ -319,6 +331,10 @@ proc loadConfigFile*(config: var NimrodConfig) =
         config.blockfilterindex = true
       elif v in ["0", "false", "no"]:
         config.blockfilterindex = false
+    of "peerblockfilters":
+      # W121 G15 / FIX-71: serve BIP-157 compact filters to peers and
+      # advertise NODE_COMPACT_FILTERS.  Default OFF (Core parity).
+      config.peerblockfilters = value.toLowerAscii() in ["", "1", "true", "yes"]
     of "asmap":
       config.asmapFile = value
     of "proxy":
@@ -402,6 +418,11 @@ Operational:
                          for the /rest/blockfilter[headers] endpoints to
                          return data. Mirrors Bitcoin Core
                          -blockfilterindex=basic.
+  --peerblockfilters     Serve BIP-157 compact filters to peers and advertise
+                         NODE_COMPACT_FILTERS in the version handshake.
+                         Default off (Core parity). Requires
+                         --blockfilterindex: setting this without the index
+                         is a startup error.
   --asmap=FILE           Load an ASMap binary file for ASN-keyed eclipse-
                          resistance bucketing.  When loaded, outbound peer
                          diversity is measured by Autonomous System Number
@@ -611,6 +632,20 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
         else:
           echo "Invalid --blockfilterindex value: " & p.val &
                " (use 1 / 0 / basic)"
+          quit(1)
+      of "peerblockfilters":
+        # W121 G15 / FIX-71: --peerblockfilters — serve BIP-157 compact
+        # filters and advertise NODE_COMPACT_FILTERS.  Default OFF.
+        # Mirrors Bitcoin Core `-peerblockfilters`
+        # (DEFAULT_PEERBLOCKFILTERS = false).
+        let v = p.val.toLowerAscii()
+        if v.len == 0 or v in ["1", "true", "yes"]:
+          result.config.peerblockfilters = true
+        elif v in ["0", "false", "no"]:
+          result.config.peerblockfilters = false
+        else:
+          echo "Invalid --peerblockfilters value: " & p.val &
+               " (use 1 / 0)"
           quit(1)
       of "asmap":
         result.config.asmapFile = p.val
@@ -1853,6 +1888,17 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
   # `IsPruneMode()` is true).
   setPruneModeAdvertise(config.pruneTarget > 0)
+
+  # BIP-157 W121 G15 / FIX-71: latch the NODE_COMPACT_FILTERS advertisement
+  # gate.  Refuse to start if --peerblockfilters is set without
+  # --blockfilterindex (mirrors Core init.cpp:993-996:
+  # `InitError("Cannot set -peerblockfilters without -blockfilterindex.")`).
+  # The bit is only advertised when both knobs are on; otherwise stays off.
+  if config.peerblockfilters and not config.blockfilterindex:
+    error "cannot set --peerblockfilters without --blockfilterindex"
+    echo "Error: --peerblockfilters requires --blockfilterindex"
+    quit(1)
+  setCompactFiltersAdvertise(config.peerblockfilters and config.blockfilterindex)
 
   # Create data directory
   if not dirExists(config.dataDir):

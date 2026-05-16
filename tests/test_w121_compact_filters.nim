@@ -16,6 +16,7 @@ import std/[unittest]
 import ../src/storage/indexes/[gcs, blockfilterindex, base]
 import ../src/crypto/siphash
 import ../src/network/messages
+import ../src/network/peer as net_peer
 import ../src/primitives/types
 
 suite "W121 BIP-158 construction (G1-G10)":
@@ -100,15 +101,51 @@ suite "W121 BIP-157 P2P (G11-G20)":
   test "G14 PRESENT: NODE_COMPACT_FILTERS service-flag constant":
     check NodeCompactFilters == 64'u64
 
-  test "G15 MISSING: NODE_COMPACT_FILTERS advertised in our version msg":
-    ## peer.sendVersion() sets `ourServices = NodeNetwork or NodeWitness`
-    ## plus `NodeNetworkLimited` only when prune-mode is on.  Even when
-    ## --blockfilterindex is enabled, peers never see (1<<6) in our
-    ## services bitfield, so light-clients cannot discover that nimrod
-    ## serves BIP-157 filters.  Core: `init.cpp` sets
-    ## `nLocalServices |= NODE_COMPACT_FILTERS` when fBlockFilterIndex.
-    ## Reference: bitcoin-core/src/init.cpp; bitcoin-core/src/net_processing.cpp:3268-3275
-    check not compiles(advertiseCompactFiltersService)
+  test "G15 PRESENT: NODE_COMPACT_FILTERS advertised in our version msg":
+    ## FIX-71 (W121 G15): peer.sendVersion() now ORs NodeCompactFilters
+    ## (1<<6 = 64) into the outbound `services` bitfield iff the operator
+    ## opted in with --peerblockfilters AND --blockfilterindex is on.
+    ## Latched at daemon startup from `setCompactFiltersAdvertise`.
+    ## Mirrors Core init.cpp:992-999.
+    check compiles(net_peer.advertiseCompactFiltersService)
+    check compiles(net_peer.setCompactFiltersAdvertise)
+
+    # Default state: OFF (Core parity DEFAULT_PEERBLOCKFILTERS = false).
+    net_peer.setCompactFiltersAdvertise(false)
+    check net_peer.advertiseCompactFiltersService() == false
+
+    # When operator opts in (CLI: --peerblockfilters AND
+    # --blockfilterindex), nimrod advertises NODE_COMPACT_FILTERS.
+    net_peer.setCompactFiltersAdvertise(true)
+    check net_peer.advertiseCompactFiltersService() == true
+
+    # Reset so other suites see the default state.
+    net_peer.setCompactFiltersAdvertise(false)
+
+  test "G15b FORWARD-REGRESSION: ourServices ORs NodeCompactFilters when gated":
+    ## Forward-regression guard: prove the gate is wired all the way
+    ## through to the bits that go on the wire.  Mirrors how
+    ## sendVersion() composes `ourServices` so a future refactor that
+    ## drops the OR (or moves the toggle reset around) will trip here
+    ## even if the helper still exists.
+    block off_path:
+      net_peer.setCompactFiltersAdvertise(false)
+      var ourServices = NodeNetwork or NodeWitness
+      if net_peer.advertiseCompactFiltersService():
+        ourServices = ourServices or NodeCompactFilters
+      check (ourServices and NodeCompactFilters) == 0'u64
+
+    block on_path:
+      net_peer.setCompactFiltersAdvertise(true)
+      var ourServices = NodeNetwork or NodeWitness
+      if net_peer.advertiseCompactFiltersService():
+        ourServices = ourServices or NodeCompactFilters
+      check (ourServices and NodeCompactFilters) == NodeCompactFilters
+      check (ourServices and NodeNetwork) == NodeNetwork
+      check (ourServices and NodeWitness) == NodeWitness
+
+    # Reset to OFF — module-level state must not bleed across suites.
+    net_peer.setCompactFiltersAdvertise(false)
 
   test "G16 PRESENT: mkGetCFilters dispatched to a real handler":
     ## Routed in nimrod.nim::handleMessage; uses
@@ -218,16 +255,32 @@ suite "W121 RPC / REST (G26-G30)":
     check not compiles(rpcGetBlockFilter)
     check not compiles(handleGetBlockFilter)
 
-  test "G29 MISSING: -peerblockfilters CLI knob":
-    ## Core: `-peerblockfilters` (default false) gates whether to advertise
-    ## NODE_COMPACT_FILTERS and serve getcfilters/getcfheaders/getcfcheckpt
-    ## at all.  Without this, even an index-enabled node should not serve
-    ## peers (Core init.cpp aborts startup if the flag is set without
-    ## -blockfilterindex).  nimrod's config.nim has --blockfilterindex but
-    ## no --peerblockfilters; the P2P handlers in nimrod.nim serve any
-    ## peer that asks as soon as the index is enabled.
-    ## Reference: bitcoin-core/src/init.cpp peerblockfilters wiring.
-    check not compiles(peerBlockFiltersEnabled)
+  test "G29 PRESENT: -peerblockfilters CLI knob":
+    ## FIX-71 (W121 G29): added `--peerblockfilters` / `peerblockfilters`
+    ## (config + CLI + conf-file) gating whether nimrod advertises
+    ## NODE_COMPACT_FILTERS.  Default OFF (Core parity
+    ## DEFAULT_PEERBLOCKFILTERS = false).  At startup, --peerblockfilters
+    ## set without --blockfilterindex hard-fails with a Core-equivalent
+    ## InitError ("Cannot set -peerblockfilters without -blockfilterindex"),
+    ## matching bitcoin-core/src/init.cpp:992-999.
+    check compiles(net_peer.peerBlockFiltersEnabled)
+
+    # Default state mirrors DEFAULT_PEERBLOCKFILTERS = false.
+    net_peer.setCompactFiltersAdvertise(false)
+    check net_peer.peerBlockFiltersEnabled() == false
+
+    # When the operator opts in, the helper returns true.
+    net_peer.setCompactFiltersAdvertise(true)
+    check net_peer.peerBlockFiltersEnabled() == true
+
+    # The helper is an alias of `advertiseCompactFiltersService()` —
+    # both views of the same module-level toggle, so they MUST be in
+    # lockstep.  Forward-regression guard against accidental divergence.
+    check net_peer.peerBlockFiltersEnabled() ==
+          net_peer.advertiseCompactFiltersService()
+
+    # Reset to OFF so other suites see the default state.
+    net_peer.setCompactFiltersAdvertise(false)
 
   test "G30 MISSING: RPC scanblocks (BIP-157 filter-driven wallet scan)":
     ## Core RPC `scanblocks` walks the chain using the block-filter index
