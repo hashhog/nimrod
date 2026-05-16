@@ -25,6 +25,8 @@ import ../storage/indexes/blockfilterindex
 import ../storage/indexes/gcs
 import ../mempool/mempool
 import ../crypto/hashing
+import ../wallet/wallet
+import ../wallet/payjoin as payjoinMod
 
 type
   RestError* = object of CatchableError
@@ -51,6 +53,15 @@ type
     tlsKeyPath*: string           ## On-disk PKCS#8 PEM key path (informational).
     tlsPrivateKey*: TLSPrivateKey ## Loaded once at startup; reused per accept.
     tlsCertificate*: TLSCertificate ## Loaded once at startup; reused per accept.
+    # ---- PayJoin receiver (W119 + FIX-65) ----
+    wallet*: Wallet               ## Optional: when set, enables POST
+                                  ## /payjoin BIP-78 receiver endpoint.
+                                  ## nil ⇒ POST /payjoin → 404 (the
+                                  ## existing read-only REST contract).
+    payjoinSessions*: PayJoinSessionTable
+      ## Replay-protection + TTL table for the receiver path.
+      ## Initialised when `wallet` is provided so the same RestServer
+      ## instance can be carried across many POSTs.
 
 const
   MaxGetUtxosOutpoints* = 15  ## Max outpoints per getutxos request
@@ -106,7 +117,8 @@ proc newRestServer*(
   txIndex: TxIndex = nil,
   filterIndex: BlockFilterIndex = nil,
   tlsCertPath: string = "",
-  tlsKeyPath: string = ""
+  tlsKeyPath: string = "",
+  wallet: Wallet = nil
 ): RestServer =
   ## Construct a REST server.
   ##
@@ -134,7 +146,9 @@ proc newRestServer*(
     tlsCertPath: "",
     tlsKeyPath: "",
     tlsPrivateKey: nil,
-    tlsCertificate: nil
+    tlsCertificate: nil,
+    wallet: wallet,
+    payjoinSessions: (if wallet != nil: newPayJoinSessionTable() else: nil)
   )
 
   if tlsBothSet:
@@ -1008,6 +1022,86 @@ proc handleRestBlockFilterHeaders*(rest: RestServer, uriPart: string): RestRespo
 # Request routing
 # ============================================================================
 
+# ============================================================================
+# PayJoin POST endpoint (W119 + FIX-65)
+# ============================================================================
+
+proc payjoinErrorBody(kind: PayJoinErrorKind, message: string): string =
+  ## BIP-78 §"Receive request errors" body shape — JSON object with
+  ## `errorCode` (the canonical string from the enum) + free-form
+  ## `message`. We hand-build the object so the dependency on
+  ## `std/json` stays minimal and the wire body is stable byte-for-byte.
+  let j = %*{
+    "errorCode": $kind,
+    "message": message
+  }
+  $j
+
+proc payjoinHttpStatusFor(kind: PayJoinErrorKind): HttpStatusCode =
+  ## BIP-78 §"Receive request errors" suggests 4xx for sender-induced
+  ## failures and 503 for receiver-induced. We use:
+  ##   * 400  for malformed Original PSBT or version mismatch
+  ##   * 503  for receiver-side `unavailable` / `not-enough-money`
+  case kind
+  of pjeOriginalPsbtRejected, pjeVersionUnsupported: Http400
+  of pjeUnavailable, pjeNotEnoughMoney: Http503
+
+proc handleRestPayJoin*(rest: RestServer, query: string,
+                       contentType: string, body: string): RestResponse =
+  ## POST /payjoin entry. Returns a `RestResponse` whose JSON body is
+  ## either a BIP-78 proposal (base64 PSBT wrapped in `{"psbt":...}`)
+  ## or a BIP-78 error envelope.
+  ##
+  ## Contract:
+  ##   * If the RestServer has no wallet wired, return 404 (the
+  ##     existing read-only contract is preserved by default).
+  ##   * Content-Type MUST be text/plain; otherwise 400 with
+  ##     `original-psbt-rejected`.
+  ##   * Body is the base64 Original PSBT.
+  ##   * On success the response body is `<base64 PSBT proposal>` as
+  ##     plain text (Content-Type: text/plain) — BIP-78 §"Receiver"
+  ##     specifies a raw base64 body, not JSON. We surface that exactly.
+  if rest.wallet == nil:
+    return restError(Http404, "PayJoin endpoint disabled (no wallet)")
+
+  if not checkPayJoinContentType(contentType):
+    return RestResponse(
+      status: Http400,
+      contentType: "application/json",
+      body: payjoinErrorBody(pjeOriginalPsbtRejected,
+        "Content-Type must be text/plain (got '" & contentType & "')") &
+        "\r\n")
+
+  var w = rest.wallet
+  let height =
+    if rest.chainState != nil: rest.chainState.bestHeight
+    else: 0'i32
+
+  try:
+    let proposal = payjoinReceive(
+      w, body.strip(), query, rest.payjoinSessions, height)
+    return RestResponse(
+      status: Http200,
+      contentType: "text/plain",
+      body: proposal)
+  except PayJoinError as e:
+    return RestResponse(
+      status: payjoinHttpStatusFor(e.kind),
+      contentType: "application/json",
+      body: payjoinErrorBody(e.kind, e.msg) & "\r\n")
+  except CatchableError as e:
+    return RestResponse(
+      status: Http500,
+      contentType: "application/json",
+      body: payjoinErrorBody(pjeUnavailable,
+        "Internal receiver error: " & e.msg) & "\r\n")
+
+proc handleRestPayJoinPost*(rest: RestServer, query: string,
+                           contentType: string, body: string): RestResponse =
+  ## Audit alias (W119 G1 surface) — `check not compiles(handleRestPayJoinPost)`
+  ## was the pinned assertion; FIX-65 flips it to compiles.
+  handleRestPayJoin(rest, query, contentType, body)
+
 proc handleRestRequest*(rest: RestServer, path: string): RestResponse =
   ## Route a REST request to the appropriate handler
   ## path should be the URI path starting with /rest/
@@ -1071,8 +1165,17 @@ proc processStream(rest: RestServer,
   ## transport directly) and the HTTPS path (reader/writer are the TLS
   ## stream halves and have already completed the handshake before the
   ## first call).
+  ##
+  ## FIX-65 extended this from GET-only to GET+POST. POST is needed for
+  ## the BIP-78 PayJoin receiver endpoint (`POST /payjoin?...`). The
+  ## parser reads the request line, captures `Content-Length` and
+  ## `Content-Type`, then on the blank line either dispatches (GET) or
+  ## reads `Content-Length` bytes of body before dispatching (POST).
   var inHeaders = true
   var path = ""
+  var meth = ""
+  var contentLength: int = 0
+  var contentType: string = ""
 
   while not reader.atEof():
     try:
@@ -1083,28 +1186,95 @@ proc processStream(rest: RestServer,
           # End of headers - process request
           inHeaders = false
 
-          if path.len > 0:
-            var resp: RestResponse
+          var resp: RestResponse
+          if meth == "GET" and path.len > 0:
             {.gcsafe.}:
               try:
                 resp = rest.handleRestRequest(path)
               except CatchableError as e:
                 resp = restError(Http500, "Internal error: " & e.msg)
+            let httpResponse = formatHttpResponse(resp)
+            await writer.write(httpResponse)
+          elif meth == "POST" and path.len > 0:
+            # Read body of exactly contentLength bytes. Cap at 4 MiB
+            # (more than enough for any base64 PSBT — even a 200-input
+            # Original PSBT is well under 200 KiB).
+            const MaxPostBody = 4 * 1024 * 1024
+            var body = ""
+            if contentLength > MaxPostBody:
+              resp = restError(Http400,
+                "Content-Length exceeds receiver limit (" &
+                $MaxPostBody & ")")
+              let httpResponse = formatHttpResponse(resp)
+              await writer.write(httpResponse)
+            elif contentLength > 0:
+              try:
+                var buf = newSeq[byte](contentLength)
+                await reader.readExactly(addr buf[0], contentLength)
+                body = newString(contentLength)
+                if contentLength > 0:
+                  copyMem(addr body[0], addr buf[0], contentLength)
+              except CatchableError as e:
+                resp = restError(Http400,
+                  "Failed reading POST body: " & e.msg)
+                let httpResponse = formatHttpResponse(resp)
+                await writer.write(httpResponse)
+                break
+            # Dispatch POST routes. Currently only /payjoin is wired.
+            let (postPath, postQuery) = block:
+              let q = path.find('?')
+              if q < 0: (path, "")
+              else: (path[0 ..< q], path[q + 1 .. ^1])
 
+            {.gcsafe.}:
+              try:
+                if postPath == "/payjoin" or postPath == "/rest/payjoin":
+                  resp = rest.handleRestPayJoin(postQuery, contentType, body)
+                else:
+                  resp = restError(Http404,
+                    "POST " & postPath & " not found")
+              except CatchableError as e:
+                resp = restError(Http500,
+                  "Internal error: " & e.msg)
             let httpResponse = formatHttpResponse(resp)
             await writer.write(httpResponse)
 
           # Reset for keep-alive
           inHeaders = true
           path = ""
+          meth = ""
+          contentLength = 0
+          contentType = ""
 
         elif line.startsWith("GET "):
-          # Extract path from GET request
           let parts = line.split(' ')
           if parts.len >= 2:
+            meth = "GET"
             path = parts[1]
 
-        # Skip other headers
+        elif line.startsWith("POST "):
+          let parts = line.split(' ')
+          if parts.len >= 2:
+            meth = "POST"
+            path = parts[1]
+
+        else:
+          # Header parsing — only the two we need.
+          let colon = line.find(':')
+          if colon > 0:
+            let hk = line[0 ..< colon].strip().toLowerAscii()
+            let hv = line[colon + 1 .. ^1].strip()
+            case hk
+            of "content-length":
+              try:
+                contentLength = parseInt(hv)
+              except ValueError:
+                contentLength = 0
+            of "content-type":
+              contentType = hv
+            else:
+              discard
+          # Other headers are skipped (no auth, no Host check on read-only).
 
     except CatchableError:
       break
