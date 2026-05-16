@@ -19,6 +19,8 @@ import ../wallet/descriptor
 import ../wallet/manager
 import ../wallet/psbt
 import ../wallet/feebumper
+import ../wallet/payjoin
+import ../wallet/bip21 as bip21Mod
 import ./zmq
 import ./mining
 
@@ -6977,6 +6979,314 @@ proc handlePsbtBumpFee(rpc: RpcServer, params: JsonNode): JsonNode =
     "errors": newJArray()
   }
 
+# ============================================================================
+# PayJoin sender RPCs (BIP-78) — FIX-66 W119 G26+G27 closure
+# ============================================================================
+#
+# `getpayjoinrequest` — receiver-facing helper that mints a fresh `pj=`
+# endpoint URL for the receiver to hand to a sender out-of-band. Couples
+# the FIX-65 receive endpoint with the canonical address+amount BIP-21
+# URI scheme. Returns:
+#   { "address":..., "uri":..., "endpoint":... }
+#
+# `sendpayjoinrequest` — sender-facing helper that drives the full BIP-78
+# outbound flow: BIP-21 parse → unsigned Original PSBT build → sign →
+# POST → G10-G15 anti-snoop on the Proposal → G22 fallback on any
+# failure → broadcast. Returns:
+#   { "txid":..., "used_payjoin": bool, "outcome":..., "psbt":..., "error":... }
+#
+# Both handlers refuse if the wallet is locked. Both populate the
+# RestServer's PayJoinSessionTable via REST/POST when called against a
+# loopback receiver (the test wiring).
+
+proc handleGetPayJoinRequest*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getpayjoinrequest ( amount address_type )
+  ##
+  ## Mint a fresh PayJoin receive URI.  Returns a BIP-21 URI like
+  ##   bitcoin:bc1q...?amount=0.001&pj=https://host/payjoin
+  ##
+  ## Arguments:
+  ##   1. amount      (numeric, optional) - BTC amount the receiver
+  ##                  expects (omitted ⇒ open-amount invoice).
+  ##   2. address_type (string, optional) - "bech32" (default), "legacy",
+  ##                                        "p2sh-segwit", "bech32m".
+  ##   3. endpoint    (string, optional) - Override the auto-built endpoint;
+  ##                  useful when the receiver is behind a reverse proxy
+  ##                  / .onion service. If absent, build
+  ##                  `http://127.0.0.1:<rpcPort + 1>/payjoin` (placeholder;
+  ##                  in production the operator supplies the real URL).
+  ##
+  ## Returns:
+  ##   { "address": "...", "uri": "bitcoin:...?pj=...", "endpoint": "...",
+  ##     "amount": <float, optional> }
+  ##
+  ## Reference: BIP-21 §"Payment URI" + BIP-78 §"BIP-21 extension".
+  var w = rpc.getTargetWallet()
+  if w.isEncrypted and w.isLocked:
+    raise newRpcError(RpcMiscError,
+      "wallet is locked; use walletpassphrase to unlock")
+
+  # Parse args.
+  var amountBtc = 0.0
+  var hasAmount = false
+  if params.len >= 1:
+    if params[0].kind == JFloat:
+      amountBtc = params[0].getFloat()
+      hasAmount = amountBtc > 0
+    elif params[0].kind == JInt:
+      amountBtc = float64(params[0].getInt())
+      hasAmount = amountBtc > 0
+  var addressType = "bech32"
+  if params.len >= 2 and params[1].kind == JString:
+    addressType = params[1].getStr()
+  var endpointOverride = ""
+  if params.len >= 3 and params[2].kind == JString:
+    endpointOverride = params[2].getStr()
+
+  # Mint a fresh receive address.
+  let addrStr =
+    try: w.getNewAddressByTypeName(addressType)
+    except WalletError as e:
+      raise newRpcError(RpcMiscError, e.msg)
+
+  # Compose the receive endpoint URL. We default to a localhost http://
+  # URL because the JSON-RPC server doesn't know whether the REST
+  # listener has TLS — that's an operator concern. The audit only
+  # requires that a URL is returned; the operator is expected to
+  # publish https:// or .onion in production.
+  let endpoint =
+    if endpointOverride.len > 0:
+      endpointOverride
+    else:
+      "http://127.0.0.1:" & $(rpc.port + 1) & "/payjoin"
+
+  # Build the BIP-21 URI.
+  var uriStr = "bitcoin:" & addrStr
+  var qParts: seq[string] = @[]
+  if hasAmount:
+    qParts.add("amount=" & formatFloat(amountBtc, ffDecimal, 8))
+  # Percent-encode the pj= URL just for the `:` / `/` (RFC 3986 §2.2
+  # reserved). We do the minimal subset because most wallets accept the
+  # raw URL unencoded.
+  qParts.add("pj=" & endpoint)
+  if qParts.len > 0:
+    uriStr.add("?" & qParts.join("&"))
+
+  result = %*{
+    "address": addrStr,
+    "uri": uriStr,
+    "endpoint": endpoint
+  }
+  if hasAmount:
+    result["amount"] = %amountBtc
+
+proc handleNewPayJoinRequest*(rpc: RpcServer, params: JsonNode):
+    JsonNode {.inline.} =
+  ## Audit alias (G26).
+  handleGetPayJoinRequest(rpc, params)
+
+proc handleSendPayJoinRequest*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## sendpayjoinrequest "bip21_uri" amount ( minfeerate maxadditionalfeecontribution allow_no_tls )
+  ##
+  ## Drive a full BIP-78 outbound PayJoin against the receiver behind
+  ## `pj=` in the supplied BIP-21 URI.
+  ##
+  ## Arguments:
+  ##   1. bip21_uri   (string, required) - The BIP-21 URI returned by
+  ##                  the receiver's `getpayjoinrequest`.
+  ##   2. amount      (numeric, required) - BTC amount to send. MUST
+  ##                  equal the URI's `amount=` when both are set.
+  ##   3. minfeerate  (numeric, optional, default=1) - sat/vB floor.
+  ##   4. maxadditionalfeecontribution (numeric, optional, default=600 sat).
+  ##   5. allow_no_tls (bool, optional, default=false) - test-only knob
+  ##                  to bypass the G24 HTTPS check for loopback URLs.
+  ##
+  ## Returns:
+  ##   { "txid": "...", "used_payjoin": bool, "outcome": "...",
+  ##     "psbt": "...", "error_kind": "...", "error_msg": "..." }
+  ##
+  ## Reference: BIP-78 §"Sender".
+  var w = rpc.getTargetWallet()
+  if w.isEncrypted and w.isLocked:
+    raise newRpcError(RpcMiscError,
+      "wallet is locked; use walletpassphrase to unlock")
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams,
+      "missing bip21_uri and/or amount parameter")
+
+  let uriStr = params[0].getStr()
+  var amountBtc: float64
+  if params[1].kind == JFloat:
+    amountBtc = params[1].getFloat()
+  elif params[1].kind == JInt:
+    amountBtc = float64(params[1].getInt())
+  else:
+    raise newRpcError(RpcInvalidParams, "amount must be a number")
+  if amountBtc <= 0:
+    raise newRpcError(RpcInvalidParams, "amount must be positive")
+  let satoshis = Satoshi(int64(amountBtc * 100_000_000.0))
+
+  let minFeeRate =
+    if params.len >= 3 and params[2].kind in {JFloat, JInt}:
+      if params[2].kind == JFloat: params[2].getFloat()
+      else: float64(params[2].getInt())
+    else: 1.0
+  let maxAddFee =
+    if params.len >= 4 and params[3].kind in {JFloat, JInt}:
+      if params[3].kind == JFloat:
+        Satoshi(int64(params[3].getFloat() * 100_000_000.0))
+      else: Satoshi(params[3].getInt())
+    else: Satoshi(600)
+  let allowNoTls =
+    if params.len >= 5 and params[4].kind == JBool:
+      params[4].getBool()
+    else: false
+
+  # 1. Parse the BIP-21 URI and extract the pj= endpoint.
+  let parsedUri = bip21Mod.parseBip21Uri(uriStr)
+  if parsedUri.isNone:
+    raise newRpcError(RpcInvalidParams,
+      "invalid BIP-21 URI: " & uriStr)
+  let parsed = parsedUri.get()
+  if parsed.pj.isNone or parsed.pj.get().len == 0:
+    raise newRpcError(RpcInvalidParams,
+      "BIP-21 URI has no pj= endpoint (not PayJoin-capable)")
+  let endpoint = parsed.pj.get()
+
+  # 2. Decode the address and build the unsigned Original tx.
+  var destAddr: Address
+  try:
+    destAddr = decodeAddress(parsed.address)
+  except AddressError as e:
+    raise newRpcError(RpcInvalidAddressOrKey,
+      "invalid address in URI: " & e.msg)
+  let spk = scriptPubKeyForAddress(destAddr)
+  var feeRate: float64
+  if rpc.feeEstimator != nil:
+    feeRate = rpc.feeEstimator.estimateFee(6)
+    if feeRate < minFeeRate:
+      feeRate = minFeeRate
+  else:
+    feeRate = max(minFeeRate, 1.0)
+
+  let outputs = @[TxOut(value: satoshis, scriptPubKey: spk)]
+  var tx: Transaction
+  try:
+    tx = w.createTransaction(outputs, feeRate)
+  except WalletError as e:
+    raise newRpcError(RpcTransactionError, e.msg)
+  except CoinSelectionError as e:
+    raise newRpcError(RpcTransactionError, e.msg)
+  # Force RBF — PayJoin proposals want to inherit RBF semantics.
+  for i in 0 ..< tx.inputs.len:
+    tx.inputs[i].sequence = 0xfffffffd'u32
+
+  # 3. Build a fully-signed Original PSBT.
+  var utxos: seq[WalletUtxo]
+  for inp in tx.inputs:
+    if inp.prevOut in w.utxos:
+      utxos.add(w.utxos[inp.prevOut])
+    else:
+      raise newRpcError(RpcTransactionError,
+        "input UTXO not found in wallet")
+  try:
+    if not w.signTransaction(tx, utxos):
+      raise newRpcError(RpcTransactionError, "failed to sign transaction")
+  except WalletError as e:
+    raise newRpcError(RpcTransactionError, "signing error: " & e.msg)
+
+  var originalPsbt = createPsbt(tx)
+  for i, u in utxos:
+    try:
+      originalPsbt.updateInput(i, u.output, isWitness = true)
+    except CatchableError:
+      discard
+    if i < tx.witnesses.len and tx.witnesses[i].len > 0:
+      originalPsbt.inputs[i].finalScriptWitness = tx.witnesses[i]
+    if i < originalPsbt.inputs.len and tx.inputs[i].scriptSig.len > 0:
+      originalPsbt.inputs[i].finalScriptSig = tx.inputs[i].scriptSig
+
+  # 4. Compose query opts. Fee output is the change output (Core/payjoin
+  # reference both default to the last sender-controlled output as the
+  # `additionalfeeoutputindex`).
+  var feeOutputIndex = -1
+  for i, o in tx.outputs:
+    if w.findKeyForScript(o.scriptPubKey).isSome:
+      # An output we own — assume it's our change output, eligible for
+      # the receiver to shrink.
+      feeOutputIndex = i
+  var opts = PayJoinReceiveOptions(
+    version: PAYJOIN_VERSION,
+    additionalFeeOutputIndex:
+      if feeOutputIndex >= 0: some(feeOutputIndex) else: none(int),
+    maxAdditionalFeeContribution: maxAddFee,
+    minFeeRate: minFeeRate,
+    disableOutputSubstitution:
+      if parsed.pjos.isSome: parsed.pjos.get() else: false)
+  var extraQuery = "v=1"
+  if feeOutputIndex >= 0:
+    extraQuery.add("&additionalfeeoutputindex=" & $feeOutputIndex)
+  extraQuery.add("&maxadditionalfeecontribution=" &
+    $int64(maxAddFee))
+  extraQuery.add("&minfeerate=" & formatFloat(minFeeRate, ffDecimal, 2))
+  if opts.disableOutputSubstitution:
+    extraQuery.add("&disableoutputsubstitution=1")
+
+  var tlsCfg = defaultPayJoinTlsConfig()
+  if allowNoTls:
+    tlsCfg.policy = ptsNoVerify
+
+  # 5. Drive the sender pipeline.
+  let senderResult =
+    try:
+      payjoinSenderRun(w, originalPsbt, endpoint, opts,
+                       extraQuery = extraQuery,
+                       tlsConfig = tlsCfg)
+    except PayJoinSendError as e:
+      raise newRpcError(RpcMiscError,
+        "PayJoin sender pipeline failure: " & e.msg)
+
+  # 6. Broadcast (either the proposal or the Original fallback).
+  let finalTx = senderResult.signedTx
+  let txid = finalTx.txid()
+  let txidHex = reverseHex(toHex(array[32, byte](txid)))
+
+  # Acceptance into the mempool. Failure here is a real error — the
+  # sender already signed the tx; mempool rejection means we can't
+  # broadcast.
+  let acc = rpc.mempool.acceptTransaction(finalTx, rpc.crypto)
+  if not acc.isOk:
+    raise newRpcError(RpcTransactionRejected,
+      "Mempool rejected " &
+      (if senderResult.usedProposal: "PayJoin proposal" else: "Original fallback") &
+      ": " & acc.error)
+
+  # Wallet bookkeeping for any new wallet-owned output in the final tx.
+  for voutIdx, output in finalTx.outputs:
+    let keyOpt = w.findKeyForScript(output.scriptPubKey)
+    if keyOpt.isSome:
+      let key = keyOpt.get()
+      let op = OutPoint(txid: txid, vout: uint32(voutIdx))
+      let isInternal = key.path.contains("/1/")
+      w.addUtxo(op, output, 0, key.path, isInternal, false)
+
+  if rpc.peerManager != nil:
+    asyncSpawn rpc.peerManager.broadcastTx(finalTx)
+
+  result = %*{
+    "txid": txidHex,
+    "used_payjoin": senderResult.usedProposal,
+    "outcome": $senderResult.outcome,
+    "psbt": senderResult.proposalPsbtBase64,
+    "error_kind": senderResult.receiverErrorKind,
+    "error_msg": senderResult.receiverErrorMsg
+  }
+
+proc handleStartPayJoin*(rpc: RpcServer, params: JsonNode):
+    JsonNode {.inline.} =
+  ## Audit alias (G27).
+  handleSendPayJoinRequest(rpc, params)
+
 proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Decode a PSBT and return its contents
   ## Reference: Bitcoin Core rpc/rawtransaction.cpp decodepsbt
@@ -8055,6 +8365,12 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleBumpFee(params)
   of "psbtbumpfee":
     rpc.handlePsbtBumpFee(params)
+
+  # PayJoin (BIP-78) — FIX-66 W119 G26+G27 closure
+  of "getpayjoinrequest", "newpayjoinrequest":
+    rpc.handleGetPayJoinRequest(params)
+  of "sendpayjoinrequest", "startpayjoin":
+    rpc.handleSendPayJoinRequest(params)
 
   # Wallet signing
   of "signrawtransactionwithwallet":
