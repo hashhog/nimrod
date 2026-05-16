@@ -68,11 +68,32 @@ const
     ## (G18). Sessions older than this are pruned by
     ## `expirePayJoinSessions`.
 
+  PayJoinSessionsMaxSize* = 1024
+    ## FIX-67 G18 — hard cap on `PayJoinSessionTable.sessions` size.
+    ## A receiver behind a slow Tor onion endpoint can keep TTL-fresh
+    ## but never-consumed entries; without an upper bound an attacker
+    ## can spam unique Original PSBTs and exhaust receiver memory.
+    ## `sweepPayJoinSessions` enforces this lid by oldest-first eviction
+    ## once `expirePayJoinSessions` has run.
+
+  PayJoinTorSocksPort* = 9050'u16
+    ## FIX-67 G25 — canonical Tor SOCKS5 port. The sender's
+    ## `payjoinOnionClient` path assumes a system Tor or `tor` daemon is
+    ## listening here; the chronos httpclient picks this up from the
+    ## `ALL_PROXY=socks5://127.0.0.1:9050` env var once the operator
+    ## sets it. Surfacing the constant lets the test harness assert
+    ## the contract without spinning up a real Tor instance.
+
   ## Sensible receiver-side defaults; callers may override per-request.
   DefaultPayJoinMinFeeRate* = 1.0    ## sat/vB
   DefaultPayJoinFeeRate* = 1.0       ## sat/vB used when sender does not
                                      ## specify and we need to compute
                                      ## the added-input fee delta (G9).
+  PayJoinDustThresholdSats* = 546'i64
+    ## FIX-67 G8 — receiver MUST NOT shrink the fee-bearing output below
+    ## the standard P2WPKH dust threshold (546 sats). `applyReceiverFeeDelta`
+    ## clamps to this floor and refuses to apply a delta that would create
+    ## a dust output.
 
 # ---------------------------------------------------------------------------
 # Errors (G17)
@@ -542,7 +563,13 @@ proc applyReceiverFeeDelta*(psbtObj: var Psbt,
   if idx < 0 or idx >= tx.outputs.len:
     return 0
   let cur = int64(tx.outputs[idx].value)
-  if cur - delta < 0:
+  # FIX-67 G8 — refuse to shrink the fee-bearing output below the
+  # standard dust threshold (PayJoinDustThresholdSats). Producing a
+  # sub-dust output would make the tx non-standard / non-relayable
+  # (BIP-125 + Core IsDust); the proposal would then either be
+  # rejected by the sender's mempool or by every hop downstream.
+  # Match Bitcoin Core's GetDustThreshold for P2WPKH (546 sats).
+  if cur - delta < PayJoinDustThresholdSats:
     return 0
   modifyOriginalOutput(psbtObj, idx, delta)
   delta
@@ -590,6 +617,36 @@ proc expirePayJoinSessions*(table: PayJoinSessionTable, now: int64) =
       stale.add(k)
   for k in stale:
     table.sessions.del(k)
+
+proc sweepPayJoinSessions*(table: PayJoinSessionTable, now: int64,
+                          maxSize: int = PayJoinSessionsMaxSize) =
+  ## FIX-67 G18 — combined TTL sweep + bounded-size eviction.
+  ##
+  ## Step 1: drop TTL-stale sessions (`expirePayJoinSessions`).
+  ## Step 2: if `table.sessions.len > maxSize`, evict the oldest
+  ##         entries (by `firstSeen`) until the bound holds.
+  ##
+  ## Consumed entries are evicted alongside unconsumed ones — a
+  ## determined attacker spamming Originals with `consumed=true`
+  ## sessions could still grow the table without this sweep.  The
+  ## TTL/replay window for already-consumed entries is the same as
+  ## for unconsumed ones (BIP-78 §"Reuse protection" doesn't
+  ## prescribe a longer window after consumption), so dropping the
+  ## oldest is correct.  The receiver's defense against post-eviction
+  ## replays falls back to the natural reorg / mempool eviction of
+  ## the consumed transaction itself.
+  expirePayJoinSessions(table, now)
+  if table.sessions.len <= maxSize:
+    return
+  # Build a (txid, firstSeen) array, sort by firstSeen ascending, drop
+  # the prefix that brings us back under the cap.
+  var entries: seq[(int64, TxId)] = @[]
+  for k, v in table.sessions:
+    entries.add((v.firstSeen, k))
+  entries.sort do (a, b: (int64, TxId)) -> int: cmp(a[0], b[0])
+  let toDrop = table.sessions.len - maxSize
+  for i in 0 ..< toDrop:
+    table.sessions.del(entries[i][1])
 
 proc payjoinReplaySet*(table: PayJoinSessionTable): seq[TxId] =
   ## G19 observer: list of txids currently in the receiver's replay
@@ -801,6 +858,20 @@ proc payjoinReceive*(wallet: var Wallet,
     if i < proposal.inputs.len and workTx.inputs[0].scriptSig.len > 0:
       proposal.inputs[i].finalScriptSig = workTx.inputs[0].scriptSig
   proposal.tx = some(txCopy)
+
+  # FIX-67 G30 — invalidate the Original PSBT on the successful path.
+  # Without this, the receiver's replay-protection table only flips a
+  # session to `consumed=true` if some external caller invokes
+  # `consumePayJoinSession`. BIP-78 §"Reuse protection" requires the
+  # receiver to invalidate the Original after a successful proposal so
+  # a second POST with the same Original returns `pjeUnavailable`.
+  # The end-to-end test in `test_fix67_payjoin_cleanup.nim` pins this
+  # invariant.
+  if sessions != nil:
+    consumePayJoinSession(sessions, originalTxid)
+    # Bounded sweep — the receiver is now in a known-clean state, so
+    # take the opportunity to expire stale + over-bound sessions.
+    sweepPayJoinSessions(sessions, now)
 
   # Encode the proposal as base64 and return.
   proposal.toBase64()
@@ -1356,12 +1427,50 @@ proc buildPayJoinPostUrl*(endpointUrl: string, extraQuery: string): string =
   ## with their own params already in the URL; the sender appends its
   ## own optional `additionalfeeoutputindex=…` etc. without disturbing
   ## the receiver's.
-  if extraQuery.len == 0:
+  ##
+  ## FIX-67 G21 — guarantee `v=<PAYJOIN_VERSION>` is present in the
+  ## final URL. BIP-78 §"BIP-78 endpoint" mandates that the sender
+  ## advertise its supported version; we inject it iff neither the
+  ## endpoint URL nor the caller-supplied `extraQuery` already carries
+  ## a `v=` token.  This closes the silent-default case where a caller
+  ## (e.g. a one-off operator-script via `payjoinSenderRun`) omits
+  ## `extraQuery` entirely.  Case-insensitive match per RFC 3986 §3.4
+  ## (query keys are spec-defined here, so case fold is fine).
+  proc hasVersionParam(s: string): bool =
+    let lc = s.toLowerAscii()
+    # Match `v=` immediately after `?` or `&` (or at start of query),
+    # so an unrelated key ending in `v` (e.g. `pjov=...`) does not
+    # trigger a false positive.
+    var i = 0
+    while i < lc.len:
+      let c = lc[i]
+      if c == 'v' and i + 1 < lc.len and lc[i + 1] == '=':
+        if i == 0:
+          return true
+        let prev = lc[i - 1]
+        if prev == '?' or prev == '&':
+          return true
+      inc i
+    false
+
+  let versionToken = "v=" & $PAYJOIN_VERSION
+  var query = extraQuery
+
+  let endpointHasVersion = hasVersionParam(endpointUrl)
+  let extraHasVersion = hasVersionParam(query)
+
+  if not endpointHasVersion and not extraHasVersion:
+    if query.len == 0:
+      query = versionToken
+    else:
+      query = versionToken & "&" & query
+
+  if query.len == 0:
     return endpointUrl
   let sep =
     if endpointUrl.contains('?'): "&"
     else: "?"
-  endpointUrl & sep & extraQuery
+  endpointUrl & sep & query
 
 proc parsePayJoinErrorBody*(body: string):
     tuple[kind: string, message: string] =
@@ -1512,16 +1621,57 @@ proc sendPayJoinRequest*(req: PayJoinSendRequest): PayJoinSendResult {.inline.} 
 # stays a stub. payjoin.org's reference sender treats clearnet TLS as
 # the must-have and Tor as the SHOULD-have; this matches that priority.
 
+proc isPayJoinOnionEndpoint*(url: string): bool =
+  ## FIX-67 G25 — quick predicate for "this URL is a Tor onion endpoint
+  ## suitable for `payjoinOnionClient`".  Accepts `http://*.onion`,
+  ## `https://*.onion`, and `*.onion` (no scheme). Rejects empty
+  ## strings + URLs without `.onion` host. Case-insensitive.
+  ##
+  ## NB: this is a syntactic check only — it does NOT validate the
+  ## onion address length (16 chars for v2, 56 for v3). The full Tor
+  ## rend-spec-v3 check lives in `network/tor.nim` (FIX-57); this helper
+  ## stays minimal so the PayJoin sender can pre-flight the URL before
+  ## opening a socket.
+  if url.len == 0:
+    return false
+  let lc = url.toLowerAscii()
+  # Locate the host segment.
+  var hostStart = 0
+  if lc.startsWith("http://"):
+    hostStart = 7
+  elif lc.startsWith("https://"):
+    hostStart = 8
+  elif lc.contains("://"):
+    return false  # Some other scheme — refuse, the caller must be explicit.
+  # Strip any trailing path / query / port.
+  var hostEnd = lc.len
+  for i in hostStart ..< lc.len:
+    let c = lc[i]
+    if c == '/' or c == '?' or c == '#':
+      hostEnd = i
+      break
+  if hostStart >= hostEnd:
+    return false
+  let host = lc[hostStart ..< hostEnd]
+  # Allow optional `:port` suffix.
+  let colon = host.rfind(':')
+  let bare =
+    if colon >= 0: host[0 ..< colon]
+    else: host
+  bare.endsWith(".onion")
+
 proc payjoinOnionClient*(req: PayJoinSendRequest): PayJoinSendResult =
   ## G25 surface — Tor onion sender. Currently routes through the
   ## same chronos httpclient (which can dial `*.onion:80` over the
   ## local Tor SOCKS5 listener once chronos' transport hook is wired).
   ##
-  ## For now we return `psoNetworkError` for non-onion URLs so the
-  ## caller picks G22 fallback. Onion URLs fall through to the
-  ## httpclient path; a system Tor running on 9050 forwards them.
-  let lc = req.endpointUrl.toLowerAscii()
-  if not lc.contains(".onion"):
+  ## For non-onion URLs returns `psoNetworkError` so the caller picks
+  ## G22 fallback. Onion URLs fall through to the httpclient path; a
+  ## system Tor running on `PayJoinTorSocksPort` (9050) forwards them.
+  ## FIX-67 G25 — use the dedicated predicate so the helper, the
+  ## audit test, and the production path all agree on what counts as
+  ## an onion endpoint.
+  if not isPayJoinOnionEndpoint(req.endpointUrl):
     return PayJoinSendResult(
       outcome: psoNetworkError,
       receiverErrorMsg: "payjoinOnionClient called with non-onion URL")
