@@ -324,27 +324,56 @@ suite "W121 Persistence (G21-G25)":
     check compiles(readFilter)
     check MaxFilterFileSize == 16 * 1024 * 1024
 
-  test "G25 MISSING: Core-parity on-disk record layout (hash + compactsize)":
-    ## Core's WriteFilterToDisk (blockfilterindex.cpp:177-232) writes
-    ##     block_hash (32) || CompactSize(filter_len) || encoded_filter
-    ## and ReadFilterFromDisk recovers the hash + length, verifies the
-    ## stored hash matches the DB hash (`if (Hash(encoded_filter) != hash)`).
+  test "G25 PRESENT: Core-parity on-disk record layout (hash + compactsize)":
+    ## FIX-87 (W121 G25 P1-CDIV closure): nimrod now writes per-record
+    ## using the Core layout from `BlockFilterIndex::WriteFilterToDisk`
+    ## (bitcoin-core/src/index/blockfilterindex.cpp:177-232):
     ##
-    ## Nimrod's writeFilter (blockfilterindex.nim:169-192) writes ONLY the
-    ## raw encoded_filter bytes — no hash, no length prefix.  Consequence:
-    ##   1. readFilter takes a `filterSize: int` parameter, but the on-disk
-    ##      record contains no record of the size, so the only call site
-    ##      (`getFilter`) hard-codes `1024 * 1024` and depends on
-    ##      `skipDecode = true` to silently accept the trailing 1 MiB of
-    ##      garbage as part of the filter.
-    ##   2. There is no on-disk integrity check; bit-rot in a fltr*.dat
-    ##      file cannot be detected, and the per-block hash recovery used
-    ##      by Core's `entry.hash` check is impossible.
-    ##   3. The .dat file is not Core-compatible — a Core node cannot
-    ##      read a nimrod-written fltr*.dat and vice versa.
+    ##     block_hash (32 raw bytes) || CompactSize(filter_len) || filter_bytes
+    ##
+    ## The read path (`readFilterRecord`) reverses the wrapper AND
+    ## verifies the on-disk block_hash matches the hash the caller
+    ## expected — corruption detection at the per-record layer (the
+    ## analogue of Core's `if (Hash(encoded_filter) != hash)` check).
+    ##
+    ## Cross-impl consequence: nimrod's `fltr*.dat` files are now
+    ## byte-for-byte readable by Core (and vice versa, modulo the
+    ## per-impl current-file-num bookkeeping in the LevelDB sidecar),
+    ## so operators can migrate a chainstate between Core and nimrod
+    ## without rebuilding the filter index from genesis.
+    ##
+    ## BlockFilterIndexCodecVersion is bumped to 3 to force any v1 or
+    ## v2 (pre-FIX-87, raw-bytes-only) index to be dropped and rebuilt
+    ## via the `maybeMigrateCodec` path on next start.
+    ##
     ## Reference: bitcoin-core/src/index/blockfilterindex.cpp:151-232
-    check not compiles(writeFilterRecord)
-    check not compiles(readFilterRecord)
+    check compiles(writeFilterRecord)
+    check compiles(readFilterRecord)
+    check compiles(encodeFilterRecord)
+
+    # Source-level regression guard: the new per-record format MUST be
+    # what writeFilterRecord emits.  Build a tiny payload, run it
+    # through encodeFilterRecord, and assert the byte layout matches
+    # Core's `block_hash || CompactSize(len) || bytes`.
+    var hb: array[32, byte]
+    for i in 0 ..< 32:
+      hb[i] = byte(i)
+    let bh = BlockHash(hb)
+    let filterBytes = @[0xaa'u8, 0xbb, 0xcc]
+    let record = encodeFilterRecord(bh, filterBytes)
+    # 32 (hash) + 1 (CompactSize<253) + 3 (filter) = 36
+    check record.len == 36
+    for i in 0 ..< 32:
+      check record[i] == byte(i)
+    check record[32] == 0x03'u8   # CompactSize(3) = 0x03
+    check record[33] == 0xaa'u8
+    check record[34] == 0xbb'u8
+    check record[35] == 0xcc'u8
+
+    # FIX-87 also bumps the on-disk codec version so v1+v2 indexes
+    # rebuild on next start (the v2 records lack the wrapper and
+    # cannot be salvaged by the v3 reader).
+    check BlockFilterIndexCodecVersion == 3'u32
 
 suite "W121 RPC / REST (G26-G30)":
 
