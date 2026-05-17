@@ -17,7 +17,7 @@
 ## Reference: BIP 157 https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki
 ## Reference: BIP 158 https://github.com/bitcoin/bips/blob/master/bip-0158.mediawiki
 
-import std/[options, os, streams, strformat]
+import std/[options, os, streams, strformat, strutils]
 import ./base
 import ./gcs
 import ../db
@@ -47,9 +47,23 @@ const
   DbFilterIndex* = byte('f')       ## Key prefix for filter index entries
   DbFilterByHash* = byte('g')      ## Key prefix for hash-indexed entries
   DbPrevHeader* = byte('P')        ## Key for previous filter header
+  DbCodecVersion* = byte('V')      ## Key for codec format version (FIX-83)
   FilterFilePrefix* = "fltr"
   FilterFileSuffix* = ".dat"
   MaxFilterFileSize* = 16 * 1024 * 1024  ## 16 MiB per filter file
+
+  ## On-disk codec format version for the BIP-158 filter index.
+  ##
+  ## v1 — Pre-FIX-83: BitWriter/BitReader packed bits LSB-first within each
+  ##   byte (the W122 BUG-1 P0-CDIV regression).  `fltr*.dat` files contained
+  ##   GCS-encoded filters that round-tripped locally but were byte-incompatible
+  ##   with Bitcoin Core and every other BIP-158 impl.
+  ## v2 — FIX-83: codec rewritten MSB-first matching Core
+  ##   (`bitcoin-core/src/streams.h:303-358`).  `fltr*.dat` files are
+  ##   byte-for-byte readable by Core.  On node restart with a v1 index on
+  ##   disk, the entire filter index is dropped and re-built from the
+  ##   chainstate (auto-rebuild path below).
+  BlockFilterIndexCodecVersion* = 2'u32
 
 # ============================================================================
 # FilterIndexEntry serialization
@@ -93,6 +107,10 @@ proc filterHashKey*(blockHash: BlockHash): seq[byte] =
 proc prevHeaderKey*(): seq[byte] =
   @[DbPrevHeader]
 
+proc codecVersionKey*(): seq[byte] =
+  ## Key for the on-disk codec format version (FIX-83 / W122).
+  @[DbCodecVersion]
+
 # ============================================================================
 # Filter file management
 # ============================================================================
@@ -128,6 +146,121 @@ proc getFilterFileSize*(idx: BlockFilterIndex, fileNum: int32): int32 =
 # BlockFilterIndex implementation
 # ============================================================================
 
+proc readCodecVersion*(idx: BlockFilterIndex): uint32 =
+  ## Read the codec format version stamped on this index.  An index that
+  ## was never stamped (legacy fresh-write of unknown vintage, OR a
+  ## pre-FIX-83 W122 LSB-first index) returns 0.
+  let data = idx.db.get(cfMeta, codecVersionKey())
+  if data.isNone or data.get().len < 4:
+    return 0
+  var r = BinaryReader(data: data.get(), pos: 0)
+  let v = r.readInt32LE()
+  if v < 0:
+    return 0
+  uint32(v)
+
+proc writeCodecVersion*(idx: BlockFilterIndex, version: uint32) =
+  ## Stamp the on-disk codec format version onto the index.
+  var w = BinaryWriter()
+  w.writeInt32LE(int32(version))
+  idx.db.put(cfMeta, codecVersionKey(), w.data)
+
+proc resetIndex*(idx: BlockFilterIndex) =
+  ## Drop the entire filter index — DB entries AND on-disk fltr*.dat
+  ## files — and reset best-block/prev-header state so the next sync
+  ## pass rebuilds from genesis.  Used by the FIX-83 / W122 codec-version
+  ## migration: a pre-FIX-83 LSB-first index is unreadable by Core peers
+  ## and must be re-emitted before the node can serve BIP-157 traffic.
+  ##
+  ## Safe to call when the DB has no prior filter entries (no-op on the
+  ## DB side, just deletes any stray .dat files and rewrites the version
+  ## stamp).
+  warn "blockfilterindex: dropping legacy filter index for codec migration",
+       dir = idx.dataDir, target_version = BlockFilterIndexCodecVersion
+
+  # 1. Delete all height-keyed, hash-keyed, prev-header, best-block,
+  # best-height entries from the meta CF.  We iterate and collect keys
+  # first, then delete, to avoid mutating during iteration.
+  var keysToDelete: seq[seq[byte]]
+  for kv in idx.db.iterCf(cfMeta):
+    if kv.key.len == 0:
+      continue
+    let prefix = kv.key[0]
+    if prefix == DbFilterIndex or prefix == DbFilterByHash or
+       prefix == DbPrevHeader or prefix == DbBestBlock or
+       prefix == DbBestHeight:
+      keysToDelete.add(kv.key)
+  for k in keysToDelete:
+    idx.db.delete(cfMeta, k)
+
+  # 2. Delete every fltr?????.dat file in the index directory.  The
+  # bytes inside them are LSB-first GCS encodings, so we cannot
+  # salvage any of them — they're poison to Core peers and to
+  # nimrod's own (now MSB-first) decoder.
+  if dirExists(idx.dataDir):
+    for path in walkDirRec(idx.dataDir, yieldFilter = {pcFile}):
+      let name = extractFilename(path)
+      if name.startsWith(FilterFilePrefix) and name.endsWith(FilterFileSuffix):
+        try:
+          removeFile(path)
+        except OSError as e:
+          warn "blockfilterindex: failed to remove legacy filter file",
+               path = path, error = e.msg
+
+  # 3. Reset in-memory state and stamp the new codec version so the
+  # next start sees a clean v2 index.
+  idx.bestHeight = -1
+  idx.bestBlockHash = BlockHash(default(array[32, byte]))
+  idx.prevFilterHeader = default(array[32, byte])
+  idx.currentFileNum = 0
+  idx.currentFileSize = 0
+  idx.writeCodecVersion(BlockFilterIndexCodecVersion)
+
+  info "blockfilterindex: legacy index dropped; will rebuild on next sync",
+       new_codec_version = BlockFilterIndexCodecVersion
+
+proc maybeMigrateCodec*(idx: BlockFilterIndex): bool =
+  ## On startup: if the index has data but a stale (or absent) codec
+  ## version stamp, drop it and re-stamp at the current version.  Returns
+  ## true if a migration was performed.  Idempotent: a v2 index returns
+  ## false without touching disk.
+  ##
+  ## The "absent version + bestHeight >= 0" branch is the W122 BUG-1
+  ## footprint: nodes that built any filters before FIX-83 landed have
+  ## v1 (LSB-first) bytes in fltr*.dat AND no version key written.
+  let stamped = idx.readCodecVersion()
+  if stamped == BlockFilterIndexCodecVersion:
+    return false
+
+  # Distinguish "fresh empty index, nothing to migrate" from "legacy
+  # index with stale bytes".  A fresh empty index has no best-block key,
+  # no fltr*.dat files, and no filter entries — we can just stamp the
+  # current version and move on.
+  let bestHeightLoaded = idx.bestHeight >= 0
+  let hasOldFiles = block:
+    var found = false
+    if dirExists(idx.dataDir):
+      for path in walkDirRec(idx.dataDir, yieldFilter = {pcFile}):
+        let name = extractFilename(path)
+        if name.startsWith(FilterFilePrefix) and name.endsWith(FilterFileSuffix):
+          found = true
+          break
+    found
+
+  if not bestHeightLoaded and not hasOldFiles:
+    # Pristine: just stamp.
+    idx.writeCodecVersion(BlockFilterIndexCodecVersion)
+    return false
+
+  # Legacy data present (either explicit v1 stamp or unstamped pre-FIX-83
+  # filters).  Drop everything and rebuild from genesis on next sync.
+  warn "blockfilterindex: codec version mismatch — rebuilding index",
+       stamped_version = stamped,
+       target_version = BlockFilterIndexCodecVersion,
+       cause = "W122 FIX-83 BIP-158 codec MSB-first rewrite"
+  idx.resetIndex()
+  true
+
 proc newBlockFilterIndex*(db: Database, dataDir: string,
                           filterType: BlockFilterType = bftBasic,
                           enabled: bool = true): BlockFilterIndex =
@@ -153,6 +286,13 @@ proc newBlockFilterIndex*(db: Database, dataDir: string,
     let prevData = db.get(cfMeta, prevHeaderKey())
     if prevData.isSome and prevData.get().len == 32:
       copyMem(addr result.prevFilterHeader[0], addr prevData.get()[0], 32)
+
+    # FIX-83 (W122): if the on-disk codec version is missing or stale, drop
+    # the index and rebuild on next sync.  See `BlockFilterIndexCodecVersion`
+    # commentary at the top of the file.  This runs *before* picking up the
+    # current file number/size below so the file-walk sees the (now-empty)
+    # directory after migration.
+    discard result.maybeMigrateCodec()
 
     # Find current file number and size
     while fileExists(result.filterFilePath(result.currentFileNum)):

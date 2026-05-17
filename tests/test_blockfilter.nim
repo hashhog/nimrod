@@ -629,3 +629,109 @@ suite "BlockFilterIndex removeBlock (disconnect / reorg-aware filter chain)":
     # h1's filter is preserved by hash (Core parity — light-client
     # reconciliation can still serve it).
     check idx.getFilterEntryByHash(h1).isSome
+
+# ============================================================================
+# FIX-83 / W122: codec format-version migration
+# ============================================================================
+
+suite "BlockFilterIndex codec format-version migration (FIX-83 / W122)":
+  ## Pre-FIX-83 nimrod packed GCS bits LSB-first within each byte; any
+  ## fltr*.dat files written by that codec are byte-incompatible with
+  ## Core peers.  FIX-83 bumps `BlockFilterIndexCodecVersion` and adds an
+  ## `maybeMigrateCodec` step inside the constructor: on detecting a
+  ## stale (or absent) version stamp alongside any actual filter data,
+  ## drop the entire index and rebuild from genesis on the next sync.
+  ##
+  ## These tests verify:
+  ##   - fresh index gets stamped with the current version (no migration)
+  ##   - an index with the current version is left alone
+  ##   - an index missing the version key WITH legacy fltr*.dat files
+  ##     triggers a full reset
+
+  test "fresh index is stamped with current codec version":
+    let dir = createTempDir("bfi_codec_fresh_", "")
+    defer: removeDir(dir)
+    let db = openDatabase(dir / "db")
+    defer: db.close()
+    let idx = newBlockFilterIndex(db, dir, bftBasic, enabled = true)
+    check idx.readCodecVersion() == BlockFilterIndexCodecVersion
+
+  test "an index already at the current codec version is left alone":
+    let dir = createTempDir("bfi_codec_current_", "")
+    defer: removeDir(dir)
+    let db = openDatabase(dir / "db")
+    defer: db.close()
+    var idx = newBlockFilterIndex(db, dir, bftBasic, enabled = true)
+    # Simulate "already migrated": add a block, confirm stamp.
+    var hb: array[32, byte]
+    hb[0] = 0xee
+    let blk = Block(
+      header: BlockHeader(version: 1),
+      txs: @[Transaction(
+        version: 1,
+        outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[1'u8, 2, 3])]
+      )]
+    )
+    let info = BlockInfo(
+      hash: BlockHash(hb),
+      prevHash: BlockHash(default(array[32, byte])),
+      height: 1,
+      data: some(blk),
+      undoData: none(base.BlockUndo),
+      fileNum: 0,
+      dataPos: 100
+    )
+    check idx.customAppend(info) == true
+    idx.saveBestBlock(BlockHash(hb), 1)
+    check idx.readCodecVersion() == BlockFilterIndexCodecVersion
+    let migrated = idx.maybeMigrateCodec()
+    check migrated == false
+    # Filter entry is still there.
+    check idx.getFilterEntry(1).isSome
+
+  test "legacy (unstamped) index with fltr files is reset on next open":
+    let dir = createTempDir("bfi_codec_legacy_", "")
+    defer: removeDir(dir)
+    block phase1_legacy_build:
+      let db = openDatabase(dir / "db")
+      defer: db.close()
+      var idx = newBlockFilterIndex(db, dir, bftBasic, enabled = true)
+      var hb: array[32, byte]
+      hb[0] = 0x55
+      let blk = Block(
+        header: BlockHeader(version: 1),
+        txs: @[Transaction(
+          version: 1,
+          outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[7'u8, 8, 9])]
+        )]
+      )
+      let info = BlockInfo(
+        hash: BlockHash(hb),
+        prevHash: BlockHash(default(array[32, byte])),
+        height: 1,
+        data: some(blk),
+        undoData: none(base.BlockUndo),
+        fileNum: 0,
+        dataPos: 100
+      )
+      check idx.customAppend(info) == true
+      idx.saveBestBlock(BlockHash(hb), 1)
+      # Confirm we wrote a fltr*.dat
+      check fileExists(dir / "indexes" / "blockfilter" / "fltr00000.dat")
+      # Forcibly strip the codec version key to simulate the pre-FIX-83
+      # on-disk state (no version key at all).
+      idx.db.delete(cfMeta, codecVersionKey())
+      check idx.readCodecVersion() == 0
+
+    block phase2_reopen_migrates:
+      let db = openDatabase(dir / "db")
+      defer: db.close()
+      let idx = newBlockFilterIndex(db, dir, bftBasic, enabled = true)
+      # After re-open, the migration should have:
+      #   - dropped the fltr*.dat (or all of them)
+      #   - reset bestHeight to -1
+      #   - stamped the current version
+      check idx.readCodecVersion() == BlockFilterIndexCodecVersion
+      check idx.bestHeight == -1
+      check idx.getFilterEntry(1).isNone
+      check not fileExists(dir / "indexes" / "blockfilter" / "fltr00000.dat")

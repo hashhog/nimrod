@@ -19,6 +19,7 @@ import ../src/crypto/siphash
 import ../src/network/messages
 import ../src/network/peer as net_peer
 import ../src/primitives/types
+import ./blockfilters_vectors
 
 suite "W121 BIP-158 construction (G1-G10)":
 
@@ -69,17 +70,27 @@ suite "W121 BIP-158 construction (G1-G10)":
     let f = newGCSFilter(params, @[])
     check f.encoded == @[byte(0)]
 
-  test "G10 MISSING: BIP-158 Core test-vector regression battery":
-    ## BIP-158 ships canonical test vectors (testnet block #1, etc.) in
-    ## bitcoin-core/src/test/data/blockfilters.json.  Nimrod has unit tests
-    ## of its own encode/decode round-trip but no cross-impl check that the
-    ## bytes match Core's expected filter for a known block.  This means a
-    ## quiet byte-order bug in basicFilterParams() (k0/k1 derivation) — or
-    ## any drift from the BIP-158 element-extraction rules — would not be
-    ## detected against the canonical fixture set.
+  test "G10 PRESENT (FIX-83): BIP-158 Core test-vector regression battery":
+    ## Closes W121 G10 (previously MISSING).
+    ##
+    ## BIP-158 ships canonical test vectors in
+    ## `bitcoin-core/src/test/data/blockfilters.json`.  Pre-FIX-83, nimrod
+    ## had only its own encode/decode round-trip — a quiet byte-order bug
+    ## (W122 BUG-1 — LSB-first vs MSB-first) round-tripped locally but
+    ## emitted bytes that no other BIP-158 impl could parse.  FIX-83
+    ## rewrote the codec MSB-first AND lifted the JSON vectors into a
+    ## Nim regression table (`coreBIP158TestVectors`) so the same class
+    ## of bug fails this test before reaching the wire.
+    ##
     ## Reference: bitcoin-core/src/test/data/blockfilters.json
-    check not compiles(coreBIP158TestVectors)
-    check not compiles(verifyAgainstBIP158Vectors)
+    ## Reference: tests/blockfilters_vectors.nim
+    ## Reference: audit/w122_bip158_codec_stress.md
+    check compiles(coreBIP158TestVectors)
+    check compiles(verifyAgainstBIP158Vectors)
+    check coreBIP158TestVectors.len >= 2
+    let res = verifyAgainstBIP158Vectors(coreBIP158TestVectors)
+    check res.passed == coreBIP158TestVectors.len
+    check res.failed == 0
 
 suite "W121 BIP-157 P2P (G11-G20)":
 
