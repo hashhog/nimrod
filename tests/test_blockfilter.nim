@@ -735,3 +735,235 @@ suite "BlockFilterIndex codec format-version migration (FIX-83 / W122)":
       check idx.bestHeight == -1
       check idx.getFilterEntry(1).isNone
       check not fileExists(dir / "indexes" / "blockfilter" / "fltr00000.dat")
+
+# ============================================================================
+# FIX-87 / W121 G25: Core-parity per-record on-disk wrapper
+# ============================================================================
+
+suite "BlockFilterIndex per-record disk layout (FIX-87 / W121 G25)":
+  ## Core's `BlockFilterIndex::WriteFilterToDisk`
+  ## (bitcoin-core/src/index/blockfilterindex.cpp:177-232) emits, for
+  ## every block-filter record in fltr*.dat:
+  ##
+  ##     block_hash (32 raw bytes) || CompactSize(filter_len) || filter_bytes
+  ##
+  ## `ReadFilterFromDisk` reverses the wrapper and (in Core) verifies
+  ## the inner GCS bytes hash to the DB-recorded `entry.hash`.  Nimrod's
+  ## per-record verify is one level out (we compare the on-disk
+  ## `block_hash` against the caller's `expectedBlockHash`), which is a
+  ## strict superset of Core's check given that the DB entry is keyed by
+  ## height → (filterHash, filterHeader, fileNum, filePos) — corruption
+  ## at the filter-bytes layer would still surface in BIP-157
+  ## headersync, while corruption at the block-hash layer surfaces here.
+  ##
+  ## These tests guard against regression of the wrapper format and of
+  ## the corruption-detection behaviour.
+
+  test "encodeFilterRecord matches Core layout byte-for-byte":
+    var hb: array[32, byte]
+    for i in 0 ..< 32:
+      hb[i] = byte(i)
+    let bh = BlockHash(hb)
+    let filterBytes = @[0xde'u8, 0xad, 0xbe, 0xef]
+    let record = encodeFilterRecord(bh, filterBytes)
+    # 32 (hash) + 1 (CompactSize<253) + 4 (filter) = 37
+    check record.len == 37
+    for i in 0 ..< 32:
+      check record[i] == byte(i)
+    check record[32] == 0x04'u8
+    check record[33] == 0xde'u8
+    check record[34] == 0xad'u8
+    check record[35] == 0xbe'u8
+    check record[36] == 0xef'u8
+
+  test "encodeFilterRecord uses CompactSize encoding for medium lengths":
+    var hb: array[32, byte]
+    hb[0] = 0xff
+    let bh = BlockHash(hb)
+    # 253 bytes — first CompactSize-multi-byte encoding (0xFD + uint16LE)
+    let filterBytes = newSeq[byte](253)
+    let record = encodeFilterRecord(bh, filterBytes)
+    # 32 (hash) + 3 (CompactSize: 0xFD + 0xFD 0x00) + 253 (filter)
+    check record.len == 32 + 3 + 253
+    check record[32] == 0xFD'u8
+    check record[33] == 0xFD'u8
+    check record[34] == 0x00'u8
+
+  test "writeFilterRecord + readFilterRecord round-trip (single record)":
+    let dir = createTempDir("bfi_record_rt_", "")
+    defer: removeDir(dir)
+    let db = openDatabase(dir / "db")
+    defer: db.close()
+    let idx = newBlockFilterIndex(db, dir, bftBasic, enabled = true)
+
+    var hb: array[32, byte]
+    for i in 0 ..< 32:
+      hb[i] = byte(i * 7 mod 256)
+    let bh = BlockHash(hb)
+    let filterBytes = @[0x01'u8, 0x02, 0x03, 0x04, 0x05]
+    let pos = idx.writeFilterRecord(bh, filterBytes)
+    check pos.fileNum == 0
+    check pos.filePos == 0
+
+    let readBack = idx.readFilterRecord(pos.fileNum, pos.filePos, bh)
+    check readBack.isSome
+    check readBack.get() == filterBytes
+
+  test "writeFilterRecord + readFilterRecord round-trip (multiple records)":
+    let dir = createTempDir("bfi_record_multi_", "")
+    defer: removeDir(dir)
+    let db = openDatabase(dir / "db")
+    defer: db.close()
+    let idx = newBlockFilterIndex(db, dir, bftBasic, enabled = true)
+
+    # Write 3 records sequentially, verify each one can be read back
+    # at its own (fileNum, filePos) and the records do not bleed.
+    var positions: seq[tuple[fileNum: int32, filePos: int32]]
+    var hashes: seq[BlockHash]
+    var bodies: seq[seq[byte]]
+    for i in 0 ..< 3:
+      var hb: array[32, byte]
+      hb[0] = byte(i)
+      let bh = BlockHash(hb)
+      let body = @[byte(i), byte(i+1), byte(i+2)]
+      let pos = idx.writeFilterRecord(bh, body)
+      check pos.fileNum == 0
+      positions.add(pos)
+      hashes.add(bh)
+      bodies.add(body)
+    # Strictly increasing positions.
+    check positions[0].filePos < positions[1].filePos
+    check positions[1].filePos < positions[2].filePos
+
+    for i in 0 ..< 3:
+      let r = idx.readFilterRecord(positions[i].fileNum, positions[i].filePos, hashes[i])
+      check r.isSome
+      check r.get() == bodies[i]
+
+  test "readFilterRecord rejects on block_hash mismatch (corruption detection)":
+    let dir = createTempDir("bfi_record_mismatch_", "")
+    defer: removeDir(dir)
+    let db = openDatabase(dir / "db")
+    defer: db.close()
+    let idx = newBlockFilterIndex(db, dir, bftBasic, enabled = true)
+
+    var hb1, hb2: array[32, byte]
+    hb1[0] = 0x11
+    hb2[0] = 0x22
+    let real = BlockHash(hb1)
+    let lying = BlockHash(hb2)
+    let body = @[0xaa'u8, 0xbb, 0xcc]
+    let pos = idx.writeFilterRecord(real, body)
+    check pos.fileNum == 0
+
+    # Caller asks for `lying` but on-disk says `real` → readFilterRecord
+    # must refuse to return any bytes (Core analogue: Hash mismatch).
+    let result = idx.readFilterRecord(pos.fileNum, pos.filePos, lying)
+    check result.isNone
+
+    # Caller asks for the correct hash → record comes back intact.
+    let ok = idx.readFilterRecord(pos.fileNum, pos.filePos, real)
+    check ok.isSome
+    check ok.get() == body
+
+  test "customAppend writes records in the new format (on-disk verify)":
+    ## Drive a real customAppend through the index and then independently
+    ## parse the fltr*.dat to confirm the per-record wrapper landed.
+    ## This is the "source-level regression guard": if a future refactor
+    ## swaps writeFilterRecord back to a raw-bytes emitter, this test
+    ## catches it before it ships.
+    let dir = createTempDir("bfi_record_append_", "")
+    defer: removeDir(dir)
+    let db = openDatabase(dir / "db")
+    defer: db.close()
+    let idx = newBlockFilterIndex(db, dir, bftBasic, enabled = true)
+
+    var hb: array[32, byte]
+    hb[0] = 0xa5
+    let bh = BlockHash(hb)
+    let blk = Block(
+      header: BlockHeader(version: 1),
+      txs: @[Transaction(
+        version: 1,
+        outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[0x76'u8, 0xa9, 0x14])]
+      )]
+    )
+    let info = BlockInfo(
+      hash: bh,
+      prevHash: BlockHash(default(array[32, byte])),
+      height: 1,
+      data: some(blk),
+      undoData: none(base.BlockUndo),
+      fileNum: 0,
+      dataPos: 100
+    )
+    check idx.customAppend(info) == true
+    let entry = idx.getFilterEntry(1)
+    check entry.isSome
+    let e = entry.get()
+
+    # Independently re-parse the .dat file from the recorded position.
+    let datPath = dir / "indexes" / "blockfilter" / filterFileName(e.fileNum)
+    check fileExists(datPath)
+    let raw = readFile(datPath)
+    let rawBytes = cast[seq[byte]](raw)
+    # First 32 bytes at filePos are the block_hash.
+    var onDisk: array[32, byte]
+    for i in 0 ..< 32:
+      onDisk[i] = rawBytes[int(e.filePos) + i]
+    check BlockHash(onDisk) == bh
+
+    # And readFilterRecord at the recorded position returns the same
+    # filter bytes that customAppend computed and getFilter exposes.
+    let readBack = idx.readFilterRecord(e.fileNum, e.filePos, bh)
+    check readBack.isSome
+    let viaGetFilter = idx.getFilter(1, bh)
+    check viaGetFilter.isSome
+    check readBack.get() == getEncodedFilter(viaGetFilter.get())
+
+  test "v2 index is rebuilt on next start (codec version migration)":
+    ## FIX-87 bumps BlockFilterIndexCodecVersion from 2 to 3.  A v2
+    ## index (FIX-83 codec but no per-record wrapper) must be dropped
+    ## on next start so the v3 reader doesn't try to parse v2 records
+    ## as CompactSize-prefixed wrappers (and fail loudly or silently
+    ## return garbage).
+    let dir = createTempDir("bfi_record_v2_migrate_", "")
+    defer: removeDir(dir)
+    block phase1_v2_simulate:
+      let db = openDatabase(dir / "db")
+      defer: db.close()
+      var idx = newBlockFilterIndex(db, dir, bftBasic, enabled = true)
+      var hb: array[32, byte]
+      hb[0] = 0x77
+      let blk = Block(
+        header: BlockHeader(version: 1),
+        txs: @[Transaction(
+          version: 1,
+          outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[3'u8, 4, 5])]
+        )]
+      )
+      let info = BlockInfo(
+        hash: BlockHash(hb),
+        prevHash: BlockHash(default(array[32, byte])),
+        height: 1,
+        data: some(blk),
+        undoData: none(base.BlockUndo),
+        fileNum: 0,
+        dataPos: 100
+      )
+      check idx.customAppend(info) == true
+      idx.saveBestBlock(BlockHash(hb), 1)
+      check fileExists(dir / "indexes" / "blockfilter" / "fltr00000.dat")
+      # Forcibly stamp the codec version key to "2" to simulate a
+      # FIX-83-era index that landed before FIX-87.
+      idx.writeCodecVersion(2'u32)
+      check idx.readCodecVersion() == 2'u32
+
+    block phase2_reopen_migrates:
+      let db = openDatabase(dir / "db")
+      defer: db.close()
+      let idx = newBlockFilterIndex(db, dir, bftBasic, enabled = true)
+      check idx.readCodecVersion() == BlockFilterIndexCodecVersion
+      check idx.bestHeight == -1
+      check idx.getFilterEntry(1).isNone
+      check not fileExists(dir / "indexes" / "blockfilter" / "fltr00000.dat")
