@@ -33,16 +33,33 @@ type
     f*: uint64            ## Range of element hashes (N * M)
     encoded*: seq[byte]   ## Encoded filter data
 
-  ## Bit writer for Golomb-Rice encoding
+  ## Bit writer for Golomb-Rice encoding.
+  ##
+  ## Bits are packed **MSB-first within each byte**, matching Bitcoin Core's
+  ## `BitStreamWriter` in `bitcoin-core/src/streams.h:303-358`.  `bitPos`
+  ## tracks how many bits of the in-progress byte have already been written,
+  ## counted from the most-significant bit downward — so `bitPos == 0` means
+  ## the next bit to write lands at position 7 (MSB) of the current byte,
+  ## `bitPos == 3` means the next bit lands at position 4, etc.  This is
+  ## the byte-for-byte BIP-158 wire format used by every other compliant
+  ## implementation; the previous LSB-first layout (W122 BUG-1) was
+  ## byte-incompatible with Core for every non-trivial Golomb-Rice value.
+  ##
+  ## NOTE: switching this struct also requires the on-disk filter index
+  ## (fltr*.dat) to be rebuilt — see `BlockFilterIndexFormatVersion` in
+  ## blockfilterindex.nim.
   BitWriter* = object
     data*: seq[byte]
-    bitPos: int           ## Bits written to current byte (0-7)
+    bitPos: int           ## Bits already written to current byte from MSB (0-7)
 
-  ## Bit reader for Golomb-Rice decoding
+  ## Bit reader for Golomb-Rice decoding.  Mirrors `BitStreamReader` in
+  ## `bitcoin-core/src/streams.h:260-301`: bits are consumed MSB-first
+  ## within each byte.  `bitPos == 0` means the next bit to read is the
+  ## byte's MSB (bit 7).
   BitReader* = object
     data: seq[byte]
     pos: int              ## Current byte position
-    bitPos: int           ## Current bit within byte (0-7)
+    bitPos: int           ## Bits already consumed from current byte from MSB (0-7)
 
 # BIP 158 "Basic" filter constants
 const
@@ -50,39 +67,50 @@ const
   BasicFilterM* = 784931'u32
 
 # ============================================================================
-# Bit writer for Golomb-Rice encoding
+# Bit writer for Golomb-Rice encoding (MSB-first within each byte — Core parity)
 # ============================================================================
+#
+# Reference: bitcoin-core/src/streams.h:303-358 (BitStreamWriter::Write).
+# Core's invariant: "The next bit to be written to is at this offset from
+# the most significant bit position."  We follow the same convention so the
+# BIP-158 wire format we emit is byte-for-byte identical to Core's.
+#
+# W122 FIX-83 closes the LSB-first regression that produced
+# `0155fe0e` instead of `019dfca8` for the testnet3 genesis filter.
 
 proc newBitWriter*(): BitWriter =
   result.data = @[]
   result.bitPos = 0
 
 proc writeBits*(w: var BitWriter, value: uint64, bits: int) =
-  ## Write `bits` bits of `value` to the stream
+  ## Write the `bits` least-significant bits of `value` to the stream
+  ## **MSB-first** within each byte.  The most-significant of the `bits`
+  ## payload bits goes out first, matching Core's `BitStreamWriter::Write`.
+  ##
+  ## E.g. `writeBits(0b10110, 5)` emits bits `1,0,1,1,0` in that order on
+  ## the wire — the same order Core would emit.
+  if bits <= 0:
+    return
+  if bits > 64:
+    raise newException(GCSFilterError, "writeBits: bits must be 0..64")
   var remaining = bits
-  var val = value
-
   while remaining > 0:
-    # Start new byte if needed
+    # Start a new byte if the current one is full / fresh.
     if w.bitPos == 0:
       w.data.add(0)
-
-    # How many bits can we write to current byte?
+    # How many of the remaining payload bits fit in the current byte?
     let available = 8 - w.bitPos
     let toWrite = min(remaining, available)
-
-    # Extract bits to write (from low end of val)
-    let mask = (1'u64 shl toWrite) - 1
-    let bitsToWrite = val and mask
-
-    # Write to current byte (pack from low bits)
-    w.data[^1] = w.data[^1] or byte(bitsToWrite shl w.bitPos)
-
-    # Update state
-    w.bitPos = (w.bitPos + toWrite) mod 8
-    if w.bitPos == 0 and remaining > toWrite:
-      discard  # Will start new byte on next iteration
-    val = val shr toWrite
+    # The top `toWrite` bits of the still-unwritten portion of `value`
+    # are at positions (remaining-1) .. (remaining-toWrite).  Extract
+    # them and align them at the next free slot (counting from MSB).
+    let topBits = (value shr (remaining - toWrite)) and ((1'u64 shl toWrite) - 1)
+    # Place them at (7 - w.bitPos) .. (7 - w.bitPos - toWrite + 1).
+    let shiftFromTop = 8 - w.bitPos - toWrite
+    w.data[^1] = w.data[^1] or byte(topBits shl shiftFromTop)
+    w.bitPos += toWrite
+    if w.bitPos == 8:
+      w.bitPos = 0  # Current byte is full; next iter will add a new one.
     remaining -= toWrite
 
 proc flush*(w: var BitWriter) =
@@ -93,7 +121,7 @@ proc getData*(w: BitWriter): seq[byte] =
   w.data
 
 # ============================================================================
-# Bit reader for Golomb-Rice decoding
+# Bit reader for Golomb-Rice decoding (MSB-first within each byte)
 # ============================================================================
 
 proc newBitReader*(data: seq[byte]): BitReader =
@@ -102,11 +130,12 @@ proc newBitReader*(data: seq[byte]): BitReader =
   result.bitPos = 0
 
 proc readBit*(r: var BitReader): uint64 =
-  ## Read a single bit
+  ## Read a single bit, MSB-first within each byte.  Mirrors Core's
+  ## `BitStreamReader::Read(1)` — the first read on a fresh byte returns
+  ## bit 7 (the MSB), the eighth read returns bit 0.
   if r.pos >= r.data.len:
     raise newException(GCSFilterError, "unexpected end of filter data")
-
-  let bit = (r.data[r.pos] shr r.bitPos) and 1
+  let bit = (r.data[r.pos] shr (7 - r.bitPos)) and 1
   r.bitPos += 1
   if r.bitPos == 8:
     r.bitPos = 0
@@ -114,10 +143,11 @@ proc readBit*(r: var BitReader): uint64 =
   uint64(bit)
 
 proc readBits*(r: var BitReader, bits: int): uint64 =
-  ## Read `bits` bits from the stream
+  ## Read `bits` bits from the stream, MSB-first within each byte.
+  ## The first bit read becomes the MSB of the returned value.
   result = 0
-  for i in 0 ..< bits:
-    result = result or (r.readBit() shl i)
+  for _ in 0 ..< bits:
+    result = (result shl 1) or r.readBit()
 
 proc isEmpty*(r: BitReader): bool =
   ## Returns true if all bits have been consumed (no more bits to read).
