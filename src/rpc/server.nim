@@ -648,8 +648,14 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   let targetHex = reverseHex(toHex(target))
 
   # nTx: read from the BlockIndex (populated during block connect, W57).
-  # For blocks processed before W57 (nTx=0 in old serialized data), try the
-  # flatfile BlockIndexEntry and the RocksDB full-block fallback.
+  # For blocks processed before W57 (nTx=0 in old serialized data), try
+  # three fallbacks in order: flatfile BlockIndexEntry, RocksDB cfBlocks
+  # full-block, then flatfile loadBlock (FIX-80 — mainnet daily
+  # consensus-diff caught getblockheader returning nTx=0 for block 900000
+  # because legacy BlockIndex entries were written without nTx AND that
+  # block is not in cfBlocks RocksDB; the flatfile blk*.dat has it).
+  # Reference: bitcoin-core/src/rpc/blockchain.cpp blockheaderToJSON: nTx
+  # comes from pindex->nTx, which is always populated alongside the block.
   var nTx = int(idx.nTx)
   if nTx == 0 and rpc.blockFileManager != nil:
     let bfeOpt = rpc.blockFileManager.getBlockIndex(blockHash)
@@ -657,6 +663,14 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
       nTx = int(bfeOpt.get().nTx)
   if nTx == 0:
     let blkOpt = rpc.chainState.db.getBlock(blockHash)
+    if blkOpt.isSome:
+      nTx = blkOpt.get().txs.len
+  if nTx == 0 and rpc.blockFileManager != nil:
+    # Last-resort: read the block out of the flatfile blk*.dat. The
+    # blockFileManager.loadBlock path is the only source that survives
+    # pre-W57 indexing AND non-cfBlocks storage (every mainnet sync the
+    # node has done since switching to flatfile-backed block storage).
+    let blkOpt = rpc.blockFileManager.loadBlock(blockHash)
     if blkOpt.isSome:
       nTx = blkOpt.get().txs.len
 
