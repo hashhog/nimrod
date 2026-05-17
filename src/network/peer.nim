@@ -1658,6 +1658,90 @@ proc resetMisbehavior*(peer: var Peer) =
   peer.misbehaviorScore = 0
   peer.shouldDisconnect = false
 
+# ----------------------------------------------------------------------------
+# BIP-157 protocol-violation classification + disconnect helper
+# Reference: bitcoin-core/src/net_processing.cpp::PrepareBlockFilterRequest
+#            (ProcessGetCFilters / ProcessGetCFHeaders / ProcessGetCFCheckPt)
+#
+# Core sets `node.fDisconnect = true` on EVERY violation path below; nimrod's
+# pre-FIX-78 handlers only logged + returned, letting a misbehaving peer probe
+# the index indefinitely with no consequence (DoS vector + manipulation
+# surface).  FIX-78 (W121 G20 P1-CDIV) wires these calls into the three
+# handlers in src/nimrod.nim.
+# ----------------------------------------------------------------------------
+
+type
+  CFRequestViolation* = enum
+    ## Protocol-violation classification for BIP-157 getcfilters /
+    ## getcfheaders / getcfcheckpt requests.  Matches the three
+    ## `node.fDisconnect = true` paths in Core's PrepareBlockFilterRequest.
+    cfrvNone                = "ok"
+    cfrvUnsupportedType     = "unsupported-filter-type"
+    cfrvUnknownStopHash     = "unknown-stop-hash"
+    cfrvInvalidRange        = "start-greater-than-stop"
+    cfrvRangeTooLarge       = "range-too-large"
+
+# BIP-157 wire constants.  Public so call-sites in nimrod.nim can use them
+# without duplicating the magic numbers.
+const
+  CFiltersMaxRange*  = 1000'i32
+    ## MAX_GETCFILTERS_SIZE — Core net_processing.cpp:103.
+  CFHeadersMaxRange* = 2000'i32
+    ## MAX_GETCFHEADERS_SIZE — Core net_processing.cpp:106.
+  CFCheckPtInterval* = 1000'i32
+    ## CFCHECKPT_INTERVAL — Core net_processing.cpp:100.
+
+proc validateGetCFiltersRequest*(filterType: uint8,
+                                 startHeight: int32,
+                                 stopHeight: int32,
+                                 stopFound: bool,
+                                 maxRange: int32): CFRequestViolation =
+  ## Classify a BIP-157 getcfilters / getcfheaders request against the four
+  ## protocol-violation paths in Core's PrepareBlockFilterRequest:
+  ##   1. filter_type != 0 (only `basic` is implemented).
+  ##   2. stop_hash unknown to our block index.
+  ##   3. start_height > stop_height (peer inverted the range).
+  ##   4. stop_height - start_height >= max_range (range too large).
+  ## Returns cfrvNone iff the request is well-formed; otherwise the specific
+  ## violation reason.  Pure function, no side effects — safe to unit-test.
+  if filterType != 0'u8:
+    return cfrvUnsupportedType
+  if not stopFound:
+    return cfrvUnknownStopHash
+  if startHeight > stopHeight:
+    return cfrvInvalidRange
+  if maxRange > 0'i32 and stopHeight - startHeight >= maxRange:
+    return cfrvRangeTooLarge
+  cfrvNone
+
+proc validateGetCFCheckPtRequest*(filterType: uint8,
+                                  stopFound: bool): CFRequestViolation =
+  ## CFCheckPt has no range bounds (max_height_diff = uint32.max in Core), so
+  ## only the filter-type + stop-hash paths can trip.  Reference:
+  ## bitcoin-core/src/net_processing.cpp:3397 (ProcessGetCFCheckPt).
+  if filterType != 0'u8:
+    return cfrvUnsupportedType
+  if not stopFound:
+    return cfrvUnknownStopHash
+  cfrvNone
+
+proc disconnectOnBadFilterRequest*(peer: Peer,
+                                   violation: CFRequestViolation,
+                                   msgKind: string): Future[void] {.async.} =
+  ## Mirror Core's `node.fDisconnect = true` for BIP-157 protocol violations.
+  ## Flags the peer for discourage (so banman picks it up), logs at warn-level
+  ## with the violation reason, and closes the transport.
+  ##
+  ## Caller MUST `await` this, then `return` from the message handler — once
+  ## the transport is closed, any subsequent sendMessage on this peer will
+  ## throw, so we don't want to fall through to the normal serve path.
+  if violation == cfrvNone:
+    return
+  peer.shouldDisconnect = true
+  warn "BIP-157 protocol violation — disconnecting peer",
+       peer = $peer, message = msgKind, reason = $violation
+  await peer.disconnect(msgKind & ": " & $violation)
+
 # Pre-handshake message validation
 # Reference: Bitcoin Core net_processing.cpp ProcessMessage()
 # - Non-version messages before version: drop and misbehave
