@@ -845,19 +845,161 @@ suite "W120 G21-G22 Rule #8 ImprovesFeerateDiagram":
     check improvesFeerateDiagram(orig, repl)
     check not improvesFeerateDiagram(repl, orig)
 
-  test "G22 BUG-5 dead-helper: validateRbfDiagram + checkRbfImprovesDiagram " &
-       "exist but checkRbfRules() builds its own ad-hoc diagram":
-    ## cluster.nim lines 838-973 implement the full Core-style
-    ## cluster-aware diagram validators. They walk the affected clusters,
-    ## simulate the replacement tempCluster, relinearize, and call
-    ## compareFeerateDiagrams. They are NEVER called from checkRbfRules.
-    ## mempool.nim:1893-1912 instead builds a flat per-entry FeeFrac list
-    ## sorted descending. For a tightly-clustered conflict set this
-    ## produces a different (looser) diagram comparison than Core.
+  test "G22 FIX-79: validateRbfDiagram is now wired into checkRbfRules " &
+       "(dead-helper closure)":
+    ## W120 BUG-5 (P2-DEAD) FLIPPED: cluster.nim lines 838-973 implement
+    ## the full Core-style cluster-aware diagram validator. As of FIX-79
+    ## checkRbfRules in mempool.nim invokes validateRbfDiagram (via a
+    ## transient ClusterManager built from current mempool entries),
+    ## replacing the prior ad-hoc per-entry FeeFrac sort that diverged
+    ## from Core's cluster-aware ImprovesFeerateDiagram (Core 27+).
+    ##
+    ## Source-level regression guard: scan the mempool.nim source and
+    ## assert that checkRbfRules references validateRbfDiagram. This
+    ## catches accidental reverts to the inline ad-hoc diagram pattern.
     check compiles(validateRbfDiagram)
     check compiles(checkRbfImprovesDiagram)
-    # The ad-hoc path that's actually used:
     check compiles(improvesFeerateDiagram)
+
+    # Forward-regression source guard.
+    let mempoolSrc = readFile("src/mempool/mempool.nim")
+    # Locate proc checkRbfRules*(... and slice to the next top-level proc.
+    let crrStart = mempoolSrc.find("proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,\n                    conflicts: HashSet[TxId]")
+    check crrStart >= 0
+    # The implementation starts after the second match (forward decl is first).
+    let crrImplStart = mempoolSrc.find("proc checkRbfRules*(", crrStart + 1)
+    check crrImplStart >= 0
+    let crrEnd = mempoolSrc.find("\nproc removeConflicts*", crrImplStart)
+    check crrEnd > crrImplStart
+    let body = mempoolSrc[crrImplStart ..< crrEnd]
+    check body.find("validateRbfDiagram") >= 0
+    # Belt-and-braces: the FIX-79 marker should also be present.
+    check body.find("FIX-79") >= 0
+
+# ---------------------------------------------------------------------------
+# FIX-79 behavioral tests: validateRbfDiagram strict-gt semantics wired
+# into checkRbfRules. Reference: bitcoin-core/src/policy/rbf.cpp
+# ImprovesFeerateDiagram + src/util/feefrac.cpp CompareChunks.
+# ---------------------------------------------------------------------------
+suite "W120 FIX-79 validateRbfDiagram wired into checkRbfRules":
+
+  test "FIX-79 strict improvement: replacement at much higher feerate accepted":
+    ## Single-conflict, no parents. Conflict: 1_000 sats / 100 vbytes
+    ## = 10 sat/vB. Replacement: 5_000 sats / 100 vbytes = 50 sat/vB.
+    ## Replacement strictly dominates → accept.
+    cleanupTestDb()
+    var cs = newChainState(TestDbPath, regtestParams())
+    var mp = newMempool(cs, regtestParams(), fullRbf = true)
+
+    let prevOutpoint = makeOutpoint(0xB1)
+    let conflictTxid = makeTxid(0x10)
+    let conflictTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: prevOutpoint, scriptSig: @[],
+                     sequence: 0x00000000'u32)],
+      outputs: @[TxOut(value: Satoshi(9_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    mp.entries[conflictTxid] = MempoolEntry(
+      tx: conflictTx, txid: conflictTxid, fee: Satoshi(1_000),
+      weight: 400, feeRate: 10.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(1_000), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100)
+    mp.spentBy[prevOutpoint] = conflictTxid
+
+    let replacement = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: prevOutpoint, scriptSig: @[],
+                     sequence: 0x00000000'u32)],
+      outputs: @[TxOut(value: Satoshi(5_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let conflicts = toHashSet([conflictTxid])
+    let res = mp.checkRbfRules(replacement, Satoshi(5_000), 100, conflicts)
+    check res.isOk
+    cs.close()
+    cleanupTestDb()
+
+  test "FIX-79 strict-gt tie: replacement with identical feerate REJECTED":
+    ## Core's CompareChunks uses std::is_gt (strict greater-than). Equal
+    ## diagrams resolve to dcrEquivalent → improvesFeerateDiagram=false →
+    ## REJECT. Ties must lose — replacement must STRICTLY improve.
+    ##
+    ## Conflict: 1_000 sats / 100 vbytes = 10 sat/vB
+    ## Replacement: 1_000 sats / 100 vbytes = 10 sat/vB (identical chunk).
+    ## Rules #3/#4 are individually satisfied (equal fee with zero
+    ## incremental relay fee passes); strict-gt diagram check must reject.
+    cleanupTestDb()
+    var cs = newChainState(TestDbPath, regtestParams())
+    var mp = newMempool(cs, regtestParams(), fullRbf = true)
+
+    let prevOutpoint = makeOutpoint(0xB2)
+    let conflictTxid = makeTxid(0x20)
+    let conflictTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: prevOutpoint, scriptSig: @[],
+                     sequence: 0x00000000'u32)],
+      outputs: @[TxOut(value: Satoshi(9_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    mp.entries[conflictTxid] = MempoolEntry(
+      tx: conflictTx, txid: conflictTxid, fee: Satoshi(1_000),
+      weight: 400, feeRate: 10.0, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(1_000), ancestorWeight: 400,
+      ancestorCount: 1, ancestorSize: 100)
+    mp.spentBy[prevOutpoint] = conflictTxid
+
+    let replacement = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: prevOutpoint, scriptSig: @[],
+                     sequence: 0x00000000'u32)],
+      outputs: @[TxOut(value: Satoshi(9_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let conflicts = toHashSet([conflictTxid])
+    # incrementalRelayFee=0 isolates the diagram check from Rule #4.
+    let res = mp.checkRbfRules(replacement, Satoshi(1_000), 100, conflicts,
+                               incrementalRelayFee = 0.0)
+    check not res.isOk
+    check res.error.find("feerate diagram") >= 0
+    cs.close()
+    cleanupTestDb()
+
+  test "FIX-79 worsening replacement (lower feerate) REJECTED":
+    ## High-feerate conflict (666 sat/vB) "replaced" by huge low-feerate
+    ## (11 sat/vB). Even though absolute fee climbs (Rule #3 passes), the
+    ## feerate diagram degrades → REJECT. This mirrors the W106 G20a fix
+    ## assertion under the new cluster-aware path.
+    cleanupTestDb()
+    var cs = newChainState(TestDbPath, regtestParams())
+    var mp = newMempool(cs, regtestParams(), fullRbf = true)
+
+    let prevOutpoint = makeOutpoint(0xB3)
+    let conflictTxid = makeTxid(0x30)
+    let conflictTx = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: prevOutpoint, scriptSig: @[],
+                     sequence: 0x00000000'u32)],
+      outputs: @[TxOut(value: Satoshi(9_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    mp.entries[conflictTxid] = MempoolEntry(
+      tx: conflictTx, txid: conflictTxid, fee: Satoshi(100_000),
+      weight: 600, feeRate: 666.7, timeAdded: getTime(),
+      height: 100, ancestorFee: Satoshi(100_000), ancestorWeight: 600,
+      ancestorCount: 1, ancestorSize: 150)
+    mp.spentBy[prevOutpoint] = conflictTxid
+
+    let replacement = Transaction(
+      version: 1,
+      inputs: @[TxIn(prevOut: prevOutpoint, scriptSig: @[],
+                     sequence: 0x00000000'u32)],
+      outputs: @[TxOut(value: Satoshi(1_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0)
+    let conflicts = toHashSet([conflictTxid])
+    # Rule #3 passes (110_001 > 100_000); Rule #4 satisfied
+    # (additional 10_001 >= relay_fee(1.0) * 10_000). Diagram check fires.
+    let res = mp.checkRbfRules(replacement, Satoshi(110_001), 10_000,
+                               conflicts)
+    check not res.isOk
+    check res.error.find("feerate diagram") >= 0
+    cs.close()
+    cleanupTestDb()
 
 # ---------------------------------------------------------------------------
 # G23-G24: AcceptTransaction wiring + RPC bip125-replaceable

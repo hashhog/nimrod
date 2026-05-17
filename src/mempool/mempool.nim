@@ -1895,29 +1895,92 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
 
   # Rule #8 (ImprovesFeerateDiagram, Core 27+): the replacement must strictly improve
   # the feerate diagram vs. the evicted set.
-  # Reference: Bitcoin Core src/policy/rbf.cpp ImprovesFeerateDiagram() (line 127-140).
-  # We build a simple per-tx diagram for each evicted entry (treating each as its own
-  # chunk — sufficient for the single-tx path where no cluster structure is tracked),
-  # then compare against a single-chunk diagram for the replacement.
+  # Reference: Bitcoin Core src/policy/rbf.cpp ImprovesFeerateDiagram() (line 127-140);
+  # src/util/feefrac.cpp CompareChunks (strict-gt — equal-feerate ties REJECT).
+  #
+  # FIX-79 (W120 #7 dead-helper closure): delegate to the cluster-aware
+  # validateRbfDiagram in cluster.nim. We build a TRANSIENT ClusterManager
+  # populated with each direct conflict + its in-mempool ancestors AND its
+  # full descendant chain (everything in `allConflicts`). Edges are wired
+  # from mp.spentBy / mp.entries so the simulated linearization preserves
+  # CPFP / parent-child topology and matches Core's cluster-aware behaviour.
   block:
-    var originalChunks: seq[FeeFrac]
-    for evictedTxid in allConflicts:
-      if evictedTxid in mp.entries:
-        let e = mp.entries[evictedTxid]
-        let vsize = (e.weight + 3) div 4
-        if vsize > 0:
-          originalChunks.add(FeeFrac(fee: int64(e.fee), size: vsize))
-    # Sort descending by feerate so the diagram is non-increasing (canonical form).
-    originalChunks.sort(proc(a, b: FeeFrac): int =
-      if a > b: -1
-      elif b > a: 1
-      else: 0
-    )
-    let originalDiagram = buildFeerateDiagram(originalChunks)
-    # Replacement is a single chunk.
-    let replacementChunks = @[FeeFrac(fee: int64(txFee), size: txVsize)]
-    let replacementDiagram = buildFeerateDiagram(replacementChunks)
-    if not improvesFeerateDiagram(originalDiagram, replacementDiagram):
+    var cm = newClusterManager()
+    # Collect the universe of txids whose topology matters for this RBF:
+    #  - every directly conflicting tx + every descendant (allConflicts)
+    #  - every in-mempool ancestor of each conflicting tx (so CPFP /
+    #    chain context is preserved when validateRbfDiagram simulates
+    #    removing the conflicts)
+    var universe = initHashSet[TxId]()
+    for txid in allConflicts:
+      universe.incl(txid)
+    for conflictTxid in conflicts:
+      if conflictTxid in mp.entries:
+        let conflictTx = mp.entries[conflictTxid].tx
+        for ancTxid in mp.calculateAncestors(conflictTx):
+          universe.incl(ancTxid)
+    # Add each tx to the transient cluster manager in a topological order
+    # (parents before children). Since `addTransaction` infers cluster
+    # membership from already-present parent txids, we iterate until every
+    # tx whose parents are present has been added.
+    var pending: seq[TxId]
+    for txid in universe:
+      pending.add(txid)
+    var added = initHashSet[TxId]()
+    # Bounded passes — universe.len is at most MaxReplacementCandidates +
+    # ancestor count, well below any pathological loop bound.
+    for _ in 0 ..< (universe.len + 1):
+      if pending.len == 0:
+        break
+      var nextPending: seq[TxId]
+      for txid in pending:
+        if txid notin mp.entries:
+          continue
+        let entry = mp.entries[txid]
+        # Determine in-universe parents (only edges that survive within the
+        # transient cluster contribute to the diagram).
+        var parents: seq[TxId]
+        var allParentsReady = true
+        for input in entry.tx.inputs:
+          let parentTxid = input.prevOut.txid
+          if parentTxid in universe:
+            if parentTxid notin added:
+              allParentsReady = false
+              break
+            parents.add(parentTxid)
+        if not allParentsReady:
+          nextPending.add(txid)
+          continue
+        let vsize = (entry.weight + 3) div 4
+        if vsize <= 0:
+          added.incl(txid)
+          continue
+        discard cm.addTransaction(txid, int64(entry.fee), vsize, parents)
+        added.incl(txid)
+      if nextPending.len == pending.len:
+        # No progress (cycle or missing parent edge) — bail out of the loop
+        # and let validateRbfDiagram work with what we managed to add.
+        break
+      pending = nextPending
+    # Replacement's parents in the universe (in-mempool ancestors of the
+    # new tx that aren't being evicted).
+    var replacementParents: seq[TxId]
+    for input in tx.inputs:
+      let parentTxid = input.prevOut.txid
+      if parentTxid in universe and parentTxid notin allConflicts:
+        replacementParents.add(parentTxid)
+    let conflictTxidsSeq = block:
+      var s: seq[TxId]
+      for txid in allConflicts: s.add(txid)
+      s
+    let diagRes = cm.validateRbfDiagram(conflictTxidsSeq,
+                                        int64(txFee), txVsize,
+                                        replacementParents)
+    # Strict-gt: validateRbfDiagram returns Ok(true) only when the new
+    # diagram is dcrBetter (strictly improves at some point with no chunk
+    # worse). Equal-feerate ties resolve to dcrEquivalent → Ok(false) →
+    # REJECT, matching Core's CompareChunks std::is_gt semantic.
+    if not diagRes.isOk or not diagRes.value:
       return err(HashSet[TxId], "rejecting replacement: insufficient feerate: does not improve feerate diagram")
 
   ok(allConflicts)
