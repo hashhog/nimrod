@@ -100,6 +100,7 @@ import ./test_mempool_eviction_w86
 import ./test_disconnect_block
 import ./test_connect_block_w93
 import ./test_w117_proxy_wireup
+import ./test_w135_standardness
 
 when isMainModule:
   echo "Running all tests..."
