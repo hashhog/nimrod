@@ -1,29 +1,37 @@
 ## Signature verification cache - caches successful script verifications
 ## to avoid redundant work during block connection and mempool acceptance.
 ##
-## Fix W105 G7+G8+G10:
-##   G7: key uses wtxid (witness transaction ID) not txid; witness-malleated
-##       variants of the same txid now correctly produce distinct cache keys.
+## Fix W160 BUG-11:
+##   Cache key now folds in (sighash || pubkey || sig) per Bitcoin Core's
+##   ComputeEntryECDSA / ComputeEntrySchnorr (sigcache.cpp:39-50). The previous
+##   key — SHA256(nonce || wtxid || inputIndex || flags) — was insufficient for
+##   the tapscript-multisig case where a single input runs multiple OP_CHECKSIG
+##   ops with different (sighash, sig, pubkey) tuples: the first successful
+##   verify cached `(wtxid, inputIdx, flags) -> true`, and every subsequent
+##   verify call for the same input short-circuited regardless of which
+##   sig/pubkey was being checked. With the new key, distinct (sighash, sig,
+##   pubkey) tuples map to distinct cache slots, matching Core's per-sig
+##   caching semantics.
+##
+## Fix W105 G7+G8+G10 (preserved):
 ##   G8: 32-byte nonce sampled from OS CSPRNG at SigCache construction time;
-##       key = SHA256(nonce || wtxid || inputIndex_le32 || flags_le32) so
-##       cache entries are not predictable from public transaction data.
+##       key = SHA256(nonce || sighash || pubkey || sig) so cache entries are
+##       not predictable from public transaction data.
 ##   G10: Lock protects all table accesses; safe for concurrent lookup/insert
 ##        from parallel script-verification tasks if the parallel path is
 ##        re-enabled, and from concurrent mempool + block-connect execution.
 ##
-## Reference: bitcoin-core/src/script/sigcache.h
-##   SignatureCache::ComputeEntry — salted SHA256 over sig material + nonce
-##   ValidationCache ctor — nonce = GetRandHash()
-##   SignatureCache::Get — std::shared_lock<std::shared_mutex>
-##   SignatureCache::Set — std::unique_lock<std::shared_mutex>
+## Reference: bitcoin-core/src/script/sigcache.cpp:39-50
+##   ComputeEntryECDSA(entry, sighash, sig, pubkey)
+##   ComputeEntrySchnorr(entry, sighash, sig, pubkey)
 
 import std/[tables, hashes, locks, sysrand]
 import ../crypto/hashing
 
 type
-  ## Internal key: first 8 bytes of SHA256(nonce||wtxid||inputIndex||flags).
+  ## Internal key: first 8 bytes of SHA256(nonce || sighash || pubkey || sig).
   ## Using a uint64 keeps the Table hot-path cheap while preserving collision
-  ## resistance from the 256-bit hash.
+  ## resistance from the underlying 256-bit hash.
   SigCacheKey* = uint64
 
   SigCache* = ref object
@@ -32,28 +40,25 @@ type
     maxEntries: int
     lock: Lock                    ## Protects all accesses to `entries`
 
-## Derive the internal cache key from (nonce, wtxid, inputIndex, flags).
-proc computeKey*(cache: SigCache, wtxid: array[32, byte],
-                 inputIndex: uint32, flags: uint32): SigCacheKey =
-  ## key = SHA256(nonce[32] || wtxid[32] || inputIndex_le32[4] || flags_le32[4])
+## Derive the internal cache key from (nonce, sighash, pubkey, sig).
+## Mirrors Core's ComputeEntryECDSA/ComputeEntrySchnorr which fold the
+## sighash, signature bytes, and pubkey bytes into the cache key so two
+## different (sighash, sig, pubkey) tuples for the same transaction input
+## map to distinct cache slots — closes the tapscript-multisig short-circuit
+## documented in W160 BUG-11.
+proc computeKey*(cache: SigCache, sighash: array[32, byte],
+                 pubkey: openArray[byte], sig: openArray[byte]): SigCacheKey =
+  ## key = SHA256(nonce[32] || sighash[32] || pubkey[..] || sig[..])
   ## Take the first 8 bytes of the resulting 32-byte hash as the uint64 key.
-  var buf: array[72, byte]
-  # nonce
+  var buf = newSeq[byte](64 + pubkey.len + sig.len)
   for i in 0 ..< 32:
     buf[i] = cache.nonce[i]
-  # wtxid
   for i in 0 ..< 32:
-    buf[32 + i] = wtxid[i]
-  # inputIndex little-endian 4 bytes
-  buf[64] = byte(inputIndex and 0xFF'u32)
-  buf[65] = byte((inputIndex shr 8) and 0xFF'u32)
-  buf[66] = byte((inputIndex shr 16) and 0xFF'u32)
-  buf[67] = byte((inputIndex shr 24) and 0xFF'u32)
-  # flags little-endian 4 bytes
-  buf[68] = byte(flags and 0xFF'u32)
-  buf[69] = byte((flags shr 8) and 0xFF'u32)
-  buf[70] = byte((flags shr 16) and 0xFF'u32)
-  buf[71] = byte((flags shr 24) and 0xFF'u32)
+    buf[32 + i] = sighash[i]
+  for i in 0 ..< pubkey.len:
+    buf[64 + i] = pubkey[i]
+  for i in 0 ..< sig.len:
+    buf[64 + pubkey.len + i] = sig[i]
   let digest = sha256Single(buf)
   # Pack first 8 bytes as little-endian uint64
   result = uint64(digest[0]) or
@@ -77,17 +82,17 @@ proc newSigCache*(maxEntries: int = 50_000): SigCache =
       "SigCache: system entropy unavailable; cannot initialize nonce")
   result = c
 
-proc lookup*(cache: SigCache, wtxid: array[32, byte],
-             inputIndex: uint32, flags: uint32): bool =
-  ## Thread-safe lookup; returns true iff (wtxid, inputIndex, flags) is cached.
-  let key = cache.computeKey(wtxid, inputIndex, flags)
+proc lookup*(cache: SigCache, sighash: array[32, byte],
+             pubkey: openArray[byte], sig: openArray[byte]): bool =
+  ## Thread-safe lookup; returns true iff (sighash, pubkey, sig) is cached.
+  let key = cache.computeKey(sighash, pubkey, sig)
   withLock cache.lock:
     result = cache.entries.hasKey(key)
 
-proc insert*(cache: SigCache, wtxid: array[32, byte],
-             inputIndex: uint32, flags: uint32) =
+proc insert*(cache: SigCache, sighash: array[32, byte],
+             pubkey: openArray[byte], sig: openArray[byte]) =
   ## Thread-safe insert. Evicts one entry (first found) when at capacity.
-  let key = cache.computeKey(wtxid, inputIndex, flags)
+  let key = cache.computeKey(sighash, pubkey, sig)
   withLock cache.lock:
     if cache.entries.hasKey(key):
       return
@@ -98,6 +103,41 @@ proc insert*(cache: SigCache, wtxid: array[32, byte],
         break
     cache.entries[key] = true
 
+## Backward-compatible (wtxid, inputIndex, flags) API used by older tests and
+## tooling. The underlying key derivation is identical to the new
+## (sighash, pubkey, sig) API — we just stuff the legacy fields into the
+## sighash/pubkey/sig slots so distinct (wtxid, inputIdx, flags) tuples still
+## map to distinct slots. New production code MUST use the canonical
+## (sighash, pubkey, sig) overloads above — they are what closes W160 BUG-11.
+proc encodeLegacyKey(wtxid: array[32, byte], inputIndex: uint32,
+                     flags: uint32): tuple[sighash: array[32, byte],
+                                            pubkey: array[4, byte],
+                                            sig: array[4, byte]] =
+  result.sighash = wtxid
+  result.pubkey = [byte(inputIndex and 0xFF'u32),
+                   byte((inputIndex shr 8) and 0xFF'u32),
+                   byte((inputIndex shr 16) and 0xFF'u32),
+                   byte((inputIndex shr 24) and 0xFF'u32)]
+  result.sig = [byte(flags and 0xFF'u32),
+                byte((flags shr 8) and 0xFF'u32),
+                byte((flags shr 16) and 0xFF'u32),
+                byte((flags shr 24) and 0xFF'u32)]
+
+proc computeKey*(cache: SigCache, wtxid: array[32, byte],
+                 inputIndex: uint32, flags: uint32): SigCacheKey =
+  let parts = encodeLegacyKey(wtxid, inputIndex, flags)
+  cache.computeKey(parts.sighash, parts.pubkey, parts.sig)
+
+proc lookup*(cache: SigCache, wtxid: array[32, byte],
+             inputIndex: uint32, flags: uint32): bool =
+  let parts = encodeLegacyKey(wtxid, inputIndex, flags)
+  cache.lookup(parts.sighash, parts.pubkey, parts.sig)
+
+proc insert*(cache: SigCache, wtxid: array[32, byte],
+             inputIndex: uint32, flags: uint32) =
+  let parts = encodeLegacyKey(wtxid, inputIndex, flags)
+  cache.insert(parts.sighash, parts.pubkey, parts.sig)
+
 proc clear*(cache: SigCache) =
   withLock cache.lock:
     cache.entries.clear()
@@ -105,3 +145,8 @@ proc clear*(cache: SigCache) =
 proc len*(cache: SigCache): int =
   withLock cache.lock:
     result = cache.entries.len
+
+## Process-wide sigcache, shared by every CHECKSIG / CHECKSIGADD evaluation
+## across all transactions in the mempool and block-validation hot paths.
+## Mirrors Bitcoin Core's static `signatureCache` / `g_sig_cache` (init.cpp).
+var globalSigCache* = newSigCache(50_000)

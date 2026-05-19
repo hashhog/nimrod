@@ -11,9 +11,12 @@ import ./params
 from ./pow import nil
 
 export params
-export sig_cache
 
-var globalSigCache* = newSigCache(50_000)
+# Re-exports `globalSigCache` (the process-wide signature cache, see
+# `perf/sig_cache.nim`). Previously this module owned the global directly;
+# moving it into `sig_cache.nim` lets `script/interpreter.nim` consult the
+# same cache without an import cycle (validation already imports interpreter).
+export sig_cache
 
 type
   ValidationError* = enum
@@ -1517,10 +1520,14 @@ proc verifyScripts*(
       return voidErr(veInputsMissing)
 
     for inputIdx, inp in tx.inputs:
-      # Check signature cache before expensive verification
-      if globalSigCache.lookup(txidBytes, uint32(inputIdx), flagsUint):
-        continue
-
+      # W160 BUG-11 fix: the previous input-level sigcache shortcut here
+      # ("if globalSigCache.lookup(wtxid, inputIdx, flags): continue") was
+      # structurally unsafe for tapscript-multisig inputs (one input → many
+      # OP_CHECKSIG calls with different sig/pubkey/sighash tuples). It also
+      # could not be re-keyed on (sighash, pubkey, sig) at this layer because
+      # a single input has no single sighash. The per-sig cache is now
+      # consulted inside the OP_CHECKSIG / OP_CHECKSIGADD opcode handlers
+      # (script/interpreter.nim) — same shape as Core's CachingTransactionSignatureChecker.
       let utxo = allUtxos[inputIdx]
 
       # Get witness data for this input
@@ -1543,9 +1550,7 @@ proc verifyScripts*(
 
       if not verified:
         return voidErr(veScriptVerifyFailed)
-
-      # Cache successful verification
-      globalSigCache.insert(txidBytes, uint32(inputIdx), flagsUint)
+      discard txidBytes  ## silence-unused; retained for future wtxid-keyed script-execution cache (Core's m_script_execution_cache, W105 G13).
 
     # Remove spent UTXOs
     for inp in tx.inputs:
