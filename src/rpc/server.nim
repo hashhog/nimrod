@@ -1197,7 +1197,7 @@ proc handlePreciousBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
 # Mempool RPCs
 proc handleGetMempoolInfo*(rpc: RpcServer): JsonNode =
-  let minFee = rpc.mempool.minFeeRate / 100000000.0  # Convert sat/vbyte to BTC/kB
+  let minFee = rpc.mempool.minFeeRate / 100000.0  # Convert sat/vbyte to BTC/kvB
   # Calculate total fees
   var totalFeeSat: int64 = 0
   for _, entry in rpc.mempool.entries:

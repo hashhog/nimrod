@@ -770,7 +770,7 @@ proc handleRestGetUtxos*(rest: RestServer, uriPart: string): RestResponse =
 
 proc handleRestMempoolInfo*(rest: RestServer): RestResponse =
   ## GET /rest/mempool/info.json
-  let minFee = rest.mempool.minFeeRate / 100000000.0  # sat/vbyte to BTC/kB
+  let minFee = rest.mempool.minFeeRate / 100000.0  # sat/vbyte to BTC/kvB
   restJson(%*{
     "loaded": true,
     "size": rest.mempool.count,
