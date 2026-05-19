@@ -15,7 +15,16 @@
 ## - Schnorr verify: ~45,000 ops/sec on modern x86_64
 
 import std/[os, options, sysrand]
+import nimcrypto/sha2
 export options
+
+# Local SHA-256 (avoids depending on crypto/hashing to keep the secp256k1
+# module dependency-free at the consumer side).
+proc secp256k1Sha256(data: openArray[byte]): array[32, byte] =
+  var ctx: sha256
+  ctx.init()
+  ctx.update(data)
+  result = ctx.finish().data
 
 # Constants - must match libsecp256k1 headers
 const
@@ -38,6 +47,12 @@ type
   Secp256k1XonlyPubkey* = object
     ## X-only public key for Schnorr signatures (BIP340)
     data*: array[64, byte]
+
+  Secp256k1Keypair* = object
+    ## Opaque 96-byte keypair holding (seckey, pubkey) pair.
+    ## Used for BIP-340 Schnorr signing (libsecp256k1 extrakeys module).
+    ## Layout per secp256k1_extrakeys.h: opaque, do NOT touch directly.
+    data*: array[96, byte]
 
   Secp256k1RecoverableSignature* = object
     ## Recoverable ECDSA signature (64-byte sig + recovery id)
@@ -174,6 +189,46 @@ when defined(useSystemSecp256k1):
     msg: ptr byte,
     msgLen: csize_t,
     pubkey: ptr Secp256k1XonlyPubkey
+  ): cint {.importc, cdecl.}
+
+  # ==========================================================================
+  # secp256k1_extrakeys + schnorrsig SIGN side (BIP-340 wallet signing)
+  # Closes 6-WAVE Schnorr-sign-missing carry-forward W127->W161 (longest
+  # single-bug tracking in fleet history). Required for wallet to spend
+  # P2TR UTXOs it received (otherwise == funds-burn-via-DEPOSIT).
+  # Mirrors bitcoin-core/src/key.cpp:532-563 (KeyPair + KeyPair::SignSchnorr).
+  # ==========================================================================
+  proc secp256k1_keypair_create(
+    ctx: Secp256k1Context,
+    keypair: ptr Secp256k1Keypair,
+    seckey: ptr byte
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_keypair_xonly_tweak_add(
+    ctx: Secp256k1Context,
+    keypair: ptr Secp256k1Keypair,
+    tweak32: ptr byte
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_keypair_sec(
+    ctx: Secp256k1Context,
+    seckey32: ptr byte,
+    keypair: ptr Secp256k1Keypair
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_keypair_xonly_pub(
+    ctx: Secp256k1Context,
+    pubkey: ptr Secp256k1XonlyPubkey,
+    pk_parity: ptr cint,
+    keypair: ptr Secp256k1Keypair
+  ): cint {.importc, cdecl.}
+
+  proc secp256k1_schnorrsig_sign32(
+    ctx: Secp256k1Context,
+    sig64: ptr byte,
+    msg32: ptr byte,
+    keypair: ptr Secp256k1Keypair,
+    aux_rand32: ptr byte
   ): cint {.importc, cdecl.}
 
   # Recoverable ECDSA bindings (--enable-module-recovery)
@@ -557,6 +612,112 @@ when defined(useSystemSecp256k1):
     result = secp256k1_schnorrsig_verify(
       getContext(), addr sig[0], addr msgData[0], csize_t(msg.len), addr xonlyPk
     ) == 1
+
+  proc signSchnorr*(
+    seckey: PrivateKey,
+    msg32: array[32, byte],
+    merkleRoot: Option[array[32, byte]] = none(array[32, byte])
+  ): SchnorrSignature =
+    ## BIP-340 Schnorr signature for Taproot key-path spends.
+    ##
+    ## Closes 6-WAVE single-bug carry-forward W127 BUG (signSchnorr missing)
+    ## that ran W127->W158->W159->W160->W161 -- LONGEST in fleet history.
+    ## Mirrors bitcoin-core/src/key.cpp:532-563 (KeyPair + KeyPair::SignSchnorr).
+    ##
+    ## - `seckey`     : 32-byte raw private key (BIP-32 derived).
+    ## - `msg32`      : 32-byte sighash (per BIP-341 SignatureHashSchnorr).
+    ## - `merkleRoot` :
+    ##     * `none` -> NO TapTweak. Use only when caller has already tweaked
+    ##                the key externally.
+    ##     * `some(default(array[32,byte]))` (all-zero) -> BIP-86 keypath
+    ##                spend with no script tree (TapTweak with empty merkle root).
+    ##     * `some(root)` -> BIP-341 keypath spend with script tree at `root`.
+    ##
+    ## Calls libsecp's _schnorrsig_sign32 with 32 fresh bytes of aux_rand32
+    ## (matches Core's production posture). Self-verifies the result before
+    ## returning (Core's paranoia gate at key.cpp:556-562) and raises on
+    ## any failure to never hand the caller a corrupted signature.
+    var sk = seckey
+    var keypair: Secp256k1Keypair
+    if secp256k1_keypair_create(getContext(), addr keypair, addr sk[0]) != 1:
+      raise newException(Secp256k1Error, "schnorr: keypair_create failed")
+
+    # Optional BIP-341 TapTweak (BIP-86 = empty merkle root, BIP-341 script-tree
+    # spend = merkle root of script tree). Computed exactly as Core's
+    # XOnlyPubKey::ComputeTapTweakHash (pubkey.cpp:251-265): the tweak is
+    # tagged_hash("TapTweak", internal_xonly || merkle_root_or_empty).
+    if merkleRoot.isSome:
+      var xonly: Secp256k1XonlyPubkey
+      if secp256k1_keypair_xonly_pub(
+        getContext(), addr xonly, nil, addr keypair
+      ) != 1:
+        raise newException(Secp256k1Error, "schnorr: keypair_xonly_pub failed")
+      var xonlyBytes: array[32, byte]
+      if secp256k1_xonly_pubkey_serialize(
+        getContext(), addr xonlyBytes[0], addr xonly
+      ) != 1:
+        raise newException(Secp256k1Error, "schnorr: xonly_serialize failed")
+
+      let mr = merkleRoot.get()
+      # Detect "no script tree" the way Core does (uint256::IsNull): all-zero
+      # array -> empty merkle root preimage. BIP-86 keypath spend.
+      var isEmpty = true
+      for b in mr:
+        if b != 0: isEmpty = false; break
+
+      var tweakPreimage: seq[byte] = @[]
+      for b in xonlyBytes: tweakPreimage.add(b)
+      if not isEmpty:
+        for b in mr: tweakPreimage.add(b)
+
+      # tagged_hash("TapTweak", ...) - inlined to avoid pulling in interpreter dep.
+      const TapTweakTag = "TapTweak"
+      var tagBytes: seq[byte] = @[]
+      for c in TapTweakTag: tagBytes.add(byte(c))
+      let tagHash = secp256k1Sha256(tagBytes)
+      var taggedPreimage = newSeq[byte](64 + tweakPreimage.len)
+      for i in 0 ..< 32: taggedPreimage[i] = tagHash[i]
+      for i in 0 ..< 32: taggedPreimage[32 + i] = tagHash[i]
+      for i in 0 ..< tweakPreimage.len:
+        taggedPreimage[64 + i] = tweakPreimage[i]
+      let tweak = secp256k1Sha256(taggedPreimage)
+      var tweakArr = tweak
+
+      if secp256k1_keypair_xonly_tweak_add(
+        getContext(), addr keypair, addr tweakArr[0]
+      ) != 1:
+        raise newException(Secp256k1Error, "schnorr: keypair_xonly_tweak_add failed")
+
+    # Per BIP-340 + Core production posture: ALWAYS pass 32 fresh entropy
+    # bytes for aux_rand32. Improves resistance to fault-injection attacks
+    # on the deterministic nonce. See bitcoin-core/src/key.cpp:557.
+    var auxRand: array[32, byte]
+    if not urandom(auxRand):
+      raise newException(Secp256k1Error, "schnorr: urandom for aux_rand32 failed")
+
+    var msg = msg32
+    if secp256k1_schnorrsig_sign32(
+      getContext(), addr result[0], addr msg[0],
+      addr keypair, addr auxRand[0]
+    ) != 1:
+      raise newException(Secp256k1Error, "schnorr: schnorrsig_sign32 failed")
+
+    # Self-verify gate (Core's key.cpp:556-562 paranoia check). Never hand
+    # back a signature that doesn't verify against its own pubkey: a
+    # corrupted signature in the wild is worse than a sign failure since
+    # it can burn funds via a broadcast that nodes reject.
+    var verifyXonly: Secp256k1XonlyPubkey
+    if secp256k1_keypair_xonly_pub(
+      getContext(), addr verifyXonly, nil, addr keypair
+    ) != 1:
+      raise newException(Secp256k1Error, "schnorr: self-verify xonly_pub failed")
+    if secp256k1_schnorrsig_verify(
+      getContext(), addr result[0], addr msg[0], 32, addr verifyXonly
+    ) != 1:
+      # Clear the signature buffer the way Core does (memory_cleanse) before
+      # raising, so a partial copy can't leak.
+      for i in 0 ..< 64: result[i] = 0
+      raise newException(Secp256k1Error, "schnorr: self-verify failed (corrupt sig)")
 
   proc signCompactRecoverable*(
     privateKey: PrivateKey, msgHash: array[32, byte]
@@ -945,6 +1106,13 @@ else:
     msg: openArray[byte],
     signature: SchnorrSignature
   ): bool =
+    raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
+
+  proc signSchnorr*(
+    seckey: PrivateKey,
+    msg32: array[32, byte],
+    merkleRoot: Option[array[32, byte]] = none(array[32, byte])
+  ): SchnorrSignature =
     raise newException(Secp256k1Error, "secp256k1 not available - compile with -d:useSystemSecp256k1")
 
   proc signCompactRecoverable*(
