@@ -8,6 +8,7 @@ import ../primitives/types
 import ../primitives/serialize
 import ../crypto/hashing
 import ../crypto/secp256k1
+import ../perf/sig_cache
 
 type
   ScriptError* = enum
@@ -1690,7 +1691,16 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             scriptCode = findAndDelete(scriptCode, sig)
 
             let sighash = computeSighashLegacy(ctx.tx, ctx.inputIndex, scriptCode, hashType)
-            success = verifyDerLax(pubkey, sighash, sigWithoutHashType)
+            # W160 BUG-11 fix: per-sig cache keyed on (sighash, pubkey, sig) —
+            # mirrors Core's ComputeEntryECDSA in sigcache.cpp:39-50. Two
+            # different (sig, pubkey) tuples that happen to share an input no
+            # longer short-circuit each other.
+            if globalSigCache.lookup(sighash, pubkey, sigWithoutHashType):
+              success = true
+            else:
+              success = verifyDerLax(pubkey, sighash, sigWithoutHashType)
+              if success:
+                globalSigCache.insert(sighash, pubkey, sigWithoutHashType)
 
         of sigWitnessV0:
           # SegWit v0 signature check (BIP143)
@@ -1714,7 +1724,13 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
               scriptCode = @script
 
             let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, scriptCode, ctx.amount, hashType)
-            success = verifyDerLax(pubkey, sighash, sigWithoutHashType)
+            # W160 BUG-11 fix: per-sig cache; see legacy branch above.
+            if globalSigCache.lookup(sighash, pubkey, sigWithoutHashType):
+              success = true
+            else:
+              success = verifyDerLax(pubkey, sighash, sigWithoutHashType)
+              if success:
+                globalSigCache.insert(sighash, pubkey, sigWithoutHashType)
 
         of sigTaproot, sigTapscript:
           # BIP-342: unknown (non-32-byte, non-empty) pubkey types succeed
@@ -1790,7 +1806,15 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
               if ctx.sigVersion == sigTapscript:
                 return seSchnorrSigHashtype
 
-            success = verifySchnorr(xonlyPk, @sighash, sigBytes)
+            # W160 BUG-11 fix: per-sig cache for Schnorr. Mirrors Core's
+            # ComputeEntrySchnorr in sigcache.cpp:39-50. Closes the
+            # tapscript-multisig short-circuit described in the W160 audit.
+            if globalSigCache.lookup(sighash, xonlyPk, sigBytes):
+              success = true
+            else:
+              success = verifySchnorr(xonlyPk, @sighash, sigBytes)
+              if success:
+                globalSigCache.insert(sighash, xonlyPk, sigBytes)
             # In tapscript, a non-empty Schnorr sig that fails verify is
             # a HARD error (Core: SCRIPT_ERR_SCHNORR_SIG). Skip NULLFAIL
             # fall-through entirely for tapscript Schnorr.
@@ -2092,7 +2116,14 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
           if baseType == SIGHASH_SINGLE and ctx.inputIndex >= ctx.tx.outputs.len:
             return seSchnorrSigHashtype
 
-          success = verifySchnorr(xonlyPk, @sighash, sigBytes)
+          # W160 BUG-11 fix: per-sig cache for OP_CHECKSIGADD's Schnorr verify.
+          # See OP_CHECKSIG above for the rationale.
+          if globalSigCache.lookup(sighash, xonlyPk, sigBytes):
+            success = true
+          else:
+            success = verifySchnorr(xonlyPk, @sighash, sigBytes)
+            if success:
+              globalSigCache.insert(sighash, xonlyPk, sigBytes)
           if not success:
             return seSchnorrSig
         # else sig.empty() — success stays false from initialization
