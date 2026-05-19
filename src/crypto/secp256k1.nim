@@ -14,7 +14,7 @@
 ## - ECDSA verify: ~50,000 ops/sec on modern x86_64
 ## - Schnorr verify: ~45,000 ops/sec on modern x86_64
 
-import std/[os, options]
+import std/[os, options, sysrand]
 export options
 
 # Constants - must match libsecp256k1 headers
@@ -72,6 +72,13 @@ when defined(useSystemSecp256k1):
 
   proc secp256k1_context_destroy(ctx: Secp256k1Context)
     {.importc, cdecl.}
+
+  # Side-channel blinding: pass 32 random bytes after each context_create.
+  # See bitcoin-core/src/key.cpp:572-587 (ECC_Start) — Core asserts the return
+  # value and refuses to run without blinding. Closes W159 BUG-4 (P0-SEC).
+  proc secp256k1_context_randomize(
+    ctx: Secp256k1Context, seed32: ptr byte
+  ): cint {.importc, cdecl.}
 
   proc secp256k1_ec_pubkey_create(
     ctx: Secp256k1Context,
@@ -245,6 +252,12 @@ when defined(useSystemSecp256k1):
       globalContext = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN or SECP256K1_CONTEXT_VERIFY
       )
+      # Side-channel blinding (W159 BUG-4). Mirrors Core's ECC_Start.
+      var seed: array[32, byte]
+      if not urandom(seed):
+        raise newException(Secp256k1Error,
+          "secp256k1 blinding seed unavailable (urandom failed)")
+      discard secp256k1_context_randomize(globalContext, addr seed[0])
 
   proc getContext(): Secp256k1Context =
     if pointer(globalContext) == nil:
@@ -784,6 +797,12 @@ when defined(useSystemSecp256k1):
     result.ctx = secp256k1_context_create(
       SECP256K1_CONTEXT_SIGN or SECP256K1_CONTEXT_VERIFY
     )
+    # Side-channel blinding (W159 BUG-4). Mirrors Core's ECC_Start.
+    var seed: array[32, byte]
+    if not urandom(seed):
+      raise newException(Secp256k1Error,
+        "secp256k1 blinding seed unavailable (urandom failed)")
+    discard secp256k1_context_randomize(result.ctx, addr seed[0])
 
   proc close*(e: var CryptoEngine) =
     ## Close and cleanup the crypto engine
