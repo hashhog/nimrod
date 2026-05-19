@@ -578,10 +578,14 @@ when defined(useSystemSecp256k1):
         if b != 0: allZero = false
       check not allZero
 
-    test "G28 BUG-2: signInputP2TR raises WalletError (not implemented)":
-      ## P2TR signing is not implemented — signTransaction raises for P2TR inputs.
-      ## BIP-341 Schnorr signing requires secp256k1_schnorrsig_sign32 which is
-      ## not yet bound in nimrod's secp256k1.nim.
+    test "G28 (closes BUG-2): signInputP2TR signs BIP-86 P2TR via Schnorr":
+      ## W127 BUG / W158-W161 carry-forward CLOSED.
+      ##
+      ## BIP-341 Schnorr signing now wired through secp256k1_schnorrsig_sign32
+      ## (see src/crypto/secp256k1.nim signSchnorr + src/wallet/wallet.nim
+      ## signInputP2TR). 6-WAVE single-bug carry-forward closed -- previously
+      ## a P2TR UTXO received by the wallet was unspendable (funds-burn-via-
+      ## DEPOSIT pattern).
       let m = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
       var wallet = newWallet(m)
       wallet.addAccount(86, 0, 1)
@@ -604,13 +608,13 @@ when defined(useSystemSecp256k1):
       tx.outputs.add(TxOut(value: Satoshi(99000),
         scriptPubKey: @[0x00'u8, 0x14] & newSeq[byte](20)))
       tx.witnesses = @[@[]]
-      var raised = false
-      try:
-        discard wallet.signTransaction(tx, @[utxo])
-      except WalletError as e:
-        raised = true
-        check "not yet fully implemented" in e.msg
-      check raised  # documents BUG-2
+      # Should no longer raise. Sign and assert witness shape.
+      check wallet.signTransaction(tx, @[utxo])
+      check tx.inputs[0].scriptSig.len == 0   # BIP-341 keypath: empty scriptSig
+      check tx.witnesses[0].len == 1          # one witness element: <sig>
+      # Default wallet hashType for P2TR is SIGHASH_DEFAULT (0x00) -> 64-byte
+      # sig with NO appended hashtype byte (BIP-341 §"Signature validation").
+      check tx.witnesses[0][0].len == 64
 
 # ---------------------------------------------------------------------------
 # G29-G30: PSBT

@@ -1241,6 +1241,61 @@ proc signInputP2SHP2WSH*(tx: var Transaction, inputIdx: int,
   tx.inputs[inputIdx].scriptSig = pushScript(redeemScript)
   tx.witnesses[inputIdx] = witness
 
+proc signInputP2TR*(tx: var Transaction, inputIdx: int,
+                    privateKey: PrivateKey,
+                    amounts: seq[Satoshi],
+                    scriptPubKeys: seq[seq[byte]],
+                    hashType: uint32 = 0'u32) =
+  ## Sign a BIP-86 P2TR keypath-spend input (single-key, NO script tree).
+  ##
+  ## Closes 6-WAVE single-bug carry-forward W127 BUG / W158-W161 (longest
+  ## in fleet history). Replaces the prior raise "P2TR signing not yet
+  ## fully implemented" -> previously a P2TR UTXO received by the wallet
+  ## was unspendable -> funds-burn-via-DEPOSIT.
+  ##
+  ## - `inputIdx`       : index of the input to sign
+  ## - `privateKey`     : 32-byte raw seckey for this input's prevout
+  ## - `amounts`        : per-input prevout values (BIP-341 SIGHASH input)
+  ## - `scriptPubKeys`  : per-input prevout scriptPubKeys
+  ## - `hashType`       : 0x00 = SIGHASH_DEFAULT (BIP-341, omit byte from
+  ##                     witness); otherwise SIGHASH_ALL / NONE / SINGLE
+  ##                     (optionally OR'd with ANYONECANPAY), appended as
+  ##                     the 65th byte per BIP-341.
+  ##
+  ## BIP-86 keypath spend produces:
+  ##   witness = [<sig>]   (single element, 64 or 65 bytes)
+  ##   scriptSig = <empty>
+  ##
+  ## Reference: bitcoin-core/src/script/sign.cpp (CreateTaprootScriptSig),
+  ## key.cpp:549-563 (KeyPair::SignSchnorr).
+  doAssert amounts.len == tx.inputs.len, "signInputP2TR: amounts vs inputs len mismatch"
+  doAssert scriptPubKeys.len == tx.inputs.len, "signInputP2TR: spks vs inputs len mismatch"
+
+  # BIP-341 sighash. computeSighashTaproot already handles
+  # SIGHASH_DEFAULT == 0x00 -> behaves as SIGHASH_ALL for the digest while
+  # the witness omits the byte (encoded below).
+  let sighash = computeSighashTaproot(
+    tx, inputIdx, amounts, scriptPubKeys, uint8(hashType),
+    extFlag = 0, annex = @[],
+    tapleafHash = default(array[32, byte]),
+    codesepPos = 0xFFFFFFFF'u32
+  )
+
+  # BIP-86 keypath spend: TapTweak with EMPTY merkle root. Pass an all-zero
+  # merkle root array (signSchnorr treats all-zero == "empty merkle root").
+  let emptyRoot: array[32, byte] = default(array[32, byte])
+  let sig = signSchnorr(privateKey, sighash, some(emptyRoot))
+
+  # BIP-341 witness shape: [sig] only. Sig is 64 bytes for SIGHASH_DEFAULT,
+  # 65 bytes (with appended hashtype byte) for any other type.
+  var witnessElem: seq[byte]
+  for b in sig: witnessElem.add(b)
+  if hashType != 0'u32:
+    witnessElem.add(byte(hashType and 0xff))
+
+  tx.inputs[inputIdx].scriptSig = @[]
+  tx.witnesses[inputIdx] = @[witnessElem]
+
 proc signTransaction*(wallet: Wallet, tx: var Transaction,
                       utxos: seq[WalletUtxo],
                       hashTypes: seq[uint32] = @[]): bool =
@@ -1255,6 +1310,14 @@ proc signTransaction*(wallet: Wallet, tx: var Transaction,
     raise newException(WalletError, "utxo count doesn't match input count")
   if hashTypes.len != 0 and hashTypes.len != utxos.len:
     raise newException(WalletError, "hashTypes length must match utxos length")
+
+  # Pre-collect all prevout amounts + scriptPubKeys for BIP-341 sighash
+  # (taproot sighash hashes ALL prevout values + spks, not just per-input).
+  var allAmounts: seq[Satoshi] = @[]
+  var allSpks: seq[seq[byte]] = @[]
+  for u in utxos:
+    allAmounts.add(u.output.value)
+    allSpks.add(u.output.scriptPubKey)
 
   for i, utxo in utxos:
     let hashType = if hashTypes.len == 0: uint32(SIGHASH_ALL) else: hashTypes[i]
@@ -1282,8 +1345,15 @@ proc signTransaction*(wallet: Wallet, tx: var Transaction,
       # P2PKH (BIP44 legacy): OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
       signInputP2PKH(tx, i, key.extKey.key, key.extKey.publicKey, hashType)
     elif spk.len == 34 and spk[0] == 0x51 and spk[1] == 0x20:
-      # P2TR - requires Schnorr signature (simplified)
-      raise newException(WalletError, "P2TR signing not yet fully implemented")
+      # P2TR BIP-86 keypath spend (wallet-derived single-key, no script tree).
+      # Closes 6-WAVE Schnorr-sign-missing carry-forward W127->W161
+      # (longest single-bug tracking in fleet history). Calls signInputP2TR
+      # which uses signSchnorr with TapTweak of the BIP-86 empty merkle root.
+      # SIGHASH_DEFAULT (0x00) is BIP-341 recommended; caller can override
+      # via `hashTypes` (e.g. SIGHASH_ALL = 0x01 -> appended hashtype byte).
+      let trHashType = if hashTypes.len == 0: 0'u32  # BIP-341 SIGHASH_DEFAULT
+                       else: hashTypes[i]
+      signInputP2TR(tx, i, key.extKey.key, allAmounts, allSpks, trHashType)
     elif spk.len == 23 and spk[0] == 0xa9 and spk[1] == 0x14 and
          spk[22] == 0x87:
       # Bare P2SH (OP_HASH160 <20> OP_EQUAL): need redeemScript from caller;

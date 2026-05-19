@@ -179,20 +179,49 @@ suite "W127 Gate 5 (BIP-340): tagged hash is single-SHA256 — PRESENT":
     check th == expected
 
 # Gate 6 — Schnorr signing in wallet
-suite "W127 Gate 6 (BIP-340): wallet Schnorr signing — MISSING":
-  test "MISSING — no signSchnorr / signTaprootInput in wallet (BUG-3 / BUG-11)":
-    ## Reference: bitcoin-core/src/key.cpp:273 (CKey::SignSchnorr) +
-    ## key.cpp:549 (KeyPair::SignSchnorr).
-    ## Nimrod: no signSchnorr proc anywhere in src/wallet/*.nim.
-    ## src/crypto/secp256k1.nim has NO secp256k1_schnorrsig_sign FFI
-    ## binding (only secp256k1_schnorrsig_verify at :164).
-    ## src/wallet/psbt.nim defines PSBT_IN_TAP_KEY_SIG (:56) and can
-    ## *read* it but cannot *fill* it because no signer exists.
-    ## Wallet line 1285 confesses "P2TR - requires Schnorr signature
-    ## (simplified)".
-    ## TODO BUG-3 / BUG-11: add FFI binding + signSchnorrInput proc +
-    ## wire into signRawTransaction* and walletprocesspsbt.
-    skip()
+suite "W127 Gate 6 (BIP-340): wallet Schnorr signing — PRESENT (closes BUG-3 / BUG-11)":
+  test "PRESENT — signSchnorr round-trips against verifySchnorr (BIP-86 TapTweak)":
+    ## Reference: bitcoin-core/src/key.cpp:549-563 (KeyPair::SignSchnorr).
+    ## Nimrod: src/crypto/secp256k1.nim signSchnorr (FFI + TapTweak +
+    ## aux_rand32 + self-verify paranoia). Closes 6-WAVE single-bug
+    ## carry-forward W127 BUG-3/BUG-11 -> W158 -> W159 -> W160 -> W161
+    ## (longest single-bug tracking in fleet history).
+    let msg32: array[32, byte] = [
+      0xaa'u8, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+      0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+      0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+      0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99
+    ]
+    # BIP-86 keypath spend: TapTweak with empty merkle root (all-zero array
+    # is the signal -> NO merkle_root byte appended to TapTweak preimage).
+    let emptyRoot: array[32, byte] = default(array[32, byte])
+    let sig = signSchnorr(TEST_PRIVKEY, msg32, some(emptyRoot))
+
+    # Re-derive the tweaked xonly key the way wallet.nim:530-542 does for
+    # BIP-86 (P2TR address). Verifying signature against this tweaked
+    # output key proves the FFI chain is wired correctly end-to-end.
+    # taptweakOf has signature (internalPk, merkleRoot) - for BIP-86 the
+    # merkle root is empty so we pass internalPk alone via tagged hash.
+    let tagHash = sha256(cast[seq[byte]]("TapTweak"))
+    var preimage = newSeq[byte](64 + 32)
+    for i in 0 ..< 32: preimage[i] = tagHash[i]
+    for i in 0 ..< 32: preimage[32 + i] = tagHash[i]
+    for i in 0 ..< 32: preimage[64 + i] = G_INTERNAL[i]
+    let tweak = sha256(preimage)
+    let (tweakedXonly, _) = tweakXonlyPubkey(G_INTERNAL, tweak)
+
+    var msgSeq = newSeq[byte](32)
+    for i in 0 ..< 32: msgSeq[i] = msg32[i]
+    check verifySchnorr(tweakedXonly, msgSeq, sig)
+
+  test "PRESENT — signSchnorr without merkleRoot (untweaked, raw key)":
+    ## Test the `none(merkleRoot)` path: no TapTweak applied -> sig verifies
+    ## against the internal x-only key directly. Used by callers that have
+    ## already done their own tweaking (PSBT TAP_KEY_SIG fill).
+    let msg32: array[32, byte] = default(array[32, byte])
+    let sig = signSchnorr(TEST_PRIVKEY, msg32, none(array[32, byte]))
+    var msgSeq = newSeq[byte](32)
+    check verifySchnorr(G_INTERNAL, msgSeq, sig)
 
 # ===========================================================================
 # Subsystem B — BIP-341 Taproot key-path (Gates 7-13)
