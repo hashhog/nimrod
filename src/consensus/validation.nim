@@ -1997,3 +1997,168 @@ proc acceptBlock*(
       return scriptResult
 
   ok()
+
+# ---------------------------------------------------------------------------
+# Canonical block-acceptance helper.
+#
+# Fleet-wide audit pattern: nimrod has accumulated FIVE distinct entry points
+# that bypassed the canonical `acceptBlock` envelope:
+#   1. W143 BUG-3   — nimrod.nim:1611 (`--import` from stdin frames)
+#   2. W145 BUG-1   — nimrod.nim:1780 (`--import` from blk*.dat dir; missed
+#                     CVE-2018-17144 duplicate-input check)
+#   3. W154 BUG-11  — mining.nim::generateBlocks + ::generateBlockWithTxs
+#                     (regtest `generatetoaddress` / `generateblock`)
+#   4. W155 BUG-17  — server.nim submitblock side-branch persistence
+#   5. W157 BUG-15  — echo of W154 (same generateBlocks paths)
+#
+# Each bypass admitted a block that Core would reject (wrong nBits, weight
+# overflow, BIP-34 violation, duplicate inputs, coinbase value too large,
+# missing witness commitment, etc.) into the local chainstate. Core's
+# ProcessNewBlock → AcceptBlock → ContextualCheckBlock → ConnectBlock funnel
+# does NOT have a fast path for "trusted source" — every block goes through
+# the same envelope regardless of how it arrived (peer, reindex, miner,
+# submitblock, generate-rpc). The asymmetry IS the bug.
+#
+# This helper restores parity. Callers pass a `BlockSource` and the helper:
+#   - looks up prevIndex from the chain DB (genesis = synthetic sentinel)
+#   - computes skipScripts via the configured assumevalid window
+#   - runs the full `acceptBlock` envelope:
+#       checkBlock → validateBlock → checkBip30 → verifyScripts
+#   - persists via `connectBlock` (or `connectBlockIBD` when in IBD mode)
+#
+# Side-branch submitblock (BUG-17) does NOT extend the active chain so it
+# cannot call connectBlock directly; the caller validates with
+# `validateForStorage` below (also routes through acceptBlock at the limits
+# of what is feasible without UTXO context for the side-branch's parent).
+type
+  BlockSource* = enum
+    bsP2P             ## Block received from a peer over the wire.
+    bsReindex         ## --import / --reindex from local blk*.dat (or stdin).
+    bsMining          ## Locally-mined block (generatetoaddress / generateblock).
+    bsSubmitBlockTip  ## submitblock RPC, block extends active tip.
+    bsSubmitBlockSide ## submitblock RPC, block on a side-branch (no connect).
+    bsGenerateRpc     ## Reserved for future generate-* RPCs.
+
+proc acceptAndConnectBlock*(
+  cs: var ChainState,
+  blk: Block,
+  height: int32,
+  source: BlockSource,
+  crypto: CryptoEngine,
+  forceIbdConnect: bool = false
+): ChainStateResult[void] =
+  ## Unified block-acceptance + chainstate-mutation envelope.
+  ##
+  ## Every block-acceptance path (peer, reindex, miner, submitblock-tip,
+  ## generate-*) MUST route through this helper. The Core invariant is that
+  ## consensus rules are enforced once, in one place, regardless of how the
+  ## block arrived — see bitcoin-core/src/validation.cpp::AcceptBlock and
+  ## ProcessNewBlock.
+  ##
+  ## The W143/W145/W154/W155/W157 audit wave catalogued FIVE distinct nimrod
+  ## entry points that bypassed this envelope (calling `connectBlock` directly
+  ## without `checkBlock` / `validateBlock` / `acceptBlock` first). Each
+  ## bypass admitted blocks Core would reject. This helper closes the entire
+  ## architectural class.
+  ##
+  ## `forceIbdConnect=true` selects `connectBlockIBD` regardless of cs.ibdMode
+  ## (used by the --import paths which run their own IBD batching wrapper).
+  let prevHash = blk.header.prevBlock
+
+  # Look up prevIndex. Genesis (height=0) gets a synthetic sentinel because
+  # the genesis block's prevBlock is the zero hash, which is not in the DB.
+  let prevIdx = if height <= 0:
+                  BlockIndex(height: -1'i32, hash: BlockHash(default(array[32, byte])))
+                else:
+                  let prevOpt = cs.db.getBlockIndex(prevHash)
+                  if prevOpt.isNone:
+                    return err("prev block " & $prevHash & " not in chain index")
+                  prevOpt.get()
+
+  # Sanity: helper is for active-chain extension only. Side-branch submitblock
+  # uses validateForStorage instead.
+  if source == bsSubmitBlockSide:
+    return err("acceptAndConnectBlock: bsSubmitBlockSide must use validateForStorage")
+
+  # Compute skipScripts via simple assumevalid window (height-only). The
+  # ancestor-aware computation in sync.nim is for P2P where the header chain
+  # is fully synced; reindex/mining/submitblock-tip don't have that signal
+  # at the point of call. Height-only is conservative: it never skips MORE
+  # than the ancestor-aware path would.
+  let skipScripts = cs.params.assumeValidHeight > 0 and
+                    height <= cs.params.assumeValidHeight
+
+  # UTXO lookup adapter for acceptBlock (BIP-30 + verifyScripts).
+  let csRef = cs
+  let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+    try: csRef.getUtxo(op)
+    except: none(UtxoEntry)
+
+  # Full consensus envelope (Core AcceptBlock parity):
+  #   step 1 checkBlock              (PoW + merkle + tx sanity)
+  #   step 2 validateBlock           (contextual header + BIP-34 height
+  #                                   + weight + sigops + coinbase value
+  #                                   + IsFinalTx + witness commitment)
+  #   step 3 checkBip30              (CVE-2012-1909 dup-UTXO)
+  #   step 4 verifyScripts           (per-input script execution, gated
+  #                                   by skipScripts under assumevalid)
+  let acceptResult = acceptBlock(blk, prevIdx, cs.db, cs.params,
+                                 skipScripts = skipScripts,
+                                 checkPow = true,
+                                 getUtxo = utxoLookup,
+                                 crypto = crypto)
+  if not acceptResult.isOk:
+    return err("acceptBlock rejected: " & $acceptResult.error)
+
+  # Mutating-write path. Pick the right connect: callers that drive their
+  # own IBD wrapper (--import) pass forceIbdConnect=true; otherwise honour
+  # the chainstate's current IBD mode flag.
+  let useIBD = forceIbdConnect or cs.ibdMode
+  if useIBD:
+    cs.connectBlockIBD(blk, height)
+  else:
+    cs.connectBlock(blk, height)
+
+proc validateForStorage*(
+  cs: ChainState,
+  blk: Block,
+  prevIdx: BlockIndex,
+  crypto: CryptoEngine
+): ValidationResult[void] =
+  ## Validate a block bound for side-branch storage (submitblock with
+  ## prevHash != cs.bestBlockHash). Side-branch blocks are NOT connected
+  ## immediately (the UTXO state is on the active tip); they are persisted
+  ## with bsValidated status and connected later via `handleReorg` when a
+  ## reorg promotes them.
+  ##
+  ## Core's BlockManager::AcceptBlock applies the FULL CheckBlock +
+  ## ContextualCheckBlock pipeline to every block regardless of side-branch
+  ## status (validation.cpp:4298+). Before this helper, nimrod's submitblock
+  ## side-branch arm only ran `checkBlock` (PoW + merkle) and then persisted
+  ## with bsValidated — bypassing BIP-30 dup-coinbase, BIP-34 height encoding,
+  ## BIP-65/66 contextual checks, witness commitment match, MTP+1 timestamp,
+  ## coinbase value, sigops cost, weight limit, IsFinalTx. On a later reorg
+  ## the never-validated block would be added to the active chain.
+  ##
+  ## This helper closes W155 BUG-17 by routing side-branch blocks through
+  ## the same acceptBlock envelope (skip verifyScripts because the
+  ## side-branch's UTXO context is not the active tip; scripts re-verify
+  ## during the eventual handleReorg connectBlock call). All context-free
+  ## + contextual checks run.
+  ##
+  ## skipScripts is forced TRUE here: the active chainstate's UTXO set
+  ## does not match this block's parent state, so script verification
+  ## against active-chain UTXOs would falsely reject every input. Scripts
+  ## are re-verified when handleReorg later calls connectBlock on the
+  ## side-branch chain (where the disconnect-then-reconnect rebuilds the
+  ## UTXO state to the fork point).
+  let csRef = cs
+  let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+    try: csRef.getUtxo(op)
+    except: none(UtxoEntry)
+  acceptBlock(blk, prevIdx, cs.db, cs.params,
+              skipScripts = true,   # see docstring; scripts re-verify on reorg
+              checkPow = true,
+              getUtxo = utxoLookup,
+              crypto = crypto)
+
