@@ -19,6 +19,7 @@ import ./test_w95_bip340_schnorr
 import ./test_mtp_blockheader
 import ./test_w85_contextual_block_header
 import ./test_consensus
+import ./test_consensus_bypass_unification
 import ./test_storage
 import ./test_messages
 import ./test_peer

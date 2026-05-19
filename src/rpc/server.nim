@@ -3824,6 +3824,25 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       let blockHash = BlockHash(doubleSha256(headerBytes))
       let newHeight = prevIdx.height + 1
 
+      # W155 BUG-17 fix: validate side-branch blocks BEFORE persisting them
+      # with bsValidated status. Previously this path stored the block after
+      # only `checkBlock` (PoW + merkle), bypassing BIP-30 dup-coinbase,
+      # BIP-34 height encoding, BIP-65/66 contextual checks, witness
+      # commitment match, MTP+1 timestamp, coinbase value, sigops cost,
+      # weight limit, IsFinalTx. The never-validated block would then be
+      # eligible for promotion to the active chain via `handleReorg`. Core's
+      # BlockManager::AcceptBlock applies the FULL CheckBlock +
+      # ContextualCheckBlock pipeline regardless of side-branch status
+      # (validation.cpp:4298+).
+      #
+      # Script verification is intentionally skipped here because the active
+      # chainstate's UTXO set does not match this side-branch's parent state;
+      # scripts re-verify when `handleReorg` later calls `connectBlock` on
+      # the promoted chain (which rebuilds UTXO state to the fork point).
+      let sideValidation = validateForStorage(cs, blk, prevIdx, rpc.crypto)
+      if not sideValidation.isOk:
+        return %bip22String(sideValidation.error)
+
       # Compute work for this block from its nBits target. Mirrors the
       # `calculateBlockWork` helper in chainstate.nim (file-private there;
       # inlined here to avoid name-collision with network/sync.nim's `addWork`).

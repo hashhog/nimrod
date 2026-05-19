@@ -1558,6 +1558,11 @@ proc runBlockImport*(config: NimrodConfig) =
 
   cs.startIBD()
 
+  # Shared crypto engine for script verification across the entire reindex.
+  # Held in scope so secp256k1 context construction (which is non-trivial)
+  # happens once per --import invocation, not once per block.
+  let importCrypto = newCryptoEngine()
+
   if config.importBlocks == "-":
     # Read framed format from stdin
     echo "Reading blocks from stdin (framed format)..."
@@ -1607,16 +1612,21 @@ proc runBlockImport*(config: NimrodConfig) =
 
       let blk = deserializeBlock(blockData)
 
-      # Validate
-      let checkResult = checkBlock(blk, params)
-      if not checkResult.isOk:
-        echo "Block validation failed at height " & $frameHeight & ": " & $checkResult.error
-        break
-
-      # Connect
-      let connectResult = cs.connectBlockIBD(blk, frameHeight)
+      # Route through canonical acceptBlock envelope (W143 BUG-3 / W145 BUG-1
+      # fix). Previously this path called `checkBlock` + `connectBlockIBD`
+      # only, bypassing contextualCheckBlockHeader (nBits, MTP, BIP-94),
+      # validateBlock (BIP-34, weight cap, sigops, coinbase value, witness
+      # commitment, IsFinalTx), checkBip30 (CVE-2012-1909), CVE-2018-17144
+      # duplicate-input check, and script verification — every contextual
+      # consensus check. A hostile blocks.dat could advance the chain with
+      # wrong-nBits / over-subsidy / over-weight blocks. Core's reindex
+      # funnels through ProcessNewBlock → AcceptBlock → ContextualCheckBlock
+      # → ConnectBlock; this matches.
+      let connectResult = acceptAndConnectBlock(cs, blk, frameHeight,
+                                                bsReindex, importCrypto,
+                                                forceIbdConnect = true)
       if not connectResult.isOk:
-        echo "Block connect failed at height " & $frameHeight & ": " & $connectResult.error
+        echo "Block accept/connect failed at height " & $frameHeight & ": " & connectResult.error
         break
 
       imported += 1
@@ -1776,16 +1786,13 @@ proc runBlockImport*(config: NimrodConfig) =
 
       let blk = deserializeBlock(blockData)
 
-      # Validate
-      let checkResult = checkBlock(blk, params)
-      if not checkResult.isOk:
-        echo "Block validation failed at height " & $height & ": " & $checkResult.error
-        break
-
-      # Connect
-      let connectResult = cs.connectBlockIBD(blk, height)
+      # Route through canonical acceptBlock envelope (W143 BUG-3 / W145 BUG-1
+      # fix; see stdin-import path above for full rationale).
+      let connectResult = acceptAndConnectBlock(cs, blk, height,
+                                                bsReindex, importCrypto,
+                                                forceIbdConnect = true)
       if not connectResult.isOk:
-        echo "Block connect failed at height " & $height & ": " & $connectResult.error
+        echo "Block accept/connect failed at height " & $height & ": " & connectResult.error
         break
 
       imported += 1
