@@ -993,7 +993,27 @@ proc evictCleanEntries*(cs: var ChainState) =
     dec cs.cacheSize
 
 proc flushIBDBatch*(cs: var ChainState) =
-  ## Flush accumulated IBD write batch to RocksDB
+  ## Flush the accumulated IBD write batch to RocksDB as ONE atomically
+  ## crash-durable operation.
+  ##
+  ## The batch carries the chain-tip pointer (`cfMeta` bestblock/height/
+  ## totalwork), every staged UTXO mutation (`cfUtxo`), AND the block-index
+  ## rows (`cfBlockIndex`, accumulated by `connectBlockIBD`). RocksDB applies a
+  ## multi-column-family WriteBatch atomically across CFs, so the tip and the
+  ## UTXO set move together — exactly the invariant Bitcoin Core's
+  ## CCoinsViewDB::BatchWrite preserves with its DB_BEST_BLOCK batch.
+  ##
+  ## DURABILITY: the write goes through `writeSynced` (WAL on + fsync). During
+  ## IBD the primary write path has its WAL disabled (`startIBD` → `disableWAL`)
+  ## for throughput, so a plain `write` here would land only in the volatile
+  ## memtable; durability would then hinge on `flushAllColumnFamilies`, whose
+  ## per-CF `rocksdb_flush_cf` calls are NOT mutually atomic. A SIGKILL after
+  ## the UTXO CF flushed but before the meta CF flushed would leave the
+  ## on-disk tip pointer inconsistent with the on-disk UTXO set — silent
+  ## chainstate corruption surviving the restart. `writeSynced` fsyncs the
+  ## whole multi-CF batch as a unit, so a crash either loses the entire
+  ## checkpoint (chainstate stays consistent at the previous flush; IBD just
+  ## redownloads) or keeps all of it. There is no partial-checkpoint window.
   if cs.ibdBatch != nil and cs.ibdBatchBlocks > 0:
     # Write best block pointer into the batch so it's atomic
     cs.ibdBatch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](cs.bestBlockHash)))
@@ -1007,15 +1027,17 @@ proc flushIBDBatch*(cs: var ChainState) =
       let key = utxoKey(array[32, byte](op.txid), op.vout)
       cs.ibdBatch.put(cfUtxo, key, serializeUtxoEntry(entry))
 
-    # Commit the entire batch atomically
-    cs.db.db.write(cs.ibdBatch)
+    # Commit the entire batch atomically AND crash-durably (WAL + fsync).
+    # See the proc docstring: a plain `write` is only memtable-durable while
+    # IBD has the WAL disabled, which opens a tip-vs-UTXO desync window.
+    cs.db.db.writeSynced(cs.ibdBatch)
 
     # Reset batch
     cs.ibdBatch.clear()
     cs.ibdBatchBlocks = 0
     cs.ibdDeletedUtxos.clear()
-    # The batch is now durably committed to RocksDB (the `write` above is
-    # synchronous), so the block-index rows are visible to plain reads.
+    # The batch is now durably committed to RocksDB (the `writeSynced` above
+    # fsyncs the WAL), so the block-index rows are visible to plain reads.
     # Clear the unflushed shadow — clearing AFTER the write guarantees no
     # window where a read finds neither shadow nor DB.
     cs.db.ibdIndexByHash.clear()

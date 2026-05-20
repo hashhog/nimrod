@@ -2,6 +2,14 @@
 ## Regression test for the post-reboot UTXO corruption bug:
 ## With WAL disabled during IBD, flushIBDBatch() must force memtables to SST
 ## files so that all column families (cfUtxo AND cfMeta) are durable.
+##
+## Hardened (2026-05-20): flushIBDBatch now commits via `Database.writeSynced`
+## (WAL on + fsync) so the periodic IBD checkpoint is ONE atomically-durable
+## multi-column-family write. Previously the only durability mechanism while
+## IBD had the WAL disabled was a per-CF memtable flush whose `rocksdb_flush_cf`
+## calls are not mutually atomic — a crash between the UTXO-CF and meta-CF
+## flushes could persist the chain tip out of step with the UTXO set. The
+## final test below pins the tip-vs-UTXO joint-consistency invariant.
 
 import unittest2
 import std/[os, options]
@@ -181,4 +189,44 @@ suite "ChainState IBD durability":
       let hashAtBest = cs.db.getBlockHashByHeight(cs.bestHeight)
       check hashAtBest.isSome
 
+      cs.db.db.closeUnsafe()
+
+  test "synced IBD checkpoint: recovered tip and UTXO set agree exactly":
+    ## flushIBDBatch commits the chain tip (cfMeta) AND the UTXO mutations
+    ## (cfUtxo) in ONE writeSynced (WAL + fsync) batch. After exactly one
+    ## flush boundary the recovered state must be coherent: the tip is at the
+    ## flush height AND the UTXO created at that height is present. A
+    ## non-atomic flush could persist the tip without the UTXO, or the UTXO
+    ## without the tip — this pins that they move together.
+    let flushPoint = int32(IbdBatchFlushInterval)
+    var lastCoinbaseTxid: TxId
+
+    block:
+      var cs = newChainState(TestDbPath, regtestParams())
+      let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+      discard cs.connectBlock(genesis, 0)
+      cs.startIBD()
+
+      var prevHash = getBlockHash(genesis)
+      for h in 1'i32 .. flushPoint:
+        let blk = makeSimpleBlock(prevHash, h)
+        check cs.connectBlockIBD(blk, h).isOk
+        lastCoinbaseTxid = blk.txs[0].txid()
+        prevHash = getBlockHash(blk)
+
+      # connectBlockIBD at h == flushPoint triggers flushIBDBatch internally
+      # (ibdBatchBlocks reaches IbdBatchFlushInterval), so the synced
+      # checkpoint is already durable. Abandon the handle without stopIBD.
+      check cs.bestHeight == flushPoint
+      cs.db.db.closeUnsafe()
+
+    block:
+      var cs = newChainState(TestDbPath, regtestParams())
+      # Tip recovered exactly at the synced flush boundary…
+      check cs.bestHeight == flushPoint
+      # …and the UTXO set is consistent WITH that tip: the coinbase output
+      # created at the flush height resolves, at the right height.
+      let u = cs.getUtxo(OutPoint(txid: lastCoinbaseTxid, vout: 0))
+      check u.isSome
+      check u.get().height == flushPoint
       cs.db.db.closeUnsafe()
