@@ -1238,9 +1238,12 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     info "requesting blocks", count = inventory.len,
          fromHeight = sm.chainTipHeight + 1
 
-proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
+proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
   ## Validate and apply a single block at the given height.
   ## Returns true if the block was successfully applied.
+  ## Exported so the IBD block-acceptance path (incl. the contextual
+  ## difficulty check) can be exercised directly by the test suite —
+  ## see tests/test_w164_apply_block_diffbits.nim.
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
 
@@ -1294,11 +1297,40 @@ proc applyBlock(sm: SyncManager, blk: Block, height: int32): bool =
   # Skip scripts when assumevalid covers this block, OR when chainState is nil
   # (offline replay / chainDb-only mode — no UTXO set available for script eval).
   let skipScripts = (skipReason == ssrSkip) or (sm.chainState == nil)
-  let prevIdxApply = chainstate.BlockIndex(
+  let dbForApply = if sm.chainState != nil: sm.chainState.db else: sm.chainDb
+  # Build prevIndex for acceptBlock with a FULLY-POPULATED prev `header`.
+  #
+  # acceptBlock → validateBlock → contextualCheckBlockHeader computes the
+  # expected nBits via GetNextWorkRequired, which (for a non-retarget block)
+  # simply returns the PARENT block's `header.bits` (Core pow.cpp). A sentinel
+  # carrying only {hash, height} leaves `header` zero-initialised, so the
+  # expected nBits is computed as 0 and EVERY block fails "bad-diffbits".
+  # The parent header must come from a source that includes in-flight IBD
+  # state: `connectBlockIBD` batches the parent's block-index row and only
+  # flushes to RocksDB every IbdBatchFlushInterval blocks, so a plain
+  # `getBlockIndex` is stale for the freshly-connected parent.  The in-memory
+  # header chain is the correct source — it is fully synced ahead of block
+  # download, was reloaded from the block index on restart, and `processBlock`
+  # already requires this block to be in it before calling applyBlock.
+  # Fall back to the persisted block index (covers offline replay / any path
+  # where the header chain has not been populated).
+  var prevIdxApply = chainstate.BlockIndex(
     hash: blk.header.prevBlock,
     height: height - 1
   )
-  let dbForApply = if sm.chainState != nil: sm.chainState.db else: sm.chainDb
+  if height > 0:
+    let prevHeaderOpt = sm.headerChain.getHeader(blk.header.prevBlock)
+    if prevHeaderOpt.isSome:
+      prevIdxApply.header = prevHeaderOpt.get()
+      prevIdxApply.prevHash = prevHeaderOpt.get().prevBlock
+    else:
+      let prevIdxOpt = dbForApply.getBlockIndex(blk.header.prevBlock)
+      if prevIdxOpt.isSome:
+        prevIdxApply = prevIdxOpt.get()
+      else:
+        warn "applyBlock: prev block index not found — cannot validate nBits",
+             height = height, prevHash = $blk.header.prevBlock
+        return false
   # UTXO lookup: use chainState when available; noop stub otherwise (BIP-30
   # always passes with no UTXOs — equivalent to skipping BIP-30 when no DB).
   let csApply = sm.chainState
