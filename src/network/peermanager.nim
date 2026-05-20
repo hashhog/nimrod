@@ -695,38 +695,45 @@ proc startOutboundConnections*(pm: PeerManager) {.async.} =
     info "regtest mode: skipping automatic outbound connections"
     return
 
-  # First, try to connect to anchor peers
-  await pm.connectToAnchors()
+  # This proc runs as a detached background task (asyncSpawn from nimrod.nim):
+  # it MUST NOT let an exception escape, or asyncSpawn aborts the process.
+  # DNS resolution in particular can fail.  connectToPeerWithType already
+  # swallows per-peer connect errors internally.
+  try:
+    # First, try to connect to anchor peers
+    await pm.connectToAnchors()
 
-  # Resolve DNS seeds
-  let addresses = await pm.resolveDnsSeeds()
-  info "resolved addresses", count = addresses.len
+    # Resolve DNS seeds
+    let addresses = await pm.resolveDnsSeeds()
+    info "resolved addresses", count = addresses.len
 
-  # Connect to full-relay peers with netgroup diversity
-  for address in addresses:
-    if pm.outboundFullRelayCount >= pm.maxOutboundFullRelay:
-      break
+    # Connect to full-relay peers with netgroup diversity
+    for address in addresses:
+      if pm.outboundFullRelayCount >= pm.maxOutboundFullRelay:
+        break
 
-    # Skip if netgroup collision
-    if pm.hasNetGroupCollision(address):
-      debug "skipping address due to netgroup collision", address = address
-      continue
+      # Skip if netgroup collision
+      if pm.hasNetGroupCollision(address):
+        debug "skipping address due to netgroup collision", address = address
+        continue
 
-    let port = pm.params.defaultPort
-    discard await pm.connectToPeerWithType(address, port, pctFullRelay)
-    await sleepAsync(100)
+      let port = pm.params.defaultPort
+      discard await pm.connectToPeerWithType(address, port, pctFullRelay)
+      await sleepAsync(100)
 
-  # Fill remaining block-relay-only slots
-  for address in addresses:
-    if pm.outboundBlockRelayCount >= pm.maxOutboundBlockRelay:
-      break
+    # Fill remaining block-relay-only slots
+    for address in addresses:
+      if pm.outboundBlockRelayCount >= pm.maxOutboundBlockRelay:
+        break
 
-    if pm.hasNetGroupCollision(address):
-      continue
+      if pm.hasNetGroupCollision(address):
+        continue
 
-    let port = pm.params.defaultPort
-    discard await pm.connectToPeerWithType(address, port, pctBlockRelayOnly)
-    await sleepAsync(100)
+      let port = pm.params.defaultPort
+      discard await pm.connectToPeerWithType(address, port, pctBlockRelayOnly)
+      await sleepAsync(100)
+  except CatchableError as e:
+    error "outbound connection setup failed", error = e.msg
 
 proc tryEvictInbound(pm: PeerManager): Option[string] =
   ## Try to select an inbound peer to evict

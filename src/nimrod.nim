@@ -2341,16 +2341,31 @@ proc startNode*(config: NimrodConfig) {.async.} =
   info "starting P2P listener", port = config.p2pPort, bindAddr = config.bindAddr
   await state.peerManager.startListener(config.bindAddr, config.p2pPort)
 
-  # 9. Start outbound connections
-  info "connecting to peers"
-  await state.peerManager.startOutboundConnections()
-
-  # 10. Start sync loop
+  # 9. Start the sync loop and peer-manager main loop FIRST, as independent
+  #    background tasks.
+  #
+  #    These MUST be spawned before outbound connections are started.
+  #    startOutboundConnections() dials DNS-seed addresses serially, awaiting
+  #    each connect; an unreachable address can block for the full TCP connect
+  #    timeout, so filling all outbound slots can take many minutes.  When it
+  #    was `await`ed here (before syncLoop was spawned), a slow connection
+  #    phase meant syncLoop() was never started at all: the node connected to
+  #    peers but never sent a single `getheaders`, so it sat idle at its
+  #    restart height forever.  (mainnet incident 2026-05-20: nimrod stuck at
+  #    block 950146 — syncLoop never spawned.)
+  #
+  #    syncLoop polls peerManager for a sync peer every iteration, so it
+  #    correctly picks up peers as the background connection task fills slots.
+  #    Bitcoin Core runs outbound dialing in its own ThreadOpenConnections,
+  #    fully decoupled from chain sync — this mirrors that.
   info "starting sync"
   asyncSpawn state.syncManager.syncLoop()
-
-  # 11. Start peer manager main loop
   asyncSpawn state.peerManager.mainLoop()
+
+  # 10. Start outbound connections in the background.  It fills outbound slots
+  #     over time without blocking node startup or the sync loop above.
+  info "connecting to peers"
+  asyncSpawn state.peerManager.startOutboundConnections()
 
   # 11a. Startup ASMapHealthCheck (G16/G28 FIX-52).
   # Logs unique ASNs / mapped / unmapped across the initial known-address pool.
