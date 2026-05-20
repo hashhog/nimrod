@@ -1202,14 +1202,23 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   # to maximize download throughput (parallel download from multiple peers)
   let peers = sm.peerManager.getReadyPeers()
   if peers.len > 1 and sm.chainState != nil and sm.chainState.ibdMode:
-    let blocksPerPeer = max(1, inventory.len div peers.len)
+    # Cap per-peer in-flight requests at MaxBlocksPerPeer (= Bitcoin Core's
+    # MAX_BLOCKS_IN_TRANSIT_PER_PEER, 16).  A Core peer that receives a
+    # getdata with more than 16 block items still serves them, but holding
+    # > 16 blocks in flight to a single peer means one slow peer can stall
+    # the whole window; spreading evenly and capping mirrors Core's block
+    # scheduler.  Previously `blocksPerPeer = inventory.len div peers.len`
+    # was uncapped and the LAST peer was handed *all* the remaining blocks
+    # (`if i == peers.len - 1: inventory.len`), so a large window could
+    # dump 50+ blocks on one peer.
+    let blocksPerPeer = max(1, min(MaxBlocksPerPeer,
+                                   (inventory.len + peers.len - 1) div peers.len))
     var idx = 0
     var totalSent = 0
-    for i, p in peers:
+    for p in peers:
       if idx >= inventory.len:
         break
-      let endIdx = if i == peers.len - 1: inventory.len
-                   else: min(idx + blocksPerPeer, inventory.len)
+      let endIdx = min(idx + blocksPerPeer, inventory.len)
       let batch = inventory[idx ..< endIdx]
       if batch.len > 0:
         try:
@@ -1220,6 +1229,18 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
           for inv in batch:
             sm.requestedHashes.excl(BlockHash(inv.hash))
       idx = endIdx
+    # Any blocks beyond peers.len * blocksPerPeer were not requested this
+    # round (their hashes were optimistically added to requestedHashes and
+    # appended to blockQueue above); drop them from both so the next
+    # syncLoop iteration re-selects and requests them.
+    if idx < inventory.len:
+      for k in idx ..< inventory.len:
+        sm.requestedHashes.excl(BlockHash(inventory[k].hash))
+      # The un-requested hashes are the last (inventory.len - idx) entries
+      # appended to blockQueue this call; pop them back off.
+      for _ in idx ..< inventory.len:
+        if sm.blockQueue.len > 0:
+          discard sm.blockQueue.popLast()
     sm.pendingBlocks += totalSent
     sm.lastSyncTime = getTime()
     info "requesting blocks", count = totalSent, peers = peers.len,
@@ -1513,6 +1534,30 @@ proc isSynced*(sm: SyncManager): bool =
   ## Check if we're fully synchronized
   sm.chainTipHeight >= sm.headerTipHeight and
     sm.headerTipHeight >= 0
+
+proc isInitialBlockDownload*(sm: SyncManager): bool =
+  ## True while the node is still catching the block chain up to the
+  ## header chain — i.e. the equivalent of Bitcoin Core's
+  ## `ChainstateManager::IsInitialBlockDownload()` for the purposes of
+  ## the P2P layer.
+  ##
+  ## During IBD nimrod MUST NOT solicit loose mempool transactions: a peer
+  ## announces hundreds of mempool txs per `inv`, and firing a `getdata`
+  ## for every one floods the peer's send queue.  That backpressure
+  ## (`CNode::fPauseSend`) makes the peer's `ProcessGetData` break out of
+  ## its tx-serving loop *before* it reaches the single block item that is
+  ## queued behind the tx flood in the same per-peer getdata FIFO — so the
+  ## block we actually need is never served and block download stalls
+  ## forever (mainnet incident 2026-05-20: chainTip stuck at 950147,
+  ## `pendingBlocks` permanently full, sync timing out every 60 s).
+  ##
+  ## Bitcoin Core gates the very same path: net_processing.cpp's INV
+  ## handler only calls `AddTxAnnouncement` (which leads to a tx getdata)
+  ## inside `if (!m_chainman.IsInitialBlockDownload())`.  Block invs are
+  ## still processed during IBD; only the tx-getdata path is suppressed.
+  ##
+  ## A node with no headers yet (headerTipHeight < 0) is treated as IBD.
+  sm.headerTipHeight < 0 or sm.chainTipHeight < sm.headerTipHeight
 
 proc startHeaderSync*(sm: SyncManager) {.async.} =
   ## Start header synchronization

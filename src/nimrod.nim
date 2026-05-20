@@ -892,12 +892,26 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     # Request blocks we don't have
     var blockInvs: seq[InvVector]
     var txInvs: seq[InvVector]
+    # During IBD, do NOT solicit loose mempool transactions.  Each peer
+    # announces hundreds of mempool txs per `inv`; firing a `getdata` for
+    # every one floods the peer's send buffer, and that backpressure stalls
+    # the peer's getdata FIFO *before* it reaches the block we actually
+    # need (which is queued behind the tx flood) — block download then
+    # never makes progress.  Mirrors Bitcoin Core net_processing.cpp, whose
+    # INV handler only requests txs inside `if (!IsInitialBlockDownload())`.
+    # Block invs are still processed below regardless of IBD state.
+    let inIBD = state.syncManager != nil and
+                state.syncManager.isInitialBlockDownload()
     for item in msg.invItems:
       if item.invType == invBlock or item.invType == invWitnessBlock:
         # Request as witness block for segwit support
         blockInvs.add(InvVector(invType: invWitnessBlock, hash: item.hash))
       elif item.invType == invTx or item.invType == invWitnessTx or
            item.invType == invWtx:
+        # Skip all tx-announcement handling while still catching up — see
+        # the `inIBD` comment above.
+        if inIBD:
+          continue
         # BIP-339 per-peer inv type filter.
         # wtxid-relay peers send invWtx (MSG_WTX=5); ignore invTx from them.
         # Legacy peers send invTx (MSG_TX=1); ignore invWtx from them.
