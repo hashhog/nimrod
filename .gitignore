@@ -81,6 +81,7 @@ tests/test_fix68_bip125_rpc
 tests/test_w122_codec_stress
 tests/test_w162_genesis_presync
 tests/test_w163_header_chain_reload
+tests/test_validateblock_ibd_utxo
 src/mempool/cluster
 src/rpc/rest
 

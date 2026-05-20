@@ -189,6 +189,12 @@ type
     cfHandles: array[ColumnFamily, RocksDbColumnFamilyHandle]
     dbOpts: RocksDbOptionsPtr
     writeOpts: RocksDbWriteOptionsPtr
+    syncWriteOpts: RocksDbWriteOptionsPtr
+      ## A SECOND write-options handle with WAL enabled + sync=1, used by
+      ## `writeSynced`. The primary `writeOpts` may have its WAL disabled mid-
+      ## IBD for speed (`disableWAL`); `syncWriteOpts` is never mutated, so the
+      ## periodic IBD chainstate checkpoint can be made atomically crash-
+      ## durable even while WAL is globally off. See `writeSynced`.
     readOpts: RocksDbReadOptionsPtr
     blockCache: RocksDbCachePtr
     bloomFilter: RocksDbFilterPolicyPtr
@@ -315,6 +321,20 @@ proc openDatabase*(path: string, config: DatabaseConfig = defaultDbConfig()): Da
     rocksdb_writeoptions_set_sync(result.writeOpts, 0)
     rocksdb_writeoptions_disable_WAL(result.writeOpts, 0)  # Keep WAL for durability
 
+  # Dedicated sync write options — WAL enabled + sync=1, never mutated. Used by
+  # `writeSynced` so the IBD chainstate checkpoint (`flushIBDBatch`) is written
+  # as ONE atomically-durable multi-CF operation even when the primary
+  # `writeOpts` has had its WAL disabled for IBD throughput. Without this the
+  # only durability mechanism during IBD was a per-column-family memtable flush
+  # (`flushAllColumnFamilies`) whose `rocksdb_flush_cf` calls are NOT mutually
+  # atomic: a crash after the UTXO CF flushed but before the meta (chain-tip)
+  # CF flushed would leave the on-disk tip pointer inconsistent with the
+  # on-disk UTXO set. Mirrors Bitcoin Core's CCoinsViewDB::BatchWrite, whose
+  # final batch (carrying DB_BEST_BLOCK) is written synchronously.
+  result.syncWriteOpts = rocksdb_writeoptions_create()
+  rocksdb_writeoptions_set_sync(result.syncWriteOpts, 1)
+  rocksdb_writeoptions_disable_WAL(result.syncWriteOpts, 0)
+
   # Read options
   result.readOpts = rocksdb_readoptions_create()
   rocksdb_readoptions_set_verify_checksums(result.readOpts, 0)  # Skip checksums for speed
@@ -395,6 +415,9 @@ proc close*(db: Database) =
   if db.writeOpts != nil:
     rocksdb_writeoptions_destroy(db.writeOpts)
     db.writeOpts = nil
+  if db.syncWriteOpts != nil:
+    rocksdb_writeoptions_destroy(db.syncWriteOpts)
+    db.syncWriteOpts = nil
   if db.dbOpts != nil:
     rocksdb_options_destroy(db.dbOpts)
     db.dbOpts = nil
@@ -512,6 +535,20 @@ proc delete*(batch: WriteBatch, key: openArray[byte]) =
 proc write*(db: Database, batch: WriteBatch) =
   var err: cstring = nil
   rocksdb_write(db.db, db.writeOpts, batch.batch, addr err)
+  checkError(err)
+
+proc writeSynced*(db: Database, batch: WriteBatch) =
+  ## Apply `batch` atomically AND crash-durably: WAL enabled + fsync, via the
+  ## dedicated `syncWriteOpts` handle, regardless of whether the primary
+  ## `writeOpts` currently has its WAL disabled for IBD throughput.
+  ##
+  ## RocksDB applies a multi-column-family WriteBatch atomically across all
+  ## CFs; with sync=1 the WAL record is fsync'd before return, so the whole
+  ## batch survives a crash as a unit. This is the durability primitive the
+  ## periodic IBD chainstate checkpoint needs so the chain-tip pointer and the
+  ## UTXO-set mutations can never be persisted out of step with each other.
+  var err: cstring = nil
+  rocksdb_write(db.db, db.syncWriteOpts, batch.batch, addr err)
   checkError(err)
 
 proc clear*(batch: WriteBatch) =

@@ -100,6 +100,8 @@ import ./test_bip66
 import ./test_mempool_eviction_w86
 import ./test_disconnect_block
 import ./test_connect_block_w93
+import ./test_validateblock_ibd_utxo
+import ./test_ibd_durability
 import ./test_w117_proxy_wireup
 import ./test_w135_standardness
 

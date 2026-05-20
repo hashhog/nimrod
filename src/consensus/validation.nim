@@ -1266,9 +1266,30 @@ proc validateBlock*(
   utxos: ChainDb,
   params: ConsensusParams,
   checkScripts: bool = true,
-  checkPow: bool = true
+  checkPow: bool = true,
+  getUtxoOverride: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} = nil
 ): ValidationResult[void] =
   ## Full block validation per Bitcoin consensus rules
+  ##
+  ## `getUtxoOverride` — UTXO-set lookup proc. When non-nil it is used for ALL
+  ## UTXO-set reads (input existence, fee sum, sigop counting, BIP-68 sequence
+  ## locks) in place of the raw `ChainDb.getUtxo`. The `utxos: ChainDb` arg is
+  ## still used for block-index/header reads (`getMtpForHeight`,
+  ## `contextualCheckBlockHeader`) — those have their own IBD-shadow in
+  ## `ChainDb.ibdIndexByHash` / `ibdIndexByHeight` and so are correct mid-IBD.
+  ##
+  ## This override exists because the UTXO set has NO equivalent DB shadow:
+  ## during IBD `connectBlockIBD` stages freshly-created UTXOs only in
+  ## `ChainState.utxoCache` + the unflushed `ibdBatch` (flushed to RocksDB
+  ## every 2000 blocks). A bare `ChainDb.getUtxo` cannot see them, so a block
+  ## that spends an output created by an as-yet-unflushed recent block fails
+  ## with "transaction inputs missing" even though the UTXO genuinely exists.
+  ## `acceptBlock` passes `ChainState.getUtxo` (cache → DB) here so block
+  ## validation sees the SAME authoritative UTXO view that `verifyScripts`
+  ## and `connectBlockIBD` use. Mainnet incident: nimrod restarted at tip
+  ## 950148, IBD-connected 950149 into the cache only, then rejected 950150
+  ## (which spends 365 outputs created in 950149) — a deterministic false
+  ## reject, not chainstate corruption.
 
   # Step 1a: non-contextual header checks (PoW hash, time-too-new, prevHash).
   # Core CheckBlockHeader (validation.cpp:4030-4049).
@@ -1383,11 +1404,16 @@ proc validateBlock*(
   for i in 1 ..< blk.txs.len:
     let tx = blk.txs[i]
 
-    # Create UTXO lookup that includes intra-block UTXOs
+    # Create UTXO lookup that includes intra-block UTXOs.
+    # Falls through to `getUtxoOverride` (cache-aware ChainState.getUtxo, when
+    # supplied by acceptBlock) so mid-IBD blocks see UTXOs created by
+    # not-yet-flushed recent blocks; otherwise the raw ChainDb (DB-only).
     proc lookupUtxo(op: OutPoint): Option[UtxoEntry] =
       let key = $array[32, byte](op.txid) & ":" & $op.vout
       if key in intraBlockUtxos:
         return some(intraBlockUtxos[key])
+      if getUtxoOverride != nil:
+        return getUtxoOverride(op)
       utxos.getUtxo(op)
 
     let txResult = validateTransaction(tx, lookupUtxo, height, params, intraBlockUtxos)
@@ -1965,10 +1991,18 @@ proc acceptBlock*(
   # value ≤ subsidy + fees, IsFinalTx per transaction, witness commitment).
   # checkScripts=false: script execution is handled separately in step 4.
   # checkPow forwarded: validateBlock → validateBlockHeader also gates PoW.
+  #
+  # getUtxoOverride=getUtxo: feed validateBlock the SAME cache-aware UTXO
+  # lookup that step 4 (verifyScripts) and connectBlockIBD use. Without this,
+  # validateBlock's UTXO-set reads (input existence / fees / sigops / BIP-68)
+  # hit the raw ChainDb, missing UTXOs that mid-IBD `connectBlockIBD` staged
+  # only in ChainState.utxoCache — a false "transaction inputs missing"
+  # reject for any block spending a not-yet-flushed recent output.
   let height = prevIndex.height + 1
   let validateResult = validateBlock(blk, prevIndex, db, params,
                                      checkScripts = false,
-                                     checkPow = checkPow)
+                                     checkPow = checkPow,
+                                     getUtxoOverride = getUtxo)
   if not validateResult.isOk:
     return validateResult
 
