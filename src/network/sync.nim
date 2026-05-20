@@ -39,6 +39,16 @@ type
     tipHeight*: int32
     totalWork*: array[32, byte]  ## Cumulative work of the chain
 
+  HeaderBatchRouting* = enum
+    ## Outcome of classifying an incoming `headers` batch — mirrors the
+    ## branching of Bitcoin Core's ProcessHeadersMessage (net_processing.cpp).
+    hbrUnconnecting   ## headers[0].prevBlock not in our header chain (BIP-130
+                      ## announcement / transient reorg) — re-request, count
+    hbrAntiDoS        ## headers connect, but claimed work < anti-DoS
+                      ## threshold — must go through the PRESYNC pipeline
+    hbrDirect         ## headers connect AND already carry enough work
+                      ## (or threshold is zero / regtest) — validate directly
+
   ## Statistics for header presync (anti-DoS tracking)
   HeadersPresyncStats* = object
     work*: UInt256              ## Total verified work accumulated
@@ -489,7 +499,17 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     headersPresyncStats: initTable[int64, HeadersPresyncStats](),
     presyncBestPeer: -1,
     presyncBestWork: initUInt256(),
-    minimumChainWork: initUInt256(),  # Will be set from chainstate
+    # Anti-DoS work threshold.  Core's GetAntiDoSWorkThreshold() returns
+    # max(near_chaintip_work, m_chainman.MinimumChainWork()), and
+    # MinimumChainWork() defaults to GetConsensus().nMinimumChainWork
+    # (validation.cpp:6130).  Wiring this from params is REQUIRED: with a
+    # zero threshold, tryLowWorkHeadersSync() always sees
+    # totalWork >= threshold and never starts a PRESYNC sync, so the entire
+    # anti-DoS pipeline is dead code and a from-genesis batch falls through
+    # to direct validation with minPowChecked=false → "too-little-chainwork"
+    # → honest peer banned.  (W97-followup: this field was left zero with a
+    # stale "Will be set from chainstate" comment but nothing ever set it.)
+    minimumChainWork: initUInt256(params.minimumChainWork),
     receivedBlocks: initTable[int32, Block](),
     requestedHashes: initHashSet[BlockHash](),
     unconnectingHeaders: initTable[int64, int](),
@@ -765,6 +785,74 @@ proc cleanupPeerHeadersSync*(sm: SyncManager, peerId: int64) =
         sm.presyncBestWork = stats.work
         sm.presyncBestPeer = pid
 
+proc classifyHeaderBatch*(sm: SyncManager,
+                          headers: seq[BlockHeader]): tuple[
+                            routing: HeaderBatchRouting,
+                            connectHeight: int32,
+                            connectHash: BlockHash,
+                            connectBits: uint32,
+                            connectWork: UInt256] =
+  ## Decide how an incoming `headers` batch must be routed — the pure,
+  ## synchronous core of `handleHeaders`' anti-DoS branching.
+  ##
+  ## Mirrors Bitcoin Core ProcessHeadersMessage / TryLowWorkHeadersSync
+  ## (net_processing.cpp).  Core's structure is: look up
+  ## `headers[0].hashPrevBlock` in the block index — call that
+  ## `chain_start_header` — and if it exists, ALWAYS run TryLowWorkHeadersSync
+  ## against it.  Crucially, Core does NOT special-case "headers connect to
+  ## the tip": a from-genesis sync has `chain_start_header == genesis` and
+  ## still goes through the anti-DoS pipeline.
+  ##
+  ## The pre-fix nimrod routing gated the whole anti-DoS path behind
+  ## `headers[0].prevBlock != headerTip`, so a from-genesis batch (prevBlock
+  ## == genesis == our only header) skipped PRESYNC entirely and was
+  ## validated directly with minPowChecked=false → rejected with
+  ## "too-little-chainwork" → honest peer banned.  This helper removes that
+  ## special case: the connection point is found by a plain `byHash` lookup
+  ## that works for the tip and for any earlier branch point alike.
+  ##
+  ## Returns the routing decision plus the connection point (`chain_start`)
+  ## that the caller passes to `tryLowWorkHeadersSync`.
+  result.connectHeight = -1
+  if headers.len == 0:
+    result.routing = hbrDirect
+    return
+
+  let firstPrev = headers[0].prevBlock
+
+  # Core: chain_start_header = LookupBlockIndex(headers[0].hashPrevBlock).
+  # The header chain's byHash map IS our in-memory block index for headers.
+  let connectIdx = sm.headerChain.byHash.getOrDefault(firstPrev, -1)
+  if connectIdx < 0:
+    # headers_connect_blockindex == false — BIP-130 announcement or a
+    # transient reorg.  Caller applies the unconnecting-headers counter.
+    result.routing = hbrUnconnecting
+    return
+
+  result.connectHeight = int32(connectIdx)
+  result.connectHash = firstPrev
+  result.connectBits = sm.headerChain.headers[connectIdx].bits
+
+  # Cumulative work up to (and including) the connection point.  Core reads
+  # chain_start_header->nChainWork directly; nimrod's header chain does not
+  # cache per-index chainwork, so it is summed here.
+  var startWork = initUInt256()
+  for i in 0 .. connectIdx:
+    startWork = startWork + headerssync.getBlockProof(sm.headerChain.headers[i])
+  result.connectWork = startWork
+
+  # Core TryLowWorkHeadersSync: total_work = chain_start.nChainWork +
+  # CalculateClaimedHeadersWork(headers); if total_work < GetAntiDoSWorkThreshold()
+  # the batch must go through the PRESYNC pipeline.
+  let claimedWork = calculateClaimedHeadersWork(headers)
+  let totalWork = startWork + claimedWork
+  let threshold = sm.getAntiDoSWorkThreshold()
+  if totalWork < threshold:
+    result.routing = hbrAntiDoS
+  else:
+    # Enough work already (or threshold == 0 on regtest): validate directly.
+    result.routing = hbrDirect
+
 proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
   ## Request headers from peer using getheaders message
   let locator = sm.buildBlockLocator()
@@ -825,71 +913,85 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
             await peer.sendGetHeaders(locator, BlockHash(default(array[32, byte])))
       return
     # Otherwise, fall through to normal processing with validated headers
-  else:
-    # Check if we need to start a new low-work header sync
-    # This happens when headers don't connect to our best chain
-    # and have low claimed work
+  elif headersToProcess.len > 0:
+    # No active low-work sync for this peer.  Classify the batch exactly as
+    # Bitcoin Core's ProcessHeadersMessage does: find the connection point
+    # (`chain_start_header`) and, if the chain connects, run the anti-DoS
+    # decision against it.  The connection point may be our tip OR an
+    # earlier branch point — Core does NOT special-case the tip, and
+    # neither does classifyHeaderBatch.  A from-genesis sync therefore
+    # enters the PRESYNC pipeline instead of being validated directly with
+    # minPowChecked=false (which rejected the height-1 header with
+    # "too-little-chainwork" and banned the honest peer).
+    let cls = sm.classifyHeaderBatch(headersToProcess)
 
-    # Find where headers connect to our chain
-    if headersToProcess.len > 0:
-      let firstHeader = headersToProcess[0]
+    case cls.routing
+    of hbrUnconnecting:
+      # headers[0].prevBlock not in our header chain.  Bitcoin Core
+      # (net_processing.cpp::ProcessHeadersMessage) tolerates up to
+      # MaxNumUnconnectingHeadersMsgs=10 successive unconnecting
+      # messages before banning.  Pre-fix, nimrod immediately
+      # called misbehavingPeer(20)+ban after a few hits, dropping
+      # honest peers caught in transient reorgs.  See
+      # CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+      # (Pattern B).
+      let pid = getPeerId(peer)
+      sm.unconnectingHeaders[pid] = sm.unconnectingHeaders.getOrDefault(pid, 0) + 1
+      let count = sm.unconnectingHeaders[pid]
+      if count > MaxNumUnconnectingHeadersMsgs:
+        warn "peer exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS, banning",
+             peer = $peer, count = count, max = MaxNumUnconnectingHeadersMsgs
+        sm.peerManager.misbehavingPeer(peer, 20, "too many unconnecting headers")
+        sm.unconnectingHeaders.del(pid)
+        return
+      # Under threshold: do NOT ban.  Re-issue getheaders so the
+      # peer can find a common ancestor (Core's
+      # FindForkInGlobalIndex behavior).
+      info "unconnecting headers from peer, re-requesting",
+           peer = $peer, count = count, max = MaxNumUnconnectingHeadersMsgs,
+           prevBlock = $headersToProcess[0].prevBlock
+      await sm.requestHeaders(peer)
+      return
 
-      # Check if headers connect directly to our tip
-      if firstHeader.prevBlock != sm.headerTip and sm.headerTipHeight >= 0:
-        # Headers don't connect to tip - check if they branch from our chain
-        let prevHashOpt = sm.headerChain.getHeader(firstHeader.prevBlock)
-
-        if prevHashOpt.isNone:
-          # Headers don't connect to any known block.  Bitcoin Core
-          # (net_processing.cpp::ProcessHeadersMessage) tolerates up to
-          # MaxNumUnconnectingHeadersMsgs=10 successive unconnecting
-          # messages before banning.  Pre-fix, nimrod immediately
-          # called misbehavingPeer(20)+ban after a few hits, dropping
-          # honest peers caught in transient reorgs.  See
-          # CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
-          # (Pattern B).
-          let pid = getPeerId(peer)
-          sm.unconnectingHeaders[pid] = sm.unconnectingHeaders.getOrDefault(pid, 0) + 1
-          let count = sm.unconnectingHeaders[pid]
-          if count > MaxNumUnconnectingHeadersMsgs:
-            warn "peer exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS, banning",
-                 peer = $peer, count = count, max = MaxNumUnconnectingHeadersMsgs
-            sm.peerManager.misbehavingPeer(peer, 20, "too many unconnecting headers")
-            sm.unconnectingHeaders.del(pid)
-            return
-          # Under threshold: do NOT ban.  Re-issue getheaders so the
-          # peer can find a common ancestor (Core's
-          # FindForkInGlobalIndex behavior).
-          info "unconnecting headers from peer, re-requesting",
-               peer = $peer, count = count, max = MaxNumUnconnectingHeadersMsgs,
-               prevBlock = $firstHeader.prevBlock
-          await sm.requestHeaders(peer)
+    of hbrAntiDoS:
+      # Headers connect but claimed work is below the anti-DoS threshold —
+      # route through the PRESYNC/REDOWNLOAD pipeline.  tryLowWorkHeadersSync
+      # recomputes the same threshold internally and, when it starts a
+      # sync, sets headersToProcess to the headers it has cleared/validated.
+      if sm.tryLowWorkHeadersSync(peer, cls.connectHeight, cls.connectHash,
+                                  cls.connectBits, cls.connectWork,
+                                  headersToProcess):
+        # PRESYNC consumed the batch (or it was an incomplete low-work
+        # message).  Request more if the sync is still running.
+        if headersToProcess.len == 0:
+          if getPeerId(peer) in sm.peerHeadersSync:
+            let syncState = sm.peerHeadersSync[getPeerId(peer)]
+            if syncState.getState() != Done:
+              let locator = syncState.nextHeadersRequestLocator()
+              if locator.len > 0:
+                await peer.sendGetHeaders(locator, BlockHash(default(array[32, byte])))
           return
+        # tryLowWorkHeadersSync may also hand back PoW-validated headers
+        # for direct storage (the REDOWNLOAD output path); those have
+        # already cleared the work threshold.
+        minPowChecked = true
+      else:
+        # tryLowWorkHeadersSync returned false → the recomputed
+        # total_work >= threshold after all (degenerate race; classify and
+        # tryLowWork share the same threshold + no await separates them, so
+        # this is effectively unreachable).  Work is met → safe to validate
+        # directly, exactly Core's "TryLowWorkHeadersSync returned false"
+        # path which calls ProcessNewBlockHeaders with min_pow_checked=true.
+        minPowChecked = true
 
-        # Headers branch from an earlier point - check work threshold
-        let branchHeight = sm.headerChain.byHash.getOrDefault(firstHeader.prevBlock, -1)
-        if branchHeight >= 0:
-          let branchHeader = sm.headerChain.headers[branchHeight]
-          let branchHash = firstHeader.prevBlock
-
-          # Calculate work up to branch point
-          var branchWork = initUInt256()
-          for i in 0..branchHeight:
-            let w = headerssync.getBlockProof(sm.headerChain.headers[i])
-            branchWork = branchWork + w
-
-          # Try low-work sync if claimed work is below threshold
-          if sm.tryLowWorkHeadersSync(peer, int32(branchHeight), branchHash,
-                                       branchHeader.bits, branchWork, headersToProcess):
-            # Headers being processed through anti-DoS sync
-            if headersToProcess.len == 0:
-              # Request more headers through low-work sync
-              if getPeerId(peer) in sm.peerHeadersSync:
-                let syncState = sm.peerHeadersSync[getPeerId(peer)]
-                let locator = syncState.nextHeadersRequestLocator()
-                if locator.len > 0:
-                  await peer.sendGetHeaders(locator, BlockHash(default(array[32, byte])))
-              return
+    of hbrDirect:
+      # Headers connect AND already carry enough cumulative work to clear
+      # the anti-DoS threshold (Core's GetAntiDoSWorkThreshold).  This is
+      # the case Core handles by skipping TryLowWorkHeadersSync entirely
+      # and calling ProcessNewBlockHeaders with min_pow_checked=true.
+      # On regtest the threshold is zero, so every connecting batch lands
+      # here — matching the pre-W97 behaviour for regtest.
+      minPowChecked = true
 
   # Normal header processing (either direct or validated through anti-DoS)
   var accepted = 0
