@@ -271,72 +271,106 @@ proc fingerprint*(key: ExtendedKey): array[4, byte] =
 proc deriveChild*(parent: ExtendedKey, index: uint32): ExtendedKey =
   ## Derive child extended key from parent
   ## If index >= 0x80000000, it's a hardened derivation (requires private key)
+  ##
+  ## BIP-32 retry contract (W161 BUG-4): if libsecp rejects the IL+parent
+  ## tweak (because parse256(IL) >= n OR the resulting key is zero / the
+  ## point at infinity), the spec mandates "proceed with the next value
+  ## for i". We honour that here by looping on the requested child index
+  ## without crossing the hardened/unhardened boundary. Probability per
+  ## iteration is ~2^-127, so in practice the loop body runs once. See
+  ## bitcoin-core/src/key.cpp::CExtKey::Derive +
+  ## bitcoin-core/src/wallet/scriptpubkeyman.cpp::DescriptorScriptPubKeyMan::TopUp.
+  ##
+  ## BIP-32 depth invariant (W161 BUG-5): parent depth MUST be < 0xFF;
+  ## otherwise we would silently wrap to 0 and produce an xprv whose
+  ## serialised form claims depth=0 (a master-key marker), a fake-master
+  ## footgun. See bitcoin-core/src/key.cpp::CExtKey::Derive line 483.
+
+  # W161 BUG-5: depth-byte overflow guard. Core: `if (nDepth == 0xFF) return false`.
+  if parent.depth == 0xFF'u8:
+    raise newException(WalletError,
+      "BIP-32 max derivation depth (255) reached; cannot derive deeper child")
+
   let hardened = index >= HARDENED
 
   if hardened and not parent.isPrivate:
     raise newException(WalletError, "cannot derive hardened child from public key")
 
-  # Prepare data for HMAC
-  var data: seq[byte]
-  if hardened:
-    # Hardened: 0x00 || private key || index
-    data.add(0x00'u8)
-    data.add(@(parent.key))
-  else:
-    # Normal: public key || index
-    data.add(@(parent.publicKey))
+  # W161 BUG-4: loop on the requested child index per BIP-32 spec.
+  # Boundaries: hardened indexes live in [HARDENED, 2^32); unhardened in
+  # [0, HARDENED). Wrapping past either edge is a spec violation and must
+  # raise rather than silently cross into the other regime.
+  var curIndex = index
+  while true:
+    # Prepare data for HMAC
+    var data: seq[byte]
+    if hardened:
+      # Hardened: 0x00 || private key || index
+      data.add(0x00'u8)
+      data.add(@(parent.key))
+    else:
+      # Normal: public key || index
+      data.add(@(parent.publicKey))
 
-  # Add index (big-endian)
-  data.add(byte((index shr 24) and 0xff))
-  data.add(byte((index shr 16) and 0xff))
-  data.add(byte((index shr 8) and 0xff))
-  data.add(byte(index and 0xff))
+    # Add index (big-endian)
+    data.add(byte((curIndex shr 24) and 0xff))
+    data.add(byte((curIndex shr 16) and 0xff))
+    data.add(byte((curIndex shr 8) and 0xff))
+    data.add(byte(curIndex and 0xff))
 
-  # HMAC-SHA512
-  var hmacCtx: HMAC[sha512]
-  hmacCtx.init(parent.chainCode)
-  hmacCtx.update(data)
-  let output = hmacCtx.finish()
-  hmacCtx.clear()
+    # HMAC-SHA512
+    var hmacCtx: HMAC[sha512]
+    hmacCtx.init(parent.chainCode)
+    hmacCtx.update(data)
+    let output = hmacCtx.finish()
+    hmacCtx.clear()
 
-  result.depth = parent.depth + 1
-  result.parentFingerprint = fingerprint(parent)
-  result.childIndex = index
-  result.isPrivate = parent.isPrivate
+    # IL = left 32 bytes of HMAC output, used as the additive tweak for
+    # both CKD_priv and CKD_pub. libsecp's tweak_add primitives return
+    # None when parse256(IL) >= n OR the resulting key is invalid (zero
+    # seckey / point at infinity); on either rejection BIP-32 says
+    # "proceed with the next value for i".
+    var il: array[32, byte]
+    copyMem(addr il[0], addr output.data[0], 32)
 
-  # Right 32 bytes = new chain code
-  copyMem(addr result.chainCode[0], addr output.data[32], 32)
+    if parent.isPrivate:
+      # Private key derivation: child_key = (parent_key + IL) mod n.
+      # Mirrors bitcoin-core/src/key.cpp::CKey::Derive.
+      let tweaked = tweakSeckeyAdd(parent.key, il)
+      if tweaked.isSome:
+        result.depth = parent.depth + 1
+        result.parentFingerprint = fingerprint(parent)
+        result.childIndex = curIndex
+        result.isPrivate = parent.isPrivate
+        copyMem(addr result.chainCode[0], addr output.data[32], 32)
+        result.key = tweaked.get()
+        result.publicKey = derivePublicKey(result.key)
+        return
+    else:
+      # Public key derivation: child_pubkey = parent_pubkey + IL*G.
+      let tweakedPk = tweakPubkeyAdd(parent.publicKey, il)
+      if tweakedPk.isSome:
+        result.depth = parent.depth + 1
+        result.parentFingerprint = fingerprint(parent)
+        result.childIndex = curIndex
+        result.isPrivate = parent.isPrivate
+        copyMem(addr result.chainCode[0], addr output.data[32], 32)
+        result.publicKey = tweakedPk.get()
+        # No private key in xpub-only derivation; leave result.key zeroed
+        # (default array init) and isPrivate = false (already set above).
+        return
 
-  # IL = left 32 bytes of HMAC output, used as the additive tweak for both
-  # CKD_priv and CKD_pub. Per BIP-32: if IL >= n OR the resulting key is
-  # invalid (zero seckey / point-at-infinity pubkey), the caller MUST bump
-  # the child index and retry. libsecp's tweak_add primitives signal this
-  # by returning 0; we surface that as a `WalletError` so the caller (or
-  # any future retry loop) can react. Probability ~2^-127 — in practice
-  # unreachable, but consensus-correct callers must handle it.
-  var il: array[32, byte]
-  copyMem(addr il[0], addr output.data[0], 32)
-
-  if parent.isPrivate:
-    # Private key derivation: child_key = (parent_key + IL) mod n
-    # Implemented via libsecp256k1 secp256k1_ec_seckey_tweak_add (mirrors
-    # Bitcoin Core src/key.cpp::CKey::Derive).
-    let tweaked = tweakSeckeyAdd(parent.key, il)
-    if tweaked.isNone:
-      raise newException(WalletError,
-        "BIP-32 child key invalid (IL >= n or child == 0); bump index and retry")
-    result.key = tweaked.get()
-    result.publicKey = derivePublicKey(result.key)
-  else:
-    # Public key derivation: child_pubkey = parent_pubkey + IL*G
-    # Implemented via libsecp256k1 secp256k1_ec_pubkey_tweak_add.
-    let tweakedPk = tweakPubkeyAdd(parent.publicKey, il)
-    if tweakedPk.isNone:
-      raise newException(WalletError,
-        "BIP-32 child pubkey invalid (IL >= n or child == infinity); bump index and retry")
-    result.publicKey = tweakedPk.get()
-    # No private key available in xpub-only derivation; leave result.key zeroed
-    # (default array initialisation) and isPrivate = false (already set above).
+    # Libsecp rejected; bump curIndex per BIP-32 retry contract.
+    # Preserve hardened/unhardened semantics: do not cross the boundary.
+    if hardened:
+      if curIndex == high(uint32):
+        raise newException(WalletError,
+          "BIP-32 retry exhausted hardened index space (reached 2^32)")
+    else:
+      if curIndex == HARDENED - 1'u32:
+        raise newException(WalletError,
+          "BIP-32 retry would cross unhardened/hardened boundary (reached 2^31 - 1)")
+    curIndex = curIndex + 1'u32
 
 proc derivePathStr*(master: ExtendedKey, path: string): ExtendedKey =
   ## Derive key from path string like "m/44'/0'/0'/0/0"
