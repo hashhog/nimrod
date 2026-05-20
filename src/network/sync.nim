@@ -474,6 +474,81 @@ proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
 # SyncManager
 # =============================================================================
 
+proc loadHeaderChainFromDb*(chainDb: ChainDb,
+                            params: ConsensusParams): HeaderChain =
+  ## Reconstruct the in-memory header chain from the persisted block index.
+  ##
+  ## The header chain is otherwise NOT persisted: every restart re-initialised
+  ## it to genesis only (`tipHeight == 0`) even though the block chainstate was
+  ## hundreds of thousands of blocks ahead.  nimrod then had to re-sync every
+  ## header from genesis on each restart — a multi-hour operation that, on
+  ## mainnet, also tripped the W97/W162 anti-DoS path.  (See the long-standing
+  ## "TODO: Load header chain from database" this proc replaces.)
+  ##
+  ## The block index already stores, for every block on the active chain, the
+  ## full `BlockHeader` and the cumulative `totalWork` (see `BlockIndex` in
+  ## storage/chainstate.nim).  Walking height 0..bestHeight and copying those
+  ## headers in rebuilds the header chain exactly — no network round-trips, no
+  ## re-validation, and consistent with the block index by construction.
+  ##
+  ## Bitcoin Core does the equivalent in `BlockManager::LoadBlockIndex` /
+  ## `CChainState::LoadChainTip`: the block-tree (CBlockIndex map, headers
+  ## included) is loaded from disk on startup, never re-downloaded.
+  ##
+  ## On any inconsistency (a missing height->hash row, a missing BlockIndex, a
+  ## prevHash that does not link) the reload stops and returns whatever prefix
+  ## linked cleanly; the caller treats a short result as "re-sync the rest"
+  ## rather than failing startup.  A genesis-only chain is always a valid
+  ## fallback because the live header-sync path can rebuild forward from it.
+  let genesis = buildGenesisBlock(params)
+  let genesisHash = params.genesisBlockHash
+  result = initHeaderChain(genesis.header, genesisHash)
+
+  let bestHeight = chainDb.bestHeight
+  if bestHeight <= 0:
+    # Nothing beyond genesis to load.
+    return
+
+  var prevHash = genesisHash
+  var loaded: int32 = 0
+  for height in 1'i32 .. bestHeight:
+    let hashOpt = chainDb.getBlockHashByHeight(height)
+    if hashOpt.isNone:
+      warn "header-chain reload: missing height->hash, stopping",
+           height = height, loaded = loaded
+      break
+    let hash = hashOpt.get()
+
+    let idxOpt = chainDb.getBlockIndex(hash)
+    if idxOpt.isNone:
+      warn "header-chain reload: missing block index, stopping",
+           height = height, hash = $hash, loaded = loaded
+      break
+    let idx = idxOpt.get()
+
+    # The header must link onto the prefix we have already accepted.  A break
+    # in the chain means the index is inconsistent; stop and let the live
+    # header sync rebuild from the clean prefix.
+    if idx.header.prevBlock != prevHash:
+      warn "header-chain reload: prevHash mismatch, stopping",
+           height = height, hash = $hash, loaded = loaded
+      break
+
+    let arrayIdx = result.headers.len
+    result.headers.add(idx.header)
+    result.hashes.add(hash)
+    result.byHash[hash] = arrayIdx
+    result.tip = hash
+    result.tipHeight = height
+    # Use the cumulative work the block index already cached for this block
+    # (kept consistent with connectBlock); no need to re-sum per header.
+    result.totalWork = idx.totalWork
+    prevHash = hash
+    inc loaded
+
+  info "reloaded header chain from block index",
+       tipHeight = result.tipHeight, bestHeight = bestHeight, loaded = loaded
+
 proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
                      params: ConsensusParams,
                      chainState: ChainState = nil,
@@ -541,11 +616,19 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
       result.chainTip = params.genesisBlockHash
       result.headerTip = params.genesisBlockHash
 
-    # TODO: Load header chain from database
-    # For now, start fresh and re-sync headers
-    let genesis = buildGenesisBlock(params)
-    let genesisHash = params.genesisBlockHash
-    result.headerChain = initHeaderChain(genesis.header, genesisHash)
+    # Reload the header chain from the persisted block index instead of
+    # starting fresh at genesis.  Previously this was a "TODO: Load header
+    # chain from database" that left headerChain at tipHeight==0 — forcing a
+    # full from-genesis header re-sync on every restart and (on mainnet)
+    # tripping the W97/W162 anti-DoS path.  The block index already holds
+    # every header on the active chain, so this is a pure local reload.
+    result.headerChain = loadHeaderChainFromDb(chainDb, params)
+    # Keep the cheap headerTip/headerTipHeight summary fields consistent with
+    # whatever prefix actually linked (loadHeaderChainFromDb stops early on a
+    # corrupt index and returns the clean prefix; the live header sync then
+    # rebuilds forward from there).
+    result.headerTip = result.headerChain.tip
+    result.headerTipHeight = result.headerChain.tipHeight
 
 proc selectSyncPeer*(sm: SyncManager): Peer =
   ## Select the best peer for syncing (highest reported height)

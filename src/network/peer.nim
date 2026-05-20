@@ -22,6 +22,12 @@ const
   HandshakeTimeoutSec* = 60  # 60 seconds (Bitcoin Core compatible)
   PingTimeoutSec* = 30       # 30 seconds
   ReadTimeoutSec* = 120      # 2 minutes
+  # TCP connect() timeout for an outbound dial.  Without an explicit cap the
+  # connect falls back to the OS default (~127s on Linux), which is far too
+  # long: the outbound-connection loop dials addresses serially, so one dead
+  # peer stalls every subsequent dial for two minutes.  Bitcoin Core uses
+  # DEFAULT_CONNECT_TIMEOUT = 5000 ms (src/net.h); match it.
+  ConnectTimeoutSec* = 5
   MinProtocolVersion* = 70015'u32  # Minimum for witness support
   ScorePreHandshakeMessage* = 10'u32  # Misbehavior for pre-handshake messages
   ScoreDuplicateVersion* = 1'u32      # Misbehavior for duplicate version
@@ -232,7 +238,10 @@ proc connect*(peer: Peer): Future[bool] {.async.} =
         peer.proxyManager, peer.address, peer.port)
     else:
       let ta = initTAddress(peer.address, Port(peer.port))
-      peer.transport = await connect(ta)
+      # Cap the TCP connect at ConnectTimeoutSec.  Chronos `connect` otherwise
+      # inherits the OS connect timeout (~127s); a single unreachable address
+      # would then stall the serial outbound-dial loop for two minutes.
+      peer.transport = await connect(ta).wait(ctimer.seconds(ConnectTimeoutSec))
     peer.state = psConnected
     peer.lastSeen = stdtimes.getTime()
     info "connected to peer", peer = $peer,
