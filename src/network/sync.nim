@@ -13,7 +13,11 @@ import ./peermanager
 import ./messages
 import ./headerssync
 import ../primitives/[types, serialize, uint256]
-import ../consensus/[params, pow, validation, assumevalid]
+# The `assumevalid` module is no longer imported here: applyBlock and
+# processReceivedBlocks were migrated to the unified `acceptAndConnectBlock`
+# envelope, which computes the assumevalid skip-scripts decision internally
+# (validation.nim) instead of this path hand-rolling an AssumeValidContext.
+import ../consensus/[params, pow, validation]
 import ../storage/chainstate
 import ../storage/indexes/blockfilterindex
 import ../crypto/[hashing, secp256k1]
@@ -1277,116 +1281,48 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
            expected = $expectedPrev, got = $blk.header.prevBlock
       return false
 
-  # Validate block
-  let checkResult = checkBlock(blk, sm.params)
-  if not checkResult.isOk:
-    warn "invalid block", height = height, error = $checkResult.error
-    return false
-
-  # Unified consensus check pipeline (Core ProcessNewBlock parity):
-  # acceptBlock runs checkBlock → validateBlock → checkBip30 → verifyScripts
-  # in one place, eliminating the 3-entry-point hand-rolled-pipeline pattern.
-  # Reference: bitcoin-core/src/validation.cpp::Chainstate::ProcessNewBlock.
+  # ===========================================================================
+  # Unified block-acceptance + connect (Core ProcessNewBlock parity).
   #
-  # Assumevalid: use ancestor-check semantics (Bitcoin Core v28.0).
-  # The ancestor-check MUST query the block INDEX (sm.headerChain), not the
-  # active chain (sm.chainDb.getBlockHashByHeight).  Bitcoin Core's
-  # GetAncestor() walks block-index pindex pointers; it does not require the
-  # ancestor to be on the active chain.  During IBD we have header-synced past
-  # assumeValidHeight long before the active chain reaches it, so using the
-  # active-chain map would leave activeHashAtAssumeValidHeight empty, trip
-  # ssrHashNotInIndex, and force script verification when it should be skipped.
-  # See overnight-2026-04-13/NIMROD-MISSING-INPUT-DIAG.md.
+  # ARCHITECTURAL NOTE (supersedes the piecemeal 493bcd1 / W164 patch).
   #
-  # Note on parallel verifier: verifyScriptsParallel (src/perf/parallel_verify.nim)
-  # was wired here in b751f80 but reverted because it fails deterministically at
-  # mainnet block 821384.  Likely cause: hardcoded mainnetParams() in the verifier
-  # computes script flags without height-aware BIP activation (P2-OPT-ROUND-2
-  # parallel-verify-bug-001).  The module is retained for a future ROUND-3 pass.
-  var avCtxApply = AssumeValidContext(
-    blockHash: hash,
-    blockHeight: height,
-    assumeValidHeight: sm.params.assumeValidHeight,
-    bestHeaderHeight: sm.headerTipHeight,
-    bestHeaderChainWork: sm.headerChain.totalWork
-  )
-  avCtxApply.activeHashAtBlockHeight = sm.headerChain.getHashByHeight(height)
-  if sm.params.assumeValidHeight > 0:
-    avCtxApply.activeHashAtAssumeValidHeight =
-      sm.headerChain.getHashByHeight(sm.params.assumeValidHeight)
-  let skipReason = shouldSkipScripts(avCtxApply, sm.params)
-  # Skip scripts when assumevalid covers this block, OR when chainState is nil
-  # (offline replay / chainDb-only mode — no UTXO set available for script eval).
-  let skipScripts = (skipReason == ssrSkip) or (sm.chainState == nil)
-  let dbForApply = if sm.chainState != nil: sm.chainState.db else: sm.chainDb
-  # Build prevIndex for acceptBlock with a FULLY-POPULATED prev `header`.
+  # This IBD path used to hand-build the `prevIndex` it fed to `acceptBlock`
+  # as a sentinel carrying only {hash, height}. That zero-initialised the
+  # parent `header`, which broke EVERY contextual check that reads it:
+  #   - 493bcd1 patched `prevIndex.header` (from sm.headerChain) ONLY for the
+  #     bad-diffbits gate, leaving the rest of the contextual surface exposed.
+  #   - W164-followup: mainnet block 950149 then failed "bad-txns-nonfinal"
+  #     because the BIP-113 finality cutoff (validateBlock) and the
+  #     time-too-old gate (contextualCheckBlockHeader) call getMtpForHeight,
+  #     which walked `ChainDb` readers that were STALE for the unflushed IBD
+  #     batch window — producing a too-low MTP and a false non-final verdict.
   #
-  # acceptBlock → validateBlock → contextualCheckBlockHeader computes the
-  # expected nBits via GetNextWorkRequired, which (for a non-retarget block)
-  # simply returns the PARENT block's `header.bits` (Core pow.cpp). A sentinel
-  # carrying only {hash, height} leaves `header` zero-initialised, so the
-  # expected nBits is computed as 0 and EVERY block fails "bad-diffbits".
-  # The parent header must come from a source that includes in-flight IBD
-  # state: `connectBlockIBD` batches the parent's block-index row and only
-  # flushes to RocksDB every IbdBatchFlushInterval blocks, so a plain
-  # `getBlockIndex` is stale for the freshly-connected parent.  The in-memory
-  # header chain is the correct source — it is fully synced ahead of block
-  # download, was reloaded from the block index on restart, and `processBlock`
-  # already requires this block to be in it before calling applyBlock.
-  # Fall back to the persisted block index (covers offline replay / any path
-  # where the header chain has not been populated).
-  var prevIdxApply = chainstate.BlockIndex(
-    hash: blk.header.prevBlock,
-    height: height - 1
-  )
-  if height > 0:
-    let prevHeaderOpt = sm.headerChain.getHeader(blk.header.prevBlock)
-    if prevHeaderOpt.isSome:
-      prevIdxApply.header = prevHeaderOpt.get()
-      prevIdxApply.prevHash = prevHeaderOpt.get().prevBlock
-    else:
-      let prevIdxOpt = dbForApply.getBlockIndex(blk.header.prevBlock)
-      if prevIdxOpt.isSome:
-        prevIdxApply = prevIdxOpt.get()
-      else:
-        warn "applyBlock: prev block index not found — cannot validate nBits",
-             height = height, prevHash = $blk.header.prevBlock
-        return false
-  # UTXO lookup: use chainState when available; noop stub otherwise (BIP-30
-  # always passes with no UTXOs — equivalent to skipping BIP-30 when no DB).
-  let csApply = sm.chainState
-  let utxoForApply = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
-    if csApply == nil: return none(UtxoEntry)
-    try: csApply.getUtxo(op)
-    except: none(UtxoEntry)
-  try:
-    {.gcsafe.}:
-      let cryptoApply = newCryptoEngine()
-      let acceptResultApply = acceptBlock(blk, prevIdxApply, dbForApply, sm.params,
-                                          skipScripts = skipScripts,
-                                          checkPow = false,  # PoW already checked by checkBlock above
-                                          getUtxo = utxoForApply,
-                                          crypto = cryptoApply)
-      if not acceptResultApply.isOk:
-        warn "block failed consensus checks (IBD applyBlock)", height = height,
-             error = $acceptResultApply.error
-        if acceptResultApply.error == veScriptVerifyFailed:
-          warn "script verification failed", height = height,
-               error = $acceptResultApply.error, txCount = blk.txs.len,
-               hasWitness = (blk.txs.len > 1 and blk.txs[1].witnesses.len > 0)
-          if sm.failedBlockHeight == height:
-            sm.failedBlockRetries += 1
-          else:
-            sm.failedBlockHeight = height
-            sm.failedBlockRetries = 1
-        return false
-  except Exception as e:
-    warn "block consensus check error (IBD applyBlock)", height = height, error = e.msg
-    return false
-
-  # Apply block to chainstate
-  # Use IBD fast path when catching up (skips undo data, batches writes)
+  # The architectural fix has two halves and is "fix it once", not whack-a-
+  # mole on individual fields:
+  #   (1) ChainDb now keeps an unflushed-IBD block-index shadow
+  #       (ibdIndexByHash / ibdIndexByHeight). `getBlockIndex` and
+  #       `getBlockHashByHeight` consult it, so EVERY contextual check
+  #       (diffbits getAncestor walk, getMtpForHeight, BIP-94) reads correct
+  #       data mid-IBD regardless of how prevIndex was obtained.
+  #   (2) This path no longer hand-builds prevIndex. It routes through
+  #       `acceptAndConnectBlock` — the SAME unified envelope every other
+  #       entry point (reindex, mining, submitblock) uses — which looks
+  #       prevIndex up from the DB exactly once, runs the full
+  #       checkBlock -> validateBlock (contextualCheckBlockHeader +
+  #       contextualCheckBlock) -> checkBip30 -> verifyScripts envelope, and
+  #       connects via connectBlockIBD/connectBlock.
+  #
+  # Result: the IBD path validates blocks with byte-identical context-
+  # correctness as reindex/mining/submitblock. There is no IBD-specific
+  # context-construction code left to drift.
+  #
+  # The `chainState == nil` offline-replay path keeps a direct `acceptBlock`
+  # call below: `acceptAndConnectBlock` requires a live `var ChainState`
+  # (UTXO set) which offline replay does not have.
+  # ===========================================================================
   if sm.chainState != nil:
+    # --- IBD mode transition (decide BEFORE connect; acceptAndConnectBlock
+    #     honours cs.ibdMode when choosing connectBlockIBD vs connectBlock). ---
     let blocksRemaining = sm.headerTipHeight - height
     # Use IBD fast path whenever more than a handful of blocks behind.
     # The old threshold of 1000 caused normal-sync (inv-based, ~1000 blk/hr)
@@ -1394,23 +1330,20 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
     # < 1000) instead of the much faster IBD batch mode (~2000-5000 blk/hr).
     # See wave31-2026-04-16/CAMLCOIN-NIMROD-GRADUATION.md Bug #3.
     let isIBD = blocksRemaining > 10
-
-    # Enter IBD mode if catching up and not already in IBD
     if isIBD and not sm.chainState.ibdMode:
       sm.chainState.startIBD()
       info "entering IBD mode for block sync", height = height,
            remaining = blocksRemaining
-
-    # Exit IBD mode when nearly caught up
     if not isIBD and sm.chainState.ibdMode:
       sm.chainState.stopIBD()
       info "exiting IBD mode, switching to normal sync", height = height
 
-    # Pre-generate undo BEFORE the connect mutates the UTXO cache.  The
-    # filter index needs spent-output scriptPubKeys (BIP-158) which the
-    # IBD fast path does not write to disk; resolving them after-the-fact
-    # would miss anything already deleted from the cache.  Cheap: a few
-    # cache/DB lookups already done in the upcoming connect.
+    # Pre-generate undo BEFORE the connect mutates the UTXO cache. The filter
+    # index needs spent-output scriptPubKeys (BIP-158) which the IBD fast path
+    # does not write to disk; resolving them after-the-fact would miss
+    # anything already deleted from the cache. generateBlockUndo only READS
+    # UTXOs, so it is correct to run it before acceptAndConnectBlock (which
+    # does the accept + connect). Cheap: a few cache/DB lookups.
     var undoForFilter = chainstate.BlockUndo()
     let captureUndo = sm.filterIndex != nil and sm.filterIndex.enabled
     if captureUndo:
@@ -1421,12 +1354,39 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
       except Exception:
         undoForFilter = chainstate.BlockUndo()
 
-    let connectResult = if sm.chainState.ibdMode:
-                          sm.chainState.connectBlockIBD(blk, height)
-                        else:
-                          sm.chainState.connectBlock(blk, height)
-    if not connectResult.isOk:
-      warn "failed to connect block to chainstate", error = $connectResult.error
+    # Full envelope: checkBlock -> validateBlock (contextualCheckBlockHeader
+    # + contextualCheckBlock incl. BIP-113 finality) -> checkBip30 ->
+    # verifyScripts (assumevalid-gated) -> connectBlockIBD / connectBlock.
+    var acceptOk = true
+    var acceptErr = ""
+    try:
+      {.gcsafe.}:
+        let cryptoApply = newCryptoEngine()
+        let res = acceptAndConnectBlock(sm.chainState, blk, height,
+                                        bsIBD, cryptoApply)
+        if not res.isOk:
+          acceptOk = false
+          acceptErr = res.error
+    except Exception as e:
+      acceptOk = false
+      acceptErr = e.msg
+    if not acceptOk:
+      warn "block failed consensus checks (IBD applyBlock)", height = height,
+           error = acceptErr
+      # Script-verify failure retry tracking (unchanged behaviour): a script
+      # failure mid-IBD is often a transient missing-input race, retried by
+      # the caller. acceptAndConnectBlock prefixes "acceptBlock rejected: "
+      # onto the ValidationError string; veScriptVerifyFailed stringifies to
+      # "script verification failed", so the substring match identifies it.
+      if "script verification failed" in acceptErr:
+        warn "script verification failed", height = height,
+             error = acceptErr, txCount = blk.txs.len,
+             hasWitness = (blk.txs.len > 1 and blk.txs[1].witnesses.len > 0)
+        if sm.failedBlockHeight == height:
+          sm.failedBlockRetries += 1
+        else:
+          sm.failedBlockHeight = height
+          sm.failedBlockRetries = 1
       return false
 
     # Populate BIP-157 basic block-filter index (no-op when nil/disabled).
@@ -1439,6 +1399,39 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
       except Exception:
         discard
   else:
+    # --- Offline replay (chainState == nil): no live UTXO set. Run the full
+    #     acceptBlock envelope directly (prevIndex from the DB — now correct
+    #     for the unflushed window via the ChainDb shadow), then persist via
+    #     the legacy chainDb.applyBlock. Script verification is skipped (no
+    #     UTXO set); BIP-30 trivially passes with no UTXOs. ---
+    let prevIdxOff = if height <= 0:
+                       chainstate.BlockIndex(height: -1'i32,
+                         hash: BlockHash(default(array[32, byte])))
+                     else:
+                       let p = sm.chainDb.getBlockIndex(blk.header.prevBlock)
+                       if p.isNone:
+                         warn "applyBlock(offline): prev block index not found",
+                              height = height, prevHash = $blk.header.prevBlock
+                         return false
+                       p.get()
+    let noUtxo = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+      none(UtxoEntry)
+    try:
+      {.gcsafe.}:
+        let cryptoOff = newCryptoEngine()
+        let resOff = acceptBlock(blk, prevIdxOff, sm.chainDb, sm.params,
+                                 skipScripts = true,   # no UTXO set offline
+                                 checkPow = true,
+                                 getUtxo = noUtxo,
+                                 crypto = cryptoOff)
+        if not resOff.isOk:
+          warn "block failed consensus checks (offline applyBlock)",
+               height = height, error = $resOff.error
+          return false
+    except Exception as e:
+      warn "block consensus check error (offline applyBlock)",
+           height = height, error = e.msg
+      return false
     sm.chainDb.applyBlock(blk, height)
 
   # Update chain tip (NOT header tip - they're tracked separately)
@@ -1924,65 +1917,22 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
       dl.receivedBlocks.del(height)
       continue
 
-    # Unified consensus check pipeline (Core ProcessNewBlock parity):
-    # acceptBlock runs checkBlock → validateBlock → checkBip30 → verifyScripts.
-    # Reference: bitcoin-core/src/validation.cpp::Chainstate::ProcessNewBlock.
-    #
-    # Assumevalid: mirror applyBlock's 6-condition shouldSkipScripts gate so
-    # that --noassumevalid operators get full script verification on this path.
-    # UTXO source: getUtxoIBD — IBD-batch-aware lookup for both BIP-30 and
-    # script verification (sees pending batch writes, not only flushed DB).
+    # ARCHITECTURAL NOTE — see applyBlock() above for the full rationale.
+    # This second IBD block-application path had the IDENTICAL defect: it
+    # hand-built `prevIdxPRB` as a sentinel with a zero header (it never even
+    # received 493bcd1's partial fix). It now routes through the same unified
+    # `acceptAndConnectBlock` envelope so its contextual checks
+    # (contextualCheckBlockHeader bad-diffbits/MTP/BIP-94 + contextualCheckBlock
+    # BIP-113 finality) get correct context — backed by the ChainDb unflushed
+    # IBD shadow that makes getMtpForHeight / getBlockIndex correct mid-batch.
     let headerBytesPRB = serialize(blk.header)
     let hashPRB = BlockHash(doubleSha256(headerBytesPRB))
-    var avCtxPRB = AssumeValidContext(
-      blockHash: hashPRB,
-      blockHeight: height,
-      assumeValidHeight: sm.params.assumeValidHeight,
-      bestHeaderHeight: sm.headerTipHeight,
-      bestHeaderChainWork: sm.headerChain.totalWork
-    )
-    avCtxPRB.activeHashAtBlockHeight = sm.headerChain.getHashByHeight(height)
-    if sm.params.assumeValidHeight > 0:
-      avCtxPRB.activeHashAtAssumeValidHeight =
-        sm.headerChain.getHashByHeight(sm.params.assumeValidHeight)
-    let skipReasonPRB = shouldSkipScripts(avCtxPRB, sm.params)
-    # Skip scripts when assumevalid covers this block, OR when chainState is nil.
-    let skipScriptsPRB = (skipReasonPRB == ssrSkip) or (sm.chainState == nil)
-    let prevIdxPRB = chainstate.BlockIndex(
-      hash: blk.header.prevBlock,
-      height: height - 1
-    )
-    let dbForPRB = if sm.chainState != nil: sm.chainState.db else: sm.chainDb
-    let csPRB = sm.chainState
-    # Use getUtxoIBD so BIP-30 and script eval see the pending IBD write batch.
-    let utxoForPRB = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
-      if csPRB == nil: return none(UtxoEntry)
-      try: csPRB.getUtxoIBD(op)
-      except: none(UtxoEntry)
-    var acceptPassedPRB = true
-    {.gcsafe.}:
-      try:
-        let cryptoPRB = newCryptoEngine()
-        let acceptResultPRB = acceptBlock(blk, prevIdxPRB, dbForPRB, sm.params,
-                                          skipScripts = skipScriptsPRB,
-                                          checkPow = false,  # PoW already checked by checkBlock above
-                                          getUtxo = utxoForPRB,
-                                          crypto = cryptoPRB)
-        if not acceptResultPRB.isOk:
-          warn "block failed consensus checks (IBD processReceivedBlocks)", height = height,
-               error = $acceptResultPRB.error
-          acceptPassedPRB = false
-      except Exception as e:
-        warn "block consensus check error (IBD processReceivedBlocks)", height = height,
-             error = e.msg
-        acceptPassedPRB = false
-    if not acceptPassedPRB:
-      dl.receivedBlocks.del(height)
-      continue
-
-    # Apply block to chainstate using IBD fast path
     if sm.chainState != nil:
-      # See applyBlock() above for why we capture undo BEFORE connect.
+      # Always IBD-batched here (startIBD ran above); acceptAndConnectBlock
+      # honours cs.ibdMode -> connectBlockIBD.
+      #
+      # Capture filter-index undo BEFORE accept+connect (generateBlockUndo
+      # only reads UTXOs). See applyBlock().
       var undoForFilter = chainstate.BlockUndo()
       let captureUndo = sm.filterIndex != nil and sm.filterIndex.enabled
       if captureUndo:
@@ -1993,29 +1943,75 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
         except Exception:
           undoForFilter = chainstate.BlockUndo()
 
-      let connectResult = sm.chainState.connectBlockIBD(blk, height)
-      if not connectResult.isOk:
-        warn "failed to connect block during IBD", height = height, error = $connectResult.error
+      var acceptOkPRB = true
+      var acceptErrPRB = ""
+      try:
+        {.gcsafe.}:
+          let cryptoPRB = newCryptoEngine()
+          let resPRB = acceptAndConnectBlock(sm.chainState, blk, height,
+                                             bsIBD, cryptoPRB)
+          if not resPRB.isOk:
+            acceptOkPRB = false
+            acceptErrPRB = resPRB.error
+      except Exception as e:
+        acceptOkPRB = false
+        acceptErrPRB = e.msg
+      if not acceptOkPRB:
+        warn "block failed consensus checks (IBD processReceivedBlocks)",
+             height = height, error = acceptErrPRB
         dl.receivedBlocks.del(height)
         continue
 
       # BIP-157 filter index population (no-op when nil/disabled).
       if captureUndo:
         try:
-          let pHeader = serialize(blk.header)
-          let pHash = BlockHash(doubleSha256(pHeader))
-          discard sm.filterIndex.addBlock(blk, pHash, height, undoForFilter)
+          discard sm.filterIndex.addBlock(blk, hashPRB, height, undoForFilter)
         except CatchableError:
           discard
         except Exception:
           discard
     else:
+      # Offline replay (no live UTXO set): full acceptBlock envelope with
+      # script verification skipped (prevIndex from the DB — correct for the
+      # unflushed window via the ChainDb shadow), then legacy persist.
+      let prevIdxOffPRB = if height <= 0:
+                            chainstate.BlockIndex(height: -1'i32,
+                              hash: BlockHash(default(array[32, byte])))
+                          else:
+                            let p = sm.chainDb.getBlockIndex(blk.header.prevBlock)
+                            if p.isNone:
+                              warn "processReceivedBlocks(offline): prev index not found",
+                                   height = height, prevHash = $blk.header.prevBlock
+                              dl.receivedBlocks.del(height)
+                              continue
+                            p.get()
+      let noUtxoPRB = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+        none(UtxoEntry)
+      var acceptOkOff = true
+      var acceptErrOff = ""
+      try:
+        {.gcsafe.}:
+          let cryptoOffPRB = newCryptoEngine()
+          let resOffPRB = acceptBlock(blk, prevIdxOffPRB, sm.chainDb, sm.params,
+                                      skipScripts = true,
+                                      checkPow = true,
+                                      getUtxo = noUtxoPRB,
+                                      crypto = cryptoOffPRB)
+          if not resOffPRB.isOk:
+            acceptOkOff = false
+            acceptErrOff = $resOffPRB.error
+      except Exception as e:
+        acceptOkOff = false
+        acceptErrOff = e.msg
+      if not acceptOkOff:
+        warn "block failed consensus checks (offline processReceivedBlocks)",
+             height = height, error = acceptErrOff
+        dl.receivedBlocks.del(height)
+        continue
       sm.chainDb.applyBlock(blk, height)
 
-    # Update chain tip
-    let headerBytes = serialize(blk.header)
-    let hash = BlockHash(doubleSha256(headerBytes))
-    sm.chainTip = hash
+    # Update chain tip (hashPRB computed above).
+    sm.chainTip = hashPRB
     sm.chainTipHeight = height
 
     # Update stats

@@ -2038,6 +2038,10 @@ type
     bsSubmitBlockTip  ## submitblock RPC, block extends active tip.
     bsSubmitBlockSide ## submitblock RPC, block on a side-branch (no connect).
     bsGenerateRpc     ## Reserved for future generate-* RPCs.
+    bsIBD             ## IBD block-application path (sync.nim applyBlock /
+                      ## processReceivedBlocks). The caller toggles cs.ibdMode
+                      ## around the call, so the envelope picks connectBlockIBD
+                      ## vs connectBlock from that flag (no forceIbdConnect).
 
 proc acceptAndConnectBlock*(
   cs: var ChainState,
@@ -2050,16 +2054,23 @@ proc acceptAndConnectBlock*(
   ## Unified block-acceptance + chainstate-mutation envelope.
   ##
   ## Every block-acceptance path (peer, reindex, miner, submitblock-tip,
-  ## generate-*) MUST route through this helper. The Core invariant is that
-  ## consensus rules are enforced once, in one place, regardless of how the
-  ## block arrived — see bitcoin-core/src/validation.cpp::AcceptBlock and
-  ## ProcessNewBlock.
+  ## generate-*, and the IBD block-application path) MUST route through this
+  ## helper. The Core invariant is that consensus rules are enforced once, in
+  ## one place, regardless of how the block arrived — see
+  ## bitcoin-core/src/validation.cpp::AcceptBlock and ProcessNewBlock.
   ##
   ## The W143/W145/W154/W155/W157 audit wave catalogued FIVE distinct nimrod
   ## entry points that bypassed this envelope (calling `connectBlock` directly
   ## without `checkBlock` / `validateBlock` / `acceptBlock` first). Each
   ## bypass admitted blocks Core would reject. This helper closes the entire
   ## architectural class.
+  ##
+  ## W166 migrated the IBD block-application path (sync.nim applyBlock /
+  ## processReceivedBlocks, source `bsIBD`) onto this helper as well: it used
+  ## to hand-build a sentinel prevIndex with a zero header, which fed wrong
+  ## context to the contextual checks (bad-diffbits, then bad-txns-nonfinal
+  ## on mainnet block 950149). The IBD path now gets the SAME context-correct
+  ## envelope as every other entry point.
   ##
   ## `forceIbdConnect=true` selects `connectBlockIBD` regardless of cs.ibdMode
   ## (used by the --import paths which run their own IBD batching wrapper).

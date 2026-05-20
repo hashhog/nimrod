@@ -83,6 +83,31 @@ type
     db*: Database
     bestBlockHash*: BlockHash
     bestHeight*: int32
+    # IBD unflushed block-index shadow.
+    #
+    # During IBD `connectBlockIBD` defers ALL writes (block-index rows
+    # included) into a single RocksDB WriteBatch and only flushes every
+    # IbdBatchFlushInterval (2000) blocks. Until that flush, RocksDB does
+    # NOT contain the just-connected blocks' index rows, so the raw reads
+    # `getBlockIndex` / `getBlockHashByHeight` return stale data for the
+    # whole unflushed window.
+    #
+    # That staleness silently mis-feeds EVERY contextual consensus check
+    # that walks recent blocks through a `ChainDb`:
+    #   - getMtpForHeight (BIP-113 finality cutoff in validateBlock, and
+    #     the time-too-old gate in contextualCheckBlockHeader) — produced
+    #     "bad-txns-nonfinal" on valid mainnet block 950149.
+    #   - the bad-diffbits getAncestor walk in contextualCheckBlockHeader
+    #     (493bcd1 patched only the immediate parent header, not the
+    #     deeper retarget ancestor walk).
+    #
+    # These two maps shadow the unflushed window so the raw `ChainDb`
+    # readers (used by validation, mempool, mining, RPC) transparently see
+    # in-flight IBD blocks. They are the single source of truth for the
+    # unflushed window: `connectBlockIBD` populates them, `flushIBDBatch`
+    # clears them once the rows are durable in RocksDB.
+    ibdIndexByHash*: Table[BlockHash, BlockIndex]
+    ibdIndexByHeight*: Table[int32, BlockHash]
 
   ## ChainState wraps ChainDb with cache management and consensus params
   ChainState* = ref object
@@ -107,9 +132,13 @@ type
     # expensive column-family flushes on every state transition.
     ibdBlocksSinceLastDiskFlush*: int
     ibdDiskFlushInterval*: int   ## Configurable via --ibd-flush-interval (default 2000)
-    # In-memory height->hash for blocks not yet flushed to RocksDB during IBD.
-    # getBlockHashByHeight reads from RocksDB; this map covers the unflushed window.
-    ibdHeightToHash*: Table[int32, BlockHash]
+    # NOTE: the IBD unflushed block-index shadow now lives on `ChainDb`
+    # (`ibdIndexByHash` / `ibdIndexByHeight`). It used to be a height-only
+    # `ibdHeightToHash` map here, but that could not cover hash -> index
+    # lookups (getMtpForHeight's getBlockIndex walk, the diffbits
+    # getAncestor retarget walk). Moving it down to ChainDb makes the raw
+    # `getBlockIndex` / `getBlockHashByHeight` readers shadow-aware for
+    # EVERY caller (validation, mempool, mining, RPC) — one source of truth.
     # Multi-block reorg atomicity: while a single-batch reorg is in progress
     # (handleReorg), reads from getUtxo must be filtered against UTXOs that
     # have been *staged* into the in-flight WriteBatch but not yet written
@@ -278,7 +307,9 @@ proc openChainDb*(path: string): ChainDb =
   result = ChainDb(
     db: openDatabase(path),
     bestBlockHash: BlockHash(default(array[32, byte])),
-    bestHeight: -1
+    bestHeight: -1,
+    ibdIndexByHash: initTable[BlockHash, BlockIndex](),
+    ibdIndexByHeight: initTable[int32, BlockHash]()
   )
 
   # Load best block from meta
@@ -330,14 +361,34 @@ proc putBlockIndexHashOnly*(cdb: ChainDb, idx: BlockIndex) =
   cdb.db.put(cfBlockIndex, blockKey(array[32, byte](idx.hash)), serializeBlockIndex(idx))
 
 proc getBlockIndex*(cdb: ChainDb, hash: BlockHash): Option[BlockIndex] =
-  ## Get block index by hash
+  ## Get block index by hash.
+  ##
+  ## Consults the IBD unflushed shadow FIRST: during IBD `connectBlockIBD`
+  ## defers index rows into a write batch that is not visible to a plain
+  ## RocksDB read until the periodic flush. Without this, every contextual
+  ## consensus check that walks recent blocks (getMtpForHeight finality
+  ## cutoff, the diffbits getAncestor retarget walk) would read stale data
+  ## for the whole unflushed window. See the `ibdIndexByHash` field comment.
+  if cdb.ibdIndexByHash.len > 0:
+    let shadow = cdb.ibdIndexByHash.getOrDefault(hash, BlockIndex(height: -1))
+    if shadow.height >= 0:
+      return some(shadow)
   let data = cdb.db.get(cfBlockIndex, blockKey(array[32, byte](hash)))
   if data.isSome:
     return some(deserializeBlockIndex(data.get()))
   none(BlockIndex)
 
 proc getBlockHashByHeight*(cdb: ChainDb, height: int32): Option[BlockHash] =
-  ## Get block hash at given height
+  ## Get block hash at given height.
+  ##
+  ## Consults the IBD unflushed shadow FIRST (see `getBlockIndex` above and
+  ## the `ibdIndexByHeight` field comment): mid-IBD the height -> hash rows
+  ## for the unflushed window live only in the in-memory shadow, not yet in
+  ## RocksDB. getMtpForHeight walks this proc for the previous 11 blocks; a
+  ## stale miss there silently truncated the MTP window and rejected valid
+  ## blocks with "bad-txns-nonfinal".
+  if cdb.ibdIndexByHeight.len > 0 and height in cdb.ibdIndexByHeight:
+    return some(cdb.ibdIndexByHeight[height])
   let data = cdb.db.get(cfBlockIndex, blockIndexKey(height))
   if data.isSome and data.get().len >= 32:
     var hash: array[32, byte]
@@ -353,12 +404,14 @@ proc getBlockByHeight*(cdb: ChainDb, height: int32): Option[Block] =
   none(Block)
 
 proc getBlockHashByHeight*(cs: ChainState, height: int32): Option[BlockHash] =
-  ## Get block hash at given height, checking the IBD in-memory map first.
-  ## During IBD, blocks are batched and only written to RocksDB every 2000
-  ## blocks. This proc covers the unflushed window so that getblockhash is
-  ## never "out of range" for heights that are already connected.
-  if cs.ibdMode and height in cs.ibdHeightToHash:
-    return some(cs.ibdHeightToHash[height])
+  ## Get block hash at given height.
+  ##
+  ## Delegates to the raw `ChainDb` reader, which now consults the IBD
+  ## unflushed shadow itself — so the unflushed window is covered uniformly
+  ## for every caller (validation/mempool/mining/RPC) instead of only this
+  ## ChainState-typed path. During IBD blocks are batched and only written
+  ## to RocksDB every 2000 blocks; the shadow ensures getblockhash is never
+  ## "out of range" for heights that are already connected.
   cs.db.getBlockHashByHeight(height)
 
 # UTXO operations (ChainDb - low level)
@@ -480,7 +533,6 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     ibdDeletedUtxos: initTable[string, bool](),
     ibdBlocksSinceLastDiskFlush: 0,
     ibdDiskFlushInterval: IbdBatchFlushInterval,  # default: flush to disk every 2000 blocks
-    ibdHeightToHash: initTable[int32, BlockHash](),
     reorgDeletedUtxos: nil,
     disconnectHook: nil
   )
@@ -962,8 +1014,12 @@ proc flushIBDBatch*(cs: var ChainState) =
     cs.ibdBatch.clear()
     cs.ibdBatchBlocks = 0
     cs.ibdDeletedUtxos.clear()
-    # Height->hash entries are now in RocksDB; clear the in-memory shadow.
-    cs.ibdHeightToHash.clear()
+    # The batch is now durably committed to RocksDB (the `write` above is
+    # synchronous), so the block-index rows are visible to plain reads.
+    # Clear the unflushed shadow — clearing AFTER the write guarantees no
+    # window where a read finds neither shadow nor DB.
+    cs.db.ibdIndexByHash.clear()
+    cs.db.ibdIndexByHeight.clear()
 
     # Update ChainDb in-memory state
     cs.db.bestBlockHash = cs.bestBlockHash
@@ -1311,9 +1367,16 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
   cs.ibdBatch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
   cs.ibdBatch.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](blockHash)))
 
-  # Track in the in-memory map so getBlockHashByHeight can serve this height
-  # before the batch is flushed to RocksDB (which happens every 2000 blocks).
-  cs.ibdHeightToHash[height] = blockHash
+  # Track the row in the ChainDb unflushed shadow so that the raw readers
+  # `getBlockIndex` (by hash) AND `getBlockHashByHeight` (by height) serve
+  # this block before the write batch is flushed to RocksDB (every 2000
+  # blocks). This is what makes the contextual consensus checks correct
+  # mid-IBD: getMtpForHeight walks the previous 11 blocks via these readers
+  # (BIP-113 finality cutoff + the time-too-old gate), and the bad-diffbits
+  # getAncestor retarget walk uses getBlockIndex. Cleared by flushIBDBatch
+  # once the rows are durable. See the `ChainDb.ibdIndexByHash` comment.
+  cs.db.ibdIndexByHash[blockHash] = idx
+  cs.db.ibdIndexByHeight[height] = blockHash
 
   # Update in-memory state
   cs.bestBlockHash = blockHash
@@ -1495,6 +1558,15 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
 
   # Remove block index height mapping
   batch.delete(cfBlockIndex, blockIndexKey(height))
+
+  # Keep the IBD unflushed shadow consistent: if this block is still in the
+  # unflushed window (rare — disconnect during IBD is not a normal path, but
+  # defense-in-depth), drop it so the contextual checks never see a block
+  # that has been disconnected. The hash row is left as an orphan index
+  # entry, mirroring Core which retains the CBlockIndex on disconnect.
+  if cs.db.ibdIndexByHeight.getOrDefault(height, BlockHash(default(array[32, byte]))) == blockHash:
+    cs.db.ibdIndexByHeight.del(height)
+  cs.db.ibdIndexByHash.del(blockHash)
 
   # Subtract work (reverse the work addition)
   let blockWork = calculateBlockWork(blk.header.bits)
@@ -2109,6 +2181,12 @@ proc disconnectBlock*(cdb: ChainDb, blk: Block, height: int32) =
 
   # Remove block index height mapping
   batch.delete(cfBlockIndex, blockIndexKey(height))
+
+  # Keep the IBD unflushed shadow consistent (defense-in-depth — see the
+  # ChainState-level disconnectBlock for rationale).
+  if cdb.ibdIndexByHeight.getOrDefault(height, BlockHash(default(array[32, byte]))) == blockHash:
+    cdb.ibdIndexByHeight.del(height)
+  cdb.ibdIndexByHash.del(blockHash)
 
   # Update best block to previous
   let newBestHeight = height - 1
