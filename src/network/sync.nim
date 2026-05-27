@@ -941,14 +941,30 @@ proc classifyHeaderBatch*(sm: SyncManager,
     result.routing = hbrDirect
 
 proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
-  ## Request headers from peer using getheaders message
+  ## Request headers from peer using getheaders message.
+  ##
+  ## Catches PeerError + CatchableError so transport-level send failures
+  ## (peer disconnected mid-write, malformed framing) do not propagate up
+  ## through the async chain to syncLoop, where they would crash the
+  ## entire nimrod process. Observed 2026-05-26 22:46 (#137): unhandled
+  ## "transport write failed: Transport connection is already dropped!"
+  ## from sendMessageV1 → sendGetHeaders → requestHeaders → startHeaderSync
+  ## → syncLoop killed the node. Log + clear syncPeer to rotate on next
+  ## iteration; do not re-raise.
   let locator = sm.buildBlockLocator()
   let hashStop = default(array[32, byte])  # Get as many as possible
 
-  await peer.sendGetHeaders(
-    @(locator.mapIt(BlockHash(it))),
-    BlockHash(hashStop)
-  )
+  try:
+    await peer.sendGetHeaders(
+      @(locator.mapIt(BlockHash(it))),
+      BlockHash(hashStop)
+    )
+  except CatchableError as e:
+    warn "requestHeaders send failed, rotating peer",
+         peer = $peer, error = e.msg
+    if sm.syncPeer == peer:
+      sm.syncPeer = nil
+    return
 
   sm.lastSyncTime = getTime()
   info "requested headers", peer = $peer, locatorLen = locator.len,
