@@ -332,9 +332,21 @@ proc writeTimestampedAddrV2*(w: var BinaryWriter, ta: TimestampedAddrV2) =
 proc readTimestampedAddrV2*(r: var BinaryReader): Option[TimestampedAddrV2] =
   ## Deserialize a timestamped address from addrv2 message
   ## Returns none for unknown network types (from future)
+  ##
+  ## BIP-155 `services` is a 64-bit bitfield, not a container length, and is
+  ## serialized with `CompactSizeFormatter<false>` in Bitcoin Core
+  ## (protocol.h:446 — `READWRITE(Using<CompactSizeFormatter<false>>(services_tmp))`).
+  ## Pass `range_check=false` to readCompactSize so a peer announcing an
+  ## experimental / future service bit at position >= 26 (value > 0x02000000)
+  ## does not get rejected with "ReadCompactSize(): size too large" — that
+  ## would tear down the whole message loop and disconnect the peer.
+  ## Observed on mainnet (2026-05-27): every honest Satoshi peer eventually
+  ## triggered this once they relayed any address with a high-bit service
+  ## flag set, destroying the per-peer PRESYNC state on each disconnect and
+  ## preventing from-genesis IBD from making progress past +782 headers.
   var ta: TimestampedAddrV2
   ta.timestamp = r.readUint32LE()
-  ta.services = r.readCompactSize()
+  ta.services = r.readCompactSize(range_check = false)
 
   let addrOpt = r.readNetAddressV2()
   if addrOpt.isNone:

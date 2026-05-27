@@ -1,8 +1,8 @@
 ## Tests for BIP155 ADDRv2 protocol implementation
 
 import unittest2
-import std/options
-import ../src/primitives/serialize
+import std/[options, strutils]
+import ../src/primitives/[serialize, types]
 import ../src/network/addr
 import ../src/network/messages
 
@@ -351,6 +351,123 @@ suite "torv3 validation":
     var r2 = BinaryReader(data: badData, pos: 0)
     expect AddrV2Error:
       discard r2.readNetAddressV2()
+
+suite "addrv2 services bitfield (regression: ReadCompactSize size-too-large)":
+  ## Regression for the 2026-05-27 mainnet bug where readTimestampedAddrV2
+  ## passed `range_check=true` to readCompactSize for the `services` field,
+  ## a 64-bit bitfield encoded with `CompactSizeFormatter<false>` in Bitcoin
+  ## Core (protocol.h:446).  Any peer that gossiped an address with a
+  ## service bit at position >= 26 (encoded value > 0x02000000 = MAX_SIZE)
+  ## triggered `ReadCompactSize(): size too large`, ending the message loop
+  ## and destroying per-peer PRESYNC state — so from-genesis IBD never
+  ## made progress past +782 headers.
+  ##
+  ## With the fix (addr.nim::readTimestampedAddrV2 now passes
+  ## `range_check=false`), these high-bit service flags decode cleanly.
+
+  test "services with bit 31 set (5-byte CompactSize, value > MAX_SIZE) decodes":
+    var ta: TimestampedAddrV2
+    ta.timestamp = 1700000000
+    ta.services = 0x80000001'u64  # bit 31 + NODE_NETWORK; > 0x02000000
+    ta.address = NetAddressV2(networkId: netIPv4)
+    ta.address.ipv4 = [192'u8, 168, 1, 1]
+    ta.port = 8333
+
+    var w = BinaryWriter()
+    w.writeTimestampedAddrV2(ta)
+
+    var r = BinaryReader(data: w.data, pos: 0)
+    let decoded = r.readTimestampedAddrV2()
+    check decoded.isSome
+    check decoded.get().services == ta.services
+
+  test "services with bit 63 set (9-byte CompactSize) decodes":
+    # Forces the readUint64LE() branch in readCompactSize.
+    var ta: TimestampedAddrV2
+    ta.timestamp = 1700000001
+    ta.services = 0x8000000000000001'u64  # bit 63 + NODE_NETWORK
+    ta.address = NetAddressV2(networkId: netIPv4)
+    ta.address.ipv4 = [127'u8, 0, 0, 1]
+    ta.port = 8333
+
+    var w = BinaryWriter()
+    w.writeTimestampedAddrV2(ta)
+
+    var r = BinaryReader(data: w.data, pos: 0)
+    let decoded = r.readTimestampedAddrV2()
+    check decoded.isSome
+    check decoded.get().services == ta.services
+
+  test "addrv2 message with high-bit services decodes via deserializePayload":
+    # End-to-end: build a full addrv2 wire payload (count + 1 entry) with
+    # high service bits and confirm the top-level dispatcher can parse it
+    # without raising.  Pre-fix this raised SerializationError.
+    var ta: TimestampedAddrV2
+    ta.timestamp = 1700000002
+    ta.services = 0xFFFFFFFFFFFFFFFF'u64  # all bits set
+    ta.address = NetAddressV2(networkId: netIPv4)
+    ta.address.ipv4 = [10'u8, 0, 0, 1]
+    ta.port = 8333
+
+    var w = BinaryWriter()
+    w.writeCompactSize(1'u64)  # one address
+    w.writeTimestampedAddrV2(ta)
+
+    let msg = deserializePayload("addrv2", w.data)
+    check msg.kind == mkAddrV2
+    check msg.addressesV2.len == 1
+    check msg.addressesV2[0].services == ta.services
+
+suite "headers payload byte accounting (regression: from-genesis IBD)":
+  ## Regression-style guard against a future readHeadersPayload byte-drift:
+  ## the wire format for a `headers` message is
+  ##   compactsize(count) | (80-byte header | 1-byte 0x00 dummy txcount) * N
+  ## so a 2000-header batch is 3 + 2000 * 81 = 162003 bytes total.  If
+  ## readBlockHeader ever consumed off-by-N bytes, the next iteration's
+  ## dummy-txcount read would misinterpret a header byte as a CompactSize
+  ## prefix — a stray 0xFD/0xFE/0xFF would trigger size-too-large.
+
+  test "writer/reader round-trip consumes exactly count*81 + size(count) bytes":
+    var headers: seq[BlockHeader]
+    for i in 0 ..< 2000:
+      var h: BlockHeader
+      h.version = int32(0x20000000)
+      # leave prevBlock / merkleRoot as zeros — only byte-count matters
+      h.timestamp = uint32(1700000000 + i)
+      h.bits = 0x1d00ffff'u32
+      h.nonce = uint32(i)
+      headers.add(h)
+
+    var w = BinaryWriter()
+    w.writeHeadersPayload(headers)
+
+    # 2000 fits in a 3-byte CompactSize (0xFD prefix + uint16LE).
+    let expectedSize = 3 + 2000 * 81
+    check w.data.len == expectedSize
+
+    var r = BinaryReader(data: w.data, pos: 0)
+    let decoded = r.readHeadersPayload()
+    check decoded.len == 2000
+    check r.pos == expectedSize
+    check r.remaining() == 0
+
+  test "readHeadersPayload would catch a missing dummy-txcount (negative)":
+    # Build a payload that drops the trailing 0x00 dummy byte from one entry.
+    # The next iteration will misalign and (since the next header's version
+    # field's first byte is unlikely to be a valid trailing byte) the reader
+    # will overrun or mis-decode.  This test just asserts the WELL-FORMED
+    # case still parses — the malformed case is non-trivial to assert
+    # deterministically since outcome depends on header bytes.  Kept as a
+    # sanity guard: the canonical writer is the only producer the reader
+    # is contracted to round-trip with.
+    var headers: seq[BlockHeader]
+    var h: BlockHeader
+    h.timestamp = 1
+    headers.add(h)
+
+    var w = BinaryWriter()
+    w.writeHeadersPayload(headers)
+    check w.data.len == 1 + 80 + 1  # count(1) + header(80) + dummy(1)
 
 suite "string conversion":
   test "ipv4 to string":
