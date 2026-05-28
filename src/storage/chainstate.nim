@@ -248,7 +248,10 @@ proc deserializeBlockIndex*(data: seq[byte]): BlockIndex =
 
 # Serialization for UtxoEntry
 
-proc serializeUtxoEntry(entry: UtxoEntry): seq[byte] =
+proc serializeUtxoEntry*(entry: UtxoEntry): seq[byte] =
+  ## Exported so the snapshot loader can stage per-coin writes directly into
+  ## its WriteBatch (FIX-D, chainstate atomicity family 2026-05-26) without
+  ## taking the per-coin `putUtxo` round-trip.
   var w = BinaryWriter()
   w.writeTxOut(entry.output)
   w.writeInt32LE(entry.height)
@@ -302,6 +305,11 @@ proc deserializeTxLocation(data: seq[byte]): TxLocation =
 
 # ChainDb operations (low-level database access)
 
+# Forward declaration — definition lives further down with the rest of the
+# snapshot-load atomicity helpers (FIX-D). Declared here so `openChainDb` can
+# call it during DB open.
+proc recoverFromSnapshotCrash*(cdb: ChainDb): bool
+
 proc openChainDb*(path: string): ChainDb =
   ## Open the chain database
   result = ChainDb(
@@ -311,6 +319,28 @@ proc openChainDb*(path: string): ChainDb =
     ibdIndexByHash: initTable[BlockHash, BlockIndex](),
     ibdIndexByHeight: initTable[int32, BlockHash]()
   )
+
+  # FIX-D (chainstate atomicity family 2026-05-26): if the previous process
+  # crashed mid-`loadtxoutset`, the SNAPSHOT_LOAD_IN_PROGRESS marker is still
+  # set in cfMeta. Clear the partial chainstate + reset tip BEFORE we read the
+  # tip pointer below — otherwise we'd publish the stale tip pointer to
+  # consensus code that would then read inconsistent UTXOs.
+  #
+  # Wrapped in try/except + {.cast(gcsafe).} so the recovery code's
+  # chronicles-log + RocksDB iterator exception surface (Exception-typed,
+  # and the iter pulls from globals that the strict-gcsafe checker can't
+  # see across) does not widen the exception/gcsafe footprint of
+  # openChainDb / newChainState — which is called from the
+  # chronos-`{.async.}` daemon entry point.
+  {.cast(gcsafe).}:
+    try:
+      discard result.recoverFromSnapshotCrash()
+    except CatchableError as e:
+      warn "recoverFromSnapshotCrash failed; daemon will continue with on-disk tip",
+           err = e.msg
+    except Exception as e:
+      warn "recoverFromSnapshotCrash hit unexpected Exception; daemon continuing",
+           err = e.msg
 
   # Load best block from meta
   let bestHashData = result.db.get(cfMeta, metaKey("bestblock"))
@@ -498,6 +528,153 @@ proc updateBestBlock*(cdb: ChainDb, hash: BlockHash, height: int32) =
   var w = BinaryWriter()
   w.writeInt32LE(height)
   cdb.db.put(cfMeta, metaKey("height"), w.data)
+
+# ============================================================================
+# Snapshot-load atomicity marker (analog of ouroboros FIX-D, 2026-05-26).
+# ============================================================================
+#
+# `loadSnapshot` (the `loadtxoutset` RPC handler in `snapshot.nim`) historically
+# wrote per-coin UTXOs directly via `putUtxo` and then called `updateBestBlock`
+# as a separate step. A SIGKILL between those two steps left RocksDB with a mix
+# of new-snapshot UTXOs and the old chain tip pointer — a half-loaded state
+# that subsequent block validation would happily mistake for a healthy chain.
+#
+# To close this gap we follow ouroboros's three-phase FIX-D protocol:
+#
+#   Phase 1 (begin): write the `SNAPSHOT_LOAD_IN_PROGRESS` marker via
+#     `writeSynced` (WAL + fsync) BEFORE any per-coin write. After this
+#     completes, a crash leaves the marker on disk and `recoverFromSnapshotCrash`
+#     on next open detects + clears the partial state.
+#   Phase 2 (chunks): apply N coins per RocksDB WriteBatch (single batch is
+#     atomic across all CFs; we still keep WAL on for the chunked writes so
+#     the per-chunk write is durable, matching ouroboros's chunk semantics).
+#   Phase 3 (commit): a single WriteBatch fuses tip update + marker delete,
+#     written via `writeSynced` so either all three (bestblock, height, marker
+#     deletion) land or none do.
+#
+# The marker key lives in `cfMeta` under a fixed name. Value is
+# `[32-byte base_blockhash][4-byte base_height LE]` (36 bytes), matching the
+# ouroboros payload so future cross-impl tooling can read it byte-identically.
+#
+# Reference: ouroboros commit 2b76e0e + family doc
+# `CORE-PARITY-AUDIT/_chainstate-atomicity-family-2026-05-26.md`.
+
+const SnapshotLoadMarkerKey* = "snapshot_load_in_progress"
+  ## cfMeta key name for the SNAPSHOT_LOAD_IN_PROGRESS marker. Public so
+  ## tests and tooling can probe it.
+
+proc writeSnapshotLoadMarker*(cdb: ChainDb,
+                               baseBlockhash: BlockHash,
+                               baseHeight: int32) =
+  ## Phase 1 — write the SNAPSHOT_LOAD_IN_PROGRESS marker to cfMeta. Caller
+  ## should invoke this BEFORE any per-coin UTXO write so a crash mid-load can
+  ## be detected on next open. We persist via the synced sibling
+  ## (`writeSynced` on a single-entry batch) so the marker survives a crash
+  ## even if the daemon previously called `disableWAL` for IBD throughput.
+  var value = newSeq[byte](36)
+  let h = array[32, byte](baseBlockhash)
+  for i in 0 ..< 32:
+    value[i] = h[i]
+  let height = cast[uint32](baseHeight)
+  value[32] = byte(height and 0xff)
+  value[33] = byte((height shr 8) and 0xff)
+  value[34] = byte((height shr 16) and 0xff)
+  value[35] = byte((height shr 24) and 0xff)
+
+  let batch = cdb.db.newWriteBatch()
+  defer: batch.destroy()
+  batch.put(cfMeta, metaKey(SnapshotLoadMarkerKey), value)
+  cdb.db.writeSynced(batch)
+
+proc getSnapshotLoadMarker*(cdb: ChainDb):
+    Option[tuple[baseBlockhash: BlockHash, baseHeight: int32]] =
+  ## Read the SNAPSHOT_LOAD_IN_PROGRESS marker if present. Returns the
+  ## `(baseBlockhash, baseHeight)` of the in-progress load, or `none` if no
+  ## load is in progress.
+  let data = cdb.db.get(cfMeta, metaKey(SnapshotLoadMarkerKey))
+  if data.isNone:
+    return none(tuple[baseBlockhash: BlockHash, baseHeight: int32])
+  let bytes = data.get()
+  if bytes.len != 36:
+    # Defensive: corrupt marker. Treat as present so the recovery path clears
+    # the chainstate — better to lose a not-yet-committed snapshot than to
+    # silently keep a half-loaded one.
+    return some((baseBlockhash: BlockHash(default(array[32, byte])),
+                 baseHeight: 0'i32))
+  var hash: array[32, byte]
+  for i in 0 ..< 32:
+    hash[i] = bytes[i]
+  let height = int32(
+    uint32(bytes[32]) or
+    (uint32(bytes[33]) shl 8) or
+    (uint32(bytes[34]) shl 16) or
+    (uint32(bytes[35]) shl 24)
+  )
+  some((baseBlockhash: BlockHash(hash), baseHeight: height))
+
+proc hasSnapshotLoadMarker*(cdb: ChainDb): bool =
+  ## Convenience predicate — tests + operator diagnostics.
+  cdb.db.contains(cfMeta, metaKey(SnapshotLoadMarkerKey))
+
+proc clearUtxoColumnFamily*(cdb: ChainDb) =
+  ## Iterate every key in `cfUtxo` and delete it in a single WriteBatch. Used
+  ## by `recoverFromSnapshotCrash` to reset the chainstate after detecting a
+  ## crashed `loadtxoutset` — partial per-coin chunks have half-overwritten the
+  ## UTXO set and there is no per-block undo trail to replay back to the prior
+  ## tip, so the only safe recovery is to wipe the UTXO CF and force the
+  ## operator to re-run `loadtxoutset`. Mirrors ouroboros's `clear_chainstate`.
+  var keysToDelete: seq[seq[byte]] = @[]
+  for (key, _) in cdb.db.iterCf(cfUtxo):
+    keysToDelete.add(key)
+  if keysToDelete.len == 0:
+    return
+  let batch = cdb.db.newWriteBatch()
+  defer: batch.destroy()
+  for k in keysToDelete:
+    batch.delete(cfUtxo, k)
+  cdb.db.writeSynced(batch)
+
+proc recoverFromSnapshotCrash*(cdb: ChainDb): bool =
+  ## Called during `openChainDb`. If a SNAPSHOT_LOAD_IN_PROGRESS marker is
+  ## present, the previous process crashed mid-`loadtxoutset` and the UTXO CF
+  ## contains a mix of partial-snapshot + partial-old coins that cannot be
+  ## safely repaired. We:
+  ##   1. wipe the UTXO column family,
+  ##   2. reset the on-disk tip pointer to all-zeros / height 0 (genesis
+  ##      sentinel — distinguishable from any real tip),
+  ##   3. delete the marker.
+  ## The operator must re-run `loadtxoutset` from the source file to restore
+  ## the chainstate. Returns `true` if a recovery was performed, `false`
+  ## otherwise. Mirrors ouroboros's `recover_from_crash` (snapshot branch).
+  let markerOpt = cdb.getSnapshotLoadMarker()
+  if markerOpt.isNone:
+    return false
+
+  let marker = markerOpt.get()
+  warn "SNAPSHOT_LOAD_IN_PROGRESS marker found — crash detected during loadtxoutset; clearing chainstate",
+       baseHeight = marker.baseHeight
+
+  cdb.clearUtxoColumnFamily()
+
+  # Reset best-block to all-zeros / height 0 so callers see a clean slate
+  # and don't try to validate blocks above a missing UTXO set. Fuse the
+  # reset + marker-delete into one atomic, synced WriteBatch — either both
+  # land or neither does, so a second crash here cannot leave the daemon in
+  # a state where the marker is gone but the tip still points at the snapshot.
+  let zeroHash = BlockHash(default(array[32, byte]))
+  cdb.bestBlockHash = zeroHash
+  cdb.bestHeight = 0
+  let batch = cdb.db.newWriteBatch()
+  defer: batch.destroy()
+  batch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](zeroHash)))
+  var w = BinaryWriter()
+  w.writeInt32LE(0)
+  batch.put(cfMeta, metaKey("height"), w.data)
+  batch.delete(cfMeta, metaKey(SnapshotLoadMarkerKey))
+  cdb.db.writeSynced(batch)
+
+  warn "Snapshot-load crash recovery complete — chainstate cleared; tip reset to genesis-sentinel; re-run loadtxoutset to restore"
+  true
 
 # ============================================================================
 # ChainState - High-level UTXO set manager with cache and reorg support

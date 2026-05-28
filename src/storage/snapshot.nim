@@ -644,15 +644,47 @@ proc validateSnapshotMetadata*(
           "Assumeutxo height in snapshot metadata not recognized (0) - " &
           "refusing to load snapshot")
 
+## Chunk size for the per-coin WriteBatch (Phase 2 of FIX-D). Matches
+## ouroboros's `_CHUNK_SIZE = 10_000` so the cross-impl crash-recovery
+## semantics are identical. 10K coins per batch keeps the RocksDB
+## WriteBatch memory bounded (~1–2 MB) and cuts the per-coin overhead
+## while still bounding how much progress is lost on a mid-load crash.
+const SnapshotLoadChunkSize* = 10_000
+
 proc loadSnapshot*(
     path: string,
     targetCs: var ChainState,
     params: ConsensusParams,
     assumeutxoData: seq[AssumeutxoData]
 ): tuple[success: bool, coinsLoaded: uint64, error: string] =
-  ## Load a Core-format UTXO snapshot into `targetCs`. Verifies the
-  ## metadata against the hardcoded assumeutxo list, streams every coin
-  ## into the cache + db, and updates the chain tip on success.
+  ## Load a Core-format UTXO snapshot into `targetCs`.
+  ##
+  ## Atomicity (FIX-D, chainstate atomicity family 2026-05-26 — analog of
+  ## ouroboros commit `2b76e0e`):
+  ##
+  ##   Phase 1 (begin):  write the SNAPSHOT_LOAD_IN_PROGRESS marker via
+  ##                     `writeSynced` (WAL + fsync) BEFORE any per-coin
+  ##                     write. After this returns, a crash is recoverable —
+  ##                     next-boot `recoverFromSnapshotCrash` (wired into
+  ##                     `openChainDb`) detects the marker, wipes the partial
+  ##                     UTXO CF, and resets the tip to the genesis sentinel.
+  ##                     The operator must then re-run `loadtxoutset`.
+  ##   Phase 2 (chunks): apply up to `SnapshotLoadChunkSize` coins per
+  ##                     RocksDB WriteBatch. RocksDB applies the WriteBatch
+  ##                     atomically across CFs, so per-chunk writes are
+  ##                     all-or-nothing. The marker stays set across chunks.
+  ##   Phase 3 (commit): a SINGLE atomic + synced WriteBatch fuses tip
+  ##                     update + marker delete. Pre-FIX-D the tip write and
+  ##                     the per-coin writes were independent — a SIGKILL
+  ##                     could leave a mix of partial-snapshot UTXOs with
+  ##                     the old tip pointer still on disk. Post-FIX-D the
+  ##                     three states (no-load-started, load-in-progress,
+  ##                     load-committed) are crash-distinguishable.
+  ##
+  ## Pre-FIX-D the loader did per-coin direct `putUtxo` (one put per coin,
+  ## no batching, no marker) followed by a separate `updateBestBlock`. See
+  ## `CORE-PARITY-AUDIT/_chainstate-atomicity-family-2026-05-26.md` for the
+  ## full family context.
   var sf: SnapshotFile
   try:
     sf = openSnapshotForRead(path)
@@ -679,6 +711,16 @@ proc loadSnapshot*(
 
   let baseHeight = assumeData.height
 
+  # ----------------------------------------------------------
+  # FIX-D Phase 1 — write the SNAPSHOT_LOAD_IN_PROGRESS marker
+  # BEFORE any per-coin write. The marker is written via the synced
+  # write-options path so it survives a power loss even when WAL is
+  # globally disabled for IBD throughput. After this point, a crash
+  # mid-load is recoverable: next-boot `recoverFromSnapshotCrash`
+  # clears the partial chainstate.
+  # ----------------------------------------------------------
+  targetCs.db.writeSnapshotLoadMarker(sf.metadata.baseBlockhash, baseHeight)
+
   var coinsLoaded: uint64 = 0
   # Stream every loaded coin's canonical `TxOutSer` bytes through a
   # `HashWriter` (SHA256d) so we can verify the snapshot's `hash_serialized`
@@ -686,8 +728,27 @@ proc loadSnapshot*(
   # This is the `CoinStatsHashType::HASH_SERIALIZED` branch — NOT MuHash3072.
   # We must NOT mark the chain tip valid until the digest matches au_data.
   var hw = initHashWriter()
+
+  # Phase 2 — chunked per-coin writes. We collect up to SnapshotLoadChunkSize
+  # coins per WriteBatch (matches ouroboros). The cache mirror (`putUtxoCache`)
+  # is updated in-step so in-process readers see the loaded coins immediately.
+  var chunkBatch = targetCs.db.db.newWriteBatch()
+  var chunkCount = 0
+  defer: chunkBatch.destroy()
+
+  # Inline-as-template to dodge the capture-`var ChainState` restriction on
+  # nested closures.
+  template flushChunk() =
+    if chunkCount > 0:
+      targetCs.db.db.write(chunkBatch)
+      chunkBatch.destroy()
+      chunkBatch = targetCs.db.db.newWriteBatch()
+      chunkCount = 0
+
   # Wrap the streaming loop: SnapshotError from readCoin (including B4
   # group-overcount) surfaces as a structured failure rather than an exception.
+  # Crucially, if we bail out here we do NOT delete the marker — next-boot
+  # `recoverFromSnapshotCrash` will detect it and clear the partial state.
   try:
     while true:
       let coinOpt = sf.readCoin()
@@ -722,7 +783,12 @@ proc loadSnapshot*(
         isCoinbase: coin.isCoinbase
       )
       targetCs.putUtxoCache(coin.outpoint, entry)
-      targetCs.db.putUtxo(coin.outpoint, entry)
+      let utxoK = utxoKey(array[32, byte](coin.outpoint.txid),
+                          coin.outpoint.vout)
+      chunkBatch.put(cfUtxo, utxoK, serializeUtxoEntry(entry))
+      inc chunkCount
+      if chunkCount >= SnapshotLoadChunkSize:
+        flushChunk()
       let coinBytes = serializeCoinForHash(
         coin.outpoint, int64(coin.output.value), coin.output.scriptPubKey,
         coin.height, coin.isCoinbase
@@ -736,6 +802,9 @@ proc loadSnapshot*(
     return (false, coinsLoaded,
             "coin count mismatch: expected " & $sf.metadata.coinsCount &
             ", got " & $coinsLoaded)
+
+  # Flush tail residue (<SnapshotLoadChunkSize coins remaining).
+  flushChunk()
 
   # B5: Trailing-bytes exhaustion check
   # (bitcoin-core/src/validation.cpp:5872-5882).
@@ -775,9 +844,31 @@ proc loadSnapshot*(
             dispHex(assumeData.hashSerialized) & ", got " &
             dispHex(computedHash))
 
+  # ----------------------------------------------------------
+  # FIX-D Phase 3 — final atomic commit batch. ONE WriteBatch fuses:
+  #   - cfMeta bestblock pointer
+  #   - cfMeta height pointer
+  #   - delete of SNAPSHOT_LOAD_IN_PROGRESS marker
+  # written via `writeSynced` (WAL + fsync). Either all three land or
+  # none do, so a crash here cannot leave the tip pointing at the
+  # snapshot with the marker still set (which would trigger an
+  # unwanted recovery on next open) — nor leave the marker deleted
+  # with the tip not yet updated (which would silently "lose" the
+  # just-loaded snapshot on next open).
+  # ----------------------------------------------------------
   targetCs.bestBlockHash = sf.metadata.baseBlockhash
   targetCs.bestHeight = assumeData.height
-  targetCs.db.updateBestBlock(sf.metadata.baseBlockhash, assumeData.height)
+  targetCs.db.bestBlockHash = sf.metadata.baseBlockhash
+  targetCs.db.bestHeight = assumeData.height
+  let commitBatch = targetCs.db.db.newWriteBatch()
+  defer: commitBatch.destroy()
+  commitBatch.put(cfMeta, metaKey("bestblock"),
+                  @(array[32, byte](sf.metadata.baseBlockhash)))
+  var hw2 = BinaryWriter()
+  hw2.writeInt32LE(assumeData.height)
+  commitBatch.put(cfMeta, metaKey("height"), hw2.data)
+  commitBatch.delete(cfMeta, metaKey(SnapshotLoadMarkerKey))
+  targetCs.db.db.writeSynced(commitBatch)
   return (true, coinsLoaded, "")
 
 # ============================================================================

@@ -2204,3 +2204,351 @@ suite "W102 AssumeUTXO per-coin validation gates":
     # returns nil or raises RpcMethodNotFound.
     # When implemented, this test should verify the response shape instead.
     check code != 0  # non-zero = currently unimplemented
+
+# ----------------------------------------------------------------------------
+# FIX-D — snapshot-load atomicity via SNAPSHOT_LOAD_IN_PROGRESS marker.
+#
+# These tests pin the contract of the marker-based atomicity protocol added
+# in this commit (analog of ouroboros commit 2b76e0e). The contract:
+#
+#   1. The marker key + helpers (`writeSnapshotLoadMarker`,
+#      `getSnapshotLoadMarker`, `hasSnapshotLoadMarker`,
+#      `clearUtxoColumnFamily`, `recoverFromSnapshotCrash`) round-trip via
+#      cfMeta and survive close+reopen of the database.
+#
+#   2. `recoverFromSnapshotCrash` invoked on a db with the marker present
+#      MUST: clear cfUtxo, reset the tip pointer to all-zeros / height 0,
+#      delete the marker. Returns true.
+#
+#   3. `recoverFromSnapshotCrash` invoked on a db WITHOUT the marker MUST
+#      be a no-op. Returns false. UTXOs + tip pointer untouched.
+#
+#   4. Re-opening the database (via `openChainDb`) auto-runs the recovery,
+#      so if a previous process crashed mid-loadtxoutset (marker set, tip
+#      not yet committed, cfUtxo half-populated), the next open lands in
+#      the clean "genesis-sentinel" state ready for the operator to re-run
+#      loadtxoutset.
+#
+#   5. A successful `loadSnapshot` (happy path, when the chain happens to
+#      meet the assumeutxo whitelist) MUST clear the marker as part of the
+#      final commit batch — so subsequent re-opens are no-op'd by recovery.
+#      We cover the negative path (load fails → marker stays set) and the
+#      successful-helper path (manual begin + commit clears it).
+#
+# Reference: ouroboros snapshot.py / ferrous-utils sync db.rs +
+#            CORE-PARITY-AUDIT/_chainstate-atomicity-family-2026-05-26.md
+# ----------------------------------------------------------------------------
+
+import ../src/storage/db as snapshot_db
+
+suite "FIX-D — snapshot-load atomicity":
+  test "marker round-trips (write + read + has + delete) via cfMeta":
+    let testDir = getTempDir() / "nimrod_fixd_marker_roundtrip"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    var cs = newChainState(dbDir, regtestParams())
+    defer: cs.close()
+
+    check cs.db.hasSnapshotLoadMarker() == false
+    check cs.db.getSnapshotLoadMarker().isNone
+
+    let baseHash = BlockHash(mkHashWith([0xF1'u8, 0xD0, 0xBE, 0xEF]))
+    cs.db.writeSnapshotLoadMarker(baseHash, 840_000'i32)
+
+    check cs.db.hasSnapshotLoadMarker() == true
+    let m = cs.db.getSnapshotLoadMarker()
+    check m.isSome
+    check m.get().baseBlockhash == baseHash
+    check m.get().baseHeight == 840_000'i32
+
+  test "marker survives close + re-open of the database":
+    # The whole point of the marker is to be readable on the NEXT process —
+    # so we round-trip across close+reopen, which is what crash-recovery does.
+    let testDir = getTempDir() / "nimrod_fixd_marker_persist"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let baseHash = BlockHash(mkHashWith([0xC0'u8, 0xCA, 0xC0, 0x1A]))
+    block writePhase:
+      var cs = newChainState(dbDir, regtestParams())
+      cs.db.writeSnapshotLoadMarker(baseHash, 12345'i32)
+      check cs.db.hasSnapshotLoadMarker()
+      cs.close()
+
+    # Re-open: openChainDb now auto-clears the marker via
+    # `recoverFromSnapshotCrash` (item 4 of the contract).  Verify the
+    # marker DOES get cleared on reopen AND the tip is reset to the
+    # genesis sentinel (bestHeight=0, bestBlockHash=all-zeros) because
+    # there are no committed UTXOs above it.
+    block recoveryPhase:
+      var cs2 = newChainState(dbDir, regtestParams())
+      defer: cs2.close()
+      check cs2.db.hasSnapshotLoadMarker() == false  # auto-cleared
+      check cs2.bestHeight == 0                      # genesis sentinel
+      check cs2.bestBlockHash == BlockHash(default(array[32, byte]))
+
+  test "crash-mid-load recovery: marker + partial UTXOs -> cleared on reopen":
+    # Simulate the failure mode FIX-D fixes:
+    #   1. operator runs `loadtxoutset`
+    #   2. Phase 1 writes the SNAPSHOT_LOAD_IN_PROGRESS marker
+    #   3. Phase 2 writes some chunk of UTXOs to cfUtxo (the "partial load")
+    #   4. SIGKILL fires BEFORE the Phase 3 commit batch (no tip update,
+    #      no marker delete)
+    #   5. next process opens the database — must observe a clean slate
+    #
+    # Without FIX-D: the cfUtxo half-populated, the tip still points at
+    # the old chain, the marker is absent. New blocks would validate
+    # against a corrupt UTXO set.
+    # With FIX-D: the marker is present → recovery wipes cfUtxo + resets
+    # the tip → operator re-runs loadtxoutset.
+    let testDir = getTempDir() / "nimrod_fixd_crash_recovery"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let baseHash = BlockHash(mkHashWith([0x12'u8, 0x34, 0x56, 0x78]))
+    let baseHeight = 840_000'i32
+    let partialTxid = TxId(mkHashWith([0xAB'u8, 0xCD, 0xEF, 0x01]))
+    let partialOp = OutPoint(txid: partialTxid, vout: 0'u32)
+
+    block crashPhase:
+      var cs = newChainState(dbDir, regtestParams())
+      # Phase 1: mark the snapshot load in progress.
+      cs.db.writeSnapshotLoadMarker(baseHash, baseHeight)
+      # Phase 2: write a partial UTXO (mimic the per-chunk WriteBatch
+      # landing one or more coins before the SIGKILL).
+      cs.db.putUtxo(partialOp, UtxoEntry(
+        output: TxOut(value: Satoshi(50_00000000),
+                      scriptPubKey: @[0x51'u8]),
+        height: baseHeight,
+        isCoinbase: false
+      ))
+      # SIGKILL simulation: close WITHOUT writing the Phase 3 commit
+      # batch. The marker stays set, the partial UTXO stays in cfUtxo.
+      check cs.db.hasUtxo(partialOp)
+      check cs.db.hasSnapshotLoadMarker()
+      cs.close()
+
+    block recoveryPhase:
+      var cs2 = newChainState(dbDir, regtestParams())
+      defer: cs2.close()
+      # All three invariants of FIX-D recovery must hold:
+      #   - marker is gone (cleared by recoverFromSnapshotCrash)
+      #   - the partial UTXO is gone (cfUtxo was wiped)
+      #   - the tip points at the genesis sentinel, so block validation
+      #     can NOT continue from the half-loaded snapshot
+      check cs2.db.hasSnapshotLoadMarker() == false
+      check cs2.db.hasUtxo(partialOp) == false
+      check cs2.bestHeight == 0
+      check cs2.bestBlockHash == BlockHash(default(array[32, byte]))
+
+  test "recoverFromSnapshotCrash is a no-op when no marker is set":
+    # The reverse contract: on a healthy database (no in-progress load),
+    # recovery MUST NOT touch the tip pointer or the UTXO set.
+    let testDir = getTempDir() / "nimrod_fixd_noop_recovery"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let healthyTxid = TxId(mkHashWith([0x42'u8]))
+    let healthyOp = OutPoint(txid: healthyTxid, vout: 0'u32)
+    let healthyTip = BlockHash(mkHashWith([0x99'u8, 0x88, 0x77]))
+
+    var cs = newChainState(dbDir, regtestParams())
+    defer: cs.close()
+
+    cs.db.putUtxo(healthyOp, UtxoEntry(
+      output: TxOut(value: Satoshi(1_00000000), scriptPubKey: @[0x51'u8]),
+      height: 100'i32,
+      isCoinbase: false
+    ))
+    cs.db.updateBestBlock(healthyTip, 100'i32)
+
+    check cs.db.recoverFromSnapshotCrash() == false
+    check cs.db.hasUtxo(healthyOp) == true
+    check cs.db.bestBlockHash == healthyTip
+    check cs.db.bestHeight == 100'i32
+
+  test "marker payload is exactly 36 bytes (32-byte hash + 4-byte LE height)":
+    # Pins the on-disk layout — future cross-impl tooling (incl. ouroboros)
+    # can parse the marker byte-identically.
+    let testDir = getTempDir() / "nimrod_fixd_marker_payload"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    var cs = newChainState(dbDir, regtestParams())
+    defer: cs.close()
+
+    let baseHash = BlockHash(mkHashWith([0xDE'u8, 0xAD]))
+    cs.db.writeSnapshotLoadMarker(baseHash, 0x01020304'i32)
+
+    # Read raw bytes via the low-level db interface.
+    let raw = cs.db.db.get(snapshot_db.cfMeta,
+                           snapshot_db.metaKey(SnapshotLoadMarkerKey))
+    check raw.isSome
+    check raw.get().len == 36
+    # Last four bytes are LE height = 0x04 03 02 01.
+    check raw.get()[32] == 0x04'u8
+    check raw.get()[33] == 0x03'u8
+    check raw.get()[34] == 0x02'u8
+    check raw.get()[35] == 0x01'u8
+    # First 32 bytes are the raw blockhash.
+    let hashBytes = array[32, byte](baseHash)
+    for i in 0 ..< 32:
+      check raw.get()[i] == hashBytes[i]
+
+  test "happy-path commit clears the marker (no recovery on reopen)":
+    # Mimic the Phase 1 / Phase 3 pair that `loadSnapshot` runs on the
+    # happy path: write the marker, then commit the tip + delete the
+    # marker in one synced WriteBatch. After this, reopening the database
+    # must NOT trigger recovery, the marker is gone, and the tip survives.
+    let testDir = getTempDir() / "nimrod_fixd_happy_commit"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let snapshotTip = BlockHash(mkHashWith([0xAB'u8, 0xBA]))
+    let snapshotHeight = 840_000'i32
+
+    block commitPhase:
+      var cs = newChainState(dbDir, regtestParams())
+      # Phase 1 — begin.
+      cs.db.writeSnapshotLoadMarker(snapshotTip, snapshotHeight)
+      check cs.db.hasSnapshotLoadMarker()
+
+      # Phase 3 — commit (single batch fuses tip + height + marker delete).
+      let batch = cs.db.db.newWriteBatch()
+      defer: batch.destroy()
+      batch.put(snapshot_db.cfMeta, snapshot_db.metaKey("bestblock"),
+                @(array[32, byte](snapshotTip)))
+      var w = BinaryWriter()
+      w.writeInt32LE(snapshotHeight)
+      batch.put(snapshot_db.cfMeta, snapshot_db.metaKey("height"), w.data)
+      batch.delete(snapshot_db.cfMeta,
+                   snapshot_db.metaKey(SnapshotLoadMarkerKey))
+      cs.db.db.writeSynced(batch)
+
+      check cs.db.hasSnapshotLoadMarker() == false
+      cs.close()
+
+    # Re-open: recovery does NOT fire (no marker), tip survives.
+    block reopenPhase:
+      var cs2 = newChainState(dbDir, regtestParams())
+      defer: cs2.close()
+      check cs2.db.hasSnapshotLoadMarker() == false
+      check cs2.bestBlockHash == snapshotTip
+      check cs2.bestHeight == snapshotHeight
+
+  test "loadSnapshot failure leaves marker set (next-boot recovery will fire)":
+    # loadSnapshot fails the content-hash check on a junk snapshot — but
+    # because Phase 1 already wrote the marker before the per-coin loop,
+    # a crash here leaves the marker on disk so next-boot recovery can
+    # clear the half-loaded state. We assert that path: after a failed
+    # loadSnapshot the marker remains, and re-opening the database
+    # triggers the recovery (genesis sentinel).
+    let testDir = getTempDir() / "nimrod_fixd_failure_marker"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    let mainnet = mainnetParams()
+
+    # Build a snapshot whose base_blockhash IS in the assumeutxo whitelist
+    # (so we get past validateSnapshotMetadata) and whose body declares
+    # one coin that we make WAY out of MoneyRange — Phase 2's B2 check
+    # will reject it AFTER Phase 1 has written the marker.
+    let snapPath = testDir / "junk.dat"
+    block:
+      var w = BinaryWriter()
+      let meta = SnapshotMetadata(
+        version: SnapshotVersion,
+        networkMagic: mainnet.networkMagic,
+        baseBlockhash: mainnet.assumeutxoData[0].blockhash,
+        coinsCount: 1
+      )
+      w.writeSnapshotMetadata(meta)
+      # txid group: txid + coins_per_txid=1
+      let txid = TxId(mkHashWith([0xBA'u8, 0xD0]))
+      w.writeTxId(txid)
+      w.writeCompactSize(1)
+      # one coin: vout=0, code=0 (height 0, not coinbase),
+      # value=compressAmount of an int64 that decompresses out of range.
+      # Easier: use B1 (height > base_height): code = (basHeight+1) << 1.
+      w.writeCompactSize(0)
+      let badCode = uint64(mainnet.assumeutxoData[0].height + 1'i32) * 2'u64
+      w.writeVarInt(badCode)  # height > base_height → B1 fires
+      w.writeVarInt(compressAmount(1_00000000'u64))
+      # tiny P2PKH-ish script
+      w.writeCompressedScript(@[0x76'u8, 0xA9, 0x14] & newSeq[byte](20) &
+                              @[0x88'u8, 0xAC])
+      let f = open(snapPath, fmWrite)
+      discard f.writeBytes(w.data, 0, w.data.len)
+      f.close()
+
+    block loadAttempt:
+      var cs = newChainState(dbDir, mainnet)
+      let res = loadSnapshot(snapPath, cs, mainnet, mainnet.assumeutxoData)
+      check res.success == false
+      # B1 fires partway through Phase 2 — marker is still set because
+      # Phase 3 commit (the marker-delete) never ran.
+      check cs.db.hasSnapshotLoadMarker() == true
+      cs.close()
+
+    # On reopen, the auto-recovery in openChainDb fires.
+    block reopen:
+      var cs2 = newChainState(dbDir, mainnet)
+      defer: cs2.close()
+      check cs2.db.hasSnapshotLoadMarker() == false
+      check cs2.bestHeight == 0
+      check cs2.bestBlockHash == BlockHash(default(array[32, byte]))
+
+  test "clearUtxoColumnFamily removes every cfUtxo entry":
+    # Direct contract test for the helper that backs recoverFromSnapshotCrash.
+    # We seed N coins, call clear, and verify nothing remains.
+    let testDir = getTempDir() / "nimrod_fixd_clear_utxo"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let dbDir = testDir / "cs"
+    createDir(dbDir)
+
+    var cs = newChainState(dbDir, regtestParams())
+    defer: cs.close()
+
+    for i in 0 ..< 20:
+      let txid = TxId(mkHashWith([byte(i)]))
+      cs.db.putUtxo(OutPoint(txid: txid, vout: 0'u32), UtxoEntry(
+        output: TxOut(value: Satoshi(int64(i + 1) * 1_00000000),
+                      scriptPubKey: @[0x51'u8]),
+        height: int32(i + 1),
+        isCoinbase: false
+      ))
+
+    # Sanity: at least the first coin is in the db.
+    check cs.db.hasUtxo(OutPoint(txid: TxId(mkHashWith([0'u8])), vout: 0))
+
+    cs.db.clearUtxoColumnFamily()
+
+    var anyLeft = false
+    for _ in cs.db.db.iterCf(snapshot_db.cfUtxo):
+      anyLeft = true
+      break
+    check anyLeft == false
