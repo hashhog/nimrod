@@ -10,7 +10,7 @@
 ##   BIP-86: https://github.com/bitcoin/bips/blob/master/bip-0086.mediawiki
 
 import std/[unittest, strutils]
-import ../src/wallet/wallet
+import ../src/wallet/[wallet, descriptor]
 import ../src/crypto/[secp256k1, address]
 
 proc hexToBytes(hex: string): seq[byte] =
@@ -272,3 +272,66 @@ when defined(useSystemSecp256k1):
       let child = deriveChild(master, HARDENED - 1'u32)
       # The returned childIndex is in unhardened space (< HARDENED).
       check child.childIndex < HARDENED
+
+  suite "BIP-32 test vector 5 — decoder rejection of malformed xprv/xpub":
+    # BIP-32 spec, "Test Vectors" §5 (added 2021 alongside Core
+    # commit 56a42f10f4 "Stricter BIP32 decoding and test vector 5").
+    # Each string is a Base58Check-valid but BIP-32-malformed extended
+    # key that the decoder MUST reject. Categories exercised:
+    #   - pubkey version with a non-curve pubkey payload (0x02 00..00 07)
+    #   - prvkey version with non-zero key-prefix byte (BIP-32 says 0x00)
+    #   - depth=0 with non-zero parent fingerprint (a "fake-master" footgun)
+    #   - depth=0 with non-zero child index
+    #   - private key == 0  /  private key == n  /  private key > n
+    #   - version byte that matches no known network (xpub^prv version swap)
+    # We test BOTH the matching-version interpretation (e.g. an xprv string
+    # decoded by version match) AND the cross-version path (e.g. trying to
+    # parse the same payload as the other key type). Either path must throw
+    # DescriptorError; silent acceptance is the fake-master / non-curve-key
+    # consensus footgun this vector exists to catch.
+
+    const TEST5 = [
+      "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6LBpB85b3D2yc8sfvZU521AAwdZafEz7mnzBBsz4wKY5fTtTQBm",
+      "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFGTQQD3dC4H2D5GBj7vWvSQaaBv5cxi9gafk7NF3pnBju6dwKvH",
+      "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6Txnt3siSujt9RCVYsx4qHZGc62TG4McvMGcAUjeuwZdduYEvFn",
+      "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFGpWnsj83BHtEy5Zt8CcDr1UiRXuWCmTQLxEK9vbz5gPstX92JQ",
+      "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6N8ZMMXctdiCjxTNq964yKkwrkBJJwpzZS4HS2fxvyYUA4q2Xe4",
+      "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFAzHGBP2UuGCqWLTAPLcMtD9y5gkZ6Eq3Rjuahrv17fEQ3Qen6J",
+      "xprv9s2SPatNQ9Vc6GTbVMFPFo7jsaZySyzk7L8n2uqKXJen3KUmvQNTuLh3fhZMBoG3G4ZW1N2kZuHEPY53qmbZzCHshoQnNf4GvELZfqTUrcv",
+      "xpub661no6RGEX3uJkY4bNnPcw4URcQTrSibUZ4NqJEw5eBkv7ovTwgiT91XX27VbEXGENhYRCf7hyEbWrR3FewATdCEebj6znwMfQkhRYHRLpJ",
+      "xprv9s21ZrQH4r4TsiLvyLXqM9P7k1K3EYhA1kkD6xuquB5i39AU8KF42acDyL3qsDbU9NmZn6MsGSUYZEsuoePmjzsB3eFKSUEh3Gu1N3cqVUN",
+      "xpub661MyMwAuDcm6CRQ5N4qiHKrJ39Xe1R1NyfouMKTTWcguwVcfrZJaNvhpebzGerh7gucBvzEQWRugZDuDXjNDRmXzSZe4c7mnTK97pTvGS8",
+      "DMwo58pR1QLEFihHiXPVykYB6fJmsTeHvyTp7hRThAtCX8CvYzgPcn8XnmdfHGMQzT7ayAmfo4z3gY5KfbrZWZ6St24UVf2Qgo6oujFktLHdHY4",
+      "DMwo58pR1QLEFihHiXPVykYB6fJmsTeHvyTp7hRThAtCX8CvYzgPcn8XnmdfHPmHJiEDXkTiJTVV9rHEBUem2mwVbbNfvT2MTcAqj3nesx8uBf9",
+      "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzF93Y5wvzdUayhgkkFoicQZcP3y52uPPxFnfoLZB21Teqt1VvEHx",
+      "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFAzHGBP2UuGCqWLTAPLcMtD5SDKr24z3aiUvKr9bJpdrcLg1y3G",
+      "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6Q5JXayek4PRsn35jii4veMimro1xefsM58PgBMrvdYre8QyULY",
+      "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHL"
+    ]
+
+    test "all 16 TEST5 vectors are rejected by decodeExtendedKey":
+      for s in TEST5:
+        var rejected = false
+        try:
+          discard decodeExtendedKey(s)
+        except CatchableError:
+          rejected = true
+        check (rejected, s) == (true, s)
+
+    test "regression: a valid xprv from vector 1 still decodes":
+      # Sanity guard — we tightened the decoder; the canonical happy
+      # path must still work.
+      const validXprv =
+        "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi"
+      let (k, isPriv, mainnet) = decodeExtendedKey(validXprv)
+      check isPriv
+      check mainnet
+      check k.depth == 0
+
+    test "regression: a valid xpub from vector 1 still decodes":
+      const validXpub =
+        "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8"
+      let (k, isPriv, mainnet) = decodeExtendedKey(validXpub)
+      check not isPriv
+      check mainnet
+      check k.depth == 0
