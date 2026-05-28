@@ -1241,9 +1241,43 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
   if accepted > 0:
     sm.unconnectingHeaders.del(getPeerId(peer))
 
-  # If we received 2000 headers, request more
+  # If we received 2000 headers, request more.
+  #
+  # When the peer is mid-flight in a PRESYNC/REDOWNLOAD low-work sync the
+  # next getheaders MUST resume from the per-phase continuation hash
+  # (lastHeaderHash in PRESYNC, redownloadBufferLastHash in REDOWNLOAD),
+  # NOT from the main headerChain tip.  buildBlockLocator() uses the main
+  # chain tip and confuses the peer mid-REDOWNLOAD: the peer replies with
+  # headers continuing from tip, REDOWNLOAD's validateAndStoreRedownloadedHeader
+  # rejects them (prevBlock != redownloadBufferLastHash), the sync state
+  # finalises to Done, and the entire low-work pipeline tears down after
+  # the very first batch popped out of REDOWNLOAD.  Observed 2026-05-28
+  # (8h of restart.log: 715 "low-work header sync failed state=Done", 0
+  # "low-work header sync complete", headerChain crawled +782 per cycle
+  # because that's exactly redownloadBufferSize-overflow per pop).  See
+  # CORE-PARITY-AUDIT/_nimrod-presync-part3-2026-05-28.md.
   if headers.len >= MaxHeadersPerRequest:
-    await sm.requestHeaders(peer)
+    let peerId = getPeerId(peer)
+    if peerId in sm.peerHeadersSync and
+       sm.peerHeadersSync[peerId].getState() != Done:
+      let locator = sm.buildPresyncLocator(sm.peerHeadersSync[peerId])
+      if locator.len > 0:
+        try:
+          await peer.sendGetHeaders(
+            locator.mapIt(BlockHash(it)),
+            BlockHash(default(array[32, byte])))
+          sm.lastSyncTime = getTime()
+          info "requested headers", peer = $peer,
+               locatorLen = locator.len, tipHeight = sm.headerChain.tipHeight
+        except CatchableError as e:
+          warn "requestHeaders (presync continuation) send failed",
+               peer = $peer, error = e.msg
+          if sm.syncPeer == peer:
+            sm.syncPeer = nil
+      else:
+        await sm.requestHeaders(peer)
+    else:
+      await sm.requestHeaders(peer)
   else:
     # Received less than 2000 = reached peer's tip
     info "reached header tip", height = sm.headerChain.tipHeight
