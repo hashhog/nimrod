@@ -638,13 +638,24 @@ proc selectSyncPeer*(sm: SyncManager): Peer =
   ## Select the best peer for syncing (highest reported height)
   sm.peerManager.getBestPeer()
 
-proc buildBlockLocator*(sm: SyncManager): seq[array[32, byte]] =
-  ## Build block locator with exponential backoff
-  ## Returns hashes at heights: tip, tip-1, ..., tip-9, tip-11, tip-15, ..., 0
+proc buildLocatorFromHeight*(sm: SyncManager, startHeight: int32):
+    seq[array[32, byte]] =
+  ## Build a block locator with exponential backoff starting from `startHeight`.
+  ## Equivalent of Bitcoin Core's chain.cpp::LocatorEntries(index): collect
+  ## hashes at heights startHeight, startHeight-1, ..., startHeight-9, then
+  ## doubling step back to 0, always terminating with the genesis hash.
+  ##
+  ## Used by both buildBlockLocator (startHeight == headerChain.tipHeight) and
+  ## the PRESYNC/REDOWNLOAD locator path (startHeight == chainStartHeight): the
+  ## latter previously sent only two entries (lastHeaderHash + chainStartHash),
+  ## so a peer that had pruned or simply did not recognise either would either
+  ## return no headers or silently restart at chain_start, causing the next
+  ## PRESYNC batch's continuity check to fail and the entire low-work pipeline
+  ## to tear down — see CORE-PARITY-AUDIT/_nimrod-presync-part2-2026-05-27.md.
   result = @[]
 
   var step = 1
-  var height = sm.headerChain.tipHeight
+  var height = startHeight
 
   while height >= 0:
     let hashOpt = sm.headerChain.getHashByHeight(height)
@@ -661,6 +672,11 @@ proc buildBlockLocator*(sm: SyncManager): seq[array[32, byte]] =
   let genesisHash = array[32, byte](sm.params.genesisBlockHash)
   if result.len == 0 or result[^1] != genesisHash:
     result.add(genesisHash)
+
+proc buildBlockLocator*(sm: SyncManager): seq[array[32, byte]] =
+  ## Build block locator with exponential backoff
+  ## Returns hashes at heights: tip, tip-1, ..., tip-9, tip-11, tip-15, ..., 0
+  sm.buildLocatorFromHeight(sm.headerChain.tipHeight)
 
 # =============================================================================
 # Anti-DoS Header Sync (PRESYNC/REDOWNLOAD)
@@ -856,6 +872,47 @@ proc isContinuationOfLowWorkHeadersSync*(sm: SyncManager, peer: Peer,
   headers = result.powValidatedHeaders
   true
 
+proc buildPresyncLocator*(sm: SyncManager,
+                          syncState: HeadersSyncState):
+    seq[array[32, byte]] =
+  ## Build a full getheaders locator for an in-flight PRESYNC/REDOWNLOAD sync.
+  ##
+  ## Mirrors Bitcoin Core's HeadersSyncState::NextHeadersRequestLocator()
+  ## (headerssync.cpp:296): the locator starts with the per-phase "where to
+  ## continue from" hash (lastHeaderHash in PRESYNC, redownloadBufferLastHash
+  ## in REDOWNLOAD) and is followed by the exponential-backoff locator built
+  ## from chain_start back to genesis (Core's chain.cpp::LocatorEntries).
+  ##
+  ## Previously nimrod only sent two entries (continue-from-hash +
+  ## chainStartHash).  When the chosen sync peer had not yet seen our most
+  ## recent commitment-only header (the common case during PRESYNC, because
+  ## those headers are never relayed — they only live in the PRESYNC state
+  ## machine), the peer fell back to chainStartHash and replied with the SAME
+  ## batch over and over.  The next PRESYNC continuity check
+  ## (headers[0].prevBlock == state.lastHeaderHash) then failed because the
+  ## peer was sending headers starting at chainStartHash+1, not at
+  ## lastHeaderHash+1.  PRESYNC torn down, REDOWNLOAD never reached,
+  ## headerChain advanced only via the eventual fall-through into the
+  ## direct-acceptance loop (~782 headers per ~90-second cycle, observed
+  ## 2026-05-27 — see CORE-PARITY-AUDIT/_nimrod-presync-part2-2026-05-27.md).
+  result = @[]
+
+  if syncState.getState() == Presync:
+    result.add(array[32, byte](syncState.lastHeaderHash))
+  elif syncState.getState() == Redownload:
+    result.add(array[32, byte](syncState.redownloadBufferLastHash))
+  else:
+    # Done — nothing meaningful to request.
+    return
+
+  # Append the chain_start exponential-backoff locator.  Skip the first entry
+  # if it duplicates the chainStartHash we'd otherwise emit twice.
+  let chainStartLocator =
+    sm.buildLocatorFromHeight(int32(syncState.chainStartHeight))
+  for h in chainStartLocator:
+    if result.len == 0 or result[^1] != h:
+      result.add(h)
+
 proc cleanupPeerHeadersSync*(sm: SyncManager, peerId: int64) =
   ## Clean up header sync state for a disconnected peer
   sm.peerHeadersSync.del(peerId)
@@ -1011,9 +1068,12 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
       if getPeerId(peer) in sm.peerHeadersSync:
         let syncState = sm.peerHeadersSync[getPeerId(peer)]
         if syncState.getState() != Done:
-          let locator = syncState.nextHeadersRequestLocator()
+          # Full chain_start exponential locator (Core parity, headerssync.cpp:296).
+          let locator = sm.buildPresyncLocator(syncState)
           if locator.len > 0:
-            await peer.sendGetHeaders(locator, BlockHash(default(array[32, byte])))
+            await peer.sendGetHeaders(
+              locator.mapIt(BlockHash(it)),
+              BlockHash(default(array[32, byte])))
       return
     # Otherwise, fall through to normal processing with validated headers
   elif headersToProcess.len > 0:
@@ -1070,9 +1130,12 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
           if getPeerId(peer) in sm.peerHeadersSync:
             let syncState = sm.peerHeadersSync[getPeerId(peer)]
             if syncState.getState() != Done:
-              let locator = syncState.nextHeadersRequestLocator()
+              # Full chain_start exponential locator (Core parity, headerssync.cpp:296).
+              let locator = sm.buildPresyncLocator(syncState)
               if locator.len > 0:
-                await peer.sendGetHeaders(locator, BlockHash(default(array[32, byte])))
+                await peer.sendGetHeaders(
+                  locator.mapIt(BlockHash(it)),
+                  BlockHash(default(array[32, byte])))
           return
         # tryLowWorkHeadersSync may also hand back PoW-validated headers
         # for direct storage (the REDOWNLOAD output path); those have
