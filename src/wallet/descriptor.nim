@@ -306,15 +306,42 @@ proc decodeExtendedKey*(s: string): tuple[key: ExtendedKey, isPrivate: bool, mai
   copyMem(addr key.chainCode[0], addr data[13], 32)
   key.isPrivate = isPrivate
 
+  # BIP-32 vector #5 (Core key.cpp::CExtKey::Decode + pubkey.cpp::CExtPubKey::Decode,
+  # commit 56a42f10f4): a master key (depth=0) MUST have zero parent fingerprint
+  # AND zero child index; otherwise the xprv/xpub is malformed and must be
+  # rejected. This catches the "fake-master" footgun where an interior node is
+  # mis-serialised with depth=0.
+  if key.depth == 0:
+    var fpZero = true
+    for b in key.parentFingerprint:
+      if b != 0:
+        fpZero = false
+        break
+    if not fpZero or key.childIndex != 0:
+      raise newException(DescriptorError,
+        "invalid extended key: depth=0 must have zero parent fingerprint and child index")
+
   if isPrivate:
-    # Private key: 0x00 + 32 bytes
+    # Private key: 0x00 + 32 bytes. The 0x00 prefix byte is BIP-32 vector #5's
+    # "invalid private key prefix" rejection (Core: `code[41] != 0`).
     if data[45] != 0:
       raise newException(DescriptorError, "invalid private key encoding")
     copyMem(addr key.key[0], addr data[46], 32)
-    key.publicKey = derivePublicKey(key.key)
+    # derivePublicKey raises on seckey == 0 or seckey >= n — closes BIP-32
+    # vector #5 cases (private key 0 / private key n+1).
+    try:
+      key.publicKey = derivePublicKey(key.key)
+    except CatchableError as e:
+      raise newException(DescriptorError,
+        "invalid extended private key: " & e.msg)
   else:
-    # Public key: 33 bytes
+    # Public key: 33 bytes. BIP-32 vector #5 includes an "invalid pubkey
+    # 02 00...07" string that base58-decodes cleanly but is not on the curve;
+    # we must reject it by fully parsing through libsecp.
     copyMem(addr key.publicKey[0], addr data[45], 33)
+    if decompressPubkey(key.publicKey).len == 0:
+      raise newException(DescriptorError,
+        "invalid extended public key: pubkey is not on the secp256k1 curve")
 
   (key, isPrivate, mainnet)
 
