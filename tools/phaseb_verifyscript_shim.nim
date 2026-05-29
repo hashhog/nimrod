@@ -44,6 +44,22 @@
 ##             {"valid":false,"reason":"..."}   (>=1 input failed)
 ##             {"error":"..."}                  (could not evaluate -> skip)
 ##
+## Third op `checktx` (CheckTransaction-level, context-free structural
+## validation): mirrors bitcoin-core/src/consensus/tx_check.cpp::
+## CheckTransaction. These are the checks `verifytx` (per-input VerifyScript
+## only) cannot catch — empty vin/vout, output value range and running
+## total, duplicate inputs, oversize, coinbase scriptSig length, and a null
+## prevout in a non-coinbase. We deserialize tx_hex and call nimrod's OWN
+## `checkTransaction` (src/consensus/validation.nim:1620) so the harness
+## exercises nimrod's consensus code, not a reimplementation in the shim.
+## No UTXO/chain state is needed (params is passed but only the context-free
+## gates G1..G9 run; mainnetParams() is a placeholder the proc never reads).
+##
+##   request:  {"op":"checktx","tx_hex":"..."}
+##   response: {"valid":true}                   (structurally valid)
+##             {"valid":false,"reason":"..."}   (CheckTransaction rejected)
+##             {"error":"..."}                  (could not deserialize)
+##
 ## Lives inside the nimrod submodule (not the meta-repo) so the local
 ## `nim.cfg` (-d:useSystemSecp256k1, library linkage) and the nimble dep
 ## paths in config.nims apply when compiling.
@@ -52,6 +68,7 @@ import std/[json, strutils, tables]
 import ../src/primitives/types
 import ../src/primitives/serialize
 import ../src/script/interpreter
+import ../src/consensus/validation
 
 proc hexDecode(s: string): seq[byte] =
   if s.len mod 2 != 0:
@@ -258,12 +275,32 @@ proc processVerifyTx(req: JsonNode): string =
 
   result = """{"valid":true}"""
 
+## CheckTransaction-level (context-free, structural) validation. Mirrors
+## bitcoin-core/src/consensus/tx_check.cpp::CheckTransaction by delegating
+## to nimrod's OWN `checkTransaction` (src/consensus/validation.nim:1620),
+## so a divergence here is a nimrod consensus bug, not a shim bug. No
+## UTXO/chain state is needed — only the context-free gates G1..G9 run
+## (vin/vout non-empty, oversize, output value range + running total,
+## duplicate inputs, coinbase scriptSig length, non-coinbase null prevout).
+## `params` is required by the signature but never read by those gates, so
+## mainnetParams() is a placeholder.
+proc processCheckTx(req: JsonNode): string =
+  let txBytes = hexDecode(req["tx_hex"].getStr())
+  let tx = deserializeTransaction(txBytes)
+  let res = checkTransaction(tx, mainnetParams())
+  if res.isOk:
+    result = """{"valid":true}"""
+  else:
+    result = """{"valid":false,"reason":"""" &
+      jsonEscape($res.error) & "\"}"
+
 proc process(line: string): string =
   let req = parseJson(line)
   let op = if req.hasKey("op"): req["op"].getStr() else: "verifyscript"
   case op
   of "verifyscript": processVerifyScript(req)
   of "verifytx": processVerifyTx(req)
+  of "checktx": processCheckTx(req)
   else: raise newException(ValueError, "unknown op: " & op)
 
 proc main() =
