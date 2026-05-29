@@ -68,6 +68,10 @@ type
     seSchnorrSigSize = "schnorr signature length must be 64 or 65 (BIP-340)"
     seSchnorrSigHashtype = "invalid schnorr sighash byte (BIP-341)"
     seSchnorrSig = "schnorr signature verification failed (BIP-340)"
+    # SCRIPT_VERIFY_CONST_SCRIPTCODE (interpreter.cpp:330-332, 1146-1148):
+    # with this flag set, FindAndDelete actually removing a push from the
+    # scriptCode (found > 0) is a hard error in pre-segwit (BASE) execution.
+    seSigFindAndDelete = "found pushed signature in scriptCode (CONST_SCRIPTCODE)"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -95,6 +99,10 @@ type
     sfDiscourageUpgradablePubkeyType  # BIP-342: discourage unknown pubkey lengths
                                        # in tapscript CHECKSIG/CHECKSIGADD
                                        # (Core SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE)
+    sfConstScriptCode  # SCRIPT_VERIFY_CONST_SCRIPTCODE: FindAndDelete removing a
+                       # push from the scriptCode (or OP_CODESEPARATOR in a
+                       # pre-segwit script) is a hard error
+                       # (Core SCRIPT_VERIFY_CONST_SCRIPTCODE)
 
   SigVersion* = enum
     sigBase = 0        # Legacy scripts
@@ -1687,8 +1695,13 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
               scriptCode = script[int(interp.codesepPos) ..< script.len]
             else:
               scriptCode = @script
-            # FindAndDelete - only for legacy
+            # FindAndDelete - only for legacy. Per Core interpreter.cpp:330-332,
+            # if FindAndDelete actually removed a push (found > 0) and
+            # CONST_SCRIPTCODE is set, this is a hard error (SCRIPT_ERR_SIG_FINDANDDELETE).
+            let scriptCodeBefore = scriptCode
             scriptCode = findAndDelete(scriptCode, sig)
+            if scriptCode != scriptCodeBefore and sfConstScriptCode in interp.flags:
+              return seSigFindAndDelete
 
             let sighash = computeSighashLegacy(ctx.tx, ctx.inputIndex, scriptCode, hashType)
             # W160 BUG-11 fix: per-sig cache keyed on (sighash, pubkey, sig) —
@@ -1879,6 +1892,24 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
         return seInvalidStack
       let dummy = interp.pop()
 
+      # CONST_SCRIPTCODE FindAndDelete reject (Core interpreter.cpp:1142-1150):
+      # in pre-segwit (BASE) execution Core runs FindAndDelete for EVERY pushed
+      # signature over the scriptCode BEFORE the verification loop, and if any
+      # removal happened (found > 0) while CONST_SCRIPTCODE is set it is a hard
+      # error. Done here as a standalone pass to match Core's ordering (fires
+      # before encoding checks / verification).
+      if ctx.sigVersion == sigBase and sfConstScriptCode in interp.flags:
+        var fadScriptCode: seq[byte]
+        if interp.codesepPos != 0xFFFFFFFF'u32 and int(interp.codesepPos) <= script.len:
+          fadScriptCode = script[int(interp.codesepPos) ..< script.len]
+        else:
+          fadScriptCode = @script
+        for s in sigs:
+          let before = fadScriptCode
+          fadScriptCode = findAndDelete(fadScriptCode, s)
+          if fadScriptCode != before:
+            return seSigFindAndDelete
+
       # Verify signatures
       var success = true
       var iSig = 0
@@ -2006,8 +2037,15 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
         if (uint32(sequence) and SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0:
           discard
         else:
-          # Check tx version
-          if ctx.tx.version < 2:
+          # Check tx version. Core (interpreter.cpp:1790) compares
+          # `txTo->version < 2` where version is uint32_t — an UNSIGNED
+          # comparison. nimrod stores version as int32, so a high-bit-set
+          # version (e.g. 0xFFFFFFFF) would be negative and spuriously fail a
+          # signed `< 2`. Compare the raw bits as uint32 to match Core, so a
+          # tx with version 0xFFFFFFFF (= 4294967295u, NOT < 2) satisfies the
+          # BIP-68 version gate. (tx_valid case: "Valid CHECKSEQUENCEVERIFY
+          # even with negative tx version number".)
+          if cast[uint32](ctx.tx.version) < 2'u32:
             return seUnsatisfiedLocktime
 
           let txSequence = ctx.tx.inputs[ctx.inputIndex].sequence

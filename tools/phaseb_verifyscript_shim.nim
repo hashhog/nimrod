@@ -22,11 +22,33 @@
 ##             {"result":false,"reason":"..."}  (reject)
 ##             {"error":"..."}                  (could not evaluate)
 ##
+## Second op `verifytx` (for tx_valid.json / tx_invalid.json): unlike
+## `verifyscript` (which rebuilds Core's synthetic credit/spend pair),
+## these vectors give a REAL serialized multi-input tx, so the sighash
+## must be computed over THAT tx. Mirrors
+## bitcoin-core/src/test/transaction_tests.cpp::CheckTxScripts: deserialize
+## tx_hex with nimrod's OWN deserializer (parses the segwit marker/flag +
+## per-input witnesses), build the prevout->(scriptPubKey, amount) map,
+## then run verifyScriptWithError per input with the checker bound to THE
+## REAL TX (input index + amount + all-prevouts) so the legacy/BIP-143/
+## BIP-341 sighash commits to the actual surrounding transaction. The tx is
+## valid iff ALL inputs pass; reject on the FIRST failing input (Core's loop
+## is `i < vin.size() && tx_valid`).
+##
+##   request:  {"op":"verifytx",
+##              "tx_hex":"...",
+##              "prevouts":[{"txid":"<display-hex>","vout":N,
+##                           "scriptPubKey_hex":"...","amount_sats":0},...],
+##              "flags":["P2SH","WITNESS",...]}
+##   response: {"valid":true}                   (all inputs verify)
+##             {"valid":false,"reason":"..."}   (>=1 input failed)
+##             {"error":"..."}                  (could not evaluate -> skip)
+##
 ## Lives inside the nimrod submodule (not the meta-repo) so the local
 ## `nim.cfg` (-d:useSystemSecp256k1, library linkage) and the nimble dep
 ## paths in config.nims apply when compiling.
 
-import std/[json, strutils]
+import std/[json, strutils, tables]
 import ../src/primitives/types
 import ../src/primitives/serialize
 import ../src/script/interpreter
@@ -66,11 +88,11 @@ proc buildFlags(tokens: JsonNode): set[ScriptFlags] =
       result.incl(sfDiscourageUpgradableWitnessProgram)
     of "WITNESS_PUBKEYTYPE": result.incl(sfWitnessPubkeyType)
     of "CONST_SCRIPTCODE":
-      # nimrod has no SCRIPT_VERIFY_CONST_SCRIPTCODE equivalent flag; it is
-      # tracked here as a no-op (the const-scriptcode rule is not separately
-      # enforced). Map to empty so the row still produces a decision rather
-      # than being skipped; see triage notes.
-      discard
+      # Maps to nimrod's sfConstScriptCode (SCRIPT_VERIFY_CONST_SCRIPTCODE).
+      # The enforcement (FindAndDelete found>0 => SCRIPT_ERR_SIG_FINDANDDELETE)
+      # lives in interpreter.nim; this just passes the flag through so the rule
+      # actually fires.
+      result.incl(sfConstScriptCode)
     of "TAPROOT": result.incl(sfTaproot)
     of "DISCOURAGE_UPGRADABLE_PUBKEYTYPE":
       result.incl(sfDiscourageUpgradablePubkeyType)
@@ -134,9 +156,7 @@ proc jsonEscape(s: string): string =
     of '\t': result.add("\\t")
     else: result.add(c)
 
-proc process(line: string): string =
-  let req = parseJson(line)
-
+proc processVerifyScript(req: JsonNode): string =
   let ssig = hexDecode(req["scriptSig_hex"].getStr())
   let spk = hexDecode(req["scriptPubKey_hex"].getStr())
   let amount = if req.hasKey("amount_sats"): req["amount_sats"].getBiggestInt()
@@ -165,6 +185,86 @@ proc process(line: string): string =
     result = """{"result":true}"""
   else:
     result = """{"result":false,"reason":"""" & jsonEscape($err) & "\"}"
+
+## Convert a DISPLAY-ORDER txid hex (as given in the tx_*.json prevouts) to
+## the wire-order TxId that nimrod's deserializer stores in OutPoint.txid.
+## readTxId reads the 32 prevout bytes verbatim (little-endian / wire order);
+## the JSON hex is the big-endian display string, so we hex-decode then
+## reverse to match. (`$TxId` reverses on the way out, the mirror of this.)
+proc txidFromDisplayHex(s: string): TxId =
+  let raw = hexDecode(s)
+  if raw.len != 32:
+    raise newException(ValueError, "prevout txid not 32 bytes: " & $raw.len)
+  var arr: array[32, byte]
+  for i in 0 ..< 32:
+    arr[i] = raw[31 - i]
+  TxId(arr)
+
+## Mirror Core's transaction_tests.cpp::CheckTxScripts over a REAL tx.
+## Deserialize tx_hex with nimrod's own deserializer (handles the segwit
+## marker/flag + per-input witnesses), build the prevout map, then run
+## verifyScriptWithError per input with the sighash computed over THE REAL
+## TX. Valid iff ALL inputs pass; reject on the FIRST failing input.
+proc processVerifyTx(req: JsonNode): string =
+  let txBytes = hexDecode(req["tx_hex"].getStr())
+  let tx = deserializeTransaction(txBytes)
+
+  let flags = buildFlags(req["flags"])
+
+  # Prevout map keyed by (wire-order txid, vout). Both spk + amount.
+  var spkMap = initTable[(TxId, uint32), seq[byte]]()
+  var amtMap = initTable[(TxId, uint32), int64]()
+  for p in req["prevouts"]:
+    let txid = txidFromDisplayHex(p["txid"].getStr())
+    let vout = uint32(p["vout"].getBiggestInt())
+    let spk = hexDecode(p["scriptPubKey_hex"].getStr())
+    # amount defaults to 0 when absent (Core: contains(prevout) ? at : 0).
+    let amt = if p.hasKey("amount_sats"): p["amount_sats"].getBiggestInt()
+              else: 0'i64
+    spkMap[(txid, vout)] = spk
+    amtMap[(txid, vout)] = amt
+
+  # Assemble per-input spent-script / spent-amount vectors in the tx's own
+  # input order, so the BIP-143/BIP-341 all-prevouts commitment lines up
+  # with input i. A prevout missing from the map => malformed row => error
+  # (the driver skips it; never a fake pass).
+  let n = tx.inputs.len
+  var spentScripts = newSeq[seq[byte]](n)
+  var spentAmounts = newSeq[Satoshi](n)
+  for i in 0 ..< n:
+    let key = (tx.inputs[i].prevOut.txid, tx.inputs[i].prevOut.vout)
+    if not spkMap.hasKey(key):
+      raise newException(ValueError,
+        "no prevout scriptPubKey for input " & $i & " " &
+        $tx.inputs[i].prevOut.txid & ":" & $tx.inputs[i].prevOut.vout)
+    spentScripts[i] = spkMap[key]
+    spentAmounts[i] = Satoshi(amtMap.getOrDefault(key, 0'i64))
+
+  # Per-input VerifyScript over the real tx. Reject on first failure,
+  # matching Core's `i < vin.size() && tx_valid` short-circuit.
+  for i in 0 ..< n:
+    let ssig = tx.inputs[i].scriptSig
+    let spk = spentScripts[i]
+    let amount = spentAmounts[i]
+    let witness = if i < tx.witnesses.len: tx.witnesses[i]
+                  else: @[]
+    let err = verifyScriptWithError(
+      ssig, spk, tx, i, amount, flags, witness,
+      spentAmounts, spentScripts
+    )
+    if err != seOk:
+      return """{"valid":false,"reason":"""" &
+        jsonEscape("input " & $i & ": " & $err) & "\"}"
+
+  result = """{"valid":true}"""
+
+proc process(line: string): string =
+  let req = parseJson(line)
+  let op = if req.hasKey("op"): req["op"].getStr() else: "verifyscript"
+  case op
+  of "verifyscript": processVerifyScript(req)
+  of "verifytx": processVerifyTx(req)
+  else: raise newException(ValueError, "unknown op: " & op)
 
 proc main() =
   var line: string
