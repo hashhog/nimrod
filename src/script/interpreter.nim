@@ -72,6 +72,10 @@ type
     # with this flag set, FindAndDelete actually removing a push from the
     # scriptCode (found > 0) is a hard error in pre-segwit (BASE) execution.
     seSigFindAndDelete = "found pushed signature in scriptCode (CONST_SCRIPTCODE)"
+    # SCRIPT_VERIFY_CONST_SCRIPTCODE (interpreter.cpp:474-476): with this flag
+    # set, OP_CODESEPARATOR in pre-segwit (BASE) script is rejected even in an
+    # unexecuted branch (it would make the scriptCode non-constant).
+    seOpCodeSeparator = "using OP_CODESEPARATOR in non-witness script (CONST_SCRIPTCODE)"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -117,7 +121,13 @@ type
     opCount*: int
     crypto*: CryptoEngine
     execStack*: seq[bool]  # Track IF/ELSE execution state
-    codesepPos*: uint32    # Position after last OP_CODESEPARATOR
+    codesepPos*: uint32    # OPCODE INDEX of last OP_CODESEPARATOR (BIP-341 tapscript sigmsg)
+    # BYTE OFFSET just after the last executed OP_CODESEPARATOR, used for the
+    # legacy / SegWit-v0 sighash scriptCode = CScript(pbegincodehash, pend).
+    # Mirrors Core's `pbegincodehash = pc` (interpreter.cpp:1054) which is a
+    # BYTE iterator, distinct from `execdata.m_codeseparator_pos = opcode_pos`
+    # (the opcode index, kept above for tapscript). 0xFFFFFFFF => start of script.
+    codesepByteOffset*: uint32
     # BIP-342 tapscript validation-weight budget. Mirrors Core's
     # ScriptExecutionData::m_validation_weight_left (interpreter.cpp:362).
     # Initialized at the tapscript leaf entry to
@@ -305,6 +315,7 @@ proc newInterpreter*(): ScriptInterpreter =
   result.opCount = 0
   result.execStack = @[]
   result.codesepPos = 0xFFFFFFFF'u32  # BIP341: initialize to max
+  result.codesepByteOffset = 0xFFFFFFFF'u32  # legacy/segwit-v0: start-of-script sentinel
 
 proc newInterpreter*(flags: set[ScriptFlags]): ScriptInterpreter =
   result = newInterpreter()
@@ -568,48 +579,133 @@ proc taggedHash*(tag: string, data: openArray[byte]): array[32, byte] =
   preimage.add(data)
   sha256(preimage)
 
-# FindAndDelete - removes exact matches of a push-encoded signature from script
-# Only used for sig_version BASE (legacy)
+# Encode `data` as the minimal push CScript() would emit (script.h
+# AppendDataSize, lines 405-425). Used to build the exact byte pattern that
+# Core's FindAndDelete(scriptCode, CScript() << vchSig) removes.
+proc encodePush(data: seq[byte]): seq[byte] =
+  let size = data.len
+  result = @[]
+  if size < int(OP_PUSHDATA1):           # < 0x4c -> single length byte
+    result.add(byte(size))
+  elif size <= 0xff:
+    result.add(OP_PUSHDATA1)
+    result.add(byte(size))
+  elif size <= 0xffff:
+    result.add(OP_PUSHDATA2)
+    result.add(byte(size and 0xff))
+    result.add(byte((size shr 8) and 0xff))
+  else:
+    result.add(OP_PUSHDATA4)
+    result.add(byte(size and 0xff))
+    result.add(byte((size shr 8) and 0xff))
+    result.add(byte((size shr 16) and 0xff))
+    result.add(byte((size shr 24) and 0xff))
+  result.add(data)
+
+# Advance `pc` past one opcode (mirrors CScript::GetOp). Returns the position
+# just after the opcode + its immediate push payload, or script.len if the
+# script is truncated/malformed (Core's GetOp also stops at end). Never reads
+# OOB.
+proc nextOpEnd(script: seq[byte], pc: int): int =
+  if pc >= script.len:
+    return script.len
+  let opcode = script[pc]
+  var p = pc + 1
+  if opcode <= 0x4b'u8:
+    p += int(opcode)
+  elif opcode == OP_PUSHDATA1:
+    if p >= script.len: return script.len
+    p += 1 + int(script[p])
+  elif opcode == OP_PUSHDATA2:
+    if p + 1 >= script.len: return script.len
+    p += 2 + (int(script[p]) or (int(script[p + 1]) shl 8))
+  elif opcode == OP_PUSHDATA4:
+    if p + 3 >= script.len: return script.len
+    p += 4 + (int(script[p]) or (int(script[p + 1]) shl 8) or
+              (int(script[p + 2]) shl 16) or (int(script[p + 3]) shl 24))
+  if p > script.len:
+    return script.len
+  result = p
+
+# FindAndDelete - byte-exact removal of the push-encoded signature from script,
+# matching Core FindAndDelete(script, CScript() << vchSig) (interpreter.cpp:229).
+# Core builds the EXACT push encoding of `sig` (CScript() << vchSig) and removes
+# every byte-identical occurrence found at an opcode boundary — it is NOT
+# push-prefix-agnostic. A sig pushed via a different (e.g. non-minimal
+# OP_PUSHDATA1) encoding does NOT match. Only used for sig_version BASE.
 proc findAndDelete*(script: seq[byte], sig: seq[byte]): seq[byte] =
-  ## Remove all occurrences of push-encoded sig from script
   if sig.len == 0:
     return script
 
+  let pushB = encodePush(sig)
+  let bn = pushB.len
+
   result = @[]
-  var i = 0
+  var pc = 0
+  var pc2 = 0
+  # Mirror Core's do/while: copy [pc2,pc); strip consecutive matches at pc;
+  # set pc2 = pc; then advance pc by one opcode. Stop when GetOp can't advance.
+  while true:
+    # Emit the gap between the previous match-end and the current opcode start.
+    for k in pc2 ..< pc:
+      result.add(script[k])
+    # Remove all consecutive byte-exact matches of pushB starting at pc.
+    while script.len - pc >= bn and (block:
+        var eq = true
+        for j in 0 ..< bn:
+          if script[pc + j] != pushB[j]:
+            eq = false
+            break
+        eq):
+      pc += bn
+    pc2 = pc
+    # GetOp: advance one opcode. Core's loop condition `while (GetOp(pc,...))`
+    # is false once pc reaches end, after which the trailing [pc2,end) tail is
+    # appended only if something was removed; here we always emit the tail.
+    if pc >= script.len:
+      break
+    pc = nextOpEnd(script, pc)
+  # Append any trailing bytes (the [pc2,end) tail).
+  for k in pc2 ..< script.len:
+    result.add(script[k])
 
-  while i < script.len:
-    let opcode = script[i]
-
-    # Check for direct push (1-75 bytes)
-    if opcode >= 0x01 and opcode <= 0x4b:
-      let pushLen = int(opcode)
-      if i + 1 + pushLen <= script.len:
-        let pushData = script[i + 1 ..< i + 1 + pushLen]
-        if pushData == sig:
-          i += 1 + pushLen
-          continue
-
-    # Check for OP_PUSHDATA1
-    elif opcode == OP_PUSHDATA1 and i + 1 < script.len:
-      let pushLen = int(script[i + 1])
-      if i + 2 + pushLen <= script.len:
-        let pushData = script[i + 2 ..< i + 2 + pushLen]
-        if pushData == sig:
-          i += 2 + pushLen
-          continue
-
-    # Check for OP_PUSHDATA2
-    elif opcode == OP_PUSHDATA2 and i + 2 < script.len:
-      let pushLen = int(script[i + 1]) or (int(script[i + 2]) shl 8)
-      if i + 3 + pushLen <= script.len:
-        let pushData = script[i + 3 ..< i + 3 + pushLen]
-        if pushData == sig:
-          i += 3 + pushLen
-          continue
-
-    result.add(script[i])
-    i += 1
+# Strip all OP_CODESEPARATOR opcodes from scriptCode before hashing.
+# Mirrors Core's CTransactionSignatureSerializer::SerializeScriptCode
+# (interpreter.cpp:1271-1291): it walks the scriptCode opcode-by-opcode with
+# GetOp and omits every OP_CODESEPARATOR opcode (the byte 0xab only when it is
+# an actual opcode, NOT when it appears inside a push payload). Used ONLY by
+# the legacy (BASE) sighash path: Core's WITNESS_V0 branch serializes the
+# (already codesep-sliced) scriptCode verbatim via `ss << scriptCode`
+# (interpreter.cpp:1654) and does NOT strip codeseps.
+proc stripCodeSeparators(scriptCode: openArray[byte]): seq[byte] =
+  result = newSeqOfCap[byte](scriptCode.len)
+  var pc = 0
+  let n = scriptCode.len
+  while pc < n:
+    let opcode = scriptCode[pc]
+    # Determine the full byte span of this opcode (opcode + any push payload),
+    # mirroring CScript::GetOp. A truncated push is copied verbatim to the end.
+    var opEnd = pc + 1
+    if opcode <= 0x4b'u8:
+      opEnd += int(opcode)
+    elif opcode == OP_PUSHDATA1:
+      if opEnd < n: opEnd += 1 + int(scriptCode[opEnd])
+      else: opEnd = n
+    elif opcode == OP_PUSHDATA2:
+      if opEnd + 1 < n: opEnd += 2 + (int(scriptCode[opEnd]) or (int(scriptCode[opEnd+1]) shl 8))
+      else: opEnd = n
+    elif opcode == OP_PUSHDATA4:
+      if opEnd + 3 < n:
+        opEnd += 4 + (int(scriptCode[opEnd]) or (int(scriptCode[opEnd+1]) shl 8) or
+                      (int(scriptCode[opEnd+2]) shl 16) or (int(scriptCode[opEnd+3]) shl 24))
+      else: opEnd = n
+    if opEnd > n: opEnd = n
+    # Skip OP_CODESEPARATOR opcodes (it's a 1-byte opcode, no payload); copy all
+    # other opcodes (with their payloads) verbatim.
+    if not (opcode == OP_CODESEPARATOR and opEnd == pc + 1):
+      for k in pc ..< opEnd:
+        result.add(scriptCode[k])
+    pc = opEnd
 
 # Sighash computation
 type
@@ -627,9 +723,10 @@ proc computeSighashLegacy*(tx: Transaction, inputIndex: int,
   for i in 0 ..< modifiedTx.inputs.len:
     modifiedTx.inputs[i].scriptSig = @[]
 
-  # Set scriptCode for the input being signed
+  # Set scriptCode for the input being signed, with all OP_CODESEPARATOR
+  # opcodes stripped (Core SerializeScriptCode, interpreter.cpp:1271-1291).
   if inputIndex < modifiedTx.inputs.len:
-    modifiedTx.inputs[inputIndex].scriptSig = @scriptCode
+    modifiedTx.inputs[inputIndex].scriptSig = stripCodeSeparators(scriptCode)
 
   let baseType = hashType and 0x1f
 
@@ -1095,6 +1192,14 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
     # Check for disabled opcodes (always fail, even in non-executing branch)
     if opcode.isDisabled:
       return seDisabledOpcode
+
+    # SCRIPT_VERIFY_CONST_SCRIPTCODE (Core interpreter.cpp:474-476): in
+    # pre-segwit (BASE) script, OP_CODESEPARATOR is rejected even in an
+    # unexecuted branch when the flag is set. Fires before the executing
+    # dispatch below, exactly like Core (which checks before `if (fExec ...)`).
+    if opcode == OP_CODESEPARATOR and ctx.sigVersion == sigBase and
+       sfConstScriptCode in interp.flags:
+      return seOpCodeSeparator
 
     let executing = interp.isExecuting()
 
@@ -1636,6 +1741,11 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       # diverges from Core whenever any pushdata opcode precedes the
       # OP_CODESEPARATOR (pushdata byte size > 1, so byte pos > opcode idx).
       interp.codesepPos = currentOpcodePos
+      # Legacy / SegWit-v0 sighash: Core sets `pbegincodehash = pc`
+      # (interpreter.cpp:1054) — the BYTE position just AFTER the
+      # OP_CODESEPARATOR opcode. `pc` has already been advanced past the
+      # opcode byte above (pc += 1), so it is exactly that byte offset.
+      interp.codesepByteOffset = uint32(pc)
 
     of OP_CHECKSIG, OP_CHECKSIGVERIFY:
       if interp.stack.len < 2:
@@ -1689,10 +1799,13 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             let hashType = uint32(sig[sig.len - 1])
             let sigWithoutHashType = sig[0 ..< sig.len - 1]
 
-            # scriptCode starts after last OP_CODESEPARATOR (matching Bitcoin Core pbegincodehash)
+            # scriptCode = CScript(pbegincodehash, pend): the subscript from
+            # the BYTE position just after the last executed OP_CODESEPARATOR
+            # to the script end (Core interpreter.cpp:326). codesepByteOffset
+            # is a BYTE offset (not the opcode index in codesepPos).
             var scriptCode: seq[byte]
-            if interp.codesepPos != 0xFFFFFFFF'u32 and int(interp.codesepPos) <= script.len:
-              scriptCode = script[int(interp.codesepPos) ..< script.len]
+            if interp.codesepByteOffset != 0xFFFFFFFF'u32 and int(interp.codesepByteOffset) <= script.len:
+              scriptCode = script[int(interp.codesepByteOffset) ..< script.len]
             else:
               scriptCode = @script
             # FindAndDelete - only for legacy. Per Core interpreter.cpp:330-332,
@@ -1733,8 +1846,14 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
               scriptCode.add(pubkeyHash)
               scriptCode.add([OP_EQUALVERIFY, OP_CHECKSIG])
             else:
-              # P2WSH: use the witness script being executed
-              scriptCode = @script
+              # P2WSH: scriptCode = the witnessScript being executed, sliced at
+              # the BYTE position just after the last executed OP_CODESEPARATOR
+              # (Core EvalChecksigPreTapscript scriptCode(pbegincodehash, pend),
+              # interpreter.cpp:326 — same rule as BASE, but NO FindAndDelete).
+              if interp.codesepByteOffset != 0xFFFFFFFF'u32 and int(interp.codesepByteOffset) <= script.len:
+                scriptCode = script[int(interp.codesepByteOffset) ..< script.len]
+              else:
+                scriptCode = @script
 
             let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, scriptCode, ctx.amount, hashType)
             # W160 BUG-11 fix: per-sig cache; see legacy branch above.
@@ -1900,8 +2019,8 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       # before encoding checks / verification).
       if ctx.sigVersion == sigBase and sfConstScriptCode in interp.flags:
         var fadScriptCode: seq[byte]
-        if interp.codesepPos != 0xFFFFFFFF'u32 and int(interp.codesepPos) <= script.len:
-          fadScriptCode = script[int(interp.codesepPos) ..< script.len]
+        if interp.codesepByteOffset != 0xFFFFFFFF'u32 and int(interp.codesepByteOffset) <= script.len:
+          fadScriptCode = script[int(interp.codesepByteOffset) ..< script.len]
         else:
           fadScriptCode = @script
         for s in sigs:
@@ -1935,10 +2054,11 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             if sig.len >= 1:
               let hashType = uint32(sig[sig.len - 1])
               let sigWithoutHashType = sig[0 ..< sig.len - 1]
-              # scriptCode starts after last OP_CODESEPARATOR
+              # scriptCode = CScript(pbegincodehash, pend) sliced at the BYTE
+              # offset after the last executed OP_CODESEPARATOR (not opcode idx).
               var scriptCode: seq[byte]
-              if interp.codesepPos != 0xFFFFFFFF'u32 and int(interp.codesepPos) <= script.len:
-                scriptCode = script[int(interp.codesepPos) ..< script.len]
+              if interp.codesepByteOffset != 0xFFFFFFFF'u32 and int(interp.codesepByteOffset) <= script.len:
+                scriptCode = script[int(interp.codesepByteOffset) ..< script.len]
               else:
                 scriptCode = @script
               # FindAndDelete all signatures (only for legacy)
@@ -1951,8 +2071,16 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             if sig.len >= 1:
               let hashType = uint32(sig[sig.len - 1])
               let sigWithoutHashType = sig[0 ..< sig.len - 1]
-              # For P2WSH, use the witness script as scriptCode
-              let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, script, ctx.amount, hashType)
+              # P2WSH scriptCode = the witnessScript sliced at the BYTE offset
+              # after the last executed OP_CODESEPARATOR (Core
+              # EvalChecksigPreTapscript scriptCode(pbegincodehash, pend);
+              # WITNESS_V0 has NO FindAndDelete).
+              var scriptCode: seq[byte]
+              if interp.codesepByteOffset != 0xFFFFFFFF'u32 and int(interp.codesepByteOffset) <= script.len:
+                scriptCode = script[int(interp.codesepByteOffset) ..< script.len]
+              else:
+                scriptCode = @script
+              let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, scriptCode, ctx.amount, hashType)
               verified = verifyDerLax(pubkey, sighash, sigWithoutHashType)
 
           else:
@@ -2384,9 +2512,14 @@ proc verifyScriptWithError*(
   let stackCopy = interp.stack
 
   # Clear altstack and opcount between scriptSig and scriptPubKey execution
-  # (Bitcoin Core resets opcount per-script via separate EvalScript calls)
+  # (Bitcoin Core resets opcount per-script via separate EvalScript calls).
+  # Core also resets pbegincodehash to script.begin() at the start of each
+  # EvalScript (it is a local), so an OP_CODESEPARATOR in the scriptSig must
+  # NOT carry into the scriptPubKey's sighash subscript.
   interp.altStack = @[]
   interp.opCount = 0
+  interp.codesepPos = 0xFFFFFFFF'u32
+  interp.codesepByteOffset = 0xFFFFFFFF'u32
 
   # Execute scriptPubKey
   let err = interp.eval(scriptPubKey, ctx)
