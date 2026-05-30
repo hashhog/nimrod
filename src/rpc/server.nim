@@ -3941,8 +3941,42 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # for `handleReorg`.
       newChainBlocks.reverse()
 
+      # Wire the per-block script-verification hook so `handleReorg` re-runs
+      # full per-input script verification on each promoted side-branch block,
+      # exactly like Bitcoin Core's ConnectTip -> ConnectBlock does on a reorg.
+      # `validateForStorage` deliberately skipped verifyScripts at store time
+      # (the side-branch's UTXO context is not the active tip); this hook is
+      # where that deferred verification finally runs, against the UTXO view
+      # `handleReorg` rebuilds to the fork point. The hook reads UTXOs via
+      # `csCapture.getUtxo`, which inside the reorg honours the in-flight
+      # reorgDeletedUtxos / utxoCache / DB layering, so it sees the correct
+      # post-disconnect + partially-reconnected view at each step.
+      # Returning (ok: false) on a script failure aborts the reorg and leaves
+      # the original tip intact (handleReorg rolls back; no batch commit).
+      let csCapture = cs
+      let reorgCrypto = rpc.crypto
+      let reorgParams = cs.params
+      cs.reorgVerifyHook = proc(blk: Block, height: int32): tuple[ok: bool, err: string]
+                                {.gcsafe, raises: [].} =
+        let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+          try: csCapture.getUtxo(op)
+          except: none(UtxoEntry)
+        var res: ValidationResult[void]
+        try:
+          {.gcsafe.}:
+            res = verifyScripts(blk, utxoLookup, height, reorgCrypto, reorgParams)
+        except CatchableError as e:
+          return (ok: false, err: e.msg)
+        except Exception as e:
+          return (ok: false, err: e.msg)
+        if res.isOk: (ok: true, err: "")
+        else: (ok: false, err: bip22String(res.error))
+
       var disconnectedTxs: seq[Transaction] = @[]
       let reorgRes = cs.handleReorg(forkPoint, newChainBlocks, disconnectedTxs)
+      # Clear the hook after the reorg so it cannot leak into an unrelated
+      # later handleReorg call with a stale captured crypto/params.
+      cs.reorgVerifyHook = nil
       if not reorgRes.isOk:
         # Storage of the side-branch block already succeeded; the reorg
         # failure leaves the original tip intact. Surface as inconclusive
