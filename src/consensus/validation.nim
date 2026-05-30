@@ -62,6 +62,10 @@ type
     veTimeWarpAttack = "block timestamp too early on diff adjustment block (time-timewarp-attack)"
     veTimeTooNew = "block timestamp too far in the future (time-too-new)"
     veTooFarAhead = "block too far ahead of active tip (fTooFarAhead)"
+    # CVE-2012-2459: merkle tree mutated by duplicate-txid construction.
+    # Core CheckMerkleRoot rejects bad-txns-duplicate when ComputeMerkleRoot's
+    # `mutated` flag is set (identical adjacent pair at some level).
+    veMutatedMerkleTree = "merkle tree mutated (bad-txns-duplicate)"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -117,6 +121,9 @@ proc bip22String*(e: ValidationError): string =
   case e
   of veBadPow, veExceedsTarget: "high-hash"
   of veBadMerkleRoot: "bad-txnmrklroot"
+  # CVE-2012-2459: Core CheckMerkleRoot sets state Invalid "bad-txns-duplicate"
+  # when ComputeMerkleRoot reports the tree was mutated (validation.cpp).
+  of veMutatedMerkleTree: "bad-txns-duplicate"
   of veBadWitnessCommitment: "bad-witness-merkle-match"
   of veWitnessNonceSize: "bad-witness-nonce-size"
   of veUnexpectedWitness: "unexpected-witness"
@@ -171,10 +178,28 @@ proc bip22String*(e: ValidationError): string =
   of veOk: ""
   else: "rejected"
 
-# Merkle root computation with Bitcoin's duplicate-last-if-odd rule
-proc computeMerkleRoot*(txids: seq[array[32, byte]]): array[32, byte] =
-  ## Compute merkle root from a list of transaction hashes
-  ## If odd number of elements, duplicate the last one
+# Merkle root computation with Bitcoin's duplicate-last-if-odd rule.
+#
+# CVE-2012-2459 mutation detection (Core consensus/merkle.cpp:46-63,
+# ComputeMerkleRoot with bool* mutated): at the TOP of each level-collapse
+# iteration — BEFORE the odd-tail duplication and BEFORE the pairwise hash —
+# scan every COMPLETE adjacent pair (pos, pos+1) and set `mutated` if the two
+# hashes are equal:
+#     for pos in 0, 2, 4 ... while pos+1 < size: if h[pos]==h[pos+1] -> mutated
+# The lone trailing element at an odd level is NOT compared at this level
+# (pos+1 < size excludes it) — but once it is duplicated for the next level it
+# becomes an identical adjacent pair caught on the NEXT level's scan. This is
+# exactly Core's ordering; doing the scan AFTER the odd-dup (or comparing the
+# lone tail against itself) would false-reject honest odd-N blocks.
+#
+# CheckBlock (Core validation.cpp CheckMerkleRoot) rejects bad-txns-duplicate
+# when `mutated` is set, treating it identically to a bad merkle root.
+proc computeMerkleRootMutated*(txids: seq[array[32, byte]],
+                               mutated: var bool): array[32, byte] =
+  ## Compute merkle root AND report CVE-2012-2459 mutation. `mutated` is set to
+  ## true iff any complete adjacent pair at any level is identical (the
+  ## duplicate-txid mutation), per Core ComputeMerkleRoot's `bool* mutated`.
+  mutated = false
   if txids.len == 0:
     return default(array[32, byte])
 
@@ -183,6 +208,15 @@ proc computeMerkleRoot*(txids: seq[array[32, byte]]): array[32, byte] =
 
   var level = txids
   while level.len > 1:
+    # Core merkle.cpp:49-53 — scan complete adjacent pairs at the TOP of the
+    # level, BEFORE the odd-tail duplication below. Only pairs with pos+1 <
+    # size are compared (the lone tail is excluded here, caught next level).
+    var pos = 0
+    while pos + 1 < level.len:
+      if level[pos] == level[pos + 1]:
+        mutated = true
+      pos += 2
+
     var nextLevel: seq[array[32, byte]]
     var i = 0
     while i < level.len:
@@ -198,6 +232,15 @@ proc computeMerkleRoot*(txids: seq[array[32, byte]]): array[32, byte] =
     level = nextLevel
 
   result = level[0]
+
+proc computeMerkleRoot*(txids: seq[array[32, byte]]): array[32, byte] =
+  ## Compute merkle root from a list of transaction hashes
+  ## If odd number of elements, duplicate the last one.
+  ## Mutation-agnostic wrapper over computeMerkleRootMutated (mutation is
+  ## checked explicitly on the block-acceptance path; see checkBlock /
+  ## validateBlock).
+  var mutated = false
+  computeMerkleRootMutated(txids, mutated)
 
 proc computeWitnessCommitment*(wtxids: seq[array[32, byte]], reserved: array[32, byte]): array[32, byte] =
   ## Compute witness commitment for SegWit blocks
@@ -1333,14 +1376,20 @@ proc validateBlock*(
       return voidErr(veDuplicateTx)
     txids[txid] = true
 
-  # Check merkle root
+  # Check merkle root + CVE-2012-2459 mutation (Core CheckMerkleRoot).
   var txHashes: seq[array[32, byte]]
   for tx in blk.txs:
     txHashes.add(array[32, byte](tx.txid()))
 
-  let computedMerkle = computeMerkleRoot(txHashes)
+  var merkleMutated = false
+  let computedMerkle = computeMerkleRootMutated(txHashes, merkleMutated)
   if computedMerkle != blk.header.merkleRoot:
     return voidErr(veBadMerkleRoot)
+  # Duplicate-txid mutation: identical adjacent pair at some level. Core treats
+  # this identically to a bad merkle root (bad-txns-duplicate), rejecting the
+  # block. validation.cpp CheckMerkleRoot.
+  if merkleMutated:
+    return voidErr(veMutatedMerkleTree)
 
   # Check block weight
   let weight = calculateBlockWeight(blk)
@@ -1870,14 +1919,19 @@ proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
     if not txResult.isOk:
       return txResult
 
-  # Verify merkle root
+  # Verify merkle root + CVE-2012-2459 mutation (Core CheckMerkleRoot).
   var txHashes: seq[array[32, byte]]
   for tx in blk.txs:
     txHashes.add(array[32, byte](tx.txid()))
 
-  let computedRoot = computeMerkleRoot(txHashes)
+  var rootMutated = false
+  let computedRoot = computeMerkleRootMutated(txHashes, rootMutated)
   if computedRoot != blk.header.merkleRoot:
     return voidErr(veBadMerkleRoot)
+  # Duplicate-txid mutation (CVE-2012-2459): reject identically to a bad merkle
+  # root. Core CheckBlock -> CheckMerkleRoot, bad-txns-duplicate.
+  if rootMutated:
+    return voidErr(veMutatedMerkleTree)
 
   # Witness commitment check is intentionally absent here.
   # Bitcoin Core CheckBlock() is context-free and explicitly defers witness
