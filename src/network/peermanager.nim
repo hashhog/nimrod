@@ -88,6 +88,19 @@ type
     ourHeight*: int32
     seedNodes*: seq[tuple[host: string, port: uint16]]
     fallbackPeers*: seq[tuple[host: string, port: uint16]]
+    # -connect peer pinning (Core/clearbit semantics).  When non-empty the node
+    # connects to ONLY these peers and disables DNS-seed resolution AND the
+    # auto-outbound fill (addrman/diversity dialing).  Mirrors clearbit's
+    # PeerManager.connect_address branch (peer.zig:7009) + the
+    # `connect_address == null` gate on the outbound-fill loop (peer.zig:7050),
+    # and Bitcoin Core's `-connect` which implies `-dnsseed=0`.  Pinned peers
+    # are dialed as manual connections (NoBan, bypass slot/netgroup/routability
+    # gates) and re-dialed by maintainConnections when dropped.
+    connectPeers*: seq[tuple[host: string, port: uint16]]
+    # Independent DNS-seed switch (`--nodnsseed` / `-dnsseed=0`).  Default true.
+    # Set false to suppress DNS-seed resolution without pinning peers; also
+    # forced false implicitly when connectPeers is non-empty.
+    dnsSeedEnabled*: bool
     inFlightBlocks*: Table[BlockHash, InFlightBlock]
     running*: bool
     dataDir*: string
@@ -246,6 +259,8 @@ proc newPeerManager*(params: ConsensusParams,
     anchorList: newAnchorList(dataDir),
     seedNodes: @[],
     fallbackPeers: @[],
+    connectPeers: @[],
+    dnsSeedEnabled: true,
     ourHeight: 0,
     inFlightBlocks: initTable[BlockHash, InFlightBlock](),
     running: false,
@@ -446,8 +461,19 @@ proc hasNetGroupCollision*(pm: PeerManager, address: string): bool =
   let ng = pm.getNetGroupForAddress(address)
   ng in pm.outboundNetGroups
 
+proc dnsSeedingEnabled*(pm: PeerManager): bool =
+  ## DNS-seed resolution is on only when explicitly enabled AND no `-connect`
+  ## peers are pinned.  Mirrors Core (`-connect` implies `-dnsseed=0`) and
+  ## clearbit's connect-branch which skips dnsSeeds() (peer.zig:7009/7039).
+  pm.dnsSeedEnabled and pm.connectPeers.len == 0
+
 proc resolveDnsSeeds*(pm: PeerManager): Future[seq[string]] {.async.} =
   var addresses: seq[string]
+
+  # `--nodnsseed` / `-dnsseed=0`, or `--connect` (implies dnsseed=0): no DNS.
+  if not pm.dnsSeedingEnabled():
+    debug "DNS seeding disabled (--nodnsseed or --connect set)"
+    return addresses
 
   for (host, port) in pm.seedNodes:
     try:
@@ -689,6 +715,26 @@ proc startOutboundConnections*(pm: PeerManager) {.async.} =
   info "starting outbound connections",
        maxFullRelay = pm.maxOutboundFullRelay,
        maxBlockRelay = pm.maxOutboundBlockRelay
+
+  # -connect peer pinning (Core/clearbit): when pinned peers are set, connect
+  # to ONLY those, as manual connections (NoBan + bypass slot/netgroup/
+  # routability gates), and do NOT resolve DNS seeds or fill auto-outbound
+  # slots.  Re-runs on each maintainConnections pass to re-dial any pinned peer
+  # that has dropped (the "retry the dead pinned peer" behavior).  Mirrors
+  # clearbit's connect_address branch (peer.zig:7009) + the
+  # `connect_address == null` gate on the outbound-fill loop (peer.zig:7050).
+  if pm.connectPeers.len > 0:
+    info "connect mode: dialing only pinned peers, DNS + auto-outbound disabled",
+         pinned = pm.connectPeers.len
+    try:
+      for (host, port) in pm.connectPeers:
+        if peerKey(host, port) in pm.peers:
+          continue  # already connected — nothing to do this pass
+        discard await pm.connectManualPeer(host, port)
+        await sleepAsync(100)
+    except CatchableError as e:
+      error "connect-mode dial failed", error = e.msg
+    return
 
   # Regtest: no automatic outbound connections (manual/addnode only)
   if pm.params.network == Regtest:
@@ -1046,6 +1092,13 @@ proc maintainConnections(pm: PeerManager) {.async.} =
     pm.peers.del(key)
 
   pm.cleanupBans()
+
+  # -connect mode: re-dial only the pinned peers (no DNS, no auto-fill).
+  # startOutboundConnections handles the connect branch + skips already-
+  # connected pins.  Mirrors clearbit's per-tick maintainManualConnections.
+  if pm.connectPeers.len > 0:
+    await pm.startOutboundConnections()
+    return
 
   # Try to maintain connections
   let fullRelayDeficit = pm.maxOutboundFullRelay - pm.outboundFullRelayCount

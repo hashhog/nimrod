@@ -112,6 +112,15 @@ type
     i2psam*: string         ## --i2psam=host:port: I2P SAM bridge endpoint for
                             ## .i2p outbound (default SAM port is 7656).
                             ## Mirrors Core's `-i2psam=host:port`.  W117 FIX-56.
+    connectPeers*: seq[string] ## --connect=<ip:port> (repeatable): connect to
+                            ## ONLY these peers and disable DNS-seed resolution
+                            ## AND auto-outbound (addrman/diversity) dialing.
+                            ## Mirrors Bitcoin Core `-connect` (which implies
+                            ## `-dnsseed=0`) and clearbit's --connect branch.
+                            ## Empty = normal DNS + auto-outbound behavior.
+    noDnsSeed*: bool        ## --nodnsseed / --dnsseed=0: suppress DNS-seed
+                            ## resolution independently of --connect.  Default
+                            ## false (DNS seeding on).  Mirrors Core `-dnsseed`.
     cjdnsReachable*: bool   ## --cjdnsreachable: allow outbound connections to
                             ## CJDNS addresses (fc00::/8).  Default off — Core
                             ## requires the operator to opt-in because the host
@@ -226,6 +235,8 @@ proc defaultConfig*(): NimrodConfig =
     proxy: "",
     onionProxy: "",
     i2psam: "",
+    connectPeers: @[],
+    noDnsSeed: false,
     cjdnsReachable: false,
     # W119 + FIX-64 REST/TLS termination (default off — plaintext)
     rpcTlsCert: "",
@@ -348,6 +359,17 @@ proc loadConfigFile*(config: var NimrodConfig) =
       config.i2psam = value
     of "cjdnsreachable":
       config.cjdnsReachable = value.toLowerAscii() in ["", "1", "true", "yes"]
+    of "connect":
+      # Core/clearbit -connect=<ip:port> (repeatable in conf): pin to ONLY
+      # these peers; disables DNS + auto-outbound.  `connect=0` clears.
+      if value.len == 0 or value == "0":
+        config.connectPeers = @[]
+      else:
+        config.connectPeers.add(value)
+    of "nodnsseed":
+      config.noDnsSeed = value.toLowerAscii() in ["", "1", "true", "yes"]
+    of "dnsseed":
+      config.noDnsSeed = value.toLowerAscii() in ["0", "false", "no"]
     of "rpc-tls-cert", "rpctlscert":
       # W119 + FIX-64: PEM-encoded X.509 cert for the REST listener.
       config.rpcTlsCert = value
@@ -440,6 +462,15 @@ Operational:
   --cjdnsreachable       Allow outbound to CJDNS addresses (fc00::/8).
                          Default off; the host must have a CJDNS route.
                          Mirrors Bitcoin Core -cjdnsreachable.  W117 FIX-56.
+  --connect=IP:PORT      Connect to ONLY this peer (repeatable for multiple).
+                         Disables DNS-seed resolution and auto-outbound
+                         (addrman/diversity) dialing — the node talks to just
+                         the pinned peer(s).  Bare IP uses the network default
+                         port.  --connect=0 clears the list.  Mirrors Bitcoin
+                         Core -connect (which implies -dnsseed=0).
+  --nodnsseed            Suppress DNS-seed resolution (equivalently
+                         --dnsseed=0), independently of --connect.  Mirrors
+                         Bitcoin Core -dnsseed=0.
   --rpc-tls-cert=PATH    PEM-encoded X.509 cert for the REST listener.
                          Pair with --rpc-tls-key to enable HTTPS (TLS 1.2+).
                          Required for clearnet BIP-78 PayJoin.  W119 + FIX-64.
@@ -671,6 +702,23 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           result.config.cjdnsReachable = true
         else:
           result.config.cjdnsReachable = p.val.toLowerAscii() in ["1", "true", "yes"]
+      of "connect":
+        # Core/clearbit -connect=<ip:port> (repeatable): pin to ONLY these
+        # peers; disables DNS-seed resolution + auto-outbound fill.  Empty
+        # value (`--connect=` alone, like Core's `-connect=0`) clears the list.
+        if p.val.len == 0 or p.val == "0":
+          result.config.connectPeers = @[]
+        else:
+          result.config.connectPeers.add(p.val)
+      of "nodnsseed":
+        # Core -dnsseed=0 / -nodnsseed: suppress DNS-seed resolution.
+        if p.val.len == 0:
+          result.config.noDnsSeed = true
+        else:
+          result.config.noDnsSeed = p.val.toLowerAscii() in ["1", "true", "yes"]
+      of "dnsseed":
+        # Core -dnsseed=<0|1>: --dnsseed=0 suppresses DNS seeding.
+        result.config.noDnsSeed = p.val.toLowerAscii() in ["0", "false", "no"]
       of "rpc-tls-cert", "rpctlscert":
         # W119 + FIX-64: --rpc-tls-cert=<path> — PEM X.509 cert served by
         # the REST listener.  Pair with --rpc-tls-key to enable HTTPS.
@@ -2142,6 +2190,30 @@ proc startNode*(config: NimrodConfig) {.async.} =
   if config.cjdnsReachable:
     state.peerManager.setCjdnsReachable(true)
     info "CJDNS outbound enabled"
+
+  # -connect / -nodnsseed peer pinning (Core/clearbit semantics).  When
+  # --connect is set the peer manager connects to ONLY these peers and skips
+  # DNS-seed resolution + auto-outbound fill (handled in peermanager.nim:
+  # startOutboundConnections / maintainConnections / resolveDnsSeeds).
+  # Reference: bitcoin-core/src/init.cpp -connect (implies -dnsseed=0);
+  # clearbit peer.zig:7009/7050.
+  if config.noDnsSeed:
+    state.peerManager.dnsSeedEnabled = false
+    info "DNS seeding disabled (--nodnsseed / --dnsseed=0)"
+  for spec in config.connectPeers:
+    let parsed = parseHostPort(spec)
+    if parsed.isSome:
+      let hp = parsed.get()
+      state.peerManager.connectPeers.add((host: hp.host, port: hp.port))
+    elif spec.len > 0 and ':' notin spec:
+      # Bare IP with no port: default to the chain's P2P port (Core parity —
+      # `-connect=1.2.3.4` uses the network default port).
+      state.peerManager.connectPeers.add((host: spec, port: params.defaultPort))
+    else:
+      warn "invalid --connect value, expected ip:port", value = spec
+  if state.peerManager.connectPeers.len > 0:
+    info "connect mode: pinned to fixed peers; DNS + auto-outbound disabled",
+         peers = state.peerManager.connectPeers.len
 
   # 5b. Optional BIP-157 basic block-filter index.  Created BEFORE the sync
   # manager so we can pass it down — the SyncManager fans every successful
