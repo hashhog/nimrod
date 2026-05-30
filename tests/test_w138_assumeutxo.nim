@@ -73,7 +73,7 @@
 ##     - 3432-3435 NODE_NETWORK -> NODE_NETWORK_LIMITED
 ##     - 3462-3519 getchainstates
 ##   bitcoin-core/src/kernel/chainparams.cpp
-##     - 158-183   mainnet assumeutxo_data (4 entries)
+##     - 158-183   mainnet assumeutxo_data (5 entries)
 ##     - 271-284   testnet3 assumeutxo_data (2 entries)
 ##     - 376-389   testnet4 assumeutxo_data (2 entries)
 ##     - 489-502   signet assumeutxo_data (2 entries)
@@ -101,9 +101,9 @@ const
   CORE_SNAPSHOT_BLOCKHASH_FILENAME = "base_blockhash"
   # bitcoin-core/src/node/utxo_snapshot.h:128
   CORE_SNAPSHOT_CHAINSTATE_SUFFIX = "_snapshot"
-  # bitcoin-core/src/kernel/chainparams.cpp:158-183 mainnet (4 entries)
-  CORE_MAINNET_ASSUMEUTXO_COUNT = 4
-  CORE_MAINNET_ASSUMEUTXO_HEIGHTS = [840_000, 880_000, 910_000, 935_000]
+  # bitcoin-core/src/kernel/chainparams.cpp:158-183 mainnet (5 entries)
+  CORE_MAINNET_ASSUMEUTXO_COUNT = 5
+  CORE_MAINNET_ASSUMEUTXO_HEIGHTS = [840_000, 880_000, 910_000, 935_000, 944_183]
   # bitcoin-core/src/kernel/chainparams.cpp:376-389 testnet4 (2 entries)
   CORE_TESTNET4_ASSUMEUTXO_COUNT = 2
   CORE_TESTNET4_ASSUMEUTXO_HEIGHTS = [90_000, 120_000]

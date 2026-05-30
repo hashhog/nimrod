@@ -264,6 +264,16 @@ proc mainnetParams*(): ConsensusParams =
       blockhash: BlockHash(hexToBytes32(
         "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"
       ))
+    ),
+    AssumeutxoData(
+      height: 944183'i32,
+      hashSerialized: hexToBytes32(
+        "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"
+      ),
+      chainTxCount: 1334000000'u64,
+      blockhash: BlockHash(hexToBytes32(
+        "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"
+      ))
     )
   ]
   # Legacy aliases
