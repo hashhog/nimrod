@@ -69,6 +69,7 @@ import ../src/primitives/types
 import ../src/primitives/serialize
 import ../src/script/interpreter
 import ../src/consensus/validation
+import ../src/consensus/pow
 
 proc hexDecode(s: string): seq[byte] =
   if s.len mod 2 != 0:
@@ -294,6 +295,114 @@ proc processCheckTx(req: JsonNode): string =
     result = """{"valid":false,"reason":"""" &
       jsonEscape($res.error) & "\"}"
 
+## PoW difficulty differential op `nextwork`. Drives nimrod's REAL
+## src/consensus/pow.nim::getNextWorkRequired (the BlockIndex/chain-generic
+## entrypoint that does the retarget math + the height%2016 off-by-one + the
+## [timespan/4, timespan*4] clamp + the powLimit clamp + BIP94 anchoring),
+## NOT a value-based or legacy twin.  Mirrors how validation.nim:858-896
+## builds the call (PowParams field-copy from getParams(network), a pow.
+## BlockIndex for the previous block, and a getAncestor closure).
+##
+##   request:  {"op":"nextwork","network":"mainnet","height":<H>,
+##              "block_time":<u32>,
+##              "last":{"height":<int>,"bits":"<8hex>","time":<u32>},
+##              "first":{"height":<int>,"bits":"<8hex>","time":<u32>}}
+##              ("first" present ONLY on retarget boundaries, H%2016==0)
+##   response: {"nbits":"<8hex>"}   (impl's REAL computed required nBits)
+##             {"error":"..."}      (cannot compute -> driver skips)
+##
+## bits are 8-lowercase-hex (Core getblockheader format); nimrod stores nBits
+## as uint32, so we parse on entry and format on exit.
+
+## Map the network token to nimrod's params.Network enum (mirrors getParams
+## input).  Unknown token -> raise (shim emits {"error":...}; driver skips).
+proc networkFromToken(name: string): Network =
+  case name
+  of "mainnet": Mainnet
+  of "testnet3": Testnet3
+  of "testnet4": Testnet4
+  of "regtest": Regtest
+  of "signet": Signet
+  else: raise newException(ValueError, "unknown network: " & name)
+
+## Parse an 8-hex Core-format nBits string into the uint32 nimrod stores.
+proc parseBits(s: string): uint32 =
+  if s.len != 8:
+    raise newException(ValueError, "bits not 8 hex chars: " & s)
+  uint32(parseHexInt(s))
+
+## Format a uint32 nBits back to 8-lowercase-hex (Core getblockheader format).
+proc formatBits(b: uint32): string =
+  toLowerAscii(toHex(b, 8))
+
+## Build a pow.BlockIndex from a JSON {"height","bits","time"} node.  Only the
+## fields getNextWorkRequired reads are populated: height, header.timestamp,
+## header.bits.  prevBlock/hash are left default — getAncestor here is a
+## height-keyed closure over (last, first), so prevHash links are never walked.
+proc powIndexFromJson(node: JsonNode): pow.BlockIndex =
+  result = pow.BlockIndex(
+    height: int32(node["height"].getBiggestInt()),
+    hash: default(BlockHash)
+  )
+  result.header = default(BlockHeader)
+  result.header.timestamp = uint32(node["time"].getBiggestInt())
+  result.header.bits = parseBits(node["bits"].getStr())
+
+proc processNextWork(req: JsonNode): string =
+  let network = networkFromToken(req["network"].getStr())
+  let blockTime = uint32(req["block_time"].getBiggestInt())
+
+  # Field-copy ConsensusParams -> pow.PowParams (validation.nim:880-894).
+  let cp = getParams(network)
+  let powNetwork: pow.NetworkKind = case cp.network
+    of Mainnet:  pow.Mainnet
+    of Testnet3: pow.Testnet3
+    of Testnet4: pow.Testnet4
+    of Regtest:  pow.Regtest
+    of Signet:   pow.Signet
+  let powParams = pow.PowParams(
+    network:                     powNetwork,
+    powLimit:                    cp.powLimit,
+    powTargetTimespan:           cp.powTargetTimespan,
+    powTargetSpacing:            cp.powTargetSpacing,
+    powAllowMinDifficultyBlocks: cp.powAllowMinDifficultyBlocks,
+    powNoRetargeting:            cp.powNoRetargeting,
+    enforceBIP94:                cp.enforceBIP94
+  )
+
+  # pindexLast = the tip the next block is solved on (= request "last").
+  let lastIndex = powIndexFromJson(req["last"])
+
+  # getAncestor: a height-keyed closure over the (last, first) 2-node chain.
+  # On a retarget boundary getNextWorkRequired asks for height
+  # (last.height - 2015) == first.height, which must resolve to "first".
+  # On passthrough rows mainnet never calls getAncestor (returns last.bits),
+  # but testnet min-diff can walk back; we serve "last" for its own height and
+  # "first" for first's height, and raise for any other height so a wrong
+  # ancestor request surfaces as {"error":...} (driver skips) rather than a
+  # silently-faked value.
+  var firstIndex: pow.BlockIndex
+  let haveFirst = req.hasKey("first") and req["first"].kind == JObject
+  if haveFirst:
+    firstIndex = powIndexFromJson(req["first"])
+
+  let lastH = lastIndex.height
+  let firstH = if haveFirst: firstIndex.height else: int32.low
+  let lastIdxCap = lastIndex
+  let firstIdxCap = firstIndex
+  let getAncestor = proc(idx: pow.BlockIndex, height: int32): pow.BlockIndex =
+    if height == lastH:
+      lastIdxCap
+    elif haveFirst and height == firstH:
+      firstIdxCap
+    else:
+      raise newException(ValueError,
+        "getAncestor: no node at height " & $height &
+        " (have last=" & $lastH & (if haveFirst: ", first=" & $firstH else: "") & ")")
+
+  let nbits = pow.getNextWorkRequired(lastIndex, blockTime, powParams, getAncestor)
+  result = """{"nbits":"""" & formatBits(nbits) & "\"}"
+
 proc process(line: string): string =
   let req = parseJson(line)
   let op = if req.hasKey("op"): req["op"].getStr() else: "verifyscript"
@@ -301,6 +410,7 @@ proc process(line: string): string =
   of "verifyscript": processVerifyScript(req)
   of "verifytx": processVerifyTx(req)
   of "checktx": processCheckTx(req)
+  of "nextwork": processNextWork(req)
   else: raise newException(ValueError, "unknown op: " & op)
 
 proc main() =
