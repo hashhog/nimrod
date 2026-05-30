@@ -403,6 +403,66 @@ proc processNextWork(req: JsonNode): string =
   let nbits = pow.getNextWorkRequired(lastIndex, blockTime, powParams, getAncestor)
   result = """{"nbits":"""" & formatBits(nbits) & "\"}"
 
+## Merkle-root differential op `merkleroot` (CVE-2012-2459).
+## Drives nimrod's REAL tx-merkle primitive
+## (src/consensus/validation.nim:175 computeMerkleRoot), which builds the
+## root with Bitcoin's duplicate-last-if-odd rule.
+##
+## txids arrive in DISPLAY order (Core getblock convention, big-endian); the
+## impl merkle code works on internal/wire byte order, so each txid is
+## hex-decoded then reversed (the SAME display->wire reversal `verifytx`
+## applies via txidFromDisplayHex). The computed internal root is reversed
+## back to display order so it matches Core's header `merkleroot`.
+##
+## CRITICAL — mutated reflects nimrod's TRUE block-acceptance behavior:
+## nimrod's REAL merkle primitive now carries CVE-2012-2459 detection via
+## computeMerkleRootMutated (src/consensus/validation.nim — Core's
+## adjacent-pair-equal scan at the TOP of each level, BEFORE the odd-tail
+## duplication, complete pairs only). checkBlock / validateBlock reject a
+## mutated block with veMutatedMerkleTree (bad-txns-duplicate), so this op
+## reports the REAL `mutated` returned by the impl primitive — NOT a faked
+## value and NOT a check re-implemented in the shim. Honest odd-N blocks stay
+## mutated=false; cve2459 duplicate-tx constructions report mutated=true.
+##
+##   request:  {"op":"merkleroot","txids":["<64-hex display>",...]}
+##   response: {"root":"<64-hex display>","mutated":<bool>}
+##             {"error":"..."}   (cannot compute -> driver skips)
+
+## Reverse a DISPLAY-ORDER (big-endian) 32-byte hex txid to internal/wire
+## byte order, returning array[32,byte] for computeMerkleRoot. Same reversal
+## as txidFromDisplayHex (which wraps the result in TxId for OutPoint).
+proc internalHashFromDisplayHex(s: string): array[32, byte] =
+  let raw = hexDecode(s)
+  if raw.len != 32:
+    raise newException(ValueError, "txid not 32 bytes: " & $raw.len)
+  for i in 0 ..< 32:
+    result[i] = raw[31 - i]
+
+## Format an internal/wire 32-byte hash back to DISPLAY-ORDER hex (mirror of
+## internalHashFromDisplayHex; same convention as `$TxId` in types.nim which
+## emits bytes 31..0).
+proc displayHexFromInternalHash(h: array[32, byte]): string =
+  result = ""
+  for i in countdown(31, 0):
+    result.add(toHex(h[i], 2).toLowerAscii)
+
+proc processMerkleRoot(req: JsonNode): string =
+  var hashes: seq[array[32, byte]] = @[]
+  for t in req["txids"]:
+    hashes.add(internalHashFromDisplayHex(t.getStr()))
+  if hashes.len == 0:
+    raise newException(ValueError, "empty txids")
+
+  # nimrod's REAL merkle primitive WITH CVE-2012-2459 mutation detection. The
+  # same computeMerkleRootMutated drives checkBlock / validateBlock, which
+  # reject a mutated block (veMutatedMerkleTree / bad-txns-duplicate).
+  var mutated = false
+  let internalRoot = computeMerkleRootMutated(hashes, mutated)
+  let displayRoot = displayHexFromInternalHash(internalRoot)
+
+  let mutatedStr = if mutated: "true" else: "false"
+  result = """{"root":"""" & displayRoot & """","mutated":""" & mutatedStr & "}"
+
 proc process(line: string): string =
   let req = parseJson(line)
   let op = if req.hasKey("op"): req["op"].getStr() else: "verifyscript"
@@ -411,6 +471,7 @@ proc process(line: string): string =
   of "verifytx": processVerifyTx(req)
   of "checktx": processCheckTx(req)
   of "nextwork": processNextWork(req)
+  of "merkleroot": processMerkleRoot(req)
   else: raise newException(ValueError, "unknown op: " & op)
 
 proc main() =
