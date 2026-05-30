@@ -1226,6 +1226,50 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
     sm.headerTip = hash
     sm.headerTipHeight = expectedHeight
 
+    # Persist the accepted header into the DB block index (status
+    # bsHeaderOnly).  Core loads the FULL block tree (CBlockIndex map,
+    # headers included) before validating any block body; nimrod previously
+    # kept accepted headers only in the in-memory `headerChain` and wrote
+    # block-index rows lazily from connectBlock/connectBlockIBD when the
+    # BODY connected.  That gap is fatal to assumeUTXO snapshot bootstrap:
+    # after `--load-snapshot` the UTXO set + tip are at the snapshot base
+    # (e.g. 944183) but NO block-index row exists for it, so when block
+    # 944184's body arrives `acceptAndConnectBlock` does
+    # `cs.db.getBlockIndex(prevHash)` (validation.nim:2118) and rejects it
+    # with "prev block ... not in chain index"; the contextual checks of
+    # 944184 (getNextWorkRequired getAncestor walk + getMtpForHeight, which
+    # both read `cs.db`) likewise have nothing to walk.  Persisting headers
+    # as they are accepted makes the DB block index the single source of
+    # truth the validation path already reads, so once header sync (from
+    # genesis — headers are the cheap part assumeUTXO does NOT skip) passes
+    # the snapshot base, the parent lookup + contextual walks all succeed
+    # and forward block-body download/connect proceeds from base+1.
+    #
+    # Safe for the genesis path: connectBlock/connectBlockIBD write the
+    # authoritative full BlockIndex (status bsValidated, undoPos, nTx) with
+    # the same key when the body connects, overwriting this header-only row.
+    # We only claim the height->hash slot when no body-backed row already
+    # owns it (header sync always runs ahead of body sync, so these are
+    # heights with no connected body yet — and they carry the real chain
+    # headers).
+    if sm.chainDb != nil:
+      let hdrIdx = chainstate.BlockIndex(
+        hash: hash,
+        height: expectedHeight,
+        status: bsHeaderOnly,
+        prevHash: header.prevBlock,
+        header: header,
+        totalWork: sm.headerChain.totalWork,
+        nTx: 0
+      )
+      # by-hash row: required for getBlockIndex(prevHash) parent lookup and
+      # the getAncestor retarget walk.
+      sm.chainDb.putBlockIndexHashOnly(hdrIdx)
+      # height->hash row: only if no body-backed block already owns this
+      # height (do not clobber a connected block's authoritative mapping).
+      if sm.chainDb.getBlockHashByHeight(expectedHeight).isNone:
+        sm.chainDb.putBlockIndex(hdrIdx)
+
     lastValidHeight = expectedHeight
     accepted += 1
 
