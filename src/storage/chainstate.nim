@@ -160,6 +160,39 @@ type
     # Reference: bitcoin-core/src/index/base.cpp::BaseIndex::BlockDisconnected.
     disconnectHook*: proc(blockHash: BlockHash, prevHash: BlockHash,
                           height: int32) {.raises: [].}
+    # Optional per-block script-verification hook fired by `handleReorg` while
+    # connecting each promoted side-branch block, BEFORE that block's UTXO
+    # mutation is staged. Closes the reorg false-accept (chain-split class):
+    # the inline connect loop in `handleReorg` mutated the UTXO set
+    # (spend/create/index/advance-tip) but ran NO per-input script
+    # verification, so an invalid-script block sitting on a higher-work
+    # side-branch could be promoted onto the active chain with forged
+    # signatures unchecked. Bitcoin Core re-runs full script verification on
+    # every reorg-connected block via ConnectTip -> ConnectBlock
+    # (validation.cpp), and rustoshi (reorganize -> connect_block_with_
+    # sequence_locks) + blockbrew (ReorgTo -> ConnectBlock) do the same.
+    #
+    # The hook receives the candidate block and its height and returns ok()
+    # when every input script verifies (or scripts are legitimately skipped
+    # under assume-valid), or an error string on the first script failure —
+    # which aborts the reorg and rolls the in-memory + on-disk state back to
+    # the pre-reorg chain (RocksDB WriteBatch is never committed).
+    #
+    # Indirected through a callback so chainstate.nim does NOT import
+    # consensus/validation (which imports storage/chainstate — a cycle).
+    # Wired by the layer that owns both the ChainState and a CryptoEngine
+    # (src/rpc/server.nim, the only handleReorg caller). When nil (tests, or
+    # before wiring) the loop behaves as before — but the production reorg
+    # path MUST wire it so promoted blocks are script-verified.
+    #
+    # Returns (ok: true) when every input script verifies, or
+    # (ok: false, err: <reason>) on the first failure. A plain tuple is used
+    # instead of ChainStateResult[void] because this field is declared inside
+    # the ChainState object body, before the generic `case` ChainStateResult
+    # type is fully defined in the same `type` section (Nim rejects the
+    # forward reference to a generic variant type as a proc return type here).
+    reorgVerifyHook*: proc(blk: Block, height: int32): tuple[ok: bool, err: string]
+                          {.gcsafe, raises: [].}
 
   ## Result type for chainstate operations
   ChainStateResult*[T] = object
@@ -2094,6 +2127,46 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     # Generate undo data BEFORE mutating UTXO state.
     let undo = cs.generateUndoData(blk)
     let blockUndo = cs.generateBlockUndo(blk)
+
+    # ---- Script verification on the promoted side-branch block ----
+    # Bitcoin Core re-runs full per-input script verification on EVERY block
+    # connected during a reorg (ConnectTip -> ConnectBlock, validation.cpp),
+    # using the UTXO view rebuilt to the fork point plus the already-connected
+    # earlier side-branch blocks. nimrod's main-chain path runs the same check
+    # via acceptBlock -> verifyScripts; the reorg path previously inlined the
+    # UTXO mutation WITHOUT this check, so a higher-work side-branch block with
+    # forged signatures could be promoted onto the active chain unverified
+    # (chain-split-class false-accept). We close that here by invoking the
+    # injected verify hook against the live UTXO view at this exact point:
+    #   * all earlier `newChain` blocks have already been staged into
+    #     cs.utxoCache + cs.reorgDeletedUtxos (this loop processes them in
+    #     order, fork+1 -> tip), and
+    #   * THIS block's inputs are not yet spent,
+    # which is precisely the view Core's ConnectBlock sees. Intra-block spends
+    # within `blk` are resolved by verifyScripts' own intra-block UTXO tracking,
+    # so cs.getUtxo (which honours reorgDeletedUtxos / cache / DB) is the
+    # correct source.
+    #
+    # The skip gate is computed HERE (not in the hook) and mirrors the
+    # main-chain assume-valid logic — `acceptBlock` skips verifyScripts when
+    # shouldSkipScripts == ssrSkip; the per-input coinbase-maturity bypass
+    # below uses the identical computation. Keeping the gate in chainstate.nim
+    # (where buildAssumeValidContext / shouldSkipScripts are already in scope)
+    # means we never OVER-flag a block the main path would have skipped, and
+    # the hook stays a pure "verify scripts for this block" callback (so
+    # server.nim's wiring needs no assume-valid plumbing).
+    #
+    # On the first script failure the reorg is aborted: rollbackInMemory()
+    # restores the pre-reorg in-memory state, the WriteBatch is never
+    # committed (defer destroy), and the original tip is left intact.
+    if cs.reorgVerifyHook != nil:
+      let avCtxV = buildAssumeValidContext(cs, blockHash, newHeight)
+      if shouldSkipScripts(avCtxV, cs.params) != ssrSkip:
+        let verifyRes = cs.reorgVerifyHook(blk, newHeight)
+        if not verifyRes.ok:
+          rollbackInMemory()
+          return err("reorg connect rejected block " & $blockHash &
+                     " at height " & $newHeight & ": " & verifyRes.err)
 
     # Write undo to flat file (rev*.dat). This is durable independent of
     # the RocksDB batch, but committing it early is fine: on a mid-reorg
