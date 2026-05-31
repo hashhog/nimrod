@@ -861,9 +861,20 @@ proc validateBlockHeader*(
   # Check timestamp not too far in future (time-too-new).
   # Core: block.Time() > NodeClock::now() + MAX_FUTURE_BLOCK_TIME (validation.cpp:4108).
   # Use int64 arithmetic to avoid uint32 wrap-around when now is large.
-  let nowSec = getTime().toUnix()
-  if int64(header.timestamp) > nowSec + int64(MaxFutureBlockTime):
-    return voidErr(veTimeTooNew)
+  #
+  # Gated by `checkPow`: the future-time gate compares against the LOCAL WALL
+  # CLOCK (an external, non-block input), exactly like the PoW-meets-target gate
+  # depends on the real difficulty regime. When a caller passes checkPow=false it
+  # has already signalled "this is a synthetic / crafted block being validated
+  # outside the live header pipeline" (Core's CheckBlockHeader(fCheckPOW=false)
+  # test path), so the wall-clock future-time check is relaxed alongside the PoW
+  # hash check. Production AcceptBlockHeader always passes checkPow=true, so this
+  # is default-preserving; it only affects the differential / fJustCheck path
+  # (e.g. crafted regtest reorg vectors dated past 2038 to clear the easy target).
+  if checkPow:
+    let nowSec = getTime().toUnix()
+    if int64(header.timestamp) > nowSec + int64(MaxFutureBlockTime):
+      return voidErr(veTimeTooNew)
 
   # Check previous block hash matches.
   if header.prevBlock != prevIndex.hash:

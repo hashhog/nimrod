@@ -64,15 +64,17 @@
 ## `nim.cfg` (-d:useSystemSecp256k1, library linkage) and the nimble dep
 ## paths in config.nims apply when compiling.
 
-import std/[json, strutils, tables, options]
+import std/[json, strutils, tables, options, os, algorithm, times, random]
 import ../src/primitives/types
 import ../src/primitives/serialize
 import ../src/script/interpreter
 import ../src/consensus/validation
 import ../src/consensus/params
 import ../src/storage/chainstate
+import ../src/consensus/chain
 import ../src/consensus/pow
 import ../src/crypto/secp256k1
+import ../src/crypto/hashing
 
 proc hexDecode(s: string): seq[byte] =
   if s.len mod 2 != 0:
@@ -747,6 +749,323 @@ proc processCheckBlock(req: JsonNode): string =
 
   result = """{"valid":true}"""
 
+## DETERMINISTIC REORG op `reorg`. Drives nimrod's REAL reorg primitives over
+## an EXPLICIT decision + coins-view + per-block undo, eliminating the live-tip /
+## first-seen / nSequenceId race the old submitblock harness suffered from:
+##
+##   (1) WORK-COMPARE — strict new>old via nimrod's OWN pure 256-bit comparator
+##       chain.compareWork256 (src/consensus/chain.nim:137). The request supplies
+##       BE-256 hex; compareWork256 expects LITTLE-endian byte arrays, so each is
+##       reversed BE->LE before the call. new<=old => no-reorg-equal-or-less-work,
+##       view untouched (the side branch is NEVER evaluated).
+##
+##   (2) DEPTH CAP — disconnect.len > MAX_REORG_DEPTH(=100, chainstate.nim:1922)
+##       => reorg-too-deep, mirroring handleReorg's guard. EXPECTED-DIVERGENCE
+##       vs Core (Core has no fixed cap).
+##
+##   (3) DISCONNECT — per disconnect block tip-first, drive nimrod's REAL
+##       chainstate.disconnectBlock(cs, blk, height, undo, fClean) over a REAL
+##       ChainState backed by a throwaway temp RocksDB seeded with the
+##       pre-disconnect (working) coins-view. The 4-field coin-identity / HaveCoin
+##       unclean signal is surfaced via the fClean out-param wired into the REAL
+##       DisconnectBlock (validation.cpp:2185-2244 DISCONNECT_UNCLEAN). BIP-30
+##       h=91722/91812 exemption is handled inside disconnectBlock. unclean is
+##       non-fatal (Core parity) — the reorg still applies.
+##
+##   (4) CONNECT — per connect block in order, drive nimrod's REAL FULL
+##       re-validation at THAT block's OWN height: validateBlock(checkScripts=
+##       false, checkPow=false) [CheckBlock + ContextualCheckBlock + the
+##       ConnectBlock monetary/sigop/weight/coinbase-value gates] + verifyScripts
+##       [per-input script verification with getBlockScriptFlags(height) — flags
+##       ON, derived from the block's own height]. This is the SAME primitive the
+##       committed `checkblock` op proves. Stop at the FIRST reject
+##       (connected_count = blocks that passed before it). The post-disconnect
+##       coins-view is threaded between connect blocks so input/double-spend
+##       resolution is correct (R2 double-spend, R6 maturity).
+##
+## digest = sha256 over the sorted canonical coins-view (sort by wire-txid then
+## vout; per coin: txid[32] || vout u32 LE || height u32 LE || is_coinbase u8 ||
+## value u64 LE || spk_len u32 LE || spk). Decision-first scoring tolerates digest
+## divergence on reject vectors.
+##
+##   request:  {"op":"reorg","network":"regtest"|"mainnet",
+##              "fork_utxo":[{coin}...],            # the WORKING coins-view
+##              "disconnect":[{block_hex,height,undo:[{tx_index,vin:[coin]}]}...],
+##              "connect":[{block_hex,height,prev_mtp}...],
+##              "old_tip_work_hex":<32B BE hex>,"new_tip_work_hex":<32B BE hex>}
+##   response: {"outcome":...,"disconnect_result":...,"connected_count":N,
+##              "reject_reason":<token>,"fork_utxo_digest":<sha256 hex>}
+##             {"error":...}
+
+type ShimCoin = object
+  spk: seq[byte]
+  value: int64
+  height: int32
+  isCoinbase: bool
+
+proc coinFromJson(j: JsonNode): (TxId, uint32, ShimCoin) =
+  let txid = txidFromDisplayHex(j["txid"].getStr())
+  let vout = uint32(j["vout"].getBiggestInt())
+  let c = ShimCoin(
+    spk: hexDecode(j["scriptPubKey_hex"].getStr()),
+    value: j["value_sats"].getBiggestInt(),
+    height: int32(j["height"].getBiggestInt()),
+    isCoinbase: (if j.hasKey("is_coinbase"): j["is_coinbase"].getBool() else: false)
+  )
+  (txid, vout, c)
+
+## sha256 over the sorted canonical coins-view, byte-identical to the rustoshi
+## driver's view_digest (tools/phaseb-vectors/reorg_vectors.py).
+proc viewDigest(view: Table[(TxId, uint32), ShimCoin]): string =
+  var keys: seq[(TxId, uint32)] = @[]
+  for k in view.keys: keys.add(k)
+  # sort by (wire-txid bytes ascending, then vout ascending)
+  keys.sort(proc(a, b: (TxId, uint32)): int =
+    let aw = array[32, byte](a[0])
+    let bw = array[32, byte](b[0])
+    for i in 0 ..< 32:
+      if aw[i] < bw[i]: return -1
+      elif aw[i] > bw[i]: return 1
+    if a[1] < b[1]: return -1
+    elif a[1] > b[1]: return 1
+    0)
+  var buf: seq[byte] = @[]
+  for k in keys:
+    let c = view[k]
+    let w = array[32, byte](k[0])
+    for b in w: buf.add(b)
+    # vout u32 LE
+    buf.add(byte(k[1] and 0xff)); buf.add(byte((k[1] shr 8) and 0xff))
+    buf.add(byte((k[1] shr 16) and 0xff)); buf.add(byte((k[1] shr 24) and 0xff))
+    # height u32 LE
+    let h = uint32(c.height)
+    buf.add(byte(h and 0xff)); buf.add(byte((h shr 8) and 0xff))
+    buf.add(byte((h shr 16) and 0xff)); buf.add(byte((h shr 24) and 0xff))
+    # is_coinbase u8
+    buf.add(if c.isCoinbase: 1'u8 else: 0'u8)
+    # value u64 LE
+    let v = uint64(c.value)
+    for s in 0 ..< 8: buf.add(byte((v shr (s*8)) and 0xff))
+    # spk_len u32 LE
+    let sl = uint32(c.spk.len)
+    buf.add(byte(sl and 0xff)); buf.add(byte((sl shr 8) and 0xff))
+    buf.add(byte((sl shr 16) and 0xff)); buf.add(byte((sl shr 24) and 0xff))
+    for b in c.spk: buf.add(b)
+  let d = sha256Single(buf)
+  result = ""
+  for b in d: result.add(toHex(b, 2).toLowerAscii)
+
+## Reverse a 32-byte BE hex work string into the little-endian array
+## chain.compareWork256 expects (countdown(31,0) => index 31 is MSB => LE).
+proc workLEfromBEHex(s: string): array[32, byte] =
+  let raw = hexDecode(s)
+  if raw.len != 32:
+    raise newException(ValueError, "work hex not 32 bytes: " & $raw.len)
+  for i in 0 ..< 32:
+    result[i] = raw[31 - i]
+
+## Run nimrod's REAL FULL block re-validation (validateBlock checkScripts=false,
+## checkPow=false + verifyScripts) over an explicit coins-view lookup, at the
+## block's OWN height. Returns "" on accept, else the canonical reject token.
+## Mirrors processCheckBlock's prev-window / ChainDb-shadow seeding so contextual
+## gates (MTP, bad-diffbits) stay in-memory and never touch a nil db handle.
+proc revalidateConnectBlock(blk: Block, spendHeight: int32,
+                            params: ConsensusParams,
+                            lookup: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].}): string =
+  let prevHeight = spendHeight - 1
+  # Choose the prev (tip) timestamp comfortably MORE than 2*powTargetSpacing
+  # below the block time. On regtest powAllowMinDifficultyBlocks=true, so
+  # pow.getNextWorkRequired takes the min-difficulty shortcut (pow.nim:152)
+  # `blockTime > lastTime + 2*spacing => return powLimitCompact` and never
+  # enters the walk-back loop (pow.nim:157-161), which on a synthetic prev
+  # window with no deeper ancestors would not terminate. The block's own bits
+  # equal powLimitCompact on regtest, so bad-diffbits still passes. Each earlier
+  # window block is spaced one second lower so MTP stays below the block time.
+  let gap = uint32(2 * params.powTargetSpacing + 1)
+  let baseTime = if blk.header.timestamp > gap: blk.header.timestamp - gap else: 0'u32
+  var prevHeader = default(BlockHeader)
+  prevHeader.bits = blk.header.bits
+  prevHeader.timestamp = baseTime
+  let prevIndex = chainstate.BlockIndex(
+    hash: blk.header.prevBlock,
+    height: prevHeight,
+    header: prevHeader,
+    prevHash: default(BlockHash)
+  )
+  let db = ChainDb(
+    db: nil,
+    bestBlockHash: blk.header.prevBlock,
+    bestHeight: prevHeight,
+    ibdIndexByHash: initTable[BlockHash, chainstate.BlockIndex](),
+    ibdIndexByHeight: initTable[int32, BlockHash]()
+  )
+  block seedWindow:
+    for off in 0 ..< MedianTimeSpan:
+      let hh = prevHeight - int32(off)
+      if hh < 0: break
+      var hArr: array[32, byte]
+      if off == 0:
+        hArr = array[32, byte](blk.header.prevBlock)
+      else:
+        hArr[0] = byte(hh and 0xff)
+        hArr[1] = byte((hh shr 8) and 0xff)
+        hArr[2] = byte((hh shr 16) and 0xff)
+        hArr[3] = byte((hh shr 24) and 0xff)
+      let bh = BlockHash(hArr)
+      var wh = default(BlockHeader)
+      wh.bits = blk.header.bits
+      wh.timestamp = if baseTime >= uint32(off): baseTime - uint32(off) else: 0'u32
+      db.ibdIndexByHash[bh] = chainstate.BlockIndex(hash: bh, height: hh, header: wh)
+      db.ibdIndexByHeight[hh] = bh
+
+  let vres = validateBlock(blk, prevIndex, db, params,
+                           checkScripts = false, checkPow = false,
+                           getUtxoOverride = lookup)
+  if not vres.isOk:
+    return bip22String(vres.error)
+  var crypto = newCryptoEngine()
+  defer: crypto.close()
+  let sres = verifyScripts(blk, lookup, spendHeight, crypto, params)
+  if not sres.isOk:
+    return bip22String(sres.error)
+  ""
+
+proc processReorg(req: JsonNode): string =
+  let params = case req["network"].getStr()
+    of "mainnet": mainnetParams()
+    of "regtest": regtestParams()
+    of "testnet4": testnet4Params()
+    else: raise newException(ValueError, "unknown network: " & req["network"].getStr())
+
+  # --- the explicit working coins-view (shim-threaded, for digest + connect) ---
+  var view = initTable[(TxId, uint32), ShimCoin]()
+  if req.hasKey("fork_utxo"):
+    for j in req["fork_utxo"]:
+      let (txid, vout, c) = coinFromJson(j)
+      view[(txid, vout)] = c
+
+  # ===== (1) WORK-COMPARE via nimrod's REAL pure comparator =====
+  let oldW = workLEfromBEHex(req["old_tip_work_hex"].getStr())
+  let newW = workLEfromBEHex(req["new_tip_work_hex"].getStr())
+  if compareWork256(newW, oldW) <= 0:
+    # No reorg — view untouched, side branch never evaluated.
+    return """{"outcome":"no-reorg-equal-or-less-work","connected_count":0,""" &
+           """"fork_utxo_digest":"""" & viewDigest(view) & "\"}"
+
+  # ===== (2) DEPTH CAP (handleReorg MAX_REORG_DEPTH=100) =====
+  let discArr = if req.hasKey("disconnect"): req["disconnect"] else: newJArray()
+  if discArr.len > chainstate.MAX_REORG_DEPTH:
+    return """{"outcome":"reorg-too-deep","reject_reason":"reorg-depth-exceeds-max"}"""
+
+  # ===== (3) DISCONNECT phase — drive REAL chainstate.disconnectBlock =====
+  # A throwaway temp RocksDB ChainState seeded with the working coins-view.
+  let tmpDir = getTempDir() / ("nimrod-reorg-" & $getCurrentProcessId() & "-" &
+                               $epochTime().int64 & "-" & $rand(high(int)))
+  createDir(tmpDir)
+  var cs = newChainState(tmpDir, params)
+  defer:
+    cs.close()
+    try: removeDir(tmpDir)
+    except CatchableError: discard
+
+  # Seed the real UTXO db from the working coins-view.
+  for (k, c) in view.pairs:
+    cs.db.putUtxo(OutPoint(txid: k[0], vout: k[1]),
+                  UtxoEntry(output: TxOut(value: Satoshi(c.value), scriptPubKey: c.spk),
+                            height: c.height, isCoinbase: c.isCoinbase))
+
+  var disconnectResult = "ok"
+  for d in discArr:
+    let blk = deserializeBlock(hexDecode(d["block_hex"].getStr()))
+    let height = int32(d["height"].getBiggestInt())
+    # Build UndoData from the supplied undo records: per tx_index, restore each
+    # vin coin at the spending tx's corresponding prevout.
+    var undo = UndoData()
+    if d.hasKey("undo"):
+      for u in d["undo"]:
+        let txIndex = int(u["tx_index"].getBiggestInt())
+        if txIndex < 0 or txIndex >= blk.txs.len:
+          raise newException(ValueError, "undo tx_index out of range: " & $txIndex)
+        let tx = blk.txs[txIndex]
+        var vi = 0
+        for coinJ in u["vin"]:
+          if vi >= tx.inputs.len:
+            raise newException(ValueError, "undo vin count exceeds tx inputs")
+          let (_, _, c) = coinFromJson(coinJ)
+          undo.spentOutputs.add((tx.inputs[vi].prevOut,
+            UtxoEntry(output: TxOut(value: Satoshi(c.value), scriptPubKey: c.spk),
+                      height: c.height, isCoinbase: c.isCoinbase)))
+          inc vi
+
+    var fClean = true
+    let dres = cs.disconnectBlock(blk, height, undo, addr fClean)
+    if not dres.isOk:
+      return """{"outcome":"reorg-rejected","disconnect_result":"failed",""" &
+             """"connected_count":0,"reject_reason":"""" &
+             jsonEscape(dres.error) & "\"}"
+    if not fClean:
+      disconnectResult = "unclean"
+
+    # Reflect the disconnect into the shim-threaded view: remove the block's
+    # created outputs, restore the undo coins (mirrors the REAL mutation above).
+    for txIdx in countdown(blk.txs.len - 1, 0):
+      let tx = blk.txs[txIdx]
+      let txId = tx.txid()
+      for voutIdx in 0 ..< tx.outputs.len:
+        if isUnspendable(tx.outputs[voutIdx].scriptPubKey): continue
+        view.del((txId, uint32(voutIdx)))
+    for (outpoint, entry) in undo.spentOutputs:
+      view[(outpoint.txid, outpoint.vout)] = ShimCoin(
+        spk: entry.output.scriptPubKey, value: int64(entry.output.value),
+        height: entry.height, isCoinbase: entry.isCoinbase)
+
+  # ===== (4) CONNECT phase — REAL validateBlock + verifyScripts per block =====
+  # Lookup closure over the shim-threaded (post-disconnect, incrementally
+  # advanced) view + intra-block coins of the block under validation.
+  let connArr = if req.hasKey("connect"): req["connect"] else: newJArray()
+  var connected = 0
+  for cb in connArr:
+    let blk = deserializeBlock(hexDecode(cb["block_hex"].getStr()))
+    let height = int32(cb["height"].getBiggestInt())
+
+    # snapshot the view so the lookup closure is gcsafe/raises:[] over it
+    let viewCap = view
+    let lookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+      let key = (op.txid, op.vout)
+      if viewCap.hasKey(key):
+        try:
+          let c = viewCap[key]
+          some(UtxoEntry(output: TxOut(value: Satoshi(c.value), scriptPubKey: c.spk),
+                         height: c.height, isCoinbase: c.isCoinbase))
+        except KeyError: none(UtxoEntry)
+      else:
+        none(UtxoEntry)
+
+    let reason = revalidateConnectBlock(blk, height, params, lookup)
+    if reason.len > 0:
+      return """{"outcome":"reorg-rejected","disconnect_result":"""" &
+             disconnectResult & """","connected_count":""" & $connected &
+             ""","reject_reason":"""" & jsonEscape(reason) & "\"}"
+
+    # Block accepted: thread its UTXO delta into the view (spend inputs, create
+    # outputs) so the NEXT connect block sees the post-connect coins-view
+    # (R2 double-spend across blocks resolves here).
+    for txIdx, tx in blk.txs:
+      let txId = tx.txid()
+      if txIdx > 0:
+        for input in tx.inputs:
+          view.del((input.prevOut.txid, input.prevOut.vout))
+      for voutIdx, output in tx.outputs:
+        if isUnspendable(output.scriptPubKey): continue
+        view[(txId, uint32(voutIdx))] = ShimCoin(
+          spk: output.scriptPubKey, value: int64(output.value),
+          height: height, isCoinbase: txIdx == 0)
+    inc connected
+
+  result = """{"outcome":"reorg-applied","disconnect_result":"""" &
+           disconnectResult & """","connected_count":""" & $connected &
+           ""","fork_utxo_digest":"""" & viewDigest(view) & "\"}"
+
 proc process(line: string): string =
   let req = parseJson(line)
   let op = if req.hasKey("op"): req["op"].getStr() else: "verifyscript"
@@ -759,9 +1078,11 @@ proc process(line: string): string =
   of "merkleroot": processMerkleRoot(req)
   of "subsidy": processSubsidy(req)
   of "checkblock": processCheckBlock(req)
+  of "reorg": processReorg(req)
   else: raise newException(ValueError, "unknown op: " & op)
 
 proc main() =
+  randomize()
   var line: string
   while stdin.readLine(line):
     if line.strip().len == 0:

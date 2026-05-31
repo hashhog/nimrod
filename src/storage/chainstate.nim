@@ -291,7 +291,7 @@ proc serializeUtxoEntry*(entry: UtxoEntry): seq[byte] =
   w.writeUint8(if entry.isCoinbase: 1 else: 0)
   w.data
 
-proc deserializeUtxoEntry(data: seq[byte]): UtxoEntry =
+proc deserializeUtxoEntry*(data: seq[byte]): UtxoEntry =
   var r = BinaryReader(data: data, pos: 0)
   result.output = r.readTxOut()
   result.height = r.readInt32LE()
@@ -1674,7 +1674,8 @@ proc isBip30UnspendableForDisconnect(height: int32, blockHash: BlockHash): bool 
   (height == 91722'i32 and array[32, byte](blockHash) == bip30Unspend1Hash) or
   (height == 91812'i32 and array[32, byte](blockHash) == bip30Unspend2Hash)
 
-proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoData): ChainStateResult[void] =
+proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoData,
+                      fClean: ptr bool = nil): ChainStateResult[void] =
   ## Disconnect a block: restore spent outputs, remove created outputs.
   ## Requires undo data to restore spent UTXOs.
   ##
@@ -1683,6 +1684,24 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
   ##  Gate 2: fEnforceBIP30 — relax output-mismatch for h=91722/91812 coinbases (val:2201-2202).
   ##  Gate 3: Restore inputs in reverse vin order (validation.cpp:2233).
   ##  Gate 4: SetBestBlock unconditionally (validation.cpp:2245).
+  ##
+  ## `fClean` (optional out-param, default nil → behavior unchanged): when
+  ## non-nil, this tracks Bitcoin Core's `DISCONNECT_UNCLEAN` signal
+  ## (validation.cpp:2185-2244). Core sets `fClean = false` (non-fatal, the
+  ## disconnect still proceeds and the function still returns success/ok) on
+  ## two conditions, both of which nimrod previously collapsed silently into
+  ## "ok" because the writer is purely key-driven:
+  ##   (a) SpendCoin output-side identity mismatch (validation.cpp:2218-2226):
+  ##       the coin being removed for a created output is absent, or does not
+  ##       match the block's output by the 4-field coin identity
+  ##       (value + scriptPubKey + height + isCoinbase). BIP-30-unspendable
+  ##       coinbases (h=91722/91812 with the matching hash) are EXEMPT.
+  ##   (b) ApplyTxInUndo HaveCoin overwrite (validation.cpp:2153): the spent
+  ##       input being restored is already present (unspent) in the view, so
+  ##       the restore overwrites a live coin.
+  ## This makes the real DisconnectBlock surface the same tri-valued
+  ## ok/unclean distinction Core's caller (DisconnectTip) observes, without
+  ## altering the default (nil) call path used everywhere in production.
 
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
@@ -1717,6 +1736,22 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
       # skip the delete to avoid an inconsistency marker (equivalent to Core's
       # fClean=false path that still proceeds).
       if not isBip30Exception:
+        # DISCONNECT_UNCLEAN (a): Core SpendCoin output-identity check
+        # (validation.cpp:2218-2226). When fClean tracking is requested, verify
+        # the coin we are about to remove is present AND matches the block's
+        # output by the 4-field coin identity (value + scriptPubKey + height +
+        # isCoinbase). Absent or mismatched => non-fatal unclean. The delete
+        # still proceeds (key-driven), matching Core.
+        if fClean != nil:
+          let present = cs.getUtxo(outpoint)
+          if present.isNone:
+            fClean[] = false
+          else:
+            let cur = present.get()
+            if cur.output.value != tx.outputs[voutIdx].value or
+               cur.output.scriptPubKey != tx.outputs[voutIdx].scriptPubKey or
+               cur.height != height or cur.isCoinbase != isCoinbase:
+              fClean[] = false
         batch.delete(cfUtxo, key)
         cs.deleteUtxoCache(outpoint)
 
@@ -1749,6 +1784,15 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
   #   legacy datadirs and crash-recovery from old undo files.
   for (outpoint, entry) in undo.spentOutputs:
     var restoreEntry = entry
+
+    # DISCONNECT_UNCLEAN (b): ApplyTxInUndo HaveCoin overwrite check
+    # (validation.cpp:2153). If the outpoint we are about to restore is already
+    # present (unspent) in the view, the restore overwrites a live coin —
+    # Core's `view.AddCoin(out, std::move(undo), !fClean)` with fClean=false.
+    # Non-fatal: the put below proceeds and still overwrites.
+    if fClean != nil:
+      if cs.getUtxo(outpoint).isSome:
+        fClean[] = false
 
     # Gate 6: missing-metadata sibling recovery.
     if restoreEntry.height == 0 and not restoreEntry.isCoinbase:
