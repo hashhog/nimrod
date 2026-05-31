@@ -1166,6 +1166,129 @@ proc processReorg(req: JsonNode): string =
            disconnectResult & """","connected_count":""" & $connected &
            ""","fork_utxo_digest":"""" & viewDigest(view) & "\"}"
 
+## HEADER-LEVEL reject differential op `checkheader`. Drives nimrod's REAL
+## header-acceptance gates — the SAME two procs validateBlock's Step 1a/1b call
+## (validation.nim:1348-1360) — over an EXPLICIT (header, prev-context) tuple
+## with a flag-gated injected clock, so the header reject bar is exercised
+## deterministically without a live tip:
+##
+##   Stage 1  validateBlockHeader(header, prevIndex, params,
+##              checkPow = not skip_pow, currentTime = current_time)
+##            -> high-hash  (Core CheckBlockHeader -> CheckProofOfWork, which
+##                           now folds nBits-malformed / target>powLimit /
+##                           hash>target into one verdict via pow.checkProofOfWork)
+##            -> time-too-new (Core ContextualCheckBlockHeader:4108, WALL CLOCK;
+##                           injected via the new currentTime param — sentinel 0
+##                           disables it, exactly the corpus's determinism control)
+##            -> prevHash link
+##
+##   Stage 2  contextualCheckBlockHeaderEx(header, height, prevHeader, prevHash,
+##              mtp, params, expectedBitsOverride, firstHeader, firstHeight)
+##            -> bad-diffbits  (Gate 1, FIRST: header.bits == GetNextWorkRequired
+##                              computed by nimrod's OWN pow.getNextWorkRequired
+##                              over the prev (+ optional first) context — NOT the
+##                              block's own bits; an explicit expected_bits override
+##                              isolates the gate on retarget boundaries)
+##            -> time-too-old  (Gate 2: header.ts > mtp)
+##            -> time-timewarp-attack (Gate 3: BIP94, testnet4 boundary, ts<prev-600)
+##            -> bad-version   (Gate 4: v<2/<3/<4 post BIP34/66/65)
+##
+## bad-diffbits is THE flagship false-accept guard. nimrod ALREADY enforces it
+## (validation.nim:988 header.bits != expectedBits -> veIncorrectProofOfWork),
+## so this op confirms there is no hole — it never compares against the block's
+## own bits, only the prev-context-derived expected nBits.
+##
+## bad-version reason: nimrod's bip22String(veBadBlockVersion) is the bare token
+## "bad-version"; Core formats `strprintf("bad-version(0x%08x)", block.nVersion)`
+## (validation.cpp:4116). Since the shim is the differential driver and HAS the
+## header version, it appends the Core `(0x%08x)` suffix here — the same place
+## Core does it — so the token matches the corpus byte-for-byte. The DECISION
+## (reject) and the gate (version) are nimrod's; only the printf-style suffix is
+## reconstructed in the driver.
+##
+##   request:  {"op":"checkheader","network":"...","header_hex":"<80B>",
+##              "height":<int>,
+##              "prev":{"bits":"<8hex>","time":<u32>,"hash":"<display-hex>"},
+##              "mtp":<u32>,"current_time":<int64; 0 disables time-too-new>,
+##              "skip_pow":<bool>,
+##              "expected_bits":"<8hex>"?,            # opt diffbits override
+##              "first":{"height":<int>,"bits":"<8hex>","time":<u32>}?}  # opt
+##   response: {"accept":true} | {"accept":false,"reason":"<bip22 token>"}
+##             {"error":"..."}  (cannot evaluate -> driver skips)
+proc processCheckHeader(req: JsonNode): string =
+  let network = networkFromToken(req["network"].getStr())
+  let params = getParams(network)
+
+  let headerBytes = hexDecode(req["header_hex"].getStr())
+  if headerBytes.len != 80:
+    raise newException(ValueError, "header_hex not 80 bytes: " & $headerBytes.len)
+  let header = deserializeBlockHeader(headerBytes)
+
+  let height = int32(req["height"].getBiggestInt())
+  let currentTime = if req.hasKey("current_time"): req["current_time"].getBiggestInt()
+                    else: 0'i64
+  # skip_pow defaults FALSE for checkheader: the point is to drive the strict
+  # range-aware pow.checkProofOfWork over a crafted header for the high-hash class.
+  let skipPow = if req.hasKey("skip_pow"): req["skip_pow"].getBool() else: false
+
+  let prev = req["prev"]
+  let prevBits = parseBits(prev["bits"].getStr())
+  let prevTime = uint32(prev["time"].getBiggestInt())
+  let mtp = uint32(req["mtp"].getBiggestInt())
+
+  # prevIndex: hash = the header's OWN prevBlock (so validateBlockHeader's
+  # prevHash-link gate passes), bits/timestamp = the supplied prev-context.
+  var prevHeader = default(BlockHeader)
+  prevHeader.bits = prevBits
+  prevHeader.timestamp = prevTime
+  let prevIndex = chainstate.BlockIndex(
+    hash: header.prevBlock,
+    height: height - 1,
+    header: prevHeader,
+    prevHash: default(BlockHash)
+  )
+
+  # ---- Stage 1: CheckBlockHeader (high-hash) + time-too-new (injected clock) +
+  # prevHash, all via nimrod's REAL validateBlockHeader. minPowChecked=true so the
+  # PRESYNC too-little-chainwork gate (not under test) does not fire.
+  let hdrRes = validateBlockHeader(header, prevIndex, params,
+                                   checkPow = not skipPow,
+                                   minPowChecked = true,
+                                   currentTime = currentTime)
+  if not hdrRes.isOk:
+    return """{"accept":false,"reason":"""" &
+      jsonEscape(bip22String(hdrRes.error)) & "\"}"
+
+  # ---- Stage 2: ContextualCheckBlockHeader (bad-diffbits / time-too-old /
+  # timewarp / bad-version) via the explicit-input twin contextualCheckBlockHeaderEx.
+  let expectedOverride =
+    if req.hasKey("expected_bits"):
+      int64(parseBits(req["expected_bits"].getStr()))
+    else:
+      -1'i64
+  var firstHeader = default(BlockHeader)
+  var firstHeight = -1'i32
+  if req.hasKey("first") and req["first"].kind == JObject:
+    let f = req["first"]
+    firstHeader.bits = parseBits(f["bits"].getStr())
+    firstHeader.timestamp = uint32(f["time"].getBiggestInt())
+    firstHeight = int32(f["height"].getBiggestInt())
+
+  let ctxRes = contextualCheckBlockHeaderEx(
+    header, height, prevHeader, header.prevBlock, mtp, params,
+    expectedOverride, firstHeader, firstHeight)
+  if not ctxRes.isOk:
+    # Core formats bad-version with the nVersion suffix (validation.cpp:4116);
+    # reconstruct it here (the driver) so the token matches the corpus.
+    if ctxRes.error == veBadBlockVersion:
+      let v = uint32(header.version)
+      return """{"accept":false,"reason":"bad-version(0x""" &
+        toLowerAscii(toHex(v, 8)) & ")\"}"
+    return """{"accept":false,"reason":"""" &
+      jsonEscape(bip22String(ctxRes.error)) & "\"}"
+
+  result = """{"accept":true}"""
+
 proc process(line: string): string =
   let req = parseJson(line)
   let op = if req.hasKey("op"): req["op"].getStr() else: "verifyscript"
@@ -1179,6 +1302,7 @@ proc process(line: string): string =
   of "subsidy": processSubsidy(req)
   of "checkblock": processCheckBlock(req)
   of "checkbip30": processCheckBip30(req)
+  of "checkheader": processCheckHeader(req)
   of "reorg": processReorg(req)
   else: raise newException(ValueError, "unknown op: " & op)
 
