@@ -810,12 +810,36 @@ proc validateTransaction*(
   ok(fee)
 
 # Block header validation
+
+## Field-copy a ConsensusParams into the minimal pow.PowParams the PoW
+## primitives need (mirrors the inline copy in contextualCheckBlockHeader and
+## the validation.nim:880-894 nextwork call site). Centralised so the
+## CheckProofOfWork range fold and the GetNextWorkRequired diffbits gate build
+## the SAME params object.
+proc toPowParams(params: ConsensusParams): pow.PowParams =
+  let powNetwork: pow.NetworkKind = case params.network
+    of Mainnet:  pow.Mainnet
+    of Testnet3: pow.Testnet3
+    of Testnet4: pow.Testnet4
+    of Regtest:  pow.Regtest
+    of Signet:   pow.Signet
+  pow.PowParams(
+    network:                     powNetwork,
+    powLimit:                    params.powLimit,
+    powTargetTimespan:           params.powTargetTimespan,
+    powTargetSpacing:            params.powTargetSpacing,
+    powAllowMinDifficultyBlocks: params.powAllowMinDifficultyBlocks,
+    powNoRetargeting:            params.powNoRetargeting,
+    enforceBIP94:                params.enforceBIP94
+  )
+
 proc validateBlockHeader*(
   header: BlockHeader,
   prevIndex: BlockIndex,
   params: ConsensusParams,
   checkPow: bool = true,
-  minPowChecked: bool = true
+  minPowChecked: bool = true,
+  currentTime: int64 = 0
 ): ValidationResult[void] =
   ## Validate block header against consensus rules.
   ##
@@ -829,6 +853,15 @@ proc validateBlockHeader*(
   ##   the header is rejected immediately with veInsufficientChainWork.
   ##   Reference: validation.cpp:4229 — `if (!min_pow_checked) return
   ##   state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork")`.
+  ##
+  ## currentTime: flag-gated injectable wall clock for the time-too-new gate
+  ##   (mirrors the `checkPow` injectable-PoW pattern). Sentinel 0 (the default)
+  ##   means "use the real wall clock" (getTime()), so production callers that
+  ##   omit it are byte-identical to the previous behaviour. A non-zero value
+  ##   pins `now` deterministically (differential / fJustCheck path) so the
+  ##   future-time boundary can be exercised without depending on the host clock.
+  ##   Core compares against NodeClock::now() (validation.cpp:4108); injecting it
+  ##   is the same seam Core's mocktime / SetMockTime provides for tests.
   ##
   ## NOTE: This proc does NOT have access to the chain DB, so it cannot
   ## enforce MTP (time-too-old), bad-diffbits, bad-version, or
@@ -850,29 +883,47 @@ proc validateBlockHeader*(
     if not isZeroMinWork:
       return voidErr(veInsufficientChainWork)
 
-  # Check proof of work — hash must be <= target encoded by nBits.
-  # Core validation.cpp CheckBlockHeader: just the hash-meets-target gate.
+  # Check proof of work — Core CheckBlockHeader -> CheckProofOfWork
+  # (validation.cpp:3831 -> pow.cpp). CheckProofOfWork folds THREE rejections
+  # into one high-hash verdict: (a) nBits malformed (mantissa sign bit set =>
+  # fNegative, or target == 0), (b) target > powLimit (out-of-range difficulty),
+  # (c) the actual hash > target. nimrod's pow.checkProofOfWork (pow.nim:49-66)
+  # implements all three; the bare params.hashMeetsTarget used previously only
+  # did (c), so a header whose nBits encoded an above-powLimit / zero / negative
+  # target slipped past this gate (and, with a crafted prev so GetNextWorkRequired
+  # returns the same out-of-range bits, past bad-diffbits too) — a false-accept.
+  # Routing through pow.checkProofOfWork closes that fold to match Core. Still
+  # gated by checkPow, so production (always checkPow=true) only gains the Core
+  # rejections, never relaxes; the synthetic/fJustCheck path (checkPow=false) is
+  # unchanged.
   if checkPow:
     let headerBytes = serialize(header)
     let hash = BlockHash(doubleSha256(headerBytes))
-    if not hashMeetsTarget(hash, header.bits):
+    if not pow.checkProofOfWork(hash, header.bits, toPowParams(params)):
       return voidErr(veExceedsTarget)
 
   # Check timestamp not too far in future (time-too-new).
   # Core: block.Time() > NodeClock::now() + MAX_FUTURE_BLOCK_TIME (validation.cpp:4108).
   # Use int64 arithmetic to avoid uint32 wrap-around when now is large.
   #
-  # Gated by `checkPow`: the future-time gate compares against the LOCAL WALL
-  # CLOCK (an external, non-block input), exactly like the PoW-meets-target gate
-  # depends on the real difficulty regime. When a caller passes checkPow=false it
-  # has already signalled "this is a synthetic / crafted block being validated
-  # outside the live header pipeline" (Core's CheckBlockHeader(fCheckPOW=false)
-  # test path), so the wall-clock future-time check is relaxed alongside the PoW
-  # hash check. Production AcceptBlockHeader always passes checkPow=true, so this
-  # is default-preserving; it only affects the differential / fJustCheck path
-  # (e.g. crafted regtest reorg vectors dated past 2038 to clear the easy target).
-  if checkPow:
-    let nowSec = getTime().toUnix()
+  # Clock source (the `now` Core compares against):
+  #   * currentTime != 0  -> the INJECTED deterministic clock (differential /
+  #                          fJustCheck path). Runs regardless of checkPow so the
+  #                          future-time boundary can be exercised on a crafted
+  #                          header without depending on the host wall clock.
+  #   * currentTime == 0 (default) & checkPow -> the LOCAL WALL CLOCK (getTime()),
+  #                          exactly the production AcceptBlockHeader behaviour.
+  #   * currentTime == 0 & not checkPow -> SKIP. checkPow=false signals "synthetic
+  #                          / crafted block validated outside the live header
+  #                          pipeline" (Core's CheckBlockHeader(fCheckPOW=false)
+  #                          path), so without an injected clock the wall-clock
+  #                          future-time check is relaxed alongside the PoW hash
+  #                          check — preserving the existing reorg/checkblock
+  #                          vectors dated past 2038 to clear the easy target.
+  # Production always passes the default currentTime=0 + checkPow=true, so this is
+  # byte-identical to the prior behaviour for live header acceptance.
+  if currentTime != 0 or checkPow:
+    let nowSec = if currentTime != 0: currentTime else: getTime().toUnix()
     if int64(header.timestamp) > nowSec + int64(MaxFutureBlockTime):
       return voidErr(veTimeTooNew)
 
@@ -931,21 +982,7 @@ proc contextualCheckBlockHeader*(
       cur = pow.BlockIndex(height: parent.height, header: parent.header, hash: parent.hash)
     cur
 
-  let powNetwork: pow.NetworkKind = case params.network
-    of Mainnet:  pow.Mainnet
-    of Testnet3: pow.Testnet3
-    of Testnet4: pow.Testnet4
-    of Regtest:  pow.Regtest
-    of Signet:   pow.Signet
-  let powParams = pow.PowParams(
-    network:                  powNetwork,
-    powLimit:                 params.powLimit,
-    powTargetTimespan:        params.powTargetTimespan,
-    powTargetSpacing:         params.powTargetSpacing,
-    powAllowMinDifficultyBlocks: params.powAllowMinDifficultyBlocks,
-    powNoRetargeting:         params.powNoRetargeting,
-    enforceBIP94:             params.enforceBIP94
-  )
+  let powParams = toPowParams(params)
 
   let expectedBits = pow.getNextWorkRequired(powPrev, header.timestamp, powParams, getAncestor)
   if header.bits != expectedBits:
@@ -974,6 +1011,98 @@ proc contextualCheckBlockHeader*(
   if header.version < 3 and height >= int32(params.bip66Height):
     return voidErr(veBadBlockVersion)
   # BIP65: nVersion < 4 rejected after BIP65 activation height.
+  if header.version < 4 and height >= int32(params.bip65Height):
+    return voidErr(veBadBlockVersion)
+
+  ok()
+
+## Differential / fJustCheck twin of contextualCheckBlockHeader that takes the
+## chain-derived inputs EXPLICITLY instead of reading them out of a live ChainDb:
+##   * prevHeader  — the previous block's header (its bits + timestamp feed the
+##                   GetNextWorkRequired base and the BIP-94 timewarp prev-600 floor).
+##   * mtp         — MedianTimePast of prev's 11 ancestors (Gate 2 time-too-old).
+##   * expectedBitsOverride — sentinel <0 means "compute via GetNextWorkRequired"
+##                   exactly as the production proc does; >=0 pins the mandated
+##                   nBits so a single gate can be isolated on a retarget boundary
+##                   (the differential corpus uses this to test the timewarp floor
+##                   without seeding a 2016-deep ancestor window — the retarget
+##                   value itself is covered separately by the `nextwork` op).
+##   * firstHeader/firstHeight — optional first-block-of-period, linked as prev's
+##                   ancestor so GetNextWorkRequired's getAncestor(h-2015) resolves
+##                   on a boundary when no override is supplied.
+##
+## It runs the SAME four gates in the SAME Core order (4088 bad-diffbits, 4092
+## time-too-old, 4097 BIP-94 timewarp, 4112 bad-version) over nimrod's REAL
+## pow.getNextWorkRequired, so it is a faithful, gated, NON-production view: the
+## live AcceptBlock path keeps calling contextualCheckBlockHeader above.
+## Mirrors rustoshi's contextual_check_block_header(header, height, prev_entry,
+## ctx{mtp}, params, current_time, expected_bits) shim entrypoint.
+proc contextualCheckBlockHeaderEx*(
+  header: BlockHeader,
+  height: int32,
+  prevHeader: BlockHeader,
+  prevHash: BlockHash,
+  mtp: uint32,
+  params: ConsensusParams,
+  expectedBitsOverride: int64 = -1,
+  firstHeader: BlockHeader = default(BlockHeader),
+  firstHeight: int32 = -1
+): ValidationResult[void] =
+  let powParams = toPowParams(params)
+
+  # Gate 1: bad-diffbits — nBits must match GetNextWorkRequired(prev).
+  # Core validation.cpp:4088-4089.
+  let expectedBits =
+    if expectedBitsOverride >= 0:
+      uint32(expectedBitsOverride and 0xffffffff'i64)
+    else:
+      let powPrev = pow.BlockIndex(
+        height: height - 1, header: prevHeader, hash: prevHash)
+      # Height-keyed getAncestor over the prev (+ optional first) context. On a
+      # min-difficulty network (regtest/testnet) GetNextWorkRequired's non-boundary
+      # branch (pow.cpp:33 / pow.nim:157-161) walks ancestors back toward genesis
+      # while their bits stay at powLimit — so it asks for EVERY height in
+      # [0, prev.height], not just prev.height. We model that uniform-difficulty
+      # ancestor chain by serving, for any height in [0, prev.height], a synthetic
+      # index carrying the SAME prev bits + timestamp (exactly the chain shape a
+      # fresh regtest/testnet chain has, where every pre-retarget block sits at
+      # powLimit). This is faithful: it reproduces what nimrod's production
+      # getAncestor would return walking such a chain, and the walk terminates at
+      # height 0 (pow.nim loop guard `pindex.height > 0`). `first` (when supplied)
+      # pins the first-of-period block for a retarget boundary. Any out-of-range
+      # height raises so a genuinely impossible ancestor request surfaces as an
+      # error (driver skips), never a silently-faked value.
+      let firstIdx = pow.BlockIndex(
+        height: firstHeight, header: firstHeader, hash: default(BlockHash))
+      let getAncestor = proc(idx: pow.BlockIndex, targetHeight: int32): pow.BlockIndex =
+        if targetHeight == height - 1: powPrev
+        elif firstHeight >= 0 and targetHeight == firstHeight: firstIdx
+        elif targetHeight >= 0 and targetHeight < height - 1:
+          pow.BlockIndex(height: targetHeight, header: prevHeader,
+                         hash: default(BlockHash))
+        else:
+          raise newException(ValueError,
+            "getAncestor: no node at height " & $targetHeight)
+      pow.getNextWorkRequired(powPrev, header.timestamp, powParams, getAncestor)
+  if header.bits != expectedBits:
+    return voidErr(veIncorrectProofOfWork)
+
+  # Gate 2: time-too-old — timestamp strictly greater than MTP (Core 4092-4093).
+  if header.timestamp <= mtp:
+    return voidErr(veBadTimestamp)
+
+  # Gate 3: time-timewarp-attack (BIP94, testnet4/regtest only; Core 4097-4105).
+  if params.enforceBIP94:
+    if height mod int32(params.difficultyAdjustmentInterval) == 0:
+      if int64(header.timestamp) < int64(prevHeader.timestamp) - MaxTimeWarp:
+        return voidErr(veTimeWarpAttack)
+
+  # Gate 4: bad-version — reject obsolete versions after soft-fork activation
+  # (Core 4113-4118; identical to contextualCheckBlockHeader).
+  if header.version < 2 and height >= int32(params.bip34Height):
+    return voidErr(veBadBlockVersion)
+  if header.version < 3 and height >= int32(params.bip66Height):
+    return voidErr(veBadBlockVersion)
   if header.version < 4 and height >= int32(params.bip65Height):
     return voidErr(veBadBlockVersion)
 
