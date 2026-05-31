@@ -749,6 +749,106 @@ proc processCheckBlock(req: JsonNode): string =
 
   result = """{"valid":true}"""
 
+## BIP-30 dup-txid / coin-overwrite op `checkbip30` (CVE-2012-1909).
+## Drives nimrod's REAL `checkBip30` (src/consensus/validation.nim:1829) — the
+## EXACT proc acceptBlock step 3 (validation.nim:2086) calls — over a seeded
+## UTXO view, NOT a reimplementation in the shim.
+##
+## WHY a dedicated op and NOT the committed `checkblock` op: `checkblock` drives
+## `validateBlock` DIRECTLY (validation.nim:2067-2070, checkScripts=false), and
+## nimrod's BIP-30 gate lives in `acceptBlock` step 3 — OUTSIDE validateBlock
+## (validateBlock = the contextual header + weight + sigops + BIP-34-height +
+## coinbase-value gates; checkBip30 is a separate step). Routing the BIP-30
+## vectors through `checkblock` would NOT exercise checkBip30 at all (the
+## collision would slip past validateBlock and the block would falsely accept).
+## So this op isolates and drives checkBip30 over the seeded view exactly as
+## ConnectBlock's HaveCoin loop does (validation.cpp:2467-2475).
+##
+## Mirrors the rustoshi `checkblock` BIP-30 loop (validation.rs:1684) which
+## scans every block-tx output for an existing unspent coin. The coinbase txid
+## T = doubleSha256(non-witness coinbase bytes) is computed by nimrod's OWN
+## `tx.txid()` inside checkBip30 — so the collision key matches byte-for-byte
+## with the seeded (T,0) coin (the corpus T is the impl-agnostic dbl-sha256).
+##
+## Decision-first scoring + ANTI-MASKING: checkBip30 only ever returns ok()
+## (accept) or veBip30DuplicateOutput (=> "bad-txns-BIP30"). There is no
+## structural / missing-input gate on this path, so a reject here CANNOT be
+## masked by anything other than the BIP-30 gate itself. P1 (byte-identical
+## block, no (T,0) seed) accepts because the HaveCoin scan finds nothing; if P1
+## rejected it would prove the seeding leaked into the no-seed case.
+##
+## BIP-34 short-circuit (N1): checkBip30 clears fEnforceBIP30 when
+## height >= params.bip34Height (mainnet 227931) and height < 1_983_702 and
+## params.bip34Hash is non-zero (mainnet IS non-zero, params.nim:170), then
+## returns ok() WITHOUT scanning — so a post-BIP34 collision (h=400000) accepts.
+## This is nimrod's REAL Gate 2/3 logic; over-enforcing here (rejecting N1)
+## would be a real missing-short-circuit bug.
+##
+## The block hash fed to Gate 1 (IsBIP30Repeat) is doubleSha256(serialize(
+## blk.header)) — nimrod's own header serializer + hasher — so the historical
+## h=91842/h=91880 exemption is keyed on the REAL block hash, not a faked one.
+## The corpus blocks are at h=91000 / h=400000 with zero prevBlock, so they are
+## NOT the historical exempt blocks and Gate 1 never fires for them.
+##
+##   request:  {"op":"checkbip30","block_hex":"<FINAL bytes>",
+##              "prevouts":[{"txid":"<DISPLAY-hex>","vout":N,
+##                           "scriptPubKey_hex":"<spk>","value_sats":<i64>,
+##                           "height":<int>,"is_coinbase":<bool>},...the seeded
+##                          (T,0) collision coin (R1/N1) or empty (P1)],
+##              "spend_height":<int = the block height>}
+##   response: {"valid":true}                          (BIP-30 accepts)
+##             {"valid":false,"reason":"bad-txns-BIP30"} (collision rejected)
+##             {"error":"..."}                          (cannot evaluate)
+proc processCheckBip30(req: JsonNode): string =
+  let blockBytes = hexDecode(req["block_hex"].getStr())
+  let blk = deserializeBlock(blockBytes)
+  let height = int32(req["spend_height"].getBiggestInt())
+
+  # Seed the in-memory UTXO view — one coin per prevout, keyed by wire-order
+  # (txid, vout). Identical display->wire reversal + Table plumbing as
+  # processConnectTx / processCheckBlock. The seeded (T,0) coin models a prior
+  # block having created the coinbase output that this block's coinbase would
+  # overwrite — the exact CVE-2012-1909 collision.
+  var view = initTable[(TxId, uint32), chainstate.UtxoEntry]()
+  for p in req["prevouts"]:
+    let txid = txidFromDisplayHex(p["txid"].getStr())
+    let vout = uint32(p["vout"].getBiggestInt())
+    let spk = hexDecode(p["scriptPubKey_hex"].getStr())
+    let value = p["value_sats"].getBiggestInt()
+    let coinHeight = int32(p["height"].getBiggestInt())
+    let isCb = if p.hasKey("is_coinbase"): p["is_coinbase"].getBool() else: false
+    view[(txid, vout)] = chainstate.UtxoEntry(
+      output: TxOut(value: Satoshi(value), scriptPubKey: spk),
+      height: coinHeight,
+      isCoinbase: isCb
+    )
+
+  # hasUtxo closure over the seeded view (the bool signature checkBip30 wants).
+  # Outpoint NOT in view => false (no collision). gcsafe/raises:[] to match the
+  # checkBip30 hasUtxo signature; the try/except satisfies raises:[].
+  let hasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
+    let key = (op.txid, op.vout)
+    if view.hasKey(key):
+      try: view.hasKey(key)
+      except KeyError: false
+    else:
+      false
+
+  # Block hash for Gate 1 (IsBIP30Repeat): nimrod's OWN header serializer +
+  # doubleSha256 (the SAME computation acceptBlock step 3 uses, validation.nim
+  # :2077-2078). Never a faked hash.
+  let blkHeaderBytes = serialize(blk.header)
+  let blkHashArr = array[32, byte](doubleSha256(blkHeaderBytes))
+
+  # Drive nimrod's REAL checkBip30 over the seeded view at mainnet params
+  # (bip34Height=227931, bip34Hash non-zero) so the BIP-34 short-circuit fires
+  # for post-BIP34 heights exactly as Core does.
+  let res = checkBip30(blk, height, blkHashArr, mainnetParams(), hasUtxo)
+  if not res.isOk:
+    return """{"valid":false,"reason":"""" &
+      jsonEscape(bip22String(res.error)) & "\"}"
+  result = """{"valid":true}"""
+
 ## DETERMINISTIC REORG op `reorg`. Drives nimrod's REAL reorg primitives over
 ## an EXPLICIT decision + coins-view + per-block undo, eliminating the live-tip /
 ## first-seen / nSequenceId race the old submitblock harness suffered from:
@@ -1078,6 +1178,7 @@ proc process(line: string): string =
   of "merkleroot": processMerkleRoot(req)
   of "subsidy": processSubsidy(req)
   of "checkblock": processCheckBlock(req)
+  of "checkbip30": processCheckBip30(req)
   of "reorg": processReorg(req)
   else: raise newException(ValueError, "unknown op: " & op)
 
