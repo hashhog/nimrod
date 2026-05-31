@@ -72,6 +72,7 @@ import ../src/consensus/validation
 import ../src/consensus/params
 import ../src/storage/chainstate
 import ../src/consensus/pow
+import ../src/crypto/secp256k1
 
 proc hexDecode(s: string): seq[byte] =
   if s.len mod 2 != 0:
@@ -572,6 +573,180 @@ proc processSubsidy(req: JsonNode): string =
   let subsidy = validation.getBlockSubsidy(height, mainnetParams())
   result = """{"subsidy_sats":""" & $int64(subsidy) & "}"
 
+## VALIDATE-ONLY block differential op `checkblock`. Drives nimrod's REAL
+## block-acceptance gates — CheckBlock (context-free) + ContextualCheckBlock
+## + ConnectBlock (monetary / sigops / weight / witness-commitment / BIP-34
+## coinbase height) + per-input VerifyScript — over a FINAL (already-mutated)
+## block_hex, validating it AS-IS (we never recompute the merkle root or
+## re-derive the witness commitment; the mutated bytes are taken verbatim so a
+## merkle/witness mutation is actually caught by the impl's own gate).
+##
+## Pipeline:  deserializeBlock(block_hex)
+##              -> validateBlock(blk, prevIndex, db, mainnetParams(),
+##                               checkScripts=false, checkPow=!skip_pow,
+##                               getUtxoOverride=seeded-view)
+##              -> (if not skip_scripts) verifyScripts(blk, seeded-view, ...)
+##
+## WHY validateBlock DIRECTLY and NOT acceptBlock: acceptBlock step 1 re-runs
+## the context-free checkBlock(), whose checkBlockHeader() ALWAYS verifies the
+## PoW hash regardless of any flag (validation.nim:1899 -> 1648). The corpus
+## block_hex is FINAL/mutated and misses the mainnet PoW target, so routing
+## through acceptBlock would make every mutant reject on "high-hash" — a SILENT
+## DEAD-GATE. validateBlock's header step (validateBlockHeader) takes checkPow
+## as a parameter and skips the hash-meets-target gate when false, while still
+## running merkle / weight / coinbase / witness / per-tx / sigop / monetary
+## gates. This is exactly Core's CheckBlock(fCheckPOW=false) usage (the corpus
+## sets skip_pow=true). With checkPow=false getNextWorkRequired returns the
+## prev block's bits without an ancestor walk (709742 is not a retarget
+## boundary, mainnet powAllowMinDifficultyBlocks=false), so no deep chain
+## window is required for the bad-diffbits gate.
+##
+## UTXO view: one coin per prevout entry, keyed by wire-order (txid, vout)
+## using the SAME txidFromDisplayHex display->wire reversal + the SAME
+## Table[(TxId,uint32),UtxoEntry] + lookup-closure-returns-none-for-omitted
+## plumbing as `connecttx` (processConnectTx above). An omitted prevout models
+## a missing/spent input. The closure is wired into BOTH validateBlock
+## (getUtxoOverride, for fee/sigop/BIP68 reads) and verifyScripts (for script
+## input lookups), so the two stages see the identical seeded view.
+##
+## prevIndex / ChainDb: built via the OBJECT CTOR (NOT openChainDb, which would
+## hit disk). prevIndex carries height = spend_height - 1, hash = the block's
+## OWN header.prevBlock (already wire-order from the deserializer), and a header
+## whose `bits` equal the block's nBits (so the non-retarget bad-diffbits gate
+## passes for the real block) and a `timestamp` strictly below the block time
+## (so the MTP time-too-old gate passes). The ChainDb's ibdIndexBy{Hash,Height}
+## shadow maps are populated with an 11-block synthetic prev window so
+## getMtpForHeight stays entirely inside the in-memory shadow and never
+## dereferences the nil `db` handle.
+##
+##   request:  {"op":"checkblock","block_hex":"<FINAL bytes>",
+##              "prevouts":[{"txid":"<DISPLAY-hex>","vout":N,
+##                           "scriptPubKey_hex":"<spk>","value_sats":<u64>,
+##                           "height":<int>,"is_coinbase":<bool>},...one per
+##                          NON-COINBASE input across all non-coinbase txs],
+##              "spend_height":<int>,"skip_pow":<bool>,"skip_scripts":<bool>}
+##   response: {"valid":true}                          (block accepted)
+##             {"valid":false,"reason":"<bad-* token>"} (a gate rejected)
+##             {"error":"..."}                          (cannot evaluate)
+proc processCheckBlock(req: JsonNode): string =
+  let blockBytes = hexDecode(req["block_hex"].getStr())
+  let blk = deserializeBlock(blockBytes)
+  let spendHeight = int32(req["spend_height"].getBiggestInt())
+  let skipPow = if req.hasKey("skip_pow"): req["skip_pow"].getBool() else: true
+  let skipScripts = if req.hasKey("skip_scripts"): req["skip_scripts"].getBool()
+                    else: false
+
+  # Seed the in-memory UTXO view — one coin per prevout, keyed by wire-order
+  # (txid, vout). Identical plumbing to processConnectTx (display->wire
+  # reversal via txidFromDisplayHex).
+  var view = initTable[(TxId, uint32), chainstate.UtxoEntry]()
+  for p in req["prevouts"]:
+    let txid = txidFromDisplayHex(p["txid"].getStr())
+    let vout = uint32(p["vout"].getBiggestInt())
+    let spk = hexDecode(p["scriptPubKey_hex"].getStr())
+    let value = p["value_sats"].getBiggestInt()
+    let coinHeight = int32(p["height"].getBiggestInt())
+    let isCb = if p.hasKey("is_coinbase"): p["is_coinbase"].getBool() else: false
+    view[(txid, vout)] = chainstate.UtxoEntry(
+      output: TxOut(value: Satoshi(value), scriptPubKey: spk),
+      height: coinHeight,
+      isCoinbase: isCb
+    )
+
+  # Lookup closure over the seeded view. Outpoint NOT in view => none
+  # (missing/spent input). gcsafe/raises:[] to match validateBlock's
+  # getUtxoOverride signature; the try/except satisfies raises:[] (Table.[]
+  # is raises:[KeyError]) and only ever wraps a successful hasKey hit.
+  let lookup = proc(op: OutPoint): Option[chainstate.UtxoEntry] {.gcsafe, raises: [].} =
+    let key = (op.txid, op.vout)
+    if view.hasKey(key):
+      try: some(view[key])
+      except KeyError: none(chainstate.UtxoEntry)
+    else:
+      none(chainstate.UtxoEntry)
+
+  let params = mainnetParams()
+  let prevHeight = spendHeight - 1
+
+  # prevIndex: hash = the block's OWN header.prevBlock (wire-order from the
+  # deserializer, so validateBlockHeader's prevBlock-link check passes). bits =
+  # the block's nBits (non-retarget => getNextWorkRequired returns this, so the
+  # bad-diffbits gate passes). timestamp = one below the block time so the MTP
+  # gate (single-window fallback) accepts.
+  var prevHeader = default(BlockHeader)
+  prevHeader.bits = blk.header.bits
+  prevHeader.timestamp = (if blk.header.timestamp > 0'u32: blk.header.timestamp - 1'u32
+                          else: 0'u32)
+  let prevIndex = chainstate.BlockIndex(
+    hash: blk.header.prevBlock,
+    height: prevHeight,
+    header: prevHeader,
+    prevHash: default(BlockHash)
+  )
+
+  # ChainDb via the OBJECT CTOR (no disk). db left nil; the ibd shadow maps are
+  # populated so every getMtpForHeight read stays in-memory and never touches
+  # the nil db handle. Seed an 11-block (MedianTimeSpan) synthetic window
+  # heights [prevHeight-10 .. prevHeight] with strictly-increasing timestamps
+  # all below the block time, so getMtpForHeight's 11-deep walk completes
+  # entirely inside the shadow.
+  let db = ChainDb(
+    db: nil,
+    bestBlockHash: blk.header.prevBlock,
+    bestHeight: prevHeight,
+    ibdIndexByHash: initTable[BlockHash, chainstate.BlockIndex](),
+    ibdIndexByHeight: initTable[int32, BlockHash]()
+  )
+  block seedWindow:
+    let baseTime = prevHeader.timestamp
+    for off in 0 ..< MedianTimeSpan:
+      let h = prevHeight - int32(off)
+      if h < 0: break
+      # Synthetic, internally-consistent hash per height (height-tagged); the
+      # height = prevHeight slot reuses the real prevBlock hash so it also
+      # backs the prevIndex link if anything reads it back.
+      var hArr: array[32, byte]
+      if off == 0:
+        hArr = array[32, byte](blk.header.prevBlock)
+      else:
+        hArr[0] = byte(h and 0xff)
+        hArr[1] = byte((h shr 8) and 0xff)
+        hArr[2] = byte((h shr 16) and 0xff)
+        hArr[3] = byte((h shr 24) and 0xff)
+      let bh = BlockHash(hArr)
+      var wh = default(BlockHeader)
+      wh.bits = blk.header.bits
+      # Earlier heights get earlier timestamps so MTP < block time.
+      wh.timestamp = if baseTime >= uint32(off): baseTime - uint32(off) else: 0'u32
+      db.ibdIndexByHash[bh] = chainstate.BlockIndex(hash: bh, height: h, header: wh)
+      db.ibdIndexByHeight[h] = bh
+
+  # Step 1+2+3: CheckBlock (context-free) + ContextualCheckBlock + the
+  # ConnectBlock monetary/sigop/weight/witness gates, all inside validateBlock.
+  # checkScripts=false here (scripts run in step 4); checkPow=!skip_pow so the
+  # PoW hash gate is skipped exactly when the corpus asks (no high-hash on a
+  # body mutant => no silent dead-gate).
+  let vres = validateBlock(blk, prevIndex, db, params,
+                           checkScripts = false,
+                           checkPow = not skipPow,
+                           getUtxoOverride = lookup)
+  if not vres.isOk:
+    return """{"valid":false,"reason":"""" &
+      jsonEscape(bip22String(vres.error)) & "\"}"
+
+  # Step 4: REAL per-input script verification (skip_scripts=false). Uses the
+  # SAME seeded view. verifyScripts returns veScriptVerifyFailed on the first
+  # failing input -> "block-script-verify-flag-failed".
+  if not skipScripts:
+    var crypto = newCryptoEngine()
+    defer: crypto.close()
+    let sres = verifyScripts(blk, lookup, spendHeight, crypto, params)
+    if not sres.isOk:
+      return """{"valid":false,"reason":"""" &
+        jsonEscape(bip22String(sres.error)) & "\"}"
+
+  result = """{"valid":true}"""
+
 proc process(line: string): string =
   let req = parseJson(line)
   let op = if req.hasKey("op"): req["op"].getStr() else: "verifyscript"
@@ -583,6 +758,7 @@ proc process(line: string): string =
   of "nextwork": processNextWork(req)
   of "merkleroot": processMerkleRoot(req)
   of "subsidy": processSubsidy(req)
+  of "checkblock": processCheckBlock(req)
   else: raise newException(ValueError, "unknown op: " & op)
 
 proc main() =
