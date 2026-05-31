@@ -64,11 +64,13 @@
 ## `nim.cfg` (-d:useSystemSecp256k1, library linkage) and the nimble dep
 ## paths in config.nims apply when compiling.
 
-import std/[json, strutils, tables]
+import std/[json, strutils, tables, options]
 import ../src/primitives/types
 import ../src/primitives/serialize
 import ../src/script/interpreter
 import ../src/consensus/validation
+import ../src/consensus/params
+import ../src/storage/chainstate
 import ../src/consensus/pow
 
 proc hexDecode(s: string): seq[byte] =
@@ -295,6 +297,96 @@ proc processCheckTx(req: JsonNode): string =
     result = """{"valid":false,"reason":"""" &
       jsonEscape($res.error) & "\"}"
 
+## Connect-time economic op `connecttx`. Drives nimrod's REAL connect-time
+## Consensus::CheckTxInputs (bitcoin-core/src/consensus/tx_verify.cpp:164-214)
+## by delegating to nimrod's OWN `validateTransaction`
+## (src/consensus/validation.nim:727) — the proc connectBlock /
+## connectBlockIBD call per non-coinbase tx (validation.nim:1249-1265,
+## 1460-1502) to enforce the monetary rules. NOTHING here re-implements
+## value-in>=out / maturity / missing; the shim only seeds the UTXO view and
+## reports the impl's verdict.
+##
+## What validateTransaction enforces (= Core CheckTxInputs):
+##   - missing/spent input  → veInputsMissing  (bad-txns-inputs-missingorspent)
+##   - coinbase maturity 100 → veImmatureCoinbase (bad-txns-premature-spend-of-coinbase)
+##   - per-input value MoneyRange → veBadAmount  (bad-txns-inputvalues-outofrange)
+##   - running-sum input MoneyRange → veBadAmount (bad-txns-inputvalues-outofrange)
+##   - no-inflation value-in>=value-out → veOutputsBelowInputs (bad-txns-in-belowout)
+## It returns the fee on success. validateTransaction does NOT run script
+## verification, so the economic verdict is isolated (no assumevalid wiring
+## needed — a script failure cannot mask the monetary decision because the
+## script is never evaluated on this path).
+##
+## validateTransaction omits Core's per-tx upper-bound fee check
+## (`if (!MoneyRange(nFees))` → "bad-txns-fee-outofrange", tx_verify.cpp:208);
+## we add that ONE explicit MoneyRange(fee) gate in the shim (a fee > MAX_MONEY
+## can only arise from out-of-range inputs the impl already rejects, so this is
+## a belt-and-suspenders gate, not a re-implementation of the economic rule).
+##
+##   request:  {"op":"connecttx","tx_hex":"<segwit-aware>",
+##              "prevouts":[{"txid":"<DISPLAY-hex>","vout":N,
+##                           "scriptPubKey_hex":"<spk>","value_sats":<i64>,
+##                           "height":<int coin.nHeight>,
+##                           "is_coinbase":<bool>},...],
+##              "spend_height":<int nSpendHeight>}
+##   response: {"valid":true,"fee_sats":<i64>}      (CheckTxInputs accepts)
+##             {"valid":false,"reason":"bad-txns-*"} (CheckTxInputs rejects)
+##             {"error":"..."}                       (cannot evaluate -> skip)
+##
+## An OMITTED prevout entry models a missing/spent input: the lookup closure
+## returns none for that outpoint, and validateTransaction rejects with
+## veInputsMissing exactly as ConnectBlock would on a missing coin.
+proc processConnectTx(req: JsonNode): string =
+  let txBytes = hexDecode(req["tx_hex"].getStr())
+  let tx = deserializeTransaction(txBytes)
+  let spendHeight = int32(req["spend_height"].getBiggestInt())
+
+  # Seed the in-memory UTXO view: one coin per prevout entry, keyed by the
+  # wire-order (txid, vout). Reuses the verifytx display->wire txid reversal.
+  var view = initTable[(TxId, uint32), chainstate.UtxoEntry]()
+  for p in req["prevouts"]:
+    let txid = txidFromDisplayHex(p["txid"].getStr())
+    let vout = uint32(p["vout"].getBiggestInt())
+    let spk = hexDecode(p["scriptPubKey_hex"].getStr())
+    let value = p["value_sats"].getBiggestInt()
+    let coinHeight = int32(p["height"].getBiggestInt())
+    let isCb = if p.hasKey("is_coinbase"): p["is_coinbase"].getBool() else: false
+    view[(txid, vout)] = chainstate.UtxoEntry(
+      output: TxOut(value: Satoshi(value), scriptPubKey: spk),
+      height: coinHeight,
+      isCoinbase: isCb
+    )
+
+  # Lookup closure over the seeded view. An outpoint NOT in the view => none
+  # (missing/spent input), which validateTransaction rejects.
+  let lookup = proc(op: OutPoint): Option[chainstate.UtxoEntry] =
+    let key = (op.txid, op.vout)
+    if view.hasKey(key):
+      some(view[key])
+    else:
+      none(chainstate.UtxoEntry)
+
+  # REAL connect-time economic check (validation.nim:727), at mainnet params
+  # (coinbaseMaturity=100). Returns the fee on success.
+  let res = validateTransaction(tx, lookup, spendHeight, mainnetParams())
+  if not res.isOk:
+    # Normalize the impl's enum string to a Core bad-txns-* token where the
+    # mapping is unambiguous; the DECISION (valid=false) is what is scored.
+    let reason = case res.error
+      of veInputsMissing:     "bad-txns-inputs-missingorspent"
+      of veImmatureCoinbase:  "bad-txns-premature-spend-of-coinbase"
+      of veBadAmount:         "bad-txns-inputvalues-outofrange"
+      of veOutputsBelowInputs:"bad-txns-in-belowout"
+      else:                   $res.error
+    return """{"valid":false,"reason":"""" & jsonEscape(reason) & "\"}"
+
+  # Core tx_verify.cpp:208 per-tx fee upper bound (validateTransaction omits it).
+  let fee = res.value
+  if fee < 0'i64 or fee > int64(MaxMoney):
+    return """{"valid":false,"reason":"bad-txns-fee-outofrange"}"""
+
+  result = """{"valid":true,"fee_sats":""" & $fee & "}"
+
 ## PoW difficulty differential op `nextwork`. Drives nimrod's REAL
 ## src/consensus/pow.nim::getNextWorkRequired (the BlockIndex/chain-generic
 ## entrypoint that does the retarget math + the height%2016 off-by-one + the
@@ -487,6 +579,7 @@ proc process(line: string): string =
   of "verifyscript": processVerifyScript(req)
   of "verifytx": processVerifyTx(req)
   of "checktx": processCheckTx(req)
+  of "connecttx": processConnectTx(req)
   of "nextwork": processNextWork(req)
   of "merkleroot": processMerkleRoot(req)
   of "subsidy": processSubsidy(req)
