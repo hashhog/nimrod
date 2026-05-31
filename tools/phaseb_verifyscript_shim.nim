@@ -463,6 +463,23 @@ proc processMerkleRoot(req: JsonNode): string =
   let mutatedStr = if mutated: "true" else: "false"
   result = """{"root":"""" & displayRoot & """","mutated":""" & mutatedStr & "}"
 
+## Block-subsidy differential op `subsidy`. Drives nimrod's REAL PRIMARY
+## consensus subsidy fn (src/consensus/validation.nim:256
+## getBlockSubsidy(height: int32, params)) — the one block validation /
+## ConnectBlock uses for the coinbase cap — at MAINNET params (halving
+## interval 210000). A SECOND def exists at params.nim:533; this op
+## deliberately drives the validation one so the differential catches a
+## disagreement (halving-boundary off-by-one, missing >=64 zero-guard).
+## The halving schedule is NOT re-implemented in the shim.
+##
+##   request:  {"op":"subsidy","height":<int>}
+##   response: {"subsidy_sats":<int>}   (impl's REAL subsidy in satoshis)
+##             {"error":"..."}          (cannot compute -> driver skips)
+proc processSubsidy(req: JsonNode): string =
+  let height = int32(req["height"].getBiggestInt())
+  let subsidy = validation.getBlockSubsidy(height, mainnetParams())
+  result = """{"subsidy_sats":""" & $int64(subsidy) & "}"
+
 proc process(line: string): string =
   let req = parseJson(line)
   let op = if req.hasKey("op"): req["op"].getStr() else: "verifyscript"
@@ -472,6 +489,7 @@ proc process(line: string): string =
   of "checktx": processCheckTx(req)
   of "nextwork": processNextWork(req)
   of "merkleroot": processMerkleRoot(req)
+  of "subsidy": processSubsidy(req)
   else: raise newException(ValueError, "unknown op: " & op)
 
 proc main() =
