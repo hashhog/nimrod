@@ -12,6 +12,7 @@ import ./storage/indexes/[blockfilterindex, gcs]
 import ./network/[peer, peermanager, sync, messages, compact_blocks, asmap, netgroup]
 import ./mempool/[mempool, persist, orphan]
 import ./mining/fees
+import ./wallet/manager
 import ./rpc/server
 import ./rpc/rpc_thread
 import ./rpc/rest
@@ -2370,6 +2371,13 @@ proc startNode*(config: NimrodConfig) {.async.} =
     # W115 FIX-50: netGroupManager is always non-nil after step 5a above;
     # usingAsmap() returns false when no file was given / load failed.
     state.rpcServer.netGroupManager = state.netGroupManager
+    # Wire the multi-wallet manager so createwallet / loadwallet / getnewaddress
+    # and the rest of the wallet RPCs work. Without this the field stays nil and
+    # every wallet handler early-returns "wallet functionality not enabled".
+    # Wallets live under <datadir>/<network>/wallets (Core per-network layout);
+    # newWalletManager creates that dir on demand.
+    state.rpcServer.walletManager =
+      newWalletManager(networkDir, params, state.chainState)
     # Run RPC on a dedicated OS thread with its own chronos event loop so that
     # CPU-heavy block validation on the main thread does not block RPC accept
     # or response. See src/rpc/rpc_thread.nim for rationale and known v1 caveats.
