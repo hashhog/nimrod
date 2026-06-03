@@ -1409,6 +1409,41 @@ proc bogoSizeFor(scriptPubKeyLen: int): uint64 =
   ##   2 (scriptPubKey len) + scriptPubKey.size().
   uint64(32 + 4 + 4 + 8 + 2 + scriptPubKeyLen)
 
+iterator iterateUtxos*(cs: var ChainState): tuple[outpoint: OutPoint,
+                                                   entry: UtxoEntry] =
+  ## Forward cursor walk of the authoritative UTXO set, yielding each
+  ## logical (outpoint, coin) pair. Used by `scantxoutset` and any other
+  ## consumer that needs to scan the whole set without recomputing stats.
+  ##
+  ## Same pre-walk flush + unspendable-coin filter + key decode as
+  ## `computeUtxoSetInfo` (see that proc for the rationale on each step);
+  ## factored out here so the RPC layer doesn't reach into the raw
+  ## `cs.db.db` cursor directly.
+  if cs.ibdMode:
+    cs.flushIBDBatch()
+  else:
+    cs.flushCache()
+
+  for (key, value) in cs.db.db.iterCf(cfUtxo):
+    if key.len != 36:
+      continue
+    var entry: UtxoEntry
+    try:
+      entry = deserializeUtxoEntry(value)
+    except CatchableError:
+      continue
+
+    if isUnspendable(entry.output.scriptPubKey):
+      continue
+
+    var txidBytes: array[32, byte]
+    copyMem(addr txidBytes[0], unsafeAddr key[0], 32)
+    let vout = (uint32(key[32]) shl 24) or
+               (uint32(key[33]) shl 16) or
+               (uint32(key[34]) shl 8)  or
+                uint32(key[35])
+    yield (OutPoint(txid: TxId(txidBytes), vout: vout), entry)
+
 proc computeUtxoSetInfo*(cs: var ChainState,
                          hashType: CoinStatsHashType): UtxoSetInfo =
   ## Walk the entire UTXO set and return Core-parity stats.

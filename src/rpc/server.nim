@@ -5216,6 +5216,152 @@ proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
 
   response
 
+proc parseScanObject(rpc: RpcServer, scanobject: JsonNode): seq[byte] =
+  ## Translate a single scanobject into the scriptPubKey bytes to match.
+  ##
+  ## Supported (minimal, mirrors the simplest descriptors Core accepts in
+  ## scantxoutset — see bitcoin-core/src/rpc/blockchain.cpp::scantxoutset →
+  ## EvalDescriptorStringOrObject):
+  ##   addr(<address>)        — outputs paying to <address>'s scriptPubKey
+  ##   raw(<scriptPubKey-hex>) — outputs whose script equals these exact bytes
+  ##
+  ## Core also accepts an object form { "desc": "...", "range": ... }; we
+  ## accept the object's "desc" string but ignore "range" (xpub-range
+  ## descriptors are out of scope). Single-key pkh()/wpkh()/tr() descriptors
+  ## and combo() are NOT yet supported (follow-up).
+  var desc: string
+  case scanobject.kind
+  of JString:
+    desc = scanobject.getStr()
+  of JObject:
+    if not scanobject.hasKey("desc") or scanobject["desc"].kind != JString:
+      raise newRpcError(RpcInvalidParams,
+                        "Scan object needs to be either a string or an object")
+    desc = scanobject["desc"].getStr()
+  else:
+    raise newRpcError(RpcInvalidParams,
+                      "Scan object needs to be either a string or an object")
+
+  # Strip an optional BIP-380 checksum suffix (#xxxxxxxx); we don't verify it.
+  let hashPos = desc.find('#')
+  if hashPos >= 0:
+    desc = desc[0 ..< hashPos]
+  desc = desc.strip()
+
+  if desc.startsWith("addr(") and desc.endsWith(")"):
+    let addrStr = desc[5 ..< desc.len - 1].strip()
+    try:
+      let parsedAddr = decodeAddress(addrStr)
+      return scriptPubKeyForAddress(parsedAddr)
+    except AddressError as e:
+      raise newRpcError(RpcInvalidAddressOrKey,
+                        "Address is not valid: " & addrStr & " (" & e.msg & ")")
+  elif desc.startsWith("raw(") and desc.endsWith(")"):
+    let hexStr = desc[4 ..< desc.len - 1].strip()
+    if hexStr.len mod 2 != 0:
+      raise newRpcError(RpcInvalidParams, "raw() script is not hex")
+    for c in hexStr:
+      if c notin HexDigits:
+        raise newRpcError(RpcInvalidParams, "raw() script is not hex")
+    return hexToBytes(hexStr)
+  else:
+    raise newRpcError(RpcInvalidParams,
+                      "Unsupported descriptor '" & desc &
+                      "'; scantxoutset supports addr(<address>) and " &
+                      "raw(<hex>) only")
+
+proc handleScanTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## scantxoutset "action" [ scanobjects ]
+  ##
+  ## Scans the current UTXO set for outputs whose scriptPubKey matches any of
+  ## the supplied scan objects, and returns the matches plus set-wide stats.
+  ##
+  ## Reference: bitcoin-core/src/rpc/blockchain.cpp::scantxoutset.
+  ##
+  ## Supported actions:
+  ##   "start"  — run the scan (only this does real work; scanobjects required)
+  ##   "status" — no persistent scan state here; returns null (no scan running)
+  ##   "abort"  — no scan to abort here; returns false
+  ##
+  ## Supported scan objects (minimal): addr(<address>), raw(<hex>). See
+  ## parseScanObject. Single-key descriptors / xpub ranges are out of scope.
+  ##
+  ## Returns (action=="start"):
+  ## {
+  ##   "success":      true,
+  ##   "txouts":       total UTXOs scanned,
+  ##   "height":       chain tip height,
+  ##   "bestblock":    tip hash (display byte order),
+  ##   "unspents":     [ {txid,vout,scriptPubKey,desc,amount,coinbase,
+  ##                       height,blockhash,confirmations} ... ],
+  ##   "total_amount": sum of matched amounts, in BTC
+  ## }
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "action argument is required")
+
+  let action = params[0].getStr()
+
+  if action == "status":
+    # No long-running background scan in this implementation, so there is
+    # never a scan in progress — Core returns null in that case.
+    return newJNull()
+  elif action == "abort":
+    # Nothing to abort (no scan in progress) — Core returns false.
+    return %false
+  elif action != "start":
+    raise newRpcError(RpcInvalidParams, "Invalid action '" & action & "'")
+
+  # action == "start"
+  if params.len < 2 or params[1].kind != JArray:
+    raise newRpcError(RpcMiscError,
+                      "scanobjects argument is required for the start action")
+
+  # Build the set of scriptPubKey "needles" to match against.
+  var needles = initHashSet[seq[byte]]()
+  for scanobject in params[1]:
+    needles.incl(rpc.parseScanObject(scanobject))
+
+  let isMainnet = rpc.params.network == Mainnet
+
+  # Snapshot tip BEFORE the walk; iterateUtxos flushes state to disk so the
+  # cursor sees the authoritative set (mirrors Core's ForceFlushStateToDisk).
+  let tipHeight = rpc.chainState.bestHeight
+  let tipHash = rpc.chainState.bestBlockHash
+
+  var count: int64 = 0
+  var totalIn: int64 = 0
+  let unspents = newJArray()
+
+  for (outpoint, entry) in rpc.chainState.iterateUtxos():
+    inc count  # total UTXOs scanned, matched or not
+
+    if entry.output.scriptPubKey notin needles:
+      continue
+
+    let amount = int64(entry.output.value)
+    totalIn += amount
+
+    let unspent = %*{
+      "txid": reverseHex(toHex(array[32, byte](outpoint.txid))),
+      "vout": outpoint.vout,
+      "scriptPubKey": toHex(entry.output.scriptPubKey),
+      "desc": inferAddrDescriptor(entry.output.scriptPubKey, isMainnet),
+      "amount": btcAmountNode(amount),
+      "coinbase": entry.isCoinbase,
+      "height": entry.height,
+      "confirmations": tipHeight - entry.height + 1
+    }
+    unspents.add(unspent)
+
+  result = %*{
+    "success": true,
+    "txouts": count,
+    "height": tipHeight,
+    "bestblock": reverseHex(toHex(array[32, byte](tipHash))),
+    "unspents": unspents,
+    "total_amount": btcAmountNode(totalIn)
+  }
+
 proc handleScrubUnspendable*(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Operator-invoked one-shot scrub: walk the chainstate UTXO column
   ## family and delete every entry whose scriptPubKey is provably
@@ -8324,6 +8470,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleLoadTxOutSet(params)
   of "gettxoutsetinfo":
     rpc.handleGetTxOutSetInfo(params)
+  of "scantxoutset":
+    rpc.handleScanTxOutSet(params)
   of "scrubunspendable":
     rpc.handleScrubUnspendable(params)
 
