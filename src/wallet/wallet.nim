@@ -95,6 +95,15 @@ type
     seed*: array[64, byte]
     masterKey*: ExtendedKey
     accounts*: seq[Account]
+    ## Keys imported by importprivkey (NOT derived from the HD seed). Each is a
+    ## standalone DerivedKey carrying a hand-built ExtendedKey (the imported
+    ## 32-byte privkey + its derived pubkey) and the address(es) that pay it.
+    ## Mirrors Bitcoin Core's legacy keystore (CWallet::ImportPrivKeys): the key
+    ## lives in the keystore alongside the HD-derived keys, so findKeyForScript
+    ## matches its scripts and the wallet can both credit and spend its coins.
+    ## Held separately from `accounts` so reseedAccounts (sethdseed keypool
+    ## flush) never wipes an imported key.
+    importedKeys*: seq[DerivedKey]
     utxos*: Table[OutPoint, WalletUtxo]
     chainState*: ChainState
     params*: ConsensusParams
@@ -846,7 +855,82 @@ proc findKeyForScript*(wallet: Wallet, scriptPubKey: seq[byte]): Option[DerivedK
     for key in account.internalKeys:
       if scriptPubKeyForAddress(key.address) == scriptPubKey:
         return some(key)
+  # Imported (non-HD) keys: matched the same way so importprivkey'd coins are
+  # credited at block-connect / rescan and remain spendable. Mirrors Core's
+  # single keystore that holds derived + imported keys together.
+  for key in wallet.importedKeys:
+    if scriptPubKeyForAddress(key.address) == scriptPubKey:
+      return some(key)
   none(DerivedKey)
+
+proc importPrivateKey*(wallet: var Wallet, privKey: PrivateKey,
+                       compressed: bool = true): seq[string] =
+  ## Add a raw private key (decoded from a WIF) to the wallet keystore as an
+  ## imported (non-HD) key, registering the address(es) it can be spent to so
+  ## findKeyForScript matches them at block-connect / rescan time. Returns the
+  ## list of address strings now owned by the wallet for this key.
+  ##
+  ## Reference: Bitcoin Core wallet/rpc/backup.cpp importprivkey ->
+  ## CWallet::ImportPrivKeys / AddKeyPubKey: the key enters the same keystore as
+  ## HD-derived keys, and the wallet learns to recognise the standard scripts
+  ## that pay it. We register the native-segwit (P2WPKH) and legacy (P2PKH)
+  ## forms — the two single-key standard outputs a regtest payer can target —
+  ## so coins sent to either are credited and spendable.
+  let pub = derivePublicKey(privKey)
+  let pkh = hash160(pub)
+
+  # Build the standalone ExtendedKey wrapping the imported scalar. depth/index
+  # are unused for an imported key (it is not part of any derivation path); we
+  # only need key + publicKey for signing and address derivation.
+  var extKey: ExtendedKey
+  extKey.key = privKey
+  extKey.publicKey = pub
+  extKey.depth = 0
+  extKey.parentFingerprint = [0'u8, 0, 0, 0]
+  extKey.childIndex = 0
+  extKey.isPrivate = true
+
+  result = @[]
+
+  proc addImported(wallet: var Wallet, addr0: Address): string =
+    let spk = scriptPubKeyForAddress(addr0)
+    # Idempotent: don't double-register a script we already own.
+    if wallet.findKeyForScript(spk).isSome:
+      return encodeAddress(addr0, wallet.mainnet)
+    let dk = DerivedKey(
+      extKey: extKey,
+      path: "imported",
+      address: addr0,
+      addressStr: encodeAddress(addr0, wallet.mainnet))
+    wallet.importedKeys.add(dk)
+    dk.addressStr
+
+  # Native segwit (the wallet's default getnewaddress type) and legacy P2PKH.
+  result.add(wallet.addImported(Address(kind: P2WPKH, wpkh: pkh)))
+  result.add(wallet.addImported(Address(kind: P2PKH, pubkeyHash: pkh)))
+
+proc encodeWIF*(privKey: PrivateKey, mainnet: bool, compressed: bool = true): string =
+  ## Encode a 32-byte private key as a WIF string. Layout (Base58Check):
+  ##   [version=0x80 mainnet / 0xEF testnet] || 32-byte key || (0x01 if compressed)
+  ## Reference: Bitcoin Core key_io.cpp EncodeSecret.
+  var payload: seq[byte] = @[]
+  payload.add(if mainnet: 0x80'u8 else: 0xEF'u8)
+  payload.add(@privKey)
+  if compressed:
+    payload.add(0x01'u8)
+  base58CheckEncode(payload)
+
+proc dumpPrivKey*(wallet: Wallet, address: string): Option[string] =
+  ## Return the WIF private key for an address the wallet owns, or none if the
+  ## address is not in the wallet (or is watch-only). Reference: Bitcoin Core
+  ## wallet/rpc/backup.cpp dumpprivkey -> CWallet::GetKey + EncodeSecret.
+  let spk =
+    try: scriptPubKeyForAddress(decodeAddress(address))
+    except CatchableError: return none(string)
+  let keyOpt = wallet.findKeyForScript(spk)
+  if keyOpt.isNone or not keyOpt.get().extKey.isPrivate:
+    return none(string)
+  some(encodeWIF(keyOpt.get().extKey.key, wallet.mainnet, compressed = true))
 
 # =============================================================================
 # UTXO Management and Block Scanning

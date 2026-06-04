@@ -5802,6 +5802,167 @@ proc handleSetHdSeed(rpc: RpcServer, params: JsonNode): JsonNode =
     "xpub": xpub
   }
 
+proc rescanWalletRange(rpc: RpcServer, w: Wallet,
+                       startHeight, stopHeight: int32) {.gcsafe.} =
+  ## Walk the active chain from startHeight..stopHeight (inclusive) and scan
+  ## each block into the given wallet's ledger via scanBlockForWallet — the
+  ## backward counterpart of the block-connect scan. This rediscovers every
+  ## wallet-owned output funded in the range (crediting the UTXO set + history)
+  ## and debits inputs that spent wallet coins. Mirrors Bitcoin Core's
+  ## CWallet::ScanForWalletTransactions, which replays the block range through
+  ## the same transaction-recognition path used at block-connect.
+  ##
+  ## scanBlockForWallet is idempotent ({txid,vout} set inserts; spends re-delete
+  ## already-absent entries), so re-scanning an already-scanned block is a no-op.
+  if w == nil:
+    return
+  # Wallet is a ref object; a local var binding mutates the same instance.
+  var wv = w
+  var h = startHeight
+  while h <= stopHeight:
+    let hashOpt = rpc.chainState.db.getBlockHashByHeight(h)
+    if hashOpt.isSome:
+      let blkOpt = rpc.chainState.db.getBlock(hashOpt.get())
+      if blkOpt.isSome:
+        try:
+          wv.scanBlockForWallet(blkOpt.get(), h)
+        except CatchableError:
+          discard  # never let a single bad block abort the whole rescan
+    inc h
+
+proc handleRescanBlockchain(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## rescanblockchain ( start_height stop_height )
+  ##
+  ## Rescan the local blockchain for transactions affecting the wallet, over an
+  ## optional [start_height, stop_height] range. This is the REAL wallet rescan
+  ## (distinct from scantxoutset, which scans the chainstate UTXO set without
+  ## touching any wallet): it credits the wallet UTXO ledger + transaction
+  ## history for every wallet-owned output found in the range, so a wallet
+  ## restored from seed (which derives keys but does NOT scan the chain) can
+  ## rediscover its on-chain funds.
+  ##
+  ## Reference: bitcoin-core/src/wallet/rpc/transactions.cpp rescanblockchain ->
+  ## CWallet::ScanForWalletTransactions.
+  ##
+  ## Arguments:
+  ##   1. start_height (numeric, optional, default=0)
+  ##   2. stop_height  (numeric, optional, default=tip)
+  ##
+  ## Returns: { "start_height": <int>, "stop_height": <int> }
+  let w = rpc.getTargetWallet()
+
+  if rpc.chainState == nil:
+    raise newRpcError(RpcMiscError, "no chain state")
+  let tipHeight = rpc.chainState.bestHeight
+
+  var startHeight = 0'i32
+  if params.len >= 1 and params[0].kind != JNull:
+    let sh = params[0].getInt()
+    if sh < 0 or int32(sh) > tipHeight:
+      raise newRpcError(RpcInvalidParams, "Invalid start_height")
+    startHeight = int32(sh)
+
+  var stopHeight = tipHeight
+  if params.len >= 2 and params[1].kind != JNull:
+    let st = params[1].getInt()
+    if st < 0 or int32(st) > tipHeight:
+      raise newRpcError(RpcInvalidParams, "Invalid stop_height")
+    elif int32(st) < startHeight:
+      raise newRpcError(RpcInvalidParams, "stop_height must be greater than start_height")
+    stopHeight = int32(st)
+
+  rpc.rescanWalletRange(w, startHeight, stopHeight)
+
+  %*{
+    "start_height": startHeight,
+    "stop_height": stopHeight
+  }
+
+proc handleImportPrivKey(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## importprivkey "privkey" ( "label" rescan )
+  ##
+  ## Add a private key (as returned by dumpprivkey / a WIF string) to the
+  ## wallet. The key's standard address(es) are registered in the keystore so
+  ## the wallet recognises and can spend coins paying them. If rescan is true
+  ## (the default), the existing chain is rescanned so the key's already-on-chain
+  ## funds are credited immediately.
+  ##
+  ## Reference: bitcoin-core/src/wallet/rpc/backup.cpp importprivkey ->
+  ## CWallet::ImportPrivKeys + (optionally) ScanForWalletTransactions.
+  ##
+  ## Arguments:
+  ##   1. privkey (string, required) — the WIF-encoded private key
+  ##   2. label   (string, optional, default="") — label for the address(es)
+  ##   3. rescan  (bool, optional, default=true) — rescan the chain afterwards
+  ##
+  ## Returns: null on success (Core shape).
+  var w = rpc.getTargetWallet()
+
+  if w.isEncrypted and w.isLocked:
+    raise newRpcError(RpcWalletError,
+      "Error: Please enter the wallet passphrase with walletpassphrase first.")
+
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "privkey (WIF string) is required")
+  let wif = params[0].getStr()
+
+  let label = if params.len >= 2 and params[1].kind == JString: params[1].getStr() else: ""
+  let doRescan = if params.len >= 3 and params[2].kind == JBool: params[2].getBool() else: true
+
+  var privKey: PrivateKey
+  var compressed = true
+  try:
+    let (k, c, _) = decodeWIF(wif)
+    privKey = k
+    compressed = c
+  except CatchableError:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid private key encoding")
+
+  var addrs: seq[string]
+  try:
+    addrs = w.importPrivateKey(privKey, compressed)
+  except CatchableError as e:
+    raise newRpcError(RpcWalletError, "Error adding key to wallet: " & e.msg)
+
+  # Apply the label (if any) to the imported address(es).
+  if label.len > 0:
+    for a in addrs:
+      w.labels[a] = label
+
+  # Rescan the existing chain so funds already paid to the imported key are
+  # credited now (Core importprivkey rescan=true default).
+  if doRescan and rpc.chainState != nil:
+    rpc.rescanWalletRange(w, 0'i32, rpc.chainState.bestHeight)
+
+  newJNull()
+
+proc handleDumpPrivKey(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## dumpprivkey "address"
+  ##
+  ## Reveal the WIF-encoded private key for an address the wallet owns. The
+  ## companion to importprivkey: dump a key from one wallet, import it into
+  ## another. Reference: bitcoin-core/src/wallet/rpc/backup.cpp dumpprivkey.
+  ##
+  ## Arguments:
+  ##   1. address (string, required) — a wallet address
+  ##
+  ## Returns: the private key as a WIF string.
+  let w = rpc.getTargetWallet()
+
+  if w.isEncrypted and w.isLocked:
+    raise newRpcError(RpcWalletError,
+      "Error: Please enter the wallet passphrase with walletpassphrase first.")
+
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "address is required")
+  let address = params[0].getStr()
+
+  let wifOpt = w.dumpPrivKey(address)
+  if wifOpt.isNone:
+    raise newRpcError(RpcWalletError,
+      "Private key for address " & address & " is not known")
+  %wifOpt.get()
+
 proc handleGetRawChangeAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Generate a new change address
   ## Reference: Bitcoin Core wallet/rpc/addresses.cpp getrawchangeaddress
@@ -8877,6 +9038,14 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   of "gettransaction":
     rpc.handleGetTransaction(params)
 
+  # Wallet import / rescan
+  of "rescanblockchain":
+    rpc.handleRescanBlockchain(params)
+  of "importprivkey":
+    rpc.handleImportPrivKey(params)
+  of "dumpprivkey":
+    rpc.handleDumpPrivKey(params)
+
   # Wallet encryption
   of "encryptwallet":
     rpc.handleEncryptWallet(params)
@@ -9035,9 +9204,41 @@ proc handleSingleRequest(rpc: RpcServer, reqJson: JsonNode): JsonNode =
       "error": %*{"code": RpcInternalError, "message": "internal error: " & e.msg}
     }
 
-proc handleRequest(rpc: RpcServer, body: string): string =
+proc decodeUrlPathSegment(s: string): string =
+  ## Minimal percent-decoding for a URL path segment (wallet names). Decodes
+  ## %XX escapes; leaves everything else as-is.
+  result = ""
+  var i = 0
+  while i < s.len:
+    if s[i] == '%' and i + 2 < s.len:
+      try:
+        result.add(char(parseHexInt(s[i+1 .. i+2])))
+        i += 3
+        continue
+      except CatchableError:
+        discard
+    result.add(s[i])
+    inc i
+
+proc handleRequest(rpc: RpcServer, body: string, reqPath: string = ""): string =
   ## Handle a JSON-RPC request (single or batch)
   ## Reference: Bitcoin Core httprpc.cpp HTTPReq_JSONRPC
+  ##
+  ## reqPath is the HTTP request path. The /wallet/<name> endpoint selects which
+  ## loaded wallet wallet RPCs operate on (Core's multi-wallet convention); we
+  ## record it in currentWalletName, consumed by getTargetWallet. A bare "/"
+  ## leaves it empty (single-wallet / default resolution).
+  block setWallet:
+    var p = reqPath
+    # Strip a query string if present.
+    let q = p.find('?')
+    if q >= 0:
+      p = p[0 ..< q]
+    if p.startsWith("/wallet/"):
+      rpc.currentWalletName = decodeUrlPathSegment(p["/wallet/".len .. ^1])
+    else:
+      rpc.currentWalletName = ""
+
   var parsedJson: JsonNode
 
   # Parse the JSON body
@@ -9116,6 +9317,10 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
   var contentLength = 0
   var inHeaders = true
   var authHeader = ""
+  # Per-request URL path, captured from the HTTP request line. Used to route
+  # wallet RPCs to the wallet named in /wallet/<name> (Bitcoin Core's
+  # -rpcwallet / multi-wallet endpoint convention). "" means no specific wallet.
+  var reqPath = ""
 
   while not transp.closed:
     try:
@@ -9153,7 +9358,7 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
             var respResult: string
             {.gcsafe.}:
               try:
-                respResult = rpc.handleRequest(body)
+                respResult = rpc.handleRequest(body, reqPath)
               except CatchableError:
                 respResult = makeErrorResponse(newJNull(), RpcInternalError, "internal error")
               except Exception:
@@ -9173,10 +9378,14 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
           headers.clear()
           contentLength = 0
           authHeader = ""
+          reqPath = ""
 
         elif line.startsWith("POST") or line.startsWith("GET"):
-          # Request line - ignore
-          discard
+          # Request line: "<METHOD> <path> HTTP/1.x" — capture the path so the
+          # /wallet/<name> endpoint can route wallet RPCs to a named wallet.
+          let parts = line.split(' ')
+          if parts.len >= 2:
+            reqPath = parts[1]
 
         elif line.contains(":"):
           let colonIdx = line.find(':')
