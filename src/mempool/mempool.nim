@@ -982,7 +982,14 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     else:
       let entry = utxo.get()
       if entry.isCoinbase:
-        let age = tipHeight - entry.height
+        # Core spends mempool txs at the NEXT block height
+        # (mempool_spend_height = m_chain.Tip()->nHeight + 1,
+        # validation.cpp:374), so the maturity gate is
+        #   (tipHeight + 1) - coinHeight >= COINBASE_MATURITY.
+        # Using tipHeight alone was off-by-one too strict: it rejected a
+        # coinbase one block before Core would, wedging a wallet spend of a
+        # coin that is mature at the tip-the-block-will-extend.
+        let age = (tipHeight + 1) - entry.height
         if age < int32(mp.params.coinbaseMaturity):
           return err(AtmpAcceptInfo, "bad-txns-premature-spend-of-coinbase: age=" &
                      $age & " required=" & $mp.params.coinbaseMaturity)

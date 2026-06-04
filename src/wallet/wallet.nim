@@ -836,14 +836,27 @@ proc getBalance*(wallet: Wallet): Satoshi =
     result = result + utxo.output.value
 
 proc isMatureCoinbase*(utxo: WalletUtxo, currentHeight: int32): bool =
-  ## Check if a coinbase UTXO has reached maturity
-  ## Coinbase outputs require CoinbaseMaturity (100) confirmations
+  ## Check if a coinbase UTXO has reached maturity for the WALLET.
+  ##
+  ## Bitcoin Core's wallet (CWallet::GetTxBlocksToMaturity, wallet.cpp:3333)
+  ## treats a coinbase as immature while
+  ##   GetBlocksToMaturity = max(0, (COINBASE_MATURITY+1) - chain_depth) > 0,
+  ## i.e. it is spendable only once chain_depth >= COINBASE_MATURITY + 1
+  ## (chain_depth == confirmations == currentHeight - height + 1).
+  ##
+  ## This is deliberately one block MORE conservative than the mempool's
+  ## maturity gate (which spends at tip+1, i.e. accepts confirmations >=
+  ## COINBASE_MATURITY).  Using the wallet rule here guarantees coin-selection
+  ## never offers a coin the mempool would later reject with
+  ## bad-txns-premature-spend-of-coinbase, and makes getbalance match Core
+  ## (at tip 101 after mining 101, only the height-1 coinbase is mature -> 50
+  ## BTC, not the height-2 coinbase which is still 1 block short).
   if not utxo.isCoinbase:
     return true  # Non-coinbase outputs are always mature
   if utxo.height <= 0:
     return false  # Unconfirmed coinbase is never mature
   let confirmations = currentHeight - utxo.height + 1
-  confirmations >= CoinbaseMaturity
+  confirmations >= CoinbaseMaturity + 1
 
 proc getSpendableBalance*(wallet: Wallet, currentHeight: int32): Satoshi =
   ## Get spendable balance (excluding immature coinbase)
