@@ -1078,6 +1078,11 @@ proc handleGetDeploymentInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   result["height"]      = %targetHeight
   result["deployments"] = rpc.buildDeployments(targetHash, targetHeight)
 
+# Forward declaration: the wallet history unscan hook is defined alongside the
+# block-connect scan hooks (further down, near the mining RPCs) but is needed
+# here by handleInvalidateBlock for symmetric reorg/disconnect bookkeeping.
+proc unscanBlockFromWallets(rpc: RpcServer, blk: Block, height: int32) {.gcsafe.}
+
 # Chain Management RPCs
 proc handleInvalidateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Permanently marks a block and all its descendants as invalid
@@ -1101,6 +1106,25 @@ proc handleInvalidateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
   if idxOpt.isNone:
     raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+
+  # Wallet history unscan (symmetric with the block-connect scan): if the block
+  # being invalidated is on the active chain, drop the transaction-history
+  # records it and every active-chain descendant contributed, so
+  # listtransactions/gettransaction never report a tx no longer in the active
+  # chain. Best-effort, runs BEFORE the disconnect while the height->hash
+  # mapping is still intact. Mirrors Bitcoin Core CWallet::blockDisconnected.
+  let invalidHeight = idxOpt.get().height
+  if invalidHeight >= 0 and invalidHeight <= rpc.chainState.bestHeight:
+    let activeAtHeight = rpc.chainState.db.getBlockHashByHeight(invalidHeight)
+    if activeAtHeight.isSome and activeAtHeight.get() == blockHash:
+      var h = rpc.chainState.bestHeight
+      while h >= invalidHeight:
+        let bhOpt = rpc.chainState.db.getBlockHashByHeight(h)
+        if bhOpt.isSome:
+          let blkOpt = rpc.chainState.db.getBlock(bhOpt.get())
+          if blkOpt.isSome:
+            rpc.unscanBlockFromWallets(blkOpt.get(), h)
+        dec h
 
   # Call the chain management function
   let result = rpc.chainState.invalidateBlock(blockHash)
@@ -4070,6 +4094,30 @@ proc scanConnectedBlocksIntoWallets(rpc: RpcServer, hashes: seq[BlockHash]) {.gc
     if blkOpt.isSome:
       rpc.scanBlockIntoWallets(blkOpt.get(), height)
 
+proc unscanBlockFromWallets(rpc: RpcServer, blk: Block, height: int32) {.gcsafe.} =
+  ## Reverse of scanBlockIntoWallets for a block leaving the active chain
+  ## (invalidateblock / reorg disconnect). Symmetric with the connect hook:
+  ## drops the transaction-history records this block contributed to every
+  ## loaded wallet so listtransactions/gettransaction never report a tx that
+  ## is no longer in the active chain. Best-effort — a wallet bookkeeping
+  ## failure must never abort the disconnect. The live UTXO ledger is
+  ## reconstructible via scantxoutset, so we only revert the history here.
+  if rpc.walletManager != nil:
+    for name in rpc.walletManager.listLoadedWallets():
+      let lwOpt = rpc.walletManager.getWallet(name)
+      if lwOpt.isSome:
+        var w = lwOpt.get().wallet
+        if w != nil:
+          try:
+            w.unscanBlockForWallet(blk, height)
+          except CatchableError:
+            discard
+  elif rpc.wallet != nil:
+    try:
+      rpc.wallet.unscanBlockForWallet(blk, height)
+    except CatchableError:
+      discard
+
 # Regtest mining RPCs
 
 proc handleGenerateToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
@@ -6014,6 +6062,19 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   if not acceptResult.isOk:
     raise newRpcError(RpcTransactionRejected, "mempool rejected: " & acceptResult.error)
 
+  # Record the wallet transaction-history entry NOW, before the spent UTXOs are
+  # removed below — mirrors Bitcoin Core CWallet::CommitTransaction inserting
+  # the wtx into mapWallet at commit time. The input values come from the live
+  # ledger (the prevouts we are about to spend are still present), so the spend
+  # debit / fee are captured correctly even though the block scan that later
+  # confirms this tx will no longer see those prevouts in the ledger.
+  block recordSend:
+    var inputValues: seq[Satoshi]
+    for input in tx.inputs:
+      if input.prevOut in w.utxos:
+        inputValues.add(w.utxos[input.prevOut].output.value)
+    w.recordOutgoingTx(tx, inputValues, getTime().toUnix())
+
   # Remove spent UTXOs from wallet
   for input in tx.inputs:
     w.removeUtxo(input.prevOut)
@@ -6033,37 +6094,125 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
 
   %txidHex
 
+# ============================================================================
+# Wallet transaction-history helpers (listtransactions / gettransaction)
+# ============================================================================
+# These read from the wallet's persistent transaction-history ledger
+# (Wallet.txHistory / txOrder), populated at block-connect scan time by
+# wallet.scanBlockForWallet -> recordWalletTx. The live UTXO set
+# (Wallet.utxos) only knows about UNSPENT coins, so it cannot report a spend;
+# the history ledger is what makes a "send" entry visible. Field shapes, sign
+# conventions and category names mirror Bitcoin Core wallet/rpc/transactions.cpp
+# (ListTransactions / WalletTxToJSON) and wallet/receive.cpp
+# (CachedTxGetAmounts).
+
+proc satToBtc(s: Satoshi): float64 =
+  float64(int64(s)) / 100_000_000.0
+
+proc recordConfirmations(rpc: RpcServer, rec: WalletTxRecord): int32 =
+  ## confirmations = tip - height + 1 for a confirmed tx (Core
+  ## GetTxDepthInMainChain), 0 if unconfirmed.
+  let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
+  if rec.height > 0 and currentHeight >= rec.height:
+    currentHeight - rec.height + 1
+  else:
+    0'i32
+
+proc recordCategory(rpc: RpcServer, rec: WalletTxRecord): string =
+  ## Core ListTransactions receive-leg category for a coinbase: orphan (<1
+  ## conf), immature (< COINBASE_MATURITY+1 conf), else generate. Non-coinbase
+  ## receive legs are "receive". (Send legs are always "send", handled inline.)
+  if not rec.isCoinbase:
+    return "receive"
+  let confs = rpc.recordConfirmations(rec)
+  if confs < 1: "orphan"
+  elif confs < (100 + 1): "immature"
+  else: "generate"
+
+proc pushTxDescription(rpc: RpcServer, rec: WalletTxRecord, entry: JsonNode) =
+  ## Mirror Bitcoin Core WalletTxToJSON: the per-tx description block shared by
+  ## listtransactions long entries and gettransaction. Adds confirmations,
+  ## generated, block{hash,height,index,time}, txid, time, timereceived.
+  let confs = rpc.recordConfirmations(rec)
+  entry["confirmations"] = %confs
+  if rec.isCoinbase:
+    entry["generated"] = %true
+  if rec.height > 0:
+    entry["blockhash"] = %reverseHex(toHex(array[32, byte](rec.blockHash)))
+    entry["blockheight"] = %rec.height
+    entry["blockindex"] = %rec.blockIndex
+    entry["blocktime"] = %rec.blockTime
+  entry["txid"] = %($rec.txid)
+  entry["time"] = %rec.time
+  entry["timereceived"] = %rec.time
+
+proc buildTxLegs(rpc: RpcServer, rec: WalletTxRecord, fLong: bool,
+                 labelFilter: string): seq[JsonNode] =
+  ## Build the per-leg JSON entries for one wallet tx, matching Core
+  ## ListTransactions: one "send" entry per non-change sent output (amount
+  ## negative, negative fee), one receive/generate/immature entry per output
+  ## paid to the wallet (amount positive). fLong attaches the tx-description
+  ## block (used by listtransactions). labelFilter "*" = no filter.
+  result = @[]
+  let mainnet = rpc.params.network == Mainnet
+  # Fee (positive) = debit - valueOut, only meaningful when the wallet sent.
+  let fee = if rec.fromMe: int64(rec.debit) - int64(rec.valueOut) else: 0'i64
+
+  # Sent legs first (Core order).
+  if labelFilter == "*":
+    for d in rec.details:
+      if not d.isSend: continue
+      let addrOpt = extractAddressFromScript(d.scriptPubKey, mainnet)
+      var entry = newJObject()
+      if addrOpt.isSome: entry["address"] = %addrOpt.get()
+      entry["category"] = %"send"
+      entry["amount"] = %(-satToBtc(d.amount))   # negative for send
+      entry["vout"] = %d.vout
+      entry["fee"] = %(satToBtc(Satoshi(-fee)))   # negative fee
+      if fLong: rpc.pushTxDescription(rec, entry)
+      entry["abandoned"] = %false
+      result.add(entry)
+
+  # Received legs.
+  for d in rec.details:
+    if d.isSend or not d.isMine: continue
+    let addrOpt = extractAddressFromScript(d.scriptPubKey, mainnet)
+    let addressStr = if addrOpt.isSome: addrOpt.get() else: ""
+    if labelFilter != "*":
+      if addressStr == "": continue
+      let lbl = rpc.getTargetWallet().labels.getOrDefault(addressStr, "")
+      if lbl != labelFilter: continue
+    var entry = newJObject()
+    if addrOpt.isSome: entry["address"] = %addrOpt.get()
+    # Coinbase receive legs get orphan/immature/generate; else "receive".
+    entry["category"] = %rpc.recordCategory(rec)
+    entry["amount"] = %satToBtc(d.amount)          # positive for receive
+    entry["vout"] = %d.vout
+    entry["abandoned"] = %false
+    if fLong: rpc.pushTxDescription(rec, entry)
+    result.add(entry)
+
 proc handleListTransactions(rpc: RpcServer, params: JsonNode): JsonNode =
-  ## List wallet transactions
+  ## List the wallet's most recent transactions, Core-shaped.
   ## Reference: Bitcoin Core wallet/rpc/transactions.cpp listtransactions
   ##
   ## Arguments:
   ## 1. label (string, optional, default="*") - Filter by label (or "*" for all)
   ## 2. count (numeric, optional, default=10) - Number of transactions to return
   ## 3. skip (numeric, optional, default=0) - Number of transactions to skip
-  ## 4. include_watchonly (bool, optional, default=true) - Include watch-only addresses
+  ## 4. include_watchonly (bool, optional, default=true)
   ##
-  ## Returns: Array of transaction records
+  ## Each entry mirrors Core: {address, category (send/receive/generate/
+  ## immature), amount (NEGATIVE for send), vout, fee (negative, send only),
+  ## confirmations, generated (coinbase), blockhash, blockheight, blockindex,
+  ## blocktime, txid, time, timereceived, abandoned}.
   ##
-  ## Each entry:
-  ## {
-  ##   "address": "...",        - Address involved
-  ##   "category": "...",       - "send", "receive", or "generate"
-  ##   "amount": n,             - Amount in BTC
-  ##   "vout": n,               - Output index
-  ##   "fee": n,                - Fee (for "send" only)
-  ##   "confirmations": n,      - Number of confirmations
-  ##   "blockhash": "...",      - Block hash (if confirmed)
-  ##   "blockheight": n,        - Block height (if confirmed)
-  ##   "blockindex": n,         - Index in block (if confirmed)
-  ##   "txid": "...",           - Transaction ID
-  ##   "time": n,               - Transaction time
-  ##   "timereceived": n        - Time received by wallet
-  ## }
+  ## Backed by the wallet transaction-history ledger (Wallet.txHistory), not
+  ## the live UTXO set, so a "send" the wallet made is reported even though its
+  ## input UTXOs are gone.
 
   let w = rpc.getTargetWallet()
 
-  # Parse parameters
   let labelFilter = if params.len >= 1 and params[0].kind == JString: params[0].getStr() else: "*"
   let count = if params.len >= 2: params[1].getInt() else: 10
   let skip = if params.len >= 3: params[2].getInt() else: 0
@@ -6073,103 +6222,83 @@ proc handleListTransactions(rpc: RpcServer, params: JsonNode): JsonNode =
   if skip < 0:
     raise newRpcError(RpcInvalidParams, "skip must be non-negative")
 
-  let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
-  let mainnet = rpc.params.network == Mainnet
-  let now = getTime().toUnix()
+  # Flatten every recorded tx into its legs, in scan (first-seen) order. Core
+  # appends most-recent last and returns the LAST (count) entries after (skip),
+  # i.e. the tail of the time-ordered list. txOrder is oldest-first.
+  var allLegs: seq[JsonNode] = @[]
+  for txId in w.txOrder:
+    if txId notin w.txHistory: continue
+    let rec = w.txHistory[txId]
+    for leg in rpc.buildTxLegs(rec, fLong = true, labelFilter = labelFilter):
+      allLegs.add(leg)
 
-  # Build transaction records from UTXOs
-  # Each UTXO represents a "receive" transaction
-  type TxRecord = object
-    address: string
-    category: string
-    amount: float64
-    vout: uint32
-    confirmations: int32
-    blockhash: string
-    blockheight: int32
-    txid: string
-    time: int64
-    timereceived: int64
-    isCoinbase: bool
+  # Core: return entries [size - count - skip, size - skip), i.e. the tail.
+  let total = allLegs.len
+  var stop = total - skip
+  if stop < 0: stop = 0
+  var start = stop - count
+  if start < 0: start = 0
 
-  var records: seq[TxRecord]
-
-  for _, utxo in w.utxos:
-    let confs = if utxo.height > 0: currentHeight - utxo.height + 1 else: 0'i32
-
-    # Extract address from scriptPubKey
-    let addrOpt = extractAddressFromScript(utxo.output.scriptPubKey, mainnet)
-    let addressStr = if addrOpt.isSome: addrOpt.get() else: ""
-
-    # Check label filter
-    if labelFilter != "*":
-      if addressStr != "":
-        let label = w.labels.getOrDefault(addressStr, "")
-        if label != labelFilter:
-          continue
-      else:
-        continue
-
-    # Determine category
-    let category = if utxo.isCoinbase: "generate" else: "receive"
-
-    # Get block hash if confirmed
-    var blockhash = ""
-    if utxo.height > 0:
-      let bhOpt = rpc.chainState.db.getBlockHashByHeight(utxo.height)
-      if bhOpt.isSome:
-        blockhash = reverseHex(toHex(array[32, byte](bhOpt.get())))
-
-    records.add(TxRecord(
-      address: addressStr,
-      category: category,
-      amount: float64(int64(utxo.output.value)) / 100_000_000.0,
-      vout: utxo.outpoint.vout,
-      confirmations: confs,
-      blockhash: blockhash,
-      blockheight: utxo.height,
-      txid: reverseHex(toHex(array[32, byte](utxo.outpoint.txid))),
-      time: now,  # Simplified: real impl would track actual tx time
-      timereceived: now,
-      isCoinbase: utxo.isCoinbase
-    ))
-
-  # Sort by confirmations ascending (most recent first)
-  records.sort(proc(a, b: TxRecord): int = cmp(a.confirmations, b.confirmations))
-
-  # Apply skip and count
   var resultArray = newJArray()
-  var added = 0
-  var skipped = 0
-
-  for record in records:
-    if skipped < skip:
-      inc skipped
-      continue
-
-    if added >= count:
-      break
-
-    var entry = %*{
-      "address": record.address,
-      "category": record.category,
-      "amount": record.amount,
-      "vout": record.vout,
-      "confirmations": record.confirmations,
-      "txid": record.txid,
-      "time": record.time,
-      "timereceived": record.timereceived
-    }
-
-    if record.blockhash != "":
-      entry["blockhash"] = %record.blockhash
-      entry["blockheight"] = %record.blockheight
-      entry["blockindex"] = %0  # Simplified: index in block not tracked
-
-    resultArray.add(entry)
-    inc added
-
+  for i in start ..< stop:
+    resultArray.add(allLegs[i])
   resultArray
+
+proc handleGetTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Get detailed info about an in-wallet transaction, Core-shaped.
+  ## Reference: Bitcoin Core wallet/rpc/transactions.cpp gettransaction
+  ##
+  ## Arguments:
+  ## 1. txid (string, required)
+  ## 2. include_watchonly (bool, optional)
+  ## 3. verbose (bool, optional, default=false)
+  ##
+  ## Returns {amount, fee (send only, negative), confirmations, generated,
+  ## blockhash, blockheight, blockindex, blocktime, txid, time, timereceived,
+  ## details:[{address, category, amount, vout, fee}], hex}.
+
+  let w = rpc.getTargetWallet()
+
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "txid (string) required")
+  let txidHex = params[0].getStr()
+  if txidHex.len != 64:
+    raise newRpcError(RpcInvalidParams, "txid must be 64 hex chars")
+
+  # RPC txids are big-endian display order; reverse to internal byte order.
+  var txidBytes: array[32, byte]
+  try:
+    let raw = parseHexStr(txidHex)
+    if raw.len != 32: raise newRpcError(RpcInvalidParams, "txid must be 32 bytes")
+    for i in 0 ..< 32:
+      txidBytes[31 - i] = byte(raw[i])
+  except ValueError:
+    raise newRpcError(RpcInvalidParams, "txid is not valid hex")
+  let txId = TxId(txidBytes)
+
+  if txId notin w.txHistory:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid or non-wallet transaction id")
+  let rec = w.txHistory[txId]
+
+  # Core gettransaction: nNet = credit - debit; nFee = (fromMe ? valueOut -
+  # debit : 0) which is NEGATIVE; top-level amount = nNet - nFee.
+  let nNet = int64(rec.credit) - int64(rec.debit)
+  let nFeeNeg = if rec.fromMe: int64(rec.valueOut) - int64(rec.debit) else: 0'i64
+  let amount = nNet - nFeeNeg
+
+  var entry = newJObject()
+  entry["amount"] = %(satToBtc(Satoshi(amount)))
+  if rec.fromMe:
+    entry["fee"] = %(satToBtc(Satoshi(nFeeNeg)))   # negative
+  rpc.pushTxDescription(rec, entry)
+
+  var details = newJArray()
+  for leg in rpc.buildTxLegs(rec, fLong = false, labelFilter = "*"):
+    details.add(leg)
+  entry["details"] = details
+
+  entry["hex"] = %toHex(rec.rawTx)
+  entry
 
 # ============================================================================
 # Wallet Encryption RPCs
@@ -8745,6 +8874,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleSendToAddress(params)
   of "listtransactions":
     rpc.handleListTransactions(params)
+  of "gettransaction":
+    rpc.handleGetTransaction(params)
 
   # Wallet encryption
   of "encryptwallet":

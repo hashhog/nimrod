@@ -57,6 +57,40 @@ type
     address*: string
     label*: string
 
+  ## A single credit (output to the wallet) or debit (wallet input spent) leg
+  ## of a wallet-relevant transaction. Mirrors Bitcoin Core's COutputEntry —
+  ## one entry per relevant vout (receive) or per debited destination (send).
+  WalletTxDetail* = object
+    scriptPubKey*: seq[byte]  ## Output script of this leg (address extracted at RPC)
+    isSend*: bool           ## true = a "send" leg (wallet debited, output to a
+                            ## non-change destination); false = "receive" leg
+                            ## (output paid TO the wallet)
+    isMine*: bool           ## true if this output pays the wallet
+    amount*: Satoshi        ## Always the POSITIVE leg amount; sign applied at RPC
+    vout*: uint32           ## Output index this leg refers to
+
+  ## A wallet's record of one on-chain transaction it participated in.
+  ## Populated at block-connect scan time (scanBlockForWallet) and removed at
+  ## block-disconnect (unscanBlockForWallet), mirroring Bitcoin Core's
+  ## CWalletTx in mapWallet. This is the persistent transaction-history ledger
+  ## that backs listtransactions / gettransaction — distinct from the live
+  ## UTXO set (Wallet.utxos), which only knows about *unspent* coins and so
+  ## cannot answer "show me the send I made".
+  WalletTxRecord* = object
+    txid*: TxId
+    isCoinbase*: bool
+    credit*: Satoshi        ## sum of output values paid TO the wallet
+    debit*: Satoshi         ## sum of prevout values the wallet SPENT
+    valueOut*: Satoshi      ## sum of ALL output values of the tx (for fee calc)
+    fromMe*: bool           ## true if the wallet contributed any input (a send)
+    height*: int32          ## block height this tx was confirmed at (0 = none)
+    blockHash*: BlockHash   ## hash of the confirming block
+    blockTime*: int64       ## confirming block's header timestamp
+    blockIndex*: int        ## position within the block (0-based)
+    time*: int64            ## wallet-local time the tx was first seen
+    details*: seq[WalletTxDetail]  ## per-leg credit/debit breakdown
+    rawTx*: seq[byte]       ## full (witness) serialization, for the "hex" field
+
   Wallet* = ref object
     seed*: array[64, byte]
     masterKey*: ExtendedKey
@@ -75,6 +109,12 @@ type
     unlockExpiry*: int64            ## Unix timestamp when wallet auto-locks (0 = no expiry)
     # Labels
     labels*: Table[string, string]  ## Address -> label mapping
+    # Transaction history (backs listtransactions / gettransaction).
+    # txHistory: txid -> record; txOrder: txids in first-seen (scan) order so
+    # listtransactions can return "most recent last / first N most recent"
+    # deterministically without relying on Table iteration order.
+    txHistory*: Table[TxId, WalletTxRecord]
+    txOrder*: seq[TxId]
 
 # BIP39 wordlist - loaded at compile time
 const BIP39_WORDLIST* = staticRead("../../resources/bip39-english.txt").strip().splitLines()
@@ -881,11 +921,147 @@ proc isCoinbaseTx*(tx: Transaction): bool =
       break
   allZeros and input.prevOut.vout == 0xFFFFFFFF'u32
 
+proc buildTxAmounts(wallet: Wallet, tx: Transaction,
+                    inputValues: openArray[Satoshi]):
+    tuple[credit, debit, valueOut: Satoshi, fromMe: bool,
+          details: seq[WalletTxDetail]] =
+  ## Compute the wallet's credit / debit / value-out / from-me / per-leg detail
+  ## breakdown for a transaction, mirroring Bitcoin Core's CachedTxGetAmounts
+  ## (wallet/receive.cpp:139). `inputValues` supplies the value of each input
+  ## that the wallet owns (0 for inputs it does not own); the sum is the debit.
+  var debit = Satoshi(0)
+  for v in inputValues:
+    debit = debit + v
+  let fromMe = int64(debit) > 0
+
+  var credit = Satoshi(0)
+  var valueOut = Satoshi(0)
+  var details: seq[WalletTxDetail]
+  for voutIdx, output in tx.outputs:
+    valueOut = valueOut + output.value
+    let keyOpt = wallet.findKeyForScript(output.scriptPubKey)
+    let ismine = keyOpt.isSome
+    let isChange = ismine and keyOpt.get().path.contains("/1/")
+    if ismine:
+      credit = credit + output.value
+    # Per Core CachedTxGetAmounts: emit a leg only if (we sent and it's not
+    # change) or (the output is ours).
+    if fromMe:
+      if isChange:
+        continue  # include_change=false (listtransactions/gettransaction default)
+      details.add(WalletTxDetail(
+        scriptPubKey: output.scriptPubKey,
+        isSend: true,
+        isMine: ismine,
+        amount: output.value,
+        vout: uint32(voutIdx)))
+    elif ismine:
+      details.add(WalletTxDetail(
+        scriptPubKey: output.scriptPubKey,
+        isSend: false,
+        isMine: true,
+        amount: output.value,
+        vout: uint32(voutIdx)))
+  (credit, debit, valueOut, fromMe, details)
+
+proc recordOutgoingTx*(wallet: var Wallet, tx: Transaction,
+                       inputValues: openArray[Satoshi], firstSeen: int64) =
+  ## Record a transaction the wallet just CREATED + broadcast (sendtoaddress),
+  ## before it confirms. Mirrors Bitcoin Core's CWallet::CommitTransaction,
+  ## which inserts the wtx into mapWallet at commit time with its from-me debit
+  ## and fee already known. This MUST happen at send time because
+  ## handleSendToAddress optimistically removes the spent UTXOs from the live
+  ## ledger (so coin-selection cannot reuse them) — by the time the confirming
+  ## block is scanned, the prevout values are gone, so the block scan alone
+  ## could not tell the tx apart from a plain receive of the change output.
+  ## The later block-connect scan upgrades this record with block info.
+  let txId = tx.txid()
+  let amounts = wallet.buildTxAmounts(tx, inputValues)
+  if int64(amounts.credit) == 0 and not amounts.fromMe:
+    return
+  if txId notin wallet.txHistory:
+    wallet.txOrder.add(txId)
+  wallet.txHistory[txId] = WalletTxRecord(
+    txid: txId,
+    isCoinbase: false,
+    credit: amounts.credit,
+    debit: amounts.debit,
+    valueOut: amounts.valueOut,
+    fromMe: amounts.fromMe,
+    height: 0,            # unconfirmed until a block scan upgrades it
+    blockTime: 0,
+    blockIndex: 0,
+    time: firstSeen,
+    details: amounts.details,
+    rawTx: serialize(tx, includeWitness = true))
+
+proc recordWalletTx(wallet: var Wallet, tx: Transaction, txId: TxId,
+                    coinbase: bool, blk: Block, height: int32,
+                    blockIndex: int) =
+  ## Build (or refresh) the transaction-history record for a wallet-relevant
+  ## tx confirmed in a block, and store it in wallet.txHistory. Mirrors Bitcoin
+  ## Core's CachedTxGetAmounts (wallet/receive.cpp:139): a tx is recorded if it
+  ## credits the wallet (an output is ours) and/or debits the wallet (an input
+  ## spends one of our UTXOs). Debits are valued from the wallet's own UTXO
+  ## ledger at scan time — the prevouts the wallet spent are still present iff
+  ## this is the wallet's first sight of the tx (this proc runs BEFORE the
+  ## removeUtxo pass in scanBlockForWallet).
+  ##
+  ## If the tx was already recorded at send time (recordOutgoingTx) the live
+  ## ledger no longer holds its prevouts (sendtoaddress pre-removed them), so a
+  ## ledger-only recompute would mis-classify the spend as a pure receive of
+  ## the change. We therefore PRESERVE the from-me debit/credit/details from the
+  ## existing record and only upgrade the confirmation fields here.
+  var inputValues: seq[Satoshi]
+  for input in tx.inputs:
+    if input.prevOut in wallet.utxos:
+      inputValues.add(wallet.utxos[input.prevOut].output.value)
+
+  let bHash = blockHash(serialize(blk.header))
+
+  if txId in wallet.txHistory and wallet.txHistory[txId].fromMe:
+    # Already recorded (send time) with correct from-me amounts — just confirm.
+    var rec = wallet.txHistory[txId]
+    rec.height = height
+    rec.blockHash = bHash
+    rec.blockTime = int64(blk.header.timestamp)
+    rec.blockIndex = blockIndex
+    wallet.txHistory[txId] = rec
+    return
+
+  let amounts = wallet.buildTxAmounts(tx, inputValues)
+  # Only record txs that actually touch the wallet (credit or debit).
+  if int64(amounts.credit) == 0 and not amounts.fromMe:
+    return
+
+  let firstSeen = if txId in wallet.txHistory: wallet.txHistory[txId].time
+                  else: int64(blk.header.timestamp)
+  if txId notin wallet.txHistory:
+    wallet.txOrder.add(txId)
+  wallet.txHistory[txId] = WalletTxRecord(
+    txid: txId,
+    isCoinbase: coinbase,
+    credit: amounts.credit,
+    debit: amounts.debit,
+    valueOut: amounts.valueOut,
+    fromMe: amounts.fromMe,
+    height: height,
+    blockHash: bHash,
+    blockTime: int64(blk.header.timestamp),
+    blockIndex: blockIndex,
+    time: firstSeen,
+    details: amounts.details,
+    rawTx: serialize(tx, includeWitness = true))
+
 proc scanBlockForWallet*(wallet: var Wallet, blk: Block, height: int32) =
   ## Scan a block for transactions relevant to the wallet
   for txIdx, tx in blk.txs:
     let txId = tx.txid()
     let coinbase = tx.isCoinbaseTx()
+
+    # Record the wallet transaction-history entry BEFORE mutating the UTXO
+    # ledger, so debit legs can be valued from the still-present prevouts.
+    wallet.recordWalletTx(tx, txId, coinbase, blk, height, txIdx)
 
     # Check outputs for payments to our addresses
     for voutIdx, output in tx.outputs:
@@ -900,6 +1076,22 @@ proc scanBlockForWallet*(wallet: var Wallet, blk: Block, height: int32) =
     for input in tx.inputs:
       if input.prevOut in wallet.utxos:
         wallet.removeUtxo(input.prevOut)
+
+proc unscanBlockForWallet*(wallet: var Wallet, blk: Block, height: int32) =
+  ## Reverse of scanBlockForWallet for a block being disconnected during a
+  ## reorg. Symmetric to the UTXO unscan: removes any transaction-history
+  ## records this block contributed so listtransactions/gettransaction never
+  ## report a tx that is no longer in the active chain. Mirrors Bitcoin Core's
+  ## CWallet::blockDisconnected, which marks the affected wtx unconfirmed; here
+  ## we simply drop the confirmed record (nimrod's wallet does not track
+  ## mempool-pending wtxs, so a disconnected confirmed tx leaves the history).
+  for tx in blk.txs:
+    let txId = tx.txid()
+    if txId in wallet.txHistory:
+      wallet.txHistory.del(txId)
+      let idx = wallet.txOrder.find(txId)
+      if idx >= 0:
+        wallet.txOrder.delete(idx)
 
 # =============================================================================
 # Transaction Creation and Signing
