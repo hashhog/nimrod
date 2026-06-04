@@ -2,7 +2,7 @@
 ## Bitcoin Core compatible RPC interface with HTTP Basic auth
 ## JSON-RPC 2.0 compliant with proper error codes
 
-import std/[json, strutils, tables, options, base64, parseutils, times, sets, os, algorithm, streams]
+import std/[json, strutils, tables, options, base64, parseutils, times, sets, os, algorithm, streams, sysrand]
 import chronos
 import chronicles
 import jsony
@@ -5619,6 +5619,86 @@ proc handleGetNewAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   except WalletError as e:
     raise newRpcError(RpcMiscError, e.msg)
 
+proc handleSetHdSeed(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Set / restore the wallet's HD master seed from a known value, making
+  ## key derivation deterministic so a wallet can be recovered from a
+  ## seed (or BIP-39 mnemonic) alone.
+  ##
+  ## Reference: Bitcoin Core wallet/rpc/backup.cpp sethdseed
+  ## (CWallet::SetHDSeed + keypool flush). nimrod has no on-disk WIF seed
+  ## blob to import, so this accepts the raw seed (or mnemonic) directly and
+  ## re-derives the master key via BIP-32 HMAC-SHA512(key="Bitcoin seed").
+  ##
+  ## Arguments (positional, Core-compatible ordering with an extension):
+  ##   1. newkeypool (bool, optional, default=true) — flush+regenerate keys.
+  ##      Always effectively true here (we re-derive every account).
+  ##   2. seed (string, optional) — the seed material. Accepted forms:
+  ##        - hex string, 16..64 bytes  (raw BIP-32 seed; mirrors ouroboros)
+  ##        - a BIP-39 mnemonic phrase (space-separated words)
+  ##      If omitted, a fresh random 32-byte seed is generated.
+  ##
+  ## Returns: { "seed_hex", "xprv", "xpub" } (xprv null when no privkeys).
+  var w = rpc.getTargetWallet()
+
+  if w.isEncrypted and w.isLocked:
+    raise newRpcError(RpcWalletError,
+      "Error: Please enter the wallet passphrase with walletpassphrase first.")
+
+  # Parse the seed argument. Core puts newkeypool first, seed second; we
+  # accept the seed at index 0 too when it's clearly a string (lenient).
+  var seedArg = ""
+  if params.len >= 2 and params[1].kind == JString:
+    seedArg = params[1].getStr()
+  elif params.len >= 1 and params[0].kind == JString:
+    seedArg = params[0].getStr()
+
+  var seed: seq[byte]
+  if seedArg.len == 0:
+    # Generate a fresh random 32-byte seed.
+    seed = newSeq[byte](32)
+    var arr: array[32, byte]
+    if not urandom(arr):
+      raise newRpcError(RpcMiscError, "failed to generate random seed")
+    for i in 0 ..< 32: seed[i] = arr[i]
+  elif " " in seedArg.strip():
+    # Looks like a BIP-39 mnemonic phrase.
+    if not validateMnemonic(seedArg.strip()):
+      raise newRpcError(RpcInvalidParams, "invalid BIP-39 mnemonic")
+    let s = mnemonicToSeed(seedArg.strip())
+    seed = newSeq[byte](64)
+    for i in 0 ..< 64: seed[i] = s[i]
+  else:
+    # Raw hex seed.
+    let h = seedArg.strip()
+    if h.len mod 2 != 0:
+      raise newRpcError(RpcInvalidParams, "seed hex must have even length")
+    for c in h:
+      if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+        raise newRpcError(RpcInvalidParams, "seed must be valid hex or a mnemonic")
+    seed = hexToBytes(h)
+    if seed.len < 16 or seed.len > 64:
+      raise newRpcError(RpcInvalidParams, "seed must be 16-64 bytes")
+
+  try:
+    w.setHdSeed(seed)
+  except WalletError as e:
+    raise newRpcError(RpcInvalidParams, e.msg)
+
+  let mainnet = w.mainnet
+  var seedHex = ""
+  for b in seed: seedHex.add(b.toHex(2).toLowerAscii())
+
+  var xprv = newJNull()
+  if w.masterKey.isPrivate:
+    xprv = %serializeExtendedKey(w.masterKey, mainnet)
+  let xpub = %serializeExtendedKey(neuter(w.masterKey), mainnet)
+
+  %*{
+    "seed_hex": seedHex,
+    "xprv": xprv,
+    "xpub": xpub
+  }
+
 proc handleGetRawChangeAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Generate a new change address
   ## Reference: Bitcoin Core wallet/rpc/addresses.cpp getrawchangeaddress
@@ -8581,6 +8661,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   # Wallet
   of "getnewaddress":
     rpc.handleGetNewAddress(params)
+  of "sethdseed":
+    rpc.handleSetHdSeed(params)
   of "getrawchangeaddress":
     rpc.handleGetRawChangeAddress(params)
   of "getbalance":

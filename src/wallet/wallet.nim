@@ -601,6 +601,59 @@ proc addAccount*(wallet: var Wallet, purpose: uint32 = 84, accountIndex: uint32 
 
   wallet.accounts.add(account)
 
+proc reseedAccounts(wallet: var Wallet) =
+  ## Re-derive every account's keys from the wallet's current masterKey.
+  ## Account *structure* (purpose / coinType / accountIndex / gap) is
+  ## preserved; the derived external/internal keys are regenerated from the
+  ## new master and the next-index cursors are reset to 0. Used by
+  ## setHdSeed so address derivation becomes deterministic w.r.t. the new
+  ## seed (mirrors the keypool-flush half of Core's sethdseed).
+  for ai in 0 ..< wallet.accounts.len:
+    var acc = wallet.accounts[ai]
+    let purpose = acc.purpose
+    let coinType = acc.coinType
+    let accountIndex = acc.accountIndex
+    let gap = if acc.gap > 0: acc.gap else: 20
+    acc.externalKeys = @[]
+    acc.internalKeys = @[]
+    acc.nextExternal = 0
+    acc.nextInternal = 0
+    for i in 0 ..< gap:
+      acc.externalKeys.add(wallet.derivePath(purpose, coinType, accountIndex, 0, uint32(i)))
+      acc.internalKeys.add(wallet.derivePath(purpose, coinType, accountIndex, 1, uint32(i)))
+    wallet.accounts[ai] = acc
+
+proc setHdSeed*(wallet: var Wallet, seed: openArray[byte]) =
+  ## Restore-from-seed: replace the wallet's HD seed + master key with the
+  ## given raw seed bytes and re-derive all keys deterministically.
+  ## Reference: Bitcoin Core wallet sethdseed (CWallet::SetHDSeed +
+  ## keypool flush). The raw seed is run through BIP-32
+  ## HMAC-SHA512(key="Bitcoin seed", data=seed) — same primitive as a
+  ## BIP-39 mnemonic-derived seed — so feeding the identical seed twice
+  ## yields a byte-identical master key and therefore byte-identical
+  ## addresses across the entire derivation tree.
+  if seed.len < 16 or seed.len > 64:
+    raise newException(WalletError, "seed must be 16-64 bytes")
+  # Cache the seed (zero-pad / truncate into the fixed 64-byte slot for the
+  # encrypted-on-disk path; derivation itself uses the raw bytes below).
+  for i in 0 ..< wallet.seed.len:
+    wallet.seed[i] = if i < seed.len: seed[i] else: 0'u8
+  wallet.masterKey = masterKeyFromSeedRaw(seed)
+  # If the wallet has no accounts yet (e.g. created blank), seed the default
+  # BIP-84 native-segwit account so getnewaddress works immediately.
+  if wallet.accounts.len == 0:
+    wallet.addAccount(84, 0, 20)
+  else:
+    wallet.reseedAccounts()
+
+proc setHdSeedFromMnemonic*(wallet: var Wallet, mnemonic: string,
+                            passphrase: string = "") =
+  ## Convenience restore: BIP-39 mnemonic -> 64-byte seed -> setHdSeed.
+  if not validateMnemonic(mnemonic):
+    raise newException(WalletError, "invalid mnemonic")
+  let s = mnemonicToSeed(mnemonic, passphrase)
+  wallet.setHdSeed(s)
+
 proc ensureGap(wallet: var Wallet, account: var Account, isInternal: bool) =
   ## Ensure there are enough unused addresses ahead of the next index
   let nextIdx = if isInternal: account.nextInternal else: account.nextExternal
