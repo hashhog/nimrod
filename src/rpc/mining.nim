@@ -51,11 +51,16 @@ proc mineBlock*(
                 else: 0'u32
   tmpl.header.timestamp = max(wallTs, prevMtp + 1)
 
-  # Recalculate merkle root since we may have updated transactions
+  # Recalculate merkle root since we may have updated transactions.
+  # The block merkle tree is built over TXIDs (non-witness serialization),
+  # NOT wtxids — using serialize(tx) (witness-included by default) produces a
+  # wrong root for any block containing a segwit tx, which acceptBlock then
+  # rejects as "merkle root mismatch" (it recomputes over tx.txid()).  This
+  # only ever bit blocks carrying a wallet spend (coinbase-only blocks have no
+  # witness, so the two serializations coincide).
   var txHashes: seq[array[32, byte]]
   for tx in tmpl.transactions:
-    let txBytes = serialize(tx)
-    txHashes.add(doubleSha256(txBytes))
+    txHashes.add(array[32, byte](tx.txid()))
   tmpl.header.merkleRoot = hashing.computeMerkleRoot(txHashes)
 
   # Try to find valid nonce
@@ -279,11 +284,11 @@ proc generateBlockWithTxs*(
     )
     transactions[0] = updatedCoinbase
 
-  # Compute merkle root
+  # Compute merkle root over TXIDs (non-witness), matching acceptBlock. See
+  # mineBlock for the segwit merkle-root rationale.
   var txHashes: seq[array[32, byte]]
   for tx in transactions:
-    let txBytes = serialize(tx)
-    txHashes.add(doubleSha256(txBytes))
+    txHashes.add(array[32, byte](tx.txid()))
   let merkleRoot = hashing.computeMerkleRoot(txHashes)
 
   # Determine bits

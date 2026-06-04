@@ -4022,6 +4022,54 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     # Unexpected exception — use "rejected" catch-all per BIP-22.
     %"rejected"
 
+# ============================================================================
+# Wallet block-connect hook
+# ============================================================================
+# The wallet keeps its own UTXO ledger (Wallet.utxos), credited/debited by
+# wallet.scanBlockForWallet(). That proc was dead code — nothing ever called it
+# from the chain — so getbalance/listunspent were always 0/[] and sendtoaddress
+# died "no spendable UTXOs". Mirror Bitcoin Core's CWallet::blockConnected:
+# every time a block connects to the active tip, scan it into every loaded
+# wallet so wallet-owned coinbase/payment outputs are credited and spends of
+# wallet coins are debited. Best-effort — a wallet bookkeeping failure must
+# never roll back a fully-validated block (the ledger is reconstructible via
+# scantxoutset / rescan). Wallet is a `ref object`, so mutating the instance the
+# manager holds persists across RPC calls.
+
+proc scanBlockIntoWallets(rpc: RpcServer, blk: Block, height: int32) {.gcsafe.} =
+  ## Credit/debit every loaded wallet's UTXO ledger from a connected block.
+  ## Idempotent: re-scanning the same block re-inserts the same {txid,vout}
+  ## entries (set semantics) and re-deletes already-absent spends (no-op).
+  if rpc.walletManager != nil:
+    for name in rpc.walletManager.listLoadedWallets():
+      let lwOpt = rpc.walletManager.getWallet(name)
+      if lwOpt.isSome:
+        var w = lwOpt.get().wallet
+        if w != nil:
+          try:
+            w.scanBlockForWallet(blk, height)
+          except CatchableError:
+            discard  # never let wallet bookkeeping abort a valid block
+  # Legacy single-wallet fallback (pre-walletManager deployments).
+  elif rpc.wallet != nil:
+    try:
+      rpc.wallet.scanBlockForWallet(blk, height)
+    except CatchableError:
+      discard
+
+proc scanConnectedBlocksIntoWallets(rpc: RpcServer, hashes: seq[BlockHash]) {.gcsafe.} =
+  ## Scan a run of freshly-connected blocks (in connection order) into the
+  ## wallet ledgers. `hashes` are the blocks just mined/connected, oldest first;
+  ## the tip is at chainState.bestHeight after they all connected, so block i
+  ## sits at height (bestHeight - (len-1-i)).
+  let tip = rpc.chainState.bestHeight
+  let n = hashes.len
+  for i, h in hashes:
+    let height = tip - int32(n - 1 - i)
+    let blkOpt = rpc.chainState.db.getBlock(h)
+    if blkOpt.isSome:
+      rpc.scanBlockIntoWallets(blkOpt.get(), height)
+
 # Regtest mining RPCs
 
 proc handleGenerateToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
@@ -4060,6 +4108,13 @@ proc handleGenerateToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   var mp = rpc.mempool
 
   let hashes = generateToAddress(cs, mp, rpc.params, nblocks, address, maxTries)
+
+  # Wallet block-connect hook: credit/debit every loaded wallet from the blocks
+  # just connected, so coinbase rewards paid to a wallet address (and any wallet
+  # spends confirmed in these blocks) land in the wallet UTXO ledger. Mirrors
+  # Bitcoin Core's CWallet::blockConnected. Without this, getbalance stays 0 and
+  # sendtoaddress fails "no spendable UTXOs" even after generatetoaddress.
+  rpc.scanConnectedBlocksIntoWallets(hashes)
 
   # Convert to JSON array of hex strings (reversed for display)
   var result = newJArray()
@@ -5734,7 +5789,16 @@ proc handleGetBalance(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Reference: Bitcoin Core wallet/rpc/coins.cpp getbalance
 
   let w = rpc.getTargetWallet()
-  let balance = w.getBalance()
+  # Core's getbalance reports only spendable coins: confirmed, and for coinbase
+  # past the 100-confirmation maturity window. Sum the maturity-filtered set at
+  # the current chain tip (getSpendableBalance), mirroring the
+  # premature_spend_of_coinbase rule that validation/mempool enforce on spend.
+  # Falls back to the raw total only when no chain tip is known.
+  let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
+  let balance = if currentHeight > 0:
+    w.getSpendableBalance(currentHeight)
+  else:
+    w.getBalance()
   %*(float64(int64(balance)) / 100_000_000.0)
 
 proc handleListUnspent(rpc: RpcServer, params: JsonNode): JsonNode =
@@ -5760,15 +5824,21 @@ proc handleListUnspent(rpc: RpcServer, params: JsonNode): JsonNode =
     let confs = if utxo.height > 0: currentHeight - utxo.height + 1 else: 0
     if confs >= minconf and confs <= maxconf:
       let addrOpt = extractAddressFromScript(utxo.output.scriptPubKey, mainnet)
+      # Immature coinbase coins are listed but flagged non-spendable/unsafe,
+      # matching Core's AvailableCoins semantics (a coinbase at height H is
+      # spendable once currentHeight - H >= COINBASE_MATURITY, i.e. it has
+      # COINBASE_MATURITY+1 confirmations). isMatureCoinbase returns true for
+      # all non-coinbase coins.
+      let spendable = utxo.isMatureCoinbase(currentHeight)
       var entry = %*{
         "txid": reverseHex(toHex(array[32, byte](utxo.outpoint.txid))),
         "vout": utxo.outpoint.vout,
         "amount": float64(int64(utxo.output.value)) / 100_000_000.0,
         "confirmations": confs,
         "scriptPubKey": toHex(utxo.output.scriptPubKey),
-        "spendable": true,
+        "spendable": spendable,
         "solvable": true,
-        "safe": true
+        "safe": spendable
       }
       if addrOpt.isSome:
         entry["address"] = %addrOpt.get()

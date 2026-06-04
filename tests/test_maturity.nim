@@ -26,7 +26,13 @@ suite "Coinbase Maturity":
     check utxo.isMatureCoinbase(100)
     check utxo.isMatureCoinbase(1000)
 
-  test "coinbase UTXO requires 100 confirmations":
+  test "coinbase UTXO requires 101 confirmations (Core wallet rule)":
+    # Bitcoin Core's WALLET treats a coinbase as spendable only once
+    # chain_depth >= COINBASE_MATURITY + 1 (CWallet::GetTxBlocksToMaturity,
+    # wallet.cpp:3342 -> max(0, 101 - chain_depth)). chain_depth == confs ==
+    # currentHeight - height + 1. This is one block more conservative than the
+    # mempool's spend-at-tip+1 gate, and is what makes getbalance report 50 BTC
+    # (not 100) after `generatetoaddress 101` on regtest — matching bitcoind.
     var utxo = WalletUtxo(
       outpoint: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
       output: TxOut(value: Satoshi(5000000000), scriptPubKey: @[]),
@@ -45,11 +51,15 @@ suite "Coinbase Maturity":
     # At height 198, coinbase at height 100 has 99 confirmations
     check not utxo.isMatureCoinbase(198)
 
-    # At height 199, coinbase at height 100 has 100 confirmations (mature!)
-    check utxo.isMatureCoinbase(199)
+    # At height 199, coinbase at height 100 has 100 confirmations — still
+    # immature for the wallet (needs 101 confs, i.e. chain_depth >= 101).
+    check not utxo.isMatureCoinbase(199)
 
-    # At height 200+, still mature
+    # At height 200, coinbase at height 100 has 101 confirmations (mature!)
     check utxo.isMatureCoinbase(200)
+
+    # At height 201+, still mature
+    check utxo.isMatureCoinbase(201)
     check utxo.isMatureCoinbase(1000)
 
   test "unconfirmed coinbase is never mature":
@@ -165,8 +175,12 @@ when defined(useSystemSecp256k1):
       # Total balance includes both
       check wallet.getBalance() == Satoshi(5000100000)
 
-      # At height 249, coinbase becomes mature (100 confirmations)
-      check wallet.getSpendableBalance(249) == Satoshi(5000100000)
+      # At height 249, coinbase at 150 has 100 confirmations — still immature
+      # for the wallet (Core wallet rule needs chain_depth >= 101).
+      check wallet.getSpendableBalance(249) == Satoshi(100000)
+
+      # At height 250, coinbase at 150 has 101 confirmations (mature!)
+      check wallet.getSpendableBalance(250) == Satoshi(5000100000)
 
     test "getImmatureBalance returns only immature coinbase":
       let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
@@ -200,5 +214,9 @@ when defined(useSystemSecp256k1):
       # At height 200, coinbase is immature
       check wallet.getImmatureBalance(200) == Satoshi(5000000000)
 
-      # At height 249, coinbase is mature
-      check wallet.getImmatureBalance(249) == Satoshi(0)
+      # At height 249 (100 confs) coinbase is still immature for the wallet
+      # (Core wallet rule needs chain_depth >= 101).
+      check wallet.getImmatureBalance(249) == Satoshi(5000000000)
+
+      # At height 250 (101 confs) coinbase is finally mature.
+      check wallet.getImmatureBalance(250) == Satoshi(0)

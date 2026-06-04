@@ -428,11 +428,13 @@ proc buildBlockTemplate*(
     )
     transactions[0] = updatedCoinbase
 
-  # Compute merkle root
+  # Compute merkle root over TXIDs (non-witness serialization), matching
+  # consensus checkBlock (which builds the tree from tx.txid()).  Using
+  # serialize(tx) (witness-included by default) yields a wrong root for any
+  # block containing a segwit transaction.
   var txHashes: seq[array[32, byte]]
   for tx in transactions:
-    let txBytes = serialize(tx)
-    txHashes.add(doubleSha256(txBytes))
+    txHashes.add(array[32, byte](tx.txid()))
   let merkleRoot = hashing.computeMerkleRoot(txHashes)
 
   # Get previous block hash
@@ -541,11 +543,10 @@ proc updateExtraNonce*(tmpl: var BlockTemplate, extraNonce: uint64) =
     tmpl.transactions[0].inputs[0].scriptSig = scriptSig
     tmpl.coinbaseTx.inputs[0].scriptSig = scriptSig
 
-  # Recalculate merkle root
+  # Recalculate merkle root over TXIDs (non-witness), matching acceptBlock.
   var txHashes: seq[array[32, byte]]
   for tx in tmpl.transactions:
-    let txBytes = serialize(tx)
-    txHashes.add(doubleSha256(txBytes))
+    txHashes.add(array[32, byte](tx.txid()))
   tmpl.header.merkleRoot = hashing.computeMerkleRoot(txHashes)
 
 proc hashMeetsTarget*(hash: array[32, byte], target: array[32, byte]): bool =
