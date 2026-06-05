@@ -606,7 +606,10 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   let blockHash = parseBlockHash(hashHex)
   let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
   if idxOpt.isNone:
-    raise newRpcError(RpcInvalidParams, "block not found")
+    # Core: throw RPC_INVALID_ADDRESS_OR_KEY (-5) "Block not found" for a
+    # syntactically-valid hash that is not in the block index.
+    # Reference: bitcoin-core/src/rpc/blockchain.cpp:654-656.
+    raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
 
   let idx = idxOpt.get()
 
@@ -675,10 +678,23 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
     if blkOpt.isSome:
       nTx = blkOpt.get().txs.len
 
+  # Active-chain membership: a block is on the active chain iff the active
+  # chain's hash at this height equals this block's hash. Core derives both
+  # `confirmations` and `nextblockhash` from this via ComputeNextBlockAndDepth:
+  # for an in-chain block confirmations = tip - height + 1 and nextblockhash is
+  # the active-chain block at height+1; for a side-chain block confirmations is
+  # -1 and there is no nextblockhash.
+  # Reference: bitcoin-core/src/rpc/blockchain.cpp ComputeNextBlockAndDepth +
+  # blockheaderToJSON:162-180.
+  let activeHashAtHeight = rpc.chainState.db.getBlockHashByHeight(idx.height)
+  let inActiveChain = activeHashAtHeight.isSome and activeHashAtHeight.get() == idx.hash
+
   var response = newJObject()
   response["bits"] = %bitsHex
   response["chainwork"] = %chainworkHex
-  response["confirmations"] = %int(rpc.chainState.bestHeight - idx.height + 1)
+  response["confirmations"] =
+    if inActiveChain: %int(rpc.chainState.bestHeight - idx.height + 1)
+    else: %(-1)
   response["difficulty"] = difficultyJson(getDifficultyFromBits(idx.header.bits))
   response["hash"] = %reverseHex(toHex(array[32, byte](idx.hash)))
   response["height"] = %idx.height
@@ -695,8 +711,9 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   if idx.height > 0:
     response["previousblockhash"] = %reverseHex(toHex(array[32, byte](idx.prevHash)))
 
-  # Add nextblockhash if not tip
-  if idx.height < rpc.chainState.bestHeight:
+  # Add nextblockhash if this block is on the active chain AND not the tip.
+  # Core's pnext is null for a side-chain block, so nextblockhash is omitted.
+  if inActiveChain and idx.height < rpc.chainState.bestHeight:
     let nextHashOpt = rpc.chainState.db.getBlockHashByHeight(idx.height + 1)
     if nextHashOpt.isSome:
       response["nextblockhash"] = %reverseHex(toHex(array[32, byte](nextHashOpt.get())))
