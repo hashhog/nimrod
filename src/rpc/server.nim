@@ -3779,6 +3779,88 @@ proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
 
   peers
 
+proc handleGetNodeAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Return known addresses from the address manager, after filtering by network.
+  ## Read-only addrman dump. Byte-faithful to Bitcoin Core
+  ## (bitcoin-core/src/rpc/net.cpp:911-967 getnodeaddresses):
+  ##   getnodeaddresses ( count "network" )  — both args optional.
+  ##
+  ## Returns a JSON ARRAY of objects, each with EXACTLY 5 keys in THIS ORDER:
+  ##   time     NUM_TIME — unix seconds as an INTEGER
+  ##   services NUM      — raw services bitfield as an INTEGER (not a hex string)
+  ##   address  STR      — ToStringAddr (ip literal / .onion / .b32.i2p, no port)
+  ##   port     NUM      — integer
+  ##   network  STR      — ipv4|ipv6|onion|i2p|cjdns|not_publicly_routable|internal
+  ##
+  ## count (positional 0, default 1): MAX to return; 0 = all. count < 0 → -8.
+  ## network (positional 1, optional, default all): ParseNetwork lowercases and
+  ## accepts ONLY ipv4|ipv6|onion|i2p|cjdns; any other → -8 "Network not
+  ## recognized: <raw>". The result is shuffled (non-deterministic order).
+
+  # 1. count (default 1; 0 = all). Negative → RPC_INVALID_PARAMETER (-8).
+  let hasCount = params.len >= 1 and params[0].kind != JNull
+  let count = if hasCount: params[0].getInt() else: 1
+  if count < 0:
+    raise newRpcError(RpcInvalidParameter, "Address count out of range")
+
+  # 2. network filter (optional). ParseNetwork: lowercase; only the 5 routable
+  #    networks are valid INPUT filters. Anything else → -8.
+  var networkFilter = none(string)
+  let hasNetwork = params.len >= 2 and params[1].kind != JNull
+  if hasNetwork:
+    let raw = params[1].getStr()
+    let net = raw.toLowerAscii()
+    if net notin ["ipv4", "ipv6", "onion", "i2p", "cjdns"]:
+      raise newRpcError(RpcInvalidParameter, "Network not recognized: " & raw)
+    networkFilter = some(net)
+
+  result = newJArray()
+  if rpc.peerManager == nil:
+    return  # no addrman → empty array (NOT an error), matching a fresh node
+
+  for entry in rpc.peerManager.dumpKnownAddresses(count, networkFilter):
+    var obj = newJObject()
+    obj["time"] = %entry.time
+    obj["services"] = %entry.services
+    obj["address"] = %entry.address
+    obj["port"] = %int(entry.port)
+    obj["network"] = %entry.network
+    result.add(obj)
+
+proc handleAddPeerAddress(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Add the address of a potential peer to the address manager. Testing-only,
+  ## the natural companion to getnodeaddresses. Core-shaped
+  ## (bitcoin-core/src/rpc/net.cpp:972-1027 addpeeraddress):
+  ##   addpeeraddress "address" port ( tried )
+  ## Returns {"success": bool} (+ optional "error" on failure).
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParameter, "address and port are required")
+
+  let addrString = params[0].getStr()
+  let port = uint16(params[1].getInt())
+  # `tried` (params[2]) accepted for Core-shape parity; the nimrod addrman has no
+  # separate tried table, so the flag is a no-op (the insert always lands).
+
+  # Optional `services` (positional 3) — lets the differential set a known
+  # services bitfield. Core hardcodes NODE_NETWORK|NODE_WITNESS; we default to
+  # the same (1 | 8 = 9) when omitted.
+  var services: uint64 = 0x01'u64 or 0x08'u64
+  if params.len >= 4 and params[3].kind != JNull:
+    services = uint64(params[3].getBiggestInt())
+
+  var obj = newJObject()
+  if rpc.peerManager == nil:
+    obj["success"] = %false
+    obj["error"] = %"peer manager not available"
+    return obj
+
+  let ok = rpc.peerManager.injectKnownAddress(
+    addrString, port, services, uint32(epochTime().int))
+  obj["success"] = %ok
+  if not ok:
+    obj["error"] = %"Invalid or non-routable IP address"
+  obj
+
 proc handleGetConnectionCount(rpc: RpcServer): JsonNode =
   if rpc.peerManager != nil:
     %rpc.peerManager.connectedPeerCount()
@@ -9200,6 +9282,10 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetPeerInfo()
   of "getconnectioncount":
     rpc.handleGetConnectionCount()
+  of "getnodeaddresses":
+    rpc.handleGetNodeAddresses(params)
+  of "addpeeraddress":
+    rpc.handleAddPeerAddress(params)
   of "addnode":
     rpc.handleAddNode(params)
   of "listbanned":

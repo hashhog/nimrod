@@ -1191,10 +1191,133 @@ proc addKnownAddress*(pm: PeerManager, address: NetAddress) =
   ## applied before CAddrMan::Add() in net_processing.cpp.
   if not isRoutable(address.ip):
     return
-  pm.knownAddresses.add(address)
+  var a = address
+  # DATA-GAP FIX (2026-06): if the caller did not supply a wire timestamp,
+  # stamp the connect/advertise time so getnodeaddresses emits a real `time`.
+  if a.lastSeen == 0:
+    a.lastSeen = uint32(epochTime().int)
+  pm.knownAddresses.add(a)
 
 proc getKnownAddresses*(pm: PeerManager): seq[NetAddress] =
   pm.knownAddresses
+
+type
+  KnownAddrEntry* = object
+    ## Core-shaped (rpc/net.cpp:959-965) row for the getnodeaddresses dump.
+    ## One per addrman entry; `network` is the GetNetworkName(GetNetClass())
+    ## string (netbase.cpp:114-128).
+    time*: int64       ## unix seconds (CAddress::nTime)
+    services*: uint64  ## raw services bitfield (emitted as a JSON integer)
+    address*: string   ## ToStringAddr — ip literal / .onion / .b32.i2p, no port
+    port*: uint16
+    network*: string   ## ipv4|ipv6|onion|i2p|cjdns|not_publicly_routable|internal
+
+proc netClassOfIp(ip: array[16, byte]): string =
+  ## Map a 16-byte IPv4-mapped / native-IPv6 address to its Core network string.
+  ## Mirrors CNetAddr::GetNetClass() → GetNetworkName(): an unroutable address
+  ## reports "not_publicly_routable" (Core netbase.cpp:117), routable IPv4-mapped
+  ## reports "ipv4", routable native-IPv6 reports "ipv6". CJDNS (fc00::/8) is its
+  ## own class.
+  # IPv4-mapped detection: bytes 0-9 zero, bytes 10-11 = 0xFF.
+  var isV4Mapped = true
+  for i in 0..<10:
+    if ip[i] != 0: isV4Mapped = false; break
+  if isV4Mapped and (ip[10] != 0xFF or ip[11] != 0xFF):
+    isV4Mapped = false
+  if not isRoutable(ip):
+    return "not_publicly_routable"
+  if isV4Mapped:
+    return "ipv4"
+  if ip[0] == 0xFC'u8:
+    return "cjdns"
+  return "ipv6"
+
+proc dumpKnownAddresses*(pm: PeerManager, count: int,
+                         network: Option[string]): seq[KnownAddrEntry] =
+  ## Core-faithful getnodeaddresses backend
+  ## (rpc/net.cpp:954-967 → CConnman::GetAddressesUnsafe(count, max_pct=0, net)).
+  ##  - walks BOTH the legacy IPv4/IPv6 pool and the addrv2 pool (onion/i2p/cjdns),
+  ##  - maps each entry to a Core-shaped row (time/services/address/port/network),
+  ##  - filters by `network` when set,
+  ##  - SHUFFLES the result (order is non-deterministic, per Core),
+  ##  - `count == 0` means "return all", otherwise cap at `count`.
+  var rows: seq[KnownAddrEntry]
+
+  # Legacy pool: IPv4 / IPv6 (and CJDNS folded in as IPv4-mapped/native form).
+  for na in pm.knownAddresses:
+    let net = netClassOfIp(na.ip)
+    rows.add(KnownAddrEntry(
+      time: int64(na.lastSeen),
+      services: na.services,
+      address: ipToString(na.ip),
+      port: na.port,
+      network: net))
+
+  # addrv2 pool: Tor v3 / I2P / CJDNS.
+  for ta in pm.knownAddressesV2:
+    var net = ""
+    case ta.address.networkId
+    of netTorV3: net = "onion"
+    of netI2P:   net = "i2p"
+    of netCJDNS: net = "cjdns"
+    of netIPv4:  net = "ipv4"
+    of netIPv6:  net = "ipv6"
+    else: continue  # deprecated torv2 — skip
+    rows.add(KnownAddrEntry(
+      time: int64(ta.timestamp),
+      services: ta.services,
+      address: $ta.address,
+      port: ta.port,
+      network: net))
+
+  # Network filter (post-classification, like Core's GetAddressesUnsafe(net)).
+  if network.isSome:
+    let want = network.get()
+    var filtered: seq[KnownAddrEntry]
+    for r in rows:
+      if r.network == want:
+        filtered.add(r)
+    rows = filtered
+
+  # Shuffle — Core returns a shuffled CAddress vector; callers/tests must be
+  # order-insensitive.
+  shuffle(rows)
+
+  # count == 0 → all; otherwise cap.
+  if count > 0 and rows.len > count:
+    rows.setLen(count)
+  rows
+
+proc injectKnownAddress*(pm: PeerManager, address: string, port: uint16,
+                         services: uint64, time: uint32): bool =
+  ## Core-shaped addpeeraddress backend (rpc/net.cpp:992-1013): parse the IP
+  ## literal, build the 16-byte IPv4-mapped / native-IPv6 form, stamp the
+  ## supplied time, and insert into the known-address pool (deduped by ip+port).
+  ## Returns false on an unparseable IP or a non-routable address (Core's Add()
+  ## drops unroutable entries), true on a successful insert.
+  let ip = parseIpAddr(address)
+  var ipBytes: array[16, byte]
+  if ip.isV6:
+    ipBytes = ip.v6
+  else:
+    ipBytes[10] = 0xFF
+    ipBytes[11] = 0xFF
+    ipBytes[12] = ip.v4[0]
+    ipBytes[13] = ip.v4[1]
+    ipBytes[14] = ip.v4[2]
+    ipBytes[15] = ip.v4[3]
+  if not isRoutable(ipBytes):
+    return false
+  # Dedup by ip+port (mirrors the addr-message insert path).
+  for ka in pm.knownAddresses:
+    if ka.ip == ipBytes and ka.port == port:
+      return true
+  pm.knownAddresses.add(NetAddress(
+    services: services,
+    ip: ipBytes,
+    port: port,
+    lastSeen: (if time == 0: uint32(epochTime().int) else: time)))
+  true
 
 proc relayAddresses(pm: PeerManager, source: Peer) =
   ## Relay addresses to up to 2 random peers (not back to source).
@@ -1259,7 +1382,12 @@ proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage) =
     # Add addresses to known list (max 1000 per message)
     let count = min(msg.addresses.len, 1000)
     for i in 0..<count:
-      let na = msg.addresses[i].address
+      var na = msg.addresses[i].address
+      # DATA-GAP FIX (2026-06): carry the wire timestamp onto the stored record
+      # so getnodeaddresses emits a real `time`. The legacy addr message ships a
+      # per-entry uint32 timestamp (TimestampedAddr.timestamp); without this the
+      # NetAddress lost it and `time` would be 0/fabricated.
+      na.lastSeen = msg.addresses[i].timestamp
       var found = false
       for ka in pm.knownAddresses:
         if ka.ip == na.ip and ka.port == na.port:
@@ -1283,7 +1411,10 @@ proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage) =
       let legacy = toLegacyTimestampedAddr(ta)
       if legacy.isSome:
         # IPv4 or IPv6 — store in legacy pool
-        let la = legacy.get()
+        var la = legacy.get()
+        # DATA-GAP FIX (2026-06): carry the addrv2 wire timestamp onto the
+        # stored NetAddress so getnodeaddresses emits a real `time`.
+        la.address.lastSeen = la.timestamp
         if isRoutable(la.address.ip):
           var found = false
           for ka in pm.knownAddresses:
