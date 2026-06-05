@@ -1206,7 +1206,14 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     let rbfResult = mp.checkRbfRules(tx, modifiedFee, vsizeInt, conflicts,
                                      incrementalRelayFeeSatVb)
     if not rbfResult.isOk:
-      return err(AtmpAcceptInfo, "replacement-failed: " & rbfResult.error)
+      # checkRbfRules already leads each failure with Core's reject-reason
+      # TOKEN ("insufficient fee" for rules 3/4, "bad-txns-spends-conflicting-tx"
+      # for rule 2, "too many potential replacements" for rule 5, and the
+      # feerate-diagram detail otherwise).  Surface it verbatim so the
+      # reject-reason CATEGORY matches Core instead of burying every RBF
+      # failure under a single "replacement-failed:" prefix (validation.cpp
+      # emits distinct tokens per ReplacementChecks branch, 998-1031).
+      return err(AtmpAcceptInfo, rbfResult.error)
     for c in rbfResult.value:
       conflictsToRemove.incl(c)
 
@@ -1884,10 +1891,12 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
                $len(allConflicts) & " > " & $MaxReplacementCandidates & ")")
 
   # Rule #2 (HasNoNewUnconfirmed): replacement must not spend outputs from any evicted tx.
-  # Reference: Bitcoin Core src/policy/rbf.cpp EntriesAndTxidsDisjoint()
+  # Reference: Bitcoin Core src/policy/rbf.cpp EntriesAndTxidsDisjoint().  Core's
+  # reject-reason TOKEN for this is "bad-txns-spends-conflicting-tx"
+  # (validation.cpp:1359); we lead with that token so the category matches.
   for input in tx.inputs:
     if input.prevOut.txid in allConflicts:
-      return err(HashSet[TxId], "replacement tx spends output from conflicting transaction " &
+      return err(HashSet[TxId], "bad-txns-spends-conflicting-tx: replacement spends output from conflicting transaction " &
                  $input.prevOut.txid)
 
   # Calculate total fees of all conflicting transactions.
@@ -1897,8 +1906,14 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
   # Rule #3 (PaysForRBF part 1): replacement fees >= original fees.
   # Core: "if (replacement_fees < original_fees) → reject"  (< not <=; equal is allowed).
   # Reference: Bitcoin Core src/policy/rbf.cpp PaysForRBF() line 109.
+  #
+  # Reject-reason TOKEN must match Core's category: ReplacementChecks emits
+  # state.Invalid(..., "insufficient fee", err_string) for BOTH PaysForRBF
+  # failures (validation.cpp:1013-1014).  We mirror that token so the
+  # reject-reason CATEGORY agrees with Core; the Core detail string
+  # ("less fees than conflicting txs") follows for forensics.
   if int64(txFee) < int64(conflictFees):
-    return err(HashSet[TxId], "rejecting replacement %s, less fees than conflicting txs; " &
+    return err(HashSet[TxId], "insufficient fee, rejecting replacement, less fees than conflicting txs; " &
                $int64(txFee) & " < " & $int64(conflictFees) & " sats")
 
   # Rule #4 (PaysForRBF part 2): additional fees >= incremental relay fee * replacement vsize.
@@ -1906,8 +1921,8 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
   let additionalFee = int64(txFee) - int64(conflictFees)
   let requiredAdditionalFee = int64(incrementalRelayFee * float64(txVsize))
   if additionalFee < requiredAdditionalFee:
-    return err(HashSet[TxId], "rejecting replacement: not enough additional fees to relay (" &
-               $additionalFee & " < " & $requiredAdditionalFee & " sats)")
+    return err(HashSet[TxId], "insufficient fee, rejecting replacement, not enough additional fees to relay; " &
+               $additionalFee & " < " & $requiredAdditionalFee & " sats")
 
   # Rule #8 (ImprovesFeerateDiagram, Core 27+): the replacement must strictly improve
   # the feerate diagram vs. the evicted set.
