@@ -10,6 +10,7 @@ import ../primitives/[types, serialize]
 import ../consensus/[params, validation, chain, versionbits]
 import ../storage/[chainstate, blockstore, snapshot, pruner]
 import ../storage/indexes/blockfilterindex
+import ../storage/indexes/gcs as gcsMod
 import ../mempool/[mempool, package, persist]
 import ../crypto/[hashing, secp256k1, address, signmessage]
 import ../network/[peer, peermanager, banman, messages, asmap, netgroup]
@@ -1138,6 +1139,75 @@ proc populateFilterIndexForHashes(rpc: RpcServer, hashes: seq[BlockHash]) =
     if buOpt.isSome:
       blockUndo = buOpt.get()
     discard rpc.filterIndex.addBlock(blk, hash, bidx.height, blockUndo)
+
+proc handleGetBlockFilter(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Retrieve a BIP-157 content filter (and its chained header) for a block.
+  ## Byte-faithful to Bitcoin Core
+  ## (bitcoin-core/src/rpc/blockchain.cpp getblockfilter, lines 2956-3031):
+  ##   getblockfilter "blockhash" ( "filtertype" )
+  ##
+  ## Returns { "filter": <hex GCS>, "header": <hex 32-byte> } where:
+  ##   filter = HexStr(GetEncodedFilter())  — the raw CompactSize(N)||GCS bytes,
+  ##            NOT byte-reversed (it is a byte vector, emitted in order).
+  ##   header = uint256::GetHex() of the chained filter header — uint256 GetHex()
+  ##            emits the bytes in REVERSE (display/big-endian) order, so we
+  ##            reverseHex() the internal SHA256d header.
+  ##
+  ## Error parity (Core):
+  ##   unknown filtertype          -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype"
+  ##   filter index not enabled    -> RPC_MISC_ERROR (-1) "Index is not enabled for filtertype basic"
+  ##   block hash not in index     -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Block not found"
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "missing blockhash parameter")
+
+  let hashHex = params[0].getStr()
+
+  # filtertype defaults to "basic" (BlockFilterTypeName(BASIC)).
+  let filterTypeName =
+    if params.len >= 2 and params[1].kind == JString and params[1].getStr().len > 0:
+      params[1].getStr()
+    else:
+      "basic"
+
+  # BlockFilterTypeByName: only "basic" is a known type.  Unknown -> -5.
+  # Reference: bitcoin-core/src/rpc/blockchain.cpp:2981-2983.
+  if filterTypeName != "basic":
+    raise newRpcError(RpcInvalidAddressOrKey, "Unknown filtertype")
+
+  # GetBlockFilterIndex(filtertype): if the basic block filter index is not
+  # enabled, Core throws RPC_MISC_ERROR (-1).
+  # Reference: bitcoin-core/src/rpc/blockchain.cpp:2985-2988.
+  if rpc.filterIndex == nil or not rpc.filterIndex.enabled:
+    raise newRpcError(RpcMiscError,
+      "Index is not enabled for filtertype " & filterTypeName)
+
+  # LookupBlockIndex: syntactically-valid hash not in the block index -> -5
+  # "Block not found".  Reference: bitcoin-core/src/rpc/blockchain.cpp:2995-2998.
+  let blockHash = parseBlockHash(hashHex)
+  let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
+  if idxOpt.isNone:
+    raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+  let bidx = idxOpt.get()
+
+  # LookupFilter + LookupFilterHeader.  nimrod's filter index is height-keyed
+  # but the read path verifies the on-disk block_hash matches, so this is
+  # exact for active-chain blocks.
+  let filterOpt = rpc.filterIndex.getFilter(bidx.height, blockHash)
+  let headerOpt = rpc.filterIndex.getFilterHeader(bidx.height)
+  if filterOpt.isNone or headerOpt.isNone:
+    # Core: "Filter not found." with -5 when the block was not connected.
+    # Reference: bitcoin-core/src/rpc/blockchain.cpp:3006-3022.
+    raise newRpcError(RpcInvalidAddressOrKey,
+      "Filter not found. Block was not connected to active chain.")
+
+  let encoded = gcsMod.getEncodedFilter(filterOpt.get())
+  let header = headerOpt.get()
+
+  result = newJObject()
+  # filter: raw encoded GCS bytes, lower-hex, NOT reversed.
+  result["filter"] = %toHex(encoded)
+  # header: uint256 GetHex() — reversed (big-endian display) of the SHA256d.
+  result["header"] = %reverseHex(toHex(header))
 
 proc handleGetIndexInfo(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Returns the status of one or all available indices currently running in the
@@ -5040,6 +5110,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "getblock \"blockhash\" ( verbosity )",
     "getblockchaininfo",
     "getblockcount",
+    "getblockfilter \"blockhash\" ( \"filtertype\" )",
     "getblockhash height",
     "getblockheader \"blockhash\" ( verbose )",
     "getchaintips",
@@ -9261,6 +9332,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetChainTxStats(params)
   of "getindexinfo":
     rpc.handleGetIndexInfo(params)
+  of "getblockfilter":
+    rpc.handleGetBlockFilter(params)
 
   # Chain management
   of "invalidateblock":
