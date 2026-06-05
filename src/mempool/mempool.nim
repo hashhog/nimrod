@@ -464,8 +464,17 @@ proc isDust*(output: TxOut): bool =
 proc isEphemeralDust*(output: TxOut): bool =
   ## Check if an output is ephemeral dust (0-value dust output)
   ## Ephemeral dust is specifically 0-value outputs that are meant to be
-  ## immediately spent by a child transaction (for fee bumping via CPFP)
-  int64(output.value) == 0
+  ## immediately spent by a child transaction (for fee bumping via CPFP).
+  ##
+  ## Core-parity: ephemeral dust is the GetDust() set, i.e. IsDust()-positive
+  ## outputs (policy/ephemeral_policy.cpp PreCheckEphemeralTx + CheckEphemeralSpends
+  ## both key off GetDust). IsDust() returns false for UNSPENDABLE scripts
+  ## (GetDustThreshold returns 0 when scriptPubKey.IsUnspendable()), so a
+  ## 0-value OP_RETURN is NEVER ephemeral dust. Without this exemption nimrod
+  ## over-rejected any standalone tx carrying a 0-value OP_RETURN output (a
+  ## standard, default-Core-accepted pattern) via the standalone-ephemeral
+  ## guard — a relay-policy divergence from Core.
+  int64(output.value) == 0 and not isUnspendable(output.scriptPubKey)
 
 proc hasEphemeralDust*(tx: Transaction): bool =
   ## Check if transaction has any 0-value (ephemeral dust) outputs
