@@ -5713,7 +5713,10 @@ proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   ##   "muhash":             (string)  MuHash3072 finalize digest (MUHASH only)
   ##   "total_amount":       (numeric) sum of all UTXO values, in BTC
   ## }
-  let hashTypeStr = if params.len >= 1: params[0].getStr() else: "hash_serialized_3"
+  let hashTypeStr = if params.len >= 1 and params[0].kind == JString:
+                      params[0].getStr()
+                    else:
+                      "hash_serialized_3"
 
   let coinHashType = case hashTypeStr
     of "hash_serialized_3", "hash_serialized_2", "hash_serialized":
@@ -5723,9 +5726,23 @@ proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
     of "none":
       cshtNone
     else:
-      raise newRpcError(RpcInvalidParams,
-                        "Invalid hash_type, must be one of: " &
-                        "hash_serialized_3, muhash, none")
+      # Core's `ParseHashType` rejects an unrecognised hash_type with
+      # RPC_INVALID_PARAMETER (-8) and this exact message
+      # (bitcoin-core/src/rpc/blockchain.cpp:976). Match the code AND the
+      # phrasing so the differential harness sees like-for-like.
+      raise newRpcError(RpcInvalidParameter,
+                        "'" & hashTypeStr & "' is not a valid hash_type")
+
+  # hash_or_height (params[1]) targets a specific block, which Core only
+  # supports with coinstatsindex (out of scope here). Core checks the index
+  # FIRST and throws RPC_INVALID_PARAMETER (-8) "Querying specific block
+  # heights requires coinstatsindex" before it would reach the
+  # hash_serialized_3-specific guard (blockchain.cpp:1085-1097). We have no
+  # coinstatsindex available to this RPC, so we mirror that first throw for
+  # ANY hash_type, which also covers the spec's hash_serialized_3 case.
+  if params.len >= 2 and params[1].kind != JNull:
+    raise newRpcError(RpcInvalidParameter,
+                      "Querying specific block heights requires coinstatsindex")
 
   let info = computeUtxoSetInfo(rpc.chainState, coinHashType)
 
@@ -5735,6 +5752,11 @@ proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
     "transactions": info.transactions,
     "txouts": info.txOuts,
     "bogosize": info.bogosize,
+    # `disk_size`: Core emits this (alongside `transactions`) whenever the
+    # coinstatsindex is NOT used — see blockchain.cpp:1127-1129. It is the
+    # estimated chainstate-on-disk size; impl-specific (NOT cross-node
+    # byte-comparable). nimrod sums the raw cfUtxo key+value bytes.
+    "disk_size": info.diskSize,
     "total_amount": parseJson(formatBtcAmount(info.totalAmount))
   }
 
