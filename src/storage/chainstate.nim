@@ -1400,6 +1400,11 @@ type
     txOuts*: uint64          ## total number of UTXOs
     bogosize*: uint64        ## Core's database-independent size estimate
     totalAmount*: int64      ## sum of all UTXO values (satoshi)
+    diskSize*: uint64        ## estimated on-disk size of the chainstate UTXO
+                             ## data (sum of raw key+value bytes for every
+                             ## cfUtxo entry). Mirrors Core's `disk_size`
+                             ## (`view->EstimateSize()`); impl-specific, NOT
+                             ## byte-comparable across nodes.
     hashType*: CoinStatsHashType
     hashSerialized*: array[32, byte]  ## populated when hashType != cshtNone
 
@@ -1520,6 +1525,12 @@ proc computeUtxoSetInfo*(cs: var ChainState,
     inc result.txOuts
     result.bogosize += bogoSizeFor(entry.output.scriptPubKey.len)
     result.totalAmount += int64(entry.output.value)
+    # Estimated on-disk chainstate size: the raw key + value bytes for this
+    # cfUtxo entry, as they sit in the column family. This is a deterministic
+    # proxy for Core's `view->EstimateSize()` (RocksDB has no leveldb-style
+    # range estimate bound here). Impl-specific by design — the differential
+    # test only asserts disk_size is PRESENT + integer-typed, never byte-equal.
+    result.diskSize += uint64(key.len + value.len)
 
     if hashType != cshtNone:
       let coinBytes = serializeCoinForHash(
