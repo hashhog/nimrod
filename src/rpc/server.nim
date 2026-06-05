@@ -85,6 +85,7 @@ const
   RpcInternalError* = -32603
 
   # Bitcoin Core specific error codes
+  RpcInvalidParameter* = -8        # Invalid, missing or duplicate parameter (Core RPC_INVALID_PARAMETER)
   RpcInvalidAddressOrKey* = -5     # Invalid address or key
   RpcWalletError* = -4             # Generic wallet RPC error (Core RPC_WALLET_ERROR)
   RpcTransactionError* = -25       # Generic transaction error
@@ -1042,6 +1043,140 @@ proc handleGetChainTips(rpc: RpcServer): JsonNode =
     "branchlen": 0,
     "status": "active"
   }]
+
+proc resolveBlockNtx(rpc: RpcServer, idx: BlockIndex): int =
+  ## Resolve the number of transactions in a single block, mirroring the
+  ## fallback ladder used by handleGetBlockHeader: BlockIndex.nTx first
+  ## (populated at connect, W57), then the flatfile BlockIndexEntry, then the
+  ## full block out of RocksDB / blk*.dat. Legacy pre-W57 index rows persisted
+  ## nTx=0, so the fallbacks are required for an exact cumulative count.
+  var nTx = int(idx.nTx)
+  if nTx == 0 and rpc.blockFileManager != nil:
+    let bfeOpt = rpc.blockFileManager.getBlockIndex(idx.hash)
+    if bfeOpt.isSome:
+      nTx = int(bfeOpt.get().nTx)
+  if nTx == 0:
+    let blkOpt = rpc.chainState.db.getBlock(idx.hash)
+    if blkOpt.isSome:
+      nTx = blkOpt.get().txs.len
+  if nTx == 0 and rpc.blockFileManager != nil:
+    let blkOpt = rpc.blockFileManager.loadBlock(idx.hash)
+    if blkOpt.isSome:
+      nTx = blkOpt.get().txs.len
+  nTx
+
+proc chainTxCountUpTo(rpc: RpcServer, height: int32): int64 =
+  ## Core's CBlockIndex::m_chain_tx_count analogue: the cumulative number of
+  ## transactions on the active chain from genesis (height 0) through `height`,
+  ## inclusive. Core maintains this as an O(1) running counter at block connect
+  ## (prev.m_chain_tx_count + nTx); nimrod does not persist a cumulative field,
+  ## so we reconstruct it by walking the active chain by height and summing the
+  ## per-block tx count. getchaintxstats is a low-frequency RPC and only needs
+  ## two evaluations (window end + window start) per call.
+  ## Reference: bitcoin-core/src/chain.h m_chain_tx_count, set in
+  ## CBlockIndex by validation.cpp at block connect.
+  if height < 0:
+    return 0
+  var total: int64 = 0
+  for h in 0'i32 .. height:
+    let hashOpt = rpc.chainState.db.getBlockHashByHeight(h)
+    if hashOpt.isNone:
+      continue
+    let idxOpt = rpc.chainState.db.getBlockIndex(hashOpt.get())
+    if idxOpt.isNone:
+      continue
+    total += int64(rpc.resolveBlockNtx(idxOpt.get()))
+  total
+
+proc handleGetChainTxStats(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Compute statistics about the total number and rate of transactions in the
+  ## chain. Read-only. Byte-faithful to Bitcoin Core
+  ## (bitcoin-core/src/rpc/blockchain.cpp getchaintxstats):
+  ##   getchaintxstats ( nblocks "blockhash" )  — both args optional.
+  ##
+  ## Field rules (exact):
+  ##   time                       — the FINAL block's RAW header nTime (NOT MTP).
+  ##   txcount                    — cumulative #txs genesis..pindex (optional;
+  ##                                emitted when known — always known here).
+  ##   window_final_block_hash    — pindex block hash.
+  ##   window_final_block_height  — pindex height.
+  ##   window_block_count         — the resolved nblocks.
+  ##   window_interval (optional) — MTP(pindex) - MTP(past_block); only when
+  ##                                window_block_count > 0.
+  ##   window_tx_count (optional) — txcount(pindex) - txcount(past); only when
+  ##                                window > 0 and both endpoints' txcount known.
+  ##   txrate (optional)          — window_tx_count / window_interval; only when
+  ##                                window_interval > 0 and window_tx_count known.
+
+  # 1. Resolve pindex. params[1] = blockhash (default = active tip).
+  var idx: BlockIndex
+  let hasBlockhash = params.len >= 2 and params[1].kind != JNull
+  if not hasBlockhash:
+    let tipOpt = rpc.chainState.db.getBlockIndex(rpc.chainState.bestBlockHash)
+    if tipOpt.isNone:
+      raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+    idx = tipOpt.get()
+  else:
+    let blockHash = parseBlockHash(params[1].getStr())
+    let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
+    if idxOpt.isNone:
+      raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+    idx = idxOpt.get()
+    # Must be in the active chain (Core: ActiveChain().Contains(pindex)).
+    let atHeight = rpc.chainState.db.getBlockHashByHeight(idx.height)
+    if atHeight.isNone or atHeight.get() != idx.hash:
+      raise newRpcError(RpcInvalidParameter, "Block is not in main chain")
+
+  # 2. Resolve nblocks. params[0] = nblocks.
+  #    Default = 30*24*60*60 / nPowTargetSpacing  ("one month"; 4320 @600s),
+  #    then clamped to [0, height-1]. Explicit value must be in [0, height-1].
+  let height = idx.height
+  var blockcount = (30 * 24 * 60 * 60) div rpc.params.powTargetSpacing
+  let hasNblocks = params.len >= 1 and params[0].kind != JNull
+  if not hasNblocks:
+    blockcount = max(0, min(blockcount, int(height) - 1))
+  else:
+    blockcount = params[0].getInt()
+    if blockcount < 0 or (blockcount > 0 and blockcount >= int(height)):
+      raise newRpcError(RpcInvalidParameter,
+        "Invalid block count: should be between 0 and the block's height - 1")
+
+  # 3. past_block = ancestor at (height - blockcount), on the active chain.
+  let pastHeight = height - int32(blockcount)
+  let pastHashOpt = rpc.chainState.db.getBlockHashByHeight(pastHeight)
+  if pastHashOpt.isNone:
+    raise newRpcError(RpcMiscError, "Could not locate window-start ancestor")
+  let pastIdxOpt = rpc.chainState.db.getBlockIndex(pastHashOpt.get())
+  if pastIdxOpt.isNone:
+    raise newRpcError(RpcMiscError, "Could not locate window-start ancestor")
+  let pastIdx = pastIdxOpt.get()
+
+  # window_interval uses MEDIAN-TIME-PAST (11-block window), not raw nTime.
+  let nTimeDiff = int64(getMtpForHeight(rpc.chainState.db, height)) -
+                  int64(getMtpForHeight(rpc.chainState.db, pastIdx.height))
+
+  # txcount = cumulative #txs genesis..pindex (m_chain_tx_count analogue).
+  let txCount = rpc.chainTxCountUpTo(height)
+  let haveTxCount = txCount != 0  # genesis alone has >=1 tx -> always true here
+
+  var ret = newJObject()
+  # time = the FINAL block's RAW header nTime (NOT mediantime).
+  ret["time"] = %int64(idx.header.timestamp)
+  if haveTxCount:
+    ret["txcount"] = %txCount
+  ret["window_final_block_hash"] = %reverseHex(toHex(array[32, byte](idx.hash)))
+  ret["window_final_block_height"] = %height
+  ret["window_block_count"] = %blockcount
+  if blockcount > 0:
+    ret["window_interval"] = %nTimeDiff
+    let pastTxCount = rpc.chainTxCountUpTo(pastIdx.height)
+    let havePastTxCount = pastTxCount != 0
+    if haveTxCount and havePastTxCount:
+      let windowTxCount = txCount - pastTxCount
+      ret["window_tx_count"] = %windowTxCount
+      if nTimeDiff > 0:
+        ret["txrate"] = %(float64(windowTxCount) / float64(nTimeDiff))
+  ret
 
 proc handleGetDeploymentInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Return deployment info for soft forks at a given block (or chain tip).
@@ -4696,6 +4831,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "getblockhash height",
     "getblockheader \"blockhash\" ( verbose )",
     "getchaintips",
+    "getchaintxstats ( nblocks \"blockhash\" )",
     "getdeploymentinfo ( \"blockhash\" )",
     "getdifficulty",
     "getsyncstate",
@@ -8908,6 +9044,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetTxOut(params)
   of "getdeploymentinfo":
     rpc.handleGetDeploymentInfo(params)
+  of "getchaintxstats":
+    rpc.handleGetChainTxStats(params)
 
   # Chain management
   of "invalidateblock":
