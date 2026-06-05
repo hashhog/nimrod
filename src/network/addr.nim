@@ -61,6 +61,15 @@ type
     services*: uint64
     ip*: array[16, byte]  # IPv6 or IPv4-mapped
     port*: uint16
+    lastSeen*: uint32     # Unix seconds the address was last seen / advertised.
+                          # DATA-GAP FIX (2026-06): the legacy NetAddress carried
+                          # services + ip + port but NO timestamp, so the
+                          # getnodeaddresses RPC had no real `time` to emit.
+                          # Populated from the addr/addrv2 wire timestamp on
+                          # receipt, from inject time for addpeeraddress, and from
+                          # the connect/advertise time otherwise. Mirrors Core's
+                          # CAddress::nTime which getnodeaddresses surfaces as the
+                          # NUM_TIME `time` field (rpc/net.cpp:960).
 
   TimestampedAddr* = object
     timestamp*: uint32
