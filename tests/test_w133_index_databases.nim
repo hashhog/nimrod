@@ -402,16 +402,43 @@ suite "W133 G19 — LookUpOne height→hash fallback (BUG-15)":
     check "lookUpOne" notin coinstatsSrc
 
 # ---------------------------------------------------------------------------
-# G20 — getindexinfo RPC (BUG-16)
+# G20 — getindexinfo RPC (BUG-16) — CLOSED
 # ---------------------------------------------------------------------------
-suite "W133 G20 — getindexinfo RPC absent (BUG-16)":
+# Previously this suite asserted getindexinfo was ABSENT (BUG-16 gap marker).
+# It is now implemented Core-correctly (src/rpc/node.cpp:351-410 SummaryToJSON +
+# getindexinfo). The handler emits, for each *running* index, one entry keyed by
+# the index name whose value has EXACTLY {synced, best_block_height}. nimrod runs
+# only the BIP-157 "basic block filter index", so that is the only key it emits.
+# Differential parity proven in test-suite/index/nimrod_getindexinfo.sh.
+suite "W133 G20 — getindexinfo RPC present + Core-shaped (BUG-16 CLOSED)":
 
-  test "G20 BUG-16: no getindexinfo RPC handler":
-    ## Core rpc/blockchain.cpp::getindexinfo returns per-index
-    ## {synced, best_block_height}.  Nimrod has no such RPC.
-    check "getindexinfo"      notin serverSrc.toLower
-    check "GetIndexInfo"      notin serverSrc
-    check "handleGetIndexInfo" notin serverSrc
+  test "G20 BUG-16 CLOSED: getindexinfo handler + dispatch arm present":
+    ## Core rpc/node.cpp::getindexinfo returns per-index
+    ## {synced, best_block_height}.  Nimrod now has the RPC.
+    check "proc handleGetIndexInfo" in serverSrc
+    check "of \"getindexinfo\":"    in serverSrc
+
+  test "G20 BUG-16 CLOSED: getindexinfo emits Core's exact value fields":
+    ## SummaryToJSON pushes exactly "synced" then "best_block_height" — no
+    ## best_hash / best_block_hash / name-inside-the-value.
+    let start = serverSrc.find("proc handleGetIndexInfo")
+    check start >= 0
+    let stop = serverSrc.find("proc handleGetChainTxStats")
+    let body = serverSrc[start .. (if stop > start: stop else: serverSrc.len - 1)]
+    check "\"synced\"" in body
+    check "\"best_block_height\"" in body
+    # The basic block filter index is the only index nimrod runs -> its GetName().
+    check "basic block filter index" in body
+    # MUST NOT emit best_hash / best_block_hash as JSON keys from getindexinfo
+    # (IndexSummary carries best_block_hash internally but getindexinfo never
+    # emits it).  Check the quoted-key form so the explanatory comments above —
+    # which mention the field names in prose — do not trip the guard.
+    check "[\"best_hash\"]" notin body
+    check "[\"best_block_hash\"]" notin body
+    check "(\"best_hash\")" notin body
+    check "(\"best_block_hash\")" notin body
+    # nimrod runs no txindex -> the handler must not fabricate a txindex key.
+    check "\"txindex\"" notin body
 
 # ---------------------------------------------------------------------------
 # G21-G22 — CustomOptions undo flags (BUG-18)

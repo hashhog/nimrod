@@ -124,6 +124,14 @@ proc codecVersionKey*(): seq[byte] =
 # Filter file management
 # ============================================================================
 
+proc bestIndexedHeight*(idx: BlockFilterIndex): int32 =
+  ## Height of the last block this index has incorporated (BaseIndex.bestHeight,
+  ## the analogue of Core's m_best_block_index->nHeight).  -1 when the index has
+  ## no best block yet.  Exposed so RPC handlers (getindexinfo) can report index
+  ## sync status without importing the indexes/base module directly (which would
+  ## clash with storage/undo's BlockUndo type).
+  idx.bestHeight
+
 proc filterFileName*(fileNum: int32): string =
   fmt"{FilterFilePrefix}{fileNum:05d}{FilterFileSuffix}"
 

@@ -1088,6 +1088,85 @@ proc chainTxCountUpTo(rpc: RpcServer, height: int32): int64 =
     total += int64(rpc.resolveBlockNtx(idxOpt.get()))
   total
 
+proc populateFilterIndexForHashes(rpc: RpcServer, hashes: seq[BlockHash]) =
+  ## Advance the BIP-157 basic block-filter index across blocks that were just
+  ## connected by a generate* RPC.  Mirrors Bitcoin Core's BaseIndex: the index
+  ## hooks BlockConnected for EVERY block that joins the active chain, regardless
+  ## of whether it arrived via P2P sync, submitblock, or local mining.  Without
+  ## this the index would only advance on the P2P/submitblock paths and lag the
+  ## chain tip after `generatetoaddress`, so getindexinfo would report
+  ## synced=false / best_block_height < tip.
+  ##
+  ## The blocks are already connected (UTXO cache mutated), so we read each
+  ## block's undo from rev*.dat (when present) — same approach as the daemon's
+  ## startup backfill loop.  For empty / coinbase-only regtest blocks there are
+  ## no spent prevouts, so the undo is empty and the filter is output-only-complete.
+  if rpc.filterIndex == nil or not rpc.filterIndex.enabled:
+    return
+  let cs = rpc.chainState
+  for hash in hashes:
+    let idxOpt = cs.db.getBlockIndex(hash)
+    if idxOpt.isNone:
+      continue
+    let bidx = idxOpt.get()
+    if bidx.height <= rpc.filterIndex.bestIndexedHeight():
+      continue
+    let blkOpt = cs.db.getBlock(hash)
+    if blkOpt.isNone:
+      continue
+    let blk = blkOpt.get()
+    var blockUndo = chainstate.BlockUndo()
+    let buOpt = cs.getBlockUndoFromFile(bidx, blk.header.prevBlock)
+    if buOpt.isSome:
+      blockUndo = buOpt.get()
+    discard rpc.filterIndex.addBlock(blk, hash, bidx.height, blockUndo)
+
+proc handleGetIndexInfo(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Returns the status of one or all available indices currently running in the
+  ## node.  Byte-faithful to Bitcoin Core
+  ## (bitcoin-core/src/rpc/node.cpp getindexinfo + SummaryToJSON):
+  ##   getindexinfo ( "index_name" )  — one optional positional arg.
+  ##
+  ## Shape: a dynamic JSON OBJECT keyed BY INDEX NAME.  For each *running* index
+  ## one entry is pushed whose value has EXACTLY two fields in this order:
+  ##   { "<index name>": { "synced": <bool>, "best_block_height": <int> } }
+  ## Nothing else — no best_hash / best_block_hash / name-inside-the-value.
+  ##
+  ## Index appears ONLY if it is enabled/running (Core guards each with
+  ## `if (g_txindex){...}` etc.).  nimrod runs exactly one optional index: the
+  ## BIP-157 "basic block filter index" (wired when --blockfilterindex is set).
+  ## It does NOT run a txindex / coinstatsindex / txospenderindex, so those keys
+  ## are never emitted — Core only lists indexes the node actually runs.
+  ##
+  ## index_name filter (SummaryToJSON): if index_name is non-empty AND !=
+  ## the summary's name, the entry is dropped.  So
+  ##   getindexinfo "basic block filter index" -> only that key
+  ##   getindexinfo "no-such-index"            -> {} (empty object, NOT an error)
+  ## Empty/omitted arg = all running indexes.
+
+  let indexName =
+    if params.len >= 1 and params[0].kind == JString: params[0].getStr()
+    else: ""
+
+  result = newJObject()
+
+  # BIP-157 basic block filter index (the only index nimrod runs).
+  if rpc.filterIndex != nil and rpc.filterIndex.enabled:
+    # GetName() string Core emits for the basic filter index
+    # (BlockFilterTypeName(BASIC) + " block filter index").
+    const name = "basic block filter index"
+    if indexName.len == 0 or indexName == name:
+      # synced = the index has caught up to the chain tip; best_block_height =
+      # the height the index reached (m_best_block_index->nHeight), 0 if none.
+      let tipHeight = rpc.chainState.bestHeight
+      let idxHeight = rpc.filterIndex.bestIndexedHeight()
+      let synced = idxHeight >= tipHeight
+      let bestHeight = if idxHeight < 0: 0 else: int(idxHeight)
+      var entry = newJObject()
+      entry["synced"] = %synced
+      entry["best_block_height"] = %bestHeight
+      result[name] = entry
+
 proc handleGetChainTxStats(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Compute statistics about the total number and rate of transactions in the
   ## chain. Read-only. Byte-faithful to Bitcoin Core
@@ -4306,6 +4385,11 @@ proc handleGenerateToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let hashes = generateToAddress(cs, mp, rpc.params, nblocks, address, maxTries)
 
+  # BIP-157 filter index population (no-op when nil/disabled).  Core's BaseIndex
+  # hooks BlockConnected for locally-mined blocks too — keep the index at the tip
+  # so getindexinfo reports synced=true / best_block_height==tip after mining.
+  rpc.populateFilterIndexForHashes(hashes)
+
   # Wallet block-connect hook: credit/debit every loaded wallet from the blocks
   # just connected, so coinbase rewards paid to a wallet address (and any wallet
   # spends confirmed in these blocks) land in the wallet UTXO ledger. Mirrors
@@ -4368,6 +4452,9 @@ proc handleGenerateToDescriptor(rpc: RpcServer, params: JsonNode): JsonNode =
   var mp = rpc.mempool
 
   let hashes = generateToDescriptor(cs, mp, rpc.params, nblocks, descriptorStr, maxTries)
+
+  # BIP-157 filter index population (no-op when nil/disabled). See generatetoaddress.
+  rpc.populateFilterIndexForHashes(hashes)
 
   # Broadcast new blocks to peers
   if rpc.peerManager != nil:
@@ -4455,6 +4542,9 @@ proc handleGenerateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcMiscError, "failed to generate block")
 
   let hash = hashOpt.get()
+
+  # BIP-157 filter index population (no-op when nil/disabled). See generatetoaddress.
+  rpc.populateFilterIndexForHashes(@[hash])
 
   # Broadcast new block
   if rpc.peerManager != nil:
@@ -4878,6 +4968,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "== Util ==",
     "estimaterawfee conf_target ( threshold )",
     "estimatesmartfee conf_target ( \"estimate_mode\" )",
+    "getindexinfo ( \"index_name\" )",
     "signmessage \"address\" \"message\"",
     "signmessagewithprivkey \"privkey\" \"message\"",
     "validateaddress \"address\"",
@@ -9046,6 +9137,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetDeploymentInfo(params)
   of "getchaintxstats":
     rpc.handleGetChainTxStats(params)
+  of "getindexinfo":
+    rpc.handleGetIndexInfo(params)
 
   # Chain management
   of "invalidateblock":
