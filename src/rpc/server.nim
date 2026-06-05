@@ -3066,9 +3066,18 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
   if maxFeeRate > 1.0:
     raise newRpcError(RpcInvalidParams, "maxfeerate cannot exceed 1 BTC/kvB")
 
-  # Decode all transactions
+  # Decode all transactions.
+  #
+  # NB: iterate the JArray by INDEX, never `for i, x in rawTxsArray`. The
+  # 2-variable `for` over a JsonNode binds std/json's `pairs(JsonNode)`
+  # iterator, which asserts `node.kind == JObject` and raises an
+  # AssertionDefect on a JArray. That Defect is NOT a CatchableError, so it
+  # escaped every handler here and surfaced to the client as a bogus
+  # "-32700 parse error" with id:null — making testmempoolaccept [[hex]]
+  # (the Core-shaped nested-array call) unreachable. Indexing avoids pairs().
   var txns: seq[Transaction]
-  for i, rawTxNode in rawTxsArray:
+  for i in 0 ..< rawTxsArray.len:
+    let rawTxNode = rawTxsArray[i]
     if rawTxNode.kind != JString:
       raise newRpcError(RpcInvalidParams,
         "rawtxs[" & $i & "] must be a hex string")
@@ -3279,9 +3288,14 @@ proc handleSubmitPackage(rpc: RpcServer, params: JsonNode): JsonNode =
   if maxFeeRate > 1.0:
     raise newRpcError(RpcInvalidParams, "maxfeerate cannot exceed 1 BTC/kvB")
 
-  # Parse all transactions
+  # Parse all transactions.
+  #
+  # NB: iterate the JArray by INDEX (see handleTestMempoolAccept) — the 2-var
+  # `for i, x in rawTxsArray` binds std/json's `pairs(JsonNode)` iterator which
+  # asserts JObject and raises an (uncatchable) AssertionDefect on a JArray.
   var txns: seq[Transaction]
-  for i, rawTxNode in rawTxsArray:
+  for i in 0 ..< rawTxsArray.len:
+    let rawTxNode = rawTxsArray[i]
     if rawTxNode.kind != JString:
       raise newRpcError(RpcInvalidParams, "rawtxs[" & $i & "] must be a hex string")
 
