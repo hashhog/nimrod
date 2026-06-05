@@ -168,6 +168,12 @@ proc parseTxId(txidHex: string): TxId =
     hashBytes[i] = byte(parseHexInt(reversedHex[i*2 .. i*2 + 1]))
   TxId(hashBytes)
 
+# Forward declarations: the Core-exact difficulty helpers are defined further
+# down (alongside the chainwork formatter), but getblockchaininfo/getdifficulty
+# above them need the byte-identical-to-Core serializer too.
+proc getDifficultyFromBits(bits: uint32): float64
+proc difficultyJson(d: float64): JsonNode
+
 proc bitsToTarget(bits: uint32): array[32, byte] =
   compactToTarget(bits)
 
@@ -340,7 +346,12 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
       byte((bits shr 24) and 0xff)
     ])),
     "target": reverseHex(toHex(target)),
-    "difficulty": targetToDifficulty(target),
+    # Use the Core-exact nBits->double path (getDifficultyFromBits) +
+    # difficultyJson serializer so the emitted string is byte-identical to
+    # Bitcoin Core (std::setprecision(16)), matching getblockheader/getmininginfo.
+    # The old targetToDifficulty(target) path printed the full float64 roundtrip
+    # (e.g. 4.6565423739069247e-10 vs Core's 4.656542373906925e-10).
+    "difficulty": difficultyJson(getDifficultyFromBits(bits)),
     "time": blockTime,
     "mediantime": medianTime,
     "verificationprogress": verificationProgress,
@@ -584,8 +595,13 @@ proc difficultyJson(d: float64): JsonNode =
   ## trailing zeros stripped, no decimal point for integral values).
   ## Uses parseJson(rawFloats=true) to bypass Nim's roundtrip float formatter.
   var s = formatFloat(d, ffDefault, 16)
-  # Strip trailing zeros after decimal point
-  if '.' in s:
+  # Strip trailing zeros after the decimal point — but ONLY for fixed-point
+  # notation. When ffDefault chooses scientific notation (e.g. the regtest
+  # powLimit difficulty "4.656542373906925e-10"), the string ends in the
+  # exponent, not the mantissa, so naively peeling trailing '0' chars from the
+  # end corrupts the exponent ("e-10" -> "e-1", a 1e9 error). Core emits the
+  # scientific form verbatim, so leave it untouched.
+  if '.' in s and 'e' notin s and 'E' notin s:
     var i = s.len - 1
     while i > 0 and s[i] == '0':
       dec i
@@ -1050,8 +1066,9 @@ proc handleGetDifficulty(rpc: RpcServer): JsonNode =
   if blkOpt.isSome:
     bits = blkOpt.get().header.bits
 
-  let target = bitsToTarget(bits)
-  %targetToDifficulty(target)
+  # Core-exact nBits->double path + difficultyJson serializer for byte-identical
+  # output with Bitcoin Core's getdifficulty (std::setprecision(16)).
+  difficultyJson(getDifficultyFromBits(bits))
 
 proc handleGetChainTips(rpc: RpcServer): JsonNode =
   # For now, just return the active tip
