@@ -39,8 +39,21 @@ type
 
   AddressError* = object of CatchableError
 
-proc encodeAddress*(a: Address, mainnet: bool = true): string =
-  ## Encode address to string representation
+proc encodeAddress*(a: Address, mainnet: bool = true, regtest: bool = false): string =
+  ## Encode address to string representation.
+  ##
+  ## Bech32/Bech32m human-readable part selection (Bitcoin Core
+  ## chainparams.cpp `bech32_hrp`): mainnet -> "bc", regtest -> "bcrt",
+  ## everything else (testnet3/testnet4/signet) -> "tb". The `regtest` flag
+  ## distinguishes regtest from the other non-mainnet networks, which all
+  ## share the testnet "tb" HRP; without it regtest segwit addresses would
+  ## wrongly read "tb1..." instead of "bcrt1...". Base58 (P2PKH/P2SH) testnet
+  ## and regtest prefixes are identical (0x6F / 0xC4), so `regtest` only
+  ## affects the bech32 paths.
+  let bech32hrp =
+    if mainnet: MainnetHRP
+    elif regtest: RegtestHRP
+    else: TestnetHRP
   case a.kind
   of P2PKH:
     let prefix = if mainnet: MainnetP2PKH else: TestnetP2PKH
@@ -59,7 +72,7 @@ proc encodeAddress*(a: Address, mainnet: bool = true): string =
     result = base58CheckEncode(payload)
 
   of P2WPKH:
-    let hrp = if mainnet: MainnetHRP else: TestnetHRP
+    let hrp = bech32hrp
     # Witness version 0 + 20 bytes of data
     var data5bit = @[0]  # witness version
     var data8bit = newSeq[int](a.wpkh.len)
@@ -69,7 +82,7 @@ proc encodeAddress*(a: Address, mainnet: bool = true): string =
     result = bech32Encode(hrp, data5bit, bech32Classic)
 
   of P2WSH:
-    let hrp = if mainnet: MainnetHRP else: TestnetHRP
+    let hrp = bech32hrp
     # Witness version 0 + 32 bytes of data
     var data5bit = @[0]  # witness version
     var data8bit = newSeq[int](a.wsh.len)
@@ -79,7 +92,7 @@ proc encodeAddress*(a: Address, mainnet: bool = true): string =
     result = bech32Encode(hrp, data5bit, bech32Classic)
 
   of P2TR:
-    let hrp = if mainnet: MainnetHRP else: TestnetHRP
+    let hrp = bech32hrp
     # Witness version 1 + 32 bytes of data
     var data5bit = @[1]  # witness version
     var data8bit = newSeq[int](a.taprootKey.len)

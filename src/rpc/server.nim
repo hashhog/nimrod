@@ -710,7 +710,8 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
 proc btcAmountNode*(sats: int64): JsonNode
 proc disassembleScriptSigAsmStr*(script: seq[byte]): string
 proc buildVinJson(tx: Transaction, inputIndex: int): JsonNode
-proc buildVoutJson(output: TxOut, index: int, mainnet: bool): JsonNode
+proc buildVoutJson(output: TxOut, index: int, mainnet: bool,
+                   regtest: bool = false): JsonNode
 
 proc blockStrippedSize(b: Block): int =
   ## Block size WITHOUT witness data: 80-byte header + varint(tx_count) +
@@ -1752,8 +1753,13 @@ proc getScriptType(script: seq[byte]): string =
 
   return "nonstandard"
 
-proc extractAddressFromScript(script: seq[byte], mainnet: bool): Option[string] =
-  ## Extract address from scriptPubKey if possible
+proc extractAddressFromScript(script: seq[byte], mainnet: bool,
+                              regtest: bool = false): Option[string] =
+  ## Extract address from scriptPubKey if possible.
+  ##
+  ## `regtest` selects the "bcrt" bech32 HRP for segwit addresses; without it
+  ## regtest segwit addresses collapse onto the shared testnet "tb" HRP. It
+  ## defaults to false so the many non-regtest callers are unaffected.
   let scriptType = getScriptType(script)
 
   case scriptType
@@ -1763,7 +1769,7 @@ proc extractAddressFromScript(script: seq[byte], mainnet: bool): Option[string] 
     for i in 0 ..< 20:
       hash[i] = script[3 + i]
     let addrVal = Address(kind: P2PKH, pubkeyHash: hash)
-    return some(encodeAddress(addrVal, mainnet))
+    return some(encodeAddress(addrVal, mainnet, regtest))
 
   of "scripthash":
     # P2SH: extract 20-byte hash
@@ -1771,7 +1777,7 @@ proc extractAddressFromScript(script: seq[byte], mainnet: bool): Option[string] 
     for i in 0 ..< 20:
       hash[i] = script[2 + i]
     let addrVal = Address(kind: P2SH, scriptHash: hash)
-    return some(encodeAddress(addrVal, mainnet))
+    return some(encodeAddress(addrVal, mainnet, regtest))
 
   of "witness_v0_keyhash":
     # P2WPKH: extract 20-byte hash
@@ -1779,7 +1785,7 @@ proc extractAddressFromScript(script: seq[byte], mainnet: bool): Option[string] 
     for i in 0 ..< 20:
       hash[i] = script[2 + i]
     let addrVal = Address(kind: P2WPKH, wpkh: hash)
-    return some(encodeAddress(addrVal, mainnet))
+    return some(encodeAddress(addrVal, mainnet, regtest))
 
   of "witness_v0_scripthash":
     # P2WSH: extract 32-byte hash
@@ -1787,7 +1793,7 @@ proc extractAddressFromScript(script: seq[byte], mainnet: bool): Option[string] 
     for i in 0 ..< 32:
       hash[i] = script[2 + i]
     let addrVal = Address(kind: P2WSH, wsh: hash)
-    return some(encodeAddress(addrVal, mainnet))
+    return some(encodeAddress(addrVal, mainnet, regtest))
 
   of "witness_v1_taproot":
     # P2TR: extract 32-byte x-only pubkey
@@ -1795,7 +1801,7 @@ proc extractAddressFromScript(script: seq[byte], mainnet: bool): Option[string] 
     for i in 0 ..< 32:
       key[i] = script[2 + i]
     let addrVal = Address(kind: P2TR, taprootKey: key)
-    return some(encodeAddress(addrVal, mainnet))
+    return some(encodeAddress(addrVal, mainnet, regtest))
 
   else:
     return none(string)
@@ -2059,7 +2065,8 @@ proc inferAddrDescriptor*(script: seq[byte], mainnet: bool): string =
     # charset, so this path is unreachable for well-formed inputs.
     payload
 
-proc buildScriptPubKeyJson(script: seq[byte], mainnet: bool): JsonNode =
+proc buildScriptPubKeyJson(script: seq[byte], mainnet: bool,
+                           regtest: bool = false): JsonNode =
   ## Build scriptPubKey JSON object with type, asm, hex, address, desc.
   ##
   ## Reference: bitcoin-core/src/core_io.cpp `ScriptToUniv` /
@@ -2070,7 +2077,7 @@ proc buildScriptPubKeyJson(script: seq[byte], mainnet: bool): JsonNode =
   ## `raw(<hex>)#<csum>` otherwise. W51: closes the SHAPE-MISSING `desc`
   ## gap surfaced by W50.
   let scriptType = getScriptType(script)
-  let addrOpt = extractAddressFromScript(script, mainnet)
+  let addrOpt = extractAddressFromScript(script, mainnet, regtest)
 
   result = %*{
     "asm": disassembleScript(script),
@@ -2111,14 +2118,16 @@ proc buildVinJson(tx: Transaction, inputIndex: int): JsonNode =
       txinwitness.add(%toHex(item))
     result["txinwitness"] = txinwitness
 
-proc buildVoutJson(output: TxOut, index: int, mainnet: bool): JsonNode =
+proc buildVoutJson(output: TxOut, index: int, mainnet: bool,
+                   regtest: bool = false): JsonNode =
   ## Build vout JSON object for an output. `value` is emitted as Core-shaped
   ## fixed 8-decimal text (`%d.%08d`, see `btcAmountNode`) so that
   ## whole-BTC amounts read `1.00000000` not Nim's `1.0` (W50 / W51).
+  ## `regtest` selects the "bcrt" bech32 HRP for the scriptPubKey.address.
   %*{
     "value": btcAmountNode(int64(output.value)),
     "n": index,
-    "scriptPubKey": buildScriptPubKeyJson(output.scriptPubKey, mainnet)
+    "scriptPubKey": buildScriptPubKeyJson(output.scriptPubKey, mainnet, regtest)
   }
 
 proc sighashToStr*(sighashType: int32): string =
@@ -2415,8 +2424,10 @@ proc buildNonWitnessUtxoJson*(prevTx: Transaction, mainnet: bool): JsonNode =
 
 proc buildVerboseTxJson(tx: Transaction, blockHash: Option[BlockHash],
                         confirmations: int32, blocktime: uint32,
-                        inActiveChain: Option[bool], mainnet: bool): JsonNode =
-  ## Build complete verbose transaction JSON
+                        inActiveChain: Option[bool], mainnet: bool,
+                        regtest: bool = false): JsonNode =
+  ## Build complete verbose transaction JSON.
+  ## `regtest` selects the "bcrt" bech32 HRP for vout scriptPubKey addresses.
   let txid = tx.txid()
   let wtxid = tx.wtxid()
   let weight = validation.calculateTransactionWeight(tx)
@@ -2441,7 +2452,7 @@ proc buildVerboseTxJson(tx: Transaction, blockHash: Option[BlockHash],
   # Add vout array
   var voutArray = newJArray()
   for i, outp in tx.outputs:
-    voutArray.add(buildVoutJson(outp, i, mainnet))
+    voutArray.add(buildVoutJson(outp, i, mainnet, regtest))
   result["vout"] = voutArray
 
   # Add hex
@@ -2461,7 +2472,8 @@ proc buildVerboseTxJson(tx: Transaction, blockHash: Option[BlockHash],
 proc enrichVerbosity2(rpc: RpcServer, tx: Transaction, result: var JsonNode,
                       mainnet: bool,
                       currentBlockIdx: Option[BlockIndex],
-                      txInBlockIdx: int) =
+                      txInBlockIdx: int,
+                      regtest: bool = false) =
   ## Add verbosity=2 fields to a getrawtransaction response:
   ##   - per-vin "prevout" enrichment {generated, height, value, scriptPubKey}
   ##   - top-level "fee" (sum inputs - sum outputs, in BTC)
@@ -2581,7 +2593,7 @@ proc enrichVerbosity2(rpc: RpcServer, tx: Transaction, result: var JsonNode,
         prevoutObj["generated"] = %info.generated
         prevoutObj["height"] = %info.height
         prevoutObj["value"] = btcAmountNode(info.value)
-        prevoutObj["scriptPubKey"] = buildScriptPubKeyJson(info.script, mainnet)
+        prevoutObj["scriptPubKey"] = buildScriptPubKeyJson(info.script, mainnet, regtest)
         vinNode[inpIdx]["prevout"] = prevoutObj
       else:
         allInputsKnown = false
@@ -2632,6 +2644,14 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let txid = parseTxId(txidHex)
 
+  # Special exception for the genesis block coinbase transaction. Its txid is,
+  # by construction, equal to the genesis block's merkle root. Core refuses to
+  # serve it (rpc/rawtransaction.cpp:290-293), raising RPC_INVALID_ADDRESS_OR_KEY.
+  let genesisMerkleRoot = buildGenesisBlock(rpc.params).header.merkleRoot
+  if array[32, byte](txid) == genesisMerkleRoot:
+    raise newRpcError(RpcInvalidAddressOrKey,
+      "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved")
+
   # Parse optional blockhash parameter
   var explicitBlockHash: Option[BlockHash] = none(BlockHash)
   if params.len >= 3 and params[2].kind == JString:
@@ -2641,6 +2661,7 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     explicitBlockHash = some(parseBlockHash(blockHashHex))
 
   let mainnet = rpc.params.network == Mainnet
+  let regtest = rpc.params.network == Regtest
 
   # If blockhash is explicitly provided, search only in that block
   if explicitBlockHash.isSome:
@@ -2687,10 +2708,11 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
       -1'i32  # Not in active chain
 
     var txJson = buildVerboseTxJson(tx, some(blockHash), confirmations,
-                                    blk.header.timestamp, some(inActiveChain), mainnet)
+                                    blk.header.timestamp, some(inActiveChain),
+                                    mainnet, regtest)
 
     if verbosity >= 2:
-      enrichVerbosity2(rpc, tx, txJson, mainnet, some(blockIdx), txInBlockIdx)
+      enrichVerbosity2(rpc, tx, txJson, mainnet, some(blockIdx), txInBlockIdx, regtest)
 
     return txJson
 
@@ -2704,7 +2726,7 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
     # Unconfirmed transaction — no block info, no undo data.
     # verbosity=2 cannot resolve prevouts for mempool txs; emit verbosity=1 shape.
-    return buildVerboseTxJson(tx, none(BlockHash), 0, 0, none(bool), mainnet)
+    return buildVerboseTxJson(tx, none(BlockHash), 0, 0, none(bool), mainnet, regtest)
 
   # Check tx index for confirmed transactions
   let locOpt = rpc.chainState.db.getTxIndex(txid)
@@ -2731,11 +2753,11 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   let confirmations = rpc.chainState.bestHeight - blockHeight + 1
 
   var txJson = buildVerboseTxJson(tx, some(loc.blockHash), confirmations,
-                                  blk.header.timestamp, none(bool), mainnet)
+                                  blk.header.timestamp, none(bool), mainnet, regtest)
 
   if verbosity >= 2:
     let blockIdxForUndo = idxOpt
-    enrichVerbosity2(rpc, tx, txJson, mainnet, blockIdxForUndo, int(loc.txIndex))
+    enrichVerbosity2(rpc, tx, txJson, mainnet, blockIdxForUndo, int(loc.txIndex), regtest)
 
   txJson
 
@@ -2759,6 +2781,7 @@ proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let txHex = params[0].getStr()
   let mainnet = rpc.params.network == Mainnet
+  let regtest = rpc.params.network == Regtest
 
   try:
     let txBytes = hexToBytes(txHex)
@@ -2773,7 +2796,7 @@ proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
     var outputs = newJArray()
     for i, outp in tx.outputs:
-      outputs.add(buildVoutJson(outp, i, mainnet))
+      outputs.add(buildVoutJson(outp, i, mainnet, regtest))
 
     %*{
       "txid": reverseHex(toHex(array[32, byte](txid))),
