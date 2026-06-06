@@ -1554,6 +1554,15 @@ proc setupSignalHandlers*() =
         info "saving mempool", path = mempoolPath
         discard dumpMempool(globalNodeState.mempool, mempoolPath)
 
+      # Final wallet flush. Save-on-mutation already keeps every loaded
+      # wallet's snapshot current; this is the belt-and-suspenders pass so a
+      # clean shutdown is guaranteed durable too. DATA-LOSS FIX wa0fq5wtk.
+      if globalNodeState.rpcServer != nil and
+         globalNodeState.rpcServer.walletManager != nil:
+        info "flushing wallets"
+        try: globalNodeState.rpcServer.walletManager.persistAllWallets()
+        except CatchableError: discard
+
       # Disconnect peers
       if globalNodeState.peerManager != nil:
         info "disconnecting peers"
@@ -2378,6 +2387,21 @@ proc startNode*(config: NimrodConfig) {.async.} =
     # newWalletManager creates that dir on demand.
     state.rpcServer.walletManager =
       newWalletManager(networkDir, params, state.chainState)
+
+    # Auto-load wallets marked load_on_startup (or the default wallet), then
+    # reconcile each to the chain tip: restore its crash-safe snapshot and
+    # scan the gap [lastSyncedHeight+1 .. tip] so a wallet left behind by an
+    # unclean exit (or by the live P2P/IBD block-connect path) catches up.
+    # DATA-LOSS FIX wa0fq5wtk. Best-effort — never aborts node startup.
+    try:
+      let loadErrs = state.rpcServer.walletManager.loadWalletsAtStartup()
+      for (wname, werr) in loadErrs:
+        warn "wallet failed to load at startup", wallet = wname, error = werr
+      state.rpcServer.walletManager.reconcileAllWalletsToTip()
+    except CatchableError as e:
+      warn "wallet startup load/reconcile failed", error = e.msg
+    except Exception as e:
+      warn "wallet startup load/reconcile failed", error = e.msg
     # Run RPC on a dedicated OS thread with its own chronos event loop so that
     # CPU-heavy block validation on the main thread does not block RPC accept
     # or response. See src/rpc/rpc_thread.nim for rationale and known v1 caveats.

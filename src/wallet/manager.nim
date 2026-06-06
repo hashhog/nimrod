@@ -5,9 +5,12 @@
 import std/[os, tables, json, locks, options, strutils, times]
 import ./wallet
 import ./db_sqlite
+import ./wallet_persist
 import ../consensus/params
 import ../storage/chainstate
 import ../primitives/types
+
+export wallet_persist.WalletLoadOutcome
 
 type
   WalletManagerError* = object of CatchableError
@@ -155,6 +158,44 @@ proc getWalletDbPath(wm: WalletManager, name: string): string =
   let walletDir = wm.getWalletPath(name)
   walletDir / "wallet.db"
 
+proc getWalletSnapshotPath(wm: WalletManager, name: string): string =
+  ## Path to the crash-safe wallet ledger snapshot (wallet_state.dat).
+  let walletDir = wm.getWalletPath(name)
+  walletDir / CurrentWalletSnapFile
+
+# =============================================================================
+# Crash-safe snapshot persistence
+# =============================================================================
+# DATA-LOSS FIX (sweep wa0fq5wtk): the wallet's live ledger lives in RAM and
+# was never written to disk. These helpers persist it atomically+durably on
+# every mutation (see callers in rpc/server.nim) so a SIGKILL / OOM /
+# power-loss can never lose credited coins or transaction history.
+
+proc persistWallet*(wm: WalletManager, name: string): bool {.gcsafe.} =
+  ## Atomically snapshot one loaded wallet to disk. Best-effort: a save
+  ## failure is logged inside saveWalletSnapshot and returned as false; the
+  ## caller must not crash on it.
+  var lw: LoadedWallet
+  withLock wm.walletsLock:
+    if not wm.wallets.hasKey(name):
+      return false
+    lw = wm.wallets[name]
+  if lw == nil or lw.wallet == nil:
+    return false
+  let snapPath = wm.getWalletSnapshotPath(lw.name)
+  return saveWalletSnapshot(lw.wallet, snapPath)
+
+proc persistAllWallets*(wm: WalletManager) {.gcsafe.} =
+  ## Snapshot every loaded wallet. Called from the shutdown handler as a
+  ## final flush AND usable as a periodic flush. Save-on-mutation already
+  ## keeps disk current; this is the belt-and-suspenders pass.
+  var names: seq[string]
+  withLock wm.walletsLock:
+    for name, _ in wm.wallets:
+      names.add(name)
+  for name in names:
+    discard wm.persistWallet(name)
+
 # =============================================================================
 # Wallet Enumeration
 # =============================================================================
@@ -249,7 +290,23 @@ proc loadWallet*(wm: WalletManager, filename: string,
 
   # Create wallet from database
   let mainnet = wm.params.defaultPort == 8333
-  let wallet = newWalletFromDb(db, wm.params, mainnet, wm.chainState)
+  var wallet = newWalletFromDb(db, wm.params, mainnet, wm.chainState)
+
+  # Restore the crash-safe ledger snapshot (UTXOs, history height, keypool
+  # cursors, labels). Fault-tolerant: a missing/corrupt/partial file never
+  # throws — the worst case leaves lastSyncedHeight = -1 so the startup
+  # gap-rescan rebuilds the ledger from the chain. DATA-LOSS FIX wa0fq5wtk.
+  let snapPath = wm.getWalletSnapshotPath(name)
+  let outcome = loadWalletSnapshot(wallet, snapPath)
+  case outcome
+  of wlRecoveredBak:
+    warnings.add("Wallet ledger recovered from backup snapshot (" &
+                 snapPath & ".bak)")
+  of wlCorruptKept:
+    warnings.add("Wallet ledger snapshot unrecoverable; ledger will be " &
+                 "rebuilt by rescan")
+  else:
+    discard
 
   let lw = LoadedWallet(
     wallet: wallet,
@@ -356,7 +413,8 @@ proc createWallet*(wm: WalletManager, name: string,
       utxos: initTable[OutPoint, WalletUtxo](),
       labels: initTable[string, string](),
       isEncrypted: false,
-      isLocked: false
+      isLocked: false,
+      lastSyncedHeight: -1
     )
   elif options.blank:
     # Create blank wallet - generate seed but no accounts
@@ -374,7 +432,8 @@ proc createWallet*(wm: WalletManager, name: string,
       utxos: initTable[OutPoint, WalletUtxo](),
       labels: initTable[string, string](),
       isEncrypted: false,
-      isLocked: false
+      isLocked: false,
+      lastSyncedHeight: -1
     )
 
     if options.passphrase != "":
@@ -442,3 +501,57 @@ proc loadWalletsAtStartup*(wm: WalletManager): seq[tuple[name: string, error: st
       result.add((walletName, e.msg))
     except CatchableError as e:
       result.add((walletName, e.msg))
+
+# =============================================================================
+# Startup rescan / reconcile to chain tip
+# =============================================================================
+# DATA-LOSS FIX (sweep wa0fq5wtk), requirement (4): after loading a wallet's
+# snapshot, bring its UTXO ledger up to the current chain tip. This covers two
+# gaps: (a) blocks that connected via the live P2P/IBD path while the node was
+# previously running but were never fed to the wallet, and (b) blocks that
+# connected AFTER the last persisted snapshot before an unclean exit. We scan
+# only the gap [lastSyncedHeight+1 .. tip] — not the whole chain — using the
+# same scanBlockForWallet recognition path the block-connect hook uses, then
+# persist the reconciled ledger. Mirrors Bitcoin Core CWallet::AttachChain /
+# ScanForWalletTransactions on load.
+
+proc reconcileWalletToTip*(wm: WalletManager, lw: LoadedWallet): int32 =
+  ## Scan the gap from the wallet's lastSyncedHeight to the chain tip into its
+  ## ledger and persist. Returns the number of blocks scanned. Best-effort: a
+  ## bad block never aborts the whole reconcile, and a nil chainState (e.g. in
+  ## unit tests) is a no-op.
+  if wm.chainState == nil or lw == nil or lw.wallet == nil:
+    return 0
+  var w = lw.wallet
+  let tip = wm.chainState.bestHeight
+  # lastSyncedHeight defaults to -1 (fresh / corrupt-recovered wallet) so the
+  # first scanned height is 0 (genesis), a full rebuild.
+  var h = w.lastSyncedHeight + 1
+  if h < 0: h = 0
+  var scanned: int32 = 0
+  while h <= tip:
+    let blkOpt = wm.chainState.db.getBlockByHeight(h)
+    if blkOpt.isSome:
+      try:
+        w.scanBlockForWallet(blkOpt.get(), h)
+        inc scanned
+      except CatchableError:
+        discard  # never let one bad block abort the reconcile
+    inc h
+  if scanned > 0:
+    discard wm.persistWallet(lw.name)
+  scanned
+
+proc reconcileAllWalletsToTip*(wm: WalletManager) =
+  ## Reconcile every loaded wallet to the chain tip. Called once at startup
+  ## after loadWalletsAtStartup. Each wallet is independent; one failure does
+  ## not block the others.
+  var loaded: seq[LoadedWallet]
+  withLock wm.walletsLock:
+    for _, lw in wm.wallets:
+      loaded.add(lw)
+  for lw in loaded:
+    try:
+      discard wm.reconcileWalletToTip(lw)
+    except CatchableError:
+      discard

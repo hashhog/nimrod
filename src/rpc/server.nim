@@ -1401,6 +1401,12 @@ proc handleGetDeploymentInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
 # block-connect scan hooks (further down, near the mining RPCs) but is needed
 # here by handleInvalidateBlock for symmetric reorg/disconnect bookkeeping.
 proc unscanBlockFromWallets(rpc: RpcServer, blk: Block, height: int32) {.gcsafe.}
+# Forward declaration: the wallet block-connect scan+persist hook is defined
+# near the mining RPCs but is needed earlier by handleSubmitBlock so a block
+# accepted via submitblock (not just generatetoaddress) feeds + persists the
+# wallet. DATA-LOSS FIX wa0fq5wtk.
+proc scanBlockIntoWallets(rpc: RpcServer, blk: Block, height: int32,
+                          persist: bool = true) {.gcsafe.}
 
 # Chain Management RPCs
 proc handleInvalidateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
@@ -4257,6 +4263,12 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
             confirmedTxids.add(tx.txid())
           rpc.feeEstimator.processBlock(height, confirmedTxids)
 
+        # Wallet block-connect hook: a block accepted via submitblock (the
+        # non-mining RPC path) must credit/debit + persist the wallet too,
+        # not only generatetoaddress. DATA-LOSS FIX wa0fq5wtk — persists the
+        # mutated ledger atomically. Best-effort inside the hook.
+        rpc.scanBlockIntoWallets(blk, height)
+
         # Broadcast to peers
         if rpc.peerManager != nil:
           asyncSpawn rpc.peerManager.broadcastBlock(blk)
@@ -4497,10 +4509,39 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 # scantxoutset / rescan). Wallet is a `ref object`, so mutating the instance the
 # manager holds persists across RPC calls.
 
-proc scanBlockIntoWallets(rpc: RpcServer, blk: Block, height: int32) {.gcsafe.} =
+proc persistLoadedWallets(rpc: RpcServer) {.gcsafe.} =
+  ## Atomically snapshot every loaded wallet to disk. DATA-LOSS FIX wa0fq5wtk:
+  ## called after every state-changing wallet op (per-block scan credit/debit,
+  ## getnewaddress keypool advance, setlabel, sendtoaddress) so an unclean
+  ## exit (SIGKILL/OOM/power-loss) can never lose ledger state. Best-effort —
+  ## a save failure is logged inside the persist layer and never throws.
+  if rpc.walletManager != nil:
+    try: rpc.walletManager.persistAllWallets()
+    except CatchableError: discard
+
+proc persistTargetWallet(rpc: RpcServer) {.gcsafe.} =
+  ## Snapshot the wallet targeted by the current request after a mutating
+  ## RPC (getnewaddress / setlabel / sendtoaddress …). DATA-LOSS FIX
+  ## wa0fq5wtk: the keypool advance / label / spend must hit disk before the
+  ## RPC returns so a crash right after the call cannot lose it. Best-effort.
+  if rpc.walletManager != nil:
+    try:
+      if rpc.currentWalletName != "":
+        discard rpc.walletManager.persistWallet(rpc.currentWalletName)
+      else:
+        # Default (single) wallet: persist whatever is loaded.
+        rpc.walletManager.persistAllWallets()
+    except CatchableError:
+      discard
+
+proc scanBlockIntoWallets(rpc: RpcServer, blk: Block, height: int32,
+                          persist: bool) {.gcsafe.} =
   ## Credit/debit every loaded wallet's UTXO ledger from a connected block.
   ## Idempotent: re-scanning the same block re-inserts the same {txid,vout}
   ## entries (set semantics) and re-deletes already-absent spends (no-op).
+  ## When `persist`, the (mutated) ledger is snapshotted to disk afterwards —
+  ## the save-on-mutation half of the data-loss fix. Bulk callers pass
+  ## persist=false and snapshot once at the end to avoid per-block fsync.
   if rpc.walletManager != nil:
     for name in rpc.walletManager.listLoadedWallets():
       let lwOpt = rpc.walletManager.getWallet(name)
@@ -4511,6 +4552,8 @@ proc scanBlockIntoWallets(rpc: RpcServer, blk: Block, height: int32) {.gcsafe.} 
             w.scanBlockForWallet(blk, height)
           except CatchableError:
             discard  # never let wallet bookkeeping abort a valid block
+    if persist:
+      rpc.persistLoadedWallets()
   # Legacy single-wallet fallback (pre-walletManager deployments).
   elif rpc.wallet != nil:
     try:
@@ -4529,7 +4572,9 @@ proc scanConnectedBlocksIntoWallets(rpc: RpcServer, hashes: seq[BlockHash]) {.gc
     let height = tip - int32(n - 1 - i)
     let blkOpt = rpc.chainState.db.getBlock(h)
     if blkOpt.isSome:
-      rpc.scanBlockIntoWallets(blkOpt.get(), height)
+      # Defer the snapshot until all blocks scanned (one fsync, not n).
+      rpc.scanBlockIntoWallets(blkOpt.get(), height, persist = false)
+  rpc.persistLoadedWallets()
 
 proc unscanBlockFromWallets(rpc: RpcServer, blk: Block, height: int32) {.gcsafe.} =
   ## Reverse of scanBlockIntoWallets for a block leaving the active chain
@@ -6191,6 +6236,9 @@ proc handleGetNewAddress(rpc: RpcServer, params: JsonNode): JsonNode =
 
   try:
     let addrStr = w.getNewAddressByTypeName(addressType)
+    # Persist the keypool advance immediately so a crash can't reissue this
+    # address (gap-limit safety). DATA-LOSS FIX wa0fq5wtk.
+    rpc.persistTargetWallet()
     %addrStr
   except WalletError as e:
     raise newRpcError(RpcMiscError, e.msg)
@@ -6462,6 +6510,8 @@ proc handleGetRawChangeAddress(rpc: RpcServer, params: JsonNode): JsonNode =
         raise newException(WalletError, "unknown address type: " & addressType)
 
     let addrStr = w.getNewAddressStr(addrType, -1, true)
+    # Persist the internal keypool advance (gap-limit safety). DATA-LOSS FIX.
+    rpc.persistTargetWallet()
     %addrStr
   except WalletError as e:
     raise newRpcError(RpcMiscError, e.msg)
@@ -6721,6 +6771,12 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
       let outpoint = OutPoint(txid: txid, vout: uint32(voutIdx))
       let isInternal = key.path.contains("/1/")
       w.addUtxo(outpoint, output, 0, key.path, isInternal, false)
+
+  # Persist the spend: removed prevouts + added change + the outgoing history
+  # record must all survive an unclean exit, otherwise a crash here would let
+  # coin-selection re-spend the already-broadcast inputs (double-spend attempt)
+  # or lose the send from listtransactions. DATA-LOSS FIX wa0fq5wtk.
+  rpc.persistTargetWallet()
 
   # Broadcast to peers
   if rpc.peerManager != nil:
@@ -7065,6 +7121,7 @@ proc handleSetLabel(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidAddressOrKey, "invalid address: " & address)
 
   w.setLabel(address, label)
+  rpc.persistTargetWallet()  # DATA-LOSS FIX wa0fq5wtk: label must survive a crash.
   newJNull()
 
 proc handleGetAddressesByLabel(rpc: RpcServer, params: JsonNode): JsonNode =
