@@ -189,6 +189,21 @@ type
                                           ## isolation from main-thread
                                           ## verifyScripts batches; see
                                           ## rpc_thread.nim).
+    walletReconcileThread*: Thread[WalletManager]
+                                          ## Background wallet history rescan
+                                          ## (reconcileAllWalletsToTip) runs on
+                                          ## its own OS thread so a full-chain
+                                          ## scan (first restart after the
+                                          ## wallet fix, or a seed-restore with
+                                          ## lastSyncedHeight = -1) does NOT
+                                          ## block RPC bind / P2P / sync on the
+                                          ## boot path. Mirrors Core
+                                          ## CWallet::AttachChain keeping RPC
+                                          ## responsive during a rescan
+                                          ## (getwalletinfo.scanning). MUST be
+                                          ## held by NodeState for process
+                                          ## lifetime — same `addr(t)` SIGSEGV
+                                          ## trap the RPC/REST threads document.
     netGroupManager*: NetGroupManager     ## ASMap-aware network group manager.
                                           ## Loaded from config.asmapFile at
                                           ## startup; nil-replaced with an empty
@@ -1964,6 +1979,39 @@ proc restThreadMain(rest: RestServer) {.thread.} =
     except CatchableError as e:
       error "REST thread crashed", error = e.msg
 
+proc walletReconcileThreadMain(wm: WalletManager) {.thread.} =
+  ## Thread entry point for the deferred startup wallet history rescan.
+  ##
+  ## reconcileAllWalletsToTip walks the gap [lastSyncedHeight+1 .. tip] for
+  ## every loaded wallet, rebuilding its in-memory tx/UTXO history (DATA-LOSS
+  ## FIX wa0fq5wtk). On a wallet whose locator is reset to -1 (the first
+  ## restart after the wallet fix deploys, or a seed-restored wallet) that gap
+  ## is the WHOLE chain 0..tip — ~950k blocks on mainnet. It used to run
+  ## synchronously on the boot path BEFORE startRpcThread / the P2P listener /
+  ## the sync loop, so the node looked DOWN for many minutes (RPC refused) until
+  ## the scan finished — a restart-wedge (regression from the wallet-recovery
+  ## fix). Bitcoin Core keeps RPC responsive while the wallet rescans
+  ## (CWallet::AttachChain → getwalletinfo.scanning); we mirror that by running
+  ## the rescan on this dedicated OS thread, started AFTER the RPC thread and
+  ## P2P listener are up. The recovery behaviour is unchanged — history is still
+  ## fully rebuilt and persisted — it just no longer blocks boot.
+  ##
+  ## scanBlockForWallet is a synchronous, CPU- and DB-bound loop, so this is a
+  ## plain OS thread (like startRpcThread / restThreadMain), NOT an asyncSpawn:
+  ## a CPU-bound scan on the main chronos loop would stall the heartbeat and any
+  ## main-loop I/O. WalletManager takes its own walletsLock around every
+  ## load/persist (manager.nim), and the RPC thread already shares this same
+  ## `wm` ref concurrently, so running the locked reconcile here adds no new
+  ## sharing hazard. The `{.gcsafe.}:` block mirrors rpcThreadMain.
+  {.gcsafe.}:
+    try:
+      wm.reconcileAllWalletsToTip()
+      info "background wallet reconcile complete"
+    except CatchableError as e:
+      warn "background wallet reconcile failed", error = e.msg
+    except Exception as e:
+      warn "background wallet reconcile failed", error = e.msg
+
 proc startNode*(config: NimrodConfig) {.async.} =
   ## Start the node
   ## Init order: db -> chainstate -> mempool -> peermanager -> sync -> fee estimator -> RPC -> P2P
@@ -2388,20 +2436,29 @@ proc startNode*(config: NimrodConfig) {.async.} =
     state.rpcServer.walletManager =
       newWalletManager(networkDir, params, state.chainState)
 
-    # Auto-load wallets marked load_on_startup (or the default wallet), then
-    # reconcile each to the chain tip: restore its crash-safe snapshot and
-    # scan the gap [lastSyncedHeight+1 .. tip] so a wallet left behind by an
-    # unclean exit (or by the live P2P/IBD block-connect path) catches up.
-    # DATA-LOSS FIX wa0fq5wtk. Best-effort — never aborts node startup.
+    # Auto-load wallets marked load_on_startup (or the default wallet). This is
+    # fast and stays synchronous here because the wallet RPCs need the wallets
+    # loaded before the RPC thread starts serving.
+    #
+    # The per-wallet reconcile to tip (restore the crash-safe snapshot and scan
+    # the gap [lastSyncedHeight+1 .. tip] so a wallet left behind by an unclean
+    # exit or by the live P2P/IBD block-connect path catches up — DATA-LOSS FIX
+    # wa0fq5wtk) is NOT run here: it is deferred to a background OS thread
+    # (walletReconcileThreadMain) spawned AFTER the RPC thread + P2P listener
+    # come up.  Rationale: when a wallet's lastSyncedHeight is -1 (first restart
+    # after this fix deploys, or a seed-restored wallet) the gap is the whole
+    # chain 0..tip — ~950k blocks on mainnet — so scanning it on the boot path
+    # left the node looking DOWN (RPC refused) for many minutes.  Core keeps RPC
+    # responsive while the wallet rescans; we mirror that.  Best-effort — never
+    # aborts node startup.
     try:
       let loadErrs = state.rpcServer.walletManager.loadWalletsAtStartup()
       for (wname, werr) in loadErrs:
         warn "wallet failed to load at startup", wallet = wname, error = werr
-      state.rpcServer.walletManager.reconcileAllWalletsToTip()
     except CatchableError as e:
-      warn "wallet startup load/reconcile failed", error = e.msg
+      warn "wallet startup load failed", error = e.msg
     except Exception as e:
-      warn "wallet startup load/reconcile failed", error = e.msg
+      warn "wallet startup load failed", error = e.msg
     # Run RPC on a dedicated OS thread with its own chronos event loop so that
     # CPU-heavy block validation on the main thread does not block RPC accept
     # or response. See src/rpc/rpc_thread.nim for rationale and known v1 caveats.
@@ -2484,6 +2541,21 @@ proc startNode*(config: NimrodConfig) {.async.} =
   #     over time without blocking node startup or the sync loop above.
   info "connecting to peers"
   asyncSpawn state.peerManager.startOutboundConnections()
+
+  # 10a. Deferred wallet history rescan (DATA-LOSS FIX wa0fq5wtk), now that the
+  #      RPC thread, P2P listener and sync loop are all up.  Running this on its
+  #      own OS thread keeps a full-chain scan (lastSyncedHeight = -1: first
+  #      restart after the wallet fix, or a seed-restore) off the boot path so
+  #      RPC stays bound and responsive throughout — Core CWallet::AttachChain
+  #      parity (getwalletinfo.scanning).  Only relevant when wallets/RPC are
+  #      enabled (walletManager is nil otherwise).  See
+  #      walletReconcileThreadMain for the lifetime/gcsafe rationale; the thread
+  #      handle is pinned on `state` to avoid the `addr(t)` SIGSEGV the RPC/REST
+  #      threads document.
+  if state.rpcServer != nil and state.rpcServer.walletManager != nil:
+    info "starting background wallet reconcile"
+    createThread(state.walletReconcileThread, walletReconcileThreadMain,
+                 state.rpcServer.walletManager)
 
   # 11a. Startup ASMapHealthCheck (G16/G28 FIX-52).
   # Logs unique ASNs / mapped / unmapped across the initial known-address pool.
