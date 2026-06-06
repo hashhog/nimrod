@@ -37,6 +37,7 @@ import ./test_coinselection
 import ./test_maturity
 import ./test_encrypt
 import ./test_label
+import ./test_wallet_persist
 import ./test_rpc
 import ./test_rpc_thread_lifetime
 import ./test_perf

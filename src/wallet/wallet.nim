@@ -124,6 +124,12 @@ type
     # deterministically without relying on Table iteration order.
     txHistory*: Table[TxId, WalletTxRecord]
     txOrder*: seq[TxId]
+    # Highest block height whose contents are already reflected in this
+    # wallet's in-memory ledger (utxos + txHistory). Persisted to the wallet
+    # snapshot so a restart can scan ONLY the gap [lastSyncedHeight+1 .. tip]
+    # instead of replaying the whole chain. -1 = never synced (fresh wallet).
+    # Mirrors Bitcoin Core's CWallet::m_last_block_processed_height.
+    lastSyncedHeight*: int32
 
 # BIP39 wordlist - loaded at compile time
 const BIP39_WORDLIST* = staticRead("../../resources/bip39-english.txt").strip().splitLines()
@@ -503,6 +509,7 @@ proc newWallet*(mnemonic: string, passphrase: string = "",
   result.utxos = initTable[OutPoint, WalletUtxo]()
   result.params = params
   result.mainnet = params.network == Mainnet
+  result.lastSyncedHeight = -1
 
 proc newWalletFromSeed*(seed: array[64, byte],
                         params: ConsensusParams = mainnetParams()): Wallet =
@@ -514,6 +521,7 @@ proc newWalletFromSeed*(seed: array[64, byte],
   result.utxos = initTable[OutPoint, WalletUtxo]()
   result.params = params
   result.mainnet = params.network == Mainnet
+  result.lastSyncedHeight = -1
 
 proc newWallet*(mnemonic: string, params: ConsensusParams,
                 mainnet: bool, chainState: ChainState): Wallet =
@@ -530,6 +538,7 @@ proc newWallet*(mnemonic: string, params: ConsensusParams,
   result.mainnet = mainnet
   result.chainState = chainState
   result.labels = initTable[string, string]()
+  result.lastSyncedHeight = -1
 
   # Create default BIP84 (native segwit) account
   result.addAccount(84, 0, 20)
@@ -545,6 +554,7 @@ proc newWalletFromDb*(db: WalletDb, params: ConsensusParams,
   result.mainnet = mainnet
   result.chainState = chainState
   result.labels = initTable[string, string]()
+  result.lastSyncedHeight = -1
 
   # Load encryption info if present
   let encInfo = db.getEncryption()
@@ -1139,6 +1149,11 @@ proc recordWalletTx(wallet: var Wallet, tx: Transaction, txId: TxId,
 
 proc scanBlockForWallet*(wallet: var Wallet, blk: Block, height: int32) =
   ## Scan a block for transactions relevant to the wallet
+  # Track the highest height whose contents are reflected in our ledger so a
+  # restart only scans the gap. Idempotent re-scans of an already-seen block
+  # never lower the watermark.
+  if height > wallet.lastSyncedHeight:
+    wallet.lastSyncedHeight = height
   for txIdx, tx in blk.txs:
     let txId = tx.txid()
     let coinbase = tx.isCoinbaseTx()
