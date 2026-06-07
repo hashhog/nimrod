@@ -105,6 +105,7 @@ import ./test_validateblock_ibd_utxo
 import ./test_ibd_durability
 import ./test_w117_proxy_wireup
 import ./test_w135_standardness
+import ./test_w167_getblockstats
 
 when isMainModule:
   echo "Running all tests..."
