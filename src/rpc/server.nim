@@ -1362,6 +1362,467 @@ proc handleGetChainTxStats(rpc: RpcServer, params: JsonNode): JsonNode =
         ret["txrate"] = %(float64(windowTxCount) / float64(nTimeDiff))
   ret
 
+# ────────────────────────────────────────────────────────────────────────────
+# getblockstats
+# ────────────────────────────────────────────────────────────────────────────
+# Faithful port of bitcoin-core/src/rpc/blockchain.cpp::getblockstats
+# (RPCHelpMan + lambda, lines 1956-2214) plus its helpers
+# CalculatePercentilesByWeight (1916) and CalculateTruncatedMedian (1901).
+#
+# Sibling references that were live-verified byte-identical to Core:
+#   blockbrew internal/rpc/getblockstats_methods.go
+#   hotbuns   src/rpc/server.ts getBlockStats
+#   ouroboros src/ouroboros/rpc.py rpc_getblockstats
+#
+# All amounts are satoshis; feerates are satoshis per virtual byte
+# (vsize = weight / 4 → feerate = fee * 4 / weight, integer-truncated).
+
+const
+  ## Number of feerate percentiles getblockstats computes (10th, 25th, 50th,
+  ## 75th, 90th). Core NUM_GETBLOCKSTATS_PERCENTILES (rpc/blockchain.cpp).
+  GetBlockStatsPercentiles = 5
+
+  ## Core PER_UTXO_OVERHEAD: sizeof(COutPoint) + sizeof(uint32_t) + sizeof(bool)
+  ##   = (uint256(32) + uint32(4)) + uint32(4) + bool(1) = 41
+  ## (bitcoin-core/src/rpc/blockchain.cpp:1953-1954). Added to each output's
+  ## serialized size to estimate its on-disk UTXO-set footprint.
+  PerUtxoOverhead = 41'i64
+
+  ## Core WITNESS_SCALE_FACTOR (= 4); feerate is fee*4/weight (sat/vB).
+  GbsWitnessScaleFactor = 4'i64
+
+  ## Core MAX_BLOCK_SERIALIZED_SIZE, used only as the mintxsize sentinel
+  ## (rendered as 0 when no non-coinbase tx is present).
+  GbsMaxBlockSerializedSize = 4_000_000'i64
+
+proc txOutSerializeSize(outp: TxOut): int64 =
+  ## GetSerializeSize(CTxOut): 8-byte value + CompactSize(scriptlen) + script.
+  ## Computed by serializing into a counting buffer, the same idiom
+  ## handleGetBlock uses for stripped/full size.
+  var w = BinaryWriter()
+  w.writeTxOut(outp)
+  int64(w.data.len)
+
+proc calculateTruncatedMedian(scores: var seq[int64]): int64 =
+  ## Faithful port of Core CalculateTruncatedMedian (blockchain.cpp:1901):
+  ##   empty → 0; even count → integer mean of the two central elements
+  ##   (truncated toward zero); odd count → the central element. Sorts in place.
+  let n = scores.len
+  if n == 0:
+    return 0
+  scores.sort()
+  if n mod 2 == 0:
+    (scores[n div 2 - 1] + scores[n div 2]) div 2
+  else:
+    scores[n div 2]
+
+proc calculatePercentilesByWeight(scores: var seq[tuple[rate, weight: int64]],
+                                  totalWeight: int64): seq[int64] =
+  ## Faithful port of Core CalculatePercentilesByWeight (blockchain.cpp:1916):
+  ## the [10th,25th,50th,75th,90th] feerate percentiles selected by cumulative
+  ## WEIGHT (not by count). scores are sorted by feerate ascending; a percentile
+  ## boundary at total_weight*p is crossed by accumulating each element's weight;
+  ## any remaining percentiles are filled with the largest feerate. An empty
+  ## score set yields all zeros.
+  result = newSeq[int64](GetBlockStatsPercentiles)
+  if scores.len == 0:
+    return result
+
+  # Sort by feerate ascending; weight as a deterministic tie-break (matches the
+  # blockbrew port; Core's std::sort on std::pair orders by .first then .second).
+  scores.sort(proc (a, b: tuple[rate, weight: int64]): int =
+    if a.rate != b.rate:
+      (if a.rate < b.rate: -1 else: 1)
+    elif a.weight != b.weight:
+      (if a.weight < b.weight: -1 else: 1)
+    else:
+      0)
+
+  let weights = [
+    float64(totalWeight) / 10.0,
+    float64(totalWeight) / 4.0,
+    float64(totalWeight) / 2.0,
+    (float64(totalWeight) * 3.0) / 4.0,
+    (float64(totalWeight) * 9.0) / 10.0
+  ]
+
+  var nextIdx = 0
+  var cumulative: int64 = 0
+  for el in scores:
+    cumulative += el.weight
+    while nextIdx < GetBlockStatsPercentiles and float64(cumulative) >= weights[nextIdx]:
+      result[nextIdx] = el.rate
+      inc nextIdx
+  for i in nextIdx ..< GetBlockStatsPercentiles:
+    result[i] = scores[^1].rate
+
+proc computeBlockStats*(b: Block, height: int32, mediantime: int64,
+                        subsidy: int64,
+                        txInputPrevouts: seq[seq[TxOut]]): JsonNode =
+  ## Pure core of getblockstats: compute every statistic for `b`. Always emits
+  ## the full do_all object; the handler applies any stats-subset filter.
+  ##
+  ## `txInputPrevouts[k]` holds the spent prevout TxOuts for the k-th NON-coinbase
+  ## transaction, in transaction order (the coinbase is skipped). Both the value
+  ## (for fees) and the serialized size (for the utxo_size_inc deltas, which Core
+  ## subtracts GetSerializeSize(prevoutput)+PER_UTXO_OVERHEAD for) come from these.
+  ## The handler resolves them from undo/txindex/UTXO and refuses the call when a
+  ## non-coinbase tx's inputs are unavailable (so we never report a wrong fee).
+  ##
+  ## Direct port of the per-tx loop in blockchain.cpp:2074-2198.
+  var
+    maxFee:            int64 = 0
+    maxFeeRate:        int64 = 0
+    minFee:            int64 = int64(MaxMoney)
+    minFeeRate:        int64 = int64(MaxMoney)
+    totalOut:          int64 = 0
+    totalFee:          int64 = 0
+    inputs:            int64 = 0
+    maxTxSize:         int64 = 0
+    minTxSize:         int64 = GbsMaxBlockSerializedSize
+    outputs:           int64 = 0
+    swTotalSize:       int64 = 0
+    swTotalWeight:     int64 = 0
+    swTxs:             int64 = 0
+    totalSize:         int64 = 0
+    totalWeight:       int64 = 0
+    utxos:             int64 = 0   # spendable outputs created (actual numerator)
+    utxoSizeInc:       int64 = 0
+    utxoSizeIncActual: int64 = 0
+
+    feeArray:     seq[int64]
+    feerateArray: seq[tuple[rate, weight: int64]]
+    txsizeArray:  seq[int64]
+
+  let isGenesis = height == 0
+  var undoIdx = 0  # advances per non-coinbase tx, parallels txInputValues
+
+  for tx in b.txs:
+    let coinbase = isCoinbase(tx)
+    outputs += int64(tx.outputs.len)
+
+    var txTotalOut: int64 = 0
+    for outp in tx.outputs:
+      txTotalOut += int64(outp.value)
+
+      let outSize = txOutSerializeSize(outp) + PerUtxoOverhead
+      utxoSizeInc += outSize
+
+      # The Genesis block (and BIP30-repeat coinbases, N/A on these networks)
+      # do not change the UTXO-set counts; excluded from the actual counters.
+      # Core: blockchain.cpp:2088.
+      if isGenesis:
+        continue
+      # Unspendable outputs never enter the UTXO set.
+      if isUnspendable(outp.scriptPubKey):
+        continue
+      inc utxos
+      utxoSizeIncActual += outSize
+
+    if coinbase:
+      continue
+
+    inputs += int64(tx.inputs.len)  # coinbase's fake input not counted
+    totalOut += txTotalOut          # coinbase reward not counted
+
+    # Sizes / weight (always computed; matches Core's do_all path).
+    let txSize = int64(serialize(tx, includeWitness = true).len)
+    txsizeArray.add(txSize)
+    if txSize > maxTxSize: maxTxSize = txSize
+    if txSize < minTxSize: minTxSize = txSize
+    totalSize += txSize
+
+    let weight = int64(calculateTransactionWeight(tx))
+    totalWeight += weight
+
+    if isSegwit(tx):
+      inc swTxs
+      swTotalSize += txSize
+      swTotalWeight += weight
+
+    # Fee + utxo-delta math from the resolved spent prevouts. One entry per
+    # non-coinbase tx. Core subtracts each spent prevout's
+    # GetSerializeSize(prevoutput) + PER_UTXO_OVERHEAD from both utxo_size_inc
+    # counters (blockchain.cpp:2135-2137).
+    let prevOuts = txInputPrevouts[undoIdx]
+    inc undoIdx
+
+    var txTotalIn: int64 = 0
+    for po in prevOuts:
+      txTotalIn += int64(po.value)
+      let prevoutSize = txOutSerializeSize(po) + PerUtxoOverhead
+      utxoSizeInc -= prevoutSize
+      utxoSizeIncActual -= prevoutSize
+
+    let txFee = txTotalIn - txTotalOut
+    feeArray.add(txFee)
+    if txFee > maxFee: maxFee = txFee
+    if txFee < minFee: minFee = txFee
+    totalFee += txFee
+
+    var feerate: int64 = 0
+    if weight != 0:
+      feerate = (txFee * GbsWitnessScaleFactor) div weight
+    feerateArray.add((rate: feerate, weight: weight))
+    if feerate > maxFeeRate: maxFeeRate = feerate
+    if feerate < minFeeRate: minFeeRate = feerate
+
+  var feeratePercentiles = calculatePercentilesByWeight(feerateArray, totalWeight)
+
+  let nTx = int64(b.txs.len)
+  var nNonCoinbase = nTx - 1
+  if nNonCoinbase < 0: nNonCoinbase = 0
+
+  var avgFee: int64 = 0
+  var avgTxSize: int64 = 0
+  if nNonCoinbase > 0:
+    avgFee = totalFee div nNonCoinbase
+    avgTxSize = totalSize div nNonCoinbase
+  var avgFeeRate: int64 = 0
+  if totalWeight != 0:
+    avgFeeRate = (totalFee * GbsWitnessScaleFactor) div totalWeight
+
+  if minFee == int64(MaxMoney): minFee = 0
+  if minFeeRate == int64(MaxMoney): minFeeRate = 0
+  if minTxSize == GbsMaxBlockSerializedSize: minTxSize = 0
+
+  let medianFee = calculateTruncatedMedian(feeArray)
+  let medianTxSize = calculateTruncatedMedian(txsizeArray)
+
+  let blockHash = doubleSha256(serialize(b.header))
+
+  var feeratesJson = newJArray()
+  for fp in feeratePercentiles:
+    feeratesJson.add(%fp)
+
+  result = newJObject()
+  result["avgfee"]               = %avgFee
+  result["avgfeerate"]           = %avgFeeRate
+  result["avgtxsize"]            = %avgTxSize
+  result["blockhash"]            = %reverseHex(toHex(blockHash))
+  result["feerate_percentiles"]  = feeratesJson
+  result["height"]               = %height
+  result["ins"]                  = %inputs
+  result["maxfee"]               = %maxFee
+  result["maxfeerate"]           = %maxFeeRate
+  result["maxtxsize"]            = %maxTxSize
+  result["medianfee"]            = %medianFee
+  result["mediantime"]           = %mediantime
+  result["mediantxsize"]         = %medianTxSize
+  result["minfee"]               = %minFee
+  result["minfeerate"]           = %minFeeRate
+  result["mintxsize"]            = %minTxSize
+  result["outs"]                 = %outputs
+  result["subsidy"]              = %subsidy
+  result["swtotal_size"]         = %swTotalSize
+  result["swtotal_weight"]       = %swTotalWeight
+  result["swtxs"]                = %swTxs
+  result["time"]                 = %int64(b.header.timestamp)
+  result["total_out"]            = %totalOut
+  result["total_size"]           = %totalSize
+  result["total_weight"]         = %totalWeight
+  result["totalfee"]             = %totalFee
+  result["txs"]                  = %nTx
+  result["utxo_increase"]        = %(outputs - inputs)
+  result["utxo_size_inc"]        = %utxoSizeInc
+  result["utxo_increase_actual"] = %(utxos - inputs)
+  result["utxo_size_inc_actual"] = %utxoSizeIncActual
+
+proc handleGetBlockStats(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getblockstats hash_or_height ( stats )
+  ##
+  ## First arg = a block HEIGHT (JSON integer or numeric string) into the active
+  ## chain, OR a block HASH (hex). Optional second arg = array of stat names for
+  ## a subset (omit/empty = all 31 stats). Faithful port of Bitcoin Core
+  ## rpc/blockchain.cpp::getblockstats; matches its field set, percentile method
+  ## (weight-ranked) and undo-based fee computation byte-for-byte.
+  ##
+  ## Fees (per non-coinbase tx): fee = sum(input prevout values) - sum(output
+  ## values). Input prevout values come from the block's undo data (flat-file
+  ## BlockUndo / RocksDB undo map) with a txindex assist, exactly as
+  ## handleGetBlock's verbosity=2 fee path does. The coinbase is excluded from
+  ## every fee/feerate statistic but still counts toward txs / outs /
+  ## utxo_size_inc.
+  ##
+  ## Error codes (Core parity):
+  ##   -8  height negative / above tip / invalid selected statistic
+  ##   -5  block hash not found
+  if params.len < 1 or params[0].kind == JNull:
+    raise newRpcError(RpcInvalidParams, "Missing hash_or_height parameter")
+
+  # ── 1. Resolve the target block (Core ParseHashOrHeight). ───────────────────
+  # A JSON integer, or a string of digits (Core's frontend coerces a numeric
+  # string to the NUM arg type), is a height into the ACTIVE chain. Anything
+  # else is treated as a block hash.
+  var blockHash: BlockHash
+  var height: int32
+
+  let arg0 = params[0]
+  var asHeight: int64 = 0
+  var isHeightArg = false
+  if arg0.kind == JInt:
+    asHeight = arg0.getBiggestInt()
+    isHeightArg = true
+  elif arg0.kind == JString:
+    let s = arg0.getStr()
+    # numeric string → height; otherwise → hash (Core ParseHashOrHeight).
+    var allDigits = s.len > 0
+    var startIdx = 0
+    if s.len > 0 and (s[0] == '+' or s[0] == '-'):
+      startIdx = 1
+      if s.len == 1: allDigits = false
+    for i in startIdx ..< s.len:
+      if s[i] < '0' or s[i] > '9':
+        allDigits = false
+        break
+    if allDigits:
+      try:
+        asHeight = parseBiggestInt(s)
+        isHeightArg = true
+      except ValueError:
+        isHeightArg = false
+
+  if isHeightArg:
+    let tip = rpc.chainState.bestHeight
+    if asHeight < 0:
+      raise newRpcError(RpcInvalidParameter,
+        "Target block height " & $asHeight & " is negative")
+    if asHeight > int64(tip):
+      raise newRpcError(RpcInvalidParameter,
+        "Target block height " & $asHeight & " after current tip " & $tip)
+    let hashOpt = rpc.chainState.getBlockHashByHeight(int32(asHeight))
+    if hashOpt.isNone:
+      raise newRpcError(RpcInvalidParameter, "Block height out of range")
+    blockHash = hashOpt.get()
+    height = int32(asHeight)
+  else:
+    let hs = arg0.getStr()
+    # Core ParseHashV: a malformed hex hash is RPC_INVALID_PARAMETER (-8).
+    if hs.len != 64:
+      raise newRpcError(RpcInvalidParameter,
+        "hash_or_height must be of length 64 (not " & $hs.len & ", for '" & hs & "')")
+    try:
+      blockHash = parseBlockHash(hs)
+    except ValueError:
+      raise newRpcError(RpcInvalidParameter,
+        "hash_or_height must be hexadecimal string (not '" & hs & "')")
+    let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
+    if idxOpt.isNone:
+      raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+    height = idxOpt.get().height
+
+  # ── 2. Parse the optional stats filter (do_all when absent/empty). ──────────
+  var selected: HashSet[string]
+  let doAll = not (params.len >= 2 and params[1].kind == JArray and params[1].len > 0)
+  if not doAll:
+    for v in params[1]:
+      if v.kind != JString:
+        raise newRpcError(RpcInvalidParams, "stats entries must be strings")
+      selected.incl(v.getStr())
+
+  # ── 3. Load the block body. ─────────────────────────────────────────────────
+  if rpc.blockFileManager != nil and rpc.blockFileManager.isBlockPruned(blockHash):
+    raise newRpcError(RpcMiscError, "Block not available (pruned data)")
+  let blkOpt = rpc.chainState.db.getBlock(blockHash)
+  if blkOpt.isNone:
+    raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+  let b = blkOpt.get()
+
+  # ── 4. Resolve every non-coinbase tx's spent-prevout values. ────────────────
+  # Reuses handleGetBlock's verbosity=2 fee-resolution strategy verbatim:
+  #   1. txindex batch lookup (immune to undo-data corruption)
+  #   2. flat-file BlockUndo (per-tx, per-input prevOutputs)
+  #   3. RocksDB UndoData outpoint map (last resort)
+  # Fee stats require EVERY non-coinbase input to be resolvable; if any is
+  # missing we error rather than report a wrong fee (Core GetUndoChecked).
+  let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
+
+  # feeMap stores the full spent TxOut (value + scriptPubKey) so the helper can
+  # compute both the fee and the exact prevout serialized-size delta Core uses.
+  var feeMap: Table[OutPoint, TxOut]
+  block populateFeeMap:
+    # Phase 1: txindex batch lookup, grouped by creating block.
+    type TxRef = tuple[spendTxId: TxId, txIndex: int]
+    var blockNeeds: Table[BlockHash, seq[TxRef]]
+    var resolvedTxids: HashSet[TxId]
+    for txIter, txLoop in b.txs:
+      if txIter == 0: continue  # skip coinbase
+      for inp in txLoop.inputs:
+        if inp.prevOut.txid in resolvedTxids: continue
+        let locOpt = rpc.chainState.db.getTxIndex(inp.prevOut.txid)
+        if locOpt.isSome:
+          let loc = locOpt.get()
+          if loc.blockHash notin blockNeeds:
+            blockNeeds[loc.blockHash] = @[]
+          blockNeeds[loc.blockHash].add((inp.prevOut.txid, int(loc.txIndex)))
+          resolvedTxids.incl(inp.prevOut.txid)
+    for creatingBlockHash, refs in blockNeeds:
+      let creatingBlkOpt = rpc.chainState.db.getBlock(creatingBlockHash)
+      if creatingBlkOpt.isNone: continue
+      let creatingBlk = creatingBlkOpt.get()
+      for r in refs:
+        if r.txIndex >= creatingBlk.txs.len: continue
+        let creatingTx = creatingBlk.txs[r.txIndex]
+        for voutIdx, creatingOut in creatingTx.outputs:
+          feeMap[OutPoint(txid: r.spendTxId, vout: uint32(voutIdx))] = creatingOut
+
+    # Phase 3: RocksDB undo map (only fills outpoints txindex missed).
+    let undoOpt = rpc.chainState.db.getUndoData(blockHash)
+    if undoOpt.isSome:
+      for (op, entry) in undoOpt.get().spentOutputs:
+        if op notin feeMap:
+          feeMap[op] = entry.output
+
+  # Phase 2: flat-file BlockUndo (per-tx, per-input prevOutputs).
+  var blockUndoLoaded: Option[BlockUndo]
+  if idxOpt.isSome:
+    blockUndoLoaded = rpc.chainState.getBlockUndoFromFile(idxOpt.get(),
+                                                          b.header.prevBlock)
+
+  var txInputPrevouts: seq[seq[TxOut]]
+  var txUndoCounter = 0  # index into BlockUndo.txUndo (per non-coinbase tx)
+  for txIdx, tx in b.txs:
+    if txIdx == 0:
+      continue  # coinbase: no spent prevouts
+    var inPrev: seq[TxOut]
+    for inpIdx, inp in tx.inputs:
+      var resolved = false
+      var po: TxOut
+      if inp.prevOut in feeMap:
+        po = feeMap[inp.prevOut]
+        resolved = true
+      elif blockUndoLoaded.isSome:
+        let bu = blockUndoLoaded.get()
+        if txUndoCounter < bu.txUndo.len:
+          let txUndo = bu.txUndo[txUndoCounter]
+          if inpIdx < txUndo.prevOutputs.len:
+            po = txUndo.prevOutputs[inpIdx].output
+            resolved = true
+      if not resolved:
+        # Cannot compute a correct fee for this block — refuse rather than
+        # report wrong fee stats. Mirrors Core GetUndoChecked throwing.
+        raise newRpcError(RpcMiscError,
+          "Undo data unavailable for block (cannot compute fees)")
+      inPrev.add(po)
+    inc txUndoCounter
+    txInputPrevouts.add(inPrev)
+
+  # ── 5. Compute every statistic, then apply any subset filter. ───────────────
+  let mediantime = int64(getMtpForHeight(rpc.chainState.db, height))
+  let subsidy = int64(getBlockSubsidy(height, rpc.params))
+  let full = computeBlockStats(b, height, mediantime, subsidy, txInputPrevouts)
+
+  if doAll:
+    return full
+
+  var ret = newJObject()
+  for name in selected:
+    if not full.hasKey(name):
+      raise newRpcError(RpcInvalidParameter,
+        "Invalid selected statistic '" & name & "'")
+    ret[name] = full[name]
+  ret
+
 proc handleGetDeploymentInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Return deployment info for soft forks at a given block (or chain tip).
   ## Reference: Bitcoin Core rpc/blockchain.cpp getdeploymentinfo
@@ -5175,6 +5636,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "getblockfilter \"blockhash\" ( \"filtertype\" )",
     "getblockhash height",
     "getblockheader \"blockhash\" ( verbose )",
+    "getblockstats hash_or_height ( stats )",
     "getchaintips",
     "getchaintxstats ( nblocks \"blockhash\" )",
     "getdeploymentinfo ( \"blockhash\" )",
@@ -9426,6 +9888,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetDeploymentInfo(params)
   of "getchaintxstats":
     rpc.handleGetChainTxStats(params)
+  of "getblockstats":
+    rpc.handleGetBlockStats(params)
   of "getindexinfo":
     rpc.handleGetIndexInfo(params)
   of "getblockfilter":
