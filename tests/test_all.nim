@@ -39,6 +39,7 @@ import ./test_encrypt
 import ./test_label
 import ./test_wallet_persist
 import ./test_rpc
+import ./test_getnodeaddresses
 import ./test_rpc_thread_lifetime
 import ./test_perf
 import ./test_sequence_lock
