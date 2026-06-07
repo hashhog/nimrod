@@ -11,7 +11,7 @@ import ../consensus/[params, validation, chain, versionbits]
 import ../storage/[chainstate, blockstore, snapshot, pruner]
 import ../storage/indexes/blockfilterindex
 import ../storage/indexes/gcs as gcsMod
-import ../mempool/[mempool, package, persist]
+import ../mempool/[mempool, package, persist, orphan]
 import ../crypto/[hashing, secp256k1, address, signmessage]
 import ../network/[peer, peermanager, banman, messages, asmap, netgroup]
 import ../mining/[fees, blocktemplate]
@@ -64,6 +64,10 @@ type
     netGroupManager*: NetGroupManager    ## Optional ASMap manager; nil / empty = /16 fallback.
                                          ## Wired by startNode when --asmap is given.
                                          ## Used by getpeerinfo to populate mapped_as.
+    orphanPool*: OrphanPool              ## Optional tx orphanage (src/mempool/orphan.nim);
+                                         ## holds txs whose parents we haven't seen yet.
+                                         ## Wired by startNode; consumed by getorphantxs.
+                                         ## nil on test rigs that don't exercise orphans.
 
   RpcRequest = object
     jsonrpc: string
@@ -2228,6 +2232,91 @@ proc handleLoadMempool(rpc: RpcServer, params: JsonNode): JsonNode =
     "expired":      counts.expired,
     "alreadythere": counts.alreadyThere
   }
+
+proc orphanToJson(rpc: RpcServer, entry: OrphanEntry): JsonNode =
+  ## Build the verbosity>=1 per-orphan object for getorphantxs.
+  ## Mirrors bitcoin-core/src/rpc/mempool.cpp OrphanToJSON / OrphanDescription
+  ## EXACTLY (verified against rpc/mempool.cpp:1217-1231), in this field order:
+  ##   txid, wtxid, bytes (ComputeTotalSize), vsize (BIP141), weight (BIP141),
+  ##   from (array of announcing peers).
+  ## There is NO `expiration` field in Core's OrphanToJSON — do not add one.
+  ##
+  ## Notes vs Core:
+  ##  - `bytes` = entry.size, which addOrphan stored as the with-witness
+  ##    serialized length (Core: CTransaction::ComputeTotalSize()).
+  ##  - `vsize` / `weight` are computed exactly like getrawtransaction /
+  ##    getmempoolentry: weight via calculateTransactionWeight, vsize = ceil(weight/4).
+  ##  - `from` is Core's array of numeric peer ids. nimrod's orphan pool keys
+  ##    announcers by (address, port) rather than a numeric NodeId, so we emit a
+  ##    1-element array of "address:port". A blank announcer (address == "" and
+  ##    port == 0) yields an empty array. The pool tracks a single announcer per
+  ##    orphan today, so the array is at most one element.
+  let txid = entry.txid
+  let wtxid = entry.wtxid
+  let weight = validation.calculateTransactionWeight(entry.tx)
+  let vsize = (weight + 3) div 4
+
+  result = %*{
+    "txid": reverseHex(toHex(array[32, byte](txid))),
+    "wtxid": reverseHex(toHex(array[32, byte](wtxid))),
+    "bytes": entry.size,
+    "vsize": vsize,
+    "weight": weight
+  }
+
+  var fromArr = newJArray()
+  # Empty / sentinel announcer → empty array (best-effort, see from_peer_source).
+  if not (entry.fromPeer.address.len == 0 and entry.fromPeer.port == 0'u16):
+    fromArr.add(%(entry.fromPeer.address & ":" & $entry.fromPeer.port))
+  result["from"] = fromArr
+
+proc handleGetOrphanTxs(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getorphantxs ( verbosity )
+  ## Shows transactions in the tx orphanage. EXPERIMENTAL (mirrors Core v28+).
+  ## Reference: bitcoin-core/src/rpc/mempool.cpp getorphantxs.
+  ##   verbosity 0 → array of txid strings (Core: orphan.tx->GetHash(), the
+  ##                 NON-witness txid; "may contain duplicates")
+  ##   verbosity 1 → array of { txid, wtxid, bytes, vsize, weight, from }
+  ##   verbosity 2 → verbosity-1 objects PLUS "hex" (serialized, hex-encoded tx)
+  ## Out-of-range verbosity → RPC_INVALID_PARAMETER (-8) with Core's message.
+
+  # Parse optional verbosity (default 0). Core: ParseVerbosity(..., default=0,
+  # allow_bool=false), so a BOOLEAN argument must be REJECTED (not mapped to
+  # 0/1). We accept only a JSON integer; any other kind (including JBool)
+  # raises an error, matching allow_bool=false.
+  var verbosity = 0
+  if params.len >= 1 and params[0].kind != JNull:
+    if params[0].kind == JInt:
+      verbosity = params[0].getInt()
+    else:
+      raise newRpcError(RpcInvalidParameter,
+        "JSON value of type " & $params[0].kind & " is not of expected type number")
+
+  if verbosity < 0 or verbosity > 2:
+    raise newRpcError(RpcInvalidParameter,
+      "Invalid verbosity value " & $verbosity)
+
+  var ret = newJArray()
+  if rpc.orphanPool == nil:
+    return ret  # No orphanage wired (test rig / pre-startup): empty array.
+
+  if verbosity == 0:
+    # Array of orphan txids. Core pushes orphan.tx->GetHash().ToString(), the
+    # NON-witness txid (help: "0 for an array of txids (may contain
+    # duplicates)"). The orphanage is keyed by wtxid, but the emitted value is
+    # the txid, so iterate entries and emit entry.txid (NOT the wtxid key).
+    for wtxid, entry in rpc.orphanPool.entries:
+      ret.add(%reverseHex(toHex(array[32, byte](entry.txid))))
+  elif verbosity == 1:
+    for wtxid, entry in rpc.orphanPool.entries:
+      ret.add(orphanToJson(rpc, entry))
+  else:  # verbosity == 2
+    for wtxid, entry in rpc.orphanPool.entries:
+      var o = orphanToJson(rpc, entry)
+      o["hex"] = %toHex(serialize(entry.tx, includeWitness = true))
+      ret.add(o)
+
+  ret
 
 # Raw transaction RPCs
 
@@ -9933,6 +10022,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   of "savemempool":
     # Bitcoin Core alias for dumpmempool. Keep parity.
     rpc.handleDumpMempool(params)
+  of "getorphantxs":
+    rpc.handleGetOrphanTxs(params)
 
   # Raw transactions
   of "getrawtransaction":
