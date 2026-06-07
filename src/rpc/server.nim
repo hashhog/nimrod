@@ -6513,6 +6513,15 @@ proc handleScanTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
     let amount = int64(entry.output.value)
     totalIn += amount
 
+    # Canonical hash of the active-chain block at the coin's height
+    # (Core: tip->GetAncestor(coin.nHeight)->GetBlockHash().GetHex()).
+    let blockHashOpt = rpc.chainState.getBlockHashByHeight(entry.height)
+    let blockHashHex =
+      if blockHashOpt.isSome:
+        reverseHex(toHex(array[32, byte](blockHashOpt.get())))
+      else:
+        ""
+
     let unspent = %*{
       "txid": reverseHex(toHex(array[32, byte](outpoint.txid))),
       "vout": outpoint.vout,
@@ -6521,6 +6530,7 @@ proc handleScanTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
       "amount": btcAmountNode(amount),
       "coinbase": entry.isCoinbase,
       "height": entry.height,
+      "blockhash": blockHashHex,
       "confirmations": tipHeight - entry.height + 1
     }
     unspents.add(unspent)
