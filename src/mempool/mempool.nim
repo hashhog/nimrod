@@ -1358,9 +1358,17 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # 1406).  After TrimToSize, our own tx may have been evicted (its feerate
   # is no longer above the new rolling floor).  Core returns
   # TX_RECONSIDERABLE / "mempool full" so the package layer can retry.
+  # CPFP: package members (args.packageFeerates) bypass the per-tx post-trim
+  # floor for the same reason they bypass the pre-trim min-fee gate above
+  # (GAP #6) — the package's AGGREGATE feerate was already validated, so a
+  # low-fee parent paid for by a high-fee child must not be rejected here.
+  # Core gates the equivalent CheckFeeRate on !m_package_feerates
+  # (validation.cpp:948); the post-trim path (TrimToSize) is only reached on
+  # the non-package single-tx submission flow.
   let rollingFloorAfter = mp.getMinFee()
   let effectiveMinFeeRateAfter = max(mp.minFeeRate, rollingFloorAfter)
-  if not args.bypassLimits and feeRate < effectiveMinFeeRateAfter:
+  if not args.bypassLimits and not args.packageFeerates and
+     feeRate < effectiveMinFeeRateAfter:
     return err(AtmpAcceptInfo,
                "mempool full: post-eviction floor " & $effectiveMinFeeRateAfter &
                " > tx feerate " & $feeRate)
@@ -2240,128 +2248,77 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
     result.error = "one or more transactions failed validation"
     return result
 
-  # Second pass: verify scripts and add to mempool
-  let scriptFlags = getBlockScriptFlags(mp.chainState.bestHeight, mp.params)
-  packageUtxos.clear()
+  # Second pass: route every member through the SAME single-tx admission
+  # pipeline (acceptTransactionWithArgs) the P2P/RPC single-tx path uses.
+  #
+  # DoS fix (package-relay PreChecks BYPASS): the previous two-pass logic
+  # inserted package members into the mempool after running only fee math + a
+  # bare verifyScript loop, silently skipping every other PreCheck the
+  # single-tx path enforces — IsStandardTx (version/dust/scriptSig/
+  # scriptPubKey/bare-multisig), IsWitnessStandard, ValidateInputsStandardness,
+  # the MAX_P2SH_SIGOPS + sigop-cost caps, BIP-68 sequence locks, the
+  # final-tx (BIP-113) check, RBF conflict detection (findConflicts +
+  # checkRbfRules), TRUC inheritance, the witness-stripped guard, and the
+  # consensus-flag script re-verification.  An attacker could smuggle a
+  # non-standard / conflicting / invalid-script tx into the mempool (and thus
+  # into relay) by wrapping it in a submitpackage / pkgtxns call.
+  #
+  # Core runs full PreChecks for EVERY package member
+  # (validation.cpp AcceptMultipleTransactionsInternal:1432-1556 invokes
+  # PreChecks per member, then PolicyScriptChecks at :1538).  We now do the
+  # same by calling acceptTransactionWithArgs in package (topological) order so
+  # an intra-package parent is already in mp.entries when its child resolves
+  # inputs.
+  #
+  # CPFP PRESERVED: the per-member AtmpArgs set packageFeerates=true, which is
+  # the ONLY thing that changes vs. a normal single-tx submission — it skips
+  # the per-tx absolute + rolling min-fee floor (mempool.nim GAP #6 / GAP #12,
+  # Core validation.cpp:948) because step 6 above already validated the
+  # AGGREGATE package feerate against the relay floor.  So a low-fee parent
+  # bailed out by a high-fee child still enters; all standardness/dust/script/
+  # RBF gates still run.  These flags mirror Core's
+  # ATMPArgs::PackageChildWithParents (allow_replacement=true,
+  # allow_sibling_eviction=false, package_submission=true,
+  # package_feerates=true; validation.cpp:515-528).
+  let memberArgs = AtmpArgs(
+    testAccept: false,
+    bypassLimits: false,
+    allowReplacement: true,
+    allowSiblingEviction: false,  # Core: sibling-eviction is single-tx only
+    packageFeerates: true,        # CPFP: skip the per-tx fee floor (GAP #6/#12)
+    clientMaxFeeRateSatKvB: 0.0,
+  )
+
+  # Track members WE inserted so the package is atomic: roll back in reverse
+  # (children before parents) on any mid-package rejection.
+  var inserted: seq[TxId]
 
   for i, tx in txns:
     let txid = txids[i]
 
-    # Skip if already in mempool
+    # Already-in-mempool members are not re-validated; they count as part of
+    # the package (Core skips them in AcceptMultipleTransactions).
     if txid in mp.entries:
-      # Update package UTXOs
-      for j, output in tx.outputs:
-        packageUtxos[OutPoint(txid: txid, vout: uint32(j))] = output
+      result.txResults[i].allowed = true
       continue
 
-    # Verify scripts
-    for inputIdx, input in tx.inputs:
-      var scriptPubKey: seq[byte]
-      var amount: Satoshi
-
-      let utxo = mp.chainState.getUtxo(input.prevOut)
-      if utxo.isSome:
-        scriptPubKey = utxo.get().output.scriptPubKey
-        amount = utxo.get().output.value
-      elif input.prevOut in packageUtxos:
-        scriptPubKey = packageUtxos[input.prevOut].scriptPubKey
-        amount = packageUtxos[input.prevOut].value
-      elif input.prevOut.txid in mp.entries:
-        let parentEntry = mp.entries[input.prevOut.txid]
-        let parentOutput = parentEntry.tx.outputs[input.prevOut.vout]
-        scriptPubKey = parentOutput.scriptPubKey
-        amount = parentOutput.value
-      else:
-        result.txResults[i].allowed = false
-        result.txResults[i].error = "input not found during script verification"
-        result.state = pvTx
-        result.error = "script verification failed for tx " & $i
-        return result
-
-      var witness: seq[seq[byte]] = @[]
-      if inputIdx < tx.witnesses.len:
-        witness = tx.witnesses[inputIdx]
-
-      let verified = verifyScript(
-        input.scriptSig,
-        scriptPubKey,
-        tx,
-        inputIdx,
-        amount,
-        scriptFlags,
-        witness
-      )
-
-      if not verified:
-        result.txResults[i].allowed = false
-        result.txResults[i].error = "script verification failed for input " & $inputIdx
-        result.state = pvTx
-        result.error = "script verification failed for tx " & $i
-        return result
-
-    # Add this tx's outputs to package UTXOs
-    for j, output in tx.outputs:
-      packageUtxos[OutPoint(txid: txid, vout: uint32(j))] = output
-
-  # Third pass: add all valid transactions to mempool
-  for i, tx in txns:
-    let txid = txids[i]
-
-    # Skip if already in mempool
-    if txid in mp.entries:
-      continue
-
-    let weight = weights[i]
-    let fee = fees[i]
-    let vbytes = float64(weight) / 4.0
-    let feeRate = float64(int64(fee)) / vbytes
-    let vsizeInt = (weight + 3) div 4
-
-    # Calculate ancestor stats
-    let (ancestorFee, ancestorWeight) = mp.calculateAncestorFeesAndWeight(tx, fee, weight)
-    let (ancestorCount, ancestorSize) = mp.calculateAncestorStats(tx, vsizeInt)
-
-    # Check package limits
-    let packageLimitsResult = mp.checkPackageLimits(tx, weight)
-    if not packageLimitsResult.isOk:
+    let memberRes = acceptTransactionWithArgs(mp, tx, crypto, memberArgs)
+    if not memberRes.isOk:
       result.txResults[i].allowed = false
-      result.txResults[i].error = "package limits: " & packageLimitsResult.error
-      result.state = pvMempoolError
-      result.error = "package limits exceeded for tx " & $i
+      result.txResults[i].error = memberRes.error
+      result.state = pvTx
+      result.error = "package member " & $i & " rejected: " & memberRes.error
+      # Atomic rollback: undo everything we admitted so far, children first.
+      for k in countdown(inserted.high, 0):
+        mp.removeTransaction(inserted[k])
       return result
 
-    # Check mempool size - evict if needed
-    let txSize = serialize(tx).len
-    while mp.currentSize + txSize > mp.maxSize:
-      mp.evictLowestFee()
-      if mp.entries.len == 0:
-        break
-
-    # Create entry
-    let wtxid = tx.wtxid()
-    let entry = MempoolEntry(
-      tx: tx,
-      txid: txid,
-      wtxid: wtxid,
-      fee: fee,
-      weight: weight,
-      feeRate: feeRate,
-      timeAdded: getTime(),
-      height: mp.chainState.bestHeight,
-      ancestorFee: ancestorFee,
-      ancestorWeight: ancestorWeight,
-      ancestorCount: ancestorCount,
-      ancestorSize: ancestorSize
-    )
-
-    # Add to mempool
-    mp.entries[txid] = entry
-    mp.byWtxid[wtxid] = txid
-    mp.currentSize += txSize
-
-    # Track spent outpoints
-    for input in tx.inputs:
-      mp.spentBy[input.prevOut] = txid
+    # Surface the authoritative fee/vsize the single-tx path computed (it
+    # accounts for sigop-adjusted vsize + modified fees), and mark allowed.
+    result.txResults[i].allowed = true
+    result.txResults[i].fees = memberRes.value.baseFee
+    result.txResults[i].vsize = memberRes.value.vsize
+    inserted.add(txid)
 
   result.valid = true
   result.state = pvUnset
