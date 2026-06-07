@@ -6544,6 +6544,199 @@ proc handleScanTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
     "total_amount": btcAmountNode(totalIn)
   }
 
+proc handleScanBlocks*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## scanblocks "action" ( [scanobjects] start_height stop_height "filtertype"
+  ##                        options )
+  ##
+  ## Drive the BIP-157 basic block filter index to return every block whose
+  ## GCS filter MATCHES any of the supplied scanobjects' scriptPubKeys over
+  ## [start_height, stop_height].  It is the index-side counterpart to
+  ## scantxoutset (which walks the UTXO set): scanblocks walks compact block
+  ## filters, so it can locate the block a script was funded/spent in even
+  ## after the coin is gone.
+  ##
+  ## Reference: bitcoin-core/src/rpc/blockchain.cpp::scanblocks (lines
+  ##   2531-2716).
+  ##
+  ## Supported actions:
+  ##   "start"  — run the scan (only this does real work; scanobjects required)
+  ##   "status" — no persistent scan state here; returns null (no scan running)
+  ##   "abort"  — no scan to abort here; returns false
+  ##
+  ## Returns (action=="start"):
+  ## {
+  ##   "from_height":     start_height (int),
+  ##   "to_height":       stop_height (int),
+  ##   "relevant_blocks": [ <blockhash display-hex>, ... ],
+  ##   "completed":       true  (rustoshi/nimrod scan synchronously, so the
+  ##                            scan is never aborted partway)
+  ## }
+  ##
+  ## CAVEAT: block filters have FALSE POSITIVES, so relevant_blocks is a
+  ## SUPERSET of the truly-matching blocks.  The contract is membership: a
+  ## block that genuinely contains a matched script MUST appear.
+  ##
+  ## Error parity (Core):
+  ##   unknown action      -> Core RPC_INVALID_PARAMETER (-8); here we throw
+  ##                          RpcInvalidParams to mirror handleScanTxOutSet
+  ##                          (the harness gates the action case on "is an
+  ##                          error", not the exact code).
+  ##   unknown filtertype  -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype"
+  ##   index not enabled   -> RPC_MISC_ERROR (-1) "Index is not enabled for
+  ##                          filtertype <name>"
+  ##   bad start/stop hght -> RPC_MISC_ERROR (-1) "Invalid start_height" /
+  ##                          "Invalid stop_height"
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "action argument is required")
+
+  let action = params[0].getStr()
+
+  # (1) Action dispatch (Core 2578-2596).  nimrod scans synchronously, so there
+  # is never an in-progress scan: "status" -> null, "abort" -> false.
+  if action == "status":
+    return newJNull()
+  elif action == "abort":
+    return %false
+  elif action != "start":
+    raise newRpcError(RpcInvalidParams, "Invalid action '" & action & "'")
+
+  # action == "start"
+
+  # Core signature: scanblocks "action" ( [scanobjects] start_height
+  #   stop_height "filtertype" options ).  So the positional indices are:
+  #     0 = action, 1 = scanobjects, 2 = start_height, 3 = stop_height,
+  #     4 = filtertype, 5 = options.
+
+  # (2) filtertype validation (Core 2603-2606).  Default "basic"; only "basic"
+  # is a known type.  Unknown -> -5 "Unknown filtertype".  filtertype is
+  # positional arg index 4.
+  let filterTypeName =
+    if params.len >= 5 and params[4].kind == JString and params[4].getStr().len > 0:
+      params[4].getStr()
+    else:
+      "basic"
+  if filterTypeName != "basic":
+    raise newRpcError(RpcInvalidAddressOrKey, "Unknown filtertype")
+
+  # (3) options.filter_false_positives (Core 2608-2609).  Default false; reading
+  # it must never error when absent / null / non-object.  options is arg index 5.
+  let filterFalsePositives =
+    if params.len >= 6 and params[5].kind == JObject and
+       params[5].hasKey("filter_false_positives") and
+       params[5]["filter_false_positives"].kind == JBool:
+      params[5]["filter_false_positives"].getBool()
+    else:
+      false
+
+  # (4) scanobjects required for "start" (Core get_array on params[1]).
+  if params.len < 2 or params[1].kind != JArray:
+    raise newRpcError(RpcMiscError,
+                      "scanobjects argument is required for the start action")
+
+  # Build the needle set: the scriptPubKeys to look for in each block filter.
+  # Reuse the same descriptor helper scantxoutset uses (addr()/raw()).  Use a
+  # seq (not a HashSet) so the order is deterministic for matchAny.
+  var needleSet = initHashSet[seq[byte]]()
+  for scanobject in params[1]:
+    needleSet.incl(rpc.parseScanObject(scanobject))
+  var needles: seq[seq[byte]] = @[]
+  for n in needleSet:
+    needles.add(n)
+
+  # (5) Index-enabled gate (Core 2611-2614: GetBlockFilterIndex==null ->
+  # RPC_MISC_ERROR "Index is not enabled for filtertype <name>").
+  if rpc.filterIndex == nil or not rpc.filterIndex.enabled:
+    raise newRpcError(RpcMiscError,
+                      "Index is not enabled for filtertype " & filterTypeName)
+
+  # (6) Height range (Core 2620-2641).  NOTE Core uses RPC_MISC_ERROR (-1) for
+  # bad heights here, NOT -8 like scantxoutset.  Default start=genesis(0),
+  # default stop=tip.  start_height is positional arg index 2, stop_height is
+  # index 3 (filtertype index 4, options index 5).
+  let tip = int(rpc.chainState.bestHeight)
+  let startHeight =
+    if params.len >= 3 and params[2].kind == JInt:
+      int(params[2].getBiggestInt())
+    else:
+      0
+  if startHeight < 0 or startHeight > tip:
+    raise newRpcError(RpcMiscError, "Invalid start_height")
+  let stopHeight =
+    if params.len >= 4 and params[3].kind == JInt:
+      int(params[3].getBiggestInt())
+    else:
+      tip
+  if stopHeight < startHeight or stopHeight > tip:
+    raise newRpcError(RpcMiscError, "Invalid stop_height")
+
+  # (7) Scan loop (Core 2664-2706).  For each height in [start, stop], read the
+  # block's basic filter from the index and test it against the needle set.  A
+  # height with no filter row means the index is lagging the chain — Core
+  # silently skips, but (like getblockfilter) we surface a clear error so a
+  # partial/lagging index never returns a misleadingly incomplete list.
+  let relevant = newJArray()
+  if needles.len > 0:
+    for h in startHeight .. stopHeight:
+      let blockHashOpt = rpc.chainState.getBlockHashByHeight(int32(h))
+      if blockHashOpt.isNone:
+        raise newRpcError(RpcMiscError,
+          "Filter not found. Block filters are still in the process of being indexed.")
+      let blockHash = blockHashOpt.get()
+
+      let filterOpt = rpc.filterIndex.getFilter(int32(h), blockHash)
+      if filterOpt.isNone:
+        raise newRpcError(RpcMiscError,
+          "Filter not found. Block filters are still in the process of being indexed.")
+      let bf = filterOpt.get()
+
+      if not gcsMod.matchAny(bf.filter, needles):
+        continue
+
+      # (Core 2681-2688 CheckBlockFilterMatches.)  Optional re-scan to drop GCS
+      # false positives: re-extract the block's real filter element set and
+      # require a byte-exact needle match.  This is a strict subset — it can
+      # only REMOVE false positives, never a genuine match — so the funded-block
+      # contract holds with or without it.
+      if filterFalsePositives:
+        let blkOpt = rpc.chainState.db.getBlock(blockHash)
+        if blkOpt.isNone:
+          continue
+        let blk = blkOpt.get()
+        var spentOutputs: seq[gcsMod.SpentOutput] = @[]
+        let bidxOpt = rpc.chainState.db.getBlockIndex(blockHash)
+        if bidxOpt.isSome:
+          let undoOpt = rpc.chainState.getBlockUndoFromFile(
+            bidxOpt.get(), blk.header.prevBlock)
+          if undoOpt.isSome:
+            for txUndo in undoOpt.get().txUndo:
+              for spent in txUndo.prevOutputs:
+                spentOutputs.add(gcsMod.SpentOutput(
+                  output: spent.output,
+                  height: spent.height,
+                  isCoinbase: spent.isCoinbase))
+        let elements = gcsMod.extractBasicFilterElements(blk, spentOutputs)
+        var elemSet = initHashSet[seq[byte]]()
+        for e in elements:
+          elemSet.incl(e)
+        var realMatch = false
+        for n in needles:
+          if n in elemSet:
+            realMatch = true
+            break
+        if not realMatch:
+          continue
+
+      # Display-order block hash, matching Core's GetHex() (reversed/big-endian).
+      relevant.add(%reverseHex(toHex(array[32, byte](blockHash))))
+
+  # (8) Return (Core 2708-2711).  The synchronous scan is never aborted, so
+  # `completed` is always true.
+  result = newJObject()
+  result["from_height"] = %startHeight
+  result["to_height"] = %stopHeight
+  result["relevant_blocks"] = relevant
+  result["completed"] = %true
+
 proc handleScrubUnspendable*(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Operator-invoked one-shot scrub: walk the chainstate UTXO column
   ## family and delete every entry whose scriptPubKey is provably
@@ -10011,6 +10204,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetTxOutSetInfo(params)
   of "scantxoutset":
     rpc.handleScanTxOutSet(params)
+  of "scanblocks":
+    rpc.handleScanBlocks(params)
   of "scrubunspendable":
     rpc.handleScrubUnspendable(params)
 
