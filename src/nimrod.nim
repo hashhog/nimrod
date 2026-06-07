@@ -2428,6 +2428,10 @@ proc startNode*(config: NimrodConfig) {.async.} =
     # W115 FIX-50: netGroupManager is always non-nil after step 5a above;
     # usingAsmap() returns false when no file was given / load failed.
     state.rpcServer.netGroupManager = state.netGroupManager
+    # Wire the tx orphanage so getorphantxs can enumerate held orphans.
+    # Same OrphanPool the message-dispatch path adds to (state.orphanPool);
+    # nil-safe in the handler for test rigs that don't run a live pool.
+    state.rpcServer.orphanPool = state.orphanPool
     # Wire the multi-wallet manager so createwallet / loadwallet / getnewaddress
     # and the rest of the wallet RPCs work. Without this the field stays nil and
     # every wallet handler early-returns "wallet functionality not enabled".
