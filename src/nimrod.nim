@@ -8,7 +8,7 @@ import chronicles
 import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
 import ./storage/[db, chainstate, snapshot, blockstore, pruner, undo]
-import ./storage/indexes/[blockfilterindex, gcs]
+import ./storage/indexes/[blockfilterindex, gcs, coinstatsindex]
 import ./network/[peer, peermanager, sync, messages, compact_blocks, asmap, netgroup]
 import ./mempool/[mempool, persist, orphan]
 import ./mining/fees
@@ -86,6 +86,15 @@ type
                             ## return data; without it those endpoints
                             ## report "Index is not enabled for filtertype
                             ## basic" (HTTP 400) — same as Core.
+    coinstatsindex*: bool   ## --coinstatsindex: maintain the per-height UTXO
+                            ## set statistics index (running MuHash3072 +
+                            ## counts/amounts, folded forward on every block
+                            ## connect and reversed on disconnect/reorg).
+                            ## Mirrors Bitcoin Core's `-coinstatsindex`.
+                            ## Required for `gettxoutsetinfo` to answer a
+                            ## historical `hash_or_height`; without it that
+                            ## form errors RPC -8 "Querying specific block
+                            ## heights requires coinstatsindex" (Core parity).
     peerblockfilters*: bool ## --peerblockfilters: serve BIP-157 compact
                             ## filters to peers and advertise
                             ## NODE_COMPACT_FILTERS (1<<6 = 64) in our
@@ -181,6 +190,13 @@ type
                                           ## not set. Wired into RestServer
                                           ## so /rest/blockfilter[headers]
                                           ## can read it.
+    coinStatsIndex*: CoinStatsIndex       ## Per-height UTXO-set statistics
+                                          ## index (running MuHash + counts).
+                                          ## nil when --coinstatsindex is not
+                                          ## set. Wired into RpcServer so
+                                          ## gettxoutsetinfo can answer a
+                                          ## historical hash_or_height and
+                                          ## getindexinfo can report it.
     restServer*: RestServer               ## Optional /rest/* HTTP server.
                                           ## nil when --rest is not set.
     restThread*: Thread[RestServer]       ## REST listener runs on its own
@@ -245,6 +261,7 @@ proc defaultConfig*(): NimrodConfig =
     restEnabled: false,
     restPort: 0,            # 0 = derive from rpcPort (rpcPort + 1000)
     blockfilterindex: false,
+    coinstatsindex: false,    # Core parity: DEFAULT_COINSTATSINDEX = false
     peerblockfilters: false,  # Core parity: DEFAULT_PEERBLOCKFILTERS = false
     asmapFile: "",          # empty = ASMap disabled
     # W117 FIX-56 proxy flags (all default off)
@@ -358,10 +375,22 @@ proc loadConfigFile*(config: var NimrodConfig) =
         config.blockfilterindex = true
       elif v in ["0", "false", "no"]:
         config.blockfilterindex = false
+    of "coinstatsindex":
+      # Core's `-coinstatsindex` boolean: maintain the per-height UTXO-set
+      # statistics index used to answer gettxoutsetinfo at a historical height.
+      let v = value.toLowerAscii()
+      if v in ["", "1", "true", "yes"]:
+        config.coinstatsindex = true
+      elif v in ["0", "false", "no"]:
+        config.coinstatsindex = false
     of "peerblockfilters":
       # W121 G15 / FIX-71: serve BIP-157 compact filters to peers and
       # advertise NODE_COMPACT_FILTERS.  Default OFF (Core parity).
       config.peerblockfilters = value.toLowerAscii() in ["", "1", "true", "yes"]
+    of "txindex":
+      # Accepted for Core CLI parity; nimrod always maintains the tx index
+      # (cfTxIndex).  No separate toggle — see the command-line handler.
+      discard
     of "asmap":
       config.asmapFile = value
     of "proxy":
@@ -456,6 +485,10 @@ Operational:
                          for the /rest/blockfilter[headers] endpoints to
                          return data. Mirrors Bitcoin Core
                          -blockfilterindex=basic.
+  --coinstatsindex       Maintain the per-height UTXO-set statistics index
+                         (running MuHash + counts/amounts). Required for
+                         gettxoutsetinfo to answer a historical hash_or_height.
+                         Mirrors Bitcoin Core -coinstatsindex.
   --peerblockfilters     Serve BIP-157 compact filters to peers and advertise
                          NODE_COMPACT_FILTERS in the version handshake.
                          Default off (Core parity). Requires
@@ -680,6 +713,18 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           echo "Invalid --blockfilterindex value: " & p.val &
                " (use 1 / 0 / basic)"
           quit(1)
+      of "coinstatsindex":
+        # Bitcoin Core's `-coinstatsindex` boolean. Maintain the per-height
+        # UTXO-set statistics index (running MuHash + counts/amounts) so
+        # gettxoutsetinfo can answer a historical hash_or_height.
+        let v = p.val.toLowerAscii()
+        if v.len == 0 or v in ["1", "true", "yes"]:
+          result.config.coinstatsindex = true
+        elif v in ["0", "false", "no"]:
+          result.config.coinstatsindex = false
+        else:
+          echo "Invalid --coinstatsindex value: " & p.val & " (use 1 / 0)"
+          quit(1)
       of "peerblockfilters":
         # W121 G15 / FIX-71: --peerblockfilters — serve BIP-157 compact
         # filters and advertise NODE_COMPACT_FILTERS.  Default OFF.
@@ -743,6 +788,15 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
         # W119 + FIX-64: --rpc-tls-key=<path> — PKCS#8 PEM key paired with
         # --rpc-tls-cert.  Must be unencrypted (BearSSL requirement).
         result.config.rpcTlsKey = p.val
+      of "txindex":
+        # Bitcoin Core's `-txindex`.  nimrod maintains a transaction index
+        # unconditionally (cfTxIndex is populated on every block connect — see
+        # getTxIndex consumers in rpc/server.nim and rpc/rest.nim), so this
+        # flag is accepted for CLI parity but does not toggle a separate index.
+        # We tolerate `--txindex`, `--txindex=1` and `--txindex=0` without error
+        # so Core-shaped launch lines (e.g. the coinstatsindex harness, which
+        # passes `--coinstatsindex=1 --txindex=1`) start cleanly.
+        discard
       of "help", "h":
         showHelp()
         quit(0)
@@ -2285,30 +2339,83 @@ proc startNode*(config: NimrodConfig) {.async.} =
     info "initializing blockfilterindex (basic)"
     state.blockFilterIndex = newBlockFilterIndex(
       state.chainState.db.db, networkDir, bftBasic, enabled = true)
-    # Wire BIP-157 reorg-aware filter chain: when the chainstate disconnects
-    # a block (legacy disconnectBlock or Pattern-D handleReorg), roll the
-    # filter index back symmetrically.  The hook runs AFTER the chainstate
-    # batch commits.  Mirrors bitcoin-core's BaseIndex::BlockDisconnected.
+  else:
+    state.blockFilterIndex = nil
+
+  # 5b'. Optional per-height UTXO-set statistics index (coinstatsindex).
+  # Created BEFORE the sync manager so connectBlock fan-outs can maintain it,
+  # and BEFORE the shared disconnect hook is installed (so the hook can see it).
+  # Mirrors bitcoin-core/src/index/coinstatsindex.cpp.  When OFF the field
+  # stays nil and gettxoutsetinfo at a non-tip hash_or_height errors -8 (Core
+  # parity), while the @tip path is unchanged.
+  if config.coinstatsindex:
+    info "initializing coinstatsindex"
+    state.coinStatsIndex = newCoinStatsIndex(
+      state.chainState.db.db, params, enabled = true)
+  else:
+    state.coinStatsIndex = nil
+
+  # Shared chainstate disconnect hook: when the chainstate disconnects a block
+  # (legacy disconnectBlock or Pattern-D handleReorg) fan the rollback out to
+  # BOTH optional indexes symmetrically.  The hook runs AFTER the chainstate
+  # batch commits, so the indexes never observe an un-committed state.  Index
+  # errors are swallowed (each index's removeBlock catches) so a failed index
+  # rollback never corrupts the chainstate disconnect.  The hook only carries
+  # (blockHash, prevHash, height); the coinstatsindex additionally needs the
+  # block body + undo to reverse its MuHash, so we re-read both from storage by
+  # hash here (same pattern as the IBD backfill below).  Mirrors
+  # bitcoin-core's BaseIndex::BlockDisconnected fan-out.
+  if state.blockFilterIndex != nil or state.coinStatsIndex != nil:
     let filterIdx = state.blockFilterIndex
+    let coinIdx = state.coinStatsIndex
+    let csForHook = state.chainState
+    let paramsForHook = params
     state.chainState.disconnectHook = proc(blockHash: BlockHash,
                                            prevHash: BlockHash,
                                            height: int32) {.raises: [].} =
-      try:
-        discard filterIdx.removeBlock(blockHash, prevHash, height)
-      except CatchableError as e:
-        warn "blockfilterindex: disconnectHook removeBlock raised, continuing",
-             height = height, hash = $blockHash, error = e.msg
-      except Exception as e:
-        warn "blockfilterindex: disconnectHook removeBlock raised non-Catchable, continuing",
-             height = height, hash = $blockHash, error = e.msg
-  else:
-    state.blockFilterIndex = nil
+      if filterIdx != nil:
+        try:
+          discard filterIdx.removeBlock(blockHash, prevHash, height)
+        except CatchableError as e:
+          warn "blockfilterindex: disconnectHook removeBlock raised, continuing",
+               height = height, hash = $blockHash, error = e.msg
+        except Exception as e:
+          warn "blockfilterindex: disconnectHook removeBlock raised non-Catchable, continuing",
+               height = height, hash = $blockHash, error = e.msg
+      if coinIdx != nil:
+        try:
+          # Reverse the coinstatsindex MuHash for this block.  Re-read the
+          # block body + its per-block undo by hash (the hook signature does
+          # not carry them).  If either is unavailable the index logs + no-ops
+          # (it cannot reverse without undo) — safe for the chainstate.
+          let blkOpt = csForHook.db.getBlock(blockHash)
+          if blkOpt.isSome:
+            let blk = blkOpt.get()
+            var blockUndo = chainstate.BlockUndo()
+            let idxOpt = csForHook.db.getBlockIndex(blockHash)
+            if idxOpt.isSome:
+              let bidx = idxOpt.get()
+              if bidx.undoPos.fileNum >= 0 and bidx.undoPos.pos >= 0:
+                let (loaded, ok) = csForHook.undoMgr.readBlockUndo(
+                  bidx.undoPos, prevHash, paramsForHook)
+                if ok:
+                  blockUndo = loaded
+            discard coinIdx.removeBlock(blk, blockHash, prevHash, height, blockUndo)
+          else:
+            warn "coinstatsindex: disconnectHook could not read block body, skipping rollback",
+                 height = height, hash = $blockHash
+        except CatchableError as e:
+          warn "coinstatsindex: disconnectHook removeBlock raised, continuing",
+               height = height, hash = $blockHash, error = e.msg
+        except Exception as e:
+          warn "coinstatsindex: disconnectHook removeBlock raised non-Catchable, continuing",
+               height = height, hash = $blockHash, error = e.msg
 
   # 6. Initialize sync manager
   info "initializing sync manager"
   state.syncManager = newSyncManager(state.peerManager, state.chainState.db, params,
                                      state.chainState, config.numVerifyWorkers,
-                                     state.blockFilterIndex)
+                                     state.blockFilterIndex, state.coinStatsIndex)
   state.syncManager.chainTip = state.chainState.bestBlockHash
   state.syncManager.chainTipHeight = state.chainState.bestHeight
 
@@ -2395,6 +2502,76 @@ proc startNode*(config: NimrodConfig) {.async.} =
            indexed = indexed, skipped = skipped, partial = partial,
            bestHeight = state.blockFilterIndex.bestHeight
 
+  # 6b. IBD backfill of the coinstatsindex — symmetric to 6a.  On a fresh
+  # datadir this walks at least genesis (height 0), establishing the index's
+  # currentBlockHash so the first live connect (height 1) matches its parent
+  # check.  On an existing datadir with the flag freshly flipped on it walks the
+  # whole gap, folding each block's created outputs into the running MuHash and
+  # removing its spent coins via the per-block undo.  The accumulator MUST be
+  # exact for the per-height muhash to match Core byte-for-byte, so we require
+  # real undo for non-coinbase blocks (a block with spends but no undo on disk
+  # cannot be folded correctly — the IBD fast path does not persist undo, so a
+  # coinstatsindex enabled only after such an IBD is logged as partial).
+  # Reference: bitcoin-core/src/index/base.cpp::BaseIndex::ThreadSync.
+  if state.coinStatsIndex != nil and state.coinStatsIndex.enabled:
+    let csForCsi = state.chainState
+    let tipHeightCsi = csForCsi.bestHeight
+    let startHeightCsi = state.coinStatsIndex.bestHeight + 1
+    if startHeightCsi <= tipHeightCsi:
+      info "coinstatsindex: backfilling",
+           fromHeight = startHeightCsi, toHeight = tipHeightCsi,
+           gap = (tipHeightCsi - startHeightCsi + 1)
+      var csiIndexed = 0
+      var csiPartial = 0
+      var csiSkipped = 0
+      for h in startHeightCsi .. tipHeightCsi:
+        let hashOpt = csForCsi.db.getBlockHashByHeight(h)
+        if hashOpt.isNone:
+          warn "coinstatsindex: missing height->hash, stopping backfill",
+               height = h
+          break
+        let hash = hashOpt.get()
+        let blkOpt = csForCsi.db.getBlock(hash)
+        if blkOpt.isNone:
+          warn "coinstatsindex: missing block body, stopping backfill",
+               height = h, hash = $hash
+          break
+        let blk = blkOpt.get()
+
+        var blockUndo = chainstate.BlockUndo()
+        let idxOpt = csForCsi.db.getBlockIndex(hash)
+        if idxOpt.isSome:
+          let bidx = idxOpt.get()
+          if bidx.undoPos.fileNum >= 0 and bidx.undoPos.pos >= 0:
+            let (loaded, ok) = csForCsi.undoMgr.readBlockUndo(
+              bidx.undoPos, blk.header.prevBlock, params)
+            if ok:
+              blockUndo = loaded
+            else:
+              inc csiPartial
+          else:
+            # No undo on disk (genesis or IBD fast-path).  Genesis legitimately
+            # has none; a non-coinbase block without undo cannot be folded
+            # exactly (would diverge from Core's per-height muhash).
+            if h > 0 and blk.txs.len > 1:
+              inc csiPartial
+
+        if state.coinStatsIndex.addBlock(blk, hash, h, blockUndo):
+          inc csiIndexed
+        else:
+          inc csiSkipped
+          warn "coinstatsindex: addBlock failed during backfill, stopping",
+               height = h, hash = $hash
+          break
+
+        if (csiIndexed + csiSkipped) mod 10_000 == 0:
+          info "coinstatsindex: backfill progress",
+               indexed = csiIndexed, skipped = csiSkipped,
+               partial = csiPartial, currentHeight = h
+      info "coinstatsindex: backfill complete",
+           indexed = csiIndexed, skipped = csiSkipped, partial = csiPartial,
+           bestHeight = state.coinStatsIndex.bestHeight
+
   # 7. Start RPC server
   if config.rpcEnabled:
     info "starting RPC server", port = config.rpcPort
@@ -2424,6 +2601,10 @@ proc startNode*(config: NimrodConfig) {.async.} =
     # Wire the BIP-157 filter index so submitblock populates it alongside
     # the live P2P sync path.  nil when --blockfilterindex is OFF.
     state.rpcServer.filterIndex = state.blockFilterIndex
+    # Wire the coinstatsindex so submitblock maintains it alongside the live
+    # P2P sync path, and gettxoutsetinfo / getindexinfo can read it.  nil when
+    # --coinstatsindex is OFF (then a non-tip hash_or_height errors -8).
+    state.rpcServer.coinStatsIndex = state.coinStatsIndex
     # Wire the ASMap manager so getpeerinfo can populate mapped_as.
     # W115 FIX-50: netGroupManager is always non-nil after step 5a above;
     # usingAsmap() returns false when no file was given / load failed.

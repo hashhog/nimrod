@@ -20,6 +20,7 @@ import ../primitives/[types, serialize, uint256]
 import ../consensus/[params, pow, validation]
 import ../storage/chainstate
 import ../storage/indexes/blockfilterindex
+import ../storage/indexes/coinstatsindex
 import ../crypto/[hashing, secp256k1]
 import ../perf/parallel_verify
 
@@ -108,6 +109,11 @@ type
     # bitcoin-core/src/index/base.cpp::ConnectBlock fans out to every
     # registered index after each successful block connect.
     filterIndex*: BlockFilterIndex
+    # Optional per-height UTXO-set statistics index (coinstatsindex) —
+    # maintained alongside each connectBlock/connectBlockIBD when
+    # --coinstatsindex is set.  nil when disabled.  Same fan-out rationale as
+    # filterIndex above.
+    coinStatsIndex*: CoinStatsIndex
 
 const
   MaxHeadersPerRequest* = 2000
@@ -557,7 +563,8 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
                      params: ConsensusParams,
                      chainState: ChainState = nil,
                      numVerifyWorkers: int = 0,
-                     filterIndex: BlockFilterIndex = nil): SyncManager =
+                     filterIndex: BlockFilterIndex = nil,
+                     coinStatsIndex: CoinStatsIndex = nil): SyncManager =
   result = SyncManager(
     state: ssIdle,
     headerChain: initHeaderChain(),
@@ -593,7 +600,8 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     requestedHashes: initHashSet[BlockHash](),
     unconnectingHeaders: initTable[int64, int](),
     numVerifyWorkers: numVerifyWorkers,
-    filterIndex: filterIndex
+    filterIndex: filterIndex,
+    coinStatsIndex: coinStatsIndex
   )
 
   # Initialize with genesis if chain is empty
@@ -1502,7 +1510,8 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
     # UTXOs, so it is correct to run it before acceptAndConnectBlock (which
     # does the accept + connect). Cheap: a few cache/DB lookups.
     var undoForFilter = chainstate.BlockUndo()
-    let captureUndo = sm.filterIndex != nil and sm.filterIndex.enabled
+    let captureUndo = (sm.filterIndex != nil and sm.filterIndex.enabled) or
+                      (sm.coinStatsIndex != nil and sm.coinStatsIndex.enabled)
     if captureUndo:
       try:
         undoForFilter = sm.chainState.generateBlockUndo(blk)
@@ -1551,6 +1560,13 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
     if captureUndo:
       try:
         discard sm.filterIndex.addBlock(blk, hash, height, undoForFilter)
+      except CatchableError:
+        discard
+      except Exception:
+        discard
+      # Fan out to the coinstatsindex too (no-op when nil/disabled).
+      try:
+        discard sm.coinStatsIndex.addBlock(blk, hash, height, undoForFilter)
       except CatchableError:
         discard
       except Exception:
@@ -2091,7 +2107,8 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
       # Capture filter-index undo BEFORE accept+connect (generateBlockUndo
       # only reads UTXOs). See applyBlock().
       var undoForFilter = chainstate.BlockUndo()
-      let captureUndo = sm.filterIndex != nil and sm.filterIndex.enabled
+      let captureUndo = (sm.filterIndex != nil and sm.filterIndex.enabled) or
+                        (sm.coinStatsIndex != nil and sm.coinStatsIndex.enabled)
       if captureUndo:
         try:
           undoForFilter = sm.chainState.generateBlockUndo(blk)
@@ -2123,6 +2140,13 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
       if captureUndo:
         try:
           discard sm.filterIndex.addBlock(blk, hashPRB, height, undoForFilter)
+        except CatchableError:
+          discard
+        except Exception:
+          discard
+        # Fan out to the coinstatsindex too (no-op when nil/disabled).
+        try:
+          discard sm.coinStatsIndex.addBlock(blk, hashPRB, height, undoForFilter)
         except CatchableError:
           discard
         except Exception:

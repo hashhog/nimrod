@@ -17,9 +17,11 @@
 import std/options
 import ./base
 import ../db
+import ../undo as chainundo
 import ../../primitives/[types, serialize]
 import ../../crypto/[hashing, muhash]
 import ../../consensus/params
+import chronicles
 
 type
   ## Per-block UTXO statistics
@@ -164,7 +166,9 @@ proc newCoinStatsIndex*(db: Database, params: ConsensusParams,
   result = CoinStatsIndex(
     name: "coinstatsindex",
     db: db,
-    cfHandle: cfMeta,  # Use meta CF
+    cfHandle: cfCoinStats,  # Dedicated CF (avoids key collision with the
+                            # blockfilterindex, which shares cfMeta and also
+                            # uses the base index B/H best-block keys).
     state: isIdle,
     bestHeight: -1,
     stopRequested: false,
@@ -468,3 +472,132 @@ proc getCurrentUtxoCount*(idx: CoinStatsIndex): uint64 =
 proc getCurrentTotalAmount*(idx: CoinStatsIndex): int64 =
   ## Get current total UTXO value
   idx.totalAmount
+
+proc bestIndexedHeight*(idx: CoinStatsIndex): int32 =
+  ## Highest block height this index has processed (-1 if none).
+  ## Mirrors BlockFilterIndex.bestIndexedHeight for getindexinfo parity.
+  if idx == nil: return -1
+  idx.bestHeight
+
+# ============================================================================
+# Connect/disconnect hooks — the wired, maintained interface used by the
+# daemon (live sync, submitblock) and the chainstate disconnect path.  This
+# mirrors blockfilterindex.addBlock / removeBlock so the wiring in nimrod.nim,
+# sync.nim and rpc/server.nim is structurally identical.
+# ============================================================================
+
+proc convertBlockUndo(src: chainundo.BlockUndo): base.BlockUndo =
+  ## Convert chainstate-side BlockUndo (storage/undo.BlockUndo) to the
+  ## index-side BlockUndo (storage/indexes/base.BlockUndo).  Field-compatible
+  ## but distinct types (base.nim keeps its own to avoid a circular import).
+  result.txUndo = newSeq[base.TxUndo](src.txUndo.len)
+  for i, srcTx in src.txUndo:
+    var dstTx = base.TxUndo()
+    dstTx.prevOutputs = newSeq[base.SpentOutput](srcTx.prevOutputs.len)
+    for j, srcSpent in srcTx.prevOutputs:
+      dstTx.prevOutputs[j] = base.SpentOutput(
+        output: srcSpent.output,
+        height: srcSpent.height,
+        isCoinbase: srcSpent.isCoinbase
+      )
+    result.txUndo[i] = dstTx
+  result
+
+proc addBlock*(idx: CoinStatsIndex, blk: Block, blockHash: BlockHash,
+               height: int32, blockUndo: chainundo.BlockUndo): bool =
+  ## Index a single block: fold its created outputs into the running MuHash and
+  ## remove its spent coins (via undo), then persist the per-height snapshot and
+  ## advance the best-block tracker.  Safe to no-op when disabled or already past
+  ## `height`; callers do NOT need to gate.
+  ##
+  ## Mirrors Bitcoin Core's BaseIndex::ConnectBlock -> CustomAppend ->
+  ## SetBestBlockIndex (index/coinstatsindex.cpp).
+  if idx == nil or not idx.enabled:
+    return true
+
+  # Skip already-indexed heights.  IBD backfill may call a contiguous range;
+  # the live-sync / submitblock hooks call block-by-block.  Either way we only
+  # ever advance (and never re-process the same height — re-running customAppend
+  # would double-fold into the MuHash).
+  if height <= idx.bestHeight:
+    return true
+
+  let info = base.BlockInfo(
+    hash: blockHash,
+    prevHash: blk.header.prevBlock,
+    height: height,
+    data: some(blk),
+    undoData: some(convertBlockUndo(blockUndo)),
+    fileNum: 0,
+    dataPos: 0
+  )
+
+  try:
+    if not idx.processBlock(info):
+      warn "coinstatsindex: customAppend failed",
+           height = height, hash = $blockHash
+      return false
+    # Persist the running MuHash state alongside the per-height snapshot so a
+    # restart resumes from the correct accumulator.
+    discard idx.customCommit()
+  except CatchableError as e:
+    warn "coinstatsindex: addBlock raised, skipping",
+         height = height, hash = $blockHash, error = e.msg
+    return false
+  except Exception as e:
+    warn "coinstatsindex: addBlock raised non-Catchable, skipping",
+         height = height, hash = $blockHash, error = e.msg
+    return false
+  true
+
+proc removeBlock*(idx: CoinStatsIndex, blk: Block, blockHash: BlockHash,
+                  prevHash: BlockHash, height: int32,
+                  blockUndo: chainundo.BlockUndo): bool =
+  ## Roll the index back across a single block disconnect (reorg): reverse the
+  ## block's MuHash effects and restore counts/amounts from the parent's
+  ## per-height snapshot.  Symmetric counterpart to addBlock.
+  ##
+  ## Mirrors BaseIndex::BlockDisconnected -> CustomRemove -> revertBlock.
+  if idx == nil or not idx.enabled:
+    return true
+
+  # Already rolled back past this height — nothing to do (idempotent re-replay).
+  if idx.bestHeight < height:
+    return true
+
+  let info = base.BlockInfo(
+    hash: blockHash,
+    prevHash: prevHash,
+    height: height,
+    data: some(blk),
+    undoData: some(convertBlockUndo(blockUndo)),
+    fileNum: 0,
+    dataPos: 0
+  )
+
+  try:
+    if not idx.revertBlock(info):
+      warn "coinstatsindex: customRemove failed",
+           height = height, hash = $blockHash
+      return false
+    discard idx.customCommit()
+  except CatchableError as e:
+    warn "coinstatsindex: removeBlock raised, skipping",
+         height = height, hash = $blockHash, error = e.msg
+    return false
+  except Exception as e:
+    warn "coinstatsindex: removeBlock raised non-Catchable, skipping",
+         height = height, hash = $blockHash, error = e.msg
+    return false
+  true
+
+proc getStats*(idx: CoinStatsIndex, height: int32): Option[CoinStats] =
+  ## Resolve the persisted per-height UTXO-set statistics for `height`.
+  ## Returns none when the index is disabled or the height was never indexed
+  ## (e.g. above the index's best height, or below where indexing started).
+  ## Thin wrapper over lookUpStats so the RPC layer has a single entry point.
+  if idx == nil or not idx.enabled:
+    return none(CoinStats)
+  if height < 0 or height > idx.bestHeight:
+    return none(CoinStats)
+  idx.lookUpStats(height)

@@ -182,6 +182,11 @@ type
     cfUtxo = "utxo"               # UTXO set
     cfTxIndex = "tx_index"        # TxID -> block location
     cfMeta = "meta"               # Chain metadata
+    cfCoinStats = "coin_stats"    # coinstatsindex: per-height MuHash + counts
+                                  # (dedicated CF so its B/H/M/s/h keys never
+                                  # collide with blockfilterindex's keys, which
+                                  # also live in cfMeta). create_missing_column_
+                                  # families=1 makes this auto-create on upgrade.
 
   Database* = ref object
     db: RocksDbPtr
