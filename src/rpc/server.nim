@@ -10,6 +10,7 @@ import ../primitives/[types, serialize]
 import ../consensus/[params, validation, chain, versionbits]
 import ../storage/[chainstate, blockstore, snapshot, pruner]
 import ../storage/indexes/blockfilterindex
+import ../storage/indexes/coinstatsindex
 import ../storage/indexes/gcs as gcsMod
 import ../mempool/[mempool, package, persist, orphan]
 import ../crypto/[hashing, secp256k1, address, signmessage]
@@ -61,6 +62,11 @@ type
     filterIndex*: BlockFilterIndex       ## Optional BIP-157 basic block-filter index;
                                          ## populated alongside connectBlock in submitblock.
                                          ## Wired by startNode when --blockfilterindex is set.
+    coinStatsIndex*: CoinStatsIndex      ## Optional per-height UTXO-set statistics index;
+                                         ## maintained alongside connectBlock in submitblock.
+                                         ## Wired by startNode when --coinstatsindex is set.
+                                         ## Read by gettxoutsetinfo (historical
+                                         ## hash_or_height) and getindexinfo.
     netGroupManager*: NetGroupManager    ## Optional ASMap manager; nil / empty = /16 fallback.
                                          ## Wired by startNode when --asmap is given.
                                          ## Used by getpeerinfo to populate mapped_as.
@@ -1259,7 +1265,9 @@ proc handleGetIndexInfo(rpc: RpcServer, params: JsonNode): JsonNode =
 
   result = newJObject()
 
-  # BIP-157 basic block filter index (the only index nimrod runs).
+  let tipHeight = rpc.chainState.bestHeight
+
+  # BIP-157 basic block filter index.
   if rpc.filterIndex != nil and rpc.filterIndex.enabled:
     # GetName() string Core emits for the basic filter index
     # (BlockFilterTypeName(BASIC) + " block filter index").
@@ -1267,8 +1275,20 @@ proc handleGetIndexInfo(rpc: RpcServer, params: JsonNode): JsonNode =
     if indexName.len == 0 or indexName == name:
       # synced = the index has caught up to the chain tip; best_block_height =
       # the height the index reached (m_best_block_index->nHeight), 0 if none.
-      let tipHeight = rpc.chainState.bestHeight
       let idxHeight = rpc.filterIndex.bestIndexedHeight()
+      let synced = idxHeight >= tipHeight
+      let bestHeight = if idxHeight < 0: 0 else: int(idxHeight)
+      var entry = newJObject()
+      entry["synced"] = %synced
+      entry["best_block_height"] = %bestHeight
+      result[name] = entry
+
+  # Per-height UTXO-set statistics index (coinstatsindex).  Core's GetName()
+  # for this index is "coinstatsindex" (index/coinstatsindex.cpp).
+  if rpc.coinStatsIndex != nil and rpc.coinStatsIndex.enabled:
+    const name = "coinstatsindex"
+    if indexName.len == 0 or indexName == name:
+      let idxHeight = rpc.coinStatsIndex.bestIndexedHeight()
       let synced = idxHeight >= tipHeight
       let bestHeight = if idxHeight < 0: 0 else: int(idxHeight)
       var entry = newJObject()
@@ -4782,7 +4802,8 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # path does not write undo to disk).  No-op when filter index is
       # off, so cost is paid only when --blockfilterindex is enabled.
       var undoForFilter = chainstate.BlockUndo()
-      let captureUndo = rpc.filterIndex != nil and rpc.filterIndex.enabled
+      let captureUndo = (rpc.filterIndex != nil and rpc.filterIndex.enabled) or
+                        (rpc.coinStatsIndex != nil and rpc.coinStatsIndex.enabled)
       if captureUndo:
         undoForFilter = cs.generateBlockUndo(blk)
 
@@ -4795,11 +4816,14 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         # Map chainstate error string to BIP-22 token
         return %bip22ChainError(connectResult.error)
 
-      # BIP-157 filter index population (no-op when nil/disabled).
+      # Optional index population (no-op when nil/disabled).  Both the BIP-157
+      # filter index and the coinstatsindex are folded forward here, mirroring
+      # the live-sync connectBlock fan-out.
       if captureUndo:
         let bHdr = serialize(blk.header)
         let bHash = BlockHash(doubleSha256(bHdr))
         discard rpc.filterIndex.addBlock(blk, bHash, height, undoForFilter)
+        discard rpc.coinStatsIndex.addBlock(blk, bHash, height, undoForFilter)
 
       if not cs.ibdMode:
         # Remove confirmed transactions from mempool
@@ -6346,16 +6370,131 @@ proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
       raise newRpcError(RpcInvalidParameter,
                         "'" & hashTypeStr & "' is not a valid hash_type")
 
-  # hash_or_height (params[1]) targets a specific block, which Core only
-  # supports with coinstatsindex (out of scope here). Core checks the index
-  # FIRST and throws RPC_INVALID_PARAMETER (-8) "Querying specific block
-  # heights requires coinstatsindex" before it would reach the
-  # hash_serialized_3-specific guard (blockchain.cpp:1085-1097). We have no
-  # coinstatsindex available to this RPC, so we mirror that first throw for
-  # ANY hash_type, which also covers the spec's hash_serialized_3 case.
+  # hash_or_height (params[1]) targets a SPECIFIC block.  Core only supports
+  # this with -coinstatsindex; the index FIRST guards a non-tip query and
+  # throws RPC_INVALID_PARAMETER (-8) "Querying specific block heights requires
+  # coinstatsindex" when the index is disabled (blockchain.cpp:1085-1097),
+  # BEFORE the hash_serialized_3-specific guard.  We mirror that exactly:
+  #   * index OFF  -> -8 (unchanged from before).
+  #   * index ON   -> serve the per-height snapshot from the coinstatsindex
+  #                   for MUHASH / NONE; hash_serialized_3 at a specific height
+  #                   is STILL rejected -8 (Core: blockchain.cpp:1089-1091
+  #                   "hash_serialized_3 hash type cannot be queried for a
+  #                   specific block") — the index serves muhash only.
   if params.len >= 2 and params[1].kind != JNull:
-    raise newRpcError(RpcInvalidParameter,
-                      "Querying specific block heights requires coinstatsindex")
+    if rpc.coinStatsIndex == nil or not rpc.coinStatsIndex.enabled:
+      raise newRpcError(RpcInvalidParameter,
+                        "Querying specific block heights requires coinstatsindex")
+
+    # hash_serialized_3 cannot be recomputed from the index at an arbitrary
+    # height (it is a chainstate-only hash, valid only at the tip).
+    if coinHashType == cshtHashSerialized:
+      raise newRpcError(RpcInvalidParameter,
+        "hash_serialized_3 hash type cannot be queried for a specific block")
+
+    # Resolve hash_or_height -> a block height present in the active chain.
+    var targetHeight: int32
+    case params[1].kind
+    of JInt:
+      let hOrH = params[1].getInt()
+      # Core's ParseHashOrHeight treats a small integer as a height and a
+      # 64-hex string as a block hash.  Bounds-check the height.
+      if hOrH < 0 or hOrH > int(rpc.chainState.bestHeight):
+        raise newRpcError(RpcInvalidParameter,
+                          "Target block height " & $hOrH & " after current tip " &
+                          $rpc.chainState.bestHeight)
+      targetHeight = int32(hOrH)
+    of JString:
+      let blockHash = parseBlockHash(params[1].getStr())
+      let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
+      if idxOpt.isNone:
+        raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+      let bidx = idxOpt.get()
+      # Must be on the active chain (Core resolves via the active ChainstateManager).
+      let atHeight = rpc.chainState.db.getBlockHashByHeight(bidx.height)
+      if atHeight.isNone or atHeight.get() != bidx.hash:
+        raise newRpcError(RpcInvalidParameter, "Block is not in main chain")
+      targetHeight = bidx.height
+    else:
+      raise newRpcError(RpcInvalidParameter,
+                        "hash_or_height must be a height (int) or block hash (string)")
+
+    # Pull the per-height snapshot the index folded forward on connect.
+    let statsOpt = rpc.coinStatsIndex.getStats(targetHeight)
+    if statsOpt.isNone:
+      # The index is enabled but has not (yet) indexed this height.  Mirror
+      # Core's "still syncing" path with an internal error rather than a -8.
+      raise newRpcError(RpcInternalError,
+        "Unable to get data because coinstatsindex is still syncing. " &
+        "Current height: " & $rpc.coinStatsIndex.bestIndexedHeight())
+    let stats = statsOpt.get()
+
+    # Build the index-path response shape (blockchain.cpp:1112-1173).  When the
+    # index is used, Core OMITS `transactions` + `disk_size` and ADDS
+    # `total_unspendable_amount` + `block_info`.
+    var resp = %*{
+      "height": stats.height,
+      "bestblock": reverseHex(toHex(array[32, byte](stats.blockHash))),
+      "txouts": stats.transactionOutputCount,
+      "bogosize": stats.bogoSize
+    }
+    if coinHashType == cshtMuHash:
+      resp["muhash"] = %reverseHex(toHex(stats.muhash))
+    resp["total_amount"] = parseJson(formatBtcAmount(stats.totalAmount))
+
+    let blockTotalUnspendable = stats.totalUnspendablesGenesisBlock +
+                                stats.totalUnspendablesBip30 +
+                                stats.totalUnspendablesScripts +
+                                stats.totalUnspendablesUnclaimedRewards
+    resp["total_unspendable_amount"] =
+      parseJson(formatBtcAmount(blockTotalUnspendable))
+
+    # Per-block deltas vs the parent height's snapshot (block_info).  Zeroes at
+    # height 0 (no parent).  The harness does not gate block_info, but we emit
+    # it for Core-shape parity.
+    var prevPrevoutSpent: uint64 = 0
+    var prevCoinbase: uint64 = 0
+    var prevNewOutputs: uint64 = 0
+    var prevUnspendableGenesis: int64 = 0
+    var prevUnspendableBip30: int64 = 0
+    var prevUnspendableScripts: int64 = 0
+    var prevUnspendableUnclaimed: int64 = 0
+    if stats.height > 0:
+      let prevOpt = rpc.coinStatsIndex.getStats(stats.height - 1)
+      if prevOpt.isSome:
+        let prev = prevOpt.get()
+        prevPrevoutSpent = prev.totalPrevoutSpentAmount
+        prevCoinbase = prev.totalCoinbaseAmount
+        prevNewOutputs = prev.totalNewOutputsExCoinbase
+        prevUnspendableGenesis = prev.totalUnspendablesGenesisBlock
+        prevUnspendableBip30 = prev.totalUnspendablesBip30
+        prevUnspendableScripts = prev.totalUnspendablesScripts
+        prevUnspendableUnclaimed = prev.totalUnspendablesUnclaimedRewards
+
+    let prevBlockTotalUnspendable = prevUnspendableGenesis + prevUnspendableBip30 +
+                                    prevUnspendableScripts + prevUnspendableUnclaimed
+    var blockInfo = %*{
+      "prevout_spent": parseJson(formatBtcAmount(
+        int64(stats.totalPrevoutSpentAmount - prevPrevoutSpent))),
+      "coinbase": parseJson(formatBtcAmount(
+        int64(stats.totalCoinbaseAmount - prevCoinbase))),
+      "new_outputs_ex_coinbase": parseJson(formatBtcAmount(
+        int64(stats.totalNewOutputsExCoinbase - prevNewOutputs))),
+      "unspendable": parseJson(formatBtcAmount(
+        blockTotalUnspendable - prevBlockTotalUnspendable))
+    }
+    blockInfo["unspendables"] = %*{
+      "genesis_block": parseJson(formatBtcAmount(
+        stats.totalUnspendablesGenesisBlock - prevUnspendableGenesis)),
+      "bip30": parseJson(formatBtcAmount(
+        stats.totalUnspendablesBip30 - prevUnspendableBip30)),
+      "scripts": parseJson(formatBtcAmount(
+        stats.totalUnspendablesScripts - prevUnspendableScripts)),
+      "unclaimed_rewards": parseJson(formatBtcAmount(
+        stats.totalUnspendablesUnclaimedRewards - prevUnspendableUnclaimed))
+    }
+    resp["block_info"] = blockInfo
+    return resp
 
   let info = computeUtxoSetInfo(rpc.chainState, coinHashType)
 
