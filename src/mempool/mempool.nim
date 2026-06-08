@@ -91,6 +91,13 @@ type
     ## When non-nil, acceptTransactionWithArgs calls trackTransaction on success
     ## and removeTransaction calls feeEstimator.removeTransaction on eviction.
     feeEstimator*: FeeEstimator
+    ## PrioritiseTransaction fee deltas, keyed by txid (Core's mapDeltas,
+    ## txmempool.h:299).  Value is a SIGNED satoshi delta added to the base
+    ## modular fee for block-selection purposes.  Entries persist even when the
+    ## tx is not (yet / any longer) in the mempool — Core keeps the delta so it
+    ## applies if the tx re-enters via ApplyDelta in PreChecks.  An entry whose
+    ## net delta returns to 0 is erased.  Survives restart via mempool.dat.
+    feeDeltas*: Table[TxId, int64]
 
 const
   DefaultMaxMempoolSize* = 300_000_000  ## 300 MB
@@ -221,7 +228,8 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
     blockSinceLastRollingFeeBump: false,
     lastRollingFeeUpdate: getTime().toUnix(),
     incrementalRelayFeeRate: incrementalRelayFeeRate,
-    expiryHours: expiryHours
+    expiryHours: expiryHours,
+    feeDeltas: initTable[TxId, int64]()
   )
 
 # Basic accessors
@@ -245,6 +253,64 @@ proc getTransaction*(mp: Mempool, txid: TxId): Option[Transaction] =
     some(mp.entries[txid].tx)
   else:
     none(Transaction)
+
+# ============================================================================
+# PrioritiseTransaction — fee-delta map (Core txmempool.cpp PrioritiseTransaction
+# / ApplyDelta / GetModifiedFee / GetPrioritisedTransactions).
+# ============================================================================
+
+type
+  PrioritisedDeltaInfo* = object
+    ## One row of GetPrioritisedTransactions.  Mirrors Core's
+    ## CTxMemPool::delta_info (txmempool.h:351).
+    txid*: TxId
+    delta*: int64               ## The stored fee delta (always present).
+    inMempool*: bool            ## Whether the tx is currently in the mempool.
+    modifiedFee*: int64         ## base + delta; valid ONLY when inMempool.
+
+proc getFeeDelta*(mp: Mempool, txid: TxId): int64 =
+  ## The accumulated PrioritiseTransaction delta for `txid`, or 0 if none.
+  ## Core: CTxMemPool::ApplyDelta (txmempool.cpp:657) — adds the stored delta
+  ## (defaulting to nothing) onto a running fee value.
+  mp.feeDeltas.getOrDefault(txid, 0'i64)
+
+proc getModifiedFee*(mp: Mempool, txid: TxId): int64 =
+  ## Core's CTxMemPoolEntry::GetModifiedFee = base fee + nFeeDelta.
+  ## Returns base+delta when the tx is in the mempool; otherwise just the
+  ## stored delta (a not-in-mempool prioritised tx has no base fee to add).
+  let delta = mp.getFeeDelta(txid)
+  if txid in mp.entries:
+    int64(mp.entries[txid].fee) + delta
+  else:
+    delta
+
+proc prioritiseTransaction*(mp: Mempool, txid: TxId, feeDelta: int64) =
+  ## Stack `feeDelta` (signed satoshis) onto any existing delta for `txid`.
+  ## Mirrors Core's CTxMemPool::PrioritiseTransaction (txmempool.cpp:630):
+  ##   - calls accumulate additively onto the stored value;
+  ##   - if the net delta returns to 0 the entry is ERASED from the map;
+  ##   - the delta is recorded whether or not the tx is in the mempool, so it
+  ##     applies via ApplyDelta if/when the tx (re-)enters.
+  ## The per-entry effect on block selection comes from getModifiedFee, which
+  ## reads the live map — so there is no separate cached field to update.
+  let newDelta = mp.feeDeltas.getOrDefault(txid, 0'i64) + feeDelta
+  if newDelta == 0:
+    mp.feeDeltas.del(txid)
+  else:
+    mp.feeDeltas[txid] = newDelta
+
+proc getPrioritisedTransactions*(mp: Mempool): seq[PrioritisedDeltaInfo] =
+  ## Core's CTxMemPool::GetPrioritisedTransactions (txmempool.cpp:673): one row
+  ## per mapDeltas entry, carrying the delta, in-mempool flag, and (when in the
+  ## mempool) the modified fee.
+  result = @[]
+  for txid, delta in mp.feeDeltas:
+    let inMempool = txid in mp.entries
+    var modFee = 0'i64
+    if inMempool:
+      modFee = int64(mp.entries[txid].fee) + delta
+    result.add(PrioritisedDeltaInfo(
+      txid: txid, delta: delta, inMempool: inMempool, modifiedFee: modFee))
 
 # Check if an outpoint is spent by a mempool transaction
 proc isSpent*(mp: Mempool, outpoint: OutPoint): bool =
@@ -1143,12 +1209,15 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
       return err(AtmpAcceptInfo, "bad-txns-too-many-sigops")
 
   # W96 GAP #5: modified-fee aware vsize.  Core computes m_modified_fees from
-  # m_base_fees plus PrioritiseTransaction deltas (Core validation.cpp:930).
-  # nimrod has no PrioritiseTransaction, so modified == base — but expose the
-  # value separately so the per-tx max_feerate guard below behaves the same
-  # as Core if the field is ever wired up.
+  # m_base_fees plus PrioritiseTransaction deltas (Core validation.cpp:930):
+  # PreChecks calls m_pool.ApplyDelta(hash, ws.m_modified_fees) so a delta set
+  # before the tx arrives is folded into the fee used for block selection.
+  # We apply the same: modifiedFee = base + any pre-existing prioritisation
+  # delta.  When no delta is set getFeeDelta returns 0, preserving the prior
+  # modified == base behaviour exactly.
   let baseFee = fee
-  let modifiedFee = fee
+  let feeDeltaSat = mp.getFeeDelta(txid)
+  let modifiedFee = Satoshi(int64(baseFee) + feeDeltaSat)
   let vbytes = float64(weight) / 4.0
   let vsizeInt = (weight + 3) div 4
   let feeRate = float64(int64(modifiedFee)) / vbytes
@@ -1541,10 +1610,21 @@ proc getTransactionsByFeeRate*(mp: Mempool, maxWeight: int): seq[MempoolEntry] =
   for entry in mp.entries.values:
     entries.add(entry)
 
-  # Sort by ancestor fee rate (ancestor fee / ancestor vbytes)
+  # Sort by ancestor fee rate (ancestor fee / ancestor vbytes).
+  # FIX-72 parity (mirrors rustoshi mempool.rs:2379 get_sorted_for_mining):
+  # fold each entry's OWN prioritisetransaction delta into the rank so an
+  # operator-prioritised tx surfaces ahead of equally-feed peers.  Core does
+  # this via SetTransactionFee(*it, GetModifiedFee()) in PrioritiseTransaction
+  # (txmempool.cpp:642).  We have no cached per-entry modified fee, so read the
+  # live feeDeltas map here.  Full ancestor-delta aggregation (a parent's delta
+  # raising a descendant's ancestor-score) is the W106 G8 follow-up and is NOT
+  # done here — only the entry's own delta folds into its own ancestor fee.
+  # An un-prioritised entry has delta 0, so its rank is byte-identical to before.
   entries.sort(proc(a, b: MempoolEntry): int =
-    let aRate = float64(int64(a.ancestorFee)) / (float64(a.ancestorWeight) / 4.0)
-    let bRate = float64(int64(b.ancestorFee)) / (float64(b.ancestorWeight) / 4.0)
+    let aFee = float64(int64(a.ancestorFee) + mp.getFeeDelta(a.txid))
+    let bFee = float64(int64(b.ancestorFee) + mp.getFeeDelta(b.txid))
+    let aRate = aFee / (float64(a.ancestorWeight) / 4.0)
+    let bRate = bFee / (float64(b.ancestorWeight) / 4.0)
     if aRate > bRate: -1
     elif aRate < bRate: 1
     else: 0
@@ -1656,14 +1736,21 @@ proc evictLowestFee*(mp: Mempool) =
     if hasParent:
       continue  # Not a root
 
-    # Compute combined feerate of root + all descendants
+    # Compute combined feerate of root + all descendants.
+    # FIX-72 parity (mirrors rustoshi mempool.rs evict-via-modified-fee): each
+    # member contributes its MODIFIED fee (base + its own prioritisetransaction
+    # delta), so an operator-prioritised low-base-fee tx's higher modified fee
+    # raises its package rate and protects it from eviction — Core's TrimToSize
+    # evaluates over the txgraph, which already carries modified fees.  Only the
+    # member's OWN delta is folded (ancestor-delta aggregation is the W106 G8
+    # follow-up).  Un-prioritised members have delta 0 → identical to before.
     let descendants = mp.calculateDescendants(txid)
-    var chunkFee = int64(entry.fee)
+    var chunkFee = int64(entry.fee) + mp.getFeeDelta(txid)
     var chunkWeight = entry.weight
     for descTxid in descendants:
       if descTxid in mp.entries:
         let e = mp.entries[descTxid]
-        chunkFee += int64(e.fee)
+        chunkFee += int64(e.fee) + mp.getFeeDelta(descTxid)
         chunkWeight += e.weight
 
     let chunkVbytes = float64(chunkWeight) / 4.0
@@ -1682,8 +1769,13 @@ proc evictLowestFee*(mp: Mempool) =
     # in a well-formed mempool, but handle it gracefully by picking the overall
     # lowest individual fee rate entry).
     for txid, entry in mp.entries:
-      if entry.feeRate < lowestPackageRate:
-        lowestPackageRate = entry.feeRate
+      # FIX-72 parity: rank by MODIFIED feerate (base + own delta), not base.
+      let modVbytes = float64(entry.weight) / 4.0
+      let modRate =
+        if modVbytes > 0: float64(int64(entry.fee) + mp.getFeeDelta(txid)) / modVbytes
+        else: entry.feeRate
+      if modRate < lowestPackageRate:
+        lowestPackageRate = modRate
         lowestRootTxid = txid
         foundRoot = true
 
@@ -1695,12 +1787,14 @@ proc evictLowestFee*(mp: Mempool) =
 
   # Compute the effective fee rate of the chunk being removed (sat/kvB).
   # This is what we pass to trackPackageRemoved (+ incrementalRelayFeeRate).
-  var chunkFee = int64(mp.entries[lowestRootTxid].fee)
+  # FIX-72 parity: use each member's MODIFIED fee (base + own delta), matching
+  # the selection rate above so the rolling floor reflects what was evicted.
+  var chunkFee = int64(mp.entries[lowestRootTxid].fee) + mp.getFeeDelta(lowestRootTxid)
   var chunkWeight = mp.entries[lowestRootTxid].weight
   for descTxid in descendants:
     if descTxid in mp.entries:
       let e = mp.entries[descTxid]
-      chunkFee += int64(e.fee)
+      chunkFee += int64(e.fee) + mp.getFeeDelta(descTxid)
       chunkWeight += e.weight
 
   let chunkVbytes = float64(chunkWeight) / 4.0

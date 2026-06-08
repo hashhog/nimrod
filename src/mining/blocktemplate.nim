@@ -342,8 +342,17 @@ proc buildBlockTemplate*(
   for entry in selectedEntries:
     # Minimum fee rate gate (Core addChunks lines 298-301).
     # fee rate in sat/kvB = fee_sat * 1000 / vbytes; vbytes = weight / 4.
-    # entry.feeRate is sat/vbyte; convert to sat/kvB for comparison.
-    let entryFeeRateSatKvB = int64(entry.feeRate * 1000.0)
+    # FIX-72 parity: the floor compares the MODIFIED feerate (base +
+    # prioritisetransaction delta), mirroring Core, whose txgraph already holds
+    # modified fees.  Without this an operator-prioritised low-base-fee tx that
+    # getTransactionsByFeeRate ranked high would still be dropped here by its base
+    # rate (and the early `break` would skip everything after it).  An
+    # un-prioritised entry has delta 0, so this is the base feerate as before.
+    let modifiedFeeSat = int64(entry.fee) + mempool.getFeeDelta(entry.txid)
+    let entryVbytes = float64(entry.weight) / 4.0
+    let entryFeeRateSatKvB =
+      if entryVbytes > 0: int64(float64(modifiedFeeSat) / entryVbytes * 1000.0)
+      else: int64(entry.feeRate * 1000.0)
     if entryFeeRateSatKvB < blockMinFeeRateSatKvB:
       # Entries are sorted by fee rate; once we're below the floor we're done.
       break

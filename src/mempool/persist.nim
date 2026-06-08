@@ -97,16 +97,28 @@ proc dumpMempool*(mp: Mempool, dumpPath: string,
 
   # Build the obfuscated section (count + txs + mapDeltas + unbroadcast)
   # into one buffer first, then XOR it as a single span.
+  #
+  # PrioritiseTransaction deltas: Core (node/mempool_persist.cpp:157-203)
+  # snapshots the full mapDeltas, writes each in-mempool tx's delta inline as
+  # its nFeeDelta AND erases that txid from a local copy, then serialises the
+  # remaining (not-in-mempool) deltas as the trailing mapDeltas map. We mirror
+  # that exactly so the two delta sources never double-count on reload.
+  var remainingDeltas = mp.feeDeltas  # copy
   var w = BinaryWriter()
   w.writeUint64LE(uint64(snapshot.len))
   for entry in snapshot:
     w.writeTransaction(entry.tx, includeWitness = true)
     w.writeInt64LE(entry.timeAdded.toUnix())
-    # nimrod doesn't track per-entry nFeeDelta yet — Core defaults to 0
-    # when no PrioritiseTransaction has been called.
-    w.writeInt64LE(0'i64)
-  # mapDeltas: empty (we don't track prioritisations here either). Compactsize 0.
-  w.writeCompactSize(0)
+    let delta = mp.feeDeltas.getOrDefault(entry.txid, 0'i64)
+    w.writeInt64LE(delta)
+    remainingDeltas.del(entry.txid)
+  # mapDeltas: only the deltas for txs NOT in the mempool (Core erases the
+  # in-mempool ones above). std::map<Txid, CAmount>: compactsize(count) then
+  # each (32B txid + int64 amount).
+  w.writeCompactSize(uint64(remainingDeltas.len))
+  for txid, delta in remainingDeltas:
+    w.writeHash(array[32, byte](txid))
+    w.writeInt64LE(delta)
   # unbroadcast set: empty.
   w.writeCompactSize(0)
 
@@ -221,16 +233,29 @@ proc loadMempool*(mp: Mempool, loadPath: string,
     for _ in 0 ..< int(txCount):
       let tx = r.readTransaction()
       let nTime = r.readInt64LE()
-      discard r.readInt64LE()  # nFeeDelta — nimrod doesn't track these yet
+      let nFeeDelta = r.readInt64LE()
 
       let txid = tx.txid()
       if txid in mp.entries:
         counts.alreadyThere.inc
+        # Re-apply the stored prioritisation even if the tx is already present
+        # so the delta survives across a load into a partially-populated pool.
+        if nFeeDelta != 0:
+          mp.prioritiseTransaction(txid, nFeeDelta)
         continue
 
       if nTime > 0 and (now - nTime) > expirySeconds:
         counts.expired.inc
+        # Core does not re-prioritise expired txs (they never enter), but their
+        # delta is preserved via the trailing mapDeltas section below if it was
+        # an out-of-mempool delta. In-mempool deltas of expired txs are dropped.
         continue
+
+      # Core (node/mempool_persist.cpp:99-101) records the delta BEFORE the tx
+      # is (re)admitted so PreChecks' ApplyDelta folds it into the modified
+      # fee. We do the same: set the delta first, then accept.
+      if nFeeDelta != 0:
+        mp.prioritiseTransaction(txid, nFeeDelta)
 
       try:
         let res = mp.acceptTransaction(tx, crypto)
@@ -241,11 +266,15 @@ proc loadMempool*(mp: Mempool, loadPath: string,
       except CatchableError:
         counts.failed.inc
 
-    # mapDeltas — read but ignore (we don't track per-tx priorities yet).
+    # mapDeltas — out-of-mempool prioritisations (Core node/mempool_persist.cpp
+    # :125-130 calls PrioritiseTransaction for each). These stack onto whatever
+    # was applied per-tx above, matching Core's load semantics.
     let nDeltas = r.readCompactSize()
     for _ in 0 ..< int(nDeltas):
-      discard r.readHash()       # txid
-      discard r.readInt64LE()    # CAmount
+      let dtxid = TxId(r.readHash())
+      let damount = r.readInt64LE()
+      if damount != 0:
+        mp.prioritiseTransaction(dtxid, damount)
 
     # unbroadcast set — read but ignore.
     let nUnbroadcast = r.readCompactSize()
