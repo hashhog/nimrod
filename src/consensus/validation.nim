@@ -1450,7 +1450,8 @@ proc validateBlock*(
   params: ConsensusParams,
   checkScripts: bool = true,
   checkPow: bool = true,
-  getUtxoOverride: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} = nil
+  getUtxoOverride: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} = nil,
+  skipConnectChecks: bool = false
 ): ValidationResult[void] =
   ## Full block validation per Bitcoin consensus rules
   ##
@@ -1473,6 +1474,16 @@ proc validateBlock*(
   ## 950148, IBD-connected 950149 into the cache only, then rejected 950150
   ## (which spends 365 outputs created in 950149) — a deterministic false
   ## reject, not chainstate corruption.
+  ##
+  ## `skipConnectChecks` — when true, skip all UTXO-dependent checks (per-tx
+  ## input existence, fee computation, BIP-68 sequence locks, sigop cost, and
+  ## coinbase value). This mirrors Bitcoin Core's AcceptBlock behaviour: for a
+  ## block that does NOT extend the active chain tip, Core runs only CheckBlock
+  ## + ContextualCheckBlock (context-free + header/PoW/merkle/commitment);
+  ## full UTXO validation (ConnectBlock) runs only when the block is actually
+  ## connected during ActivateBestChainStep, against the fork-point UTXO view
+  ## rebuilt by DisconnectBlock (validation.cpp:4298-4396).
+  ## Pass true only from validateForStorage (side-branch acceptance).
 
   # Step 1a: non-contextual header checks (PoW hash, time-too-new, prevHash).
   # Core CheckBlockHeader (validation.cpp:4030-4049).
@@ -1536,32 +1547,12 @@ proc validateBlock*(
   if weight > params.maxBlockWeight:
     return voidErr(veBlockOverweight)
 
-  # Validate transactions and track fees
-  # CRITICAL: Maintain intra-block UTXOs for txs that spend outputs from earlier txs in same block
-  var totalFees = int64(0)
-  var intraBlockUtxos = initTable[string, UtxoEntry]()
-  var totalSigopCost = 0  # Track sigop cost with witness discount
-
-  # Determine which sigop rules apply at this height
-  let useWitnessSigops = height >= int32(params.segwitHeight)
-
-  # Add coinbase outputs to intra-block UTXOs and count coinbase sigops
-  let coinbaseTxid = blk.txs[0].txid()
-  for vout, output in blk.txs[0].outputs:
-    let key = $array[32, byte](coinbaseTxid) & ":" & $vout
-    intraBlockUtxos[key] = UtxoEntry(
-      output: output,
-      height: height,
-      isCoinbase: true
-    )
-
-  # Coinbase legacy sigops (scaled by WitnessScaleFactor)
-  totalSigopCost += getLegacySigOpCount(blk.txs[0]) * WitnessScaleFactor
-
-  # Check if BIP68 (CSV) is active at this height
+  # Check if BIP68 (CSV) is active at this height.
+  # prevBlockMtp is used both for IsFinalTx (ContextualCheckBlock, always runs)
+  # and for BIP-68 sequence locks (ConnectBlock level, gated on skipConnectChecks).
   let bip68Active = height >= int32(params.csvHeight)
 
-  # Precompute the MTP of the previous block for sequence lock checking
+  # Precompute the MTP of the previous block for sequence lock / IsFinalTx checking.
   var prevBlockMtp: uint32 = 0
   if bip68Active and prevIndex.height >= 0:
     prevBlockMtp = getMtpForHeight(utxos, prevIndex.height)
@@ -1578,6 +1569,10 @@ proc validateBlock*(
   # early regtest blocks and falling back to block timestamp would diverge
   # from Core.  Reference: Bitcoin Core validation.cpp ContextualCheckBlock,
   # LOCKTIME_MEDIAN_TIME_PAST flag.
+  #
+  # NOTE: IsFinalTx runs even when skipConnectChecks=true (side-branch
+  # acceptance). Core's ContextualCheckBlock (validation.cpp:4146) runs this
+  # check for every block regardless of active-chain status.
   let lockTimeCutoffForFinal: uint32 =
     if bip68Active: prevBlockMtp
     else: blk.header.timestamp
@@ -1585,78 +1580,115 @@ proc validateBlock*(
     if not isFinalTxEarly(tx, uint32(height), lockTimeCutoffForFinal):
       return voidErr(veNonFinalTx)
 
-  # Create a closure for getMtpAtHeight that can be passed to sequence lock functions
-  proc getMtpAtHeight(h: int32): uint32 =
-    getMtpForHeight(utxos, h)
+  # UTXO-dependent checks: input existence, fee computation, sigop cost, BIP-68
+  # sequence locks, and coinbase value. These mirror Core's ConnectBlock
+  # (validation.cpp:2295+) rather than ContextualCheckBlock/CheckBlock.
+  #
+  # When skipConnectChecks=true (side-branch block acceptance via
+  # validateForStorage), these checks are SKIPPED. The active-chain UTXO set
+  # does not represent this block's ancestor state — a UTXO spent by the active
+  # chain above the fork point is legitimately present at the fork but appears
+  # missing here, causing a false "bad-txns-inputs-missingorspent" reject.
+  # Full UTXO validation runs at connect time (handleReorg → connectBlock) where
+  # DisconnectBlock rewinds the UTXO set to the fork point first.
+  # This matches Core AcceptBlock (validation.cpp:4298-4396): only CheckBlock +
+  # ContextualCheckBlock for any block at accept time; ConnectBlock only during
+  # ActivateBestChainStep.
+  if not skipConnectChecks:
+    # Validate transactions and track fees
+    # CRITICAL: Maintain intra-block UTXOs for txs that spend outputs from earlier txs in same block
+    var totalFees = int64(0)
+    var intraBlockUtxos = initTable[string, UtxoEntry]()
+    var totalSigopCost = 0  # Track sigop cost with witness discount
 
-  # Validate non-coinbase transactions
-  for i in 1 ..< blk.txs.len:
-    let tx = blk.txs[i]
+    # Determine which sigop rules apply at this height
+    let useWitnessSigops = height >= int32(params.segwitHeight)
 
-    # Create UTXO lookup that includes intra-block UTXOs.
-    # Falls through to `getUtxoOverride` (cache-aware ChainState.getUtxo, when
-    # supplied by acceptBlock) so mid-IBD blocks see UTXOs created by
-    # not-yet-flushed recent blocks; otherwise the raw ChainDb (DB-only).
-    proc lookupUtxo(op: OutPoint): Option[UtxoEntry] =
-      let key = $array[32, byte](op.txid) & ":" & $op.vout
-      if key in intraBlockUtxos:
-        return some(intraBlockUtxos[key])
-      if getUtxoOverride != nil:
-        return getUtxoOverride(op)
-      utxos.getUtxo(op)
-
-    let txResult = validateTransaction(tx, lookupUtxo, height, params, intraBlockUtxos)
-    if not txResult.isOk:
-      return voidErr(txResult.error)
-
-    totalFees += txResult.value
-
-    # Accumulated fees must stay within MoneyRange after each tx.
-    # Core validation.cpp:2543-2547: if (!MoneyRange(nFees)) → "bad-txns-accumulated-fee-outofrange"
-    if totalFees < 0 or totalFees > int64(MaxMoney):
-      return voidErr(veFeesOutOfRange)
-
-    # Count sigops for this transaction with proper witness discount
-    let sigopResult = getTransactionSigOpCost(tx, lookupUtxo, useP2SH = true, useWitness = useWitnessSigops)
-    if sigopResult.isOk:
-      totalSigopCost += sigopResult.value
-    # Note: If sigop counting fails (missing UTXO), validation would have already failed above
-
-    # BIP68 sequence lock check (only if CSV is active and tx version >= 2)
-    if bip68Active and tx.version >= 2:
-      let seqLockResult = checkSequenceLocksForTx(
-        tx, lookupUtxo, height, prevBlockMtp, getMtpAtHeight, params, intraBlockUtxos
-      )
-      if not seqLockResult.isOk:
-        return voidErr(seqLockResult.error)
-
-    # Mark spent UTXOs (remove from intra-block set or mark for removal from UTXO set)
-    for inp in tx.inputs:
-      let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
-      intraBlockUtxos.del(key)
-
-    # Add this transaction's outputs to intra-block UTXOs
-    let thisTxid = tx.txid()
-    for vout, output in tx.outputs:
-      let key = $array[32, byte](thisTxid) & ":" & $vout
+    # Add coinbase outputs to intra-block UTXOs and count coinbase sigops
+    let coinbaseTxid = blk.txs[0].txid()
+    for vout, output in blk.txs[0].outputs:
+      let key = $array[32, byte](coinbaseTxid) & ":" & $vout
       intraBlockUtxos[key] = UtxoEntry(
         output: output,
         height: height,
-        isCoinbase: false
+        isCoinbase: true
       )
 
-  # Check sigop cost limit (BIP-141: 80,000 max)
-  if totalSigopCost > MaxBlockSigopsCost:
-    return voidErr(veSigopExceeded)
+    # Coinbase legacy sigops (scaled by WitnessScaleFactor)
+    totalSigopCost += getLegacySigOpCount(blk.txs[0]) * WitnessScaleFactor
 
-  # Check coinbase output value
-  let subsidy = getBlockSubsidy(height, params)
-  var coinbaseValue = int64(0)
-  for output in blk.txs[0].outputs:
-    coinbaseValue += int64(output.value)
+    # Create a closure for getMtpAtHeight that can be passed to sequence lock functions
+    proc getMtpAtHeight(h: int32): uint32 =
+      getMtpForHeight(utxos, h)
 
-  if coinbaseValue > int64(subsidy) + totalFees:
-    return voidErr(veBadAmount)
+    # Validate non-coinbase transactions
+    for i in 1 ..< blk.txs.len:
+      let tx = blk.txs[i]
+
+      # Create UTXO lookup that includes intra-block UTXOs.
+      # Falls through to `getUtxoOverride` (cache-aware ChainState.getUtxo, when
+      # supplied by acceptBlock) so mid-IBD blocks see UTXOs created by
+      # not-yet-flushed recent blocks; otherwise the raw ChainDb (DB-only).
+      proc lookupUtxo(op: OutPoint): Option[UtxoEntry] =
+        let key = $array[32, byte](op.txid) & ":" & $op.vout
+        if key in intraBlockUtxos:
+          return some(intraBlockUtxos[key])
+        if getUtxoOverride != nil:
+          return getUtxoOverride(op)
+        utxos.getUtxo(op)
+
+      let txResult = validateTransaction(tx, lookupUtxo, height, params, intraBlockUtxos)
+      if not txResult.isOk:
+        return voidErr(txResult.error)
+
+      totalFees += txResult.value
+
+      # Accumulated fees must stay within MoneyRange after each tx.
+      # Core validation.cpp:2543-2547: if (!MoneyRange(nFees)) → "bad-txns-accumulated-fee-outofrange"
+      if totalFees < 0 or totalFees > int64(MaxMoney):
+        return voidErr(veFeesOutOfRange)
+
+      # Count sigops for this transaction with proper witness discount
+      let sigopResult = getTransactionSigOpCost(tx, lookupUtxo, useP2SH = true, useWitness = useWitnessSigops)
+      if sigopResult.isOk:
+        totalSigopCost += sigopResult.value
+      # Note: If sigop counting fails (missing UTXO), validation would have already failed above
+
+      # BIP68 sequence lock check (only if CSV is active and tx version >= 2)
+      if bip68Active and tx.version >= 2:
+        let seqLockResult = checkSequenceLocksForTx(
+          tx, lookupUtxo, height, prevBlockMtp, getMtpAtHeight, params, intraBlockUtxos
+        )
+        if not seqLockResult.isOk:
+          return voidErr(seqLockResult.error)
+
+      # Mark spent UTXOs (remove from intra-block set or mark for removal from UTXO set)
+      for inp in tx.inputs:
+        let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
+        intraBlockUtxos.del(key)
+
+      # Add this transaction's outputs to intra-block UTXOs
+      let thisTxid = tx.txid()
+      for vout, output in tx.outputs:
+        let key = $array[32, byte](thisTxid) & ":" & $vout
+        intraBlockUtxos[key] = UtxoEntry(
+          output: output,
+          height: height,
+          isCoinbase: false
+        )
+
+    # Check sigop cost limit (BIP-141: 80,000 max)
+    if totalSigopCost > MaxBlockSigopsCost:
+      return voidErr(veSigopExceeded)
+
+    # Check coinbase output value
+    let subsidy = getBlockSubsidy(height, params)
+    var coinbaseValue = int64(0)
+    for output in blk.txs[0].outputs:
+      coinbaseValue += int64(output.value)
+
+    if coinbaseValue > int64(subsidy) + totalFees:
+      return voidErr(veBadAmount)
 
   # BIP-141 witness commitment validation — delegates to checkWitnessMalleation.
   # Reference: Bitcoin Core ContextualCheckBlock (validation.cpp:4169) calling
@@ -2126,12 +2158,16 @@ proc checkTransactionLegacy*(tx: Transaction, params: ConsensusParams): LegacyVa
 #   prevIndex   — BlockIndex of blk.header.prevBlock (height = blk.height - 1)
 #   db          — ChainDb used by validateBlock for MTP / header lookups
 #   params      — network consensus parameters
-#   skipScripts — if true, step 4 is skipped (assumevalid / IBD fast path);
-#                 computed by the caller from shouldSkipScripts or height gate
-#   checkPow    — if true, checkBlock verifies proof-of-work; P2P paths pass
-#                 true, submitblock / IBD applyBlock pass false (already checked)
-#   getUtxo     — UTXO lookup proc, used for BIP-30 (hasUtxo) and verifyScripts
-#   crypto      — CryptoEngine for secp256k1 / Schnorr verification
+#   skipScripts       — if true, step 4 is skipped (assumevalid / IBD fast path);
+#                       computed by the caller from shouldSkipScripts or height gate
+#   checkPow          — if true, checkBlock verifies proof-of-work; P2P paths pass
+#                       true, submitblock / IBD applyBlock pass false (already checked)
+#   getUtxo           — UTXO lookup proc, used for BIP-30 (hasUtxo) and verifyScripts
+#   crypto            — CryptoEngine for secp256k1 / Schnorr verification
+#   skipConnectChecks — if true, skip UTXO-dependent checks in validateBlock (input
+#                       existence, fees, BIP-68, sigops, coinbase value) and skip
+#                       BIP-30. Pass true for side-branch storage (validateForStorage).
+#                       See validateBlock docstring for Core reference.
 
 proc acceptBlock*(
   blk: Block,
@@ -2143,7 +2179,8 @@ proc acceptBlock*(
   getUtxo: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].},
   crypto: CryptoEngine,
   activeTipHeight: int32 = -1,
-  fRequested: bool = true
+  fRequested: bool = true,
+  skipConnectChecks: bool = false
 ): ValidationResult[void] =
   ## Unified block-acceptance check pipeline (no chainstate mutation).
   ##
@@ -2192,29 +2229,40 @@ proc acceptBlock*(
   # hit the raw ChainDb, missing UTXOs that mid-IBD `connectBlockIBD` staged
   # only in ChainState.utxoCache — a false "transaction inputs missing"
   # reject for any block spending a not-yet-flushed recent output.
+  #
+  # skipConnectChecks forwarded: when true (side-branch acceptance), defers
+  # UTXO-dependent checks to connect time. See validateBlock docstring.
   let height = prevIndex.height + 1
   let validateResult = validateBlock(blk, prevIndex, db, params,
                                      checkScripts = false,
                                      checkPow = checkPow,
-                                     getUtxoOverride = getUtxo)
+                                     getUtxoOverride = getUtxo,
+                                     skipConnectChecks = skipConnectChecks)
   if not validateResult.isOk:
     return validateResult
 
   # Step 3: BIP-30 cross-block dup-UTXO check (CVE-2012-1909).
-  # Compute this block's hash for the IsBIP30Repeat gate (height+hash check).
-  # The header serialization is 80 bytes; doubleSha256 yields the block hash.
-  let blkHeaderBytes = serialize(blk.header)
-  let blkHashArr = array[32, byte](doubleSha256(blkHeaderBytes))
-  # Wrap the getUtxo proc into the bool-returning hasUtxo signature that
-  # checkBip30 requires.  The try/except in the closure is needed to satisfy
-  # raises: [] — getUtxo already declares raises: [] so this is belt-and-
-  # suspenders.
-  let bip30HasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
-    try: getUtxo(op).isSome
-    except: false
-  let bip30Result = checkBip30(blk, height, blkHashArr, params, bip30HasUtxo)
-  if not bip30Result.isOk:
-    return bip30Result
+  # Skipped when skipConnectChecks=true (side-branch acceptance): the active-tip
+  # UTXO view cannot reliably detect a dup-coinbase for a block whose fork-point
+  # state differs from the active tip. BIP-30 is checked at connect time when
+  # the fork-point UTXO view is available (handleReorg → connectBlock).
+  # Core AcceptBlock does not call ConnectBlock (which contains BIP-30) for
+  # non-best-chain blocks (validation.cpp:4298-4396).
+  if not skipConnectChecks:
+    # Compute this block's hash for the IsBIP30Repeat gate (height+hash check).
+    # The header serialization is 80 bytes; doubleSha256 yields the block hash.
+    let blkHeaderBytes = serialize(blk.header)
+    let blkHashArr = array[32, byte](doubleSha256(blkHeaderBytes))
+    # Wrap the getUtxo proc into the bool-returning hasUtxo signature that
+    # checkBip30 requires.  The try/except in the closure is needed to satisfy
+    # raises: [] — getUtxo already declares raises: [] so this is belt-and-
+    # suspenders.
+    let bip30HasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
+      try: getUtxo(op).isSome
+      except: false
+    let bip30Result = checkBip30(blk, height, blkHashArr, params, bip30HasUtxo)
+    if not bip30Result.isOk:
+      return bip30Result
 
   # Step 4: script verification (skipped when assumevalid covers this block).
   # verifyScripts takes the same getUtxo proc for UTXO lookups during input
@@ -2396,8 +2444,17 @@ proc validateForStorage*(
     try: csRef.getUtxo(op)
     except: none(UtxoEntry)
   acceptBlock(blk, prevIdx, cs.db, cs.params,
-              skipScripts = true,   # see docstring; scripts re-verify on reorg
+              skipScripts = true,          # scripts re-verify on reorg
               checkPow = true,
               getUtxo = utxoLookup,
-              crypto = crypto)
+              crypto = crypto,
+              skipConnectChecks = true)    # defer UTXO/fee/BIP-30/BIP-68 to
+                                           # connect time; active-tip UTXO does
+                                           # not represent this block's parent
+                                           # state — a UTXO consumed by the active
+                                           # chain above the fork is legitimately
+                                           # present at the fork but looks missing
+                                           # here → false bad-txns-inputs-missingorspent.
+                                           # ConnectBlock runs at handleReorg time
+                                           # against the fork-point UTXO view.
 
