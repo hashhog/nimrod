@@ -2077,6 +2077,9 @@ proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNod
   ## W70d: aligned to Core 31.99 entryToJSON field set.
   let vsize = (entry.weight + 3) div 4
   let feeF   = float64(int64(entry.fee))   / 100000000.0
+  # modified fee = base + PrioritiseTransaction delta (Core GetModifiedFee).
+  # Without a prioritisation this equals the base fee, preserving prior output.
+  let modF   = float64(rpc.mempool.getModifiedFee(txid)) / 100000000.0
   let ancestF = float64(int64(entry.ancestorFee)) / 100000000.0
   # descendant fee: nimrod mempool tracks per-entry fee only;
   # for the single-entry case (no descendants) it equals the entry fee.
@@ -2097,7 +2100,7 @@ proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNod
   obj["chunkweight"]     = %chunkWeight
   var feesObj = newJObject()
   feesObj["base"]       = %feeF
-  feesObj["modified"]   = %feeF
+  feesObj["modified"]   = %modF
   feesObj["ancestor"]   = %ancestF
   feesObj["descendant"] = %descendF
   feesObj["chunk"]      = %feeF
@@ -2336,6 +2339,83 @@ proc handleGetOrphanTxs(rpc: RpcServer, params: JsonNode): JsonNode =
       o["hex"] = %toHex(serialize(entry.tx, includeWitness = true))
       ret.add(o)
 
+  ret
+
+proc handlePrioritiseTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## prioritisetransaction "txid" ( dummy ) fee_delta
+  ## Accepts the transaction into mined blocks at a higher (or lower) priority
+  ## by recording a signed fee delta that block selection treats as if the tx
+  ## had paid that much more (or less) absolute fee.
+  ## Reference: bitcoin-core/src/rpc/mining.cpp prioritisetransaction.
+  ##
+  ## Args (positional, Core order): txid, dummy, fee_delta.
+  ##   - dummy is a legacy priority argument: it MUST be 0 or null/omitted; a
+  ##     non-zero value is rejected (Core: RPC_INVALID_PARAMETER).
+  ##   - fee_delta is a SATOSHI value (NOT a fee rate), required.
+  ## The delta STACKS additively onto any previously set delta; a net delta of
+  ## 0 erases the entry (handled in mempool.prioritiseTransaction).
+  if rpc.mempool == nil:
+    raise newRpcError(RpcInternalError, "Mempool unavailable")
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "missing txid parameter")
+
+  let txid = parseTxidParam(params[0].getStr())
+
+  # dummy (legacy priority): index 1. Must be 0 or null/omitted. Core uses
+  # MaybeArg<double>, so a JSON int or float both count; only a NON-zero
+  # value is an error.
+  if params.len >= 2 and params[1].kind != JNull:
+    var dummyVal = 0.0
+    case params[1].kind
+    of JInt:   dummyVal = float64(params[1].getBiggestInt())
+    of JFloat: dummyVal = params[1].getFloat()
+    else:
+      raise newRpcError(RpcInvalidParameter,
+        "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.")
+    if dummyVal != 0.0:
+      raise newRpcError(RpcInvalidParameter,
+        "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.")
+
+  # fee_delta (satoshis, signed): index 2, required. Core: request.params[2]
+  # .getInt<int64_t>().
+  if params.len < 3 or params[2].kind != JInt:
+    raise newRpcError(RpcInvalidParameter,
+      "fee_delta must be an integer number of satoshis")
+  let feeDelta = params[2].getBiggestInt()
+
+  # Core: non-0 fee dust transactions are not allowed for entry, and
+  # modification is not allowed afterwards (require_standard + tx in mempool +
+  # any dust output). nimrod's mempool enforces standardness, so apply the
+  # same guard when the tx is present in the mempool.
+  let entryOpt = rpc.mempool.get(txid)
+  if entryOpt.isSome:
+    for output in entryOpt.get().tx.outputs:
+      if isDust(output):
+        raise newRpcError(RpcInvalidParameter,
+          "Priority is not supported for transactions with dust outputs.")
+
+  rpc.mempool.prioritiseTransaction(txid, feeDelta)
+  %true
+
+proc handleGetPrioritisedTransactions(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getprioritisedtransactions
+  ## Returns a map of all user-created (see prioritisetransaction) fee deltas
+  ## by txid, and whether the tx is present in mempool.
+  ## Reference: bitcoin-core/src/rpc/mining.cpp getprioritisedtransactions.
+  ##
+  ## Shape (byte-exact with Core): a JSON object keyed by txid (display hex);
+  ## each value = { fee_delta: <i64>, in_mempool: <bool>,
+  ##                modified_fee: <i64, ONLY when in_mempool=true> }.
+  if rpc.mempool == nil:
+    raise newRpcError(RpcInternalError, "Mempool unavailable")
+  var ret = newJObject()
+  for info in rpc.mempool.getPrioritisedTransactions():
+    var inner = newJObject()
+    inner["fee_delta"] = %info.delta
+    inner["in_mempool"] = %info.inMempool
+    if info.inMempool:
+      inner["modified_fee"] = %info.modifiedFee
+    ret[reverseHex(toHex(array[32, byte](info.txid)))] = inner
   ret
 
 # Raw transaction RPCs
@@ -10416,6 +10496,10 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetBlockTemplate(params)
   of "submitblock":
     rpc.handleSubmitBlock(params)
+  of "prioritisetransaction":
+    rpc.handlePrioritiseTransaction(params)
+  of "getprioritisedtransactions":
+    rpc.handleGetPrioritisedTransactions(params)
 
   # Regtest mining
   of "generate":
