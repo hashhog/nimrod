@@ -747,6 +747,77 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
 
   response
 
+proc resolveGetBlockFromPeer*(rpc: RpcServer, blockHash: BlockHash,
+                              peerId: int): tuple[peer: Peer, invs: seq[InvVector]] =
+  ## Core-`FetchBlock` analog: the pure decision core of getblockfrompeer,
+  ## split out so it can be unit-tested without a live socket. Performs the
+  ## same ordered checks as Bitcoin Core and, on success, returns the peer to
+  ## message plus the getdata inventory to send to it (one MSG_BLOCK |
+  ## MSG_WITNESS_FLAG item). Raises RpcError on any failure path.
+  ##
+  ## Reference: bitcoin-core/src/rpc/blockchain.cpp getblockfrompeer (header
+  ## known / block-already-downloaded) + net_processing.cpp
+  ## PeerManagerImpl::FetchBlock (peer exists / send getdata invs).
+
+  # (1) The block header must be known. nimrod stores a BlockIndex row for
+  #     every header it has accepted (headers-first sync writes the row via
+  #     putBlockIndexHashOnly before the body is downloaded), so a present
+  #     index entry mirrors Core's non-null LookupBlockIndex.
+  #     Core: blockchain.cpp:546-548 → RPC_MISC_ERROR(-1) "Block header missing".
+  if rpc.chainState == nil or rpc.chainState.db.getBlockIndex(blockHash).isNone:
+    raise newRpcError(RpcMiscError, "Block header missing")
+
+  # (2) The block body must NOT already be on disk. nimrod only writes the
+  #     full block (getBlock) once the body has been downloaded + connected,
+  #     so a present block body mirrors Core's BLOCK_HAVE_DATA.
+  #     Core: blockchain.cpp:556-559 → RPC_MISC_ERROR(-1) "Block already downloaded".
+  if rpc.chainState.db.getBlock(blockHash).isSome:
+    raise newRpcError(RpcMiscError, "Block already downloaded")
+
+  # (3) Resolve peer_id. nimrod's getpeerinfo numbers peers 0..N-1 as a loop
+  #     counter over getReadyPeers() (see handleGetPeerInfo); resolve peer_id
+  #     as that same index into the same ordered slice so the id a client sees
+  #     in getpeerinfo is the id getblockfrompeer accepts.
+  #     Core: net_processing.cpp:1964-1966 → RPC_MISC_ERROR(-1) "Peer does not exist".
+  let readyPeers =
+    if rpc.peerManager != nil: rpc.peerManager.getReadyPeers()
+    else: @[]
+  if peerId < 0 or peerId >= readyPeers.len:
+    raise newRpcError(RpcMiscError, "Peer does not exist")
+  let peer = readyPeers[peerId]
+
+  # (4) Build the block getdata. Core's FetchBlock always requests the witness
+  #     serialization (CInv(MSG_BLOCK | MSG_WITNESS_FLAG, hash)) after rejecting
+  #     pre-segwit peers; invWitnessBlock is exactly that flag combination
+  #     (0x40000002 = MSG_BLOCK | MSG_WITNESS_FLAG).
+  #     Core: net_processing.cpp:1979-1981.
+  let invs = @[InvVector(invType: invWitnessBlock,
+                         hash: array[32, byte](blockHash))]
+  (peer, invs)
+
+proc handleGetBlockFromPeer(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getblockfrompeer "blockhash" peer_id
+  ## Attempt to fetch a block from a given peer (by its getpeerinfo id).
+  ## Returns an empty object {} on success.
+  ## Reference: bitcoin-core/src/rpc/blockchain.cpp getblockfrompeer.
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams,
+      "getblockfrompeer requires 2 parameters: blockhash, peer_id")
+
+  let blockHash = parseBlockHash(params[0].getStr())
+  let peerId = params[1].getInt()
+
+  let (peer, invs) = rpc.resolveGetBlockFromPeer(blockHash, peerId)
+
+  # Send a block getdata to that one peer. As with the other P2P-touching RPC
+  # handlers in this file (broadcastTx / broadcastBlock) the write is fired via
+  # asyncSpawn+spawnSafe so a torn-down transport can't promote a transport
+  # race into a process-killing FutureDefect.
+  asyncSpawn spawnSafe(peer.sendGetData(invs))
+
+  # Core returns UniValue::VOBJ — an empty object.
+  newJObject()
+
 # Forward declarations for helpers defined later in this file that are needed
 # by handleGetBlock (verbosity=2 path) and by buildVinJson.
 # Nim requires definitions to precede use sites unless forward declarations are
@@ -5827,6 +5898,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "getblockchaininfo",
     "getblockcount",
     "getblockfilter \"blockhash\" ( \"filtertype\" )",
+    "getblockfrompeer \"blockhash\" peer_id",
     "getblockhash height",
     "getblockheader \"blockhash\" ( verbose )",
     "getblockstats hash_or_height ( stats )",
@@ -10387,6 +10459,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetBlockHeader(params)
   of "getblock":
     rpc.handleGetBlock(params)
+  of "getblockfrompeer":
+    rpc.handleGetBlockFromPeer(params)
   of "getdifficulty":
     rpc.handleGetDifficulty()
   of "getchaintips":
