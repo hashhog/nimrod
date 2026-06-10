@@ -5,6 +5,7 @@
 import std/[os, tables, json, locks, options, strutils, times]
 import ./wallet
 import ./db_sqlite
+import ./descriptor
 import ./wallet_persist
 import ../consensus/params
 import ../storage/chainstate
@@ -308,6 +309,23 @@ proc loadWallet*(wm: WalletManager, filename: string,
   else:
     discard
 
+  # Restore watch-only state from sqlite: the disable_private_keys flag and
+  # the watched descriptors (re-expanded to scriptPubKeys so block scanning
+  # keeps crediting them). Without this, watch-only-ness was silently lost
+  # on reload. Best-effort per row — one bad descriptor must never block the
+  # wallet from loading.
+  let dpkFlag = db.getWalletFlag("disable_private_keys")
+  wallet.privateKeysDisabled = dpkFlag.isSome and dpkFlag.get() == "1"
+  for row in db.getWatchedDescriptors():
+    try:
+      let desc = parseDescriptor(row.descriptor)
+      applyWatchedDescriptor(wallet, desc, row.descriptor, row.label,
+                             row.timestamp, row.rangeEnd, mainnet)
+    except CatchableError as e:
+      warnings.add("Failed to restore watched descriptor (" &
+                   row.descriptor[0 ..< min(row.descriptor.len, 40)] &
+                   "...): " & e.msg)
+
   let lw = LoadedWallet(
     wallet: wallet,
     db: db,
@@ -404,7 +422,11 @@ proc createWallet*(wm: WalletManager, name: string,
   var wallet: Wallet
 
   if options.disablePrivateKeys:
-    # Create watch-only wallet (no keys)
+    # Create watch-only wallet (no keys). The flag is BOTH stored on the
+    # Wallet object (so key-bearing RPCs can refuse with -4) AND persisted
+    # to the wallet_flags table (so a reload keeps the wallet watch-only).
+    # Reference: bitcoin-core/src/wallet/wallet.cpp CWallet::Create —
+    # WALLET_FLAG_DISABLE_PRIVATE_KEYS persists via InitWalletFlags.
     wallet = Wallet(
       params: wm.params,
       mainnet: mainnet,
@@ -414,8 +436,10 @@ proc createWallet*(wm: WalletManager, name: string,
       labels: initTable[string, string](),
       isEncrypted: false,
       isLocked: false,
-      lastSyncedHeight: -1
+      lastSyncedHeight: -1,
+      privateKeysDisabled: true
     )
+    db.setWalletFlag("disable_private_keys", "1")
   elif options.blank:
     # Create blank wallet - generate seed but no accounts
     let mnemonic = generateMnemonic(24)

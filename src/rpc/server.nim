@@ -98,6 +98,7 @@ const
   # Bitcoin Core specific error codes
   RpcInvalidParameter* = -8        # Invalid, missing or duplicate parameter (Core RPC_INVALID_PARAMETER)
   RpcInvalidAddressOrKey* = -5     # Invalid address or key
+  RpcTypeError* = -3               # Unexpected type was passed as parameter (Core RPC_TYPE_ERROR)
   RpcWalletError* = -4             # Generic wallet RPC error (Core RPC_WALLET_ERROR)
   RpcTransactionError* = -25       # Generic transaction error
   RpcTransactionRejected* = -26    # Transaction rejected by mempool
@@ -7089,6 +7090,23 @@ proc getTargetWallet(rpc: RpcServer): Wallet {.gcsafe.} =
     raise newRpcError(RpcMiscError, "wallet not loaded")
   return rpc.wallet
 
+proc getTargetLoadedWallet(rpc: RpcServer): LoadedWallet {.gcsafe.} =
+  ## LoadedWallet (wallet + sqlite handle) counterpart of getTargetWallet,
+  ## for handlers that must persist rows (importdescriptors). Returns nil in
+  ## legacy single-wallet mode / when no manager wallet matches; callers must
+  ## treat nil as "no sqlite persistence available" (in-memory import only).
+  if rpc.walletManager == nil:
+    return nil
+  if rpc.currentWalletName != "":
+    let lwOpt = rpc.walletManager.getWallet(rpc.currentWalletName)
+    if lwOpt.isSome:
+      return lwOpt.get()
+    return nil
+  let lwOpt = rpc.walletManager.getDefaultWallet()
+  if lwOpt.isSome:
+    return lwOpt.get()
+  nil
+
 # ============================================================================
 # Wallet Management RPCs
 # ============================================================================
@@ -7132,21 +7150,43 @@ proc handleCreateWallet(rpc: RpcServer, params: JsonNode): JsonNode =
 
   if params.len >= 6 and params[5].kind == JBool:
     options.descriptors = params[5].getBool()
+    # Core: legacy (non-descriptor) wallets can no longer be created at all.
+    # Reference: bitcoin-core/src/wallet/rpc/wallet.cpp:402-405 (-4).
+    if not options.descriptors:
+      raise newRpcError(RpcWalletError,
+        "descriptors argument must be set to \"true\"; it is no longer " &
+        "possible to create a legacy wallet.")
 
   if params.len >= 7 and params[6].kind == JBool:
     options.loadOnStartup = params[6].getBool()
 
+  # Core: a passphrase only encrypts private keys, so it cannot be combined
+  # with disable_private_keys. Reference: bitcoin-core/src/wallet/wallet.cpp
+  # CreateWallet:408-412 (FAILED_CREATE -> RPC_WALLET_ERROR -4).
+  if options.disablePrivateKeys and options.passphrase.len > 0:
+    raise newRpcError(RpcWalletError,
+      "Passphrase provided but private keys are disabled. A passphrase is " &
+      "only used to encrypt private keys, so cannot be used for wallets " &
+      "with private keys disabled.")
+
   try:
     let (lw, warnings) = rpc.walletManager.createWallet(walletName, options)
-    var result = %*{
+    var resp = %*{
       "name": lw.name,
       "warning": if warnings.len > 0: warnings.join("; ") else: ""
     }
-    result
+    # Core shape: optional "warnings" string array (wallet.cpp:425-427).
+    # The joined "warning" string above is kept for backward compatibility.
+    if warnings.len > 0:
+      var warr = newJArray()
+      for wmsg in warnings:
+        warr.add(%wmsg)
+      resp["warnings"] = warr
+    resp
   except WalletManagerError as e:
-    raise newRpcError(RpcMiscError, e.msg)
+    raise newRpcError(RpcWalletError, e.msg)
   except CatchableError as e:
-    raise newRpcError(RpcMiscError, "Failed to create wallet: " & e.msg)
+    raise newRpcError(RpcWalletError, "Failed to create wallet: " & e.msg)
 
 proc handleLoadWallet(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Load a wallet from disk
@@ -7274,6 +7314,12 @@ proc handleGetNewAddress(rpc: RpcServer, params: JsonNode): JsonNode =
 
   var w = rpc.getTargetWallet()
 
+  # Watch-only (disable_private_keys) wallets have no keypool to draw from.
+  # Core: RPC_WALLET_ERROR "Error: This wallet has no available keys"
+  # (wallet/rpc/addresses.cpp getnewaddress -> CanGetAddresses).
+  if w.privateKeysDisabled:
+    raise newRpcError(RpcWalletError, "Error: This wallet has no available keys")
+
   # Parse address type (default to bech32/P2WPKH)
   var addressType = "bech32"
   if params.len >= 2 and params[1].kind == JString:
@@ -7308,6 +7354,13 @@ proc handleSetHdSeed(rpc: RpcServer, params: JsonNode): JsonNode =
   ##
   ## Returns: { "seed_hex", "xprv", "xpub" } (xprv null when no privkeys).
   var w = rpc.getTargetWallet()
+
+  # Core: sethdseed is a key-bearing operation, refused on watch-only wallets.
+  # Reference: wallet/rpc/backup.cpp sethdseed -> RPC_WALLET_ERROR (-4)
+  # "Cannot set a HD seed to a wallet with private keys disabled".
+  if w.privateKeysDisabled:
+    raise newRpcError(RpcWalletError,
+      "Cannot set a HD seed to a wallet with private keys disabled")
 
   if w.isEncrypted and w.isLocked:
     raise newRpcError(RpcWalletError,
@@ -7464,6 +7517,12 @@ proc handleImportPrivKey(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Returns: null on success (Core shape).
   var w = rpc.getTargetWallet()
 
+  # Core: private keys can never enter a disable_private_keys wallet.
+  # Reference: wallet/rpc/backup.cpp:224-226 equivalent (-4).
+  if w.privateKeysDisabled:
+    raise newRpcError(RpcWalletError,
+      "Cannot import private keys to a wallet with private keys disabled")
+
   if w.isEncrypted and w.isLocked:
     raise newRpcError(RpcWalletError,
       "Error: Please enter the wallet passphrase with walletpassphrase first.")
@@ -7539,6 +7598,10 @@ proc handleGetRawChangeAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Returns: New change address string
 
   var w = rpc.getTargetWallet()
+
+  # Watch-only wallets cannot derive change addresses (no keys). Core: -4.
+  if w.privateKeysDisabled:
+    raise newRpcError(RpcWalletError, "Error: This wallet has no available keys")
 
   var addressType = "bech32"
   if params.len >= 1 and params[0].kind == JString:
@@ -7643,7 +7706,12 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
   let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
   let immatureBalance = w.getImmatureBalance(currentHeight)
 
-  %*{
+  # private_keys_enabled = !WALLET_FLAG_DISABLE_PRIVATE_KEYS — derived from
+  # the persisted flag, no longer hardcoded true. A disable_private_keys
+  # wallet has no keypool. Reference: bitcoin-core/src/wallet/rpc/wallet.cpp
+  # getwalletinfo (private_keys_enabled at :98, flags array at :116-128).
+  let keypool = if w.privateKeysDisabled: 0 else: 20
+  var info = %*{
     "walletname": walletName,
     "walletversion": 1,
     "format": "nimrod",
@@ -7651,16 +7719,23 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
     "unconfirmed_balance": 0.0,
     "immature_balance": float64(int64(immatureBalance)) / 100_000_000.0,
     "txcount": txCount,
-    "keypoolsize": 20,
-    "keypoolsize_hd_internal": 20,
+    "keypoolsize": keypool,
+    "keypoolsize_hd_internal": keypool,
     "paytxfee": 0.0,
-    "private_keys_enabled": true,
+    "private_keys_enabled": not w.privateKeysDisabled,
     "avoid_reuse": false,
     "scanning": false,
     "descriptors": false,
     "external_signer": false,
+    "blank": (w.accounts.len == 0 and not w.privateKeysDisabled),
     "unlocked_until": (if w.isEncrypted and not w.isLocked: w.unlockExpiry else: 0)
   }
+  # Core's flags string array (only the flags nimrod models are emitted).
+  var flags = newJArray()
+  if w.privateKeysDisabled:
+    flags.add(%"disable_private_keys")
+  info["flags"] = flags
+  info
 
 # ============================================================================
 # Wallet Send/Receive RPCs
@@ -7683,6 +7758,13 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Returns: txid (string) - The transaction ID
 
   var w = rpc.getTargetWallet()
+
+  # The defining watch-only property: watched funds are observable, never
+  # spendable. Core: RPC_WALLET_ERROR (-4) "Error: Private keys are disabled
+  # for this wallet" (wallet/rpc/spend.cpp send-family guard).
+  if w.privateKeysDisabled:
+    raise newRpcError(RpcWalletError,
+      "Error: Private keys are disabled for this wallet")
 
   if params.len < 2:
     raise newRpcError(RpcInvalidParams, "missing address and/or amount parameter")
@@ -8299,51 +8381,321 @@ proc handleDeriveAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
   except DescriptorError as e:
     raise newRpcError(RpcInvalidParams, "invalid descriptor: " & e.msg)
 
+proc univalueTypeName(kind: JsonNodeKind): string =
+  ## UniValue type names exactly as Core prints them in RPC_TYPE_ERROR
+  ## messages (univalue VType names).
+  case kind
+  of JNull: "null"
+  of JBool: "bool"
+  of JInt, JFloat: "number"
+  of JString: "string"
+  of JArray: "array"
+  of JObject: "object"
+
+proc parseImportRange(v: JsonNode): tuple[lo, hi: int] =
+  ## Parse importdescriptors' "range" value: n -> [0, n]; [begin, end].
+  ## Core ParseDescriptorRange / rpc/util.cpp (-8 messages verbatim).
+  if v.kind == JInt:
+    let n = v.getInt()
+    if n < 0:
+      raise newRpcError(RpcInvalidParameter, "Range should be greater or equal than 0")
+    return (0, n)
+  if v.kind == JArray and v.len == 2 and v[0].kind == JInt and v[1].kind == JInt:
+    let lo = v[0].getInt()
+    let hi = v[1].getInt()
+    if lo < 0:
+      raise newRpcError(RpcInvalidParameter, "Range should be greater or equal than 0")
+    if hi < lo:
+      raise newRpcError(RpcInvalidParameter,
+        "Range specified as [begin,end] must not have begin after end")
+    if hi - lo >= 10000:
+      raise newRpcError(RpcInvalidParameter, "Range is too large")
+    return (lo, hi)
+  raise newRpcError(RpcInvalidParameter,
+    "Range must be specified as integer or as [begin,end]")
+
+proc findRescanStartHeight(rpc: RpcServer, targetTime: int64): int32 {.gcsafe.} =
+  ## First active-chain height whose header time >= targetTime. The caller
+  ## passes lowest_timestamp - TIMESTAMP_WINDOW (7200s), mirroring
+  ## CWallet::RescanFromTime (bitcoin-core/src/wallet/wallet.cpp:1827-1848):
+  ## funds received up to 2 hours BEFORE the stated timestamp are credited.
+  ## Returns tip+1 when no block qualifies (the rescan becomes a no-op).
+  let tip = rpc.chainState.bestHeight
+  var h = 0'i32
+  while h <= tip:
+    let hashOpt = rpc.chainState.db.getBlockHashByHeight(h)
+    if hashOpt.isSome:
+      let idxOpt = rpc.chainState.db.getBlockIndex(hashOpt.get())
+      if idxOpt.isSome and int64(idxOpt.get().header.timestamp) >= targetTime:
+        return h
+    inc h
+  tip + 1
+
+proc importDescriptorWifKeys(w: var Wallet, node: DescriptorNode) =
+  ## For a WIF-bearing single-key descriptor imported into a wallet with
+  ## private keys ENABLED, register the private key in the keystore too (so
+  ## the imported coins are spendable, like Core's descriptor SPKM holding
+  ## the key). Watch registration still happens separately; this only adds
+  ## the signing path.
+  case node.kind
+  of DKPk, DKPkh, DKWpkh, DKCombo, DKRawTr:
+    if node.key.kind == KPConstWIF:
+      discard w.importPrivateKey(node.key.privateKey, compressed = true)
+  of DKSh, DKWsh:
+    importDescriptorWifKeys(w, node.sub)
+  else:
+    discard
+
 proc handleImportDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
-  ## Refused with `RpcWalletError` (Core RPC_WALLET_ERROR / -4). The pre-fix
-  ## handler walked the requests array, ran each descriptor through
-  ## `parseDescriptor`/`getDescriptorInfo`, and returned `{"success": true}`
-  ## per descriptor without ever adding to the wallet's watched descriptors
-  ## or persisting state. The pre-fix code self-documented the gap at
-  ## L4244-4245:
+  ## importdescriptors "requests"
   ##
-  ##     # For now, just validate and return success
-  ##     # Full implementation would add to wallet's watched descriptors
+  ## Import output descriptors as WATCH-ONLY scripts (or, on a wallet with
+  ## private keys enabled, with their WIF keys) and synchronously rescan the
+  ## chain so pre-import funds are credited. Replaces the 2026-05-05 honest
+  ## -4 refusal gate (cross-impl lying-RPC audit) with the real thing.
   ##
-  ## Operators got a successful JSON-RPC response; nothing actually landed
-  ## in the wallet. Same lying-RPC pattern as the haskoin `loadtxoutset`
-  ## bug closed earlier today (rustoshi 1d0a325 / hotbuns e355cd7 /
-  ## clearbit c8866ef / nimrod 64a856d wave from this morning).
+  ## Core-contract behaviors implemented (bitcoin-core/src/wallet/rpc/
+  ## backup.cpp importdescriptors / ProcessDescriptorImport):
+  ##   * Per-element results — one {success[, error]} object per request
+  ##     element, array parallel to the input; an element failure NEVER
+  ##     aborts the batch (backup.cpp:141-300 try/catch per element).
+  ##   * EXCEPTION: a bad/missing "timestamp" in ANY element aborts the whole
+  ##     call with a top-level -3 (GetImportTimestamp is called OUTSIDE the
+  ##     per-element try, backup.cpp:388-392 + 127-139).
+  ##   * Checksums are REQUIRED (Parse(..., require_checksum=true),
+  ##     backup.cpp:158); any parse/checksum failure surfaces per-element as
+  ##     -5 with Core's CheckChecksum message strings (descriptor.cpp:
+  ##     2838-2869), e.g. "Missing checksum".
+  ##   * disable_private_keys gates, both directions, per-element -4
+  ##     (backup.cpp:224-226 and 259-262).
+  ##   * timestamp: numeric (clamped >= 1) or "now" (= chain-tip MTP,
+  ##     backup.cpp:376,385,390). After >=1 successful element the chain is
+  ##     rescanned SYNCHRONOUSLY from the first block with header time >=
+  ##     min(timestamps) - TIMESTAMP_WINDOW (7200s) — Core's
+  ##     RescanFromTime(lowest_timestamp, update=true) blocks too.
   ##
-  ## Wiring real descriptor-wallet support (descriptor → address derivation
-  ## → wallet DB write → blockchain rescan) is a multi-day project. The
-  ## honest gate is the fix; the real implementation is a follow-up.
-  ##
-  ## The gate fires AFTER cheap parameter-shape validation (so malformed
-  ## params still get RpcInvalidParams) but BEFORE any wallet state read
-  ## or write. The pre-fix `rpc.wallet == nil` check is gone — there is
-  ## no live wallet code path through this handler post-fix.
-  ##
-  ## Cross-impl audit:
-  ## `CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md`.
-  ##
-  ## Exported (`*`) so tests can call it directly the same way the
-  ## existing `handleLoadTxOutSet` tests do.
-  discard rpc  # gate fires before any rpc-state read
+  ## Exported (`*`) so tests can call it directly.
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing requests parameter")
   if params[0].kind != JArray:
     raise newRpcError(RpcInvalidParams, "requests must be an array")
 
-  raise newRpcError(
-    RpcWalletError,
-    "importdescriptors not implemented in nimrod; descriptor-wallet " &
-      "support is not wired (no descriptor→address derivation, no " &
-      "wallet DB write, no blockchain rescan). The pre-fix handler " &
-      "returned success without persisting anything. Operator-managed " &
-      "key import via `importprivkey` / `importaddress` is the " &
-      "supported path until descriptor wallets are wired end-to-end."
-  )
+  var w = rpc.getTargetWallet()
+  let lw = rpc.getTargetLoadedWallet()  # nil => no sqlite persistence
+  if rpc.chainState == nil:
+    raise newRpcError(RpcMiscError, "no chain state")
+
+  let requests = params[0]
+  let tipHeight = rpc.chainState.bestHeight
+  # "now" = chain-tip median-time-past (Core binds `now` via
+  # FoundBlock().mtpTime at backup.cpp:385).
+  let nowMtp =
+    if tipHeight >= 0: int64(getMtpForHeight(rpc.chainState.db, tipHeight))
+    else: getTime().toUnix()
+
+  # Phase 1 — resolve EVERY element's timestamp before importing anything.
+  # Core's GetImportTimestamp runs outside the per-element try, so a single
+  # malformed timestamp is a top-level RPC_TYPE_ERROR (-3) for the whole call.
+  var timestamps = newSeq[int64](requests.len)
+  for i in 0 ..< requests.len:
+    let el = requests[i]
+    if el.kind != JObject or not el.hasKey("timestamp"):
+      raise newRpcError(RpcTypeError, "Missing required timestamp field for key")
+    let ts = el["timestamp"]
+    case ts.kind
+    of JInt:
+      timestamps[i] = ts.getBiggestInt()
+    of JFloat:
+      timestamps[i] = int64(ts.getFloat())
+    of JString:
+      if ts.getStr() == "now":
+        timestamps[i] = nowMtp
+      else:
+        raise newRpcError(RpcTypeError,
+          "Expected number or \"now\" timestamp value for key. got type string")
+    else:
+      raise newRpcError(RpcTypeError,
+        "Expected number or \"now\" timestamp value for key. got type " &
+        univalueTypeName(ts.kind))
+
+  # Phase 2 — per-element import. Failures are per-element error objects.
+  var results = newJArray()
+  var anySuccess = false
+  var lowestTs = int64.high
+  for i in 0 ..< requests.len:
+    let el = requests[i]
+    var elemRes = newJObject()
+    try:
+      # minimum_timestamp = 1: timestamp 0 means scan-whole-chain
+      # (backup.cpp:376,390 max(GetImportTimestamp, 1)).
+      let ts = max(timestamps[i], 1'i64)
+
+      if not el.hasKey("desc") or el["desc"].kind != JString:
+        raise newRpcError(RpcInvalidParameter, "Descriptor not found.")
+      let descStr = el["desc"].getStr()
+      let label =
+        if el.hasKey("label") and el["label"].kind == JString: el["label"].getStr()
+        else: ""
+
+      # BIP-380 checksum gate, require-mode, then grammar parse. Core funnels
+      # both failure kinds into RPC_INVALID_ADDRESS_OR_KEY (-5)
+      # (backup.cpp:159-161).
+      var payload: string
+      var desc: Descriptor
+      try:
+        payload = splitDescriptorChecksum(descStr, requireChecksum = true)
+        desc = parseDescriptor(payload)
+      except DescriptorError as e:
+        raise newRpcError(RpcInvalidAddressOrKey, e.msg)
+      except CatchableError as e:
+        # decodeAddress/parse internals can raise non-DescriptorError types;
+        # Core maps every Parse failure to -5.
+        raise newRpcError(RpcInvalidAddressOrKey, e.msg)
+      let canonical = payload & "#" & computeDescriptorChecksum(payload)
+
+      # Range validation (Core backup.cpp:166-178, -8 messages).
+      var rangeEnd = 0
+      if desc.node.isRange():
+        if not el.hasKey("range"):
+          raise newRpcError(RpcInvalidParameter,
+            "Descriptor is ranged, please specify the range")
+        let (_, hi) = parseImportRange(el["range"])
+        rangeEnd = hi
+      elif el.hasKey("range"):
+        raise newRpcError(RpcInvalidParameter,
+          "Range should not be specified for an un-ranged descriptor")
+
+      # disable_private_keys gates, both directions (backup.cpp:224-226,
+      # 259-262; RPC_WALLET_ERROR -4).
+      let hasPriv = descriptorHasPrivateKeys(desc)
+      if w.privateKeysDisabled and hasPriv:
+        raise newRpcError(RpcWalletError,
+          "Cannot import private keys to a wallet with private keys disabled")
+      if (not w.privateKeysDisabled) and (not hasPriv):
+        raise newRpcError(RpcWalletError,
+          "Cannot import descriptor without private keys to a wallet with " &
+          "private keys enabled")
+
+      # Register the watch scripts (and, on an enabled wallet, the WIF keys
+      # so the coins are spendable).
+      applyWatchedDescriptor(w, desc, canonical, label, ts, rangeEnd,
+                             rpc.params.network == Mainnet)
+      if hasPriv and not w.privateKeysDisabled:
+        importDescriptorWifKeys(w, desc.node)
+
+      # Persist the descriptor row so the watch survives a wallet reload.
+      if lw != nil and lw.db != nil:
+        try:
+          lw.db.saveWatchedDescriptor(canonical, label, ts, rangeEnd)
+        except CatchableError:
+          discard  # in-memory import still stands; reload-safety degraded
+
+      anySuccess = true
+      if ts < lowestTs:
+        lowestTs = ts
+      elemRes["success"] = %true
+    except RpcError as e:
+      elemRes = newJObject()
+      elemRes["success"] = %false
+      elemRes["error"] = %*{"code": e.code, "message": e.msg}
+    except CatchableError as e:
+      elemRes = newJObject()
+      elemRes["success"] = %false
+      elemRes["error"] = %*{"code": RpcMiscError, "message": e.msg}
+    results.add(elemRes)
+
+  # Phase 3 — synchronous rescan iff >=1 element succeeded (backup.cpp:
+  # 399-410), from the first block with time >= lowest - TIMESTAMP_WINDOW.
+  # rescanWalletRange runs scanBlockForWallet over the range — the same
+  # recognition path as block-connect — so pre-import funds are credited
+  # into balance/listunspent before this RPC returns (Core blocks too).
+  if anySuccess:
+    if tipHeight >= 0:
+      var startHeight = 0'i32
+      if lowestTs > 1:
+        startHeight = rpc.findRescanStartHeight(lowestTs - 7200)
+      if startHeight <= tipHeight:
+        rpc.rescanWalletRange(w, startHeight, tipHeight)
+    rpc.persistTargetWallet()
+
+  results
+
+proc handleGetAddressInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getaddressinfo "address"
+  ##
+  ## Wallet-relative information about an address. Field order mirrors
+  ## Core's runtime emission order (bitcoin-core/src/wallet/rpc/
+  ## addresses.cpp:441-508): address, scriptPubKey, ismine, solvable,
+  ## desc (only when solvable), parent_desc (only for descriptor-backed
+  ## scripts — here: the imported watch descriptor with checksum),
+  ## iswatchonly (deprecated, ALWAYS false — addresses.cpp:478), then the
+  ## DescribeWalletAddress fields (isscript/iswitness/witness_*), ischange,
+  ## timestamp (when known), labels last (empty array allowed). JObject is
+  ## an OrderedTable, so insertion order is response order.
+  ##
+  ## Invalid address -> -5 (addresses.cpp:431-439).
+  let w = rpc.getTargetWallet()
+
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "address required")
+  let addrStr = params[0].getStr()
+
+  var parsedAddr: Address
+  try:
+    parsedAddr = decodeAddress(addrStr)
+  except CatchableError:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid address")
+
+  let spk = scriptPubKeyForAddress(parsedAddr)
+  let keyOpt = w.findKeyForScript(spk)
+  let watched = w.isWatchedScript(spk)
+  let ismine = keyOpt.isSome or watched
+
+  # solvable: key-backed addresses always; watched scripts iff their source
+  # descriptor is solvable (addr()/raw() watches are NOT — Core infers no
+  # signing provider for them).
+  var solvable = keyOpt.isSome
+  var watchEntry: WatchedScript
+  if watched:
+    watchEntry = w.watchedScripts[spk]
+    if not solvable:
+      try:
+        solvable = parseDescriptor(watchEntry.descriptor).node.isSolvable()
+      except CatchableError:
+        solvable = false
+
+  result = newJObject()
+  result["address"] = %addrStr
+  result["scriptPubKey"] = %toHex(spk)
+  result["ismine"] = %ismine
+  result["solvable"] = %solvable
+  if solvable and watched:
+    # The canonical imported descriptor doubles as desc for non-ranged
+    # single-script watches (Core: inferred per-address descriptor).
+    result["desc"] = %watchEntry.descriptor
+  if watched:
+    result["parent_desc"] = %watchEntry.descriptor
+  # Deprecated, always false since the legacy-watchonly removal (Core v29+).
+  result["iswatchonly"] = %false
+  let isWitness = parsedAddr.kind in {P2WPKH, P2WSH, P2TR}
+  result["isscript"] = %(parsedAddr.kind in {P2SH, P2WSH, P2TR})
+  result["iswitness"] = %isWitness
+  if isWitness:
+    result["witness_version"] = %(if parsedAddr.kind == P2TR: 1 else: 0)
+    var prog: string
+    case parsedAddr.kind
+    of P2WPKH: prog = toHex(parsedAddr.wpkh)
+    of P2WSH: prog = toHex(parsedAddr.wsh)
+    of P2TR: prog = toHex(parsedAddr.taprootKey)
+    else: prog = ""
+    result["witness_program"] = %prog
+  result["ischange"] = %(keyOpt.isSome and keyOpt.get().path.contains("/1/"))
+  if watched and watchEntry.timestamp > 0:
+    result["timestamp"] = %watchEntry.timestamp
+  var labels = newJArray()
+  if addrStr in w.labels and w.labels[addrStr].len > 0:
+    labels.add(%w.labels[addrStr])
+  result["labels"] = labels
 
 # ============================================================================
 # PSBT RPCs
@@ -10618,6 +10970,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   # Wallet
   of "getnewaddress":
     rpc.handleGetNewAddress(params)
+  of "getaddressinfo":
+    rpc.handleGetAddressInfo(params)
   of "sethdseed":
     rpc.handleSetHdSeed(params)
   of "getrawchangeaddress":
@@ -10725,6 +11079,61 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   else:
     raise newRpcError(RpcMethodNotFound, "method not found: " & methodName)
 
+proc namedArgPositions(methodName: string): seq[string] =
+  ## Positional argument-name tables for object-form ("named") params.
+  ## Bitcoin Core accepts named params for EVERY RPC via a table-driven
+  ## transform (src/rpc/server.cpp:368-470 transformNamedArguments, invoked
+  ## from ExecuteCommand at 502-511). nimrod's handlers are positional-only,
+  ## so this covers the wallet/descriptor surface where named-args use is
+  ## common (createwallet from descriptor-wallet tooling being the observed
+  ## case). An empty seq means "method known, takes no arguments"; methods
+  ## not listed raise -32602 (instead of the historic std/json
+  ## AssertionDefect that the transport layer misreported as -32700).
+  case methodName
+  of "createwallet":
+    @["wallet_name", "disable_private_keys", "blank", "passphrase",
+      "avoid_reuse", "descriptors", "load_on_startup", "external_signer"]
+  of "loadwallet": @["filename", "load_on_startup"]
+  of "unloadwallet": @["wallet_name", "load_on_startup"]
+  of "importdescriptors": @["requests"]
+  of "getaddressinfo": @["address"]
+  of "getwalletinfo", "listwallets", "listwalletdir": @[]
+  of "getnewaddress": @["label", "address_type"]
+  of "getbalance": @["dummy", "minconf", "include_watchonly", "avoid_reuse"]
+  of "listunspent":
+    @["minconf", "maxconf", "addresses", "include_unsafe", "query_options"]
+  of "sendtoaddress":
+    @["address", "amount", "comment", "comment_to", "subtractfeefromamount",
+      "replaceable", "conf_target", "estimate_mode"]
+  of "importprivkey": @["privkey", "label", "rescan"]
+  of "rescanblockchain": @["start_height", "stop_height"]
+  of "getdescriptorinfo": @["descriptor"]
+  of "deriveaddresses": @["descriptor", "range"]
+  else:
+    raise newRpcError(RpcInvalidParams,
+      "Named parameters are not supported for method " & methodName &
+      "; pass params as a positional array")
+
+proc transformNamedParams(methodName: string, params: JsonNode): JsonNode =
+  ## Map a JObject params node onto the positional array the handlers expect.
+  ## Mirrors Core transformNamedArguments: unspecified interior positions are
+  ## filled with JSON null (handlers already treat JNull as "absent"), and an
+  ## unknown name is RPC_INVALID_PARAMETER (-8, Core rpc/server.cpp:465-467).
+  ## Duplicate keys cannot survive std/json parsing, so Core's duplicate check
+  ## is structurally unreachable here.
+  let argNames = namedArgPositions(methodName)
+  var slots: seq[JsonNode] = @[]
+  for key, val in params:
+    let idx = argNames.find(key)
+    if idx < 0:
+      raise newRpcError(RpcInvalidParameter, "Unknown named parameter " & key)
+    while slots.len <= idx:
+      slots.add(newJNull())
+    slots[idx] = val
+  result = newJArray()
+  for s in slots:
+    result.add(s)
+
 proc makeErrorResponse(id: JsonNode, code: int, message: string): string =
   $ %*{
     "jsonrpc": "2.0",
@@ -10777,6 +11186,14 @@ proc handleSingleRequest(rpc: RpcServer, reqJson: JsonNode): JsonNode =
     var params = newJArray()
     if reqJson.hasKey("params"):
       params = reqJson["params"]
+
+    # Object-form ("named") params: transform to positional before dispatch.
+    # Core does this for every RPC (rpc/server.cpp:507-508); we cover the
+    # wallet/descriptor surface and return a clean -32602 elsewhere. This
+    # also closes the old failure mode where params[0] on a JObject raised
+    # an AssertionDefect that the transport layer reported as -32700.
+    if params.kind == JObject:
+      params = transformNamedParams(methodName, params)
 
     # Execute the method
     let methodResult = rpc.handleMethod(methodName, params)

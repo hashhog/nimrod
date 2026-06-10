@@ -185,6 +185,18 @@ proc open*(wdb: var WalletDb) =
       rounds INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS watched_descriptors (
+      descriptor TEXT PRIMARY KEY NOT NULL,
+      label TEXT NOT NULL DEFAULT '',
+      timestamp INTEGER NOT NULL DEFAULT 0,
+      range_end INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS wallet_flags (
+      key TEXT PRIMARY KEY NOT NULL,
+      value TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_keys_address ON keys(address);
     CREATE INDEX IF NOT EXISTS idx_utxos_key_path ON utxos(key_path);
     CREATE INDEX IF NOT EXISTS idx_utxos_spent ON utxos(spent_in_txid);
@@ -707,6 +719,133 @@ proc getAllLabels*(wdb: WalletDb): seq[tuple[address: string, label: string]] =
     result.add(($sqlite3_column_text(stmt, 0), $sqlite3_column_text(stmt, 1)))
 
   discard sqlite3_finalize(stmt)
+
+# =============================================================================
+# Watch-only descriptors + wallet flags (importdescriptors / createwallet
+# disable_private_keys persistence). Both tables auto-migrate via
+# CREATE TABLE IF NOT EXISTS in open(), so pre-existing wallet.db files keep
+# working — a deliberate alternative to bumping WalletSnapVersion (the
+# snapshot loader hard-rejects unknown versions).
+# =============================================================================
+
+type
+  ## One persisted watched-descriptor row.
+  StoredWatchedDescriptor* = object
+    descriptor*: string
+    label*: string
+    timestamp*: int64
+    rangeEnd*: int    ## Inclusive expansion end for ranged descriptors (0 = non-ranged)
+
+proc saveWatchedDescriptor*(wdb: WalletDb, descriptor, label: string,
+                            timestamp: int64, rangeEnd: int = 0) =
+  ## Persist (upsert) a watched descriptor registered by importdescriptors.
+  if not wdb.isOpen:
+    raise newException(WalletDbError, "database not open")
+
+  let db = Sqlite3(wdb.db)
+  let sql = """
+    INSERT OR REPLACE INTO watched_descriptors (descriptor, label, timestamp, range_end)
+    VALUES (?, ?, ?, ?)
+  """
+
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  checkError(db, rc, "prepare watched descriptor insert")
+
+  rc = sqlite3_bind_text(stmt, 1, descriptor.cstring, -1, SQLITE_TRANSIENT)
+  checkError(db, rc, "bind descriptor")
+
+  rc = sqlite3_bind_text(stmt, 2, label.cstring, -1, SQLITE_TRANSIENT)
+  checkError(db, rc, "bind label")
+
+  rc = sqlite3_bind_int64(stmt, 3, timestamp)
+  checkError(db, rc, "bind timestamp")
+
+  rc = sqlite3_bind_int(stmt, 4, cint(rangeEnd))
+  checkError(db, rc, "bind range_end")
+
+  rc = sqlite3_step(stmt)
+  if rc != SQLITE_DONE:
+    checkError(db, rc, "step watched descriptor insert")
+
+  discard sqlite3_finalize(stmt)
+
+proc getWatchedDescriptors*(wdb: WalletDb): seq[StoredWatchedDescriptor] =
+  ## All persisted watched descriptors (re-expanded on wallet load).
+  result = @[]
+  if not wdb.isOpen:
+    return
+
+  let db = Sqlite3(wdb.db)
+  let sql = "SELECT descriptor, label, timestamp, range_end FROM watched_descriptors"
+
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  if rc != SQLITE_OK:
+    return
+
+  while true:
+    rc = sqlite3_step(stmt)
+    if rc != SQLITE_ROW:
+      break
+    result.add(StoredWatchedDescriptor(
+      descriptor: $sqlite3_column_text(stmt, 0),
+      label: $sqlite3_column_text(stmt, 1),
+      timestamp: sqlite3_column_int64(stmt, 2),
+      rangeEnd: int(sqlite3_column_int(stmt, 3))))
+
+  discard sqlite3_finalize(stmt)
+
+proc setWalletFlag*(wdb: WalletDb, key, value: string) =
+  ## Persist a wallet flag (e.g. "disable_private_keys" -> "1").
+  if not wdb.isOpen:
+    raise newException(WalletDbError, "database not open")
+
+  let db = Sqlite3(wdb.db)
+  let sql = "INSERT OR REPLACE INTO wallet_flags (key, value) VALUES (?, ?)"
+
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  checkError(db, rc, "prepare wallet flag insert")
+
+  rc = sqlite3_bind_text(stmt, 1, key.cstring, -1, SQLITE_TRANSIENT)
+  checkError(db, rc, "bind flag key")
+
+  rc = sqlite3_bind_text(stmt, 2, value.cstring, -1, SQLITE_TRANSIENT)
+  checkError(db, rc, "bind flag value")
+
+  rc = sqlite3_step(stmt)
+  if rc != SQLITE_DONE:
+    checkError(db, rc, "step wallet flag insert")
+
+  discard sqlite3_finalize(stmt)
+
+proc getWalletFlag*(wdb: WalletDb, key: string): Option[string] =
+  ## Read a wallet flag; none when unset (pre-migration DBs included).
+  if not wdb.isOpen:
+    return none(string)
+
+  let db = Sqlite3(wdb.db)
+  let sql = "SELECT value FROM wallet_flags WHERE key = ?"
+
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  if rc != SQLITE_OK:
+    return none(string)
+
+  rc = sqlite3_bind_text(stmt, 1, key.cstring, -1, SQLITE_TRANSIENT)
+  if rc != SQLITE_OK:
+    discard sqlite3_finalize(stmt)
+    return none(string)
+
+  rc = sqlite3_step(stmt)
+  if rc != SQLITE_ROW:
+    discard sqlite3_finalize(stmt)
+    return none(string)
+
+  let value = $sqlite3_column_text(stmt, 0)
+  discard sqlite3_finalize(stmt)
+  some(value)
 
 # =============================================================================
 # Encryption Storage
