@@ -1087,6 +1087,46 @@ proc parseDescriptorNode(s: string, pos: var int, ctx: ParseContext): Descriptor
   else:
     raise newException(DescriptorError, "unknown descriptor function: " & funcName)
 
+proc splitDescriptorChecksum*(descriptor: string, requireChecksum: bool): string =
+  ## Core-parity checksum gate: validate (and strip) the trailing
+  ## "#checksum" suffix, returning the bare payload. Raises DescriptorError
+  ## with Bitcoin Core's EXACT message strings so RPC callers
+  ## (importdescriptors) can surface them verbatim as RPC_INVALID_ADDRESS_OR_KEY
+  ## (-5) errors.
+  ##
+  ## Reference: bitcoin-core/src/script/descriptor.cpp:2838-2869 CheckChecksum —
+  ##   * "Multiple '#' symbols"
+  ##   * "Missing checksum" (only when require_checksum)
+  ##   * "Expected 8 character checksum, not %u characters"
+  ##   * "Invalid characters in payload"
+  ##   * "Provided checksum '%s' does not match computed checksum '%s'"
+  ##     (provided FIRST, computed SECOND — note parseDescriptor's legacy
+  ##     message prints them the other way around)
+  var hashCount = 0
+  for ch in descriptor:
+    if ch == '#':
+      inc hashCount
+  if hashCount > 1:
+    raise newException(DescriptorError, "Multiple '#' symbols")
+  if hashCount == 0:
+    if requireChecksum:
+      raise newException(DescriptorError, "Missing checksum")
+    return descriptor
+  let hashPos = descriptor.find('#')
+  let payload = descriptor[0 ..< hashPos]
+  let given = descriptor[hashPos + 1 .. ^1]
+  if given.len != 8:
+    raise newException(DescriptorError,
+      "Expected 8 character checksum, not " & $given.len & " characters")
+  let computed = computeDescriptorChecksum(payload)
+  if computed == "":
+    raise newException(DescriptorError, "Invalid characters in payload")
+  if computed != given:
+    raise newException(DescriptorError,
+      "Provided checksum '" & given & "' does not match computed checksum '" &
+      computed & "'")
+  payload
+
 proc parseDescriptor*(descriptor: string, requireChecksum: bool = false): Descriptor =
   ## Parse a descriptor string
   new(result)
@@ -1212,6 +1252,31 @@ proc deriveScripts*(desc: Descriptor, start: int = 0, count: int = 1): seq[seq[b
     result = expanded.scripts
 
 # =============================================================================
+# Watch-only registration (importdescriptors)
+# =============================================================================
+
+proc applyWatchedDescriptor*(wallet: Wallet, desc: Descriptor,
+                             canonical, label: string, timestamp: int64,
+                             rangeEnd: int, mainnet: bool) =
+  ## Expand a parsed descriptor and register every derived scriptPubKey as a
+  ## watched script on the wallet (in-memory only — persisting the descriptor
+  ## row is the caller's job). `rangeEnd` is the inclusive expansion end for
+  ## ranged descriptors (ignored for non-ranged). Lives here rather than in
+  ## wallet.nim because this module imports wallet.nim (not vice versa).
+  var w = wallet
+  let lastPos = if desc.node.isRange(): max(rangeEnd, 0) else: 0
+  for pos in 0 .. lastPos:
+    let expanded = expandNode(desc.node, pos)
+    # addresses align 1:1 with scripts for the single-script descriptor kinds;
+    # for misaligned kinds (combo/pk/raw) store "" rather than guess.
+    let aligned = expanded.addresses.len == expanded.scripts.len
+    for si, script in expanded.scripts:
+      let addrStr =
+        if aligned: encodeAddress(expanded.addresses[si], mainnet)
+        else: ""
+      w.registerWatchedScript(script, canonical, label, addrStr, timestamp)
+
+# =============================================================================
 # Descriptor Info
 # =============================================================================
 
@@ -1248,6 +1313,12 @@ proc hasPrivateKeys(node: DescriptorNode): bool =
     return false
   of DKAddr, DKRaw, DKMiniscript:
     return false
+
+proc descriptorHasPrivateKeys*(desc: Descriptor): bool =
+  ## Whether a parsed descriptor carries any private key material (WIF or
+  ## xprv). Exported for importdescriptors' disable_private_keys gates
+  ## (bitcoin-core/src/wallet/rpc/backup.cpp:224-226 and 259-262).
+  hasPrivateKeys(desc.node)
 
 proc getDescriptorInfo*(descriptor: string): DescriptorInfo =
   ## Get information about a descriptor

@@ -15,6 +15,9 @@ import ./db_sqlite
 export address.AddressType, address.Address
 export coinselection
 export db_sqlite.WalletDb, db_sqlite.StoredKey, db_sqlite.StoredUtxo
+export db_sqlite.StoredWatchedDescriptor, db_sqlite.saveWatchedDescriptor,
+       db_sqlite.getWatchedDescriptors, db_sqlite.setWalletFlag,
+       db_sqlite.getWalletFlag
 
 type
   WalletError* = object of CatchableError
@@ -91,6 +94,17 @@ type
     details*: seq[WalletTxDetail]  ## per-leg credit/debit breakdown
     rawTx*: seq[byte]       ## full (witness) serialization, for the "hex" field
 
+  ## One watch-only script registered via importdescriptors. Mirrors the
+  ## script side of Bitcoin Core's DescriptorScriptPubKeyMan: the wallet
+  ## recognises (and credits) outputs paying this script but holds no key
+  ## for it, so the coins are observable, never spendable from here.
+  WatchedScript* = object
+    descriptor*: string   ## Canonical descriptor string (with checksum) —
+                          ## getaddressinfo's parent_desc
+    label*: string
+    addressStr*: string   ## Encoded address ("" when the script has none)
+    timestamp*: int64     ## Import timestamp (importdescriptors "timestamp")
+
   Wallet* = ref object
     seed*: array[64, byte]
     masterKey*: ExtendedKey
@@ -130,6 +144,20 @@ type
     # instead of replaying the whole chain. -1 = never synced (fresh wallet).
     # Mirrors Bitcoin Core's CWallet::m_last_block_processed_height.
     lastSyncedHeight*: int32
+    # WALLET_FLAG_DISABLE_PRIVATE_KEYS (createwallet disable_private_keys).
+    # When set the wallet holds no keys and every key-bearing operation
+    # (getnewaddress / sethdseed / importprivkey / sendtoaddress signing)
+    # must refuse with RPC_WALLET_ERROR (-4). Persisted in the wallet's
+    # sqlite wallet_flags table and restored on load.
+    # Reference: bitcoin-core/src/wallet/walletutil.h WALLET_FLAG_DISABLE_PRIVATE_KEYS.
+    privateKeysDisabled*: bool
+    # Watch-only scripts registered via importdescriptors:
+    # scriptPubKey bytes -> WatchedScript. Checked by scanBlockForWallet /
+    # buildTxAmounts when findKeyForScript misses, so watched outputs are
+    # credited by the SAME block-connect/rescan path as key-owned outputs.
+    # Persisted as descriptor rows (watched_descriptors table) and
+    # re-expanded on wallet load.
+    watchedScripts*: Table[seq[byte], WatchedScript]
 
 # BIP39 wordlist - loaded at compile time
 const BIP39_WORDLIST* = staticRead("../../resources/bip39-english.txt").strip().splitLines()
@@ -510,6 +538,7 @@ proc newWallet*(mnemonic: string, passphrase: string = "",
   result.params = params
   result.mainnet = params.network == Mainnet
   result.lastSyncedHeight = -1
+  result.watchedScripts = initTable[seq[byte], WatchedScript]()
 
 proc newWalletFromSeed*(seed: array[64, byte],
                         params: ConsensusParams = mainnetParams()): Wallet =
@@ -522,6 +551,7 @@ proc newWalletFromSeed*(seed: array[64, byte],
   result.params = params
   result.mainnet = params.network == Mainnet
   result.lastSyncedHeight = -1
+  result.watchedScripts = initTable[seq[byte], WatchedScript]()
 
 proc newWallet*(mnemonic: string, params: ConsensusParams,
                 mainnet: bool, chainState: ChainState): Wallet =
@@ -539,6 +569,7 @@ proc newWallet*(mnemonic: string, params: ConsensusParams,
   result.chainState = chainState
   result.labels = initTable[string, string]()
   result.lastSyncedHeight = -1
+  result.watchedScripts = initTable[seq[byte], WatchedScript]()
 
   # Create default BIP84 (native segwit) account
   result.addAccount(84, 0, 20)
@@ -555,6 +586,7 @@ proc newWalletFromDb*(db: WalletDb, params: ConsensusParams,
   result.chainState = chainState
   result.labels = initTable[string, string]()
   result.lastSyncedHeight = -1
+  result.watchedScripts = initTable[seq[byte], WatchedScript]()
 
   # Load encryption info if present
   let encInfo = db.getEncryption()
@@ -873,6 +905,27 @@ proc findKeyForScript*(wallet: Wallet, scriptPubKey: seq[byte]): Option[DerivedK
       return some(key)
   none(DerivedKey)
 
+proc isWatchedScript*(wallet: Wallet, scriptPubKey: seq[byte]): bool =
+  ## Whether the wallet watches this scriptPubKey (importdescriptors).
+  ## Cheap table lookup, never raises — safe inside the live block-connect
+  ## hook (scanBlockIntoWallets) on every connected block.
+  wallet.watchedScripts.len > 0 and scriptPubKey in wallet.watchedScripts
+
+proc registerWatchedScript*(wallet: var Wallet, scriptPubKey: seq[byte],
+                            descriptor, label, addressStr: string,
+                            timestamp: int64) =
+  ## Register a watch-only scriptPubKey from an imported descriptor so block
+  ## scanning credits its outputs. Idempotent (table upsert). The descriptor
+  ## parsing/expansion lives in the callers (rpc/server.nim, wallet/manager.nim)
+  ## because descriptor.nim imports this module.
+  wallet.watchedScripts[scriptPubKey] = WatchedScript(
+    descriptor: descriptor,
+    label: label,
+    addressStr: addressStr,
+    timestamp: timestamp)
+  if label.len > 0 and addressStr.len > 0:
+    wallet.labels[addressStr] = label
+
 proc importPrivateKey*(wallet: var Wallet, privKey: PrivateKey,
                        compressed: bool = true): seq[string] =
   ## Add a raw private key (decoded from a WIF) to the wallet keystore as an
@@ -1034,8 +1087,10 @@ proc buildTxAmounts(wallet: Wallet, tx: Transaction,
   for voutIdx, output in tx.outputs:
     valueOut = valueOut + output.value
     let keyOpt = wallet.findKeyForScript(output.scriptPubKey)
-    let ismine = keyOpt.isSome
-    let isChange = ismine and keyOpt.get().path.contains("/1/")
+    # Watch-only scripts (importdescriptors) are "mine" for crediting/history
+    # purposes — Core's descriptor ISMINE_SPENDABLE — but never change.
+    let ismine = keyOpt.isSome or wallet.isWatchedScript(output.scriptPubKey)
+    let isChange = keyOpt.isSome and keyOpt.get().path.contains("/1/")
     if ismine:
       credit = credit + output.value
     # Per Core CachedTxGetAmounts: emit a leg only if (we sent and it's not
@@ -1170,6 +1225,12 @@ proc scanBlockForWallet*(wallet: var Wallet, blk: Block, height: int32) =
         let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
         let isInternal = key.path.contains("/1/")
         wallet.addUtxo(outpoint, output, height, key.path, isInternal, coinbase)
+      elif wallet.isWatchedScript(output.scriptPubKey):
+        # Watch-only credit (importdescriptors). Same ledger as key-owned
+        # coins so getbalance/listunspent see them; keyPath "watch" marks
+        # the entry keyless (no signing path exists for it).
+        let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
+        wallet.addUtxo(outpoint, output, height, "watch", false, coinbase)
 
     # Check inputs for spent UTXOs
     for input in tx.inputs:

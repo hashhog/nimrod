@@ -1390,24 +1390,34 @@ suite "loadtxoutset RPC gate":
     check code2 == RpcInvalidParams
 
 # ----------------------------------------------------------------------------
-# importdescriptors RPC gate (cross-impl lying-RPC audit 2026-05-05).
+# importdescriptors — real watch-only import (replaces the 2026-05-05 -4
+# refusal gate; cross-impl lying-RPC audit closed for nimrod).
 #
-# Pre-fix the handler walked the requests array, parsed each descriptor via
-# `parseDescriptor`/`getDescriptorInfo`, and returned `{"success": true}`
-# per descriptor without ever updating wallet state. Operators got a
-# successful JSON-RPC response; nothing actually landed.
-#
-# Same option-B refusal pattern as the 2026-05-05 loadtxoutset wave
-# (rustoshi 1d0a325 / hotbuns e355cd7 / clearbit c8866ef / nimrod 64a856d).
-# Audit: CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md.
-#
-# The gate must:
-#   1. Refuse with RpcWalletError (-4, Core RPC_WALLET_ERROR).
-#   2. Surface "importdescriptors not implemented" so operators know.
-#   3. NOT touch wallet state (no parseDescriptor call).
+# Contract pinned here (bitcoin-core/src/wallet/rpc/backup.cpp):
+#   * per-element {success[, error]} results, batch NEVER aborted by an
+#     element failure (backup.cpp:141-300);
+#   * checksum REQUIRED — missing checksum is a PER-ELEMENT -5 with Core's
+#     "Missing checksum" string, NOT a top-level error (backup.cpp:158-161,
+#     descriptor.cpp:2838-2869);
+#   * private-key descriptor into a disable_private_keys wallet: per-element
+#     -4 (backup.cpp:224-226); pubkey-only descriptor into an enabled
+#     wallet: per-element -4 (backup.cpp:259-262);
+#   * malformed/missing "timestamp" anywhere: TOP-LEVEL -3 (the one
+#     batch-aborting case — GetImportTimestamp is outside the per-element
+#     try, backup.cpp:127-139, 388-392);
+#   * imported scripts land in the wallet's watched-script view, are
+#     persisted (sqlite watched_descriptors), survive unload/load, and are
+#     credited by scanBlockForWallet;
+#   * createwallet disable_private_keys persists (wallet_flags) and
+#     getwalletinfo reports private_keys_enabled honestly.
 # ----------------------------------------------------------------------------
 
-suite "importdescriptors RPC gate":
+import ../src/wallet/wallet as walletMod
+import ../src/wallet/manager
+import ../src/wallet/descriptor
+import ../src/crypto/secp256k1
+
+suite "importdescriptors watch-only import":
 
   proc mkRpc(cs: ChainState, params: ConsensusParams): RpcServer =
     let mp = newMempool(cs, params)
@@ -1421,93 +1431,266 @@ suite "importdescriptors RPC gate":
       params = params
     )
 
-  test "refuses with RpcWalletError and surfaces 'not implemented'":
-    let testDir = getTempDir() / "nimrod_importdesc_gate_basic"
+  proc hexOf(data: openArray[byte]): string =
+    for b in data:
+      result.add(toHex(int(b), 2).toLowerAscii)
+
+  # Deterministic test key (valid secp256k1 scalar).
+  proc testPriv(last: byte): PrivateKey =
+    for i in 0 ..< 31:
+      result[i] = byte(i + 1)
+    result[31] = last
+
+  proc chk(payload: string): string =
+    payload & "#" & computeDescriptorChecksum(payload)
+
+  # One rig per test: regtest chainstate + manager + dpk watch wallet "wo".
+  template withRig(dirName: string, body: untyped) =
+    let testDir = getTempDir() / dirName
+    if dirExists(testDir): removeDir(testDir)
     createDir(testDir)
     defer:
       try: removeDir(testDir) except OSError: discard
     let dbDir = testDir / "cs"
     createDir(dbDir)
-
-    let regtest = regtestParams()
+    let regtest {.inject.} = regtestParams()
     var cs = newChainState(dbDir, regtest)
     defer: cs.close()
-    let rpc = mkRpc(cs, regtest)
+    let rpc {.inject.} = mkRpc(cs, regtest)
+    var wm {.inject.} = newWalletManager(testDir, regtest, cs)
+    defer: wm.close()
+    rpc.walletManager = wm
+    discard wm.createWallet("wo", WalletCreateOptions(
+      disablePrivateKeys: true, blank: true, descriptors: true))
+    body
 
-    var caught = false
-    var code = 0
-    var msg = ""
-    try:
-      # Well-formed requests array with one descriptor object. Pre-fix
-      # would have parseDescriptor'd the desc and returned
-      # [{"success": true, "warnings": []}].
-      discard rpc.handleImportDescriptors(%*[
-        [%*{"desc": "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"}]
-      ])
-    except RpcError as e:
-      caught = true
-      code = e.code
-      msg = e.msg
-    check caught
-    check code == RpcWalletError
-    check "importdescriptors not implemented" in msg
+  test "valid pubkey+addr descriptors import per-element success:true":
+    withRig("nimrod_impdesc_success"):
+      let pub = derivePublicKey(testPriv(0x11))
+      let wpkhDesc = chk("wpkh(" & hexOf(pub) & ")")
+      let addrA = deriveAddresses(parseDescriptor(wpkhDesc), 0, 1, false)[0]
+      let addrDesc = chk("addr(" & addrA & ")")
 
-  test "gate fires regardless of wallet presence":
-    # Pre-fix the very first thing the handler did was check
-    # `if rpc.wallet == nil: raise newRpcError(RpcMiscError, "wallet not loaded")`.
-    # Post-fix the gate must short-circuit to RpcWalletError even with
-    # no wallet configured (this RpcServer has none).
-    let testDir = getTempDir() / "nimrod_importdesc_gate_no_wallet"
-    createDir(testDir)
-    defer:
-      try: removeDir(testDir) except OSError: discard
-    let dbDir = testDir / "cs"
-    createDir(dbDir)
+      let res = rpc.handleImportDescriptors(%*[[
+        {"desc": addrDesc, "timestamp": 0, "label": "wo"},
+        {"desc": wpkhDesc, "timestamp": 0}
+      ]])
+      check res.kind == JArray
+      check res.len == 2
+      for el in res:
+        check el["success"].getBool() == true
 
-    let regtest = regtestParams()
-    var cs = newChainState(dbDir, regtest)
-    defer: cs.close()
-    let rpc = mkRpc(cs, regtest)
-    check rpc.wallet == nil
+      # The scripts really landed in the wallet's watched view.
+      let w = wm.getWallet("wo").get().wallet
+      check w.watchedScripts.len >= 1
+      let spk = deriveScripts(parseDescriptor(wpkhDesc))[0]
+      check w.isWatchedScript(spk)
 
-    var code = 0
-    try:
-      discard rpc.handleImportDescriptors(%*[
-        [%*{"desc": "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"}]
-      ])
-    except RpcError as e:
-      code = e.code
-    # Must be -4 (RpcWalletError), NOT -1 (RpcMiscError "wallet not loaded").
-    check code == RpcWalletError
+  test "missing checksum -> per-element -5 'Missing checksum', batch survives":
+    withRig("nimrod_impdesc_chksum"):
+      let pub = derivePublicKey(testPriv(0x22))
+      let noChk = "wpkh(" & hexOf(pub) & ")"   # deliberately unchecksummed
 
-  test "still rejects malformed params before the gate":
-    let testDir = getTempDir() / "nimrod_importdesc_gate_bad_params"
-    createDir(testDir)
-    defer:
-      try: removeDir(testDir) except OSError: discard
-    let dbDir = testDir / "cs"
-    createDir(dbDir)
+      # Must NOT raise (top-level error would be a Core-contract violation).
+      let res = rpc.handleImportDescriptors(%*[[
+        {"desc": noChk, "timestamp": 0}
+      ]])
+      check res.kind == JArray
+      check res.len == 1
+      check res[0]["success"].getBool() == false
+      check res[0]["error"]["code"].getInt() == RpcInvalidAddressOrKey  # -5
+      check res[0]["error"]["message"].getStr() == "Missing checksum"
 
-    let regtest = regtestParams()
-    var cs = newChainState(dbDir, regtest)
-    defer: cs.close()
-    let rpc = mkRpc(cs, regtest)
+  test "checksum mismatch -> -5 with provided-then-computed Core string":
+    withRig("nimrod_impdesc_badchk"):
+      let pub = derivePublicKey(testPriv(0x33))
+      let bad = "wpkh(" & hexOf(pub) & ")#qqqqqqqq"
+      let res = rpc.handleImportDescriptors(%*[[
+        {"desc": bad, "timestamp": 0}
+      ]])
+      check res[0]["success"].getBool() == false
+      check res[0]["error"]["code"].getInt() == RpcInvalidAddressOrKey
+      let msg = res[0]["error"]["message"].getStr()
+      check msg.startsWith("Provided checksum 'qqqqqqqq' does not match computed checksum '")
 
-    # Empty params → RpcInvalidParams, NOT RpcWalletError.
-    var code = 0
-    try:
-      discard rpc.handleImportDescriptors(%*[])
-    except RpcError as e:
-      code = e.code
-    check code == RpcInvalidParams
+  test "private-key descriptor into dpk wallet -> per-element -4":
+    withRig("nimrod_impdesc_privneg"):
+      let priv = testPriv(0x44)
+      let wif = encodeWIF(priv, mainnet = false)
+      let privDesc = chk("wpkh(" & wif & ")")
+      let res = rpc.handleImportDescriptors(%*[[
+        {"desc": privDesc, "timestamp": 0}
+      ]])
+      check res.kind == JArray
+      check res.len == 1
+      check res[0]["success"].getBool() == false
+      check res[0]["error"]["code"].getInt() == RpcWalletError  # -4
+      check "private keys disabled" in res[0]["error"]["message"].getStr()
 
-    # First param not an array → RpcInvalidParams.
-    var code2 = 0
-    try:
-      discard rpc.handleImportDescriptors(%*["not-an-array"])
-    except RpcError as e:
-      code2 = e.code
-    check code2 == RpcInvalidParams
+  test "missing/typed-wrong timestamp -> TOP-LEVEL -3 (batch-aborting)":
+    withRig("nimrod_impdesc_timestamp"):
+      let pub = derivePublicKey(testPriv(0x55))
+      let goodDesc = chk("wpkh(" & hexOf(pub) & ")")
+
+      # Missing timestamp key.
+      var code = 0
+      try:
+        discard rpc.handleImportDescriptors(%*[[{"desc": goodDesc}]])
+      except RpcError as e:
+        code = e.code
+      check code == RpcTypeError  # -3
+
+      # Wrong type (bool).
+      var code2 = 0
+      var msg2 = ""
+      try:
+        discard rpc.handleImportDescriptors(%*[[
+          {"desc": goodDesc, "timestamp": true}
+        ]])
+      except RpcError as e:
+        code2 = e.code
+        msg2 = e.msg
+      check code2 == RpcTypeError
+      check "got type bool" in msg2
+
+      # A bad timestamp in element 2 aborts the WHOLE call even though
+      # element 1 is importable (Core: GetImportTimestamp outside the
+      # per-element try).
+      var code3 = 0
+      try:
+        discard rpc.handleImportDescriptors(%*[[
+          {"desc": goodDesc, "timestamp": 0},
+          {"desc": goodDesc, "timestamp": "yesterday"}
+        ]])
+      except RpcError as e:
+        code3 = e.code
+      check code3 == RpcTypeError
+      # ... and nothing from element 1 landed (whole call aborted).
+      let w = wm.getWallet("wo").get().wallet
+      check w.watchedScripts.len == 0
+
+  test "dpk flag honest in getwalletinfo + key ops refuse with -4":
+    withRig("nimrod_impdesc_dpkflag"):
+      rpc.currentWalletName = "wo"
+      let info = rpc.handleMethod("getwalletinfo", newJArray())
+      check info["private_keys_enabled"].getBool() == false
+      check info["keypoolsize"].getInt() == 0
+
+      # sendtoaddress / getnewaddress / importprivkey must refuse with -4.
+      for (m, p) in [("getnewaddress", %*[]),
+                     ("sendtoaddress", %*["bcrt1qy2syumt4leyws46zfmx8h4n5494ewexfg79d7n", 1.0]),
+                     ("importprivkey", %*[encodeWIF(testPriv(0x66), false)])]:
+        var code = 0
+        try:
+          discard rpc.handleMethod(m, p)
+        except RpcError as e:
+          code = e.code
+        check code == RpcWalletError
+
+  test "watched scripts + dpk flag survive unload/load (sqlite round-trip)":
+    withRig("nimrod_impdesc_roundtrip"):
+      rpc.currentWalletName = "wo"
+      let pub = derivePublicKey(testPriv(0x77))
+      let wpkhDesc = chk("wpkh(" & hexOf(pub) & ")")
+      let spk = deriveScripts(parseDescriptor(wpkhDesc))[0]
+
+      let res = rpc.handleImportDescriptors(%*[[
+        {"desc": wpkhDesc, "timestamp": 0, "label": "rt"}
+      ]])
+      check res[0]["success"].getBool() == true
+
+      discard wm.unloadWallet("wo")
+      let (lw2, _) = wm.loadWallet("wo")
+      check lw2.wallet.privateKeysDisabled == true
+      check lw2.wallet.isWatchedScript(spk)
+      check lw2.wallet.watchedScripts[spk].descriptor == wpkhDesc
+      check lw2.wallet.watchedScripts[spk].label == "rt"
+
+  test "watched scripts are credited by scanBlockForWallet":
+    withRig("nimrod_impdesc_scan"):
+      let pub = derivePublicKey(testPriv(0x88))
+      let wpkhDesc = chk("wpkh(" & hexOf(pub) & ")")
+      let res = rpc.handleImportDescriptors(%*[[
+        {"desc": wpkhDesc, "timestamp": 0}
+      ]])
+      check res[0]["success"].getBool() == true
+
+      var w = wm.getWallet("wo").get().wallet
+      let spk = deriveScripts(parseDescriptor(wpkhDesc))[0]
+      var prevTxid: array[32, byte]
+      prevTxid[0] = 0xAB
+      let tx = Transaction(
+        version: 2,
+        inputs: @[TxIn(
+          prevOut: OutPoint(txid: TxId(prevTxid), vout: 0),
+          scriptSig: @[],
+          sequence: 0xffffffff'u32)],
+        outputs: @[TxOut(value: Satoshi(123_456_789), scriptPubKey: spk)],
+        lockTime: 0)
+      let blk = Block(
+        header: BlockHeader(version: 2, timestamp: 1700000000'u32),
+        txs: @[tx])
+      w.scanBlockForWallet(blk, 7'i32)
+
+      check w.utxos.len == 1
+      var credited = false
+      for _, u in w.utxos:
+        if u.output.scriptPubKey == spk and int64(u.output.value) == 123_456_789:
+          check u.keyPath == "watch"
+          credited = true
+      check credited
+      # Watch-only funds count toward the balance the RPC layer reports.
+      check int64(w.getBalance()) == 123_456_789
+
+  test "getaddressinfo dispatch + ismine for watched address":
+    withRig("nimrod_impdesc_addrinfo"):
+      rpc.currentWalletName = "wo"
+      let pub = derivePublicKey(testPriv(0x99))
+      let wpkhDesc = chk("wpkh(" & hexOf(pub) & ")")
+      let addrA = deriveAddresses(parseDescriptor(wpkhDesc), 0, 1, false)[0]
+
+      # Before import: reachable through dispatch (NOT -32601), ismine false.
+      let pre = rpc.handleMethod("getaddressinfo", %*[addrA])
+      check pre.kind == JObject
+      check pre["ismine"].getBool() == false
+      check pre["iswatchonly"].getBool() == false
+
+      discard rpc.handleImportDescriptors(%*[[
+        {"desc": wpkhDesc, "timestamp": 0}
+      ]])
+
+      let post = rpc.handleMethod("getaddressinfo", %*[addrA])
+      check post["ismine"].getBool() == true
+      check post["solvable"].getBool() == true
+      check post["parent_desc"].getStr() == wpkhDesc
+      check post["iswatchonly"].getBool() == false  # deprecated, always false
+      check post["labels"].kind == JArray
+
+      # Invalid address -> -5.
+      var code = 0
+      try:
+        discard rpc.handleMethod("getaddressinfo", %*["notanaddress"])
+      except RpcError as e:
+        code = e.code
+      check code == RpcInvalidAddressOrKey
+
+  test "still rejects malformed params with -32602":
+    withRig("nimrod_impdesc_bad_params"):
+      # Empty params → RpcInvalidParams, NOT a wallet error.
+      var code = 0
+      try:
+        discard rpc.handleImportDescriptors(%*[])
+      except RpcError as e:
+        code = e.code
+      check code == RpcInvalidParams
+
+      # First param not an array → RpcInvalidParams.
+      var code2 = 0
+      try:
+        discard rpc.handleImportDescriptors(%*["not-an-array"])
+      except RpcError as e:
+        code2 = e.code
+      check code2 == RpcInvalidParams
 
 # ----------------------------------------------------------------------------
 # gettxoutsetinfo (W12) — UTXO set walk + Core-byte-parity statistics
