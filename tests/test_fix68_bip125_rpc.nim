@@ -238,7 +238,13 @@ suite "FIX-68 BUG-3: bip125-replaceable reflects tx opt-in state":
 # ---------------------------------------------------------------------------
 suite "FIX-68 BUG-8: getmempoolinfo.fullrbf reflects mp.fullRbf":
 
-  test "fullRbf=false → getmempoolinfo.fullrbf == false":
+  # NOTE (byte-diff parity): Core v31.99 REMOVED the mempoolfullrbf option and
+  # MempoolInfoToJSON now hardcodes `fullrbf = true` (mempool.cpp:1058).
+  # getmempoolinfo.fullrbf is therefore ALWAYS true regardless of the node's
+  # mp.fullRbf config (the per-tx bip125-replaceable field still reflects the
+  # real opt-in state — see the anti-regression suite below). These tests assert
+  # the Core-exact wire output the byte-diff gate requires.
+  test "getmempoolinfo.fullrbf == true regardless of mp.fullRbf=false (Core v31.99)":
     cleanupTestDb()
     let params = regtestParams()
     var cs = newChainState(TestDbPath, params)
@@ -248,12 +254,12 @@ suite "FIX-68 BUG-8: getmempoolinfo.fullrbf reflects mp.fullRbf":
     let info = rpc.handleGetMempoolInfo()
     check info.hasKey("fullrbf")
     check info["fullrbf"].kind == JBool
-    check info["fullrbf"].getBool() == false
+    check info["fullrbf"].getBool() == true
 
     cs.close()
     cleanupTestDb()
 
-  test "fullRbf=true → getmempoolinfo.fullrbf == true":
+  test "getmempoolinfo.fullrbf == true with mp.fullRbf=true":
     cleanupTestDb()
     let params = regtestParams()
     var cs = newChainState(TestDbPath, params)
@@ -266,16 +272,15 @@ suite "FIX-68 BUG-8: getmempoolinfo.fullrbf reflects mp.fullRbf":
     cs.close()
     cleanupTestDb()
 
-  test "default mempool (no fullRbf arg) → getmempoolinfo.fullrbf == false":
-    ## newMempool's default is fullRbf=false; RPC must surface that.
+  test "default mempool → getmempoolinfo.fullrbf == true (hardcoded, Core v31.99)":
     cleanupTestDb()
     let params = regtestParams()
     var cs = newChainState(TestDbPath, params)
-    var mp = newMempool(cs, params)  # no fullRbf arg → default false
+    var mp = newMempool(cs, params)  # default fullRbf
     let rpc = makeRpc(mp, cs, params)
 
     let info = rpc.handleGetMempoolInfo()
-    check info["fullrbf"].getBool() == false
+    check info["fullrbf"].getBool() == true
 
     cs.close()
     cleanupTestDb()
@@ -324,20 +329,22 @@ suite "FIX-68 anti-regression invariants":
     cs.close()
     cleanupTestDb()
 
-  test "mp.fullRbf field matches RPC fullrbf for both true and false":
+  test "getmempoolinfo.fullrbf is hardcoded true (Core v31.99) for both configs":
+    ## Per-tx replaceability still tracks mp.fullRbf (asserted above), but the
+    ## top-level getmempoolinfo.fullrbf is hardcoded true to match Core's wire.
     cleanupTestDb()
     let params = regtestParams()
 
     var cs1 = newChainState(TestDbPath, params)
     var mp1 = newMempool(cs1, params, fullRbf = false)
     let rpc1 = makeRpc(mp1, cs1, params)
-    check rpc1.handleGetMempoolInfo()["fullrbf"].getBool() == mp1.fullRbf
+    check rpc1.handleGetMempoolInfo()["fullrbf"].getBool() == true
     cs1.close()
     cleanupTestDb()
 
     var cs2 = newChainState(TestDbPath, params)
     var mp2 = newMempool(cs2, params, fullRbf = true)
     let rpc2 = makeRpc(mp2, cs2, params)
-    check rpc2.handleGetMempoolInfo()["fullrbf"].getBool() == mp2.fullRbf
+    check rpc2.handleGetMempoolInfo()["fullrbf"].getBool() == true
     cs2.close()
     cleanupTestDb()
