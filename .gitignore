@@ -93,3 +93,4 @@ src/storage/db
 
 anchors.dat
 banlist.json
+.claude/

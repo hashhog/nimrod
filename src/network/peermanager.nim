@@ -313,6 +313,55 @@ proc newPeerManager*(params: ConsensusParams,
       ("seed.bitcoin.jonasschnelli.ch", 8333'u16),
       ("seed.btc.petertodd.net", 8333'u16)
     ]
+    # Fixed-seed fallback (Core chainparamsseeds / vFixedSeeds, net.cpp:2606-2644
+    # ThreadOpenConnections).  Consumed by resolveDnsSeeds (lines below): when
+    # DNS resolution yields fewer than maxOutboundFullRelay addresses (DNS empty
+    # OR --nodnsseed OR --connect short-circuit), these hard-coded IPv4 peers are
+    # appended so a node with an empty address book can still bootstrap.  This is
+    # a last-resort fallback layered AFTER normal DNS resolution, never a bypass.
+    # The 40 IPs are curated routable IPv4 mainnet peers (port 8333).
+    result.fallbackPeers = @[
+      ("2.121.116.198", 8333'u16),
+      ("3.86.179.235", 8333'u16),
+      ("4.2.51.251", 8333'u16),
+      ("5.2.23.226", 8333'u16),
+      ("12.11.29.34", 8333'u16),
+      ("14.49.142.41", 8333'u16),
+      ("18.27.125.103", 8333'u16),
+      ("23.93.18.82", 8333'u16),
+      ("24.16.202.74", 8333'u16),
+      ("27.83.109.113", 8333'u16),
+      ("31.41.23.249", 8333'u16),
+      ("34.65.45.157", 8333'u16),
+      ("35.78.97.86", 8333'u16),
+      ("37.15.61.236", 8333'u16),
+      ("38.52.3.192", 8333'u16),
+      ("40.160.1.232", 8333'u16),
+      ("44.223.26.178", 8333'u16),
+      ("45.19.130.200", 8333'u16),
+      ("46.126.216.3", 8333'u16),
+      ("47.90.137.13", 8333'u16),
+      ("50.4.123.66", 8333'u16),
+      ("51.154.0.142", 8333'u16),
+      ("52.182.185.242", 8333'u16),
+      ("60.241.1.72", 8333'u16),
+      ("62.34.57.141", 8333'u16),
+      ("63.247.147.166", 8333'u16),
+      ("64.23.97.128", 8333'u16),
+      ("65.94.134.253", 8333'u16),
+      ("66.35.84.14", 8333'u16),
+      ("67.4.139.122", 8333'u16),
+      ("68.61.69.53", 8333'u16),
+      ("69.4.94.226", 8333'u16),
+      ("70.44.20.24", 8333'u16),
+      ("71.56.178.136", 8333'u16),
+      ("72.88.192.74", 8333'u16),
+      ("73.42.33.255", 8333'u16),
+      ("74.48.195.218", 8333'u16),
+      ("75.80.3.4", 8333'u16),
+      ("76.124.35.108", 8333'u16),
+      ("77.38.72.37", 8333'u16)
+    ]
   of Testnet3:
     result.seedNodes = @[
       ("testnet-seed.bitcoin.jonasschnelli.ch", 18333'u16),
@@ -470,22 +519,38 @@ proc dnsSeedingEnabled*(pm: PeerManager): bool =
 proc resolveDnsSeeds*(pm: PeerManager): Future[seq[string]] {.async.} =
   var addresses: seq[string]
 
-  # `--nodnsseed` / `-dnsseed=0`, or `--connect` (implies dnsseed=0): no DNS.
-  if not pm.dnsSeedingEnabled():
-    debug "DNS seeding disabled (--nodnsseed or --connect set)"
+  # `--connect` (peer-pinned) bypasses ThreadOpenConnections entirely — no DNS
+  # AND no fixed-seed fallback (Core: -connect skips the fixed-seed logic, see
+  # net.cpp ThreadOpenConnections gating + the dnsSeedingEnabled() comment).
+  # Short-circuit hard so neither path runs.
+  if pm.connectPeers.len > 0:
+    debug "DNS seeding disabled (--connect set): no DNS, no fixed-seed fallback"
     return addresses
 
-  for (host, port) in pm.seedNodes:
-    try:
-      let resolvedAddrs = resolveTAddress(host, Port(port))
-      for ta in resolvedAddrs:
-        addresses.add($ta.address)
-    except CatchableError as e:
-      debug "DNS resolution failed", host = host, error = e.msg
+  # `--nodnsseed` / `-dnsseed=0`: skip DNS resolution but STILL fall through to
+  # the fixed-seed fallback below.  This is Core's `!dnsseed && !use_seednodes`
+  # immediate-fire path (net.cpp:2620-2625): with DNS off and no other peer
+  # source, the curated fixed seeds are the only bootstrap and must fire — the
+  # `addresses.len < maxOutboundFullRelay` guard is then trivially satisfied
+  # (addresses is empty), so all fallbackPeers are appended right away.
+  if pm.dnsSeedingEnabled():
+    for (host, port) in pm.seedNodes:
+      try:
+        let resolvedAddrs = resolveTAddress(host, Port(port))
+        for ta in resolvedAddrs:
+          addresses.add($ta.address)
+      except CatchableError as e:
+        debug "DNS resolution failed", host = host, error = e.msg
 
-  if addresses.len > 0:
-    shuffle(addresses)
+    if addresses.len > 0:
+      shuffle(addresses)
+  else:
+    debug "DNS seeding disabled (--nodnsseed): falling back to fixed seeds"
 
+  # Fixed-seed fallback (Core net.cpp:2606-2644).  Fires whenever the DNS pass
+  # produced fewer than the outbound target — DNS empty, DNS off, or DNS
+  # returned too few — appending the curated fixed peers.  Last-resort layer
+  # AFTER normal DNS, never a bypass of it.
   if addresses.len < pm.maxOutboundFullRelay:
     for (host, port) in pm.fallbackPeers:
       if host notin addresses:
