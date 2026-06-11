@@ -574,25 +574,45 @@ proc peerBloomFiltersEnabled*(): bool =
   let lv = v.toLowerAscii()
   lv == "1" or lv == "true" or lv == "yes" or lv == "on"
 
-proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
-  ## Send version message
+proc advertisedServices*(): uint64 =
+  ## Assemble the service-flags bitset we advertise in our outbound `version`.
+  ## Pure (env-driven only) so it can be unit-tested without a socket/peer.
+  ##
+  ## Full-node baseline = NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED |
+  ## NODE_P2P_V2 = 0xC09, matching Bitcoin Core's g_local_services for a
+  ## non-pruned, v2-transport-on full node (init.cpp:863 + 987-990).
+  #
   # BIP-111: NODE_BLOOM MUST NOT be advertised unless the node actually serves
   # BIP-37 bloom-filter requests (filterload / filteradd / filterclear).
   # Nimrod has no CBloomFilter implementation (W110 BUG-01), so NODE_BLOOM is
   # intentionally absent from outbound services regardless of any env var.
   # See also: peerBloomFiltersEnabled() above for the mempool-only gate.
   var ourServices = NodeNetwork or NodeWitness
-  # BIP-159: signal limited-archive serving when prune mode is enabled.
-  # Core advertises NODE_NETWORK alongside NODE_NETWORK_LIMITED in the
-  # auto-prune case (the node still has the recent-288 window), so we
-  # keep NODE_NETWORK set as well.
-  if pruneModeAdvertiseEnabled():
-    ourServices = ourServices or NodeNetworkLimited
+  # BIP-159: NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY by every full
+  # node — Core sets it in g_local_services regardless of prune mode
+  # (init.cpp:863, `NODE_NETWORK_LIMITED | NODE_WITNESS`), because any full
+  # node serves at least the recent-288-block window.  It is NOT prune-gated.
+  # A non-pruned node advertises NODE_NETWORK alongside it (added above);
+  # pruning only drops NODE_NETWORK, never NODE_NETWORK_LIMITED.
+  ourServices = ourServices or NodeNetworkLimited
+  # BIP-324: NODE_P2P_V2 signals the v2 encrypted transport.  Nimrod's inbound
+  # v2 responder runs default-on (peer.nim drives performV2HandshakeResponder
+  # for any inbound peer that initiates v2, with no env gate), so advertising
+  # this bit is honest.  Core advertises it whenever -v2transport is on
+  # (DEFAULT_V2_TRANSPORT = true; init.cpp:987-990).  The outbound initiator is
+  # still gated (bip324V2OutboundEnabled, default off), but advertisement
+  # tracks the always-on inbound responder, matching Core.
+  ourServices = ourServices or NodeP2pV2
   # BIP-157: signal compact-filter serving when --peerblockfilters AND
   # --blockfilterindex are both on.  W121 G15 / FIX-71.  Reference:
   # bitcoin-core/src/init.cpp:992-999.
   if advertiseCompactFiltersService():
     ourServices = ourServices or NodeCompactFilters
+  ourServices
+
+proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
+  ## Send version message
+  let ourServices = advertisedServices()
   let msg = newVersionMsg(
     version = ProtocolVersion,
     services = ourServices,
