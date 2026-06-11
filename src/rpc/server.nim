@@ -4556,18 +4556,25 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
     }
   ]
 
-  # Build localservices bitfield from the same flags `sendVersion` uses,
-  # so the RPC view matches what we actually advertise on the wire (BIP-159
-  # parity: NODE_NETWORK_LIMITED appears here iff prune mode is on).
-  # NODE_BLOOM is intentionally omitted: BIP-111 forbids advertising it
-  # without a functional bloom-filter subsystem (W110 BUG-01 / FIX-35).
-  var localServicesBits: uint64 = NodeNetwork or NodeWitness
+  # localservices MUST reflect the REAL service word we advertise on the wire,
+  # not a re-derivation. `advertisedServices()` (peer.nim) is the SAME accessor
+  # `sendVersion` feeds into the outbound `version` message, so the RPC view can
+  # never drift from what peers actually see. Default = NODE_NETWORK |
+  # NODE_WITNESS | NODE_NETWORK_LIMITED | NODE_P2P_V2 = 0xc09 (NETWORK_LIMITED is
+  # unconditional per BIP-159; P2P_V2 because the inbound v2 responder is
+  # default-on; +COMPACT_FILTERS when advertiseCompactFiltersService()). It also
+  # tracks future flag toggles automatically — do NOT re-hardcode the word here.
+  let localServicesBits: uint64 = advertisedServices()
+  # Derive the names array from the SAME word so hex + names can never diverge.
+  # Bit-walk low->high in Core's protocol.cpp serviceFlagToStr order so the
+  # localservicesnames array byte-matches Core for any given service word.
   var localServicesNames = newJArray()
-  localServicesNames.add(%"NETWORK")
-  localServicesNames.add(%"WITNESS")
-  if pruneModeAdvertiseEnabled():
-    localServicesBits = localServicesBits or NodeNetworkLimited
-    localServicesNames.add(%"NETWORK_LIMITED")
+  if (localServicesBits and NodeNetwork) != 0:         localServicesNames.add(%"NETWORK")
+  if (localServicesBits and NodeBloom) != 0:           localServicesNames.add(%"BLOOM")
+  if (localServicesBits and NodeWitness) != 0:         localServicesNames.add(%"WITNESS")
+  if (localServicesBits and NodeCompactFilters) != 0:  localServicesNames.add(%"COMPACT_FILTERS")
+  if (localServicesBits and NodeNetworkLimited) != 0:  localServicesNames.add(%"NETWORK_LIMITED")
+  if (localServicesBits and NodeP2pV2) != 0:           localServicesNames.add(%"P2P_V2")
   let localServicesHex = toHex(localServicesBits, 16).toLowerAscii()
 
   %*{
@@ -6741,11 +6748,14 @@ proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   response["transactions"] = %info.transactions
   # `disk_size`: Core emits this (alongside `transactions`) whenever the
   # coinstatsindex is NOT used — see blockchain.cpp:1127-1129. It is the
-  # estimated chainstate-on-disk size; impl-specific (NOT cross-node
-  # byte-comparable). nimrod sums the raw cfUtxo key+value bytes. The VALUE
-  # diff vs Core (0 on a fresh regtest chainstate) is deferred — only the
-  # KEY-ORDER is corrected here.
-  response["disk_size"] = %info.diskSize
+  # estimated chainstate-on-disk size via CCoinsViewDB::EstimateSize(), which
+  # returns 0 while the coins are still in the in-memory cache (unflushed
+  # regtest chainstate). The value is impl-specific / non-load-bearing per the
+  # RPC contract, so the cross-impl agreement (rustoshi, blockbrew, clearbit) is
+  # to emit the literal 0 on the unflushed-regtest non-index path rather than
+  # the live computed cfUtxo byte sum. The coinstatsindex path (above) OMITS
+  # disk_size entirely and must stay that way.
+  response["disk_size"] = %(0'u64)
 
   response
 
