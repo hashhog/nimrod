@@ -1164,8 +1164,14 @@ proc parseDescriptor*(descriptor: string, requireChecksum: bool = false): Descri
 # Descriptor String Generation
 # =============================================================================
 
-proc nodeToString(node: DescriptorNode): string =
-  ## Convert descriptor node to string (without checksum)
+proc nodeToString(node: DescriptorNode, mainnet: bool = true,
+                  regtest: bool = false): string =
+  ## Convert descriptor node to string (without checksum).
+  ## `mainnet`/`regtest` select the network HRP/prefix when re-encoding an
+  ## addr(...) leaf (Core's getdescriptorinfo canonicalizes the embedded
+  ## address against the node's network, so a regtest addr(bcrt1...) must stay
+  ## "bcrt1..." not flip to mainnet "bc1..."). Defaults preserve mainnet for
+  ## the wallet/derive callers that always operate on mainnet descriptors.
   case node.kind
   of DKPk:
     result = "pk(" & keyProviderToString(node.key) & ")"
@@ -1174,9 +1180,9 @@ proc nodeToString(node: DescriptorNode): string =
   of DKWpkh:
     result = "wpkh(" & keyProviderToString(node.key) & ")"
   of DKSh:
-    result = "sh(" & nodeToString(node.sub) & ")"
+    result = "sh(" & nodeToString(node.sub, mainnet, regtest) & ")"
   of DKWsh:
-    result = "wsh(" & nodeToString(node.sub) & ")"
+    result = "wsh(" & nodeToString(node.sub, mainnet, regtest) & ")"
   of DKTr:
     result = "tr(" & keyProviderToString(node.internalKey)
     # TODO: Add tree scripts
@@ -1204,7 +1210,7 @@ proc nodeToString(node: DescriptorNode): string =
       result.add("," & keyProviderToString(key))
     result.add(")")
   of DKAddr:
-    result = "addr(" & encodeAddress(node.address, true) & ")"
+    result = "addr(" & encodeAddress(node.address, mainnet, regtest) & ")"
   of DKRaw:
     result = "raw(" & toHex(node.rawScript) & ")"
   of DKCombo:
@@ -1212,9 +1218,11 @@ proc nodeToString(node: DescriptorNode): string =
   of DKMiniscript:
     result = "miniscript(...)"
 
-proc toString*(desc: Descriptor, includeChecksum: bool = true): string =
-  ## Convert descriptor to string representation
-  result = nodeToString(desc.node)
+proc toString*(desc: Descriptor, includeChecksum: bool = true,
+               mainnet: bool = true, regtest: bool = false): string =
+  ## Convert descriptor to string representation. `mainnet`/`regtest` thread
+  ## the network into any embedded addr(...) leaf (see nodeToString).
+  result = nodeToString(desc.node, mainnet, regtest)
   if includeChecksum:
     result = addDescriptorChecksum(result)
 
@@ -1320,12 +1328,15 @@ proc descriptorHasPrivateKeys*(desc: Descriptor): bool =
   ## (bitcoin-core/src/wallet/rpc/backup.cpp:224-226 and 259-262).
   hasPrivateKeys(desc.node)
 
-proc getDescriptorInfo*(descriptor: string): DescriptorInfo =
-  ## Get information about a descriptor
+proc getDescriptorInfo*(descriptor: string, mainnet: bool = true,
+                        regtest: bool = false): DescriptorInfo =
+  ## Get information about a descriptor. `mainnet`/`regtest` select the network
+  ## for canonicalizing an embedded addr(...) leaf (Core keeps a regtest
+  ## addr(bcrt1...) on its own HRP rather than re-encoding it as mainnet).
   let desc = parseDescriptor(descriptor)
 
   result.checksum = desc.checksum
-  result.descriptor = toString(desc)
+  result.descriptor = toString(desc, true, mainnet, regtest)
   result.isRange = desc.node.isRange()
   result.isSolvable = desc.node.isSolvable()
   result.hasPrivateKeys = hasPrivateKeys(desc.node)

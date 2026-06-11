@@ -184,6 +184,10 @@ proc parseTxId(txidHex: string): TxId =
 # above them need the byte-identical-to-Core serializer too.
 proc getDifficultyFromBits(bits: uint32): float64
 proc difficultyJson(d: float64): JsonNode
+# getblockchaininfo (above) needs the same Core-exact chainwork BE formatter
+# that getblockheader uses; both are defined further down.
+proc computeChainwork*(cdb: ChainDb, startHash: BlockHash, height: int32): array[32, byte]
+proc chainworkHexBE*(w: array[32, byte]): string
 
 proc bitsToTarget(bits: uint32): array[32, byte] =
   compactToTarget(bits)
@@ -308,7 +312,9 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
     let tip = tipOpt.get()
     bits = tip.header.bits
     blockTime = tip.header.timestamp
-    medianTime = int64(tip.header.timestamp)  # Simplified: real impl would compute median
+    # Core's mediantime = GetMedianTimePast() (median of this block + up to 10
+    # predecessors), not the tip's raw nTime. Same helper getblockheader uses.
+    medianTime = int64(getMtpForHeight(rpc.chainState.db, rpc.chainState.bestHeight))
 
   let target = bitsToTarget(bits)
 
@@ -345,17 +351,29 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
     if pruned:
       pruneHeight = rpc.blockFileManager.getPruneHeight()
 
+  # bits: big-endian %08x of the compact nBits field (Core strprintf("%08x")),
+  # matching getblockheader. The old little-endian cast emitted e.g. "ffff7f20"
+  # for regtest where Core emits "207fffff".
+  let bitsHexBE = toHex([
+    byte((bits shr 24) and 0xff),
+    byte((bits shr 16) and 0xff),
+    byte((bits shr 8) and 0xff),
+    byte(bits and 0xff)
+  ])
+
+  # chainwork: Core emits nChainWork.GetHex() (big-endian 64-char hex). Recompute
+  # the cumulative work the same Core-exact way getblockheader does, rather than
+  # the approximate little-endian rpc.chainState.totalWork.
+  let chainworkBE = chainworkHexBE(
+    computeChainwork(rpc.chainState.db, rpc.chainState.bestBlockHash,
+                     rpc.chainState.bestHeight))
+
   var response = %*{
     "chain": chainName,
     "blocks": rpc.chainState.bestHeight,
     "headers": rpc.chainState.bestHeight,
     "bestblockhash": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
-    "bits": toHex(cast[array[4, byte]]([
-      byte(bits and 0xff),
-      byte((bits shr 8) and 0xff),
-      byte((bits shr 16) and 0xff),
-      byte((bits shr 24) and 0xff)
-    ])),
+    "bits": bitsHexBE,
     "target": reverseHex(toHex(target)),
     # Use the Core-exact nBits->double path (getDifficultyFromBits) +
     # difficultyJson serializer so the emitted string is byte-identical to
@@ -367,10 +385,11 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
     "mediantime": medianTime,
     "verificationprogress": verificationProgress,
     "initialblockdownload": rpc.chainState.bestHeight < 100,
-    "chainwork": toHex(rpc.chainState.totalWork),
+    "chainwork": chainworkBE,
     "size_on_disk": sizeOnDisk,
     "pruned": pruned,
-    "warnings": ""
+    # Core v31.99 emits warnings as an array of strings (empty = no warnings).
+    "warnings": newJArray()
   }
 
   # Add pruneheight only if pruned
@@ -385,13 +404,8 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   elif rpc.blockFileManager != nil and rpc.blockFileManager.isPruneMode:
     response["prune_target_size"] = %rpc.blockFileManager.getPruneTarget()
 
-  # Add softforks — same data source as getdeploymentinfo via buildDeployments.
-  # Bitcoin Core emits "softforks" keyed by id; each entry has "type" and
-  # "active" at minimum, plus "height" (buried) or "bip9" sub-object (BIP9).
-  response["softforks"] = rpc.buildDeployments(
-    rpc.chainState.bestBlockHash,
-    rpc.chainState.bestHeight
-  )
+  # NOTE: Core v31.99 REMOVED the "softforks" object from getblockchaininfo
+  # (softfork state now lives in getdeploymentinfo only). Do not emit it here.
 
   response
 
@@ -717,23 +731,27 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   let activeHashAtHeight = rpc.chainState.db.getBlockHashByHeight(idx.height)
   let inActiveChain = activeHashAtHeight.isSome and activeHashAtHeight.get() == idx.hash
 
+  # Core blockheaderToJSON key order (rpc/blockchain.cpp:159-176):
+  #   hash, confirmations, height, version, versionHex, merkleroot, time,
+  #   mediantime, nonce, bits, target, difficulty, chainwork, nTx,
+  #   [previousblockhash], [nextblockhash].
   var response = newJObject()
-  response["bits"] = %bitsHex
-  response["chainwork"] = %chainworkHex
+  response["hash"] = %reverseHex(toHex(array[32, byte](idx.hash)))
   response["confirmations"] =
     if inActiveChain: %int(rpc.chainState.bestHeight - idx.height + 1)
     else: %(-1)
-  response["difficulty"] = difficultyJson(getDifficultyFromBits(idx.header.bits))
-  response["hash"] = %reverseHex(toHex(array[32, byte](idx.hash)))
   response["height"] = %idx.height
-  response["mediantime"] = %mediantime
-  response["merkleroot"] = %reverseHex(toHex(idx.header.merkleRoot))
-  response["nTx"] = %nTx
-  response["nonce"] = %idx.header.nonce
-  response["target"] = %targetHex
-  response["time"] = %int64(idx.header.timestamp)
   response["version"] = %idx.header.version
   response["versionHex"] = %versionHex
+  response["merkleroot"] = %reverseHex(toHex(idx.header.merkleRoot))
+  response["time"] = %int64(idx.header.timestamp)
+  response["mediantime"] = %mediantime
+  response["nonce"] = %idx.header.nonce
+  response["bits"] = %bitsHex
+  response["target"] = %targetHex
+  response["difficulty"] = difficultyJson(getDifficultyFromBits(idx.header.bits))
+  response["chainwork"] = %chainworkHex
+  response["nTx"] = %nTx
 
   # Add previousblockhash if not genesis
   if idx.height > 0:
@@ -936,6 +954,7 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   let blockWeight  = 3 * strippedSize + fullSize
 
   let mainnet = rpc.params.network == Mainnet
+  let regtest = rpc.params.network == Regtest
 
   # ── tx array ────────────────────────────────────────────────────────────────
   # verbosity=1 → txid strings; verbosity=2 → full TxToUniv objects with hex.
@@ -1041,8 +1060,10 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # Build vout array using the shared W55 buildVoutJson helpers.
       var voutArr = newJArray()
       for i, outp in tx.outputs:
-        voutArr.add(buildVoutJson(outp, i, mainnet))
+        voutArr.add(buildVoutJson(outp, i, mainnet, regtest))
 
+      # Core TxToUniv key order: txid, hash, version, size, vsize, weight,
+      # locktime, vin, vout, [fee], hex — fee is pushed BEFORE hex.
       var txObj = newJObject()
       txObj["txid"]     = %txidStr
       txObj["hash"]     = %hashStr
@@ -1053,7 +1074,6 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       txObj["locktime"] = %tx.lockTime
       txObj["vin"]      = vinArr
       txObj["vout"]     = voutArr
-      txObj["hex"]      = %toHex(fullTxBytes)
 
       # fee field: sum input values (from the pre-computed feeMap + flat file undo
       # fallback) minus output values.
@@ -1091,52 +1111,56 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         if allInputsKnown and fee >= 0:
           txObj["fee"] = btcAmountNode(fee)
 
+      # hex is pushed last (after the optional fee), per Core TxToUniv.
+      txObj["hex"] = %toHex(fullTxBytes)
+
       txArray.add(txObj)
 
   # Build coinbase_tx summary object (Core 27+ field).
-  # Reference: bitcoin-core/src/rpc/blockchain.cpp BlockToJSON coinbase_tx.
-  # Shape: {coinbase, locktime, sequence, version, witness} — NOT a full tx.
+  # Reference: bitcoin-core/src/rpc/blockchain.cpp coinbaseTxToJSON.
+  # Core key order: version, locktime, sequence, coinbase, [witness].
   var coinbaseTxObj = newJObject()
   if b.txs.len > 0:
     let cbtx = b.txs[0]
-    if cbtx.inputs.len > 0:
-      coinbaseTxObj["coinbase"] = %toHex(cbtx.inputs[0].scriptSig)
+    coinbaseTxObj["version"] = %cbtx.version
     coinbaseTxObj["locktime"] = %cbtx.lockTime
     if cbtx.inputs.len > 0:
       coinbaseTxObj["sequence"] = %cbtx.inputs[0].sequence
-    coinbaseTxObj["version"] = %cbtx.version
+      coinbaseTxObj["coinbase"] = %toHex(cbtx.inputs[0].scriptSig)
     # witness: first item of the first witness stack (the BIP141 commitment nonce).
     if cbtx.witnesses.len > 0 and cbtx.witnesses[0].len > 0:
       coinbaseTxObj["witness"] = %toHex(cbtx.witnesses[0][0])
 
-  # Assemble the response object.
+  # Assemble the response object. Core blockToJSON = blockheaderToJSON keys
+  # (rpc/blockchain.cpp:159-180) followed by strippedsize, size, weight,
+  # coinbase_tx, tx. previousblockhash/nextblockhash are emitted at the end of
+  # the header section (before strippedsize).
   var response = newJObject()
-  response["bits"]         = %bitsHex
-  response["chainwork"]    = %chainworkHex
-  response["confirmations"] = %int(rpc.chainState.bestHeight - height + 1)
-  response["coinbase_tx"]  = coinbaseTxObj
-  response["difficulty"]   = diffNode
   response["hash"]         = %reverseHex(toHex(computedHash))
+  response["confirmations"] = %int(rpc.chainState.bestHeight - height + 1)
   response["height"]       = %height
-  response["mediantime"]   = %mediantime
-  response["merkleroot"]   = %reverseHex(toHex(b.header.merkleRoot))
-  response["nTx"]          = %b.txs.len
-  response["nonce"]        = %b.header.nonce
-  if height > 0:
-    response["previousblockhash"] = %reverseHex(toHex(array[32, byte](b.header.prevBlock)))
-  response["size"]         = %fullSize
-  response["strippedsize"] = %strippedSize
-  response["target"]       = %targetHex
-  response["time"]         = %int64(b.header.timestamp)
-  response["tx"]           = txArray
   response["version"]      = %b.header.version
   response["versionHex"]   = %versionHex
-  response["weight"]       = %blockWeight
-
+  response["merkleroot"]   = %reverseHex(toHex(b.header.merkleRoot))
+  response["time"]         = %int64(b.header.timestamp)
+  response["mediantime"]   = %mediantime
+  response["nonce"]        = %b.header.nonce
+  response["bits"]         = %bitsHex
+  response["target"]       = %targetHex
+  response["difficulty"]   = diffNode
+  response["chainwork"]    = %chainworkHex
+  response["nTx"]          = %b.txs.len
+  if height > 0:
+    response["previousblockhash"] = %reverseHex(toHex(array[32, byte](b.header.prevBlock)))
   if height < rpc.chainState.bestHeight:
     let nextHashOpt = rpc.chainState.db.getBlockHashByHeight(height + 1)
     if nextHashOpt.isSome:
       response["nextblockhash"] = %reverseHex(toHex(array[32, byte](nextHashOpt.get())))
+  response["strippedsize"] = %strippedSize
+  response["size"]         = %fullSize
+  response["weight"]       = %blockWeight
+  response["coinbase_tx"]  = coinbaseTxObj
+  response["tx"]           = txArray
 
   response
 
@@ -2103,11 +2127,18 @@ proc handlePreciousBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
 # Mempool RPCs
 proc handleGetMempoolInfo*(rpc: RpcServer): JsonNode =
-  let minFee = rpc.mempool.minFeeRate / 100000.0  # Convert sat/vbyte to BTC/kvB
   # Calculate total fees
   var totalFeeSat: int64 = 0
   for _, entry in rpc.mempool.entries:
     totalFeeSat += int64(entry.fee)
+
+  # Core v31.99 lowered DEFAULT_MIN_RELAY_TX_FEE / DEFAULT_INCREMENTAL_RELAY_FEE
+  # from 1000 to 100 sat/kvB. ValueFromAmount(CFeeRate(100).GetFeePerK()) =
+  # 0.00000100 BTC. Emit via btcAmountNode so the fixed-8-decimal text matches
+  # Core exactly (Nim float `0.00001` renders as 1e-05).
+  # Reference: bitcoin-core/src/rpc/mempool.cpp MempoolInfoToJSON (1048-1063).
+  const minRelaySats: int64 = 100
+
   %*{
     "loaded": true,
     "size": rpc.mempool.count,
@@ -2115,17 +2146,20 @@ proc handleGetMempoolInfo*(rpc: RpcServer): JsonNode =
     "usage": rpc.mempool.size,
     "total_fee": float64(totalFeeSat) / 100000000.0,
     "maxmempool": rpc.mempool.maxSize,
-    "mempoolminfee": minFee,
-    "minrelaytxfee": minFee,
-    "incrementalrelayfee": 0.00001,
+    "mempoolminfee": btcAmountNode(minRelaySats),
+    "minrelaytxfee": btcAmountNode(minRelaySats),
+    "incrementalrelayfee": btcAmountNode(minRelaySats),
     "unbroadcastcount": 0,
-    # FIX-68 (W120 BUG-8): reflect the mempool's actual fullRbf field, not
-    # a hardcoded literal.  An operator who configured mempoolfullrbf=0
-    # must observe `false` here.  Core master removed the option and
-    # hardcodes true, but nimrod still gates on the field so the RPC must
-    # mirror the actual configuration.
-    # Reference: src/mempool/mempool.nim Mempool.fullRbf field.
-    "fullrbf": rpc.mempool.fullRbf
+    # Core master removed the mempoolfullrbf option and hardcodes `true`
+    # (mempool.cpp:1058). Match Core's wire output.
+    "fullrbf": true,
+    # The 5 policy fields Core v31.99 added after fullrbf, in Core order.
+    # Defaults match Core's DEFAULT_* constants (and rustoshi's solved values).
+    "permitbaremultisig": true,            # DEFAULT_PERMIT_BAREMULTISIG
+    "maxdatacarriersize": 100_000,         # MAX_OP_RETURN_RELAY
+    "limitclustercount": 64,               # DEFAULT_CLUSTER_LIMIT
+    "limitclustersize": 101_000,           # DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000
+    "optimal": true                        # DoWork(0) on default mempool
   }
 
 proc parseTxidParam(hexStr: string): TxId =
@@ -2838,7 +2872,8 @@ proc btcAmountNode*(sats: int64): JsonNode =
   ## `rawNumberNode` for details.
   rawNumberNode(formatBitcoinAmount(sats))
 
-proc inferAddrDescriptor*(script: seq[byte], mainnet: bool): string =
+proc inferAddrDescriptor*(script: seq[byte], mainnet: bool,
+                          regtest: bool = false): string =
   ## Build a BIP-380 descriptor string for a scriptPubKey, mirroring Core's
   ## `InferDescriptor` (script/descriptor.cpp:2897) when called without a
   ## SigningProvider that has the keys (which is the case for `decodepsbt`).
@@ -2885,7 +2920,7 @@ proc inferAddrDescriptor*(script: seq[byte], mainnet: bool): string =
           parts.add(keys)
           "multi(" & parts.join(",") & ")"
     else:
-      let addrOpt = extractAddressFromScript(script, mainnet)
+      let addrOpt = extractAddressFromScript(script, mainnet, regtest)
       if addrOpt.isSome:
         "addr(" & addrOpt.get() & ")"
       else:
@@ -2911,15 +2946,18 @@ proc buildScriptPubKeyJson(script: seq[byte], mainnet: bool,
   let scriptType = getScriptType(script)
   let addrOpt = extractAddressFromScript(script, mainnet, regtest)
 
+  # Core ScriptToUniv (core_io.cpp) key order: asm, desc, hex, address, type.
+  # Build incrementally so `address` is emitted BEFORE `type`.
   result = %*{
     "asm": disassembleScript(script),
-    "desc": inferAddrDescriptor(script, mainnet),
-    "hex": toHex(script),
-    "type": scriptType
+    "desc": inferAddrDescriptor(script, mainnet, regtest),
+    "hex": toHex(script)
   }
 
   if addrOpt.isSome:
     result["address"] = %addrOpt.get()
+
+  result["type"] = %scriptType
 
 proc buildVinJson(tx: Transaction, inputIndex: int): JsonNode =
   ## Build vin JSON object for an input
@@ -2927,10 +2965,13 @@ proc buildVinJson(tx: Transaction, inputIndex: int): JsonNode =
   let isCoinbase = inp.prevOut.txid == TxId(default(array[32, byte])) and
                    inp.prevOut.vout == 0xFFFFFFFF'u32
 
+  # Core (core_io.cpp TxToUniv) pushes keys in the order:
+  #   coinbase | (txid, vout, scriptSig), then txinwitness (if any), then sequence.
+  # i.e. txinwitness comes BEFORE sequence, so build the object incrementally
+  # to preserve that key order.
   if isCoinbase:
     result = %*{
-      "coinbase": toHex(inp.scriptSig),
-      "sequence": inp.sequence
+      "coinbase": toHex(inp.scriptSig)
     }
   else:
     result = %*{
@@ -2939,16 +2980,17 @@ proc buildVinJson(tx: Transaction, inputIndex: int): JsonNode =
       "scriptSig": %*{
         "asm": disassembleScriptSigAsmStr(inp.scriptSig),
         "hex": toHex(inp.scriptSig)
-      },
-      "sequence": inp.sequence
+      }
     }
 
-  # Add witness data if present
+  # Add witness data if present (BEFORE sequence, per Core key order).
   if tx.witnesses.len > inputIndex and tx.witnesses[inputIndex].len > 0:
     var txinwitness = newJArray()
     for item in tx.witnesses[inputIndex]:
       txinwitness.add(%toHex(item))
     result["txinwitness"] = txinwitness
+
+  result["sequence"] = %inp.sequence
 
 proc buildVoutJson(output: TxOut, index: int, mainnet: bool,
                    regtest: bool = false): JsonNode =
@@ -3644,12 +3686,15 @@ proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   except CatchableError as e:
     raise newRpcError(RpcInvalidParams, "invalid transaction: " & e.msg)
 
-proc buildP2SHWrapAddress(script: seq[byte], mainnet: bool): string =
+proc buildP2SHWrapAddress(script: seq[byte], mainnet: bool,
+                          regtest: bool = false): string =
   ## Compute P2SH-wrap address for a redeem script.
   ## P2SH = base58check(version=0x05/0xC4 || HASH160(redeemScript))
+  ## P2SH base58 prefixes are identical on testnet and regtest, so `regtest`
+  ## is accepted for signature symmetry but does not change the result.
   let h = hash160(script)
   let addrVal = Address(kind: P2SH, scriptHash: h)
-  encodeAddress(addrVal, mainnet)
+  encodeAddress(addrVal, mainnet, regtest)
 
 proc buildP2WPKHScript(hash: openArray[byte]): seq[byte] =
   ## Build OP_0 <20-byte-hash> witness program (P2WPKH).
@@ -3741,17 +3786,19 @@ proc handleDecodeScript(rpc: RpcServer, params: JsonNode): JsonNode =
       @[]
 
   let mainnet = rpc.params.network == Mainnet
+  let regtest = rpc.params.network == Regtest
   let scriptType = getScriptType(script)
 
   # Build top-level object (same as buildScriptPubKeyJson but WITHOUT hex).
-  let addrOpt = extractAddressFromScript(script, mainnet)
+  # Core decodescript / ScriptToUniv key order: asm, desc, address, type.
+  let addrOpt = extractAddressFromScript(script, mainnet, regtest)
   result = %*{
     "asm": disassembleScript(script),
-    "desc": inferAddrDescriptor(script, mainnet),
-    "type": scriptType
+    "desc": inferAddrDescriptor(script, mainnet, regtest)
   }
   if addrOpt.isSome:
     result["address"] = %addrOpt.get()
+  result["type"] = %scriptType
 
   # Determine can_wrap (mirrors Core's switch + validity checks).
   let canWrap =
@@ -3766,7 +3813,7 @@ proc handleDecodeScript(rpc: RpcServer, params: JsonNode): JsonNode =
       false
 
   if canWrap:
-    result["p2sh"] = %buildP2SHWrapAddress(script, mainnet)
+    result["p2sh"] = %buildP2SHWrapAddress(script, mainnet, regtest)
 
     # Determine can_wrap_P2WSH.
     let canWrapP2WSH =
@@ -3798,17 +3845,19 @@ proc handleDecodeScript(rpc: RpcServer, params: JsonNode): JsonNode =
           # P2WSH from SHA256(script) for nonstandard/multisig
           buildP2WSHScript(script)
 
-      let segwitAddrOpt = extractAddressFromScript(segwitScript, mainnet)
+      # Inner segwit object uses ScriptToUniv key order: asm, desc, hex,
+      # address, type, then p2sh-segwit.
+      let segwitAddrOpt = extractAddressFromScript(segwitScript, mainnet, regtest)
       var sr = %*{
         "asm": disassembleScript(segwitScript),
-        "desc": inferAddrDescriptor(segwitScript, mainnet),
-        "hex": toHex(segwitScript),
-        "type": getScriptType(segwitScript)
+        "desc": inferAddrDescriptor(segwitScript, mainnet, regtest),
+        "hex": toHex(segwitScript)
       }
       if segwitAddrOpt.isSome:
         sr["address"] = %segwitAddrOpt.get()
+      sr["type"] = %getScriptType(segwitScript)
       # p2sh-segwit = P2SH wrap of the witness script
-      sr["p2sh-segwit"] = %buildP2SHWrapAddress(segwitScript, mainnet)
+      sr["p2sh-segwit"] = %buildP2SHWrapAddress(segwitScript, mainnet, regtest)
 
       result["segwit"] = sr
 
@@ -4479,8 +4528,8 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
     },
     {
       "name": "ipv6",
-      "limited": true,
-      "reachable": false,
+      "limited": false,
+      "reachable": true,
       "proxy": "",
       "proxy_randomize_credentials": false
     },
@@ -4534,10 +4583,14 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
     "connections_in": inCount,
     "connections_out": outCount,
     "networks": networks,
-    "relayfee": 0.00001,
-    "incrementalfee": 0.00001,
+    # Core v31.99: relayfee = minRelayTxFee.GetFeePerK(), incrementalfee =
+    # incrementalRelayFee.GetFeePerK(); both default to 100 sat/kvB =
+    # 0.00000100 BTC. Emit via btcAmountNode for Core's fixed-8-decimal text.
+    "relayfee": btcAmountNode(100),
+    "incrementalfee": btcAmountNode(100),
     "localaddresses": [],
-    "warnings": ""
+    # Core v31.99 emits warnings as an array of strings (empty = no warnings).
+    "warnings": newJArray()
   }
 
 proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
@@ -5813,17 +5866,19 @@ proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
     of Signet:   "signet"
   # next block uses same bits as tip (accurate except at adjustment boundaries)
   let nextHeight = height + 1
+  # Core getmininginfo (mining.cpp:465-477) does NOT emit `currentblocksize`.
+  # blockmintxfee = ValueFromAmount(blockMinFeeRate.GetFeePerK()) with
+  # DEFAULT_BLOCK_MIN_TX_FEE=1 sat/kvB → 0.00000001 BTC.
   var resp = newJObject()
   resp["blocks"]           = %height
-  resp["currentblocksize"] = %0
   resp["currentblockweight"] = %0
   resp["currentblocktx"]  = %0
   resp["bits"]             = %bitsHex
   resp["difficulty"]       = diffNode
   resp["target"]           = %targetHex
-  resp["blockmintxfee"]    = %0.00001000
   resp["networkhashps"]    = %0.0
   resp["pooledtx"]         = %rpc.mempool.count
+  resp["blockmintxfee"]    = btcAmountNode(1)
   resp["chain"]            = %chainName
   var nextObj = newJObject()
   nextObj["height"]     = %nextHeight
@@ -5831,7 +5886,9 @@ proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
   nextObj["difficulty"] = diffNode
   nextObj["target"]     = %targetHex
   resp["next"]     = nextObj
-  resp["warnings"] = %""
+  # Core v31.99 emits warnings as an ARRAY of strings (empty when no warnings),
+  # not a bare string. Reference: mining.cpp GetWarnings (node/warnings).
+  resp["warnings"] = newJArray()
   resp
 
 proc handleGetTxOut(rpc: RpcServer, params: JsonNode): JsonNode =
@@ -5856,6 +5913,7 @@ proc handleGetTxOut(rpc: RpcServer, params: JsonNode): JsonNode =
   let txid = TxId(txidBytes)
 
   let isMainnet = rpc.params.network == Mainnet
+  let isRegtest = rpc.params.network == Regtest
 
   # Check mempool first if requested
   if includeMempool:
@@ -5868,7 +5926,7 @@ proc handleGetTxOut(rpc: RpcServer, params: JsonNode): JsonNode =
           "bestblock": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
           "confirmations": 0,
           "value": btcAmountNode(int64(output.value)),
-          "scriptPubKey": buildScriptPubKeyJson(output.scriptPubKey, isMainnet),
+          "scriptPubKey": buildScriptPubKeyJson(output.scriptPubKey, isMainnet, isRegtest),
           "coinbase": false
         }
 
@@ -5884,7 +5942,7 @@ proc handleGetTxOut(rpc: RpcServer, params: JsonNode): JsonNode =
     "bestblock": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
     "confirmations": confirmations,
     "value": btcAmountNode(int64(utxo.output.value)),
-    "scriptPubKey": buildScriptPubKeyJson(utxo.output.scriptPubKey, isMainnet),
+    "scriptPubKey": buildScriptPubKeyJson(utxo.output.scriptPubKey, isMainnet, isRegtest),
     "coinbase": utxo.isCoinbase
   }
 
@@ -6103,13 +6161,19 @@ proc handleValidateAddress(rpc: RpcServer, params: JsonNode): JsonNode =
     # Core: isscript=true for P2SH and any witness program >20 bytes (P2WSH=32B, P2TR=32B)
     let isScript = parsedAddr.kind in {P2SH, P2WSH, P2TR}
 
+    # Core key order (rpc/output_script.cpp validateaddress +
+    # rpc/util.cpp DescribeAddress):
+    #   isvalid, address, scriptPubKey, isscript, iswitness,
+    #   witness_version, witness_program.
     result = newJObject()
-    result["address"]      = %addrStr
-    result["isscript"]     = %isScript
     result["isvalid"]      = %true
-    result["iswitness"]    = %isWitness
+    result["address"]      = %addrStr
     result["scriptPubKey"] = %toHex(scriptPubKey)
+    result["isscript"]     = %isScript
+    result["iswitness"]    = %isWitness
     if isWitness:
+      let witnessVer = if parsedAddr.kind == P2TR: 1 else: 0
+      result["witness_version"]  = %witnessVer
       # witness_program: hex of the raw program bytes
       var prog: string
       case parsedAddr.kind
@@ -6122,13 +6186,12 @@ proc handleValidateAddress(rpc: RpcServer, params: JsonNode): JsonNode =
       else:
         prog = ""
       result["witness_program"]  = %prog
-      let witnessVer = if parsedAddr.kind == P2TR: 1 else: 0
-      result["witness_version"]  = %witnessVer
   except AddressError:
+    # Core invalid-form key order: isvalid, error_locations, error.
     result = newJObject()
-    result["error"] = %"Invalid or unsupported Segwit (Bech32) or Base58 encoding."
-    result["error_locations"] = newJArray()
     result["isvalid"] = %false
+    result["error_locations"] = newJArray()
+    result["error"] = %"Invalid or unsupported Segwit (Bech32) or Base58 encoding."
 
 # ============================================================================
 # Pruning RPCs
@@ -6651,18 +6714,14 @@ proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let info = computeUtxoSetInfo(rpc.chainState, coinHashType)
 
+  # Core none/tip-path key order (blockchain.cpp:1114-1130):
+  #   height, bestblock, txouts, bogosize, [hash_serialized_3 | muhash],
+  #   total_amount, transactions, disk_size.
   var response = %*{
     "height": info.height,
     "bestblock": reverseHex(toHex(array[32, byte](info.bestBlock))),
-    "transactions": info.transactions,
     "txouts": info.txOuts,
-    "bogosize": info.bogosize,
-    # `disk_size`: Core emits this (alongside `transactions`) whenever the
-    # coinstatsindex is NOT used — see blockchain.cpp:1127-1129. It is the
-    # estimated chainstate-on-disk size; impl-specific (NOT cross-node
-    # byte-comparable). nimrod sums the raw cfUtxo key+value bytes.
-    "disk_size": info.diskSize,
-    "total_amount": parseJson(formatBtcAmount(info.totalAmount))
+    "bogosize": info.bogosize
   }
 
   case coinHashType
@@ -6677,6 +6736,16 @@ proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   of cshtMuHash:
     response["muhash"] = %reverseHex(toHex(info.hashSerialized))
   of cshtNone: discard
+
+  response["total_amount"] = parseJson(formatBtcAmount(info.totalAmount))
+  response["transactions"] = %info.transactions
+  # `disk_size`: Core emits this (alongside `transactions`) whenever the
+  # coinstatsindex is NOT used — see blockchain.cpp:1127-1129. It is the
+  # estimated chainstate-on-disk size; impl-specific (NOT cross-node
+  # byte-comparable). nimrod sums the raw cfUtxo key+value bytes. The VALUE
+  # diff vs Core (0 on a fresh regtest chainstate) is deferred — only the
+  # KEY-ORDER is corrected here.
+  response["disk_size"] = %info.diskSize
 
   response
 
@@ -8307,9 +8376,11 @@ proc handleGetDescriptorInfo(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing descriptor parameter")
 
   let descriptorStr = params[0].getStr()
+  let mainnet = rpc.params.network == Mainnet
+  let regtest = rpc.params.network == Regtest
 
   try:
-    let info = getDescriptorInfo(descriptorStr)
+    let info = getDescriptorInfo(descriptorStr, mainnet, regtest)
     %*{
       "descriptor": info.descriptor,
       "checksum": info.checksum,

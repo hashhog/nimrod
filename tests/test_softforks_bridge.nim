@@ -127,11 +127,12 @@ suite "softforks bridge: getblockchaininfo and getdeploymentinfo share one data 
     cs.close()
     removeDir(tempDir)
 
-  test "getblockchaininfo response contains softforks key":
+  test "getblockchaininfo no longer emits softforks (Core v31.99 parity)":
+    ## Core v31.99 REMOVED the softforks object from getblockchaininfo; the
+    ## softfork/deployment state lives in getdeploymentinfo only. Assert the
+    ## byte-diff-driven removal so the bridge can't silently come back.
     let info = rpc.handleGetBlockchainInfo()
-    check info.hasKey("softforks")
-    check info["softforks"].kind == JObject
-    check info["softforks"].len > 0
+    check (not info.hasKey("softforks"))
 
   test "getdeploymentinfo response contains deployments key":
     let depInfo = rpc.handleGetDeploymentInfo(newJArray())
@@ -139,56 +140,35 @@ suite "softforks bridge: getblockchaininfo and getdeploymentinfo share one data 
     check depInfo["deployments"].kind == JObject
     check depInfo["deployments"].len > 0
 
-  test "softforks and deployments agree on all shared fields at chain tip":
-    ## Core assertion: both RPCs produce identical deployment state because
-    ## they both call buildDeployments with the same block hash and height.
-    let info    = rpc.handleGetBlockchainInfo()
-    let depInfo = rpc.handleGetDeploymentInfo(newJArray())
+  test "deployments self-consistent at tip vs explicit tip hash":
+    ## getdeploymentinfo (default tip) and getdeploymentinfo (explicit tip
+    ## hash) must agree on every shared field — both call buildDeployments
+    ## with the same block hash and height.
+    let depInfoTip = rpc.handleGetDeploymentInfo(newJArray())
 
-    let softforks   = info["softforks"]
-    let deployments = depInfo["deployments"]
-
-    compareDeployments(softforks, deployments)
-
-  test "both RPCs include all expected fork ids":
-    let expected = ["bip34", "bip65", "bip66", "csv", "segwit", "testdummy", "taproot"]
-    let info    = rpc.handleGetBlockchainInfo()
-    let depInfo = rpc.handleGetDeploymentInfo(newJArray())
-
-    let sf = info["softforks"]
-    let di = depInfo["deployments"]
-
-    for id in expected:
-      check sf.hasKey(id)
-      check di.hasKey(id)
-
-  test "buried forks active from genesis on regtest agree across both RPCs":
-    ## On regtest, csv and segwit heights are 0, so they must be active
-    ## immediately.  Both RPCs must agree.
-    let info    = rpc.handleGetBlockchainInfo()
-    let depInfo = rpc.handleGetDeploymentInfo(newJArray())
-
-    for id in ["csv", "segwit"]:
-      check info["softforks"][id]["active"].getBool() == true
-      check depInfo["deployments"][id]["active"].getBool() == true
-      check info["softforks"][id]["active"].getBool() ==
-            depInfo["deployments"][id]["active"].getBool()
-
-  test "taproot is active on regtest (AlwaysActive BIP9) in both RPCs":
-    let info    = rpc.handleGetBlockchainInfo()
-    let depInfo = rpc.handleGetDeploymentInfo(newJArray())
-
-    check info["softforks"]["taproot"]["active"].getBool() == true
-    check depInfo["deployments"]["taproot"]["active"].getBool() == true
-
-  test "getdeploymentinfo at explicit tip hash matches getblockchaininfo.softforks":
-    ## Pass the tip hash explicitly to getdeploymentinfo; must produce same
-    ## deployment state as getblockchaininfo (which always uses tip).
     let tipHash = reverseHexLocal(toHexLocal(array[32, byte](cs.bestBlockHash)))
-
     var explicitParams = newJArray()
     explicitParams.add(%tipHash)
     let depInfoExplicit = rpc.handleGetDeploymentInfo(explicitParams)
-    let info            = rpc.handleGetBlockchainInfo()
 
-    compareDeployments(info["softforks"], depInfoExplicit["deployments"])
+    compareDeployments(depInfoTip["deployments"], depInfoExplicit["deployments"])
+
+  test "getdeploymentinfo includes all expected fork ids":
+    let expected = ["bip34", "bip65", "bip66", "csv", "segwit", "testdummy", "taproot"]
+    let depInfo = rpc.handleGetDeploymentInfo(newJArray())
+    let di = depInfo["deployments"]
+    for id in expected:
+      check di.hasKey(id)
+
+  test "buried forks reflect regtest activation heights at genesis (getdeploymentinfo)":
+    ## On regtest segwit/taproot activate at height 0 (active from genesis);
+    ## csv/bip34/bip65/bip66 activate at height 1, so on a genesis-only chain
+    ## (height 0) csv is NOT yet active. buriedDeployment(height, 0): active iff
+    ## 0 >= activationHeight.
+    let depInfo = rpc.handleGetDeploymentInfo(newJArray())
+    check depInfo["deployments"]["segwit"]["active"].getBool() == true
+    check depInfo["deployments"]["csv"]["active"].getBool() == false
+
+  test "taproot is active on regtest (AlwaysActive BIP9)":
+    let depInfo = rpc.handleGetDeploymentInfo(newJArray())
+    check depInfo["deployments"]["taproot"]["active"].getBool() == true
