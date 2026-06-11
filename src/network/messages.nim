@@ -27,6 +27,12 @@ const
                                ## NODE_COMPACT_FILTERS = (1 << 6)
                                ## Reference: bitcoin-core/src/protocol.h:321-323
   NodeNetworkLimited* = 1024'u64
+  NodeP2pV2* = 2048'u64        ## BIP-324: serves the v2 encrypted transport
+                               ## (1 << 11).  Advertised because the inbound v2
+                               ## responder runs default-on (peer.nim:1047-1062);
+                               ## Core gates this on -v2transport, default true.
+                               ## Reference: bitcoin-core/src/protocol.h /
+                               ## init.cpp:987-990.
 
 type
   MessageHeader* = object
