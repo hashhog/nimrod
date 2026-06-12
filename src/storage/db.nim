@@ -187,6 +187,11 @@ type
                                   # collide with blockfilterindex's keys, which
                                   # also live in cfMeta). create_missing_column_
                                   # families=1 makes this auto-create on upgrade.
+    cfTxoSpender = "txo_spender"  # txospenderindex: spent-outpoint -> spending
+                                  # tx record + the base-index B/H best-block
+                                  # keys. Dedicated CF for the same key-collision
+                                  # reason as cfCoinStats; auto-creates on upgrade
+                                  # via create_missing_column_families=1.
 
   Database* = ref object
     db: RocksDbPtr

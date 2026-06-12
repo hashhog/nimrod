@@ -21,6 +21,7 @@ import ../consensus/[params, pow, validation]
 import ../storage/chainstate
 import ../storage/indexes/blockfilterindex
 import ../storage/indexes/coinstatsindex
+import ../storage/indexes/txospenderindex
 import ../crypto/[hashing, secp256k1]
 import ../perf/parallel_verify
 
@@ -114,6 +115,12 @@ type
     # --coinstatsindex is set.  nil when disabled.  Same fan-out rationale as
     # filterIndex above.
     coinStatsIndex*: CoinStatsIndex
+    # Optional spent-outpoint -> spending-tx index (txospenderindex) —
+    # maintained alongside each connectBlock/connectBlockIBD when
+    # --txospenderindex is set.  nil when disabled.  Same fan-out rationale as
+    # filterIndex above.  Folded forward here on connect; rolled back via the
+    # chainstate disconnectHook on reorg/invalidateblock.
+    txoSpenderIndex*: TxoSpenderIndex
 
 const
   MaxHeadersPerRequest* = 2000
@@ -564,7 +571,8 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
                      chainState: ChainState = nil,
                      numVerifyWorkers: int = 0,
                      filterIndex: BlockFilterIndex = nil,
-                     coinStatsIndex: CoinStatsIndex = nil): SyncManager =
+                     coinStatsIndex: CoinStatsIndex = nil,
+                     txoSpenderIndex: TxoSpenderIndex = nil): SyncManager =
   result = SyncManager(
     state: ssIdle,
     headerChain: initHeaderChain(),
@@ -601,7 +609,8 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     unconnectingHeaders: initTable[int64, int](),
     numVerifyWorkers: numVerifyWorkers,
     filterIndex: filterIndex,
-    coinStatsIndex: coinStatsIndex
+    coinStatsIndex: coinStatsIndex,
+    txoSpenderIndex: txoSpenderIndex
   )
 
   # Initialize with genesis if chain is empty
@@ -1571,6 +1580,16 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
         discard
       except Exception:
         discard
+    # Fan out to the txospenderindex (no-op when nil/disabled).  It derives its
+    # keys from the block's own inputs and needs NO undo data, so it is fed
+    # OUTSIDE the captureUndo gate — otherwise enabling --txospenderindex alone
+    # (with filter/coinstats off) would never populate it.
+    try:
+      discard sm.txoSpenderIndex.addBlock(blk, hash, height, chainstate.BlockUndo())
+    except CatchableError:
+      discard
+    except Exception:
+      discard
   else:
     # --- Offline replay (chainState == nil): no live UTXO set. Run the full
     #     acceptBlock envelope directly (prevIndex from the DB — now correct
@@ -2151,6 +2170,15 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
           discard
         except Exception:
           discard
+      # Fan out to the txospenderindex (no-op when nil/disabled).  Needs no undo
+      # data, so it is fed OUTSIDE the captureUndo gate (see the linear-connect
+      # site above for rationale).
+      try:
+        discard sm.txoSpenderIndex.addBlock(blk, hashPRB, height, chainstate.BlockUndo())
+      except CatchableError:
+        discard
+      except Exception:
+        discard
     else:
       # Offline replay (no live UTXO set): full acceptBlock envelope with
       # script verification skipped (prevIndex from the DB — correct for the
