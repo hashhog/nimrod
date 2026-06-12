@@ -126,6 +126,18 @@ type
     # Misbehavior scoring (Bitcoin Core: 100 = ban threshold)
     misbehaviorScore*: uint32
     shouldDisconnect*: bool
+    # Anti-DoS addr-relay state (Bitcoin Core net_processing.cpp Peer):
+    #  - getaddrRecvd: true once we have answered this peer's first getaddr.
+    #    A second getaddr from the same connection is ignored
+    #    (Core m_getaddr_recvd; net_processing.cpp:4833).
+    #  - addrTokenBucket / addrTokenTimestamp: leaky-bucket rate-limit on
+    #    INBOUND addr messages.  Refilled at MAX_ADDR_RATE_PER_SECOND (0.1/s),
+    #    capped at MAX_ADDR_PROCESSING_TOKEN_BUCKET (1000); each processed addr
+    #    spends one token, excess is dropped (Core m_addr_token_bucket;
+    #    net_processing.cpp:5646-5670).
+    getaddrRecvd*: bool
+    addrTokenBucket*: float64
+    addrTokenTimestamp*: int64         # unix seconds of last bucket refill
     # Internal state
     recvBuffer*: seq[byte]
     closing*: bool
@@ -179,6 +191,17 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     closing: false,
     misbehaviorScore: 0,
     shouldDisconnect: false,
+    # Anti-DoS addr-relay state.  NOTE: Core actually inits m_addr_token_bucket
+    # = 1.0 (net_processing.cpp:380) and tops it up by MAX_ADDR_TO_SEND=1000 only
+    # when WE send a getaddr (net_processing.cpp:3767, once per connection).
+    # nimrod sends getaddr periodically to all ready peers (requestAddresses)
+    # rather than once-per-connection, so it uses a permissive full bucket here;
+    # after the first 1000 processed addrs the 0.1/s refill governs exactly as
+    # Core.  TODO(anti-eclipse): adopt the once-per-connection getaddr + 1.0 init
+    # + 1000 top-up to also rate-limit the first unsolicited addr burst.
+    getaddrRecvd: false,
+    addrTokenBucket: 1000.0,
+    addrTokenTimestamp: 0,
     # Handshake state
     handshakeComplete: false,
     versionReceived: false,

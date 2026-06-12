@@ -96,27 +96,25 @@ suite "W128 G1-G3 — discouragement bloom filter (BUG-1)":
     check not compiles(bm.isDiscouraged("1.2.3.4"))
 
 # ---------------------------------------------------------------------------
-# G4 — FEELER connections (BUG-2)
+# G4 — FEELER connections (BUG-2 — CLOSED 2026-06-12, anti-eclipse axis)
 # ---------------------------------------------------------------------------
-suite "W128 G4 — FEELER connection type (BUG-2)":
+suite "W128 G4 — FEELER connection type (BUG-2 CLOSED)":
 
-  test "G4 BUG-2: PeerConnectionType has no pctFeeler variant":
+  test "G4 BUG-2 CLOSED: PeerConnectionType has a pctFeeler variant":
     ## net.cpp:2753-2756 `conn_type = ConnectionType::FEELER`.
-    ## Nimrod's PeerConnectionType has 4 entries:
-    ##   pctFullRelay, pctBlockRelayOnly, pctInbound, pctManual.
-    ## No pctFeeler.
+    ## Nimrod now models the FEELER connection type as pctFeeler.
     var seenFeeler = false
     for pct in PeerConnectionType:
       let s = $pct
       if "Feeler" in s or "feeler" in s:
         seenFeeler = true
-    check seenFeeler == false  # confirm absence
+    check seenFeeler == true  # confirm present (feeler now implemented)
 
-  test "G4 BUG-2 cont: no FEELER_INTERVAL=2min exponential timer in mainLoop":
-    ## net.h:61 `FEELER_INTERVAL = 2min`.  Nimrod's mainLoop has no
-    ## `next_feeler` timer:
-    check "next_feeler" notin peermanagerSrc
-    check "FEELER_INTERVAL" notin peermanagerSrc
+  test "G4 BUG-2 CLOSED cont: FEELER_INTERVAL=120s feeler timer in mainLoop":
+    ## net.h:61 `FEELER_INTERVAL = 2min`.  Nimrod's mainLoop now opens a
+    ## periodic feeler probe on a FeelerInterval timer.
+    check "FeelerInterval" in peermanagerSrc
+    check "tryFeelerConnection" in peermanagerSrc
     check $FEELER_INTERVAL_SEC == "120"  # constant pin
 
 # ---------------------------------------------------------------------------
@@ -433,12 +431,14 @@ suite "W128 G23 — MAX_ADDNODE_CONNECTIONS pool (BUG-18)":
 # ---------------------------------------------------------------------------
 # G24 — MAX_FEELER_CONNECTIONS=1 cap (BUG-19)
 # ---------------------------------------------------------------------------
-suite "W128 G24 — MAX_FEELER_CONNECTIONS cap (BUG-19)":
+suite "W128 G24 — MAX_FEELER_CONNECTIONS cap (BUG-19 CLOSED)":
 
-  test "G24 BUG-19: no MAX_FEELER_CONNECTIONS=1 cap (because no feelers exist)":
-    ## net.h:75.  Vacuously absent (G4 documents the upstream gap).
-    check "MAX_FEELER_CONNECTIONS" notin peermanagerSrc
-    check "maxFeelerConnections"   notin peermanagerSrc
+  test "G24 BUG-19 CLOSED: MaxFeelerConnections=1 cap present":
+    ## net.h:75 MAX_FEELER_CONNECTIONS=1.  Nimrod bounds feelers to one at a
+    ## time via the single mainLoop feeler call site + the MaxFeelerConnections
+    ## constant.
+    check "MaxFeelerConnections" in peermanagerSrc
+    check MaxFeelerConnections == 1
     check $MAX_FEELER_CONNECTIONS_CORE == "1"
 
 # ---------------------------------------------------------------------------
