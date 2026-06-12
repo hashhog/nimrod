@@ -284,8 +284,8 @@ suite "RPC mempool info format":
       "bytes": 0,
       "usage": 0,
       "maxmempool": 300000000,
-      "mempoolminfee": 0.00001,
-      "minrelaytxfee": 0.00001
+      "mempoolminfee": 0.00000100,
+      "minrelaytxfee": 0.00000100
     }
 
     for field in expectedFields:
@@ -362,7 +362,7 @@ suite "RPC network info format":
       "connections": 0,
       "connections_in": 0,
       "connections_out": 0,
-      "relayfee": 0.00001
+      "relayfee": 0.00000100
     }
 
     for field in expectedFields:

@@ -211,8 +211,8 @@ suite "REST JSON response structure":
       "bytes": 0,
       "usage": 0,
       "maxmempool": 300000000,
-      "mempoolminfee": 0.00001,
-      "minrelaytxfee": 0.00001
+      "mempoolminfee": 0.00000100,
+      "minrelaytxfee": 0.00000100
     }
     check mempoolInfo.hasKey("loaded")
     check mempoolInfo.hasKey("size")

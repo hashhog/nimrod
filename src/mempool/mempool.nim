@@ -101,7 +101,12 @@ type
 
 const
   DefaultMaxMempoolSize* = 300_000_000  ## 300 MB
-  DefaultMinFeeRate* = 1.0              ## 1 sat/vbyte minimum
+  DefaultMinFeeRate* = 0.1              ## 0.1 sat/vB = 100 sat/kvB minimum
+                                        ## (Core DEFAULT_MIN_RELAY_TX_FEE = 100
+                                        ## sat/kvB, policy/policy.h:70). This is
+                                        ## the real admission floor (Mempool.minFeeRate,
+                                        ## sat/vB) consumed at CheckFeeRate (~1238).
+                                        ## Was 1.0 sat/vB = 1000 sat/kvB (10x Core).
   MaxStandardTxWeight* = 400_000        ## 400K weight units max per tx
 
   ## Rolling fee constants (Bitcoin Core txmempool.h:212, txmempool.cpp:829-859)
