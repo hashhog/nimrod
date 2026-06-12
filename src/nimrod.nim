@@ -8,7 +8,7 @@ import chronicles
 import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
 import ./storage/[db, chainstate, snapshot, blockstore, pruner, undo]
-import ./storage/indexes/[blockfilterindex, gcs, coinstatsindex]
+import ./storage/indexes/[blockfilterindex, gcs, coinstatsindex, txospenderindex]
 import ./network/[peer, peermanager, sync, messages, compact_blocks, asmap, netgroup]
 import ./mempool/[mempool, persist, orphan]
 import ./mining/fees
@@ -95,6 +95,15 @@ type
                             ## historical `hash_or_height`; without it that
                             ## form errors RPC -8 "Querying specific block
                             ## heights requires coinstatsindex" (Core parity).
+    txospenderindex*: bool  ## --txospenderindex: maintain the spent-outpoint ->
+                            ## spending-tx index (Bitcoin Core's
+                            ## `-txospenderindex`, DEFAULT_TXOSPENDERINDEX{false}).
+                            ## Folded forward on every block connect and erased on
+                            ## disconnect/reorg. Required for the CONFIRMED-spend
+                            ## path of `gettxspendingprevout`; without it that RPC
+                            ## can answer only mempool spends and otherwise errors
+                            ## "Mempool lacks a relevant spend, and
+                            ## txospenderindex is unavailable." (Core parity).
     peerblockfilters*: bool ## --peerblockfilters: serve BIP-157 compact
                             ## filters to peers and advertise
                             ## NODE_COMPACT_FILTERS (1<<6 = 64) in our
@@ -197,6 +206,12 @@ type
                                           ## gettxoutsetinfo can answer a
                                           ## historical hash_or_height and
                                           ## getindexinfo can report it.
+    txoSpenderIndex*: TxoSpenderIndex     ## Spent-outpoint -> spending-tx index
+                                          ## (Core's -txospenderindex). nil when
+                                          ## --txospenderindex is not set. Wired
+                                          ## into RpcServer so gettxspendingprevout
+                                          ## can answer the CONFIRMED-spend path
+                                          ## and getindexinfo can report it.
     restServer*: RestServer               ## Optional /rest/* HTTP server.
                                           ## nil when --rest is not set.
     restThread*: Thread[RestServer]       ## REST listener runs on its own
@@ -383,6 +398,15 @@ proc loadConfigFile*(config: var NimrodConfig) =
         config.coinstatsindex = true
       elif v in ["0", "false", "no"]:
         config.coinstatsindex = false
+    of "txospenderindex":
+      # Core's `-txospenderindex` boolean (DEFAULT_TXOSPENDERINDEX{false}):
+      # maintain the spent-outpoint -> spending-tx index used by the
+      # CONFIRMED-spend path of gettxspendingprevout.
+      let v = value.toLowerAscii()
+      if v in ["", "1", "true", "yes"]:
+        config.txospenderindex = true
+      elif v in ["0", "false", "no"]:
+        config.txospenderindex = false
     of "peerblockfilters":
       # W121 G15 / FIX-71: serve BIP-157 compact filters to peers and
       # advertise NODE_COMPACT_FILTERS.  Default OFF (Core parity).
@@ -724,6 +748,19 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           result.config.coinstatsindex = false
         else:
           echo "Invalid --coinstatsindex value: " & p.val & " (use 1 / 0)"
+          quit(1)
+      of "txospenderindex":
+        # Bitcoin Core's `-txospenderindex` boolean
+        # (DEFAULT_TXOSPENDERINDEX{false}). Maintain the spent-outpoint ->
+        # spending-tx index used by the CONFIRMED-spend path of
+        # gettxspendingprevout.
+        let v = p.val.toLowerAscii()
+        if v.len == 0 or v in ["1", "true", "yes"]:
+          result.config.txospenderindex = true
+        elif v in ["0", "false", "no"]:
+          result.config.txospenderindex = false
+        else:
+          echo "Invalid --txospenderindex value: " & p.val & " (use 1 / 0)"
           quit(1)
       of "peerblockfilters":
         # W121 G15 / FIX-71: --peerblockfilters — serve BIP-157 compact
@@ -2355,6 +2392,15 @@ proc startNode*(config: NimrodConfig) {.async.} =
   else:
     state.coinStatsIndex = nil
 
+  # txospenderindex (Core's -txospenderindex, default off). Spent-outpoint ->
+  # spending-tx index backing the CONFIRMED-spend path of gettxspendingprevout.
+  if config.txospenderindex:
+    info "initializing txospenderindex"
+    state.txoSpenderIndex = newTxoSpenderIndex(
+      state.chainState.db.db, enabled = true)
+  else:
+    state.txoSpenderIndex = nil
+
   # Shared chainstate disconnect hook: when the chainstate disconnects a block
   # (legacy disconnectBlock or Pattern-D handleReorg) fan the rollback out to
   # BOTH optional indexes symmetrically.  The hook runs AFTER the chainstate
@@ -2365,9 +2411,11 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # block body + undo to reverse its MuHash, so we re-read both from storage by
   # hash here (same pattern as the IBD backfill below).  Mirrors
   # bitcoin-core's BaseIndex::BlockDisconnected fan-out.
-  if state.blockFilterIndex != nil or state.coinStatsIndex != nil:
+  if state.blockFilterIndex != nil or state.coinStatsIndex != nil or
+     state.txoSpenderIndex != nil:
     let filterIdx = state.blockFilterIndex
     let coinIdx = state.coinStatsIndex
+    let txoIdx = state.txoSpenderIndex
     let csForHook = state.chainState
     let paramsForHook = params
     state.chainState.disconnectHook = proc(blockHash: BlockHash,
@@ -2410,12 +2458,36 @@ proc startNode*(config: NimrodConfig) {.async.} =
         except Exception as e:
           warn "coinstatsindex: disconnectHook removeBlock raised non-Catchable, continuing",
                height = height, hash = $blockHash, error = e.msg
+      if txoIdx != nil:
+        try:
+          # Erase the txospenderindex entries for this disconnected block by
+          # RE-DERIVING its spend keys from the block's OWN inputs (no undo data
+          # needed).  This single unified hook fires per disconnected block on
+          # BOTH the invalidateblock path (disconnectBlock) AND the live reorg
+          # path (handleReorg), disconnect-BEFORE-connect — so a reorg that
+          # spends the same outpoint with a different tx on the new branch
+          # erases the old branch's entry before the new branch's connect
+          # re-writes it.  Re-read the block body by hash (the hook signature
+          # does not carry it).  Mirrors Core CustomRemove(BuildSpenderPositions).
+          let blkOpt = csForHook.db.getBlock(blockHash)
+          if blkOpt.isSome:
+            discard txoIdx.removeBlock(blkOpt.get(), blockHash, prevHash, height)
+          else:
+            warn "txospenderindex: disconnectHook could not read block body, skipping erase",
+                 height = height, hash = $blockHash
+        except CatchableError as e:
+          warn "txospenderindex: disconnectHook removeBlock raised, continuing",
+               height = height, hash = $blockHash, error = e.msg
+        except Exception as e:
+          warn "txospenderindex: disconnectHook removeBlock raised non-Catchable, continuing",
+               height = height, hash = $blockHash, error = e.msg
 
   # 6. Initialize sync manager
   info "initializing sync manager"
   state.syncManager = newSyncManager(state.peerManager, state.chainState.db, params,
                                      state.chainState, config.numVerifyWorkers,
-                                     state.blockFilterIndex, state.coinStatsIndex)
+                                     state.blockFilterIndex, state.coinStatsIndex,
+                                     state.txoSpenderIndex)
   state.syncManager.chainTip = state.chainState.bestBlockHash
   state.syncManager.chainTipHeight = state.chainState.bestHeight
 
@@ -2572,6 +2644,50 @@ proc startNode*(config: NimrodConfig) {.async.} =
            indexed = csiIndexed, skipped = csiSkipped, partial = csiPartial,
            bestHeight = state.coinStatsIndex.bestHeight
 
+  # 6c. IBD backfill of the txospenderindex — symmetric to 6a/6b, but simpler:
+  # it needs ONLY the block body (keys derive from the block's own inputs; no
+  # undo required), so it can always be folded exactly even over IBD fast-path
+  # heights that lack on-disk undo.  On a fresh datadir with the flag on this is
+  # a no-op (the live connect hook handles it); on an existing datadir with the
+  # flag freshly flipped on it walks the whole gap genesis..tip.
+  # Reference: bitcoin-core/src/index/base.cpp::BaseIndex::ThreadSync.
+  if state.txoSpenderIndex != nil and state.txoSpenderIndex.enabled:
+    let csForTso = state.chainState
+    let tipHeightTso = csForTso.bestHeight
+    let startHeightTso = state.txoSpenderIndex.bestHeight + 1
+    if startHeightTso <= tipHeightTso:
+      info "txospenderindex: backfilling",
+           fromHeight = startHeightTso, toHeight = tipHeightTso,
+           gap = (tipHeightTso - startHeightTso + 1)
+      var tsoIndexed = 0
+      var tsoSkipped = 0
+      for h in startHeightTso .. tipHeightTso:
+        let hashOpt = csForTso.db.getBlockHashByHeight(h)
+        if hashOpt.isNone:
+          warn "txospenderindex: missing height->hash, stopping backfill",
+               height = h
+          break
+        let hash = hashOpt.get()
+        let blkOpt = csForTso.db.getBlock(hash)
+        if blkOpt.isNone:
+          warn "txospenderindex: missing block body, stopping backfill",
+               height = h, hash = $hash
+          break
+        if state.txoSpenderIndex.addBlock(blkOpt.get(), hash, h,
+                                          chainstate.BlockUndo()):
+          inc tsoIndexed
+        else:
+          inc tsoSkipped
+          warn "txospenderindex: addBlock failed during backfill, stopping",
+               height = h, hash = $hash
+          break
+        if (tsoIndexed + tsoSkipped) mod 10_000 == 0:
+          info "txospenderindex: backfill progress",
+               indexed = tsoIndexed, skipped = tsoSkipped, currentHeight = h
+      info "txospenderindex: backfill complete",
+           indexed = tsoIndexed, skipped = tsoSkipped,
+           bestHeight = state.txoSpenderIndex.bestHeight
+
   # 7. Start RPC server
   if config.rpcEnabled:
     info "starting RPC server", port = config.rpcPort
@@ -2605,6 +2721,11 @@ proc startNode*(config: NimrodConfig) {.async.} =
     # P2P sync path, and gettxoutsetinfo / getindexinfo can read it.  nil when
     # --coinstatsindex is OFF (then a non-tip hash_or_height errors -8).
     state.rpcServer.coinStatsIndex = state.coinStatsIndex
+    # Wire the txospenderindex so submitblock maintains it alongside the live
+    # P2P sync path, and gettxspendingprevout / getindexinfo can read it.  nil
+    # when --txospenderindex is OFF (then gettxspendingprevout can answer only
+    # mempool spends and otherwise errors -1 "txospenderindex is unavailable.").
+    state.rpcServer.txoSpenderIndex = state.txoSpenderIndex
     # Wire the ASMap manager so getpeerinfo can populate mapped_as.
     # W115 FIX-50: netGroupManager is always non-nil after step 5a above;
     # usingAsmap() returns false when no file was given / load failed.

@@ -11,6 +11,7 @@ import ../consensus/[params, validation, chain, versionbits]
 import ../storage/[chainstate, blockstore, snapshot, pruner]
 import ../storage/indexes/blockfilterindex
 import ../storage/indexes/coinstatsindex
+import ../storage/indexes/txospenderindex
 import ../storage/indexes/gcs as gcsMod
 import ../mempool/[mempool, package, persist, orphan]
 import ../crypto/[hashing, secp256k1, address, signmessage]
@@ -67,6 +68,12 @@ type
                                          ## Wired by startNode when --coinstatsindex is set.
                                          ## Read by gettxoutsetinfo (historical
                                          ## hash_or_height) and getindexinfo.
+    txoSpenderIndex*: TxoSpenderIndex    ## Optional spent-outpoint -> spending-tx index
+                                         ## (Core's -txospenderindex); maintained alongside
+                                         ## connectBlock in submitblock. Wired by startNode
+                                         ## when --txospenderindex is set. Read by
+                                         ## gettxspendingprevout (confirmed-spend path) and
+                                         ## getindexinfo.
     netGroupManager*: NetGroupManager    ## Optional ASMap manager; nil / empty = /16 fallback.
                                          ## Wired by startNode when --asmap is given.
                                          ## Used by getpeerinfo to populate mapped_as.
@@ -1263,6 +1270,29 @@ proc populateFilterIndexForHashes(rpc: RpcServer, hashes: seq[BlockHash]) =
       blockUndo = buOpt.get()
     discard rpc.filterIndex.addBlock(blk, hash, bidx.height, blockUndo)
 
+proc populateTxoSpenderIndexForHashes(rpc: RpcServer, hashes: seq[BlockHash]) =
+  ## Advance the txospenderindex across blocks just connected by a generate* RPC.
+  ## Same rationale as populateFilterIndexForHashes: Core's BaseIndex hooks
+  ## BlockConnected for EVERY block joining the active chain, including locally
+  ## mined ones.  Without this the index would lag the tip after
+  ## generatetoaddress.  No undo needed (keys derive from the block's own
+  ## inputs), so this is a plain block-body read.
+  if rpc.txoSpenderIndex == nil or not rpc.txoSpenderIndex.enabled:
+    return
+  let cs = rpc.chainState
+  for hash in hashes:
+    let idxOpt = cs.db.getBlockIndex(hash)
+    if idxOpt.isNone:
+      continue
+    let bidx = idxOpt.get()
+    if bidx.height <= rpc.txoSpenderIndex.bestIndexedHeight():
+      continue
+    let blkOpt = cs.db.getBlock(hash)
+    if blkOpt.isNone:
+      continue
+    discard rpc.txoSpenderIndex.addBlock(blkOpt.get(), hash, bidx.height,
+                                         chainstate.BlockUndo())
+
 proc handleGetBlockFilter(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Retrieve a BIP-157 content filter (and its chained header) for a block.
   ## Byte-faithful to Bitcoin Core
@@ -1385,6 +1415,19 @@ proc handleGetIndexInfo(rpc: RpcServer, params: JsonNode): JsonNode =
     const name = "coinstatsindex"
     if indexName.len == 0 or indexName == name:
       let idxHeight = rpc.coinStatsIndex.bestIndexedHeight()
+      let synced = idxHeight >= tipHeight
+      let bestHeight = if idxHeight < 0: 0 else: int(idxHeight)
+      var entry = newJObject()
+      entry["synced"] = %synced
+      entry["best_block_height"] = %bestHeight
+      result[name] = entry
+
+  # Spent-outpoint -> spending-tx index (txospenderindex).  Core's GetName() for
+  # this index is "txospenderindex" (index/txospenderindex.cpp).
+  if rpc.txoSpenderIndex != nil and rpc.txoSpenderIndex.enabled:
+    const name = "txospenderindex"
+    if indexName.len == 0 or indexName == name:
+      let idxHeight = rpc.txoSpenderIndex.bestIndexedHeight()
       let synced = idxHeight >= tipHeight
       let bestHeight = if idxHeight < 0: 0 else: int(idxHeight)
       var entry = newJObject()
@@ -2405,6 +2448,152 @@ proc orphanToJson(rpc: RpcServer, entry: OrphanEntry): JsonNode =
   if not (entry.fromPeer.address.len == 0 and entry.fromPeer.port == 0'u16):
     fromArr.add(%(entry.fromPeer.address & ":" & $entry.fromPeer.port))
   result["from"] = fromArr
+
+proc handleGetTxSpendingPrevout(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## gettxspendingprevout [{"txid","vout"},...] ( {options} )
+  ##
+  ## Scans the mempool (and the txospenderindex, if available) to find
+  ## transactions spending any of the given outputs.  Byte-faithful to Bitcoin
+  ## Core (bitcoin-core/src/rpc/mempool.cpp::gettxspendingprevout):
+  ##
+  ##   params[0] outputs  ARR of {txid (str), vout (num)}.  Empty -> error -8
+  ##                      "Invalid parameter, outputs are missing".  Negative
+  ##                      vout -> error -8 "Invalid parameter, vout cannot be
+  ##                      negative".  Strict object: unknown keys / missing
+  ##                      txid|vout rejected.
+  ##   params[1] options  OBJ {mempool_only (bool, default: true iff index
+  ##                      unavailable), return_spending_tx (bool, default
+  ##                      false)}.  Strict: unknown keys rejected.
+  ##
+  ## Algorithm: search the mempool reverse-index first; if mempool_only OR the
+  ## spend was resolved in the mempool, done.  Otherwise the request requires
+  ## the index: if it is unavailable, error -1 "Mempool lacks a relevant spend,
+  ## and txospenderindex is unavailable."; else look each remaining outpoint up
+  ## in the index.  Output pushKV order per entry: txid, vout,
+  ## spendingtxid (if found), spendingtx (iff return_spending_tx, full hex),
+  ## blockhash (CONFIRMED / index path ONLY).  An unspent outpoint yields the
+  ## bare {txid, vout}.
+
+  # --- params[0]: outputs array (required, non-empty) ---
+  if params.len < 1 or params[0].kind != JArray:
+    raise newRpcError(RpcInvalidParameter, "Invalid parameter, outputs are missing")
+  let outputParams = params[0]
+  if outputParams.len == 0:
+    raise newRpcError(RpcInvalidParameter, "Invalid parameter, outputs are missing")
+
+  # --- params[1]: options object (optional, strict) ---
+  let options =
+    if params.len >= 2 and params[1].kind != JNull: params[1]
+    else: newJObject()
+  if options.kind != JObject:
+    raise newRpcError(RpcTypeError, "Expected type object for options")
+  for k, v in options:
+    if k notin ["mempool_only", "return_spending_tx"]:
+      raise newRpcError(RpcInvalidParameter, "Unexpected key " & k)
+    if v.kind != JBool:
+      raise newRpcError(RpcTypeError, "Expected type bool for " & k)
+
+  let indexAvailable = rpc.txoSpenderIndex != nil and rpc.txoSpenderIndex.enabled
+  let mempoolOnly =
+    if options.hasKey("mempool_only"): options["mempool_only"].getBool()
+    else: not indexAvailable
+  let returnSpendingTx =
+    if options.hasKey("return_spending_tx"): options["return_spending_tx"].getBool()
+    else: false
+
+  # --- Parse + validate every requested outpoint up front (Core builds the
+  #     full worklist before touching the mempool). ---
+  type Prevout = object
+    outpoint: OutPoint
+    txidHex: string
+    vout: int
+  var prevouts: seq[Prevout]
+  for o in outputParams:
+    if o.kind != JObject:
+      raise newRpcError(RpcTypeError, "Expected type object")
+    # Strict: only txid + vout permitted; both required.
+    for k, _ in o:
+      if k notin ["txid", "vout"]:
+        raise newRpcError(RpcInvalidParameter, "Unexpected key " & k)
+    if not o.hasKey("txid") or o["txid"].kind != JString:
+      raise newRpcError(RpcInvalidParameter, "Missing txid")
+    if not o.hasKey("vout") or o["vout"].kind != JInt:
+      raise newRpcError(RpcInvalidParameter, "Missing vout")
+    let txidHex = o["txid"].getStr()
+    let txid = parseTxidParam(txidHex)  # validates 64-hex, throws -5 otherwise
+    let nOutput = o["vout"].getInt()
+    if nOutput < 0:
+      raise newRpcError(RpcInvalidParameter, "Invalid parameter, vout cannot be negative")
+    prevouts.add(Prevout(
+      outpoint: OutPoint(txid: txid, vout: uint32(nOutput)),
+      txidHex: txidHex,
+      vout: nOutput))
+
+  result = newJArray()
+
+  # Build the per-entry JSON object.  spendingTxOpt non-nil => spent (push
+  # spendingtxid, and the full hex iff return_spending_tx).
+  proc makeOutput(p: Prevout, spendingTx: Option[Transaction]): JsonNode =
+    var o = newJObject()
+    o["txid"] = %p.txidHex
+    o["vout"] = %p.vout
+    if spendingTx.isSome:
+      let stx = spendingTx.get()
+      o["spendingtxid"] = %reverseHex(toHex(array[32, byte](txid(stx))))
+      if returnSpendingTx:
+        o["spendingtx"] = %toHex(serialize(stx))
+    o
+
+  # --- Phase 1: search the mempool reverse-index first. ---
+  var remaining: seq[Prevout]
+  for p in prevouts:
+    let spenderOpt = rpc.mempool.getSpender(p.outpoint)
+    if spenderOpt.isNone and not mempoolOnly:
+      # Not spent in the mempool and we may consult the index: defer.
+      remaining.add(p)
+      continue
+    # Either spent in the mempool, or this is a mempool_only request (so the
+    # mempool answer — possibly "unspent" — is final).
+    var spendingTx = none(Transaction)
+    if spenderOpt.isSome:
+      spendingTx = rpc.mempool.getTransaction(spenderOpt.get())
+    result.add(makeOutput(p, spendingTx))
+
+  # All handled by the mempool search (or mempool_only) — return early.
+  if remaining.len == 0:
+    return result
+
+  # --- Phase 2: index path.  Some outpoints are unresolved and this was not a
+  #     mempool_only request, so the index is required. ---
+  if not indexAvailable:
+    raise newRpcError(RpcMiscError,
+      "Mempool lacks a relevant spend, and txospenderindex is unavailable.")
+
+  for p in remaining:
+    let recOpt = rpc.txoSpenderIndex.findSpender(p.outpoint)
+    if recOpt.isSome:
+      let rec = recOpt.get()
+      # Decode the stored spending tx so makeOutput can emit spendingtxid /
+      # spendingtx consistently with the mempool path.
+      var stx: Transaction
+      var decoded = false
+      try:
+        stx = deserializeTransaction(rec.spendingTx)
+        decoded = true
+      except CatchableError:
+        decoded = false
+      var o = makeOutput(p, if decoded: some(stx) else: none(Transaction))
+      if not decoded:
+        # Fall back to the stored txid if the body failed to decode.
+        o["spendingtxid"] = %reverseHex(toHex(array[32, byte](rec.spendingTxid)))
+      # blockhash is emitted ONLY on the confirmed/index path.
+      o["blockhash"] = %reverseHex(toHex(array[32, byte](rec.blockHash)))
+      result.add(o)
+    else:
+      # Unspent on-chain: bare {txid, vout}.
+      result.add(makeOutput(p, none(Transaction)))
+
+  return result
 
 proc handleGetOrphanTxs(rpc: RpcServer, params: JsonNode): JsonNode =
   ## getorphantxs ( verbosity )
@@ -5046,6 +5235,14 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         discard rpc.filterIndex.addBlock(blk, bHash, height, undoForFilter)
         discard rpc.coinStatsIndex.addBlock(blk, bHash, height, undoForFilter)
 
+      # Fan out to the txospenderindex (no-op when nil/disabled).  It needs no
+      # undo data (keys derive from the block's own inputs), so it is fed
+      # OUTSIDE the captureUndo gate — enabling --txospenderindex alone must
+      # populate it even with filter/coinstats off.
+      if rpc.txoSpenderIndex != nil and rpc.txoSpenderIndex.enabled:
+        let bHash2 = BlockHash(doubleSha256(serialize(blk.header)))
+        discard rpc.txoSpenderIndex.addBlock(blk, bHash2, height, chainstate.BlockUndo())
+
       if not cs.ibdMode:
         # Remove confirmed transactions from mempool
         var mp = rpc.mempool
@@ -5438,6 +5635,7 @@ proc handleGenerateToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   # hooks BlockConnected for locally-mined blocks too — keep the index at the tip
   # so getindexinfo reports synced=true / best_block_height==tip after mining.
   rpc.populateFilterIndexForHashes(hashes)
+  rpc.populateTxoSpenderIndexForHashes(hashes)
 
   # Wallet block-connect hook: credit/debit every loaded wallet from the blocks
   # just connected, so coinbase rewards paid to a wallet address (and any wallet
@@ -5504,6 +5702,7 @@ proc handleGenerateToDescriptor(rpc: RpcServer, params: JsonNode): JsonNode =
 
   # BIP-157 filter index population (no-op when nil/disabled). See generatetoaddress.
   rpc.populateFilterIndexForHashes(hashes)
+  rpc.populateTxoSpenderIndexForHashes(hashes)
 
   # Broadcast new blocks to peers
   if rpc.peerManager != nil:
@@ -5594,6 +5793,7 @@ proc handleGenerateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
   # BIP-157 filter index population (no-op when nil/disabled). See generatetoaddress.
   rpc.populateFilterIndexForHashes(@[hash])
+  rpc.populateTxoSpenderIndexForHashes(@[hash])
 
   # Broadcast new block
   if rpc.peerManager != nil:
@@ -10964,6 +11164,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleDumpMempool(params)
   of "getorphantxs":
     rpc.handleGetOrphanTxs(params)
+  of "gettxspendingprevout":
+    rpc.handleGetTxSpendingPrevout(params)
 
   # Raw transactions
   of "getrawtransaction":
