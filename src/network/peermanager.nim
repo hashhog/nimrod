@@ -20,6 +20,7 @@ import ./netgroup
 import ./eviction
 import ./anchors
 import ./addr
+import ./addrman
 import ./proxy as proxy_mod
 import ../consensus/params
 import ../primitives/[types, serialize]
@@ -81,6 +82,12 @@ type
     ## addrv2 messages here (they cannot be represented in the legacy 16-byte
     ## NetAddress format).  Relayed as addrv2 to peers that signaled wantsAddrV2.
     knownAddressesV2*: seq[TimestampedAddrV2]
+    ## AXIS #2: Core-bucketed address manager (CAddrMan).  knownAddresses above
+    ## stays as the rich getnodeaddresses/addr-sharing metadata store; this
+    ## table is the NEW[1024][64]/TRIED[256][64] placement + anti-Sybil engine +
+    ## peers.dat persistence.  Fed under addKnownAddress; loaded at construction
+    ## from <dataDir>/peers.dat; saved on stop().  Mirrors rustoshi 361d81b.
+    addrMan*: AddrManTable
     banManager*: BanManager
     anchorList*: AnchorList
     listener*: StreamServer
@@ -142,6 +149,8 @@ proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
 proc tryEvictInbound(pm: PeerManager): Option[string]
 proc runStalePeerChecks*(pm: PeerManager) {.async.}
 proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage)
+proc markAddressGood*(pm: PeerManager, address: string, port: uint16) {.raises: [], gcsafe.}
+proc markAddressAttempt*(pm: PeerManager, address: string, port: uint16) {.raises: [], gcsafe.}
 
 proc peerKey(host: string, port: uint16): string =
   host & ":" & $port
@@ -284,6 +293,11 @@ proc newPeerManager*(params: ConsensusParams,
     proxyManager: nil,
     cjdnsReachable: false
   )
+
+  # AXIS #2: load the Core-bucketed addrman from <dataDir>/peers.dat (or a
+  # cold empty table on first run / corrupt file).  Re-bucketed from the
+  # persisted nKey so placement is reproduced exactly across restarts.
+  result.addrMan = addrman.load(dataDir, result.netGroupManager)
 
   # Load existing ban list and anchors
   result.banManager.load()
@@ -677,6 +691,10 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
       # Add to netgroup tracking for outbound
       if connType in {pctFullRelay, pctBlockRelayOnly}:
         pm.outboundNetGroups.incl(ng)
+
+      # AXIS #2: a successful outbound handshake promotes the address NEW->TRIED
+      # in the bucketed addrman (Core marks Good() on connection success).
+      pm.markAddressGood(address, port)
 
       info "connected to peer", peer = $peer, height = peer.startHeight, connType = $connType
 
@@ -1242,6 +1260,11 @@ proc stop*(pm: PeerManager) =
   # Save anchors before shutdown
   pm.saveAnchors()
 
+  # AXIS #2: persist the Core-bucketed addrman to <dataDir>/peers.dat so the
+  # bucket placement survives restarts (atomic temp+rename; best-effort).
+  if pm.addrMan != nil:
+    pm.addrMan.save(pm.dataDir)
+
   for peer in pm.peers.values:
     asyncSpawn peer.disconnect()
 
@@ -1249,7 +1272,8 @@ proc stop*(pm: PeerManager) =
   pm.extendedPeers.clear()
   pm.outboundNetGroups.clear()
 
-proc addKnownAddress*(pm: PeerManager, address: NetAddress) =
+proc addKnownAddress*(pm: PeerManager, address: NetAddress,
+                      source: array[16, byte] = default(array[16, byte])) =
   ## Add address to the known-address pool.
   ## Non-routable addresses (RFC1918 private, loopback, link-local, etc.)
   ## are silently dropped — mirroring Bitcoin Core's IsRoutable() filter
@@ -1262,9 +1286,65 @@ proc addKnownAddress*(pm: PeerManager, address: NetAddress) =
   if a.lastSeen == 0:
     a.lastSeen = uint32(epochTime().int)
   pm.knownAddresses.add(a)
+  # AXIS #2: also place the address in the Core-bucketed addrman (NEW table).
+  # The source group defaults to the address itself (self-announce) when the
+  # caller has no source peer.  This is the anti-Sybil + persistence engine;
+  # the flat knownAddresses seq above stays as the rich-metadata store.
+  var src = source
+  var allZero = true
+  for b in src:
+    if b != 0: allZero = false; break
+  if allZero:
+    src = address.ip
+  discard pm.addrMan.add(address.ip, address.port, src, address.services,
+                         int64(a.lastSeen), pm.netGroupManager)
 
 proc getKnownAddresses*(pm: PeerManager): seq[NetAddress] =
   pm.knownAddresses
+
+proc addrToIp16(address: string): array[16, byte] =
+  ## Parse an address string into the 16-byte IPv4-mapped / native-IPv6 form
+  ## used by the addrman tables.  Returns all-zero on parse failure.
+  try:
+    let ip = parseIpAddr(address)
+    if ip.isV6:
+      return ip.v6
+    else:
+      result[10] = 0xFF
+      result[11] = 0xFF
+      result[12] = ip.v4[0]
+      result[13] = ip.v4[1]
+      result[14] = ip.v4[2]
+      result[15] = ip.v4[3]
+  except CatchableError:
+    discard
+
+proc markAddressGood*(pm: PeerManager, address: string, port: uint16) {.raises: [], gcsafe.} =
+  ## AXIS #2: promote an address NEW->TRIED on a successful connection
+  ## (Core CAddrMan::Good).  No-op if the address is not tracked.  Swallows
+  ## all errors so it is safe to call from the async connect path.
+  if pm.addrMan == nil: return
+  try:
+    let ip16 = addrToIp16(address)
+    discard pm.addrMan.good(ip16, port, getTime().toUnix(), pm.netGroupManager)
+  except Exception:
+    discard
+
+proc markAddressAttempt*(pm: PeerManager, address: string, port: uint16) {.raises: [], gcsafe.} =
+  ## AXIS #2: record a connection attempt (Core CAddrMan::Attempt).  Swallows
+  ## all errors so it is safe to call from the async connect path.
+  if pm.addrMan == nil: return
+  try:
+    let ip16 = addrToIp16(address)
+    pm.addrMan.attempt(ip16, port, getTime().toUnix())
+  except Exception:
+    discard
+
+proc selectAddress*(pm: PeerManager, newOnly: bool = false): Option[tuple[ip: array[16, byte], port: uint16]] =
+  ## AXIS #2: weighted (50/50 new/tried) bucketed peer selection
+  ## (Core CAddrMan::Select).
+  if pm.addrMan == nil: return none(tuple[ip: array[16, byte], port: uint16])
+  pm.addrMan.select(newOnly)
 
 type
   KnownAddrEntry* = object
