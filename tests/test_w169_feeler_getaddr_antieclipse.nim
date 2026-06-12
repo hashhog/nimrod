@@ -132,6 +132,32 @@ suite "W169 getaddr 23-percent cap":
     let resp = pm.buildGetAddrResponse(peer)
     check resp.len == 46         # 23% floor of 200
 
+  test "FLOOR (not ceil): N where 23*N is not a multiple of 100":
+    ## Distinguishing case for integer-FLOOR semantics (Core addrman.cpp
+    ## GetAddr_: nNodes = max_pct * nNodes / 100, size_t integer division).
+    ## N=50 -> 23*50 = 1150 -> floor(1150/100) = 11, whereas ceil/round-up
+    ## would give 12.  The N=200 case above (cap=46) cannot tell floor from
+    ## ceil because 23*200 = 4600 is an exact multiple of 100; this one can.
+    let pm = freshPm()
+    for i in 0'u16..<50'u16:
+      pm.knownAddresses.add(na(14, 0, uint8(i shr 8), uint8(i and 0xFF), 8333 + i))
+    check pm.knownAddresses.len == 50
+    let peer = newPeer("4.4.4.5", 8333, regtestParams(), pdInbound)
+    let resp = pm.buildGetAddrResponse(peer)
+    check resp.len == 11         # floor(0.23 * 50) = 11, NOT 12 (ceil)
+
+  test "FLOOR: small N=10 -> 2 not 3":
+    ## Second distinguishing point near the low end: 23*10 = 230 ->
+    ## floor = 2, ceil = 3.  Belt-and-suspenders against any +99 / round-up
+    ## regression slipping past the N=50 case.
+    let pm = freshPm()
+    for i in 0'u8..<10'u8:
+      pm.knownAddresses.add(na(15, 0, 0, i, 8333 + uint16(i)))
+    check pm.knownAddresses.len == 10
+    let peer = newPeer("4.4.4.6", 8333, regtestParams(), pdInbound)
+    let resp = pm.buildGetAddrResponse(peer)
+    check resp.len == 2          # floor(0.23 * 10) = 2, NOT 3 (ceil)
+
   test "1000 hard cap dominates when 23% would exceed it":
     let pm = freshPm()
     # 5000 addresses -> 23% = 1150, clamped to MaxAddrToSend = 1000.
