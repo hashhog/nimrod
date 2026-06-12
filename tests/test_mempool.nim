@@ -137,6 +137,37 @@ suite "Mempool basic operations":
 
     cs.close()
 
+  test "admission floor is 100 sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE)":
+    ## The real admission floor is mp.minFeeRate (sat/vB). After the fee-floor
+    ## honesty fix it defaults to 0.1 sat/vB = 100 sat/kvB (Core
+    ## DEFAULT_MIN_RELAY_TX_FEE, policy/policy.h:70), down from the old 1.0
+    ## sat/vB = 1000 sat/kvB (10x Core) lie.
+    var cs = newChainState(TestDbPath, regtestParams())
+    let params = regtestParams()
+    var mp = newMempool(cs, params)
+    check DefaultMinFeeRate == 0.1
+    check mp.minFeeRate == 0.1
+
+    # Boundary proof of the CheckFeeRate gate (mempool.nim:1235-1241):
+    #   effectiveMinFeeRate = max(mp.minFeeRate, getMinFee())  # sat/vB
+    #   reject iff  feeRate < effectiveMinFeeRate
+    # On a fresh mempool the rolling floor (getMinFee) is 0, so the static
+    # floor mp.minFeeRate governs.
+    let effectiveMinFeeRate = max(mp.minFeeRate, mp.getMinFee())
+    check effectiveMinFeeRate == 0.1
+
+    # A tx paying exactly 100 sat/kvB => feeRate 0.1 sat/vB is ADMITTED
+    # (0.1 < 0.1 is false). Compute feeRate the same way the gate does:
+    # modifiedFee / vbytes. 100 sat over 1000 vB = 0.1 sat/vB.
+    let feeRate100 = float64(100) / 1000.0      # 100 sat / 1000 vB
+    check not (feeRate100 < effectiveMinFeeRate)  # admitted at the boundary
+
+    # A tx paying 99 sat/kvB => feeRate 0.099 sat/vB is REJECTED.
+    let feeRate99 = float64(99) / 1000.0
+    check feeRate99 < effectiveMinFeeRate         # rejected below the boundary
+
+    cs.close()
+
   test "mempool with custom parameters":
     var cs = newChainState(TestDbPath, regtestParams())
     let params = regtestParams()

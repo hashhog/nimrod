@@ -37,7 +37,13 @@ const
   FeefilterHighThreshold* = 1.33  ## Send update if filter rises to 133% of last
 
   ## Fee rate constants (in sat/kvB, 1000 sat/kvB = 1 sat/vB)
-  DefaultMinRelayFee* = 1000'i64          ## 1000 sat/kvB = 1 sat/vB
+  DefaultMinRelayFee* = 100'i64           ## 100 sat/kvB = 0.1 sat/vB.
+                                          ## Matches Core's DEFAULT_MIN_RELAY_TX_FEE
+                                          ## (policy/policy.h:70). Reconciles the
+                                          ## feefilter floor with the mempool
+                                          ## admission floor (mempool.nim
+                                          ## DefaultMinFeeRate = 0.1 sat/vB =
+                                          ## 100 sat/kvB). Was 1000 sat/kvB (10x Core).
   DefaultIncrementalRelayFee* = 100'i64   ## 100 sat/kvB = 0.1 sat/vB
                                           ## Matches Core's DEFAULT_INCREMENTAL_RELAY_FEE
                                           ## (policy/policy.h:48). FIX-69: was 1000 sat/kvB

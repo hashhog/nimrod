@@ -159,8 +159,11 @@ suite "RelayManager feefilter state":
 
   test "setMempoolMinFeeRate enforces minimum":
     let rm = newRelayManager()
-    rm.setMempoolMinFeeRate(100)  # Below default
+    rm.setMempoolMinFeeRate(50)  # Below default (DefaultMinRelayFee = 100 sat/kvB)
     check rm.mempoolMinFeeRate == DefaultMinRelayFee
+    # A value at/above the floor passes through unclamped.
+    rm.setMempoolMinFeeRate(5000)
+    check rm.mempoolMinFeeRate == 5000
 
   test "getCurrentFeefilterValue during IBD":
     let rm = newRelayManager()
@@ -252,8 +255,11 @@ suite "Transaction relay with feefilter":
     check rm.getQueuedCount(peer) == 1
 
 suite "Feefilter constants":
-  test "default min relay fee is 1000 sat/kvB":
-    check DefaultMinRelayFee == 1000
+  test "default min relay fee is 100 sat/kvB (matches Core DEFAULT_MIN_RELAY_TX_FEE)":
+    ## Core: src/policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB.
+    ## Was 1000 sat/kvB (10x Core) before the fee-floor honesty fix; reconciled
+    ## with mempool.nim DefaultMinFeeRate = 0.1 sat/vB = 100 sat/kvB.
+    check DefaultMinRelayFee == 100
 
   test "default incremental relay fee is 100 sat/kvB (FIX-69 W120 BUG-1)":
     ## Core: src/policy/policy.h:48 DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB.

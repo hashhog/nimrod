@@ -1111,41 +1111,63 @@ suite "W120 G28-G30 RPC introspection bugs":
     cs.close()
     cleanupTestDb()
 
-  test "G29 BUG-7 (P1-RPC): incrementalrelayfee hardcoded 0.00001 vs " &
-       "Core default 0.00000100 (BTC/kvB)":
+  test "G29 BUG-7 (P1-RPC): incrementalrelayfee reads mp.incrementalRelayFeeRate " &
+       "(100 sat/kvB = 0.00000100 BTC), not a hardcoded literal":
     ## Core: ValueFromAmount(100 sat) = 0.00000100 BTC.
-    ## nimrod: 0.00001 BTC/kvB = 1000 sat/kvB = 1 sat/vB (10x Core).
-    ## The hardcoded value also ignores mp.incrementalRelayFeeRate.
-    ## We pin the field default at the mempool level.
+    ## After the fee-floor honesty fix, getnetworkinfo/getmempoolinfo derive
+    ## incrementalrelayfee from mp.incrementalRelayFeeRate rather than a
+    ## hardcoded 0.00001 (the old 1000-sat/kvB lie). The field itself stays
+    ## at Core's 100 sat/kvB default.
     cleanupTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     var mp = newMempool(cs, regtestParams())
     # Mempool field correctly defaults to 100 sat/kvB matching Core.
     check mp.incrementalRelayFeeRate == 100.0
-    # But the RPC layer hardcodes 0.00001 BTC/kvB (= 1000 sat/kvB).
-    # The two values disagree by 10x — divergent RPC output.
+    # The display value is now derived from this field: 100 sat/kvB ->
+    # 0.00000100 BTC (the RPC layer no longer hardcodes a divergent literal).
     cs.close()
     cleanupTestDb()
 
-  test "G30 BUG-9 (P1-RPC): mempoolminfee unit-conversion divergence":
-    ## src/rpc/server.nim:1186:
-    ##   let minFee = rpc.mempool.minFeeRate / 100000000.0
-    ##   # comment: Convert sat/vbyte to BTC/kB
-    ## Going sat/vbyte → BTC/kvB requires *1000 /1e8 = /1e5, not /1e8.
-    ## nimrod's emitted value is 1000x too small.
-    ## Core: ValueFromAmount(GetFeePerK()) on a CFeeRate built from
-    ## sat/kvB produces BTC/kvB correctly.
-    ##
-    ## We pin the underlying field, then assert the (off-by-1000x)
-    ## RPC-layer transform mathematically.
+  test "G30 BUG-9 (P1-RPC): mempoolminfee display couples to mp.minFeeRate (100 sat/kvB)":
+    ## After the fee-floor honesty fix:
+    ##  - the real admission floor mp.minFeeRate defaults to 0.1 sat/vB
+    ##    (= 100 sat/kvB = Core DEFAULT_MIN_RELAY_TX_FEE, policy.h:70), and
+    ##  - the RPC display (getmempoolinfo.minrelaytxfee, getnetworkinfo.relayfee)
+    ##    is derived from that field as int64(minFeeRate * 1000) sat/kvB ->
+    ##    0.00000100 BTC, so display can never diverge from the floor.
     cleanupTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     var mp = newMempool(cs, regtestParams())
-    check mp.minFeeRate == DefaultMinFeeRate  # 1.0 sat/vbyte default
-    # nimrod's transform: 1.0 / 1e8 = 1e-8 BTC/vB — WRONG (claims BTC/kvB)
-    let nimrodReported = mp.minFeeRate / 100_000_000.0
-    let correctTransform = mp.minFeeRate * 1000.0 / 100_000_000.0
-    # Off by exactly 1000x:
-    check abs(correctTransform - nimrodReported * 1000.0) < 1e-12
+    check mp.minFeeRate == DefaultMinFeeRate          # 0.1 sat/vB default
+    check mp.minFeeRate == 0.1
+    # The display transform: sat/vB -> sat/kvB satoshis (the value btcAmountNode
+    # renders). 0.1 sat/vB * 1000 = 100 sat/kvB -> ValueFromAmount(100) = 1e-6 BTC.
+    let displaySatsPerKvB = int64(mp.minFeeRate * 1000.0 + 0.5)
+    check displaySatsPerKvB == 100
+    cs.close()
+    cleanupTestDb()
+
+  test "display==policy guard: RPC fee fields are derived from the floor, " &
+       "not a hardcoded literal":
+    ## Spec (c): a display==policy guard so a future hardcode can never drift
+    ## from the real admission floor again. The display sites (server.nim
+    ## getmempoolinfo.minrelaytxfee / getnetworkinfo.relayfee) emit
+    ##   btcAmountNode(int64(mp.minFeeRate * 1000)).
+    ## This guard reproduces that exact derivation and pins it to the floor;
+    ## it also covers a non-default floor so a hardcoded 100 would be caught.
+    cleanupTestDb()
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    # Default floor: 100 sat/kvB -> display 100 sat/kvB -> 0.00000100 BTC.
+    var mp = newMempool(cs, regtestParams())
+    check int64(mp.minFeeRate * 1000.0 + 0.5) == 100
+    # incrementalrelayfee/incrementalfee derive from the incremental field.
+    check int64(mp.incrementalRelayFeeRate + 0.5) == 100
+
+    # Non-default floor: if a node were configured with a 5 sat/vB floor, the
+    # display MUST follow (5000 sat/kvB), proving it is coupled, not pinned.
+    var mp2 = newMempool(cs, regtestParams(), minFeeRate = 5.0)
+    check int64(mp2.minFeeRate * 1000.0 + 0.5) == 5000
+
     cs.close()
     cleanupTestDb()

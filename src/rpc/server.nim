@@ -2132,12 +2132,19 @@ proc handleGetMempoolInfo*(rpc: RpcServer): JsonNode =
   for _, entry in rpc.mempool.entries:
     totalFeeSat += int64(entry.fee)
 
-  # Core v31.99 lowered DEFAULT_MIN_RELAY_TX_FEE / DEFAULT_INCREMENTAL_RELAY_FEE
-  # from 1000 to 100 sat/kvB. ValueFromAmount(CFeeRate(100).GetFeePerK()) =
-  # 0.00000100 BTC. Emit via btcAmountNode so the fixed-8-decimal text matches
-  # Core exactly (Nim float `0.00001` renders as 1e-05).
+  # Display fields read the REAL admission floor (mp.minFeeRate, sat/vB; default
+  # 100 sat/kvB = 0.00000100 BTC per Core DEFAULT_MIN_RELAY_TX_FEE, policy.h:70).
+  # Coupled to the live mempool field — NOT a hardcoded literal — so the display
+  # can never drift from the floor a tx is actually gated against (CheckFeeRate,
+  # mempool.nim:1238). mempoolminfee = max(rolling, static floor); minrelaytxfee
+  # = the static floor; incrementalrelayfee = mp.incrementalRelayFeeRate.
+  # btcAmountNode takes satoshis (per kvB): sat/vB * 1000 -> sat/kvB.
   # Reference: bitcoin-core/src/rpc/mempool.cpp MempoolInfoToJSON (1048-1063).
-  const minRelaySats: int64 = 100
+  let minRelayFeeRateVb = rpc.mempool.minFeeRate                      # sat/vB
+  let mempoolMinFeeRateVb = max(minRelayFeeRateVb, rpc.mempool.getMinFee())
+  let minRelaySats = int64(minRelayFeeRateVb * 1000.0 + 0.5)         # sat/kvB
+  let mempoolMinSats = int64(mempoolMinFeeRateVb * 1000.0 + 0.5)     # sat/kvB
+  let incrementalSats = int64(rpc.mempool.incrementalRelayFeeRate + 0.5)  # sat/kvB
 
   %*{
     "loaded": true,
@@ -2146,9 +2153,9 @@ proc handleGetMempoolInfo*(rpc: RpcServer): JsonNode =
     "usage": rpc.mempool.size,
     "total_fee": float64(totalFeeSat) / 100000000.0,
     "maxmempool": rpc.mempool.maxSize,
-    "mempoolminfee": btcAmountNode(minRelaySats),
+    "mempoolminfee": btcAmountNode(mempoolMinSats),
     "minrelaytxfee": btcAmountNode(minRelaySats),
-    "incrementalrelayfee": btcAmountNode(minRelaySats),
+    "incrementalrelayfee": btcAmountNode(incrementalSats),
     "unbroadcastcount": 0,
     # Core master removed the mempoolfullrbf option and hardcodes `true`
     # (mempool.cpp:1058). Match Core's wire output.
@@ -4590,11 +4597,13 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
     "connections_in": inCount,
     "connections_out": outCount,
     "networks": networks,
-    # Core v31.99: relayfee = minRelayTxFee.GetFeePerK(), incrementalfee =
+    # Core: relayfee = minRelayTxFee.GetFeePerK(), incrementalfee =
     # incrementalRelayFee.GetFeePerK(); both default to 100 sat/kvB =
-    # 0.00000100 BTC. Emit via btcAmountNode for Core's fixed-8-decimal text.
-    "relayfee": btcAmountNode(100),
-    "incrementalfee": btcAmountNode(100),
+    # 0.00000100 BTC. Coupled to the live mempool floor (mp.minFeeRate, sat/vB)
+    # and mp.incrementalRelayFeeRate (sat/kvB) — NOT hardcoded — so they track
+    # the real admission floor. Emit via btcAmountNode for Core's 8-decimal text.
+    "relayfee": btcAmountNode(int64(rpc.mempool.minFeeRate * 1000.0 + 0.5)),
+    "incrementalfee": btcAmountNode(int64(rpc.mempool.incrementalRelayFeeRate + 0.5)),
     "localaddresses": [],
     # Core v31.99 emits warnings as an array of strings (empty = no warnings).
     "warnings": newJArray()
