@@ -33,6 +33,26 @@ const
   ReconnectInterval* = 30  # seconds
   PingInterval* = 120      # seconds
   GetAddrInterval* = 300   # seconds
+  # Feeler connections (Bitcoin Core net.cpp): every ~FEELER_INTERVAL the
+  # connection-open loop opens ONE short-lived FEELER to a NEW-table address,
+  # completes the handshake, promotes it NEW->TRIED via addrman Good(), then
+  # disconnects.  Bounded at MaxFeelerConnections=1 (Core
+  # MAX_FEELER_CONNECTIONS).  Feelers do NOT count toward the full-outbound
+  # slots — they keep TRIED fresh = the primary eclipse-attack mitigation.
+  FeelerInterval* = 120        # seconds (Core FEELER_INTERVAL = 2min)
+  MaxFeelerConnections* = 1    # Core MAX_FEELER_CONNECTIONS
+  # GETADDR anti-DoS (Bitcoin Core net_processing.cpp):
+  #  - MaxAddrToSend: hard cap on a getaddr response (Core MAX_ADDR_TO_SEND).
+  #  - MaxPctAddrToSend: getaddr response also capped at 23% of addrman size
+  #    (Core MAX_PCT_ADDR_TO_SEND); the effective cap is the min of the two.
+  MaxAddrToSend* = 1000        # Core MAX_ADDR_TO_SEND
+  MaxPctAddrToSend* = 23       # Core MAX_PCT_ADDR_TO_SEND
+  # Inbound addr-message rate limiting (token bucket; Core net_processing.cpp):
+  #  - MaxAddrRatePerSecond: bucket refill rate (Core MAX_ADDR_RATE_PER_SECOND).
+  #  - MaxAddrProcessingTokenBucket: soft cap on accumulated tokens
+  #    (Core MAX_ADDR_PROCESSING_TOKEN_BUCKET = MAX_ADDR_TO_SEND).
+  MaxAddrRatePerSecond* = 0.1
+  MaxAddrProcessingTokenBucket* = 1000.0
   DefaultMaxOutboundFullRelay* = 8
   DefaultMaxOutboundBlockRelay* = 2
   DefaultMaxInbound* = 117
@@ -50,6 +70,12 @@ type
     pctBlockRelayOnly  # Block-relay-only outbound (2 slots)
     pctInbound         # Inbound
     pctManual          # Manual/addnode — always noBan, never counted against limits
+    pctFeeler          # Short-lived feeler probe (Core ConnectionType::FEELER).
+                       # Selected from the NEW table only; on a successful
+                       # handshake the address is promoted NEW->TRIED (Good())
+                       # and the connection is dropped. Does NOT consume a
+                       # full-relay/block-relay slot. The primary eclipse-attack
+                       # mitigation: keeps the TRIED table fresh by probing.
 
   ExtendedPeer* = ref object
     ## Extended peer info for eclipse protection
@@ -148,9 +174,10 @@ type
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
 proc tryEvictInbound(pm: PeerManager): Option[string]
 proc runStalePeerChecks*(pm: PeerManager) {.async.}
-proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage)
+proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage)
 proc markAddressGood*(pm: PeerManager, address: string, port: uint16) {.raises: [], gcsafe.}
 proc markAddressAttempt*(pm: PeerManager, address: string, port: uint16) {.raises: [], gcsafe.}
+proc selectAddress*(pm: PeerManager, newOnly: bool = false): Option[tuple[ip: array[16, byte], port: uint16]] {.raises: [], gcsafe.}
 
 proc peerKey(host: string, port: uint16): string =
   host & ":" & $port
@@ -649,6 +676,11 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
       return false
   of pctManual:
     discard  # manual/addnode peers bypass slot limits
+  of pctFeeler:
+    discard  # feelers do not consume a full-relay/block-relay slot.
+             # Boundedness (one feeler at a time, every FeelerInterval) is
+             # enforced by the mainLoop feeler tick, mirroring Core's
+             # MAX_FEELER_CONNECTIONS=1 single-FEELER-per-open-loop rule.
 
   let peer = newPeer(address, port, pm.params, pdOutbound)
   # BIP-324: if this address has previously failed a v2 probe, skip v2
@@ -695,6 +727,20 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
       # AXIS #2: a successful outbound handshake promotes the address NEW->TRIED
       # in the bucketed addrman (Core marks Good() on connection success).
       pm.markAddressGood(address, port)
+
+      # Feeler: the probe has done its job — the NEW-table address handshook
+      # successfully and has just been promoted to TRIED above.  Now disconnect
+      # immediately (Core: "For feelers, disconnect immediately after successful
+      # handshake").  We do NOT start the message loop, send feefilter, or keep
+      # the peer in our tables — a feeler is short-lived and must not occupy a
+      # connection slot.
+      if connType == pctFeeler:
+        info "feeler connection succeeded, promoting NEW->TRIED and disconnecting",
+             peer = $peer
+        pm.extendedPeers.del(key)
+        await peer.disconnect()
+        pm.peers.del(key)
+        return true
 
       info "connected to peer", peer = $peer, height = peer.startHeight, connType = $connType
 
@@ -1208,12 +1254,43 @@ proc requestAddresses(pm: PeerManager) {.async.} =
     except CatchableError as e:
       debug "failed to request addresses", peer = $peer, error = e.msg
 
+proc tryFeelerConnection*(pm: PeerManager) {.async.} =
+  ## Open ONE short-lived feeler connection to an address selected from the
+  ## NEW table (Core ThreadOpenConnections FEELER branch: addrman.Select(true)).
+  ## On a successful handshake connectToPeerWithType promotes the address
+  ## NEW->TRIED (Good()) and disconnects.  Feelers keep the TRIED table fresh
+  ## by probing NEW entries, which is the primary eclipse-attack mitigation.
+  ## Bounded to MaxFeelerConnections=1 by the single call site (the mainLoop
+  ## feeler tick).  No-op when there is no NEW-table address to probe.
+  if pm.connectPeers.len > 0:
+    # -connect mode: addrman is intentionally unused (Core skips feelers when
+    # -connect is set).
+    return
+  let sel = pm.selectAddress(newOnly = true)
+  if sel.isNone:
+    return
+  let (ip16, port) = sel.get()
+  let address = ipToString(ip16)
+  let key = peerKey(address, port)
+  if key in pm.peers:
+    # Already connected to this address — Core would mark it Good() and pick
+    # another; the simplest faithful behavior is to promote it (it is reachable)
+    # and skip the redundant dial.
+    pm.markAddressGood(address, port)
+    return
+  debug "opening feeler connection", address = address, port = port
+  try:
+    discard await pm.connectToPeerWithType(address, port, pctFeeler)
+  except CatchableError as e:
+    debug "feeler connection failed", address = address, error = e.msg
+
 proc mainLoop*(pm: PeerManager) {.async.} =
   pm.running = true
 
   var lastReconnect = getTime()
   var lastPing = getTime()
   var lastGetAddr = getTime()
+  var lastFeeler = getTime()
   var lastStalePeerCheck = chronos.Moment.now()
 
   info "peer manager main loop started"
@@ -1233,6 +1310,13 @@ proc mainLoop*(pm: PeerManager) {.async.} =
     if (now - lastGetAddr).inSeconds >= GetAddrInterval:
       await pm.requestAddresses()
       lastGetAddr = now
+
+    # Feeler tick (Core FEELER_INTERVAL=120s): open ONE short-lived probe to a
+    # NEW-table address to keep TRIED fresh (anti-eclipse).  Single call site =
+    # MaxFeelerConnections=1.
+    if (now - lastFeeler).inSeconds >= FeelerInterval:
+      await pm.tryFeelerConnection()
+      lastFeeler = now
 
     # Run stale peer checks every second (the functions handle their own intervals)
     if nowMoment - lastStalePeerCheck >= chronos.seconds(1):
@@ -1340,11 +1424,15 @@ proc markAddressAttempt*(pm: PeerManager, address: string, port: uint16) {.raise
   except Exception:
     discard
 
-proc selectAddress*(pm: PeerManager, newOnly: bool = false): Option[tuple[ip: array[16, byte], port: uint16]] =
+proc selectAddress*(pm: PeerManager, newOnly: bool = false): Option[tuple[ip: array[16, byte], port: uint16]] {.raises: [], gcsafe.} =
   ## AXIS #2: weighted (50/50 new/tried) bucketed peer selection
-  ## (Core CAddrMan::Select).
+  ## (Core CAddrMan::Select).  Feeler probing passes newOnly=true to draw only
+  ## from the NEW table (Core addrman.Select(true)).
   if pm.addrMan == nil: return none(tuple[ip: array[16, byte], port: uint16])
-  pm.addrMan.select(newOnly)
+  try:
+    return pm.addrMan.select(newOnly)
+  except Exception:
+    return none(tuple[ip: array[16, byte], port: uint16])
 
 type
   KnownAddrEntry* = object
@@ -1520,13 +1608,71 @@ proc relayAddresses(pm: PeerManager, source: Peer) =
     elif addrCount > 0:
       asyncSpawn spawnSafe(p.sendMessage(legacyMsg))
 
-proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage) =
+proc buildGetAddrResponse*(pm: PeerManager, peer: Peer): seq[TimestampedAddr] =
+  ## Build the addr-message payload to send in reply to a peer's getaddr,
+  ## applying the GETADDR anti-DoS guards (Core net_processing.cpp:4815-4848):
+  ##  (a) Ignore getaddr from OUTBOUND connections — answering them enables a
+  ##      fingerprinting attack (Core: "if (!pfrom.IsInboundConn()) return").
+  ##  (b) Answer only the FIRST getaddr per connection; later getaddr from the
+  ##      same peer are ignored (Core m_getaddr_recvd) — returns empty.
+  ##  (c) Cap the response at min(MaxAddrToSend, 23% of addrman size)
+  ##      (Core MAX_PCT_ADDR_TO_SEND, integer floor; addrman.cpp GetAddr_).
+  ## Returns an empty seq when the request is ignored or there is nothing to
+  ## send.  Exposed so the anti-DoS guards can be proven without a live socket.
+  if peer.direction != pdInbound:
+    debug "ignoring getaddr from non-inbound connection", peer = $peer
+    return @[]
+  if peer.getaddrRecvd:
+    debug "ignoring repeated getaddr", peer = $peer
+    return @[]
+  peer.getaddrRecvd = true
+  let total = pm.knownAddresses.len
+  # 23%-cap (floor), then the hard MaxAddrToSend cap — Core takes the min.
+  var cap = (MaxPctAddrToSend * total) div 100
+  if cap > MaxAddrToSend:
+    cap = MaxAddrToSend
+  let count = min(total, cap)
+  var addrs: seq[TimestampedAddr]
+  for i in 0..<count:
+    addrs.add(TimestampedAddr(
+      timestamp: uint32(epochTime().int),
+      address: pm.knownAddresses[i]))
+  addrs
+
+proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
   ## Process addr/addrv2/getaddr/feefilter messages internally.
   case msg.kind
   of mkAddr:
     # Add addresses to known list (max 1000 per message)
     let count = min(msg.addresses.len, 1000)
+    # Inbound addr rate limiting — leaky token bucket (Core net_processing.cpp
+    # 5646-5670).  Refill the bucket by elapsed_seconds * MaxAddrRatePerSecond,
+    # capped at MaxAddrProcessingTokenBucket; each address we process spends one
+    # token.  When the bucket is empty, further addresses from a rate-limited
+    # (non-NoBan) peer are dropped.  NoBan/manual peers (Core
+    # HasPermission(Addr)) bypass the limit entirely.
+    let nowSec = getTime().toUnix()
+    if peer.addrTokenBucket < MaxAddrProcessingTokenBucket:
+      if peer.addrTokenTimestamp != 0:
+        let elapsed = float64(max(0'i64, nowSec - peer.addrTokenTimestamp))
+        peer.addrTokenBucket = min(MaxAddrProcessingTokenBucket,
+          peer.addrTokenBucket + elapsed * MaxAddrRatePerSecond)
+    peer.addrTokenTimestamp = nowSec
+    # rate_limited = !HasPermission(Addr): NoBan/manual peers are exempt.
+    var rateLimited = true
+    let pkey = peerKey(peer.address, peer.port)
+    if pkey in pm.extendedPeers:
+      let ext = pm.extendedPeers[pkey]
+      if ext.noBan or ext.connType == pctManual:
+        rateLimited = false
     for i in 0..<count:
+      # Apply rate limiting (Core: spend a token per processed addr; drop excess
+      # for rate-limited peers).
+      if peer.addrTokenBucket < 1.0:
+        if rateLimited:
+          continue
+      else:
+        peer.addrTokenBucket -= 1.0
       var na = msg.addresses[i].address
       # DATA-GAP FIX (2026-06): carry the wire timestamp onto the stored record
       # so getnodeaddresses emits a real `time`. The legacy addr message ships a
@@ -1549,7 +1695,33 @@ proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage) =
     # knownAddressesV2 so they can be relayed as addrv2 to peers that want it.
     # Previously only IPv4/IPv6 were stored; Tor/I2P/CJDNS were silently dropped.
     let count = min(msg.addressesV2.len, 1000)
+    # Inbound addr rate limiting — shares the SAME per-peer leaky token bucket as
+    # mkAddr.  Core routes both ADDR and ADDRV2 through ProcessAddrs
+    # (net_processing.cpp:4022), so addrv2 must spend from the same bucket;
+    # otherwise a peer bypasses MAX_ADDR_RATE_PER_SECOND by sending addrv2.
+    # Refill by elapsed_seconds * MaxAddrRatePerSecond, capped; spend one token
+    # per processed addr; drop the excess for rate-limited (non-NoBan) peers.
+    let nowSec = getTime().toUnix()
+    if peer.addrTokenBucket < MaxAddrProcessingTokenBucket:
+      if peer.addrTokenTimestamp != 0:
+        let elapsed = float64(max(0'i64, nowSec - peer.addrTokenTimestamp))
+        peer.addrTokenBucket = min(MaxAddrProcessingTokenBucket,
+          peer.addrTokenBucket + elapsed * MaxAddrRatePerSecond)
+    peer.addrTokenTimestamp = nowSec
+    var rateLimited = true
+    let pkey = peerKey(peer.address, peer.port)
+    if pkey in pm.extendedPeers:
+      let ext = pm.extendedPeers[pkey]
+      if ext.noBan or ext.connType == pctManual:
+        rateLimited = false
     for i in 0..<count:
+      # Spend a token per processed addr; drop excess for rate-limited peers
+      # (Core spends before the routability/validity filter).
+      if peer.addrTokenBucket < 1.0:
+        if rateLimited:
+          continue
+      else:
+        peer.addrTokenBucket -= 1.0
       let ta = msg.addressesV2[i]
       if not ta.address.isValid():
         continue
@@ -1591,15 +1763,8 @@ proc handleAddrInternal(pm: PeerManager, peer: Peer, msg: P2PMessage) =
     if msg.addressesV2.len <= 1000 and msg.addressesV2.len > 0:
       pm.relayAddresses(peer)
   of mkGetAddr:
-    # Respond with up to 1000 known addresses
-    let count = min(pm.knownAddresses.len, 1000)
-    if count > 0:
-      var addrs: seq[TimestampedAddr]
-      for i in 0..<count:
-        addrs.add(TimestampedAddr(
-          timestamp: uint32(epochTime().int),
-          address: pm.knownAddresses[i]
-        ))
+    let addrs = pm.buildGetAddrResponse(peer)
+    if addrs.len > 0:
       let response = newAddr(addrs)
       asyncSpawn peer.sendMessage(response)
   of mkFeeFilter:
