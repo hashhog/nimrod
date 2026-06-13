@@ -11553,6 +11553,219 @@ proc handleCombinePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
 
   %combined.toBase64()
 
+proc handleConvertToPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## converttopsbt "hexstring" ( permitsigdata iswitness )
+  ##
+  ## Converts a network-serialized raw transaction into a blank PSBT. This is
+  ## an OFFLINE helper — it reads no chainstate/wallet. Mirrors Core's
+  ## `converttopsbt` (bitcoin-core/src/rpc/rawtransaction.cpp:1663).
+  ##
+  ## Arguments:
+  ## 1. hexstring     (string, required) — raw transaction hex.
+  ## 2. permitsigdata (bool, optional, default=false) — if false, RPC fails
+  ##    when any input carries a scriptSig or witness; if true those are
+  ##    silently discarded.
+  ## 3. iswitness     (bool, optional) — force witness/non-witness decode.
+  ##    Absent → heuristic (try witness-aware first, fall back to legacy).
+  ##
+  ## Returns: base64-encoded PSBT string.
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing required parameter: hexstring")
+
+  let permitSigData =
+    if params.len >= 2 and params[1].kind == JBool: params[1].getBool() else: false
+
+  # Core DecodeHexTx heuristic (rawtransaction.cpp:1695-1701): iswitness
+  # present forces that single mode; absent tries both (witness first, then
+  # the legacy decoder so an empty-vin tx whose leading 0x00 would be mistaken
+  # for a segwit marker still parses).
+  var tryWitness = true
+  var tryNoWitness = true
+  if params.len >= 3 and params[2].kind == JBool:
+    tryWitness = params[2].getBool()
+    tryNoWitness = not tryWitness
+
+  var rawBytes: seq[byte]
+  try:
+    rawBytes = hexToBytes(params[0].getStr())
+  except CatchableError:
+    raise newRpcError(RpcDeserializationError, "TX decode failed")
+
+  var tx: Transaction
+  var decoded = false
+  if tryWitness:
+    try:
+      tx = deserializeTransaction(rawBytes)
+      # Core's DecodeTx (core_io.cpp DecodeTx) only accepts a candidate decode
+      # when the stream is FULLY consumed (`ssData.empty()`). deserializeTransaction
+      # does not report consumed length, so use the robust proxy: re-serialize the
+      # parsed tx witness-aware and require it to reproduce rawBytes exactly. The
+      # empty-vin tx `02..00 (vin=0) <vout> ..` mis-parses here as a 0-input/0-output
+      # segwit tx whose leading 0x00 is read as a marker, leaving trailing bytes
+      # UNCONSUMED. Without this check `decoded` would be true and the legacy
+      # fallback would never fire, silently dropping the real output.
+      if serialize(tx, includeWitness = true) == rawBytes:
+        decoded = true
+      else:
+        decoded = false
+    except CatchableError:
+      decoded = false
+  if not decoded and tryNoWitness:
+    try:
+      tx = decodeRawTxLegacyForced(rawBytes)
+      decoded = true
+    except CatchableError:
+      decoded = false
+  if not decoded:
+    raise newRpcError(RpcDeserializationError, "TX decode failed")
+
+  # Normalize the witnesses array so per-input checks are well-defined.
+  if tx.witnesses.len < tx.inputs.len:
+    let oldLen = tx.witnesses.len
+    tx.witnesses.setLen(tx.inputs.len)
+    for i in oldLen ..< tx.inputs.len:
+      tx.witnesses[i] = @[]
+
+  # Reject sig data unless permitted, then clear ALL scriptSigs/witnesses
+  # unconditionally (Core rawtransaction.cpp:1704-1710).
+  for i in 0 ..< tx.inputs.len:
+    let hasScriptSig = tx.inputs[i].scriptSig.len > 0
+    let hasWitness = i < tx.witnesses.len and tx.witnesses[i].len > 0
+    if (hasScriptSig or hasWitness) and not permitSigData:
+      raise newRpcError(RpcDeserializationError,
+        "Inputs must not have scriptSigs and scriptWitnesses")
+  for i in 0 ..< tx.inputs.len:
+    tx.inputs[i].scriptSig = @[]
+  tx.witnesses = @[]
+
+  # Build a blank PSBT (empty per-input/output maps; createPsbt allocates one
+  # PsbtInput per vin and one PsbtOutput per vout). createPsbt re-checks the
+  # scriptSigs are empty — they are, since we just cleared them.
+  let psbtObj = createPsbt(tx)
+  %psbtObj.toBase64()
+
+proc shufflePsbtIndices(n: int): seq[int] =
+  ## Fisher-Yates shuffle of [0, n) using cryptographic randomness (sysrand),
+  ## mirroring Core's std::shuffle(..., FastRandomContext()) in joinpsbts. The
+  ## shuffle is for on-wire input/output privacy only — joinpsbts callers must
+  ## treat the result as an unordered set of inputs + set of outputs.
+  result = newSeq[int](n)
+  for i in 0 ..< n:
+    result[i] = i
+  for i in countdown(n - 1, 1):
+    var raw: array[8, byte]
+    discard urandom(raw)
+    var v = 0'u64
+    for b in raw:
+      v = (v shl 8) or uint64(b)
+    let j = int(v mod uint64(i + 1))
+    let tmp = result[i]
+    result[i] = result[j]
+    result[j] = tmp
+
+proc handleJoinPsbts(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## joinpsbts ["psbt", ...]
+  ##
+  ## Joins multiple DISTINCT PSBTs (no shared input) into one PSBT carrying the
+  ## union of all inputs and outputs. OFFLINE — no chainstate/wallet access.
+  ## Mirrors Core's `joinpsbts` (bitcoin-core/src/rpc/rawtransaction.cpp:1778).
+  ##
+  ## Arguments:
+  ## 1. txs (array of base64 PSBT strings, required) — at least two.
+  ##
+  ## Returns: base64-encoded merged PSBT. The merged tx takes the MAX version
+  ## and MIN nLockTime across inputs. Inputs/outputs are shuffled for privacy,
+  ## so callers must compare as sets, not by byte order.
+  if params.len < 1 or params[0].kind != JArray:
+    raise newRpcError(RpcInvalidParameter,
+      "At least two PSBTs are required to join PSBTs.")
+
+  let txs = params[0]
+  # Core: txs.size() <= 1 → RPC_INVALID_PARAMETER (-8).
+  if txs.len <= 1:
+    raise newRpcError(RpcInvalidParameter,
+      "At least two PSBTs are required to join PSBTs.")
+
+  var psbtxs: seq[Psbt]
+  var bestVersion = 1'u32
+  var bestLocktime = 0xffffffff'u32
+  for node in txs:
+    if node.kind != JString:
+      raise newRpcError(RpcDeserializationError, "TX decode failed")
+    var p: Psbt
+    try:
+      p = fromBase64(node.getStr())
+    except CatchableError as e:
+      # Core: RPC_DESERIALIZATION_ERROR (-22) "TX decode failed <err>".
+      raise newRpcError(RpcDeserializationError, "TX decode failed " & e.msg)
+    if p.tx.isNone:
+      raise newRpcError(RpcDeserializationError, "TX decode failed")
+    let ptx = p.tx.get()
+    # Choose the highest version number.
+    if uint32(ptx.version) > bestVersion:
+      bestVersion = uint32(ptx.version)
+    # Choose the lowest lock time.
+    if ptx.lockTime < bestLocktime:
+      bestLocktime = ptx.lockTime
+    psbtxs.add(p)
+
+  # Build the merged PSBT, deduplicating inputs by prevout (txid:vout).
+  var merged: Psbt
+  merged.tx = some(Transaction(
+    version: int32(bestVersion),
+    inputs: @[],
+    outputs: @[],
+    witnesses: @[],
+    lockTime: bestLocktime))
+
+  var seenInputs = initHashSet[(TxId, uint32)]()
+  for p in psbtxs:
+    let ptx = p.tx.get()
+    for i in 0 ..< ptx.inputs.len:
+      let op = ptx.inputs[i].prevOut
+      let key = (op.txid, op.vout)
+      if key in seenInputs:
+        # Core: RPC_INVALID_PARAMETER (-8) "Input <txid>:<n> exists in
+        # multiple PSBTs". `$op.txid` renders big-endian (Core ToString()).
+        raise newRpcError(RpcInvalidParameter,
+          "Input " & $op.txid & ":" & $op.vout & " exists in multiple PSBTs")
+      seenInputs.incl(key)
+      merged.addInput(ptx.inputs[i], p.inputs[i])
+    for i in 0 ..< ptx.outputs.len:
+      merged.addOutput(ptx.outputs[i], p.outputs[i])
+    # Merge global xpubs.
+    for origin, xpubs in p.xpubs:
+      if origin notin merged.xpubs:
+        merged.xpubs[origin] = initHashSet[seq[byte]]()
+      for xpub in xpubs:
+        merged.xpubs[origin].incl(xpub)
+    # Merge unknown global map.
+    for k, v in p.unknown:
+      if k notin merged.unknown:
+        merged.unknown[k] = v
+
+  # Shuffle inputs and outputs for privacy parity (Core std::shuffle with
+  # FastRandomContext). Result is order-randomized; compare as sets.
+  let mtx = merged.tx.get()
+  let inOrder = shufflePsbtIndices(mtx.inputs.len)
+  let outOrder = shufflePsbtIndices(mtx.outputs.len)
+
+  var shuffled: Psbt
+  shuffled.tx = some(Transaction(
+    version: mtx.version,
+    inputs: @[],
+    outputs: @[],
+    witnesses: @[],
+    lockTime: mtx.lockTime))
+  shuffled.xpubs = merged.xpubs
+  shuffled.unknown = merged.unknown
+  for idx in inOrder:
+    shuffled.addInput(mtx.inputs[idx], merged.inputs[idx])
+  for idx in outOrder:
+    shuffled.addOutput(mtx.outputs[idx], merged.outputs[idx])
+
+  %shuffled.toBase64()
+
 proc handleFinalizePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Finalize the inputs of a PSBT
   ## Reference: Bitcoin Core rpc/rawtransaction.cpp finalizepsbt
@@ -12206,6 +12419,10 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleDecodePsbt(params)
   of "combinepsbt":
     rpc.handleCombinePsbt(params)
+  of "converttopsbt":
+    rpc.handleConvertToPsbt(params)
+  of "joinpsbts":
+    rpc.handleJoinPsbts(params)
   of "finalizepsbt":
     rpc.handleFinalizePsbt(params)
   of "analyzepsbt":
