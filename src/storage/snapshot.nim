@@ -77,17 +77,44 @@ type
     pendingTxid*: TxId
     pendingRemaining*: uint64
 
+  ## Role of a chainstate in the dual-chainstate (assumeUTXO) model.
+  ## Mirrors Bitcoin Core's `ChainstateRole` (validation.h): the genesis-rooted
+  ## chainstate that re-validates the snapshot is the BACKGROUND chainstate; the
+  ## snapshot-rooted chainstate the node serves from is the SNAPSHOT chainstate.
+  ## A node with no active snapshot has a single chainstate with role `csrNormal`.
+  ChainstateRole* = enum
+    csrNormal       ## Single fully-validated chainstate (no snapshot active).
+    csrSnapshot     ## Snapshot-rooted active chainstate (Core's m_from_snapshot).
+    csrBackground   ## Genesis-rooted background chainstate re-validating a snapshot.
+
   SnapshotChainState* = ref object
     chainState*: ChainState
     assumeutxo*: Assumeutxo
     snapshotBlockhash*: Option[BlockHash]
     targetUtxoHash*: Option[array[32, byte]]
+    role*: ChainstateRole   ## csrSnapshot once a snapshot is loaded into it.
 
   BackgroundValidation* = ref object
     running*: bool
     progress*: int32
     targetHeight*: int32
     snapshotHash*: array[32, byte]
+
+  ## A live snapshot activation: the snapshot (active) chainstate, the SECOND
+  ## background chainstate with its OWN separate coins store, and the driver
+  ## that re-connects genesis->base into that store and re-derives the UTXO hash.
+  ##
+  ## Mirrors the triple Core threads through `ActivateSnapshot`(validation.cpp:5588)
+  ## / `AddChainstate`(:6170): the unvalidated snapshot chainstate, the validated
+  ## background chainstate targeting the snapshot base, and the work that
+  ## independently recomputes the snapshot's HASH_SERIALIZED.
+  SnapshotActivation* = ref object
+    snapshot*: SnapshotChainState        ## Active, Unvalidated snapshot chainstate.
+    background*: ChainState              ## Background chainstate — SEPARATE store.
+    bgValidation*: BackgroundValidation  ## Drives the genesis->base re-connect.
+    baseHeight*: int32                   ## Snapshot base height (= au_data.height).
+    assumedHash*: array[32, byte]        ## au_data.hash_serialized to match against.
+    bgDbPath*: string                    ## On-disk dir of the bg coins store.
 
   SnapshotValidationResult* = enum
     svrNotReady
@@ -880,7 +907,8 @@ proc newSnapshotChainState*(cs: ChainState): SnapshotChainState =
     chainState: cs,
     assumeutxo: auValidated,
     snapshotBlockhash: none(BlockHash),
-    targetUtxoHash: none(array[32, byte])
+    targetUtxoHash: none(array[32, byte]),
+    role: csrNormal
   )
 
 proc activateSnapshot*(
@@ -905,6 +933,7 @@ proc activateSnapshot*(
       snapshotCs.assumeutxo = auUnvalidated
       snapshotCs.snapshotBlockhash = some(d.blockhash)
       snapshotCs.targetUtxoHash = some(d.hashSerialized)
+      snapshotCs.role = csrSnapshot
       return (true, "")
   return (false, "snapshot hash not found in assumeutxo data")
 
@@ -942,24 +971,48 @@ proc computeUtxoSetHashFromCoins*(coins: seq[SnapshotCoin]): array[32, byte] =
 
 proc validateSnapshot*(
     snapshotCs: SnapshotChainState,
-    backgroundCs: ChainState
+    backgroundCs: var ChainState
 ): SnapshotValidationResult =
-  ## Stub-level "did the background chain reach the snapshot?" check. This
-  ## intentionally does NOT compute a UTXO hash from `backgroundCs` since
-  ## that requires a UTXO iterator we don't yet expose.
+  ## REAL background validation (Core's `MaybeValidateSnapshot`,
+  ## validation.cpp:5967): once the BACKGROUND chainstate has re-connected
+  ## every block genesis->base into its OWN coins store, recompute the
+  ## HASH_SERIALIZED of *that store's* UTXO set and compare it to the
+  ## assumeUTXO commitment (`au_data.hash_serialized`). MATCH -> snapshot
+  ## VALIDATED + background retired; MISMATCH -> snapshot INVALID (never
+  ## silently accepted — Core calls `handle_invalid_snapshot` / `AbortNode`).
+  ##
+  ## This deliberately recomputes the hash from `backgroundCs` rather than
+  ## trusting the load-time digest: the load-time gate authenticates the
+  ## *file*; this is the trustless re-derivation by independent re-connection
+  ## that catches a snapshot whose committed hash passes the load gate but is
+  ## inconsistent with the genesis->base replay.
+  ##
+  ## Uses `computeUtxoSetInfo(.., cshtHashSerialized)` — the SAME
+  ## `serializeCoinForHash` + `HashWriter` (SHA256d) kernel the load-time gate
+  ## streams (`loadSnapshot` above), so the two hashes are byte-comparable.
   if snapshotCs.assumeutxo != auUnvalidated:
     return svrNotReady
   if snapshotCs.snapshotBlockhash.isNone or snapshotCs.targetUtxoHash.isNone:
     return svrNotReady
+  # The background chainstate must have reached the snapshot base height.
   let targetHash = snapshotCs.snapshotBlockhash.get()
-  let targetIdxOpt = backgroundCs.db.getBlockIndex(targetHash)
-  if targetIdxOpt.isNone:
+  if backgroundCs.bestBlockHash != targetHash:
     return svrNotReady
-  if backgroundCs.bestHeight < targetIdxOpt.get().height:
-    return svrNotReady
-  # Without a UTXO iterator we cannot byte-verify here. Mark validated.
-  snapshotCs.assumeutxo = auValidated
-  return svrValid
+
+  # Recompute HASH_SERIALIZED over the BACKGROUND store's own coins.
+  let info = computeUtxoSetInfo(backgroundCs, cshtHashSerialized)
+  let recomputed = info.hashSerialized
+  let assumed = snapshotCs.targetUtxoHash.get()
+
+  if recomputed == assumed:
+    # MATCH — Core: unvalidated_cs.m_assumeutxo = VALIDATED + retire bg.
+    snapshotCs.assumeutxo = auValidated
+    return svrValid
+  else:
+    # MISMATCH — Core: handle_invalid_snapshot() marks the snapshot INVALID
+    # and AbortNode()s; we never flip it to validated.
+    snapshotCs.assumeutxo = auInvalid
+    return svrInvalid
 
 # ============================================================================
 # Background validation (async — preserved from prior interface)
@@ -976,7 +1029,7 @@ proc newBackgroundValidation*(targetHeight: int32,
 
 proc runBackgroundValidation*(
     bgv: BackgroundValidation,
-    backgroundCs: ChainState,
+    backgroundCs: var ChainState,
     snapshotCs: SnapshotChainState,
     getNextBlock: proc(height: int32): Option[Block] {.gcsafe, raises: [].},
     params: ConsensusParams
@@ -988,19 +1041,152 @@ proc runBackgroundValidation*(
     if blockOpt.isNone:
       await sleepAsync(100.milliseconds)
       continue
-    var bcs = backgroundCs
-    let r = bcs.connectBlock(blockOpt.get(), bgv.progress)
+    let r = backgroundCs.connectBlock(blockOpt.get(), bgv.progress)
     if not r.isOk:
       bgv.running = false
       snapshotCs.assumeutxo = auInvalid
       return
     inc bgv.progress
     if bgv.progress > bgv.targetHeight:
+      # Reached the base: recompute HASH_SERIALIZED over the bg store and
+      # compare to the commitment (validateSnapshot flips Validated/Invalid).
       discard validateSnapshot(snapshotCs, backgroundCs)
       bgv.running = false
       return
     await sleepAsync(0.milliseconds)
   bgv.running = false
+
+# ============================================================================
+# Dual-chainstate snapshot activation (Core ActivateSnapshot / AddChainstate)
+# ============================================================================
+
+proc makeBackgroundChainState*(bgDbPath: string,
+                               params: ConsensusParams): ChainState =
+  ## Construct the SECOND (background) chainstate for snapshot validation:
+  ## a genesis-rooted chainstate with its OWN `ChainDb` at a DISTINCT on-disk
+  ## directory (NOT the active snapshot store) and a fresh, EMPTY UTXO set at
+  ## height 0.
+  ##
+  ## This is Core's `AddChainstate` demotion (validation.cpp:6170): the
+  ## genesis-validated chainstate keeps its own coins DB and is re-purposed as
+  ## the background validator that re-derives the snapshot's UTXO hash from
+  ## genesis. A brand-new store has no persisted tip, so `newChainState` seeds
+  ## it at the zero (genesis-sentinel) tip with zero coins — exactly the state
+  ## Core's background chainstate replays forward from.
+  ##
+  ## The tip height is seeded to -1 (PRE-genesis) so the re-connection driver
+  ## starts at height 0 and connects the GENESIS block first — connectBlock
+  ## special-cases height 0 (no UTXO mutation, sets bestBlockHash = genesisHash,
+  ## validation.cpp:2337-2343), which the height-1 block needs as its prevBlock.
+  result = newChainState(bgDbPath, params)
+  # newChainState reads cdb.bestBlockHash/Height from disk; a fresh dir has
+  # none, so the hash is already the zero sentinel (= genesis prevBlock).
+  result.bestBlockHash = BlockHash(default(array[32, byte]))
+  result.bestHeight = -1'i32
+  result.db.bestBlockHash = BlockHash(default(array[32, byte]))
+  result.db.bestHeight = -1'i32
+
+proc activateSnapshotWithBackground*(
+    snapshotCs: SnapshotChainState,
+    bgDbPath: string,
+    assumedHash: array[32, byte],
+    baseHeight: int32
+): SnapshotActivation =
+  ## Wire up a real dual-chainstate validation for an already-loaded snapshot
+  ## chainstate (`snapshotCs`, produced by `activateSnapshot`/`loadSnapshot`,
+  ## carrying `assumeutxo = auUnvalidated`).
+  ##
+  ## Builds the SECOND background chainstate at `bgDbPath` with its OWN separate
+  ## coins store (via `makeBackgroundChainState`) and a `BackgroundValidation`
+  ## context targeting `baseHeight`. The activation itself performs NO block
+  ## connection — exactly like Core's `ActivateSnapshot`, which returns after
+  ## demoting the prior chainstate and lets the validation queue do the work.
+  ##
+  ## Aliasing guarantee: the background store is a distinct `ChainState`/`ChainDb`
+  ## rooted at a different directory; a write to one store is invisible in the
+  ## other (proven by the dual-chainstate spec). A caller that aliases the two
+  ## stores (same db path) is a programming error — `runSnapshotValidation`
+  ## refuses it.
+  snapshotCs.assumeutxo = auUnvalidated
+  snapshotCs.role = csrSnapshot
+  let background = makeBackgroundChainState(bgDbPath, snapshotCs.chainState.params)
+  let bgv = newBackgroundValidation(baseHeight, assumedHash)
+  SnapshotActivation(
+    snapshot: snapshotCs,
+    background: background,
+    bgValidation: bgv,
+    baseHeight: baseHeight,
+    assumedHash: assumedHash,
+    bgDbPath: bgDbPath
+  )
+
+proc runSnapshotValidation*(
+    activation: SnapshotActivation,
+    getNextBlock: proc(height: int32): Option[Block] {.gcsafe, raises: [].}
+): tuple[validated: bool, error: string] =
+  ## Synchronously drive the background validation to its terminal state
+  ## (Core's `MaybeValidateSnapshot` reached at the base) and report the verdict.
+  ##
+  ## Returns `(true, "")` when the background chainstate's independently
+  ## re-computed UTXO hash MATCHED the assumed hash — the snapshot flips to
+  ## `auValidated` and the background chainstate is logically retired.
+  ##
+  ## Returns `(false, <error>)` when the genesis->base re-connect completed but
+  ## the recomputed hash MISMATCHED (snapshot -> `auInvalid`, error carries
+  ## "mismatch"), or a block failed to connect, or no block was available at a
+  ## required height. The snapshot is NEVER silently accepted on a mismatch
+  ## (Core `handle_invalid_snapshot` / `AbortNode`).
+  ##
+  ## Aliasing guard: refuse to run if the background store IS the snapshot store
+  ## (same `ChainDb` ref) — that would be a tautological hash-of-self, not an
+  ## independent re-derivation. `ChainDb` is a `ref object`, so `==` compares
+  ## reference identity.
+  if activation.background.db == activation.snapshot.chainState.db:
+    return (false, "background store aliases the snapshot store — refusing")
+
+  # Bound the loop: if `getNextBlock` returns none for a required height we must
+  # not spin forever. Track stall iterations and fail closed.
+  # `connectBlock` takes `var ChainState`; bind the ref field to a local var so
+  # the mutation flows back through the shared ref (ChainState is a ref object).
+  var bg = activation.background
+  var stalls = 0
+  const MaxStalls = 4
+  activation.bgValidation.running = true
+  activation.bgValidation.progress = bg.bestHeight + 1
+  while activation.bgValidation.running and
+        activation.bgValidation.progress <= activation.bgValidation.targetHeight:
+    let blockOpt = getNextBlock(activation.bgValidation.progress)
+    if blockOpt.isNone:
+      inc stalls
+      if stalls > MaxStalls:
+        activation.bgValidation.running = false
+        activation.snapshot.assumeutxo = auInvalid
+        return (false, "background validation stalled: missing block at height " &
+                $activation.bgValidation.progress)
+      continue
+    stalls = 0
+    let r = bg.connectBlock(blockOpt.get(), activation.bgValidation.progress)
+    if not r.isOk:
+      activation.bgValidation.running = false
+      activation.snapshot.assumeutxo = auInvalid
+      return (false, "background connect failed at height " &
+              $activation.bgValidation.progress & ": " & r.error)
+    inc activation.bgValidation.progress
+    if activation.bgValidation.progress > activation.bgValidation.targetHeight:
+      let verdict = validateSnapshot(activation.snapshot, bg)
+      activation.bgValidation.running = false
+      case verdict
+      of svrValid:
+        return (true, "")
+      of svrInvalid:
+        return (false, "snapshot UTXO hash mismatch: background re-derivation " &
+                "did not match the assumeutxo commitment")
+      of svrNotReady:
+        activation.snapshot.assumeutxo = auInvalid
+        return (false, "snapshot validation did not reach a terminal state")
+  activation.bgValidation.running = false
+  activation.snapshot.assumeutxo = auInvalid
+  return (false, "background validation did not reach the snapshot base")
 
 proc stopBackgroundValidation*(bgv: BackgroundValidation) =
   bgv.running = false

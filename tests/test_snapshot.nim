@@ -1251,21 +1251,26 @@ suite "dumptxoutset rollback":
     check not fileExists(outPath)
 
 # ----------------------------------------------------------------------------
-# loadtxoutset RPC gate (cross-impl audit 2026-05-05).
+# loadtxoutset RPC — real background dual-chainstate validation.
 #
-# loadtxoutset RPC is gated to refuse-and-direct-at-CLI in this build, per
-# the cross-impl audit at
-# CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md and the
-# rustoshi 1d0a325 / hotbuns e355cd7 reference fixes. Pre-fix the handler
-# called `loadSnapshot(...)` on the live `chainState`, which DOES persist
-# the new tip (so restart self-heals) but the running `state.syncManager`
-# was set up at boot and the RpcServer has no reference to it — so the
-# daemon kept requesting blocks from the old tip after the RPC returned.
+# UPDATED (AssumeUTXO dual-chainstate pilot): loadtxoutset now loads the
+# snapshot into an ISOLATED store (a sibling `<chainstate>-snapshot` dir, NOT
+# the live `chainState`) and drives the real SECOND background chainstate
+# (own coins store) that re-connects genesis->base and recomputes the
+# HASH_SERIALIZED to trustlessly re-verify the snapshot (Core ActivateSnapshot
+# / AddChainstate / MaybeValidateSnapshot). The verdict is surfaced via
+# getchainstates. The earlier "disabled in this build / use --load-snapshot"
+# refusal is removed.
 #
-# The gate must:
-#   1. Refuse with RpcInternalError (-32603).
-#   2. Direct the operator at the --load-snapshot CLI flag.
-#   3. NOT call loadSnapshot (no chainState side effects).
+# Invariants this suite pins:
+#   1. A non-loadable file (missing / not in the assumeutxo whitelist) is
+#      refused with RpcInternalError (-32603), matching Core's error code when
+#      ActivateSnapshot cannot proceed.
+#   2. The live `chainState` is NEVER mutated by loadtxoutset — the load goes
+#      to an isolated store, so even a refused load has zero chainState side
+#      effects.
+#   3. Malformed params (empty/empty-path) are still rejected with
+#      RpcInvalidParams before any load attempt.
 # ----------------------------------------------------------------------------
 
 suite "loadtxoutset RPC gate":
@@ -1282,7 +1287,13 @@ suite "loadtxoutset RPC gate":
       params = params
     )
 
-  test "refuses with RpcInternalError and points at the CLI flag":
+  test "non-loadable snapshot file refused with RpcInternalError":
+    ## FIXED (AssumeUTXO dual-chainstate pilot): loadtxoutset now actually
+    ## attempts the load (into an ISOLATED store) and drives background
+    ## validation. A path that cannot be loaded (missing file / not in the
+    ## assumeutxo whitelist) is refused with RpcInternalError, mirroring Core's
+    ## error code when ActivateSnapshot cannot proceed. The old "disabled in
+    ## this build / use --load-snapshot" refusal message is gone.
     let testDir = getTempDir() / "nimrod_loadtxo_gate_basic"
     createDir(testDir)
     defer:
@@ -1306,12 +1317,12 @@ suite "loadtxoutset RPC gate":
       msg = e.msg
     check caught
     check code == RpcInternalError
-    check "--load-snapshot" in msg
+    check "Unable to load UTXO snapshot" in msg
 
-  test "gate fires before any file I/O":
-    # Path does not exist; pre-fix code would have called loadSnapshot which
-    # opens the file and would have surfaced an OSError-flavoured message.
-    # Post-fix gate must short-circuit to the gate refusal regardless.
+  test "missing snapshot file is refused with RpcInternalError":
+    # A path that does not exist cannot be loaded; loadSnapshot fails to open
+    # it and the handler surfaces RpcInternalError (Core's ActivateSnapshot
+    # cannot-proceed code). No live-chainState side effects (isolated store).
     let testDir = getTempDir() / "nimrod_loadtxo_gate_nofile"
     createDir(testDir)
     defer:
@@ -2195,14 +2206,15 @@ suite "W102 AssumeUTXO per-coin validation gates":
     check res.success == false
     check "coins left over" in res.error
 
-  test "B6: validateSnapshot marks auValidated without computing background UTXO hash":
-    # Bitcoin Core validation.cpp:6033-6072 recomputes ComputeUTXOStats
-    # (HASH_SERIALIZED) on the background chainstate and compares against
-    # au_data.hash_serialized before marking the snapshot as VALIDATED.
-    # nimrod's validateSnapshot only checks whether the background chain height
-    # has reached the snapshot height — it does NOT compute a UTXO hash.
-    # This means a background chain that was corrupted or diverged would still
-    # be accepted as "valid", silently marking the snapshot trusted.
+  test "B6 FIXED: validateSnapshot is NotReady until the bg store reaches the base":
+    # FIXED (AssumeUTXO dual-chainstate pilot): validateSnapshot now recomputes
+    # ComputeUTXOStats (HASH_SERIALIZED) over the BACKGROUND store's own coins
+    # and compares to au_data.hash_serialized (Core validation.cpp:5967). Here
+    # the background store's tip (genesis sentinel) does NOT equal the snapshot
+    # base blockhash, so validateSnapshot correctly returns svrNotReady and
+    # leaves the snapshot auUnvalidated — it never validates a bg store that
+    # has not reached the base. (The full accept/mismatch behaviour is proven
+    # end-to-end in test_assumeutxo_dual_chainstate.nim.)
     let testDir = getTempDir() / "nimrod_w102_b6"
     createDir(testDir)
     defer:
@@ -2223,20 +2235,17 @@ suite "W102 AssumeUTXO per-coin validation gates":
     snapshotChain.snapshotBlockhash = some(fakeBlockhash)
     snapshotChain.targetUtxoHash = some(default(array[32, byte]))  # all-zero target
 
-    # Fake the background chain: put a block index entry at height 5 with
-    # the same blockhash so validateSnapshot thinks it has reached the target.
-    bgCs.bestHeight = 10  # background is "ahead" of the snapshot height
+    # The bg store's tip is the genesis sentinel, which does NOT equal the
+    # snapshot base blockhash, so validateSnapshot has NOT reached the base.
+    bgCs.bestHeight = 10  # height alone is not enough — tip-hash must match base
 
-    # validateSnapshot currently marks svrValid without verifying the UTXO hash.
-    # BUG: it should compute the background UTXO hash and compare to targetUtxoHash.
     let result = validateSnapshot(snapshotChain, bgCs)
-    # Because the db.getBlockIndex(fakeBlockhash) returns none, this returns
-    # svrNotReady. The REAL bug is that when getBlockIndex DOES return a match,
-    # the UTXO hash comparison is skipped. We document the stub architecture.
-    check result == svrNotReady  # stub returns NotReady (no real block index)
-    # A block-indexed background chain at the target height WOULD be accepted
-    # without UTXO hash verification:
-    check snapshotChain.assumeutxo == auUnvalidated  # unchanged = stub's limitation
+    # bgCs.bestBlockHash != snapshotChain.snapshotBlockhash → NotReady. The
+    # fixed validateSnapshot only recomputes/compares the hash once the bg
+    # store's tip IS the base — it never validates a bg store that has not
+    # actually reached the snapshot base.
+    check result == svrNotReady
+    check snapshotChain.assumeutxo == auUnvalidated  # never silently validated
 
   test "B7: activateSnapshot double-activation guard fires before file I/O":
     # Bitcoin Core validation.cpp:5600-5601 returns an error if a

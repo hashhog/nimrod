@@ -81,6 +81,18 @@ type
                                          ## holds txs whose parents we haven't seen yet.
                                          ## Wired by startNode; consumed by getorphantxs.
                                          ## nil on test rigs that don't exercise orphans.
+    assumeutxoExtra*: seq[AssumeutxoData] ## Runtime-registerable assumeUTXO whitelist
+                                          ## entries (mirrors Core chainparams.cpp
+                                          ## regtest m_assumeutxo_data). REGTEST ONLY —
+                                          ## `registerRegtestAssumeutxo` refuses other
+                                          ## networks so mainnet/testnet4 hardcoded
+                                          ## entries are never touched. loadtxoutset
+                                          ## checks params.assumeutxoData ++ this.
+    snapshotActivation*: SnapshotActivation ## Live snapshot/background dual-chainstate
+                                            ## once `loadtxoutset` has activated a
+                                            ## snapshot. nil = single normal chainstate.
+                                            ## Read by getchainstates (validated +
+                                            ## snapshot_blockhash).
 
   RpcRequest = object
     jsonrpc: string
@@ -155,6 +167,26 @@ proc isBlockSubmissionPaused*(rpc: RpcServer): bool =
   ## `dumptxoutset rollback`. Mirrors Bitcoin Core's NetworkDisable check
   ## in rpc/blockchain.cpp::dumptxoutset.
   rpc != nil and rpc.blockSubmissionPaused
+
+proc registerRegtestAssumeutxo*(rpc: RpcServer, data: AssumeutxoData) =
+  ## Register a runtime assumeUTXO whitelist entry. REGTEST ONLY — mirrors
+  ## Bitcoin Core's hardcoded `m_assumeutxo_data` for regtest
+  ## (kernel/chainparams.cpp), which Core ships empty so tests can supply their
+  ## own. Refuses any non-regtest network so the mainnet/testnet4 hardcoded
+  ## entries can never be altered at runtime.
+  if rpc.params.network != Regtest:
+    raise newRpcError(RpcMiscError,
+      "registerRegtestAssumeutxo: refusing to register a runtime assumeutxo " &
+      "entry on a non-regtest network (" & $rpc.params.network & ")")
+  rpc.assumeutxoExtra.add(data)
+
+proc effectiveAssumeutxoData*(rpc: RpcServer): seq[AssumeutxoData] =
+  ## The assumeUTXO whitelist the live loadtxoutset gate checks against:
+  ## the hardcoded per-network `params.assumeutxoData` plus any runtime
+  ## regtest entries registered via `registerRegtestAssumeutxo`.
+  result = rpc.params.assumeutxoData
+  for d in rpc.assumeutxoExtra:
+    result.add(d)
 
 proc toHex(data: openArray[byte]): string =
   result = ""
@@ -436,13 +468,15 @@ proc handleGetChainStates(rpc: RpcServer): JsonNode =
   ## Reference: Bitcoin Core rpc/blockchain.cpp getchainstates (line 3462) +
   ## RPCHelpForChainstate (3449-3460) / make_chain_data.
   ##
-  ## nimrod runs a single, fully-validated chainstate (no active background
-  ## snapshot chainstate): the snapshot-bootstrap path validates the UTXO set
-  ## against the assumeutxo table before promoting it and persists no
-  ## "from-snapshot"/background-validation marker, so the live node never holds
-  ## an unvalidated snapshot chainstate. Therefore `chainstates` is a 1-element
-  ## array with validated=true and snapshot_blockhash OMITTED, which is also
-  ## trivially "most-work (active) chainstate last".
+  ## nimrod runs a single fully-validated chainstate UNTIL `loadtxoutset`
+  ## activates a snapshot. Without a snapshot, `chainstates` is a 1-element
+  ## array with validated=true and snapshot_blockhash OMITTED. After
+  ## `loadtxoutset` (handleLoadTxOutSetImpl) spins up the real background
+  ## dual-chainstate, the element reports the live snapshot verdict:
+  ## validated reflects the snapshot chainstate's assumeutxo state (false while
+  ## the background re-validation runs / after a hash MISMATCH, true after a
+  ## MATCH) and snapshot_blockhash names the snapshot base. Either way the array
+  ## is trivially "most-work (active) chainstate last".
 
   # headers: number of headers seen so far (Core: chainman.m_best_header->nHeight,
   # or -1 if none). nimrod connects headers and blocks together — it does not keep
@@ -499,12 +533,25 @@ proc handleGetChainStates(rpc: RpcServer): JsonNode =
     # count (maxCacheSize, default 50000), not bytes, so this is the configured
     # dbcache split rather than a live byte meter — documented in notes.
     "coins_tip_cache_bytes": int64(CoinsTipCacheBytes),
-    # validated: Core's (m_assumeutxo == VALIDATED). nimrod's single chainstate is
-    # always fully validated (no live unvalidated snapshot chainstate).
+    # validated: Core's (m_assumeutxo == VALIDATED). Set below — true for the
+    # always-validated single chainstate, or the live snapshot verdict when a
+    # snapshot is active.
     "validated": true
   }
   # snapshot_blockhash is OPTIONAL — Core pushes it only for a from-snapshot
-  # chainstate. nimrod never holds one live, so it is correctly OMITTED.
+  # chainstate. When `loadtxoutset` has activated a snapshot, report the live
+  # dual-chainstate verdict: `validated` reflects the snapshot chainstate's
+  # assumeutxo state (false while the background re-validation runs OR after a
+  # hash MISMATCH, true after a MATCH), and snapshot_blockhash names the base.
+  # Mirrors Core's make_chain_data over the snapshot chainstate
+  # (rpc/blockchain.cpp::getchainstates).
+  if rpc.snapshotActivation != nil and
+     rpc.snapshotActivation.snapshot != nil:
+    let snap = rpc.snapshotActivation.snapshot
+    chainstate["validated"] = %(snap.assumeutxo == auValidated)
+    if snap.snapshotBlockhash.isSome:
+      chainstate["snapshot_blockhash"] = %reverseHex(toHex(
+        array[32, byte](snap.snapshotBlockhash.get())))
 
   %*{
     "headers": headers,
@@ -6811,55 +6858,114 @@ proc handleDumpTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
   if haveNChainTx:
     result["nchaintx"] = %nchaintx
 
-proc handleLoadTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
-  ## Refused with `RpcInternalError`. The handler used to call
-  ## `loadSnapshot(path, rpc.chainState, ...)` which DOES update the
-  ## persisted `targetCs.bestBlockHash` / `targetCs.bestHeight` and
-  ## writes via `cdb.updateBestBlock`. So persistence was correct.
-  ## What it did NOT do: refresh the running `state.syncManager`,
-  ## because `RpcServer` (`src/rpc/server.nim:27-51`) has no
-  ## reference to `syncManager`. After the RPC returned, syncManager
-  ## kept the cached `chainTip` / `chainTipHeight` it picked up at
-  ## startup (lines 1419-1420 in `src/nimrod.nim`) and continued
-  ## requesting blocks from the old tip indefinitely.
+proc handleLoadTxOutSetImpl*(rpc: RpcServer, path: string): JsonNode =
+  ## REAL loadtxoutset: after the load-time content-hash gate (which
+  ## authenticates the snapshot file), spin up the SECOND background
+  ## chainstate (own coins store), connect genesis->base, and compare the
+  ## independently-recomputed HASH_SERIALIZED to the assumeUTXO commitment.
   ##
-  ## Restart self-heals (the snapshot tip is on disk) but mid-run the
-  ## daemon stayed wedged with stale in-memory state. The CLI path
-  ## (`src/nimrod.nim:1362-1380`) calls `loadSnapshot(...)` BEFORE
-  ## `state.syncManager = newSyncManager(...)` is constructed, so
-  ## syncManager picks up the new tip naturally — that's the
-  ## structural reason the CLI works and the RPC doesn't.
-  ##
-  ## Wiring `state.syncManager` into `RpcServer` is more invasive
-  ## than the gate fix and out of scope here. Mirrors rustoshi
-  ## 1d0a325 / hotbuns e355cd7 / blockbrew + clearbit
-  ## (cross-impl wave 2026-05-05). Same JSON-RPC error code Bitcoin
-  ## Core uses in `bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset`
-  ## when `ActivateSnapshot` cannot proceed (`RPC_INTERNAL_ERROR` /
-  ## -32603).
-  ##
-  ## The gate fires before any file I/O so a refused call leaves the
-  ## datadir untouched.
-  ##
-  ## Cross-impl audit:
-  ## `CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md`.
+  ## Mirrors Bitcoin Core's `loadtxoutset` (rpc/blockchain.cpp) +
+  ## `ChainstateManager::ActivateSnapshot`/`AddChainstate`/`MaybeValidateSnapshot`
+  ## (validation.cpp:5588/6170/5967), and the camlcoin/blockbrew/hotbuns/lunarblock
+  ## pilots. A snapshot is loaded into an ISOLATED store (a sibling
+  ## `<chainstate>-snapshot` dir) so a refused/invalid load NEVER pollutes the
+  ## live chainstate. The verdict is surfaced via `getchainstates`
+  ## (validated=false while bg runs / after a mismatch, true after a match) —
+  ## Core's async `AbortNode` model means `loadtxoutset` itself returns Ok and
+  ## a mismatch is reported out-of-band rather than as an RPC error.
 
-  # Validate parameter shape only; never call loadSnapshot.
+  let assumeData = rpc.effectiveAssumeutxoData()
+
+  # Derive isolated store directories siblings to the active chainstate.
+  # `undoMgr.dataDir` is `<dbPath>/blocks`, so parentDir is the active store dir.
+  let activeDir = rpc.chainState.undoMgr.dataDir.parentDir
+  let snapDir = activeDir & "-snapshot"
+  let bgDir = activeDir & "-bgvalidate"
+  for d in [snapDir, bgDir]:
+    try:
+      if dirExists(d): removeDir(d)
+      createDir(d)
+    except OSError as e:
+      raise newRpcError(RpcInternalError, "failed to prepare snapshot dir: " & e.msg)
+
+  # 1) Load the snapshot into its OWN isolated ChainState (NOT rpc.chainState).
+  #    loadSnapshot runs the load-time HASH_SERIALIZED gate; a bad file is
+  #    refused here, before any background work, leaving the live state intact.
+  var snapCs = newChainState(snapDir, rpc.params)
+  let load = loadSnapshot(path, snapCs, rpc.params, assumeData)
+  if not load.success:
+    snapCs.close()
+    try: removeDir(snapDir) except OSError: discard
+    try: removeDir(bgDir) except OSError: discard
+    # Core returns RPC_INTERNAL_ERROR when ActivateSnapshot cannot proceed.
+    raise newRpcError(RpcInternalError, "Unable to load UTXO snapshot: " & load.error)
+
+  let snapshotCs = newSnapshotChainState(snapCs)
+  snapshotCs.assumeutxo = auUnvalidated
+  snapshotCs.role = csrSnapshot
+  snapshotCs.snapshotBlockhash = some(snapCs.bestBlockHash)
+  # Resolve the assumed hash + base height from the matched whitelist entry.
+  var assumedHash: array[32, byte]
+  var baseHeight: int32 = snapCs.bestHeight
+  for d in assumeData:
+    if d.blockhash == snapCs.bestBlockHash:
+      assumedHash = d.hashSerialized
+      baseHeight = d.height
+      break
+  snapshotCs.targetUtxoHash = some(assumedHash)
+
+  # 2) Build the SECOND background chainstate (own store) + drive genesis->base.
+  let activation = activateSnapshotWithBackground(
+    snapshotCs, bgDir, assumedHash, baseHeight)
+  rpc.snapshotActivation = activation
+
+  # Block source for the background re-connection: the active chainstate's
+  # persisted block bodies (genesis->base are already on disk from IBD).
+  let activeChain = rpc.chainState
+  proc getBlockByHeight(h: int32): Option[Block] {.gcsafe, raises: [].} =
+    {.gcsafe.}:
+      try:
+        let hashOpt = activeChain.db.getBlockHashByHeight(h)
+        if hashOpt.isNone:
+          return none(Block)
+        return activeChain.db.getBlock(hashOpt.get())
+      except CatchableError:
+        return none(Block)
+
+  # 3) Run the background validation synchronously (small regtest chains) and
+  #    record the verdict on snapshotCs.assumeutxo (read by getchainstates).
+  let verdict = runSnapshotValidation(activation, getBlockByHeight)
+
+  # Core async AbortNode model: loadtxoutset returns Ok regardless; a mismatch
+  # is surfaced through getchainstates validated=false. We log the verdict.
+  let baseHashHex = reverseHex(toHex(array[32, byte](snapCs.bestBlockHash)))
+  result = %*{
+    "coins_loaded": load.coinsLoaded,
+    "tip_hash": baseHashHex,
+    "base_height": baseHeight,
+    "path": path
+  }
+  if verdict.validated:
+    result["validated"] = %true
+  else:
+    result["validated"] = %false
+    result["validation_error"] = %verdict.error
+
+proc handleLoadTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## `loadtxoutset "path"` — load a Core-format UTXO snapshot and drive the
+  ## real background dual-chainstate validation (see `handleLoadTxOutSetImpl`).
+  ## Mirrors `bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset`. The load-time
+  ## content-hash gate authenticates the file; a second background chainstate
+  ## then re-connects genesis->base in its OWN coins store and recomputes the
+  ## HASH_SERIALIZED to trustlessly re-verify the snapshot. The verdict is
+  ## reported via `getchainstates` (validated). A snapshot whose base blockhash
+  ## is not in the assumeUTXO whitelist is refused with RPC_INTERNAL_ERROR.
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing path parameter")
   let path = params[0].getStr()
   if path == "":
     raise newRpcError(RpcInvalidParams, "path cannot be empty")
-
-  raise newRpcError(
-    RpcInternalError,
-    "loadtxoutset RPC is disabled in this build because the live daemon " &
-      "cannot atomically activate a UTXO snapshot once the header-sync " &
-      "and block-download components have started. Use the CLI flag " &
-      "--load-snapshot=<path> at startup instead — that path imports " &
-      "the snapshot, pins the chain tip, and writes the block index " &
-      "before any P2P/sync components are constructed."
-  )
+  rpc.handleLoadTxOutSetImpl(path)
 
 proc formatBtcAmount(satoshi: int64): string =
   ## Format a satoshi amount as Core's `ValueFromAmount` does:

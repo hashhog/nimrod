@@ -449,17 +449,22 @@ suite "W138 G23 — dual-chainstate manager (BUG-11)":
     check "snapshotBlockhash" in snapshotSrc
     check "targetUtxoHash" in snapshotSrc
 
-  test "G23 BUG-11: newSnapshotChainState has NO production call site":
-    ## Same shape as W136 RelayManager dead-module pattern.
+  test "G23 BUG-11 FIXED: newSnapshotChainState wired into the loadtxoutset RPC":
+    ## FIXED (AssumeUTXO dual-chainstate pilot): the snapshot-chainstate wrapper
+    ## is now instantiated in the live loadtxoutset handler to drive the real
+    ## background validation.
     check "newSnapshotChainState" in snapshotSrc  # definition
-    check "newSnapshotChainState" notin nimrodSrc
-    check "newSnapshotChainState" notin serverSrc
+    check "newSnapshotChainState" in serverSrc    # now a production call site
 
-  test "G23 BUG-11: runBackgroundValidation is dead code":
-    ## snapshot.nim:886-912 defines the async loop; no call site.
-    check "runBackgroundValidation" in snapshotSrc
-    check "runBackgroundValidation" notin nimrodSrc
-    check "runBackgroundValidation" notin serverSrc
+  test "G23 BUG-11 FIXED: background validation wired into loadtxoutset":
+    ## FIXED (AssumeUTXO dual-chainstate pilot): the background validation
+    ## machinery (`runSnapshotValidation` driving genesis->base re-connect over
+    ## a SEPARATE bg store) is now invoked from the live loadtxoutset RPC.
+    ## The async `runBackgroundValidation` loop is retained for the
+    ## interface but the synchronous `runSnapshotValidation` is the wired path.
+    check "runSnapshotValidation" in snapshotSrc
+    check "runSnapshotValidation" in serverSrc          # wired into the RPC
+    check "activateSnapshotWithBackground" in serverSrc # builds the 2nd store
 
 # ---------------------------------------------------------------------------
 # G24 — base_blockhash marker file (BUG-12, P1, MISSING)
@@ -499,16 +504,20 @@ suite "W138 G25 — chainstate_snapshot dir suffix (BUG-13)":
 # ---------------------------------------------------------------------------
 suite "W138 G26 — MaybeValidateSnapshot hash compare (BUG-14)":
 
-  test "G26 BUG-14: validateSnapshot is a stub — no UTXO hash compute":
-    ## snapshot.nim:856 — explicit confession comment:
-    ##   "intentionally does NOT compute a UTXO hash from `backgroundCs`
-    ##    since that requires a UTXO iterator we don't yet expose"
-    check "intentionally does NOT compute a UTXO hash" in snapshotSrc
-    check "Without a UTXO iterator we cannot byte-verify" in snapshotSrc
+  test "G26 BUG-14 FIXED: validateSnapshot recomputes the background UTXO hash":
+    ## FIXED: validateSnapshot now recomputes HASH_SERIALIZED over the
+    ## BACKGROUND store's own coins (`computeUtxoSetInfo(.., cshtHashSerialized)`)
+    ## and compares it to the assumeUTXO commitment (Core MaybeValidateSnapshot,
+    ## validation.cpp:5967). The old confession comments are gone.
+    check "intentionally does NOT compute a UTXO hash" notin snapshotSrc
+    check "Without a UTXO iterator we cannot byte-verify" notin snapshotSrc
+    check "computeUtxoSetInfo(backgroundCs, cshtHashSerialized)" in snapshotSrc
 
-  test "G26 BUG-14: validateSnapshot unconditionally flips auValidated":
-    check "snapshotCs.assumeutxo = auValidated" in snapshotSrc
-    check "return svrValid" in snapshotSrc
+  test "G26 BUG-14 FIXED: validateSnapshot flips auInvalid on hash MISMATCH":
+    ## A MISMATCH must NEVER silently validate — it marks the snapshot
+    ## auInvalid (Core handle_invalid_snapshot / AbortNode).
+    check "snapshotCs.assumeutxo = auInvalid" in snapshotSrc
+    check "return svrInvalid" in snapshotSrc
 
 # ---------------------------------------------------------------------------
 # G27 — _INVALID rename + fatalError (BUG-15, P1, MISSING)
@@ -574,9 +583,12 @@ suite "W138 G29 — dumptxoutset RPC parity (BUG-17)":
 # ---------------------------------------------------------------------------
 suite "W138 G30 — loadtxoutset / service flag / getchainstates (BUG-18)":
 
-  test "G30 BUG-18a: loadtxoutset RPC unconditionally refused":
-    ## server.nim:5080-5088 — RpcInternalError always thrown.
-    check "loadtxoutset RPC is disabled in this build" in serverSrc
+  test "G30 BUG-18a FIXED: loadtxoutset RPC drives real background validation":
+    ## FIXED: the old unconditional "loadtxoutset RPC is disabled in this build"
+    ## refusal is gone; the handler now loads the snapshot into an ISOLATED
+    ## store and drives the real dual-chainstate background validation.
+    check "loadtxoutset RPC is disabled in this build" notin serverSrc
+    check "handleLoadTxOutSetImpl" in serverSrc
 
   test "G30 BUG-18b: NODE_NETWORK -> NODE_NETWORK_LIMITED flip not wired to snapshot load":
     ## Core rpc/blockchain.cpp:3432-3435 RemoveLocalServices(NODE_NETWORK)
@@ -599,13 +611,13 @@ suite "W138 G30 — loadtxoutset / service flag / getchainstates (BUG-18)":
     let loadTxOutSection = serverSrc[loadTxOutStart ..< loadTxOutEnd]
     check "NODE_NETWORK_LIMITED" notin loadTxOutSection
 
-  test "G30 BUG-18c: getchainstates RPC missing from dispatch":
-    ## server.nim:8234-8275 — no `of "getchainstates":` arm.
-    check "of \"getchainstates\":" notin serverSrc
-    check "handleGetChainstates" notin serverSrc
+  test "G30 BUG-18c FIXED: getchainstates RPC wired into dispatch":
+    ## FIXED: a `getchainstates` dispatch arm + handler now exist.
+    check "of \"getchainstates\":" in serverSrc
+    check "handleGetChainStates" in serverSrc
 
-  test "G30 BUG-18c: getchainstates handler not defined":
-    check "proc handleGetChainstates" notin serverSrc
+  test "G30 BUG-18c FIXED: getchainstates handler defined":
+    check "proc handleGetChainStates" in serverSrc
 
 # ---------------------------------------------------------------------------
 # Cross-cutting: AssumeutxoData fields match Core
