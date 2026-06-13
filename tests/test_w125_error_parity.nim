@@ -175,14 +175,17 @@ suite "W125 Gate 8: -5 RPC_INVALID_ADDRESS_OR_KEY — PRESENT":
   test "PRESENT — RpcInvalidAddressOrKey constant is -5":
     check RpcInvalidAddressOrKey == -5
 
-  test "PRESENT — getrawtransaction with malformed txid raises -5":
-    ## See server.nim:2378.  Matches Core behavior for invalid txid hex.
+  test "FIXED — getrawtransaction with malformed txid raises -8 (was -5)":
+    ## Core ParseHashV (rpc/util.cpp:117) rejects a malformed txid at the
+    ## parse boundary with RPC_INVALID_PARAMETER (-8), BEFORE any lookup.
+    ## nimrod previously collapsed this to -5; the FIX wave wired
+    ## validateHashV so the malformed case now matches Core exactly.
+    ## (The well-formed-but-absent txid still returns -5 — see Gate 8b note.)
     let rpc = minimalRpcServer()
-    # txid hex must be 64 chars; "00" is too short and should fail
-    # validation.  Depending on which validation fires first we may
-    # get -5 directly or a CatchableError → -32603.
+    # "00" is too short → Core "txid must be of length 64 (not 2, for '00')".
     let r = rpc.rpcMethodErr("getrawtransaction", %*["00"])
-    check r.code in [-5, -32603]
+    check r.code == -8
+    check "must be of length 64" in r.msg
 
 # ===========================================================================
 # Gate 9 — RPC_OUT_OF_MEMORY (-7) MISSING (no analog)
