@@ -186,6 +186,20 @@ proc parseTxId(txidHex: string): TxId =
     hashBytes[i] = byte(parseHexInt(reversedHex[i*2 .. i*2 + 1]))
   TxId(hashBytes)
 
+proc validateHashV*(hashHex: string, name: string) =
+  ## Mirror of Bitcoin Core's ParseHashV (rpc/util.cpp:117). A txid/blockhash
+  ## arg that is NOT a valid 64-char hex uint256 is rejected at the parse
+  ## boundary with RPC_INVALID_PARAMETER (-8), BEFORE any lookup, using Core's
+  ## exact two messages (wrong length vs. non-hex). A well-formed-but-absent
+  ## 64-hex hash is the caller's concern and must keep its -5 / null behavior.
+  if hashHex.len != 64:
+    raise newRpcError(RpcInvalidParameter,
+      name & " must be of length 64 (not " & $hashHex.len & ", for '" & hashHex & "')")
+  for c in hashHex:
+    if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+      raise newRpcError(RpcInvalidParameter,
+        name & " must be hexadecimal string (not '" & hashHex & "')")
+
 # Forward declarations: the Core-exact difficulty helpers are defined further
 # down (alongside the chainwork formatter), but getblockchaininfo/getdifficulty
 # above them need the byte-identical-to-Core serializer too.
@@ -652,6 +666,10 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   let hashHex = params[0].getStr()
   let verbose = if params.len >= 2: params[1].getBool() else: true
 
+  # Core ParseHashV (blockchain.cpp:639, name "hash"): a malformed blockhash is
+  # RPC_INVALID_PARAMETER (-8) before any lookup. A well-formed-but-absent hash
+  # keeps the -5 "Block not found" below.
+  validateHashV(hashHex, "hash")
   let blockHash = parseBlockHash(hashHex)
   let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
   if idxOpt.isNone:
@@ -889,6 +907,10 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   let hashHex = params[0].getStr()
   let verbosity = if params.len >= 2: params[1].getInt() else: 1
 
+  # Core ParseHashV (blockchain.cpp:842, name "blockhash"): a malformed
+  # blockhash is RPC_INVALID_PARAMETER (-8) before any lookup. A well-formed-
+  # but-absent hash keeps the not-found behavior below.
+  validateHashV(hashHex, "blockhash")
   let blockHash = parseBlockHash(hashHex)
 
   # Check if block has been pruned
@@ -2302,6 +2324,10 @@ proc handleGetMempoolEntry(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing txid parameter")
 
+  # Core ParseHashV (mempool.cpp:844, name "txid"): a malformed txid is
+  # RPC_INVALID_PARAMETER (-8) at the parse boundary. A well-formed-but-absent
+  # txid still yields the -5 "Transaction not in mempool" below.
+  validateHashV(params[0].getStr(), "txid")
   let txid = parseTxidParam(params[0].getStr())
   let entryOpt = rpc.mempool.get(txid)
 
@@ -3694,8 +3720,9 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing txid parameter")
 
   let txidHex = params[0].getStr()
-  if txidHex.len != 64:
-    raise newRpcError(RpcInvalidAddressOrKey, "Invalid txid")
+  # Core ParseHashV: a malformed txid (wrong length or non-hex) is
+  # RPC_INVALID_PARAMETER (-8) at the parse boundary, before any lookup.
+  validateHashV(txidHex, "parameter 1")
 
   # Parse verbosity parameter (int or bool).
   #   false / 0  → raw hex
@@ -3726,8 +3753,9 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   var explicitBlockHash: Option[BlockHash] = none(BlockHash)
   if params.len >= 3 and params[2].kind == JString:
     let blockHashHex = params[2].getStr()
-    if blockHashHex.len != 64:
-      raise newRpcError(RpcInvalidAddressOrKey, "Invalid block hash")
+    # Core ParseHashV (rawtransaction.cpp:300, name "parameter 3"): malformed
+    # blockhash is RPC_INVALID_PARAMETER (-8) at the parse boundary.
+    validateHashV(blockHashHex, "parameter 3")
     explicitBlockHash = some(parseBlockHash(blockHashHex))
 
   let mainnet = rpc.params.network == Mainnet
@@ -6115,8 +6143,10 @@ proc handleGetTxOut(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "gettxout requires txid and vout parameters")
 
   let txidHex = params[0].getStr()
-  if txidHex.len != 64:
-    raise newRpcError(RpcInvalidAddressOrKey, "Invalid txid")
+  # Core ParseHashV (blockchain.cpp:1224, name "txid"): a malformed txid is
+  # RPC_INVALID_PARAMETER (-8) before any UTXO lookup. A well-formed-but-absent
+  # txid still returns JSON null below.
+  validateHashV(txidHex, "txid")
 
   let voutNum = params[1].getInt()
   let includeMempool = if params.len >= 3: params[2].getBool() else: true
