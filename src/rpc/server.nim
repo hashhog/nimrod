@@ -430,6 +430,88 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
 
   response
 
+proc handleGetChainStates(rpc: RpcServer): JsonNode =
+  ## Return information about chainstates.
+  ## Reference: Bitcoin Core rpc/blockchain.cpp getchainstates (line 3462) +
+  ## RPCHelpForChainstate (3449-3460) / make_chain_data.
+  ##
+  ## nimrod runs a single, fully-validated chainstate (no active background
+  ## snapshot chainstate): the snapshot-bootstrap path validates the UTXO set
+  ## against the assumeutxo table before promoting it and persists no
+  ## "from-snapshot"/background-validation marker, so the live node never holds
+  ## an unvalidated snapshot chainstate. Therefore `chainstates` is a 1-element
+  ## array with validated=true and snapshot_blockhash OMITTED, which is also
+  ## trivially "most-work (active) chainstate last".
+
+  # headers: number of headers seen so far (Core: chainman.m_best_header->nHeight,
+  # or -1 if none). nimrod connects headers and blocks together — it does not keep
+  # a header index that runs ahead of the connected tip — so the best-header height
+  # equals the active tip height. -1 only if there is genuinely no tip (no genesis).
+  let headers: int32 =
+    if rpc.chainState.bestHeight < 0: -1'i32
+    else: rpc.chainState.bestHeight
+
+  # Active chainstate tip → bits/difficulty/target. Mirror handleGetBlockchainInfo:
+  # read the tip block's nBits, falling back to the network genesis bits if the tip
+  # block body is not retrievable.
+  var bits = rpc.params.genesisBits
+  let tipOpt = rpc.chainState.db.getBlock(rpc.chainState.bestBlockHash)
+  if tipOpt.isSome:
+    bits = tipOpt.get().header.bits
+
+  let target = bitsToTarget(bits)
+
+  # verificationprogress: Core's GuessVerificationProgress(tip) → [0..1] progress
+  # towards the network tip. With headers == blocks (single connected chain, no
+  # header lead), this is 1.0 once past the early-blocks ramp, matching
+  # handleGetBlockchainInfo's progress.
+  let verificationProgress: float64 =
+    if headers <= 0: 0.0
+    elif rpc.chainState.bestHeight >= headers: 1.0
+    else: float64(rpc.chainState.bestHeight) / float64(headers)
+
+  var chainstate = %*{
+    "blocks": rpc.chainState.bestHeight,
+    "bestblockhash": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
+    # bits: big-endian %08x of the compact nBits field (Core strprintf("%08x")),
+    # matching handleGetBlockchainInfo / getblockheader.
+    "bits": toHex([
+      byte((bits shr 24) and 0xff),
+      byte((bits shr 16) and 0xff),
+      byte((bits shr 8) and 0xff),
+      byte(bits and 0xff)
+    ]),
+    # target: Core emits GetTarget(...).GetHex() — full 64-char big-endian uint256.
+    "target": reverseHex(toHex(target)),
+    # difficulty: Core-exact nBits->double path + difficultyJson serializer so the
+    # emitted number is byte-identical to Bitcoin Core (std::setprecision(16)).
+    "difficulty": difficultyJson(getDifficultyFromBits(bits)),
+    "verificationprogress": verificationProgress,
+    # coins_db_cache_bytes: Core's m_coinsdb_cache_size_bytes — the on-disk coins
+    # (UTXO) DB cache budget. nimrod serves coins from RocksDB with the shared
+    # block cache configured via defaultDbConfig().blockCacheSize == BlockCacheSize
+    # (src/storage/db.nim). Genuine configured value, not fabricated.
+    "coins_db_cache_bytes": int64(BlockCacheSize),
+    # coins_tip_cache_bytes: Core's m_coinstip_cache_size_bytes — the in-memory
+    # coins-tip cache budget. nimrod's configured coins-cache byte budget
+    # (CoinsTipCacheBytes = 450 MiB). NOTE the live ChainState flushes by entry
+    # count (maxCacheSize, default 50000), not bytes, so this is the configured
+    # dbcache split rather than a live byte meter — documented in notes.
+    "coins_tip_cache_bytes": int64(CoinsTipCacheBytes),
+    # validated: Core's (m_assumeutxo == VALIDATED). nimrod's single chainstate is
+    # always fully validated (no live unvalidated snapshot chainstate).
+    "validated": true
+  }
+  # snapshot_blockhash is OPTIONAL — Core pushes it only for a from-snapshot
+  # chainstate. nimrod never holds one live, so it is correctly OMITTED.
+
+  %*{
+    "headers": headers,
+    # Array ordered by work, most-work (active) chainstate LAST. With a single
+    # chainstate this is trivially correct.
+    "chainstates": [chainstate]
+  }
+
 proc handleGetBlockCount(rpc: RpcServer): JsonNode =
   %rpc.chainState.bestHeight
 
@@ -6207,6 +6289,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "getblockhash height",
     "getblockheader \"blockhash\" ( verbose )",
     "getblockstats hash_or_height ( stats )",
+    "getchainstates",
     "getchaintips",
     "getchaintxstats ( nblocks \"blockhash\" )",
     "getdeploymentinfo ( \"blockhash\" )",
@@ -11123,6 +11206,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetBlockCount()
   of "getbestblockhash":
     rpc.handleGetBestBlockHash()
+  of "getchainstates":
+    rpc.handleGetChainStates()
   of "getsyncstate":
     rpc.handleGetSyncState()
   of "getblockhash":
