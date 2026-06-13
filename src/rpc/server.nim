@@ -107,6 +107,7 @@ const
   RpcInvalidAddressOrKey* = -5     # Invalid address or key
   RpcTypeError* = -3               # Unexpected type was passed as parameter (Core RPC_TYPE_ERROR)
   RpcWalletError* = -4             # Generic wallet RPC error (Core RPC_WALLET_ERROR)
+  RpcDeserializationError* = -22   # Error parsing or validating structure (Core RPC_DESERIALIZATION_ERROR)
   RpcTransactionError* = -25       # Generic transaction error
   RpcTransactionRejected* = -26    # Transaction rejected by mempool
   RpcTransactionAlreadyInChain* = -27  # Transaction already confirmed
@@ -9852,6 +9853,256 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
   }
 
 # ============================================================================
+# walletprocesspsbt
+# ============================================================================
+#
+# Reference: bitcoin-core/src/wallet/rpc/spend.cpp::walletprocesspsbt (1569)
+#            → CWallet::FillPSBT → FinalizeAndExtractPSBT.
+#
+# Updater + Signer (+ Finalizer + Extractor) roles. Given a base64 PSBT, fill
+# in the UTXO data the wallet knows (witness_utxo / non_witness_utxo + scripts),
+# SIGN every input the wallet holds a key for, optionally finalize, and return
+# { psbt, complete (+ hex when complete) }.
+#
+# Signing strategy (⭐ REUSE — no fresh sighash/ECDSA):
+#   We do NOT reimplement BIP-143 / legacy sighashing. Instead we materialise
+#   the PSBT's unsigned tx into a mutable Transaction, drive the EXACT same
+#   signInputP2WPKH / signInputP2PKH / signInputP2SHP2WPKH engine that
+#   signrawtransactionwithwallet uses (computeSighashSegwitV0 /
+#   computeSighashLegacy + secp256k1.sign + DER), then lift the produced
+#   (pubkey -> DER-sig) pair back onto the PSBT input as a BIP-174 partial
+#   signature. The existing finalizePsbt() then assembles the final
+#   scriptSig / witness exactly as finalizepsbt does. This keeps a single
+#   signing code path across signrawtransactionwithwallet, walletcreatefundedpsbt
+#   (creator) and walletprocesspsbt (signer).
+proc parseWalletSighashType(s: string): uint32 =
+  ## Map a Core sighash string to the wire hashType byte. "DEFAULT" maps to
+  ## SIGHASH_ALL for the non-taproot scripts this wallet signs (Core treats
+  ## DEFAULT as ALL for ECDSA inputs). Raises RpcInvalidParams on a bad value.
+  ## Values are the canonical Bitcoin sighash flags (SIGHASH_ALL=0x01,
+  ## NONE=0x02, SINGLE=0x03, ANYONECANPAY=0x80) — kept as literals here to
+  ## avoid importing script/interpreter into the RPC module.
+  const
+    shAll = 0x01'u32
+    shNone = 0x02'u32
+    shSingle = 0x03'u32
+    shAcp = 0x80'u32
+  case s
+  of "", "DEFAULT", "ALL": shAll
+  of "NONE": shNone
+  of "SINGLE": shSingle
+  of "ALL|ANYONECANPAY": shAll or shAcp
+  of "NONE|ANYONECANPAY": shNone or shAcp
+  of "SINGLE|ANYONECANPAY": shSingle or shAcp
+  else:
+    raise newRpcError(RpcInvalidParams,
+      "'" & s & "' is not a valid sighash parameter.")
+
+proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## walletprocesspsbt "psbt" ( sign sighashtype bip32derivs finalize )
+  ##
+  ## Arguments:
+  ## 1. psbt        (string, required) — base64-encoded PSBT
+  ## 2. sign        (bool,   optional, default=true)
+  ## 3. sighashtype (string, optional, default "ALL")
+  ## 4. bip32derivs (bool,   optional, default=true) — best-effort
+  ## 5. finalize    (bool,   optional, default=true)
+  ##
+  ## Returns: { psbt: base64, complete: bool (, hex: str when complete) }
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing psbt parameter")
+
+  var w = rpc.getTargetWallet()
+
+  let sign = if params.len >= 2 and params[1].kind == JBool:
+               params[1].getBool() else: true
+  let sighashStr = if params.len >= 3 and params[2].kind == JString:
+                     params[2].getStr() else: "ALL"
+  let hashType = parseWalletSighashType(sighashStr)
+  let finalize = if params.len >= 5 and params[4].kind == JBool:
+                   params[4].getBool() else: true
+
+  if sign and w.isEncrypted and w.isLocked:
+    raise newRpcError(RpcMiscError,
+      "wallet is locked; use walletpassphrase to unlock")
+
+  # ---- Decode ----
+  var psbtObj: Psbt
+  try:
+    psbtObj = fromBase64(params[0].getStr())
+  except PsbtError as e:
+    raise newRpcError(RpcDeserializationError, "TX decode failed: " & e.msg)
+  except CatchableError as e:
+    raise newRpcError(RpcDeserializationError, "TX decode failed: " & e.msg)
+
+  if psbtObj.tx.isNone:
+    raise newRpcError(RpcDeserializationError,
+      "PSBT is missing its unsigned transaction")
+  let unsignedTx = psbtObj.tx.get()
+
+  # Helper: resolve a prevout TxOut for an input, preferring the PSBT's own
+  # witness_utxo / non_witness_utxo, then wallet UTXOs, then chainstate.
+  proc resolvePrevOut(idx: int): Option[TxOut] =
+    if psbtObj.inputs[idx].witnessUtxo.isSome:
+      return psbtObj.inputs[idx].witnessUtxo
+    if psbtObj.inputs[idx].nonWitnessUtxo.isSome:
+      let prevTx = psbtObj.inputs[idx].nonWitnessUtxo.get()
+      let vout = int(unsignedTx.inputs[idx].prevOut.vout)
+      if vout < prevTx.outputs.len:
+        return some(prevTx.outputs[vout])
+    let op = unsignedTx.inputs[idx].prevOut
+    if op in w.utxos:
+      return some(w.utxos[op].output)
+    if rpc.chainState != nil:
+      let u = rpc.chainState.getUtxo(op)
+      if u.isSome:
+        return some(u.get().output)
+    none(TxOut)
+
+  # ------------------------------------------------------------------
+  # Updater role: fill UTXO data for every input the wallet can resolve.
+  # witness_utxo for segwit (v0/v1) scripts, non_witness_utxo otherwise.
+  # ------------------------------------------------------------------
+  for i in 0 ..< psbtObj.inputs.len:
+    if psbtObj.inputs[i].witnessUtxo.isSome or
+       psbtObj.inputs[i].nonWitnessUtxo.isSome:
+      continue
+    let prevOpt = resolvePrevOut(i)
+    if prevOpt.isNone:
+      continue
+    let prev = prevOpt.get()
+    # We carry the resolved prevout as witness_utxo. For segwit inputs this is
+    # the canonical field; for legacy inputs the wallet UTXO store only holds
+    # the TxOut (not the full funding tx), so we stash the same TxOut here so
+    # the finalizer can recover the prevout scriptPubKey (finalizePsbtInput
+    # reads witnessUtxo.scriptPubKey for the legacy P2PKH branch too). A later
+    # Updater pass carrying the full funding tx may upgrade this to
+    # non_witness_utxo via updateInputWithTx.
+    psbtObj.inputs[i].witnessUtxo = some(prev)
+
+  # ------------------------------------------------------------------
+  # Signer role: materialise the unsigned tx, drive the shared signInput*
+  # engine, lift the produced (pubkey -> DER sig) back as a partial sig.
+  # ------------------------------------------------------------------
+  if sign:
+    for i in 0 ..< psbtObj.inputs.len:
+      # Skip inputs that are already finalized.
+      if psbtObj.inputs[i].isSigned():
+        continue
+
+      let prevOpt = resolvePrevOut(i)
+      if prevOpt.isNone:
+        continue
+      let prev = prevOpt.get()
+      let spk = prev.scriptPubKey
+
+      let keyOpt = w.findKeyForScript(spk)
+      if keyOpt.isNone:
+        continue  # not our key; leave for another signer (Core parity)
+      let dkey = keyOpt.get()
+
+      # Per-input sighash override: honour PSBT_IN_SIGHASH_TYPE when present,
+      # else the RPC-level sighashtype.
+      let inHashType =
+        if psbtObj.inputs[i].sighashType.isSome:
+          uint32(psbtObj.inputs[i].sighashType.get())
+        else:
+          hashType
+
+      # Build a single-input scratch tx around this input so the existing
+      # signers (which sign tx.inputs[idx] in place) operate on a faithful
+      # copy. We sign over the FULL unsigned tx (all inputs/outputs) so the
+      # BIP-143 / legacy sighash commits to the real transaction.
+      var scratch = unsignedTx
+      scratch.witnesses = newSeq[seq[seq[byte]]](scratch.inputs.len)
+      for k in 0 ..< scratch.witnesses.len:
+        scratch.witnesses[k] = @[]
+
+      var signedOk = false
+      var derSig: seq[byte]
+      var pub: seq[byte] = @(dkey.extKey.publicKey)
+      var redeemForPsbt: seq[byte] = @[]
+
+      try:
+        if spk.len == 22 and spk[0] == 0x00 and spk[1] == 0x14:
+          # P2WPKH
+          signInputP2WPKH(scratch, i, dkey.extKey.key, dkey.extKey.publicKey,
+                          prev.value, inHashType)
+          # witness = [derSig, pubkey]
+          if scratch.witnesses[i].len == 2:
+            derSig = scratch.witnesses[i][0]
+            signedOk = true
+        elif spk.len == 25 and spk[0] == 0x76 and spk[1] == 0xa9 and
+             spk[2] == 0x14 and spk[23] == 0x88 and spk[24] == 0xac:
+          # P2PKH (legacy)
+          signInputP2PKH(scratch, i, dkey.extKey.key, dkey.extKey.publicKey,
+                         inHashType)
+          # scriptSig = <len><derSig><len><pubkey>
+          let ss = scratch.inputs[i].scriptSig
+          if ss.len > 0:
+            let sigLen = int(ss[0])
+            if 1 + sigLen <= ss.len:
+              derSig = ss[1 .. sigLen]
+              signedOk = true
+        elif spk.len == 23 and spk[0] == 0xa9 and spk[1] == 0x14 and
+             spk[22] == 0x87:
+          # P2SH-P2WPKH (wrapped segwit). The wallet derives the redeemScript
+          # OP_0 <hash160(pubkey)> itself; verify it commits to the prevout.
+          let wpkh = hash160(dkey.extKey.publicKey)
+          var redeem = @[0x00'u8, 0x14]
+          redeem.add(@wpkh)
+          if verifyP2SHCommitment(redeem, spk):
+            signInputP2SHP2WPKH(scratch, i, dkey.extKey.key,
+                                dkey.extKey.publicKey, prev.value, inHashType)
+            if scratch.witnesses[i].len == 2:
+              derSig = scratch.witnesses[i][0]
+              redeemForPsbt = redeem
+              signedOk = true
+        else:
+          # P2WSH / P2SH-P2WSH / bare multisig / P2TR: requires
+          # witnessScript / taproot data not derivable from a single wallet
+          # key here. Leave unsigned (Core parity: non-fatal, partial result).
+          discard
+      except CatchableError:
+        signedOk = false
+
+      if signedOk and derSig.len > 0:
+        psbtObj.addPartialSig(i, pub, derSig)
+        if redeemForPsbt.len > 0 and psbtObj.inputs[i].redeemScript.len == 0:
+          psbtObj.inputs[i].redeemScript = redeemForPsbt
+        # Record the sighash type we signed with (BIP-174 PSBT_IN_SIGHASH_TYPE).
+        if psbtObj.inputs[i].sighashType.isNone:
+          psbtObj.inputs[i].sighashType = some(int32(inHashType))
+
+  # ------------------------------------------------------------------
+  # Finalizer role (optional): assemble final scriptSig / witness from the
+  # collected partial sigs via the shared finalizePsbt engine.
+  # ------------------------------------------------------------------
+  var complete = false
+  if finalize:
+    complete = finalizePsbt(psbtObj)
+  else:
+    # Without finalize, "complete" reflects whether every input is already
+    # ready to finalize (Core: FillPSBT reports complete iff all inputs are
+    # finalizable). Probe with the analyzer's readiness check.
+    complete = psbtObj.inputs.len > 0
+    for i in 0 ..< psbtObj.inputs.len:
+      if not (psbtObj.inputs[i].isSigned() or
+              isInputReadyToFinalize(psbtObj.inputs[i])):
+        complete = false
+        break
+
+  result = newJObject()
+  result["psbt"] = %psbtObj.toBase64()
+  result["complete"] = %complete
+
+  # Core emits the finalized network tx hex whenever complete is true.
+  if complete:
+    let txOpt = extractTransaction(psbtObj)
+    if txOpt.isSome:
+      result["hex"] = %toHex(serialize(txOpt.get(), includeWitness = true))
+
+# ============================================================================
 # fundrawtransaction
 # ============================================================================
 #
@@ -11730,6 +11981,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleAnalyzePsbt(params)
   of "walletcreatefundedpsbt":
     rpc.handleWalletCreateFundedPsbt(params)
+  of "walletprocesspsbt":
+    rpc.handleWalletProcessPsbt(params)
   of "fundrawtransaction":
     rpc.handleFundRawTransaction(params)
 
