@@ -6346,6 +6346,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "",
     "== Wallet ==",
     "createwallet \"wallet_name\"",
+    "fundrawtransaction \"hexstring\" ( options iswitness )",
     "getbalance",
     "getnewaddress",
     "getwalletinfo",
@@ -9850,6 +9851,288 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
     "changepos": changePos
   }
 
+# ============================================================================
+# fundrawtransaction
+# ============================================================================
+#
+# Reference: bitcoin-core/src/wallet/rpc/spend.cpp::fundrawtransaction (706)
+#            → FundTransaction (470).
+#
+# Raw-tx sibling of walletcreatefundedpsbt. Decode the hex raw tx, keep its
+# existing inputs/outputs, then run the SAME wallet funding/coin-selection
+# engine (wallet.createTransaction → coinselection.selectCoinsAdvanced /
+# selectCoinsSimple) to add inputs + one change output so the wallet funds
+# every output + the fee. Serialize the funded tx back to hex.
+#
+# Result shape EXACTLY matches Core (spend.cpp:831-834):
+#   { "hex": <funded raw tx hex>, "fee": <BTC>, "changepos": <int or -1> }
+#
+# We REUSE the funding core rather than reimplementing coin selection: the
+# auto-fund path calls Wallet.createTransaction (the same proc the auto-fund
+# branch of handleWalletCreateFundedPsbt above goes through). The only
+# difference is the serializer at the end: hex instead of PSBT.
+
+proc decodeRawTxLegacyForced(data: seq[byte]): Transaction =
+  ## Parse a raw tx WITHOUT the segwit-marker heuristic (Core's DecodeHexTx
+  ## try_witness=false path). Needed because an input tx produced by
+  ## createrawtransaction with an empty vin serializes as
+  ## `version | 0x00 (vin count) | vout… | locktime`, and the witness-aware
+  ## deserializeTransaction mis-reads that leading 0x00 as a segwit marker.
+  var r = BinaryReader(data: data, pos: 0)
+  result.version = r.readInt32LE()
+  let inputCount = r.readCompactSize()
+  for i in 0 ..< int(inputCount):
+    result.inputs.add(r.readTxIn())
+  let outputCount = r.readCompactSize()
+  for i in 0 ..< int(outputCount):
+    result.outputs.add(r.readTxOut())
+  result.lockTime = r.readUint32LE()
+  result.witnesses = newSeq[seq[seq[byte]]](result.inputs.len)
+
+proc handleFundRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## fundrawtransaction "hexstring" ( options iswitness )
+  ##
+  ## Arguments:
+  ## 1. hexstring (string, required) — raw tx hex to fund
+  ## 2. options   (object, optional) — {changeAddress, changePosition,
+  ##                                    feeRate (BTC/kvB), fee_rate (sat/vB),
+  ##                                    subtractFeeFromOutputs, lockUnspents,
+  ##                                    includeWatching, replaceable, ...}
+  ## 3. iswitness (bool, optional)   — accepted (decoder is witness-aware)
+  ##
+  ## Returns: { hex: <funded raw tx>, fee: BTC, changepos: int (-1 if none) }
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing required parameter: hexstring")
+
+  var w = rpc.getTargetWallet()
+
+  # ---- 1. Decode the raw tx (keeps existing inputs/outputs). ----
+  # Mirror Core's DecodeHexTx try_witness/try_no_witness heuristic
+  # (spend.cpp:806-810): iswitness present → force that mode; absent → try
+  # witness-aware first, then fall back to legacy (handles empty-vin tx hex
+  # built by createrawtransaction, whose leading 0x00 vin-count would be
+  # mis-read as a segwit marker by the witness-aware deserializer).
+  let txHex = params[0].getStr()
+  var tryWitness = true
+  var tryNoWitness = true
+  if params.len >= 3 and params[2].kind == JBool:
+    tryWitness = params[2].getBool()
+    tryNoWitness = not tryWitness
+  var rawTx: Transaction
+  var rawBytes: seq[byte]
+  try:
+    rawBytes = hexToBytes(txHex)
+  except CatchableError:
+    raise newRpcError(-22, "TX decode failed")
+  var decoded = false
+  if tryWitness:
+    try:
+      rawTx = deserializeTransaction(rawBytes)
+      decoded = true
+    except CatchableError:
+      decoded = false
+  if not decoded and tryNoWitness:
+    try:
+      rawTx = decodeRawTxLegacyForced(rawBytes)
+      decoded = true
+    except CatchableError:
+      decoded = false
+  if not decoded:
+    # Core: RPC_DESERIALIZATION_ERROR (-22) "TX decode failed".
+    raise newRpcError(-22, "TX decode failed")
+
+  let existingInputs = rawTx.inputs
+  let existingOutputs = rawTx.outputs
+
+  # ---- 2. Parse options. ----
+  var feeRate = 0.0           # sat/vB; 0 means "use estimator"
+  var changeAddrOverride = ""
+  var changePosOpt = -1       # requested change position; -1 = append at end
+  var changePosSpecified = false
+  var sffo: seq[int]          # subtractFeeFromOutputs indices
+  var replaceable = true      # Core DEFAULT_WALLET_RBF = true
+
+  if params.len >= 2 and params[1].kind == JObject:
+    let opts = params[1]
+    # fee_rate (sat/vB) takes precedence over feeRate (BTC/kvB), matching Core.
+    if opts.hasKey("fee_rate") and opts["fee_rate"].kind != JNull:
+      feeRate = opts["fee_rate"].getFloat()
+    elif opts.hasKey("feeRate") and opts["feeRate"].kind != JNull:
+      feeRate = opts["feeRate"].getFloat() * 100_000_000.0 / 1000.0
+    if opts.hasKey("changeAddress") and opts["changeAddress"].kind != JNull:
+      changeAddrOverride = opts["changeAddress"].getStr()
+    elif opts.hasKey("change_address") and opts["change_address"].kind != JNull:
+      changeAddrOverride = opts["change_address"].getStr()
+    if opts.hasKey("changePosition") and opts["changePosition"].kind != JNull:
+      changePosOpt = opts["changePosition"].getInt()
+      changePosSpecified = true
+    elif opts.hasKey("change_position") and opts["change_position"].kind != JNull:
+      changePosOpt = opts["change_position"].getInt()
+      changePosSpecified = true
+    if opts.hasKey("replaceable") and opts["replaceable"].kind == JBool:
+      replaceable = opts["replaceable"].getBool()
+    let sffoKey =
+      if opts.hasKey("subtractFeeFromOutputs"): "subtractFeeFromOutputs"
+      elif opts.hasKey("subtract_fee_from_outputs"): "subtract_fee_from_outputs"
+      else: ""
+    if sffoKey.len > 0 and opts[sffoKey].kind == JArray:
+      for idx in opts[sffoKey]:
+        sffo.add(idx.getInt())
+
+  # changePosition out-of-bounds guard (Core spend.cpp:534 — pos must be in
+  # [0, recipients.size()], where recipients = the existing outputs).
+  if changePosSpecified and
+     (changePosOpt < 0 or changePosOpt > existingOutputs.len):
+    raise newRpcError(RpcInvalidParameter, "changePosition out of bounds")
+
+  if feeRate <= 0.0:
+    if rpc.feeEstimator != nil:
+      feeRate = rpc.feeEstimator.estimateFee(6)
+    else:
+      feeRate = FallbackFeeRate
+
+  # ---- 3. Fund via the existing coin-selection engine. ----
+  # createTransaction takes the requested outputs, selects coins to cover
+  # outputs + fee, and appends a change output (when change > dust). This is
+  # the same path the auto-fund branch of walletcreatefundedpsbt uses.
+  var fundedTx: Transaction
+  var changePos = -1
+  let hadChangeAppendIdx = existingOutputs.len  # index change lands at, if any
+
+  if existingInputs.len == 0:
+    # No pre-selected inputs → pure auto-fund. Reuse createTransaction.
+    try:
+      fundedTx = w.createTransaction(existingOutputs, feeRate)
+    except WalletError as e:
+      raise newRpcError(RpcWalletError, e.msg)
+    except CoinSelectionError as e:
+      # Core surfaces insufficient-funds as RPC_WALLET_ERROR.
+      raise newRpcError(RpcWalletError, e.msg)
+    if fundedTx.outputs.len > existingOutputs.len:
+      changePos = hadChangeAppendIdx
+  else:
+    # Pre-existing inputs present. Fund the shortfall with createTransaction,
+    # then prepend the caller's existing inputs (Core keeps existing inputs and
+    # adds more via coin selection). createTransaction's selector covers the
+    # full output+fee amount; the caller's inputs add headroom. We union the
+    # input sets, de-duplicating, and recompute change from actual totalIn.
+    try:
+      fundedTx = w.createTransaction(existingOutputs, feeRate)
+    except WalletError as e:
+      raise newRpcError(RpcWalletError, e.msg)
+    except CoinSelectionError as e:
+      raise newRpcError(RpcWalletError, e.msg)
+    if fundedTx.outputs.len > existingOutputs.len:
+      changePos = hadChangeAppendIdx
+    # Splice caller's existing inputs in front, skipping any the selector
+    # already chose (avoid double-spend within the tx).
+    var seen: HashSet[OutPoint]
+    for inp in fundedTx.inputs:
+      seen.incl(inp.prevOut)
+    var mergedInputs: seq[TxIn]
+    for inp in existingInputs:
+      if inp.prevOut notin seen:
+        mergedInputs.add(inp)
+        seen.incl(inp.prevOut)
+    mergedInputs.add(fundedTx.inputs)
+    fundedTx.inputs = mergedInputs
+    fundedTx.witnesses = newSeq[seq[seq[byte]]](fundedTx.inputs.len)
+
+  # ---- 4. Preserve caller locktime/version; apply RBF semantics. ----
+  fundedTx.version = rawTx.version
+  fundedTx.lockTime = rawTx.lockTime
+  if not replaceable:
+    let nonRbfDefault: uint32 =
+      if rawTx.lockTime > 0: 0xfffffffe'u32 else: 0xffffffff'u32
+    for i in 0 ..< fundedTx.inputs.len:
+      if fundedTx.inputs[i].sequence == 0xfffffffd'u32:
+        fundedTx.inputs[i].sequence = nonRbfDefault
+
+  # ---- 5. Optional changeAddress override. ----
+  if changePos >= 0 and changeAddrOverride.len > 0:
+    try:
+      let parsed = decodeAddress(changeAddrOverride)
+      fundedTx.outputs[changePos].scriptPubKey = scriptPubKeyForAddress(parsed)
+    except AddressError as e:
+      raise newRpcError(RpcInvalidAddressOrKey,
+        "Change address must be a valid bitcoin address: " & e.msg)
+
+  # ---- 6. Optional changePosition relocation. ----
+  if changePos >= 0 and changePosSpecified and changePosOpt != changePos:
+    let changeOut = fundedTx.outputs[changePos]
+    fundedTx.outputs.delete(changePos)
+    fundedTx.outputs.insert(changeOut, changePosOpt)
+    changePos = changePosOpt
+
+  # ---- 7. Compute totalIn from the selected/known UTXOs, then fee. ----
+  var totalIn = Satoshi(0)
+  for inp in fundedTx.inputs:
+    if inp.prevOut in w.utxos:
+      totalIn = totalIn + w.utxos[inp.prevOut].output.value
+    elif rpc.chainState != nil:
+      let u = rpc.chainState.getUtxo(inp.prevOut)
+      if u.isSome:
+        totalIn = totalIn + u.get().output.value
+  var sumOuts = Satoshi(0)
+  for o in fundedTx.outputs:
+    sumOuts = sumOuts + o.value
+  let fee = int64(totalIn) - int64(sumOuts)
+
+  # ---- 7b. subtractFeeFromOutputs: shift the fee burden onto the named
+  # outputs (Core's InterpretSubtractFeeFromOutputInstructions semantics).
+  # The wallet selector funded the tx with the sender bearing the fee (it
+  # lives in the change output). To honour SFFO we move `fee` out of the
+  # named recipient outputs and into the change output, split evenly, so the
+  # recipients receive less and the sender's selected inputs are unchanged.
+  # Invariant sum(inputs) == sum(outputs) + fee and the `fee` value are both
+  # preserved (we only reshuffle value between outputs). ----
+  if sffo.len > 0 and fee > 0:
+    # Validate indices against the ORIGINAL recipient outputs (pre-change).
+    for idx in sffo:
+      if idx < 0 or idx >= existingOutputs.len:
+        raise newRpcError(RpcInvalidParameter,
+          "subtractFeeFromOutputs: vout index out of bounds")
+    # Map an original recipient index to its current position (change
+    # insertion/relocation may have shifted indices ≥ changePos).
+    proc currentIndex(origIdx: int): int =
+      result = origIdx
+      if changePos >= 0 and changePos <= origIdx:
+        inc result
+    let share = fee div int64(sffo.len)
+    var remainder = fee - share * int64(sffo.len)
+    var moved = Satoshi(0)
+    for idx in sffo:
+      let cur = currentIndex(idx)
+      var take = share
+      if remainder > 0:
+        take += 1
+        dec remainder
+      let cap = int64(fundedTx.outputs[cur].value)
+      if take > cap: take = cap          # never drive an output negative
+      fundedTx.outputs[cur].value = Satoshi(cap - take)
+      moved = moved + Satoshi(take)
+    # Credit the change output with what we pulled out of the recipients so the
+    # input/output balance (and therefore `fee`) stays exactly the same.
+    if changePos >= 0:
+      fundedTx.outputs[changePos].value =
+        fundedTx.outputs[changePos].value + moved
+
+  # ---- 8. Serialize the funded tx back to hex. ----
+  # Strip empty witnesses so the serialization is non-segwit unless the caller
+  # supplied witness data (the added inputs are unsigned).
+  var anyWitness = false
+  for wit in fundedTx.witnesses:
+    if wit.len > 0:
+      anyWitness = true
+      break
+  let hexOut = toHex(serialize(fundedTx, includeWitness = anyWitness))
+
+  %*{
+    "hex": hexOut,
+    "fee": float64(fee) / 100_000_000.0,
+    "changepos": changePos
+  }
+
 # ---------------------------------------------------------------------------
 # bumpfee / psbtbumpfee (BIP-125 fee bumping)
 # ---------------------------------------------------------------------------
@@ -11447,6 +11730,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleAnalyzePsbt(params)
   of "walletcreatefundedpsbt":
     rpc.handleWalletCreateFundedPsbt(params)
+  of "fundrawtransaction":
+    rpc.handleFundRawTransaction(params)
 
   # Fee bumping (BIP-125) — FIX-61 W118 G22 closure
   of "bumpfee":
