@@ -8831,6 +8831,129 @@ proc handleGetDescriptorInfo(rpc: RpcServer, params: JsonNode): JsonNode =
   except DescriptorError as e:
     raise newRpcError(RpcInvalidParams, "invalid descriptor: " & e.msg)
 
+proc handleListDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## listdescriptors ( private )
+  ##
+  ## List all descriptors present in the wallet, in Bitcoin Core's shape.
+  ## Reference: bitcoin-core/src/wallet/rpc/backup.cpp listdescriptors.
+  ##
+  ## Response (private=false default):
+  ##   { wallet_name, descriptors: [ { desc (WITH #checksum), timestamp,
+  ##     active, internal (active only), range + next/next_index
+  ##     (ranged active... emitted for ranged), ... } ] }
+  ##   sorted by descriptor string.
+  ##
+  ## nimrod's descriptor store is the set of watch-only descriptors registered
+  ## via importdescriptors (Wallet.watchedScripts, persisted in the
+  ## watched_descriptors sqlite table). Those imports are watch-only and are
+  ## NOT installed as active address-generating SPKMs, so `active` is false for
+  ## every one (matching Core's importdescriptors default `active=false`,
+  ## backup.cpp:172-192). `internal` is therefore omitted for all (Core emits
+  ## it only for active descriptors). For a ranged descriptor we report
+  ## `range = [range_start, range_end-1]` and `next`/`next_index = next_index`,
+  ## which for an imported ranged descriptor is range_start (0) by default
+  ## (backup.cpp:185 `next_index = range_start`). Our stored `rangeEnd` is the
+  ## INCLUSIVE last index (Core's range_end-1), so range = [0, rangeEnd].
+  ##
+  ## Exported (`*`) so unit tests can call it directly.
+
+  let priv = params.len >= 1 and params[0].kind == JBool and params[0].getBool()
+
+  let w = rpc.getTargetWallet()
+
+  # private descriptors are unsupported for watch-only wallets in Core
+  # (backup.cpp:500-502). nimrod's importdescriptors store is watch-only.
+  if priv and w.privateKeysDisabled:
+    raise newRpcError(RpcWalletError,
+      "Can't get private descriptor string for watch-only wallets")
+
+  # Resolve the wallet name for the wallet_name field, same lookup chain as
+  # getwalletinfo.
+  var walletName = "default"
+  if rpc.walletManager != nil and rpc.currentWalletName != "":
+    walletName = rpc.currentWalletName
+  elif rpc.walletManager != nil:
+    let lwOpt = rpc.walletManager.getDefaultWallet()
+    if lwOpt.isSome:
+      walletName = lwOpt.get().name
+
+  # One emitted entry per UNIQUE descriptor string. Prefer the persisted
+  # watched_descriptors rows when a sqlite handle is available — they carry the
+  # authoritative `rangeEnd`, which the per-script in-memory table does not
+  # retain. Fall back to the in-memory watchedScripts table (re-deriving
+  # isRange by parsing; range/next default to 0) when there is no DB.
+  type DescEntry = object
+    descriptor: string
+    timestamp: int64
+    rangeEnd: int
+    isRange: bool
+  var entries = initOrderedTable[string, DescEntry]()
+
+  let lw = rpc.getTargetLoadedWallet()
+  var usedDb = false
+  if lw != nil and lw.db != nil and lw.db.isOpen:
+    try:
+      for row in lw.db.getWatchedDescriptors():
+        usedDb = true
+        var ranged = false
+        try:
+          let payload = splitDescriptorChecksum(row.descriptor, requireChecksum = false)
+          ranged = parseDescriptor(payload).node.isRange()
+        except CatchableError:
+          ranged = row.rangeEnd > 0
+        entries[row.descriptor] = DescEntry(
+          descriptor: row.descriptor,
+          timestamp: row.timestamp,
+          rangeEnd: row.rangeEnd,
+          isRange: ranged)
+    except CatchableError:
+      usedDb = false
+
+  if not usedDb:
+    for _, ws in w.watchedScripts:
+      if entries.hasKey(ws.descriptor):
+        continue
+      var ranged = false
+      try:
+        let payload = splitDescriptorChecksum(ws.descriptor, requireChecksum = false)
+        ranged = parseDescriptor(payload).node.isRange()
+      except CatchableError:
+        ranged = false
+      entries[ws.descriptor] = DescEntry(
+        descriptor: ws.descriptor,
+        timestamp: ws.timestamp,
+        rangeEnd: 0,
+        isRange: ranged)
+
+  # Sort by descriptor string (Core sorts the result array, backup.cpp:541-543).
+  var keys = newSeq[string]()
+  for k in entries.keys:
+    keys.add(k)
+  keys.sort()
+
+  var descriptors = newJArray()
+  for k in keys:
+    let e = entries[k]
+    var obj = newJObject()
+    obj["desc"] = %e.descriptor   # already carries the trailing #checksum
+    obj["timestamp"] = %e.timestamp
+    obj["active"] = %false        # watch-only imports are never active here
+    # `internal` is emitted only for active descriptors -> omitted.
+    if e.isRange:
+      # next_index defaults to range_start (0) for imported descriptors.
+      let nextIndex = 0
+      var rng = newJArray()
+      rng.add(%0)
+      rng.add(%e.rangeEnd)        # inclusive end (Core's range_end-1)
+      obj["range"] = rng
+      obj["next"] = %nextIndex
+      obj["next_index"] = %nextIndex
+    descriptors.add(obj)
+
+  result = newJObject()
+  result["wallet_name"] = %walletName
+  result["descriptors"] = descriptors
+
 proc handleDeriveAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Derive addresses from a descriptor
   ## Reference: Bitcoin Core rpc/output_script.cpp deriveaddresses
@@ -12073,6 +12196,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleDeriveAddresses(params)
   of "importdescriptors":
     rpc.handleImportDescriptors(params)
+  of "listdescriptors":
+    rpc.handleListDescriptors(params)
 
   # PSBT
   of "createpsbt":
@@ -12147,6 +12272,7 @@ proc namedArgPositions(methodName: string): seq[string] =
   of "loadwallet": @["filename", "load_on_startup"]
   of "unloadwallet": @["wallet_name", "load_on_startup"]
   of "importdescriptors": @["requests"]
+  of "listdescriptors": @["private"]
   of "getaddressinfo": @["address"]
   of "getwalletinfo", "listwallets", "listwalletdir": @[]
   of "getnewaddress": @["label", "address_type"]
