@@ -16,6 +16,23 @@ import chronicles
 export db.ColumnFamily
 export undo.BlockUndo, undo.TxUndo, undo.SpentOutput, undo.FlatFilePos
 
+# Re-export the RocksDB shared block-cache budget so RPC callers (getchainstates'
+# coins_db_cache_bytes) can report the genuine on-disk coins-DB cache size without
+# importing storage/db directly. openChainDb -> openDatabase uses defaultDbConfig,
+# whose blockCacheSize IS this constant (src/storage/db.nim:18,229), so this is the
+# real cache budget the chainstate's coins data is served from.
+export db.BlockCacheSize
+
+const
+  CoinsTipCacheBytes* = 450 * 1024 * 1024
+    ## Configured in-memory coins (UTXO) cache byte budget — the documented
+    ## dbcache split for the coins-tip cache (mirrors src/storage/utxo_cache.nim
+    ## DefaultDbCacheSize = 450 MiB). NOTE: the live `ChainState` coins cache
+    ## actually flushes by ENTRY COUNT (`maxCacheSize`, default
+    ## DefaultMaxCacheSize=50000), not bytes, so no byte budget is tracked on the
+    ## hot path. This constant is the genuine configured byte budget reported as
+    ## Core's m_coinstip_cache_size_bytes (getchainstates' coins_tip_cache_bytes).
+
 type
   ChainStateError* = object of CatchableError
 
