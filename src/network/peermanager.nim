@@ -53,6 +53,11 @@ const
   #    (Core MAX_ADDR_PROCESSING_TOKEN_BUCKET = MAX_ADDR_TO_SEND).
   MaxAddrRatePerSecond* = 0.1
   MaxAddrProcessingTokenBucket* = 1000.0
+  # 3F FIX: relay gate — Core net_processing.cpp:5688 only relays addr/addrv2
+  # when the incoming message has <= 10 entries (large responses are getaddr
+  # replies and must NOT be forwarded).
+  # Reference: bitcoin-core/src/net_processing.cpp:5688.
+  AddrRelayMaxEntries* = 10
   DefaultMaxOutboundFullRelay* = 8
   DefaultMaxOutboundBlockRelay* = 2
   DefaultMaxInbound* = 117
@@ -1678,7 +1683,17 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
       # so getnodeaddresses emits a real `time`. The legacy addr message ships a
       # per-entry uint32 timestamp (TimestampedAddr.timestamp); without this the
       # NetAddress lost it and `time` would be 0/fabricated.
-      na.lastSeen = msg.addresses[i].timestamp
+      # 3G FIX: clamp received timestamp before storing.
+      # Core net_processing.cpp:5678-5680: if nTime <= 100000000 (pre-2001)
+      # or nTime > now + 10 minutes, replace with now - 5 days.
+      # Reference: bitcoin-core/src/net_processing.cpp:5678-5680.
+      let addrWireTs = msg.addresses[i].timestamp
+      let addrNowSec = uint32(getTime().toUnix())
+      na.lastSeen =
+        if addrWireTs <= 100_000_000'u32 or addrWireTs > addrNowSec + 600'u32:
+          addrNowSec - 5'u32 * 24'u32 * 3600'u32
+        else:
+          addrWireTs
       var found = false
       for ka in pm.knownAddresses:
         if ka.ip == na.ip and ka.port == na.port:
@@ -1686,8 +1701,11 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
           break
       if not found:
         pm.knownAddresses.add(na)
-    # Relay to up to 2 random peers (not back to source)
-    if msg.addresses.len <= 1000 and msg.addresses.len > 0:
+    # Relay to up to 2 random peers (not back to source).
+    # 3F FIX: Core net_processing.cpp:5688 only relays when vAddr.size() <= 10.
+    # A large addr message is a getaddr response — those are not relayed.
+    # Reference: bitcoin-core/src/net_processing.cpp:5688.
+    if msg.addresses.len <= AddrRelayMaxEntries and msg.addresses.len > 0:
       pm.relayAddresses(peer)
   of mkAddrV2:
     # BUG-4 FIX (W117): store all valid addrv2 addresses.  IPv4/IPv6 go into
@@ -1731,7 +1749,15 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
         var la = legacy.get()
         # DATA-GAP FIX (2026-06): carry the addrv2 wire timestamp onto the
         # stored NetAddress so getnodeaddresses emits a real `time`.
-        la.address.lastSeen = la.timestamp
+        # 3G FIX: clamp received timestamp before storing.
+        # Core net_processing.cpp:5678-5680: same clamp applies to addrv2.
+        # Reference: bitcoin-core/src/net_processing.cpp:5678-5680.
+        let v2NowSec = uint32(getTime().toUnix())
+        la.address.lastSeen =
+          if la.timestamp <= 100_000_000'u32 or la.timestamp > v2NowSec + 600'u32:
+            v2NowSec - 5'u32 * 24'u32 * 3600'u32
+          else:
+            la.timestamp
         if isRoutable(la.address.ip):
           var found = false
           for ka in pm.knownAddresses:
@@ -1759,8 +1785,18 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
                 found = true; break
             else: discard
         if not found:
-          pm.knownAddressesV2.add(ta)
-    if msg.addressesV2.len <= 1000 and msg.addressesV2.len > 0:
+          # 3G FIX: clamp the wire timestamp before storing (Tor/I2P/CJDNS path).
+          # Core net_processing.cpp:5678-5680: same clamp applies to addrv2.
+          var taStored = ta
+          let torNowSec = uint32(getTime().toUnix())
+          if taStored.timestamp <= 100_000_000'u32 or
+              taStored.timestamp > torNowSec + 600'u32:
+            taStored.timestamp = torNowSec - 5'u32 * 24'u32 * 3600'u32
+          pm.knownAddressesV2.add(taStored)
+    # 3F FIX: Core net_processing.cpp:5688 only relays when vAddr.size() <= 10.
+    # A large addrv2 message is a getaddr response — those are not relayed.
+    # Reference: bitcoin-core/src/net_processing.cpp:5688.
+    if msg.addressesV2.len <= AddrRelayMaxEntries and msg.addressesV2.len > 0:
       pm.relayAddresses(peer)
   of mkGetAddr:
     let addrs = pm.buildGetAddrResponse(peer)
