@@ -931,7 +931,15 @@ proc deserialize*(data: openArray[byte]): Psbt =
     of PSBT_GLOBAL_UNSIGNED_TX:
       if key.len != 1:
         raise newException(PsbtError, "unsigned tx key must be 1 byte")
-      let tx = deserializeTransaction(value)
+      # The PSBT global unsigned tx is serialized TX_NO_WITNESS / legacy
+      # (Core psbt.h:1272, UnserializeFromVector(... tx) with no witness tag),
+      # so it MUST be decoded legacy/full-consumption — NOT witness-first.
+      # An empty-vin unsigned tx (e.g. one OP_RETURN output, 0 inputs) starts
+      # `version | 0x00 (vin count) | …`; the witness-aware deserializeTransaction
+      # mis-reads the leading 0x00 as a segwit marker and silently DROPS the
+      # outputs, so round-tripping such a PSBT loses them. The legacy-forced
+      # decoder consumes the bytes correctly.
+      let tx = deserializeTransactionLegacyForced(value)
       # Verify scriptSigs and witnesses are empty
       for txin in tx.inputs:
         if txin.scriptSig.len > 0:
