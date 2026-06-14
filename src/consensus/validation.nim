@@ -579,6 +579,15 @@ type
     minHeight*: int32    ## Minimum block height for inclusion (-1 = no height constraint)
     minTime*: int64      ## Minimum MTP for inclusion (-1 = no time constraint)
 
+proc bip68VersionActive*(version: int32): bool =
+  ## BIP-68 applies only when version >= 2. Core stores version as uint32_t and
+  ## compares it UNSIGNED (fEnforceBIP68 = tx.version >= 2, tx_verify.cpp:51), so a
+  ## high-bit version (e.g. 0x80000002) STILL enforces BIP-68. nimrod stores version
+  ## as int32; a signed `>= 2` would treat 0x80000002 as negative and SKIP
+  ## enforcement, false-accepting a tx whose relative timelock is unmet (a chain
+  ## split). Compare unsigned -- same as OP_CSV (interpreter.nim:2176).
+  cast[uint32](version) >= 2'u32
+
 proc calculateSequenceLocks*(
   tx: Transaction,
   prevHeights: var seq[int32],
@@ -603,8 +612,8 @@ proc calculateSequenceLocks*(
   result.minHeight = -1
   result.minTime = -1
 
-  # BIP68 only applies to transactions with version >= 2
-  if tx.version < 2:
+  # BIP68 only applies to transactions with version >= 2 (compared unsigned).
+  if not bip68VersionActive(tx.version):
     return result
 
   # BIP68 must be enforced (caller should check height >= csvHeight)
@@ -688,8 +697,8 @@ proc checkSequenceLocksForTx*(
   ##
   ## Returns error if sequence locks are not satisfied
 
-  # BIP68 only applies if tx version >= 2
-  if tx.version < 2:
+  # BIP68 only applies if tx version >= 2 (compared unsigned).
+  if not bip68VersionActive(tx.version):
     return ok()
 
   # Coinbase transactions don't have sequence locks
@@ -1655,7 +1664,7 @@ proc validateBlock*(
       # Note: If sigop counting fails (missing UTXO), validation would have already failed above
 
       # BIP68 sequence lock check (only if CSV is active and tx version >= 2)
-      if bip68Active and tx.version >= 2:
+      if bip68Active and bip68VersionActive(tx.version):
         let seqLockResult = checkSequenceLocksForTx(
           tx, lookupUtxo, height, prevBlockMtp, getMtpAtHeight, params, intraBlockUtxos
         )
