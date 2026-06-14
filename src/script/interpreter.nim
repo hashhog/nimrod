@@ -76,6 +76,13 @@ type
     # set, OP_CODESEPARATOR in pre-segwit (BASE) script is rejected even in an
     # unexecuted branch (it would make the scriptCode non-constant).
     seOpCodeSeparator = "using OP_CODESEPARATOR in non-witness script (CONST_SCRIPTCODE)"
+    # BIP141 / Core interpreter.cpp:2082-2086: for a P2SH-wrapped witness
+    # program, scriptSig MUST be byte-for-byte equal to the minimal canonical
+    # single push of the redeemScript.  A non-minimal push (e.g. OP_PUSHDATA1
+    # for a ≤75-byte redeemScript) is push-only and evaluates identically on
+    # the stack, but differs as bytes — Core hard-rejects it to prevent
+    # scriptSig malleability re-introduction under witness.
+    seWitnessMalleatedP2SH = "witness malleated P2SH: scriptSig is not an exact single push of the redeemScript"
 
   ScriptFlags* = enum
     sfNone             # No special rules
@@ -2439,6 +2446,15 @@ proc verifyScript*(
     let (isP2shWitness, p2shVersion, p2shProgram) = isWitnessProgram(serializedScript)
 
     if sfWitness in flags and isP2shWitness:
+      # Core interpreter.cpp:2082-2086: scriptSig must be BYTE-FOR-BYTE equal
+      # to the minimal canonical single push of the redeemScript.  A push-only
+      # scriptSig that uses a non-minimal encoding (e.g. OP_PUSHDATA1 for a
+      # ≤75-byte redeemScript) evaluates identically on the stack but differs
+      # as bytes, and Core hard-rejects it as WITNESS_MALLEATED_P2SH.
+      # MINIMALDATA is a policy flag and is NOT set under ConnectBlock, so this
+      # byte-exact comparison is the ONLY guard against scriptSig malleability.
+      if scriptSig != encodePush(serializedScript):
+        return false  # seWitnessMalleatedP2SH
       return verifyWitnessProgram(
         witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags,
         ctxAmounts, ctxScriptPubKeys
@@ -2572,6 +2588,15 @@ proc verifyScriptWithError*(
     let (isP2shWitness, p2shVersion, p2shProgram) = isWitnessProgram(serializedScript)
 
     if sfWitness in flags and isP2shWitness:
+      # Core interpreter.cpp:2082-2086: scriptSig must be BYTE-FOR-BYTE equal
+      # to the minimal canonical single push of the redeemScript.  A push-only
+      # scriptSig that uses a non-minimal encoding (e.g. OP_PUSHDATA1 for a
+      # ≤75-byte redeemScript) evaluates identically on the stack but differs
+      # as bytes, and Core hard-rejects it as WITNESS_MALLEATED_P2SH.
+      # MINIMALDATA is a policy flag and is NOT set under ConnectBlock, so this
+      # byte-exact comparison is the ONLY guard against scriptSig malleability.
+      if scriptSig != encodePush(serializedScript):
+        return seWitnessMalleatedP2SH
       return verifyWitnessProgramWithError(
         witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags,
         ctxAmounts, ctxScriptPubKeys
