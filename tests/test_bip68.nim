@@ -113,3 +113,18 @@ suite "BIP68 nLockTime semantics":
 
     check checkSequenceLocks(lock, 100, 1000) == false  # MTP 1000 is invalid
     check checkSequenceLocks(lock, 100, 1001) == true   # MTP 1001 is valid
+
+suite "BIP68 version gate compares unsigned (Core uint32_t)":
+  # Core stores tx.version as uint32_t and computes fEnforceBIP68 = version >= 2
+  # UNSIGNED (tx_verify.cpp:51), so a high-bit version (0x80000002) STILL enforces
+  # BIP-68. nimrod stores version as int32; a signed >= 2 would treat it as negative
+  # and SKIP enforcement, false-accepting a tx with an unmet relative timelock (a
+  # chain split). bip68VersionActive compares unsigned; this asserts that.
+  test "high-bit version 0x80000002 enables BIP-68":
+    # int32 -2147483646 has the bit pattern 0x80000002.
+    check bip68VersionActive(cast[int32](0x80000002'u32))
+    check bip68VersionActive(cast[int32](0xFFFFFFFF'u32))
+    check bip68VersionActive(2'i32)
+    check bip68VersionActive(3'i32)
+    check not bip68VersionActive(1'i32)
+    check not bip68VersionActive(0'i32)
