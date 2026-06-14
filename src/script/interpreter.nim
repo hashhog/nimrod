@@ -2212,7 +2212,7 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
         return seInvalidStack
 
       let pubkey = interp.pop()
-      let (n, ok) = toScriptNum(interp.pop(), true)
+      let (n, ok) = toScriptNum(interp.pop(), sfMinimalData in interp.flags)
       let sig = interp.pop()
 
       if not ok:
