@@ -374,6 +374,24 @@ proc deserializeTransaction*(data: seq[byte]): Transaction =
   var r = BinaryReader(data: data, pos: 0)
   r.readTransaction()
 
+proc deserializeTransactionLegacyForced*(data: seq[byte]): Transaction =
+  ## Parse a raw tx WITHOUT the segwit-marker heuristic (Core's DecodeHexTx
+  ## try_witness=false / TX_NO_WITNESS path). Needed because a tx with an empty
+  ## vin serializes as `version | 0x00 (vin count) | vout… | locktime`, and the
+  ## witness-aware readTransaction mis-reads that leading 0x00 as a segwit
+  ## marker (dropping the real outputs). The PSBT global unsigned tx is likewise
+  ## always TX_NO_WITNESS (Core psbt.h), so it must be decoded with this proc.
+  var r = BinaryReader(data: data, pos: 0)
+  result.version = r.readInt32LE()
+  let inputCount = r.readCompactSize()
+  for i in 0 ..< int(inputCount):
+    result.inputs.add(r.readTxIn())
+  let outputCount = r.readCompactSize()
+  for i in 0 ..< int(outputCount):
+    result.outputs.add(r.readTxOut())
+  result.lockTime = r.readUint32LE()
+  result.witnesses = newSeq[seq[seq[byte]]](result.inputs.len)
+
 proc deserializeBlockHeader*(data: seq[byte]): BlockHeader =
   var r = BinaryReader(data: data, pos: 0)
   r.readBlockHeader()

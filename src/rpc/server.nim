@@ -10358,16 +10358,9 @@ proc decodeRawTxLegacyForced(data: seq[byte]): Transaction =
   ## createrawtransaction with an empty vin serializes as
   ## `version | 0x00 (vin count) | vout… | locktime`, and the witness-aware
   ## deserializeTransaction mis-reads that leading 0x00 as a segwit marker.
-  var r = BinaryReader(data: data, pos: 0)
-  result.version = r.readInt32LE()
-  let inputCount = r.readCompactSize()
-  for i in 0 ..< int(inputCount):
-    result.inputs.add(r.readTxIn())
-  let outputCount = r.readCompactSize()
-  for i in 0 ..< int(outputCount):
-    result.outputs.add(r.readTxOut())
-  result.lockTime = r.readUint32LE()
-  result.witnesses = newSeq[seq[seq[byte]]](result.inputs.len)
+  ## Thin wrapper over the shared serialize.nim decoder so the legacy-forced
+  ## path is identical everywhere it is used.
+  deserializeTransactionLegacyForced(data)
 
 proc handleFundRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   ## fundrawtransaction "hexstring" ( options iswitness )
@@ -10408,7 +10401,18 @@ proc handleFundRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   if tryWitness:
     try:
       rawTx = deserializeTransaction(rawBytes)
-      decoded = true
+      # Core's DecodeTx (core_io.cpp) only accepts a witness-aware decode when
+      # the stream is FULLY consumed (`ssData.empty()`). deserializeTransaction
+      # does not report consumed length, so use the robust proxy: re-serialize
+      # the parsed tx witness-aware and require it to reproduce rawBytes exactly.
+      # fundrawtransaction's PRIMARY input is an empty-vin tx (outputs, 0 inputs)
+      # whose leading 0x00 is mis-read here as a segwit marker, leaving the real
+      # output bytes UNCONSUMED. Without this check `decoded` would be true and
+      # the legacy fallback would never fire, silently DROPPING the outputs.
+      if serialize(rawTx, includeWitness = true) == rawBytes:
+        decoded = true
+      else:
+        decoded = false
     except CatchableError:
       decoded = false
   if not decoded and tryNoWitness:
