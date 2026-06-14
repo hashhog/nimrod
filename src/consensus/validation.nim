@@ -454,37 +454,40 @@ proc checkWitnessMalleation*(blk: Block, segwitActive: bool): ValidationResult[v
   ##       is illegal. → "unexpected-witness"
   ##   G12 Block has at least 1 tx (coinbase) — asserted before this call.
   let commitmentOpt = findWitnessCommitment(blk.txs[0])
-  if segwitActive:
-    if commitmentOpt.isSome:
-      # G5+G6: coinbase witness[input 0] must be a stack of exactly 1 item of 32 bytes.
-      # Core validation.cpp:3878-3885.
-      let witnessStack =
-        if blk.txs[0].witnesses.len > 0: blk.txs[0].witnesses[0]
-        else: newSeq[seq[byte]]()
-      if witnessStack.len != 1 or witnessStack[0].len != 32:
-        return voidErr(veWitnessNonceSize)
+  if segwitActive and commitmentOpt.isSome:
+    # G5+G6: coinbase witness[input 0] must be a stack of exactly 1 item of 32 bytes.
+    # Core validation.cpp:3878-3885.
+    let witnessStack =
+      if blk.txs[0].witnesses.len > 0: blk.txs[0].witnesses[0]
+      else: newSeq[seq[byte]]()
+    if witnessStack.len != 1 or witnessStack[0].len != 32:
+      return voidErr(veWitnessNonceSize)
 
-      # G7+G8+G9: compute witness merkle root, then SHA256d(root || nonce).
-      # Core validation.cpp:3890-3898.
-      var wtxids: seq[array[32, byte]]
-      wtxids.add(default(array[32, byte]))  # coinbase wtxid is all-zeros
-      for i in 1 ..< blk.txs.len:
-        wtxids.add(array[32, byte](blk.txs[i].wtxid()))
+    # G7+G8+G9: compute witness merkle root, then SHA256d(root || nonce).
+    # Core validation.cpp:3890-3898.
+    var wtxids: seq[array[32, byte]]
+    wtxids.add(default(array[32, byte]))  # coinbase wtxid is all-zeros
+    for i in 1 ..< blk.txs.len:
+      wtxids.add(array[32, byte](blk.txs[i].wtxid()))
 
-      var nonce: array[32, byte]
-      copyMem(addr nonce[0], unsafeAddr witnessStack[0][0], 32)
-      let computedCommitment = computeWitnessCommitment(wtxids, nonce)
+    var nonce: array[32, byte]
+    copyMem(addr nonce[0], unsafeAddr witnessStack[0][0], 32)
+    let computedCommitment = computeWitnessCommitment(wtxids, nonce)
 
-      if computedCommitment != commitmentOpt.get():
-        return voidErr(veBadWitnessCommitment)
-    # G10: no commitment present → no error (Core does not require one).
-  else:
-    # G11: segwit not active — witness data in any tx is illegal.
-    # Core validation.cpp:3905-3913.
-    for tx in blk.txs:
-      for inputIdx in 0 ..< tx.witnesses.len:
-        if tx.witnesses[inputIdx].len > 0:
-          return voidErr(veUnexpectedWitness)
+    if computedCommitment != commitmentOpt.get():
+      return voidErr(veBadWitnessCommitment)
+    # Commitment validated: return early (Core validation.cpp:3900-3902 `return true`).
+    return ok()
+
+  # No witness commitment was found (segwit inactive, OR segwit active but
+  # coinbase has no 0xaa21a9ed output).  Core validation.cpp:3905-3913:
+  # "No witness data is allowed in blocks that don't commit to witness data."
+  # This scan runs for BOTH the segwit-inactive case (G11) AND the
+  # segwit-active-no-commitment case (fixes the previous G10 false-accept).
+  for tx in blk.txs:
+    for inputIdx in 0 ..< tx.witnesses.len:
+      if tx.witnesses[inputIdx].len > 0:
+        return voidErr(veUnexpectedWitness)
 
   ok()
 

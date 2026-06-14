@@ -107,6 +107,7 @@ import ./test_ibd_durability
 import ./test_w117_proxy_wireup
 import ./test_w135_standardness
 import ./test_w167_getblockstats
+import ./test_witness_consensus_fixes
 
 when isMainModule:
   echo "Running all tests..."
