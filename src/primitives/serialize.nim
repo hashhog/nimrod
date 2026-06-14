@@ -319,6 +319,18 @@ proc readTransaction*(r: var BinaryReader): Transaction =
   for i in 0 ..< result.inputs.len:
     result.witnesses.add(r.readWitness())
 
+  # Core primitives/transaction.h:228-231: if the segwit marker+flag were
+  # present but every input's witness stack is empty, the encoding is illegal
+  # ("Superfluous witness record").  HasWitness() in Core returns true iff at
+  # least one input has a non-empty stack.
+  var hasWitness = false
+  for w in result.witnesses:
+    if w.len > 0:
+      hasWitness = true
+      break
+  if not hasWitness:
+    raise newException(SerializationError, "Superfluous witness record")
+
   result.lockTime = r.readUint32LE()
 
 proc writeBlockHeader*(w: var BinaryWriter, header: BlockHeader) =
