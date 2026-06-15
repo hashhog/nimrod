@@ -184,6 +184,80 @@ suite "ScriptCompression":
     expect SnapshotError:
       discard r.readCompressedScript()
 
+  test "Uncompressed P2PK compresses to tag 0x04/0x05 + X[32] (Finding 5B/7B)":
+    ## Non-vacuous: without the fix tryCompressScript returns false for a
+    ## 67-byte uncompressed P2PK, causing writeCompressedScript to emit
+    ## VARINT(73) + 67 raw bytes = 68 bytes. With the fix it emits the
+    ## 33-byte special encoding (tag + X). The check for w.data.len == 33
+    ## would FAIL (got 68) without the fix.
+    ##
+    ## Uses secp256k1 generator G (even y) as the test vector:
+    ##   G.x = 79be667e...   G.y = 483ada77...4b8  (LSB = 0 → tag 0x04)
+    ## Core compressor.cpp:79: out[0] = 0x04 | (pubkey[64] & 0x01)
+    let xCoord = bytesFromHex(
+      "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+    let yCoord = bytesFromHex(
+      "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
+    # Build 67-byte uncompressed P2PK: 0x41 <0x04 || X[32] || Y[32]> OP_CHECKSIG
+    var script = newSeq[byte](67)
+    script[0] = 0x41'u8
+    script[1] = 0x04'u8
+    for i in 0 ..< 32: script[2 + i] = xCoord[i]
+    for i in 0 ..< 32: script[34 + i] = yCoord[i]
+    script[66] = 0xAC'u8
+
+    var w = BinaryWriter()
+    w.writeCompressedScript(script)
+
+    # With the fix: 33 bytes (tag + X). Without the fix: 68 bytes (generic).
+    check w.data.len == 33
+    # G has even y (last byte of Y = 0xb8, LSB = 0) → tag = 0x04.
+    check w.data[0] == 0x04'u8
+    # X coordinate preserved verbatim.
+    check w.data[1..32] == xCoord
+
+    # Round-trip via decoder must recover the original 67-byte script.
+    var r = BinaryReader(data: w.data, pos: 0)
+    let decoded = r.readCompressedScript()
+    check decoded == script
+
+  test "Uncompressed P2PK with odd Y encodes as tag 0x05 (Finding 5B/7B)":
+    ## -G has the same X as G but odd Y. Tag must be 0x05. Validates Y-parity.
+    ## Non-vacuous: without the fix the encoding would be 68 bytes (generic);
+    ## with the fix it is 33 bytes with tag 0x05.
+    let xCoord = bytesFromHex(
+      "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+    # Obtain odd-Y uncompressed script by decoding the 0x05-tagged form.
+    var wTag = BinaryWriter()
+    wTag.writeVarInt(0x05'u64)
+    wTag.writeBytes(xCoord)
+    var rTag = BinaryReader(data: wTag.data, pos: 0)
+    let negGScript = rTag.readCompressedScript()
+    check negGScript.len == 67
+    check (negGScript[65].int and 1) == 1  # odd y
+
+    var w = BinaryWriter()
+    w.writeCompressedScript(negGScript)
+    # With the fix: 33 bytes, tag 0x05.
+    check w.data.len == 33
+    check w.data[0] == 0x05'u8
+    check w.data[1..32] == xCoord
+
+    var r = BinaryReader(data: w.data, pos: 0)
+    let decoded = r.readCompressedScript()
+    check decoded == negGScript
+
+  test "Invalid uncompressed P2PK (not on curve) falls back to generic encoding":
+    ## all-zero x+y is not a valid secp256k1 point; tryCompressScript must
+    ## reject it and fall through to VARINT(size+6)+raw (68 bytes, not 33).
+    var script = newSeq[byte](67)
+    script[0] = 0x41'u8; script[1] = 0x04'u8; script[66] = 0xAC'u8
+    var w = BinaryWriter()
+    w.writeCompressedScript(script)
+    # Generic path: VARINT(73) is one byte (73 < 0xfd), then 67 raw bytes = 68 total.
+    check w.data.len == 68
+    check w.data[0] == byte(73)
+
 # ----------------------------------------------------------------------------
 # Header serialization (file metadata)
 # ----------------------------------------------------------------------------

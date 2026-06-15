@@ -82,6 +82,59 @@ const
   DbCoinStats* = byte('s')         ## Key prefix for per-block stats
 
 # ============================================================================
+# BIP30 duplicate-coinbase detection (coinstatsindex)
+# ============================================================================
+#
+# Mainnet blocks at height 91722 and 91812 have coinbase transactions whose
+# txids duplicate earlier (already-spent) coinbases. The duplicate coinbase
+# outputs became unspendable because the earlier outputs were overwritten in
+# the UTXO set; coinstatsindex must NOT fold them into muhash/totals.
+#
+# Reference: Bitcoin Core index/coinstatsindex.cpp:128-131 (CustomAppend):
+#   if (is_coinbase && IsBIP30Unspendable(block.hash, block.height)) {
+#       m_total_unspendables_bip30 += block_subsidy;
+#       continue;
+#   }
+# Reference: Bitcoin Core validation.cpp:6195-6198 IsBIP30Unspendable().
+#
+# Duplicated locally (not imported from consensus/validation.nim) to avoid
+# pulling in the heavy validation -> chainstate -> interpreter import chain.
+
+proc isBip30UnspendableForIndex(height: int32, blockHash: BlockHash): bool =
+  ## Return true iff the block at (height, blockHash) is one of the two
+  ## mainnet BIP30 duplicate-coinbase blocks (h=91722, h=91812).
+  ## Their coinbase outputs must be credited to totalUnspendablesBip30 and
+  ## not folded into muhash/transactionOutputCount/totalCoinbaseAmount.
+  const bip30Unspend1Hash = block:
+    var h: array[32, byte]
+    const hex = "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"
+    for i in 0..31:
+      let hi = hex[i*2]; let lo = hex[i*2+1]
+      let hiV = (if hi >= '0' and hi <= '9': ord(hi)-ord('0')
+                 elif hi >= 'a' and hi <= 'f': ord(hi)-ord('a')+10
+                 else: ord(hi)-ord('A')+10)
+      let loV = (if lo >= '0' and lo <= '9': ord(lo)-ord('0')
+                 elif lo >= 'a' and lo <= 'f': ord(lo)-ord('a')+10
+                 else: ord(lo)-ord('A')+10)
+      h[31 - i] = byte(hiV * 16 + loV)
+    BlockHash(h)
+  const bip30Unspend2Hash = block:
+    var h: array[32, byte]
+    const hex = "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"
+    for i in 0..31:
+      let hi = hex[i*2]; let lo = hex[i*2+1]
+      let hiV = (if hi >= '0' and hi <= '9': ord(hi)-ord('0')
+                 elif hi >= 'a' and hi <= 'f': ord(hi)-ord('a')+10
+                 else: ord(hi)-ord('A')+10)
+      let loV = (if lo >= '0' and lo <= '9': ord(lo)-ord('0')
+                 elif lo >= 'a' and lo <= 'f': ord(lo)-ord('a')+10
+                 else: ord(lo)-ord('A')+10)
+      h[31 - i] = byte(hiV * 16 + loV)
+    BlockHash(h)
+  (height == 91722'i32 and blockHash == bip30Unspend1Hash) or
+  (height == 91812'i32 and blockHash == bip30Unspend2Hash)
+
+# ============================================================================
 # BogoSize calculation
 # ============================================================================
 
@@ -254,6 +307,15 @@ method customAppend*(idx: CoinStatsIndex, blockInfo: BlockInfo): bool =
     # Process all transactions
     for txIdx, tx in blk.txs:
       let isCoinbase = txIdx == 0
+
+      # Skip duplicate txid coinbase transactions (BIP30).
+      # Mainnet blocks at h=91722 and h=91812 have coinbases whose txids
+      # duplicate earlier ones. Their outputs were overwritten in the UTXO set
+      # and became unspendable; charge their value to totalUnspendablesBip30.
+      # Reference: Bitcoin Core index/coinstatsindex.cpp:128-131.
+      if isCoinbase and isBip30UnspendableForIndex(blockInfo.height, blockInfo.hash):
+        idx.totalUnspendablesBip30 += int64(blockSubsidy)
+        continue
 
       # Add new outputs
       for outIdx, output in tx.outputs:
