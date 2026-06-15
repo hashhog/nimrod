@@ -192,9 +192,12 @@ proc decompressAmount*(x: uint64): uint64 =
 # Otherwise:
 #   VARINT(script.len + 6) followed by raw script bytes.
 #
-# Encoder: recognizes P2PKH, P2SH, and compressed P2PK (tags 0x00..0x03). For
-# uncompressed P2PK we leave the script alone (generic fallback) because
-# tryCompressScript would need a secp256k1 round-trip just to encode the tag.
+# Encoder: recognizes P2PKH, P2SH, compressed P2PK (tags 0x00..0x03), and
+# uncompressed P2PK (tags 0x04/0x05). For uncompressed P2PK the encoder
+# validates via a secp256k1 round-trip (build compressed form, call
+# decompressPubkey to confirm the point is on the curve), then emits
+# tag 0x04|(Y_lsb) + X[32] — matching Bitcoin Core compressor.cpp:71-82.
+# Invalid uncompressed pubkeys fall through to the generic encoding.
 # Decoder: handles all 6 special cases. Tags 0x04/0x05 invoke libsecp256k1 to
 # recover the full y-coordinate via secp256k1_ec_pubkey_parse +
 # secp256k1_ec_pubkey_serialize(SECP256K1_EC_UNCOMPRESSED) — matches Bitcoin
@@ -231,8 +234,29 @@ proc tryCompressScript(script: openArray[byte], outBytes: var seq[byte]): bool =
     outBytes[0] = script[1]
     for i in 0 ..< 32: outBytes[1 + i] = script[2 + i]
     return true
-  # Uncompressed P2PK: we can't validate the pubkey here without secp256k1,
-  # so we leave it to the generic fallback. Decoder still handles 0x04/0x05.
+  # Uncompressed P2PK: 0x41 <0x04 || X[32] || Y[32]> OP_CHECKSIG (67 bytes).
+  # Bitcoin Core compressor.cpp:46-52 + 76-82 — IsToPubKey accepts this form,
+  # validates via CPubKey::IsFullyValid(), then encodes as tag 0x04|(Y_lsb) + X[32].
+  # Layout: script[0]=0x41(push 65), script[1]=0x04, script[2..33]=X, script[34..65]=Y,
+  #         script[66]=OP_CHECKSIG. Y-parity = LSB of script[65] (last byte of Y).
+  if script.len == 67 and script[0] == 0x41'u8 and script[1] == 0x04'u8 and
+     script[66] == OpChecksig:
+    # Validate pubkey via libsecp256k1: build compressed form (0x02|Y_lsb || X),
+    # attempt parse (secp256k1_ec_pubkey_parse accepts compressed/uncompressed).
+    # If decompressPubkey on the compressed form succeeds, the curve point is valid.
+    # This mirrors CPubKey::IsFullyValid() in Bitcoin Core.
+    let yLsb = script[65] and 0x01'u8
+    var compressedKey = newSeq[byte](33)
+    compressedKey[0] = 0x02'u8 or yLsb
+    for i in 0 ..< 32: compressedKey[1 + i] = script[2 + i]
+    let decompressed = snapshot_secp.decompressPubkey(compressedKey)
+    if decompressed.len == 65:
+      # Valid pubkey — encode as tag 0x04|(Y_lsb) + X[32] (33 bytes).
+      outBytes = newSeq[byte](33)
+      outBytes[0] = 0x04'u8 or yLsb
+      for i in 0 ..< 32: outBytes[1 + i] = script[2 + i]
+      return true
+    # Invalid curve point — fall through to generic encoding.
   return false
 
 proc writeCompressedScript*(w: var BinaryWriter, script: openArray[byte]) =
