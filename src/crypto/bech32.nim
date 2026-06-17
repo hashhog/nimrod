@@ -7,6 +7,14 @@ const
   Bech32Charset* = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
   BECH32_CONST* = 1'u32
   BECH32M_CONST* = 0x2bc830a3'u32
+  ## Maximum length of a Bech32/Bech32m encoded address, in characters.
+  ## BIP-173/BIP-350 cap addresses at 90 characters. The underlying BCH code
+  ## only guarantees detection of up to 4 errors within an 89-character window,
+  ## so any string longer than this limit must be rejected as malformed
+  ## regardless of whether its checksum happens to verify. Matches Bitcoin
+  ## Core's `bech32::CharLimit::BECH32 = 90` (bitcoin-core/src/bech32.h:38-40),
+  ## enforced in `bech32::Decode` (bitcoin-core/src/bech32.cpp:378).
+  Bech32MaxLength* = 90
 
 type
   Bech32Encoding* = enum
@@ -95,6 +103,16 @@ proc bech32Decode*(s: string): tuple[hrp: string, data: seq[int], enc: Bech32Enc
     if c >= 'A' and c <= 'Z': hasUpper = true
   if hasLower and hasUpper:
     raise newException(Bech32Error, "bech32 string has mixed case")
+
+  # Enforce the BIP-173/BIP-350 90-character limit. Beyond this length the BCH
+  # code's 4-error-detection guarantee no longer holds, so over-long strings are
+  # rejected up front regardless of checksum. Matches Bitcoin Core's
+  # `if (str.size() > limit) return {};` in bech32::Decode
+  # (bitcoin-core/src/bech32.cpp:378, CharLimit::BECH32 = 90). Checked on the
+  # original `s` (length is unchanged by lowercasing). Ordering mirrors Core:
+  # the mixed-case / character check precedes the size check.
+  if s.len > Bech32MaxLength:
+    raise newException(Bech32Error, "bech32 string too long")
 
   # Convert to lowercase for processing
   let lower = s.toLowerAscii()
