@@ -197,25 +197,51 @@ suite "W135 — Pay-to-Anchor classification [BUG-02]":
 # G11 / G31 — v0 malformed-program dispatch (BUG-04 PIN)
 # ---------------------------------------------------------------------------
 
-suite "W135 — v0 malformed witness-program classification [BUG-04]":
+suite "W135 — v0 malformed witness-program classification [BUG-04 FIXED]":
 
-  test "[BUG-04 PIN] v0 with prog.len=5 → stxWitnessUnknown (Core: NONSTANDARD)":
+  test "[BUG-04 FIXED] v0 with prog.len=5 → stxNonStandard (Core parity)":
     ## Script: [OP_0, 0x05, 0, 1, 2, 3, 4].  Core's Solver returns NONSTANDARD
-    ## for v0 with prog.len ∉ {20, 32}.  Nimrod's classifyStdTxout returns
-    ## stxWitnessUnknown (line 175).  Output-side: nimrod ACCEPTS, Core REJECTS.
+    ## for v0 with prog.len ∉ {20, 32} (script/solver.cpp:177).  classifyStdTxout
+    ## now mirrors Core: a v0 non-canonical witness program is NonStandard, not
+    ## WitnessUnknown.  Output-side: nimrod now REJECTS (matches Core).
     let script = @[byte(OP_0), 0x05'u8, 0'u8, 1'u8, 2'u8, 3'u8, 4'u8]
     let kind = classifyStdTxout(script)
-    check kind == stxWitnessUnknown  # nimrod current — pin
+    check kind == stxNonStandard
     var tx = baseTx()
     tx.outputs[0] = TxOut(value: Satoshi(10_000), scriptPubKey: script)
     let r = isStandardTx(tx)
-    # Output side: nimrod accepts (stxWitnessUnknown is not rejected at output)
-    check r.ok
+    # Output side: nimrod now rejects a v0 non-canonical program (Core parity).
+    check not r.ok
+    check r.reason == "scriptpubkey"
 
-  test "[BUG-04 PIN] v0 with prog.len=15 → stxWitnessUnknown (Core: NONSTANDARD)":
+  test "[BUG-04 FIXED] v0 with prog.len=15 → stxNonStandard (Core parity)":
     var script = @[byte(OP_0), 0x0F'u8]  # OP_0 + push-15-bytes
     for _ in 0 ..< 15: script.add(0xAA'u8)
     check script.len == 17
+    let kind = classifyStdTxout(script)
+    check kind == stxNonStandard
+
+  test "[BUG-04 FIXED] v1 16-byte program → stxWitnessUnknown (Core parity)":
+    ## Bitcoin Core Solver() (script/solver.cpp:172-175): any witness program
+    ## with witnessversion != 0 that is not a recognised canonical type is
+    ## WITNESS_UNKNOWN — a *standard* output to create.  A v1 program whose size
+    ## is not 32 (so not P2TR) and not the 2-byte P2A anchor is WitnessUnknown,
+    ## NOT NonStandard.  Mutation guard: reverting the witness branch to a
+    ## v0-only / OP_2..OP_16-only check would misclassify this.
+    var script = @[byte(OP_1), 0x10'u8]  # OP_1 (v1) + push-16-bytes
+    for _ in 0 ..< 16: script.add(0xCC'u8)
+    check script.len == 18
+    let kind = classifyStdTxout(script)
+    check kind == stxWitnessUnknown
+    # Output side: WitnessUnknown is standard to create (Core relays it).
+    var tx = baseTx()
+    tx.outputs[0] = TxOut(value: Satoshi(10_000), scriptPubKey: script)
+    let r = isStandardTx(tx)
+    check r.ok
+
+  test "[BUG-04 FIXED] v2 16-byte program → stxWitnessUnknown (Core parity)":
+    var script = @[byte(OP_2), 0x10'u8]  # OP_2 (v2) + push-16-bytes
+    for _ in 0 ..< 16: script.add(0xDD'u8)
     let kind = classifyStdTxout(script)
     check kind == stxWitnessUnknown
 
@@ -292,6 +318,70 @@ suite "W135 — Bare multisig n>3 reason-string [BUG-05]":
     let r = isStandardTx(tx)
     check not r.ok
     check r.reason == "scriptpubkey"   # nimrod ✓ (matches Core by happenstance)
+
+# ---------------------------------------------------------------------------
+# Bare multisig PUSHDATA-prefixed pubkeys (Core MatchMultisig parity)
+#
+# Core's MatchMultisig (script/solver.cpp:85-105) reads each key via GetScriptOp,
+# which decodes direct pushes AND OP_PUSHDATA1/2/4, and accepts iff
+# CPubKey::ValidSize(data) (payload 33 or 65).  isStandardMultisig now matches:
+# a pubkey pushed with an OP_PUSHDATA1 prefix is accepted; a PUSHDATA push of a
+# non-pubkey size is rejected (it keys on the length, not accept-everything).
+# Mutation guard: reverting to the direct-push-only walk (opcode == 33/65) would
+# fail the first test below.
+# ---------------------------------------------------------------------------
+
+suite "W135 — Bare multisig PUSHDATA-prefixed pubkeys":
+
+  proc bareMultisigPushdata1Key(): seq[byte] =
+    ## OP_1 OP_PUSHDATA1 0x21 <33B pk> OP_1 OP_CHECKMULTISIG  (1-of-1)
+    ## The single pubkey is pushed with an OP_PUSHDATA1 (0x4c) prefix instead of
+    ## the direct 0x21 push.  Core relays this as standard MULTISIG.
+    result.add(byte(OP_1))           # m = 1
+    result.add(0x4c'u8)              # OP_PUSHDATA1
+    result.add(0x21'u8)              # length = 33
+    for _ in 0 ..< 33: result.add(0x02'u8)
+    result.add(byte(OP_1))           # n = 1
+    result.add(byte(OP_CHECKMULTISIG))
+
+  proc bareMultisigPushdata1NonPubkey(): seq[byte] =
+    ## OP_1 OP_PUSHDATA1 0x20 <32B blob> OP_1 OP_CHECKMULTISIG
+    ## The pushed payload is 32 bytes — NOT a valid pubkey size (33/65), so it
+    ## must NOT classify as multisig (control: proves we key on ValidSize).
+    result.add(byte(OP_1))
+    result.add(0x4c'u8)              # OP_PUSHDATA1
+    result.add(0x20'u8)              # length = 32 (invalid pubkey size)
+    for _ in 0 ..< 32: result.add(0x02'u8)
+    result.add(byte(OP_1))
+    result.add(byte(OP_CHECKMULTISIG))
+
+  test "PUSHDATA1-prefixed 33B pubkey 1-of-1 classified stxMultisig (Core parity)":
+    let script = bareMultisigPushdata1Key()
+    let kind = classifyStdTxout(script)
+    check kind == stxMultisig
+    let (ok, m, n) = isStandardMultisig(script)
+    check ok
+    check m == 1
+    check n == 1
+
+  test "PUSHDATA1-prefixed 33B pubkey 1-of-1 admitted standard to create":
+    var tx = baseTx()
+    tx.outputs[0].scriptPubKey = bareMultisigPushdata1Key()
+    let r = isStandardTx(tx)
+    check r.ok
+
+  test "control: PUSHDATA1-prefixed 32B (non-pubkey) push is NOT multisig":
+    let script = bareMultisigPushdata1NonPubkey()
+    let (ok, _, _) = isStandardMultisig(script)
+    check not ok
+    check classifyStdTxout(script) == stxNonStandard
+
+  test "direct-push 33B pubkey 1-of-1 still classified stxMultisig (no regression)":
+    var script = @[byte(OP_1), 33'u8]
+    for _ in 0 ..< 33: script.add(0x02'u8)
+    script.add(byte(OP_1))
+    script.add(byte(OP_CHECKMULTISIG))
+    check classifyStdTxout(script) == stxMultisig
 
 # ---------------------------------------------------------------------------
 # G16 — OP_RETURN datacarrier byte-budget (Core parity)
