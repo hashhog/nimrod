@@ -407,10 +407,15 @@ suite "RPC network info format":
 
 suite "RPC getpeerinfo format":
   test "peer info fields":
-    # Bitcoin Core getpeerinfo returns detailed peer information
+    # Bitcoin Core v31.99 getpeerinfo returns detailed peer information.
+    # NOTE: Core v31.99 removed `startingheight` from getpeerinfo and now emits
+    # last_inv_sequence + inv_to_send between relaytxes and lastsend
+    # (rpc/net.cpp). See test_getpeerinfo_fields.nim for the wire-order /
+    # field-set regression guard against the real handler.
     let expectedFields = ["id", "addr", "services", "lastsend", "lastrecv",
                           "bytessent", "bytesrecv", "conntime", "pingtime",
-                          "version", "subver", "inbound", "startingheight",
+                          "version", "subver", "inbound",
+                          "last_inv_sequence", "inv_to_send",
                           "synced_headers", "synced_blocks"]
 
     let peerInfo = %*{
@@ -419,6 +424,8 @@ suite "RPC getpeerinfo format":
       "services": "0000000000000409",
       "servicesnames": ["NETWORK", "WITNESS"],
       "relaytxes": true,
+      "last_inv_sequence": 0,
+      "inv_to_send": 0,
       "lastsend": 1234567890,
       "lastrecv": 1234567890,
       "last_transaction": 0,
@@ -434,7 +441,6 @@ suite "RPC getpeerinfo format":
       "inbound": false,
       "bip152_hb_to": false,
       "bip152_hb_from": false,
-      "startingheight": 100000,
       "presynced_headers": -1,
       "synced_headers": 100100,
       "synced_blocks": 100100,

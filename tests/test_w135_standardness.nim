@@ -116,35 +116,27 @@ suite "W135 — Dust threshold by output shape":
     let t = dustThreshold(txout)
     check int64(t) == 330
 
-  test "G22 [BUG-01 PIN] P2TR dust threshold is 573 in nimrod (Core says 330)":
+  test "G22 [BUG-01 FIXED] P2TR dust threshold == 330 sats (Core parity)":
     ## CORE: P2TR is a witness program → witness-discounted input → 330 sats.
-    ## NIMROD (with BUG-01): script[0] = OP_1 = 0x51, which is NOT <= 0x10, so
-    ##                       isWitProg=false → legacy 148-byte input → 573 sats.
-    ## This test PINS the current divergent behavior.  When BUG-01 is fixed,
-    ## flip the expected value to 330.
+    ## Regression guard for the BUG-01 fix: the previous witness test only
+    ## matched version bytes 0x00..0x10, so P2TR (script[0] = OP_1 = 0x51) fell
+    ## through to the legacy 148-byte input estimate and returned 573. The
+    ## Core-faithful isWitnessProgram handles OP_1..OP_16, so 330 is computed.
+    ## Mirror of getDustThreshold to keep both impls in lock-step.
     let txout = TxOut(value: Satoshi(0), scriptPubKey: p2trSpk())
-    let t = dustThreshold(txout)
-    # Document what Core would compute:
-    let coreExpected = 330'i64
-    # What nimrod currently computes (the BUG):
-    let nimrodCurrent = 573'i64
-    check int64(t) == nimrodCurrent  # remove this and use coreExpected after fix
-    check int64(t) != coreExpected   # the divergence
+    check int64(dustThreshold(txout)) == 330'i64
+    check int64(mp.getDustThreshold(txout)) == 330'i64
 
-  test "G22 [BUG-01 PIN] WitnessUnknown v2 dust threshold uses legacy input estimate":
+  test "G22 [BUG-01 FIXED] WitnessUnknown v2 dust threshold uses witness input estimate":
     ## A 4-byte v2 program: [OP_2, 0x02, 0xAA, 0xBB].  Core: witness program,
-    ## input cost 67, totalSize = 8+4+1+67 = 80, threshold = 240.
-    ## Nimrod with BUG-01: script[0]=0x52, NOT <= 0x10 → legacy 148, totalSize
-    ## = 13 + 148 = 161 → 483.
+    ## input cost 67, nSize = (8+1+4) + 67 = 80, threshold = 240. Pre-fix nimrod
+    ## mis-classified it (script[0]=0x52, NOT <= 0x10) → legacy 148 → 483.
     let txout = TxOut(
       value: Satoshi(0),
       scriptPubKey: @[byte(OP_2), 0x02'u8, 0xAA'u8, 0xBB'u8]
     )
-    let t = dustThreshold(txout)
-    let nimrodCurrent = 483'i64
-    let coreExpected = 240'i64
-    check int64(t) == nimrodCurrent
-    check int64(t) != coreExpected
+    check int64(dustThreshold(txout)) == 240'i64
+    check int64(mp.getDustThreshold(txout)) == 240'i64
 
   test "G23 OP_RETURN dust threshold == 0 (Core parity)":
     let txout = TxOut(
@@ -420,19 +412,16 @@ suite "W135 — IsUnspendable in dust threshold path [BUG-09]":
     )
     check int64(dustThreshold(txout)) == 0
 
-  test "[BUG-09 PIN] non-OP_RETURN script >MAX_SCRIPT_SIZE still gets a non-zero threshold":
+  test "[BUG-09 FIXED] non-OP_RETURN script >MAX_SCRIPT_SIZE → dust threshold 0":
     ## Core's IsUnspendable() returns true for size > MAX_SCRIPT_SIZE (10000),
-    ## causing GetDustThreshold to return 0.  Nimrod's dustThreshold only
-    ## checks the OP_RETURN byte.  A 10001-byte legacy script gets a
-    ## non-zero threshold (and the rest of the standardness pipeline rejects
-    ## the tx separately via bad-txns-oversize).
+    ## causing GetDustThreshold to return 0. The dust path now delegates the
+    ## unspendable check to isUnspendable (which mirrors CScript::IsUnspendable:
+    ## OP_RETURN-headed OR size > MAX_SCRIPT_SIZE), so a 10001-byte script gets
+    ## threshold 0 like Core. Regression guard for the BUG-09 fix.
     let bigScript = newSeq[byte](10_001)
     let txout = TxOut(value: Satoshi(0), scriptPubKey: bigScript)
-    let t = dustThreshold(txout)
-    # Nimrod-current: t > 0
-    check int64(t) > 0
-    # Core would compute: t == 0 (IsUnspendable returns true)
-    # When BUG-09 is fixed, flip to: check int64(t) == 0
+    check int64(dustThreshold(txout)) == 0
+    check int64(mp.getDustThreshold(txout)) == 0
 
 # ---------------------------------------------------------------------------
 # G15 / classification — basic output-shape coverage

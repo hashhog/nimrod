@@ -495,38 +495,51 @@ proc checkTrucSiblingEviction*(mp: Mempool, tx: Transaction, txFee: Satoshi,
 # 3. If the child is evicted, the parent with ephemeral dust must also be evicted
 
 proc getDustThreshold*(output: TxOut): Satoshi =
-  ## Calculate the dust threshold for an output
-  ## Dust = output value that costs more to spend than it's worth
-  ## Based on Bitcoin Core's GetDustThreshold with dustRelayFee = 3000 sat/kvB
+  ## Calculate the dust threshold (in satoshis) for an output, faithful to
+  ## Bitcoin Core's `GetDustThreshold` (policy/policy.cpp:27-63) at the default
+  ## dustRelayFee = 3000 sat/kvB. NON-CONSENSUS — this is mempool RELAY policy
+  ## (IsStandardTx / GetDust), never block or tx validation.
   ##
-  ## For P2WPKH (22 bytes): 31 bytes output + 67 bytes input = 98 bytes
-  ## threshold = 98 * 3000 / 1000 = 294 sats
+  ##   nSize = GetSerializeSize(txout) + spending_cost
+  ##         = (8 + CompactSize(scriptlen) + scriptlen) + spending_cost
+  ## where the spending cost is a fixed estimate of the CTxIn needed to spend it:
+  ##   * witness program: 32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR) + 4 = 67
+  ##   * non-witness:     32 + 4 + 1 + 107 + 4                          = 148
+  ## threshold = dustRelayFee.GetFee(nSize) = CeilDiv(nSize * fee, 1000).
   ##
-  ## For P2PKH (25 bytes): 34 bytes output + 148 bytes input = 182 bytes
-  ## threshold = 182 * 3000 / 1000 = 546 sats
+  ## Core thresholds at 3000 sat/kvB: P2PKH 546, P2SH 540, P2WPKH 294,
+  ## P2WSH 330, P2TR 330.
+  ##
+  ## The witness branch is Core's `IsWitnessProgram` test (uniform across ALL
+  ## witness versions: P2WPKH/P2WSH/P2TR/unknown all take the segwit-discounted
+  ## 67). The previous hand-rolled witness check only matched version bytes
+  ## 0x00..0x10, so P2TR (version opcode OP_1 = 0x51) fell through to the legacy
+  ## 148-byte cost and over-rejected P2TR dust (573 vs Core 330). It also dropped
+  ## the CompactSize prefix on the serialized-output term for large scripts.
 
-  # Check if output is unspendable (OP_RETURN)
-  if output.scriptPubKey.len > 0 and output.scriptPubKey[0] == 0x6a:  # OP_RETURN
+  # Unspendable scripts (OP_RETURN / oversized) can never be dust — Core
+  # `txout.scriptPubKey.IsUnspendable()` => return 0.
+  if isUnspendable(output.scriptPubKey):
     return Satoshi(0)
 
-  let outputSize = 8 + output.scriptPubKey.len + 1  # value + scriptPubKey + varint
+  let scriptLen = output.scriptPubKey.len
+  let scriptLenPrefix =
+    if scriptLen < 0xfd: 1
+    elif scriptLen <= 0xffff: 3
+    else: 5
+  # GetSerializeSize(txout) = nValue(8) + CompactSize(scriptlen) + scriptlen
+  let txoutSerSize = 8 + scriptLenPrefix + scriptLen
 
-  # Check if it's a witness program (much cheaper to spend)
-  let isWitnessProgram = output.scriptPubKey.len >= 4 and
-    output.scriptPubKey[0] >= 0x00 and output.scriptPubKey[0] <= 0x10 and
-    int(output.scriptPubKey[1]) == output.scriptPubKey.len - 2
-
-  let inputSize = if isWitnessProgram:
-    # Witness input: prevout(36) + scriptSig(1) + sequence(4) + witness(~27)
-    # With witness discount: (36 + 1 + 4 + 107/4) ≈ 67
-    32 + 4 + 1 + (107 div 4) + 4
+  let (isWit, _, _) = interpreter.isWitnessProgram(output.scriptPubKey)
+  let spendingCost = if isWit:
+    # 75% segwit discount applied to the 107-byte script estimate.
+    32 + 4 + 1 + (107 div int(WitnessScaleFactor)) + 4
   else:
-    # Legacy input: prevout(36) + scriptSig(~107) + sequence(4) = 148
     32 + 4 + 1 + 107 + 4
 
-  let totalSize = outputSize + inputSize
-  # dustRelayFee is in sat/kvB = sat/1000 bytes
-  Satoshi((totalSize * DustRelayTxFee) div 1000)
+  let nSize = txoutSerSize + spendingCost
+  # dustRelayFee is sat/kvB; Core CFeeRate::GetFee rounds UP (CeilDiv).
+  Satoshi((nSize * DustRelayTxFee + 999) div 1000)
 
 proc isDust*(output: TxOut): bool =
   ## Check if an output is dust (value below dust threshold)
