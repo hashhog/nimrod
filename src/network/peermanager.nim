@@ -174,6 +174,14 @@ type
     # -cjdnsreachable; CConnman::m_proxy_for_net.
     proxyManager*: proxy_mod.ProxyManager
     cjdnsReachable*: bool
+    # The `addnode`-managed persistent-peer list, keyed by the exact node string
+    # the operator supplied. Mirrors Bitcoin Core's CConnman::m_added_node_params
+    # (src/net.cpp): membership is what addnode "add"/"remove" toggle, and the
+    # list's contents — not the live connection state — decide whether a
+    # duplicate add or a stale remove is an RPC error. Distinct from the addrman
+    # address book (which also holds gossiped/seed addresses); only
+    # operator-pinned entries live here.
+    addedNodes*: seq[string]
 
 # Forward declarations
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
@@ -189,6 +197,34 @@ proc peerKey(host: string, port: uint16): string =
 
 proc peerKey(peer: Peer): string =
   peerKey(peer.address, peer.port)
+
+proc addAddedNode*(pm: PeerManager, node: string): bool =
+  ## Record `node` on the `addnode`-managed list. nimrod equivalent of Bitcoin
+  ## Core's CConnman::AddNode (src/net.cpp). Returns false — and makes NO change
+  ## — when the node is already on the list (Core returns false on a string
+  ## collision); the RPC layer turns that into RPC_CLIENT_NODE_ALREADY_ADDED
+  ## (-23). Returns true when a fresh entry is recorded.
+  for n in pm.addedNodes:
+    if n == node:
+      return false
+  pm.addedNodes.add(node)
+  true
+
+proc removeAddedNode*(pm: PeerManager, node: string): bool =
+  ## Remove `node` from the `addnode`-managed list. nimrod equivalent of Bitcoin
+  ## Core's CConnman::RemoveAddedNode (src/net.cpp). Returns false when the node
+  ## was never added (Core returns false after scanning the list), which the RPC
+  ## layer turns into RPC_CLIENT_NODE_NOT_ADDED (-24). Returns true on removal.
+  for i in 0 ..< pm.addedNodes.len:
+    if pm.addedNodes[i] == node:
+      pm.addedNodes.delete(i)
+      return true
+  false
+
+proc addedNodesList*(pm: PeerManager): seq[string] =
+  ## Snapshot of the current `addnode`-managed node strings (for
+  ## getaddednodeinfo / tests). Mirrors reading CConnman::m_added_node_params.
+  pm.addedNodes
 
 # ─────────────────────────────────────────────────────────────────────────────
 # W117 BUG-3 FIX (FIX-56): proxy/network-type configuration helpers.

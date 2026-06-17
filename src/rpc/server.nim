@@ -125,6 +125,16 @@ const
   RpcTransactionAlreadyInChain* = -27  # Transaction already confirmed
   RpcMiscError* = -1               # Generic misc error
 
+  # P2P node-management RPC error codes (Core rpc/protocol.h:60-63).
+  # These let operator scripts distinguish a duplicate-add / stale-remove /
+  # not-connected / bad-IP no-op from a generic JSON-RPC transport failure,
+  # exactly as Bitcoin Core does in rpc/net.cpp (addnode / setban /
+  # disconnectnode). Non-consensus — RPC-layer error returns only.
+  RpcClientNodeAlreadyAdded* = -23   # addnode "add" of an already-added node
+  RpcClientNodeNotAdded* = -24       # addnode "remove" of a never-added node
+  RpcClientNodeNotConnected* = -29   # disconnectnode for a peer not connected
+  RpcClientInvalidIpOrSubnet* = -30  # setban with an invalid IP/subnet string
+
   # Default maxfeerate: 0.10 BTC/kvB = 10,000,000 sat/kvB = 10,000 sat/vB
   DefaultMaxFeeRate* = 0.10  # BTC/kvB
 
@@ -610,7 +620,10 @@ proc handleGetBlockHash(rpc: RpcServer, params: JsonNode): JsonNode =
   # covering heights not yet flushed to RocksDB (up to 2000 blocks).
   let hashOpt = rpc.chainState.getBlockHashByHeight(int32(height))
   if hashOpt.isNone:
-    raise newRpcError(RpcInvalidParams, "block height out of range")
+    # Core rpc/blockchain.cpp::getblockhash raises RPC_INVALID_PARAMETER (-8)
+    # with this exact message when nHeight < 0 || nHeight > active tip height,
+    # BEFORE any index lookup — not the generic JSON-RPC -32602.
+    raise newRpcError(RpcInvalidParameter, "Block height out of range")
 
   %reverseHex(toHex(array[32, byte](hashOpt.get())))
 
@@ -5165,13 +5178,27 @@ proc handleAddNode(rpc: RpcServer, params: JsonNode): JsonNode =
 
   case command
   of "add":
+    # Core rpc/net.cpp::addnode "add" raises RPC_CLIENT_NODE_ALREADY_ADDED (-23)
+    # when the node is already on the added-node list (CConnman::AddNode returns
+    # false). Record by the operator-supplied string (keyed on host:port here),
+    # and only initiate the connect on a fresh add — matching the previous
+    # success-path side effect.
+    if not rpc.peerManager.addAddedNode(node):
+      raise newRpcError(RpcClientNodeAlreadyAdded, "Error: Node already added")
     asyncSpawn connectAsync(rpc.peerManager, host, port)
   of "remove":
+    # Core rpc/net.cpp::addnode "remove" raises RPC_CLIENT_NODE_NOT_ADDED (-24)
+    # when the node was never added (CConnman::RemoveAddedNode returns false).
+    if not rpc.peerManager.removeAddedNode(node):
+      raise newRpcError(RpcClientNodeNotAdded,
+        "Error: Node could not be removed. It has not been added previously.")
     for peer in rpc.peerManager.getReadyPeers():
       if peer.address == host and peer.port == port:
         asyncSpawn rpc.peerManager.removePeer(peer)
         break
   of "onetry":
+    # Core's "onetry" does NOT touch the added-node list (net.cpp:352-357); it
+    # only opens a one-off MANUAL connection.
     asyncSpawn connectAsync(rpc.peerManager, host, port)
   else:
     raise newRpcError(RpcInvalidParams, "invalid command: " & command)
@@ -6119,6 +6146,73 @@ proc handleListBanned(rpc: RpcServer): JsonNode =
     })
   banned
 
+proc isValidIpv4Literal(s: string): bool =
+  ## True iff `s` is a dotted-quad numeric IPv4 literal (four 0..255 octets).
+  ## Mirrors the numeric-only acceptance of Core's LookupHost(.., allow_lookup
+  ## = false) for the non-subnet setban argument (no DNS resolution).
+  let parts = s.split('.')
+  if parts.len != 4: return false
+  for p in parts:
+    if p.len == 0 or p.len > 3: return false
+    for c in p:
+      if c notin {'0'..'9'}: return false
+    let v = try: parseInt(p) except ValueError: return false
+    if v < 0 or v > 255: return false
+  true
+
+proc isValidIpv6Literal(s: string): bool =
+  ## True iff `s` is a syntactically valid numeric IPv6 literal (incl. the
+  ## "::" zero-run compression and a trailing IPv4-mapped tail). Conservative
+  ## mirror of Core's CNetAddr IPv6 parse acceptance for setban; rejects empty
+  ## / non-hex / over-length forms so a bad string is reported as -30.
+  if s.len == 0: return false
+  if ':' notin s: return false
+  let doubleColon = s.count("::")
+  if doubleColon > 1: return false
+  var groups = s.split(':')
+  # A trailing IPv4-mapped tail (e.g. ::ffff:1.2.3.4) counts as 2 16-bit groups.
+  var ipv4Tail = false
+  if groups.len > 0 and '.' in groups[^1]:
+    if not isValidIpv4Literal(groups[^1]): return false
+    ipv4Tail = true
+    groups = groups[0 ..< ^1]
+  var hexGroups = 0
+  for g in groups:
+    if g.len == 0: continue  # produced by leading/trailing/'::' empty splits
+    if g.len > 4: return false
+    for c in g:
+      if c notin {'0'..'9', 'a'..'f', 'A'..'F'}: return false
+    inc hexGroups
+  let need = if ipv4Tail: 6 else: 8
+  if doubleColon == 1:
+    # Compressed form: must have fewer than the full complement of groups.
+    return hexGroups <= (need - 1)
+  else:
+    return hexGroups == need
+
+proc isValidBanSubnetArg(arg: string): bool =
+  ## Validate the `setban` subnet/IP argument exactly at the boundary Core
+  ## checks (rpc/net.cpp:765-781): a bare numeric IP, or "<ip>/<prefixlen>"
+  ## CIDR. Returns false for anything that would make Core raise
+  ## RPC_CLIENT_INVALID_IP_OR_SUBNET (-30). No DNS resolution (numeric only).
+  if arg.len == 0: return false
+  let slash = arg.find('/')
+  if slash < 0:
+    # Bare IP.
+    return isValidIpv4Literal(arg) or isValidIpv6Literal(arg)
+  # Subnet: <ip>/<prefixlen>.
+  let ipPart = arg[0 ..< slash]
+  let prefixPart = arg[slash + 1 .. ^1]
+  if prefixPart.len == 0: return false
+  for c in prefixPart:
+    if c notin {'0'..'9'}: return false
+  let prefix = try: parseInt(prefixPart) except ValueError: return false
+  let isV4 = isValidIpv4Literal(ipPart)
+  let isV6 = (not isV4) and isValidIpv6Literal(ipPart)
+  if not (isV4 or isV6): return false
+  let maxPrefix = if isV4: 32 else: 128
+  prefix >= 0 and prefix <= maxPrefix
+
 proc handleSetBan(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Add or remove a peer from the ban list
   ## setban "address" "add|remove" [bantime] [absolute]
@@ -6130,6 +6224,14 @@ proc handleSetBan(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let address = params[0].getStr()
   let command = params[1].getStr()
+
+  # Core rpc/net.cpp::setban validates the subnet/IP argument (net.cpp:765-781)
+  # and raises RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) with this exact message
+  # when it is neither a numeric IP nor a valid "<ip>/<prefix>" CIDR — for both
+  # "add" and "remove" — before touching the ban list. Previously nimrod passed
+  # the raw string straight through with no validation.
+  if not isValidBanSubnetArg(address):
+    raise newRpcError(RpcClientInvalidIpOrSubnet, "Error: Invalid IP/Subnet")
 
   case command
   of "add":
@@ -6195,7 +6297,10 @@ proc handleDisconnectNode(rpc: RpcServer, params: JsonNode): JsonNode =
       break
 
   if not found:
-    raise newRpcError(RpcInvalidParams, "Node not found in connected nodes")
+    # Core rpc/net.cpp::disconnectnode raises RPC_CLIENT_NODE_NOT_CONNECTED
+    # (-29) with this exact message when CConnman::DisconnectNode matched no
+    # connected peer (net.cpp:477-479) — not the generic JSON-RPC -32602.
+    raise newRpcError(RpcClientNodeNotConnected, "Node not found in connected nodes")
 
   newJNull()
 
