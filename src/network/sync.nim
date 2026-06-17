@@ -37,6 +37,20 @@ type
     ssDownloadingBlocks  ## Downloading full block data
     ssSynced          ## Fully synchronized
 
+  SideHeader* = object
+    ## A header that does NOT extend the active header chain — a competing
+    ## fork that branches off at some KNOWN below-tip ancestor.  Bitcoin Core
+    ## keeps every such header in the single CBlockIndex map (m_block_index)
+    ## with its own nHeight/nChainWork; nimrod's active chain is a flat linear
+    ## seq, so fork headers live here in a parallel by-hash map until (and if)
+    ## one of them wins a reorg.  `height` is the absolute chain height of this
+    ## fork header (forkPointHeight + offset), and `totalWork` is the fork's
+    ## OWN cumulative work walked from genesis through its own ancestors — NOT
+    ## derived from the active chain's totalWork (Core nChainWork parity).
+    header*: BlockHeader
+    height*: int32
+    totalWork*: array[32, byte]
+
   HeaderChain* = object
     headers*: seq[BlockHeader]
     hashes*: seq[BlockHash]        ## Index -> hash mapping
@@ -44,6 +58,12 @@ type
     tip*: BlockHash
     tipHeight*: int32
     totalWork*: array[32, byte]  ## Cumulative work of the chain
+    # Competing-fork headers that branch BELOW the active tip.  Keyed by the
+    # fork header's own hash.  Populated by handleHeaders' fork arm (does NOT
+    # ban the peer); read by requestBlocks to walk the fork's ancestry and
+    # request its missing bodies.  Empty in the steady-state single-chain
+    # case, so the normal IBD/extension path is untouched.
+    sideHeaders*: Table[BlockHash, SideHeader]
 
   HeaderBatchRouting* = enum
     ## Outcome of classifying an incoming `headers` batch — mirrors the
@@ -121,6 +141,16 @@ type
     # filterIndex above.  Folded forward here on connect; rolled back via the
     # chainstate disconnectHook on reorg/invalidateblock.
     txoSpenderIndex*: TxoSpenderIndex
+    # Reorg-drop fix (Part 2): when processBlock's side-branch arm promotes a
+    # heavier competing fork via acceptSideBranchBlock, the disconnected old-
+    # chain non-coinbase txs + the newly-connected fork blocks are stashed here
+    # for the P2P caller (nimrod.nim mkBlock arm) to drain into the mempool /
+    # fee-estimator AFTER processBlock returns.  The SyncManager does not own the
+    # Mempool (it lives on NodeState), so the refresh is split exactly like the
+    # existing post-block removeForBlock split.  Both are cleared at the start of
+    # every processBlock and only the reorg arm fills them.
+    pendingReorgDisconnectedTxs*: seq[Transaction]
+    pendingReorgConnectedBlocks*: seq[Block]
 
 const
   MaxHeadersPerRequest* = 2000
@@ -296,7 +326,8 @@ proc initHeaderChain*(): HeaderChain =
     byHash: initTable[BlockHash, int](),
     tip: BlockHash(default(array[32, byte])),
     tipHeight: -1,
-    totalWork: default(array[32, byte])
+    totalWork: default(array[32, byte]),
+    sideHeaders: initTable[BlockHash, SideHeader]()
   )
 
 proc initHeaderChain*(genesisHeader: BlockHeader, genesisHash: BlockHash): HeaderChain =
@@ -336,6 +367,52 @@ proc getHeight*(hc: HeaderChain, hash: BlockHash): Option[int32] =
     some(int32(hc.byHash[hash]))
   else:
     none(int32)
+
+# -----------------------------------------------------------------------------
+# Fork-aware resolution (Part 1: competing-branch / reorg support)
+#
+# A header that branches BELOW the active tip cannot be resolved by the linear
+# active-chain helpers above (they only walk `headers`/`hashes` by height).
+# These helpers resolve a parent against BOTH the active chain and the
+# `sideHeaders` fork map, mirroring how Bitcoin Core's single CBlockIndex map
+# holds active + fork headers together.
+# -----------------------------------------------------------------------------
+
+proc hasAnyHeader*(hc: HeaderChain, hash: BlockHash): bool =
+  ## True if `hash` is known either on the active chain or as a fork header.
+  hash in hc.byHash or hash in hc.sideHeaders
+
+proc resolveParentWork*(hc: HeaderChain,
+                        prevHash: BlockHash): Option[tuple[height: int32,
+                                                           totalWork: array[32, byte]]] =
+  ## Resolve the parent of an incoming fork header to its (height, cumulative
+  ## work) using either the active chain or the sideHeaders map.  Returns none
+  ## if the parent is not known at all (genuine orphan).
+  ##
+  ## For an active-chain parent the cumulative work is summed from genesis with
+  ## the SAME canonical work path (`calculateWork`/`addWork`) that builds
+  ## `headerChain.totalWork`, so a fork's totalWork is directly comparable to
+  ## the active chain's totalWork (Core nChainWork parity, one work path).
+  if prevHash in hc.byHash:
+    let idx = hc.byHash[prevHash]
+    var w: array[32, byte]
+    for i in 0 .. idx:
+      w = addWork(w, calculateWork(hc.headers[i].bits))
+    return some((height: int32(idx), totalWork: w))
+  if prevHash in hc.sideHeaders:
+    let sh = hc.sideHeaders[prevHash]
+    return some((height: sh.height, totalWork: sh.totalWork))
+  none(tuple[height: int32, totalWork: array[32, byte]])
+
+proc heaviestSideTip*(hc: HeaderChain): Option[SideHeader] =
+  ## Return the fork header (if any) whose cumulative work is the greatest
+  ## among all sideHeaders.  This is the candidate competing-chain tip that
+  ## requestBlocks walks down to discover the bodies it must fetch.
+  var best: Option[SideHeader] = none(SideHeader)
+  for sh in hc.sideHeaders.values:
+    if best.isNone or compareWork(sh.totalWork, best.get().totalWork) > 0:
+      best = some(sh)
+  best
 
 # =============================================================================
 # Header validation
@@ -1044,6 +1121,89 @@ proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
   info "requested headers", peer = $peer, locatorLen = locator.len,
        tipHeight = sm.headerChain.tipHeight
 
+type ForkHeaderOutcome* = enum
+  ## Result of trying to accept a header that does NOT extend the active tip.
+  fhoAccepted    ## stored as a competing-fork header (do NOT ban)
+  fhoNotFork     ## parent is unknown — caller treats as a genuine bad header
+  fhoBadPow      ## PoW failed — caller bans (genuine-bad)
+
+proc acceptForkHeader*(sm: SyncManager, header: BlockHeader,
+                       hash: BlockHash,
+                       minPowChecked: bool): ForkHeaderOutcome =
+  ## Try to accept a header that branches BELOW the active tip (a competing
+  ## fork) WITHOUT banning the peer.  Mirrors the Bitcoin Core header/AcceptBlock
+  ## split: AcceptBlockHeader runs only PoW + parent-exists + cumulative-work
+  ## here (OPTION A from the design plan); the contextual MTP/retarget checks
+  ## are deferred to the BODY path (validateForStorage, which is DB-backed and
+  ## fork-correct).  Genuine-bad headers are still rejected:
+  ##   * PoW-invalid               -> fhoBadPow  (ban)
+  ##   * no resolvable parent      -> fhoNotFork (caller falls back to ban)
+  ##   * sub-minimumChainWork      -> fhoNotFork, PRESYNC-gated (anti-DoS)
+  ##
+  ## On fhoAccepted the header is stored in `headerChain.sideHeaders` AND, like
+  ## the active-extension arm, written to the DB block index as a bsHeaderOnly
+  ## by-hash row (never claiming the active height->hash slot).
+
+  # Anti-DoS: a fork header that has NOT been work-verified by PRESYNC may only
+  # be accepted as a side branch when the network's minimumChainWork is zero
+  # (regtest) — exactly the gate validateHeader applies to active headers.
+  # Reference: validation.cpp:4220-4229 (min_pow_checked).
+  if not minPowChecked:
+    var isZeroMinWork = true
+    for b in sm.params.minimumChainWork:
+      if b != 0:
+        isZeroMinWork = false
+        break
+    if not isZeroMinWork:
+      return fhoNotFork
+
+  # PoW must hold for every header, active or fork.  This is the genuine-bad
+  # discriminator: an invalid-PoW header is rejected (peer banned by caller),
+  # never stored as a side branch.
+  if not validateHeaderPoW(header):
+    return fhoBadPow
+
+  # Parent must resolve to a KNOWN below-tip ancestor (active chain or an
+  # already-stored fork header).  If it does not, this is not a recognisable
+  # competing branch — let the caller fall back to its unlinked-header ban.
+  let parent = sm.headerChain.resolveParentWork(header.prevBlock)
+  if parent.isNone:
+    return fhoNotFork
+
+  let p = parent.get()
+  let forkHeight = p.height + 1
+  # Cumulative work = parent.totalWork + this header's work, on the SAME
+  # canonical work path (calculateWork/addWork) that builds the active chain's
+  # totalWork, so the two are directly comparable (Core nChainWork parity).
+  let cumWork = addWork(p.totalWork, calculateWork(header.bits))
+
+  sm.headerChain.sideHeaders[hash] = SideHeader(
+    header: header,
+    height: forkHeight,
+    totalWork: cumWork
+  )
+
+  # Persist a header-only by-hash row so the body path's getBlockIndex(prevHash)
+  # parent lookup + getAncestor walks find the fork header on disk (same row the
+  # active arm writes).  NEVER claim the height->hash slot: that mapping belongs
+  # to the active chain until a reorg actually switches it.
+  if sm.chainDb != nil:
+    let hdrIdx = chainstate.BlockIndex(
+      hash: hash,
+      height: forkHeight,
+      status: bsHeaderOnly,
+      prevHash: header.prevBlock,
+      header: header,
+      totalWork: cumWork,
+      nTx: 0
+    )
+    sm.chainDb.putBlockIndexHashOnly(hdrIdx)
+
+  info "accepted competing-fork header (side branch)", peer = "fork",
+       forkHeight = forkHeight,
+       forkTipWorkGTActive = (compareWork(cumWork, sm.headerChain.totalWork) > 0)
+  fhoAccepted
+
 proc handleHeaders*(sm: SyncManager, peer: Peer,
                     headers: seq[BlockHeader]) {.async.} =
   ## Handle received headers message
@@ -1185,8 +1345,8 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
     let headerBytes = serialize(header)
     let hash = BlockHash(doubleSha256(headerBytes))
 
-    # Skip if already have this header
-    if sm.headerChain.hasHeader(hash):
+    # Skip if already have this header (active chain or a stored fork header).
+    if sm.headerChain.hasAnyHeader(hash):
       continue
 
     # Check that this header connects to our chain
@@ -1199,16 +1359,39 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
         break
 
       if header.prevBlock != prevHashOpt.get():
-        # Header doesn't connect - peer sent unlinked headers
-        warn "received unlinked header", peer = $peer,
-             expected = $prevHashOpt.get(), got = $header.prevBlock
-        # G17 (W99): use Misbehaving framework so noBan/manual guards are
-        # respected.  Bitcoin Core: Misbehaving(peer, 100, "invalid header").
-        sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlockHeader,
-                                       "block-invalid-header-disconnected")
-        sm.syncPeer = nil
-        sm.state = ssIdle
-        return
+        # The header does NOT extend the active tip.  Before treating it as a
+        # genuine bad/unlinked header (ban), try the FORK ARM: a header that
+        # branches off a KNOWN below-tip ancestor is a legitimate competing
+        # chain, not an attack.  Pre-fix nimrod banned every such peer here,
+        # which is exactly the reorg-drop blocker (a heavier branch forking
+        # below the tip got the honest peer disconnected and the node stuck).
+        #
+        # acceptForkHeader runs PoW + parent-exists + cumulative-work only
+        # (Core AcceptBlockHeader; contextual MTP/retarget deferred to the body
+        # path) and stores the header to sideHeaders + a bsHeaderOnly DB row.
+        # It returns fhoNotFork when the parent is UNKNOWN — i.e. a true
+        # unlinked header — in which case we fall through to the original ban.
+        # PoW-invalid forks (fhoBadPow) are ALSO banned: genuine-bad rejection
+        # is not weakened.
+        let fho = sm.acceptForkHeader(header, hash, minPowChecked)
+        case fho
+        of fhoAccepted:
+          # Stored as a competing fork.  Do NOT touch the active chain tip,
+          # do NOT ban, just move to the next header in the batch.
+          accepted += 1
+          continue
+        of fhoNotFork, fhoBadPow:
+          # Genuine unlinked/orphan header or PoW-invalid fork: ban as before.
+          warn "received unlinked header", peer = $peer,
+               expected = $prevHashOpt.get(), got = $header.prevBlock,
+               forkOutcome = $fho
+          # G17 (W99): use Misbehaving framework so noBan/manual guards are
+          # respected.  Bitcoin Core: Misbehaving(peer, 100, "invalid header").
+          sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlockHeader,
+                                         "block-invalid-header-disconnected")
+          sm.syncPeer = nil
+          sm.state = ssIdle
+          return
 
     # Validate the header.
     # G8 (W97): pass minPowChecked so validateHeader rejects headers whose
@@ -1372,6 +1555,61 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
         sm.requestedHashes.incl(hash)
         sm.blockQueue.addLast(hash)
     height += 1
+
+  # ---------------------------------------------------------------------------
+  # Fork-body download walk (Part 1, step 3) — reorg-drop fix.
+  #
+  # The active-chain walk above floors at the validated tip (chainTipHeight+1),
+  # so the BRIDGING bodies of a competing branch that forks BELOW the tip
+  # (fork_point+1 .. fork_tip) are never requested — the fork tip's body alone
+  # is useless without its ancestors, and the reorg can never be triggered.
+  #
+  # When a sideHeaders candidate exists whose cumulative work STRICTLY exceeds
+  # the active chain (Core only switches the best-header candidate on greater
+  # nChainWork), descend the fork by prevHash from its tip down to the first
+  # ancestor whose body we already have (BLOCK_HAVE_DATA) or that is on the
+  # active chain, requesting every missing body along the way — NO height floor
+  # (Core FindNextBlocksToDownload / blockbrew part 1).  Bounded by
+  # MAX_REORG_DEPTH so a deep fork announcement cannot cost unbounded getdata.
+  let candidate = sm.headerChain.heaviestSideTip()
+  if candidate.isSome and
+     compareWork(candidate.get().totalWork, sm.headerChain.totalWork) > 0:
+    var forkHashes: seq[BlockHash]   # collected tip-down, requested fork-point-up
+    var cur = candidate.get().header
+    var curHash = BlockHash(doubleSha256(serialize(cur)))
+    var depth = 0
+    while depth < MAX_REORG_DEPTH and
+          sm.pendingBlocks + inventory.len + forkHashes.len < MaxBlocksInFlight:
+      # Stop once we reach a block on the active chain — that is the fork point,
+      # and everything at/below it is already connected.
+      if curHash in sm.headerChain.byHash:
+        break
+      # Stop if we already have this fork body on disk (BLOCK_HAVE_DATA) — the
+      # rest of the ancestry below it is already downloaded.
+      if sm.chainDb != nil and sm.chainDb.getBlock(curHash).isSome:
+        break
+      # Need this body: request it unless it is already in flight.
+      if curHash notin sm.requestedHashes:
+        forkHashes.add(curHash)
+      # Walk to the parent (resolve in sideHeaders; the active-chain case is
+      # handled by the byHash break above).
+      let prevHash = cur.prevBlock
+      if prevHash in sm.headerChain.sideHeaders:
+        cur = sm.headerChain.sideHeaders[prevHash].header
+        curHash = prevHash
+      else:
+        # Parent is the fork point (active chain) or not yet known — stop.
+        break
+      depth += 1
+    # Emit fork-point-up so bodies download in connect order.
+    for i in countdown(forkHashes.len - 1, 0):
+      let h = forkHashes[i]
+      inventory.add(InvVector(
+        invType: invWitnessBlock,
+        hash: array[32, byte](h)
+      ))
+      sm.requestedHashes.incl(h)
+      sm.blockQueue.addLast(h)
 
   if inventory.len == 0:
     return
@@ -1656,6 +1894,103 @@ proc drainBlockBuffer(sm: SyncManager) =
       warn "failed to apply buffered block", height = nextHeight
       break
 
+proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
+  ## Reorg-drop fix (Part 2): route the body of a competing fork that branches
+  ## BELOW the active tip through the side-branch-aware reorg machinery
+  ## (chainstate.acceptSideBranchBlock — the SAME proc handleSubmitBlock uses),
+  ## so a heavier branch promotes the live node instead of being dropped.
+  ##
+  ## Returns true ONLY when a reorg actually switched the active tip to this
+  ## branch (the caller then drains sm.pendingReorg* into the mempool/fee
+  ## estimator).  A valid-but-not-heavier body is STORED as a side branch and
+  ## returns false (the active tip is unchanged; the P2P refresh must NOT run a
+  ## mempool removeForBlock on a block that is not on the active chain).  A
+  ## genuine-bad body (validate-for-storage failed) is rejected and the peer is
+  ## punished via the Misbehaving framework, exactly like the direct-extension
+  ## arm in processBlock.
+  ##
+  ## chainstate cannot import validation/crypto, so the two consensus
+  ## dependencies are injected here (sync.nim imports both):
+  ##   * validate-for-storage (full CheckBlock + ContextualCheckBlock, scripts
+  ##     deferred), bip22-mapped on failure, and
+  ##   * the per-promoted-block script-verify hook handleReorg fires.
+  let headerBytes = serialize(blk.header)
+  let hash = BlockHash(doubleSha256(headerBytes))
+
+  let validateForSide = proc(b: Block, prevIdx: chainstate.BlockIndex):
+                             tuple[ok: bool, err: string] {.gcsafe, raises: [].} =
+    var vr: ValidationResult[void]
+    try:
+      {.gcsafe.}:
+        let cryptoSide = newCryptoEngine()
+        vr = validateForStorage(sm.chainState, b, prevIdx, cryptoSide)
+    except CatchableError as e:
+      return (ok: false, err: e.msg)
+    except Exception as e:
+      return (ok: false, err: e.msg)
+    if vr.isOk: (ok: true, err: "")
+    else: (ok: false, err: bip22String(vr.error))
+
+  let csCapture = sm.chainState
+  let reorgParams = sm.params
+  let reorgVerify = proc(b: Block, height: int32): tuple[ok: bool, err: string]
+                         {.gcsafe, raises: [].} =
+    let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+      try: csCapture.getUtxo(op)
+      except: none(UtxoEntry)
+    var res: ValidationResult[void]
+    try:
+      {.gcsafe.}:
+        let cryptoVerify = newCryptoEngine()
+        res = verifyScripts(b, utxoLookup, height, cryptoVerify, reorgParams)
+    except CatchableError as e:
+      return (ok: false, err: e.msg)
+    except Exception as e:
+      return (ok: false, err: e.msg)
+    if res.isOk: (ok: true, err: "")
+    else: (ok: false, err: bip22String(res.error))
+
+  var disconnectedTxs: seq[Transaction] = @[]
+  var connectedBlocks: seq[Block] = @[]
+  var sideResult: tuple[outcome: SideBranchOutcome, token: string]
+  try:
+    {.gcsafe.}:
+      sideResult = acceptSideBranchBlock(sm.chainState, blk, validateForSide,
+                                         reorgVerify, disconnectedTxs,
+                                         connectedBlocks)
+  except CatchableError as e:
+    warn "side-branch block processing failed", hash = $hash, error = e.msg
+    return false
+  except Exception as e:
+    warn "side-branch block processing failed", hash = $hash, error = e.msg
+    return false
+
+  case sideResult.outcome
+  of sboReorged:
+    # The heavier fork is now the active tip.  Re-sync the SyncManager cursor to
+    # the new tip and surface the refresh payload for the P2P caller to drain.
+    sm.chainTip = sm.chainState.bestBlockHash
+    sm.chainTipHeight = sm.chainState.bestHeight
+    sm.pendingReorgDisconnectedTxs = disconnectedTxs
+    sm.pendingReorgConnectedBlocks = connectedBlocks
+    sm.lastSyncTime = getTime()
+    info "P2P reorg: switched active tip to heavier competing branch",
+         newTip = $sm.chainTip, newHeight = sm.chainTipHeight,
+         connected = connectedBlocks.len, disconnectedTxs = disconnectedTxs.len
+    true
+  of sboSideBranch:
+    # Stored on disk as a competing branch (work <= active, or reorg deferred).
+    # Active tip unchanged — NOT a P2P-refresh event.
+    trace "stored competing-fork body as side branch", hash = $hash
+    false
+  of sboRejected:
+    # Genuine-bad body (validate-for-storage failed) or unknown parent — punish
+    # the peer exactly like the direct-extension arm (BLOCK_CONSENSUS).
+    warn "rejected competing-fork body", hash = $hash, token = sideResult.token
+    if peer != nil:
+      sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlock, "invalid side-branch block")
+    false
+
 proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   ## Process a received block, returns true if valid.
   ## Buffers out-of-order blocks and processes sequentially.
@@ -1666,6 +2001,12 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
 
+  # Reorg-drop fix (Part 2): clear any stale reorg-refresh payload from a prior
+  # call.  Only the side-branch arm below fills these; the P2P caller drains
+  # them after a successful (true) return.
+  sm.pendingReorgDisconnectedTxs.setLen(0)
+  sm.pendingReorgConnectedBlocks.setLen(0)
+
   # Remove from in-flight tracking
   sm.requestedHashes.excl(hash)
 
@@ -1674,7 +2015,27 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   let heightOpt = sm.headerChain.getHeight(hash)
 
   if heightOpt.isNone:
-    # Unknown block - not in our header chain
+    # Not on the ACTIVE header chain.  Reorg-drop fix (Part 2): this may be the
+    # body of a competing fork that branches BELOW the active tip — Part 1
+    # stored its header in sideHeaders + a bsValidated/bsHeaderOnly by-hash DB
+    # row and downloaded its bridging bodies, but the body must still reach the
+    # reorg machinery.  Route it through the side-branch-aware
+    # chainstate.acceptSideBranchBlock (the SAME proc handleSubmitBlock uses):
+    # it stores the body, and when the fork's cumulative work STRICTLY exceeds
+    # the active chain, drives handleReorg to promote it.  This is the missing
+    # link that flips the runtime STUCK -> REORG.
+    #
+    # Eligibility: the block is a known fork body iff its hash is in sideHeaders
+    # OR the DB already carries a below-tip block-index row for it (e.g. a
+    # restart re-loaded the side rows).  A truly unknown block (neither active,
+    # nor side, nor in the DB) is dropped exactly as before.
+    if sm.chainState != nil and
+       (hash in sm.headerChain.sideHeaders or
+        (sm.chainDb != nil and sm.chainDb.getBlockIndex(hash).isSome)):
+      let reorged = sm.processSideBranchBody(peer, blk)
+      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+      return reorged
+    # Unknown block - not in our header chain and not a known fork body.
     sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
     return false
 
@@ -1819,12 +2180,24 @@ proc syncLoop*(sm: SyncManager) {.async.} =
             sm.chainState.bestHeight = sm.chainTipHeight
             sm.chainState.bestBlockHash = sm.chainTip
 
+      # Reorg-drop fix (part 3): also drive block download when a heavier
+      # competing fork exists in sideHeaders. Its bridging bodies live BELOW
+      # the active tip, so an active chain that is "synced"
+      # (chainTipHeight == headerTipHeight) must NOT short-circuit the fork-body
+      # walk inside requestBlocks, nor flip us to ssSynced before the reorg
+      # fires. Without this, parts 1+2 accept the heavier fork headers and the
+      # reorg machinery is ready, but the fork bodies are never requested and
+      # the node stays stuck on the minority chain.
+      let heavierFork = block:
+        let c = sm.headerChain.heaviestSideTip()
+        c.isSome and compareWork(c.get().totalWork, sm.headerChain.totalWork) > 0
+
       # Request blocks if needed
       if sm.pendingBlocks < MaxBlocksInFlight div 2 and
-         sm.chainTipHeight < sm.headerTipHeight:
+         (sm.chainTipHeight < sm.headerTipHeight or heavierFork):
         await sm.requestBlocks(peer)
 
-      if sm.chainTipHeight >= sm.headerTipHeight:
+      if sm.chainTipHeight >= sm.headerTipHeight and not heavierFork:
         sm.state = ssSynced
         info "block sync complete", height = sm.chainTipHeight
         consecutiveTimeouts = 0

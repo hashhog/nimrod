@@ -1452,4 +1452,157 @@ suite "ChainState disconnectHook (BIP-157 reorg-aware filter chain)":
 
     cs.close()
 
+# ============================================================================
+# acceptSideBranchBlock — extracted side-branch + reorg core (reorg-drop fix,
+# Part 2).  These tests drive the proc handleSubmitBlock AND the P2P
+# processBlock side-branch arm now both call, asserting the THREE outcomes:
+#   * sboSideBranch  — fork at-or-below the active work: stored, tip unchanged.
+#   * sboReorged     — strictly-heavier fork: handleReorg promotes it; UTXO and
+#                      tip switch to the fork; connectedBlocks/disconnectedTxs
+#                      surfaced for the caller's mempool refresh.
+#   * sboRejected    — unknown parent / validate-for-storage fails.
+# The two consensus dependencies are stubbed (validate ok / verify ok) because
+# the proc's reorg machinery — not consensus validation — is under test here;
+# the consensus envelope is covered by test_consensus / test_w101.
+# ============================================================================
+
+suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
+  setup:
+    cleanupTestDb()
+  teardown:
+    cleanupTestDb()
+
+  # Stub callbacks: accept-for-storage and script-verify both succeed, so the
+  # outcome is decided purely by the work comparison + fork-point walk.
+  proc okValidate(b: Block, prevIdx: BlockIndex): tuple[ok: bool, err: string]
+                 {.gcsafe, raises: [].} = (ok: true, err: "")
+  proc okVerify(b: Block, height: int32): tuple[ok: bool, err: string]
+               {.gcsafe, raises: [].} = (ok: true, err: "")
+
+  test "heavier fork below tip REORGS the active chain":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    # Active chain A: genesis -> 1A -> 2A (tip height 2).
+    let block1A = makeSimpleBlock(genesisHash, 1, extra = 0xAA)
+    discard cs.connectBlock(block1A, 1)
+    let block2A = makeSimpleBlock(getBlockHash(block1A), 2, extra = 0xAA)
+    discard cs.connectBlock(block2A, 2)
+    check cs.bestHeight == 2
+    let coinbase2A = block2A.txs[0].txid()
+    check cs.getUtxo(OutPoint(txid: coinbase2A, vout: 0)).isSome
+
+    # Competing fork B off genesis: 1B, 2B, 3B (height 3 => strictly heavier).
+    let block1B = makeSimpleBlock(genesisHash, 1, extra = 0xBB)
+    let block2B = makeSimpleBlock(getBlockHash(block1B), 2, extra = 0xBB)
+    let block3B = makeSimpleBlock(getBlockHash(block2B), 3, extra = 0xBB)
+    let hash3B = getBlockHash(block3B)
+
+    # Deliver the fork bottom-up, exactly as the P2P fork-body walk does.
+    # 1B and 2B are at/below the active work -> stored as side branches.
+    var dtx: seq[Transaction]
+    var conn: seq[Block]
+    let r1 = cs.acceptSideBranchBlock(block1B, okValidate, okVerify, dtx, conn)
+    check r1.outcome == sboSideBranch
+    check r1.token == "inconclusive"
+    check cs.bestHeight == 2            # tip unchanged
+    check conn.len == 0
+
+    let r2 = cs.acceptSideBranchBlock(block2B, okValidate, okVerify, dtx, conn)
+    check r2.outcome == sboSideBranch
+    check cs.bestHeight == 2
+
+    # 3B makes the fork strictly heavier -> REORG.
+    let r3 = cs.acceptSideBranchBlock(block3B, okValidate, okVerify, dtx, conn)
+    check r3.outcome == sboReorged
+    check r3.token == ""
+    check cs.bestHeight == 3
+    check cs.bestBlockHash == hash3B
+
+    # connectedBlocks must be fork-point+1 .. tip in connect order.
+    check conn.len == 3
+    check getBlockHash(conn[0]) == getBlockHash(block1B)
+    check getBlockHash(conn[2]) == hash3B
+
+    # UTXO set switched: chain-A tip coinbase gone, fork coinbases present.
+    check cs.getUtxo(OutPoint(txid: coinbase2A, vout: 0)).isNone
+    check cs.getUtxo(OutPoint(txid: block3B.txs[0].txid(), vout: 0)).isSome
+
+    # reorgVerifyHook must be cleared after the reorg (try/finally invariant).
+    check cs.reorgVerifyHook == nil
+    cs.close()
+
+  test "equal/lighter fork is stored as a side branch, NOT reorged":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    # Active chain A: genesis -> 1A -> 2A (tip 2).
+    let block1A = makeSimpleBlock(genesisHash, 1, extra = 0xAA)
+    discard cs.connectBlock(block1A, 1)
+    let block2A = makeSimpleBlock(getBlockHash(block1A), 2, extra = 0xAA)
+    discard cs.connectBlock(block2A, 2)
+    let coinbase2A = block2A.txs[0].txid()
+
+    # Fork of EQUAL height (2) off genesis: equal cumulative work -> NOT heavier.
+    let block1B = makeSimpleBlock(genesisHash, 1, extra = 0xBB)
+    let block2B = makeSimpleBlock(getBlockHash(block1B), 2, extra = 0xBB)
+
+    var dtx: seq[Transaction]
+    var conn: seq[Block]
+    discard cs.acceptSideBranchBlock(block1B, okValidate, okVerify, dtx, conn)
+    let r2 = cs.acceptSideBranchBlock(block2B, okValidate, okVerify, dtx, conn)
+    check r2.outcome == sboSideBranch
+    check r2.token == "inconclusive"
+    # Active tip UNCHANGED; chain-A UTXO still present.
+    check cs.bestHeight == 2
+    check cs.bestBlockHash == getBlockHash(block2A)
+    check cs.getUtxo(OutPoint(txid: coinbase2A, vout: 0)).isSome
+    # But the fork body IS findable by hash (durable for a future reorg).
+    check cs.db.getBlockIndex(getBlockHash(block2B)).isSome
+    cs.close()
+
+  test "unknown-parent block is rejected (not stored)":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+
+    # A block whose prevBlock is an all-0xEE hash that is on NO chain.
+    var bogusPrev: array[32, byte]
+    for i in 0 ..< 32: bogusPrev[i] = 0xEE
+    let orphan = makeSimpleBlock(BlockHash(bogusPrev), 1, extra = 0xCC)
+
+    var dtx: seq[Transaction]
+    var conn: seq[Block]
+    let r = cs.acceptSideBranchBlock(orphan, okValidate, okVerify, dtx, conn)
+    check r.outcome == sboRejected
+    check r.token == "rejected"
+    check cs.db.getBlockIndex(getBlockHash(orphan)).isNone   # not stored
+    cs.close()
+
+  test "validate-for-storage failure rejects with its bip22 token":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+    let block1A = makeSimpleBlock(genesisHash, 1, extra = 0xAA)
+    discard cs.connectBlock(block1A, 1)
+
+    # Fork body whose parent (genesis) IS known, but validation rejects it.
+    let block1B = makeSimpleBlock(genesisHash, 1, extra = 0xBB)
+    proc failValidate(b: Block, prevIdx: BlockIndex): tuple[ok: bool, err: string]
+                     {.gcsafe, raises: [].} = (ok: false, err: "bad-txns-in-belowout")
+
+    var dtx: seq[Transaction]
+    var conn: seq[Block]
+    let r = cs.acceptSideBranchBlock(block1B, failValidate, okVerify, dtx, conn)
+    check r.outcome == sboRejected
+    check r.token == "bad-txns-in-belowout"
+    # Validation failed BEFORE the store, so the body is not persisted.
+    check cs.db.getBlockIndex(getBlockHash(block1B)).isNone
+    cs.close()
+
 

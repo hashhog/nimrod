@@ -5465,164 +5465,55 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # Mirrors Bitcoin Core's `BlockManager::AcceptBlock` (validation.cpp):
       # every accepted block, whether on the active chain or a side-branch,
       # gets a CBlockIndex entry with cumulative chain_work and BLOCK_HAVE_DATA.
-      # Storage and best-chain selection are decoupled — without this, the
-      # block_index lookup below for B2 (parent = B1 on a side-branch) would
-      # return None and reject with "rejected" even though the parent is on
-      # disk. Pattern Y bug surfaced by the
-      # `regression/reorg-via-submitblock` corpus entry on 2026-05-05; partial
-      # form (B1 OK, B2 rejected) per
-      # CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md.
-      let prevIdxOpt = cs.db.getBlockIndex(prevHash)
-      if prevIdxOpt.isNone:
-        # Previous block truly unknown — "rejected" is closest BIP-22 token.
-        return %"rejected"
-
-      let prevIdx = prevIdxOpt.get()
-      let headerBytes = serialize(blk.header)
-      let blockHash = BlockHash(doubleSha256(headerBytes))
-      let newHeight = prevIdx.height + 1
-
-      # W155 BUG-17 fix: validate side-branch blocks BEFORE persisting them
-      # with bsValidated status. Previously this path stored the block after
-      # only `checkBlock` (PoW + merkle), bypassing BIP-30 dup-coinbase,
-      # BIP-34 height encoding, BIP-65/66 contextual checks, witness
-      # commitment match, MTP+1 timestamp, coinbase value, sigops cost,
-      # weight limit, IsFinalTx. The never-validated block would then be
-      # eligible for promotion to the active chain via `handleReorg`. Core's
-      # BlockManager::AcceptBlock applies the FULL CheckBlock +
-      # ContextualCheckBlock pipeline regardless of side-branch status
-      # (validation.cpp:4298+).
+      # Storage and best-chain selection are decoupled.
       #
-      # Script verification is intentionally skipped here because the active
-      # chainstate's UTXO set does not match this side-branch's parent state;
-      # scripts re-verify when `handleReorg` later calls `connectBlock` on
-      # the promoted chain (which rebuilds UTXO state to the fork point).
-      let sideValidation = validateForStorage(cs, blk, prevIdx, rpc.crypto)
-      if not sideValidation.isOk:
-        return %bip22String(sideValidation.error)
+      # The store + work-compare + fork-point walk + reorg now lives in the
+      # JSON-free chainstate.acceptSideBranchBlock so the P2P body path
+      # (network/sync.nim) reaches the SAME reorg machinery (reorg-drop fix,
+      # Part 2). This RPC arm builds the two injected consensus callbacks
+      # (validate-for-storage + the per-promoted-block script-verify hook),
+      # calls the proc, and maps its outcome back to BYTE-IDENTICAL BIP-22
+      # tokens. Behaviour is verbatim with the former inline arm; the
+      # corpus entry `regression/reorg-via-submitblock` must stay green.
 
-      # Compute work for this block from its nBits target. Mirrors the
-      # `calculateBlockWork` helper in chainstate.nim (file-private there;
-      # inlined here to avoid name-collision with network/sync.nim's `addWork`).
-      let target = compactToTarget(blk.header.bits)
-      var highestBit = 0
-      for i in countdown(31, 0):
-        if target[i] != 0:
-          highestBit = i * 8
-          var b = target[i]
-          while b != 0:
-            inc highestBit
-            b = b shr 1
-          break
+      # validate-for-storage callback: full CheckBlock + ContextualCheckBlock
+      # (scripts deferred to connect-time), bip22-mapped on failure. Wraps
+      # consensus/validation.validateForStorage so chainstate (no validation
+      # import) need not see ValidationError.
+      let validateForSide = proc(b: Block, prevIdx: chainstate.BlockIndex):
+                                 tuple[ok: bool, err: string] {.gcsafe, raises: [].} =
+        var vr: ValidationResult[void]
+        try:
+          {.gcsafe.}:
+            vr = validateForStorage(cs, b, prevIdx, rpc.crypto)
+        except CatchableError:
+          # Byte-identical with the old inline arm: an exception here used to
+          # propagate to handleSubmitBlock's outer catch -> %"rejected".
+          return (ok: false, err: "rejected")
+        except Exception:
+          return (ok: false, err: "rejected")
+        if vr.isOk: (ok: true, err: "")
+        else: (ok: false, err: bip22String(vr.error))
 
-      var blockWork: array[32, byte]
-      if highestBit > 0 and highestBit < 256:
-        let workBit = 256 - highestBit
-        let bytePos = workBit div 8
-        let bitPos = workBit mod 8
-        if bytePos < 32:
-          blockWork[bytePos] = byte(1 shl bitPos)
-      else:
-        blockWork[0] = 1  # minimum work
-
-      # newTotalWork = prevIdx.totalWork + blockWork  (256-bit LE add)
-      var newTotalWork = prevIdx.totalWork
-      var carry: uint32 = 0
-      for i in 0 ..< 32:
-        let sum = uint32(newTotalWork[i]) + uint32(blockWork[i]) + carry
-        newTotalWork[i] = byte(sum and 0xff)
-        carry = sum shr 8
-
-      # Persist the side-branch block: body + block-index entry. We deliberately
-      # do NOT update the height -> hash mapping (that belongs to the active
-      # chain) and we do NOT touch the UTXO set yet (that happens during reorg).
-      # Use a hash-only block-index put so the active chain's height index
-      # survives. status = bsValidated mirrors what `connectBlock` writes for
-      # happy-path acceptance; on a future reorg, the block goes through
-      # `connectBlock` again which updates undo-pos + retains validity.
-      cs.db.storeBlock(blk)
-      let sideIdx = BlockIndex(
-        hash: blockHash,
-        height: newHeight,
-        status: bsValidated,
-        prevHash: blk.header.prevBlock,
-        header: blk.header,
-        totalWork: newTotalWork,
-        undoPos: FlatFilePos(fileNum: -1, pos: -1),
-        failureFlags: BLOCK_NO_FAILURE,
-        sequenceId: 0,
-        nTx: int32(blk.txs.len)
-      )
-      cs.db.putBlockIndexHashOnly(sideIdx)
-
-      # Block is on a fork with same or less work — accepted as side-branch
-      # per BIP-22 ("inconclusive": accepted but not yet known to be on best
-      # chain).
-      if compareWork256(newTotalWork, cs.totalWork) <= 0:
-        return %"inconclusive"
-
-      # Side-branch has STRICTLY MORE WORK than the active chain. Reorg.
-      # 1. Walk back from the new tip's parent collecting blocks until we hit
-      #    a block hash that the active chain owns at that height — that is
-      #    the fork point.
-      # 2. Build the new-chain block list (fork-point exclusive .. new tip
-      #    inclusive).
-      # 3. Hand off to `handleReorg`, which disconnects active-chain blocks
-      #    back to the fork point and connects the new chain via
-      #    `connectBlock` (refreshing UTXO + undo-files for each block).
-      var newChainBlocks: seq[Block] = @[blk]
-      var walkHash = blk.header.prevBlock
-      var walkHeight = prevIdx.height
-      var forkPoint: BlockHash = BlockHash(default(array[32, byte]))
-      var foundFork = false
-      while walkHeight >= 0:
-        let activeAtHeight = cs.db.getBlockHashByHeight(walkHeight)
-        if activeAtHeight.isSome and activeAtHeight.get() == walkHash:
-          forkPoint = walkHash
-          foundFork = true
-          break
-        let walkBlkOpt = cs.db.getBlock(walkHash)
-        if walkBlkOpt.isNone:
-          # Side-branch is missing an ancestor body — cannot reorg. Block is
-          # already stored above, surface as inconclusive (operator can
-          # reconsiderblock once the gap fills).
-          return %"inconclusive"
-        let walkBlk = walkBlkOpt.get()
-        newChainBlocks.add(walkBlk)
-        walkHash = walkBlk.header.prevBlock
-        dec walkHeight
-      if not foundFork:
-        # No common ancestor (e.g. side-branch rooted before genesis). Bail.
-        return %"inconclusive"
-
-      # newChainBlocks was built tip..fork; reverse to get fork+1..tip order
-      # for `handleReorg`.
-      newChainBlocks.reverse()
-
-      # Wire the per-block script-verification hook so `handleReorg` re-runs
-      # full per-input script verification on each promoted side-branch block,
-      # exactly like Bitcoin Core's ConnectTip -> ConnectBlock does on a reorg.
-      # `validateForStorage` deliberately skipped verifyScripts at store time
-      # (the side-branch's UTXO context is not the active tip); this hook is
-      # where that deferred verification finally runs, against the UTXO view
-      # `handleReorg` rebuilds to the fork point. The hook reads UTXOs via
-      # `csCapture.getUtxo`, which inside the reorg honours the in-flight
-      # reorgDeletedUtxos / utxoCache / DB layering, so it sees the correct
-      # post-disconnect + partially-reconnected view at each step.
-      # Returning (ok: false) on a script failure aborts the reorg and leaves
-      # the original tip intact (handleReorg rolls back; no batch commit).
+      # Per-promoted-block script-verify hook — `handleReorg` fires it against
+      # the UTXO view it rebuilds to the fork point (Core ConnectTip ->
+      # ConnectBlock parity). The hook reads UTXOs via `csCapture.getUtxo`,
+      # which inside the reorg honours the in-flight reorgDeletedUtxos /
+      # utxoCache / DB layering. Returning (ok: false) aborts the reorg and
+      # leaves the original tip intact. `acceptSideBranchBlock` sets/clears
+      # cs.reorgVerifyHook in a try/finally so it cannot leak.
       let csCapture = cs
       let reorgCrypto = rpc.crypto
       let reorgParams = cs.params
-      cs.reorgVerifyHook = proc(blk: Block, height: int32): tuple[ok: bool, err: string]
-                                {.gcsafe, raises: [].} =
+      let reorgVerify = proc(b: Block, height: int32): tuple[ok: bool, err: string]
+                             {.gcsafe, raises: [].} =
         let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
           try: csCapture.getUtxo(op)
           except: none(UtxoEntry)
         var res: ValidationResult[void]
         try:
           {.gcsafe.}:
-            res = verifyScripts(blk, utxoLookup, height, reorgCrypto, reorgParams)
+            res = verifyScripts(b, utxoLookup, height, reorgCrypto, reorgParams)
         except CatchableError as e:
           return (ok: false, err: e.msg)
         except Exception as e:
@@ -5631,16 +5522,18 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         else: (ok: false, err: bip22String(res.error))
 
       var disconnectedTxs: seq[Transaction] = @[]
-      let reorgRes = cs.handleReorg(forkPoint, newChainBlocks, disconnectedTxs)
-      # Clear the hook after the reorg so it cannot leak into an unrelated
-      # later handleReorg call with a stale captured crypto/params.
-      cs.reorgVerifyHook = nil
-      if not reorgRes.isOk:
-        # Storage of the side-branch block already succeeded; the reorg
-        # failure leaves the original tip intact. Surface as inconclusive
-        # (same shape Core uses when AcceptBlock succeeds but ActivateBestChain
-        # later finds a problem).
-        return %"inconclusive"
+      var newChainBlocks: seq[Block] = @[]
+      let sideResult = acceptSideBranchBlock(cs, blk, validateForSide,
+                                             reorgVerify, disconnectedTxs,
+                                             newChainBlocks)
+
+      # Map the outcome to byte-identical BIP-22 tokens:
+      #   sboRejected  -> the carried token ("rejected" or bip22String(error))
+      #   sboSideBranch -> "inconclusive" (stored, not best — or reorg deferred)
+      #   sboReorged   -> success (JSON null) after the post-reorg refresh below.
+      if sideResult.outcome == sboRejected or
+         sideResult.outcome == sboSideBranch:
+        return %sideResult.token
 
       # Reorg succeeded — refresh in-flight bookkeeping that the happy-path
       # arm normally handles. Mempool: refill disconnected non-coinbase txs
