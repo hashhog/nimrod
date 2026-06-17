@@ -54,6 +54,39 @@ suite "miniscript parsing":
     check node.kind == MsAfter
     check node.lockValue == 500000000
 
+  test "older/after reject out-of-range timelock (1 <= n < 2^31)":
+    # BIP-65/BIP-68 + miniscript bound: older(n)/after(n) are only valid for
+    # 1 <= n < 2^31. Bitcoin Core's miniscript parser rejects any value with
+    # bit 31 set (`*num < 1 || *num >= 0x80000000L`,
+    # bitcoin-core/src/script/miniscript.h:2027,2034). For older(), bit 31
+    # collides with the BIP-68 disable flag.
+
+    # The largest in-range value (2^31 - 1) must still parse for BOTH fragments.
+    let olderMax = parseMiniscript("older(2147483647)")  # 0x7fffffff
+    check olderMax.kind == MsOlder
+    check olderMax.lockValue == 2147483647'u32
+    let afterMax = parseMiniscript("after(2147483647)")
+    check afterMax.kind == MsAfter
+    check afterMax.lockValue == 2147483647'u32
+
+    # n == 0 is rejected (lower bound) for both fragments.
+    expect(MiniscriptError):
+      discard parseMiniscript("older(0)")
+    expect(MiniscriptError):
+      discard parseMiniscript("after(0)")
+
+    # 2^31 has bit 31 set — Core rejects it; so must we (first out-of-range).
+    expect(MiniscriptError):
+      discard parseMiniscript("older(2147483648)")  # 0x80000000
+    expect(MiniscriptError):
+      discard parseMiniscript("after(2147483648)")
+
+    # The maximum 32-bit value must also reject for both fragments.
+    expect(MiniscriptError):
+      discard parseMiniscript("older(4294967295)")  # 0xffffffff
+    expect(MiniscriptError):
+      discard parseMiniscript("after(4294967295)")
+
   test "parse sha256":
     let hashHex = "6c60f404f8167a38fc70eaf8aa17ac351023bef86bcb9d1086a19afe95bd5333"
     let node = parseMiniscript("sha256(" & hashHex & ")")

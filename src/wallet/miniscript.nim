@@ -1652,14 +1652,32 @@ proc parseMiniscriptImpl(s: string, pos: var int, ctx: MsContext): MsNode =
     let numStr = parseUntil(s, pos, {')'})
     skipWhitespace(s, pos)
     expectChar(s, pos, ')')
-    result = MsNode(kind: MsOlder, lockValue: parseUInt(numStr.strip()).uint32)
+    let olderN = parseUInt(numStr.strip()).uint32
+    # BIP-68 / miniscript: the relative-timelock value must satisfy
+    # `1 <= n < 2^31`. n == 0 is meaningless and any value with bit 31 set
+    # collides with the BIP-68 disable flag, so Core rejects both. Mirrors
+    # `*num < 1 || *num >= 0x80000000L` in
+    # bitcoin-core/src/script/miniscript.h:2034.
+    if olderN == 0'u32 or olderN >= 0x80000000'u32:
+      raise newException(MiniscriptError,
+        "older() timelock out of range (must be 1 <= n < 2^31): " & $olderN)
+    result = MsNode(kind: MsOlder, lockValue: olderN)
 
   of "after":
     skipWhitespace(s, pos)
     let numStr = parseUntil(s, pos, {')'})
     skipWhitespace(s, pos)
     expectChar(s, pos, ')')
-    result = MsNode(kind: MsAfter, lockValue: parseUInt(numStr.strip()).uint32)
+    let afterN = parseUInt(numStr.strip()).uint32
+    # BIP-65 / miniscript: the absolute-locktime value must satisfy
+    # `1 <= n < 2^31`. n == 0 is meaningless and any value with bit 31 set is
+    # outside the range an `after()` can express, so Core rejects both. Mirrors
+    # `*num < 1 || *num >= 0x80000000L` in
+    # bitcoin-core/src/script/miniscript.h:2027.
+    if afterN == 0'u32 or afterN >= 0x80000000'u32:
+      raise newException(MiniscriptError,
+        "after() timelock out of range (must be 1 <= n < 2^31): " & $afterN)
+    result = MsNode(kind: MsAfter, lockValue: afterN)
 
   of "sha256":
     skipWhitespace(s, pos)

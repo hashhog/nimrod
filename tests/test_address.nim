@@ -147,6 +147,32 @@ suite "bech32 encoding":
     expect Bech32Error:
       discard bech32Decode("bc1qW508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
 
+  test "reject over-90-char string (BIP-173/350 CharLimit)":
+    # BIP-173/BIP-350 cap addresses at 90 characters; Core's bech32::Decode
+    # rejects anything longer (CharLimit::BECH32 = 90, bech32.cpp:378) before
+    # verifying the checksum. Build a 91-char string with a *valid* checksum:
+    # len = hrp("bc") + sep('1') + data + checksum(6) = 3 + data.len + 6, so
+    # data.len = 82 yields 91 chars. The checksum is valid, so the only reason
+    # to reject is length.
+    var data82: seq[int] = @[]
+    for i in 0 ..< 82: data82.add(i mod 32)
+    let overlong = bech32Encode("bc", data82, bech32m)
+    check overlong.len == 91
+    expect Bech32Error:
+      discard bech32Decode(overlong)
+
+  test "accept exactly 90-char string (CharLimit boundary)":
+    # A 90-character string is within the limit and must decode (checksum valid).
+    # len = 3 + data.len + 6 = 90  =>  data.len = 81.
+    var data81: seq[int] = @[]
+    for i in 0 ..< 81: data81.add(i mod 32)
+    let boundary = bech32Encode("bc", data81, bech32m)
+    check boundary.len == 90
+    let (hrp, decoded, enc) = bech32Decode(boundary)
+    check hrp == "bc"
+    check enc == bech32m
+    check decoded == data81
+
 suite "address encoding":
   test "decode P2PKH mainnet - genesis address":
     let addr1 = decodeAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
