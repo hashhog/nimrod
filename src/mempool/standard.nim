@@ -188,20 +188,32 @@ proc classifyStdTxout*(script: seq[byte]): StdTxoutKind =
 
 proc dustThreshold*(output: TxOut): Satoshi =
   ## Mirror of mempool.getDustThreshold so this module has zero dependence on
-  ## mempool.nim (avoids circular import). Identical formula.
-  if output.scriptPubKey.len > 0 and output.scriptPubKey[0] == 0x6a:  # OP_RETURN
+  ## mempool.nim (avoids circular import). Identical formula, faithful to Core
+  ## `GetDustThreshold` (policy/policy.cpp:27-63). NON-CONSENSUS relay policy.
+  ##
+  ##   nSize = (8 + CompactSize(scriptlen) + scriptlen) + spending_cost
+  ## spending_cost = 67 for witness programs (all versions, incl. P2TR) else 148;
+  ## threshold = CeilDiv(nSize * dustRelayFee, 1000).
+  ##
+  ## The previous version's witness test only matched version bytes 0x00..0x10,
+  ## so P2TR (version opcode OP_1 = 0x51) was mis-classified as legacy and its
+  ## dust threshold over-stated (573 vs Core 330). Use the Core-faithful
+  ## `isWitnessProgram` (handles OP_0 and OP_1..OP_16).
+  if isUnspendable(output.scriptPubKey):
     return Satoshi(0)
-  let outputSize = 8 + output.scriptPubKey.len + 1
-  let isWitProg = output.scriptPubKey.len >= 4 and
-                  output.scriptPubKey[0] >= 0x00'u8 and
-                  output.scriptPubKey[0] <= 0x10'u8 and
-                  int(output.scriptPubKey[1]) == output.scriptPubKey.len - 2
-  let inputSize = if isWitProg:
-                    32 + 4 + 1 + (107 div 4) + 4
-                  else:
-                    32 + 4 + 1 + 107 + 4
-  let totalSize = outputSize + inputSize
-  Satoshi((totalSize * StdDustRelayTxFee) div 1000)
+  let scriptLen = output.scriptPubKey.len
+  let scriptLenPrefix =
+    if scriptLen < 0xfd: 1
+    elif scriptLen <= 0xffff: 3
+    else: 5
+  let txoutSerSize = 8 + scriptLenPrefix + scriptLen
+  let (isWit, _, _) = isWitnessProgram(output.scriptPubKey)
+  let spendingCost = if isWit:
+                       32 + 4 + 1 + (107 div 4) + 4
+                     else:
+                       32 + 4 + 1 + 107 + 4
+  let nSize = txoutSerSize + spendingCost
+  Satoshi((nSize * StdDustRelayTxFee + 999) div 1000)
 
 proc isDustOutput*(output: TxOut): bool =
   int64(output.value) < int64(dustThreshold(output))

@@ -5027,6 +5027,12 @@ proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
         "services": servicesHex,
         "servicesnames": servicesNames,
         "relaytxes": peer.relay,
+        # Core v31.99 emits last_inv_sequence + inv_to_send between relaytxes and
+        # lastsend (rpc/net.cpp:242-245). nimrod tracks neither at the manager
+        # layer, so emit 0 — same pattern as addr_processed/addr_rate_limited
+        # (and Core itself for peers without a CNodeStateStats).
+        "last_inv_sequence": 0,
+        "inv_to_send": 0,
         "lastsend": peer.lastSeen.toUnix(),
         "lastrecv": peer.lastSeen.toUnix(),
         "last_transaction": 0,
@@ -5042,7 +5048,9 @@ proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
         "inbound": peer.direction == pdInbound,
         "bip152_hb_to": false,
         "bip152_hb_from": false,
-        "startingheight": peer.startHeight,
+        # Core v31.99 removed startingheight from getpeerinfo (rpc/net.cpp emits
+        # presynced_headers directly after bip152_hb_from; m_starting_height is no
+        # longer surfaced via RPC). Dropped for wire parity.
         "presynced_headers": -1,
         "synced_headers": rpc.chainState.bestHeight,
         "synced_blocks": rpc.chainState.bestHeight,
