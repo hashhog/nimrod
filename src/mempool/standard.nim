@@ -130,19 +130,59 @@ proc isStandardMultisig*(script: seq[byte]): tuple[ok: bool, m, n: int] =
   if nOp < OP_1 or nOp > OP_16: return (false, 0, 0)
   let n = int(nOp - OP_1 + 1)
 
-  # Walk pubkeys: between byte 1 and byte (len-2), expect n pushes of 33 or 65.
+  # Walk pubkeys: between byte 1 and byte (len-2), expect n pubkey pushes.
+  #
+  # Core's MatchMultisig (script/solver.cpp:85-105) reads each key with
+  # script.GetOp(it, opcode, data) — i.e. GetScriptOp (script/script.cpp), which
+  # decodes direct 1-byte pushes AND the OP_PUSHDATA1/2/4 forms — and accepts the
+  # key iff CPubKey::ValidSize(data), i.e. the *decoded* payload is 33 or 65 bytes
+  # (pubkey.h:77). So a pubkey pushed as `OP_PUSHDATA1 0x21 <33B>` is just as
+  # standard as the direct `0x21 <33B>` form. Matching only the direct-push
+  # opcodes (the old behaviour) over-rejected PUSHDATA-prefixed bare multisig that
+  # Core relays as standard MULTISIG. The push opcode is NOT required to be
+  # minimal here — Core does not call CheckMinimalPush on the keys.
+  # NON-consensus: relay standardness only.
+  let keyEnd = script.len - 2
   var pc = 1
   var pubkeysFound = 0
-  while pc < script.len - 2:
+  while pc < keyEnd:
     let opcode = script[pc]
-    if opcode == 33 or opcode == 65:
-      let pkLen = int(opcode)
-      if pc + 1 + pkLen > script.len - 2:
-        return (false, 0, 0)
-      pc += 1 + pkLen
-      inc pubkeysFound
+    var payloadLen: int
+    var headerLen: int
+    if opcode >= 0x01 and opcode <= 0x4b:
+      # Direct push of 1..75 bytes.
+      payloadLen = int(opcode)
+      headerLen = 1
+    elif opcode == 0x4c:
+      # OP_PUSHDATA1: 1-byte length follows.
+      if pc + 2 > keyEnd: return (false, 0, 0)
+      payloadLen = int(script[pc + 1])
+      headerLen = 2
+    elif opcode == 0x4d:
+      # OP_PUSHDATA2: 2-byte LE length follows.
+      if pc + 3 > keyEnd: return (false, 0, 0)
+      payloadLen = int(script[pc + 1]) or (int(script[pc + 2]) shl 8)
+      headerLen = 3
+    elif opcode == 0x4e:
+      # OP_PUSHDATA4: 4-byte LE length follows.
+      if pc + 5 > keyEnd: return (false, 0, 0)
+      payloadLen = int(script[pc + 1]) or
+                   (int(script[pc + 2]) shl 8) or
+                   (int(script[pc + 3]) shl 16) or
+                   (int(script[pc + 4]) shl 24)
+      headerLen = 5
     else:
+      # Not a data push → not a pubkey → not a (bare) multisig.
       return (false, 0, 0)
+    # CPubKey::ValidSize: only 33-byte (compressed) or 65-byte (uncompressed)
+    # payloads are valid public keys.
+    if payloadLen != 33 and payloadLen != 65:
+      return (false, 0, 0)
+    let endPos = pc + headerLen + payloadLen
+    if endPos > keyEnd:
+      return (false, 0, 0)
+    pc = endPos
+    inc pubkeysFound
   if pubkeysFound != n: return (false, 0, 0)
   if m < 1 or m > n: return (false, 0, 0)
   (true, m, n)
@@ -164,15 +204,20 @@ proc classifyStdTxout*(script: seq[byte]): StdTxoutKind =
     return stxP2TR
   let (isWit, ver, prog) = isWitnessProgram(script)
   if isWit:
-    # Well-formed witness program of unknown version — relay-standard per
-    # Core (forward compat for future witness versions). Length of program
-    # constrained by isWitnessProgram (2..40).
-    if ver == 0 and (prog.len == 20 or prog.len == 32):
-      # already covered above, fall-through guard.
-      return stxNonStandard
-    if ver == 1 and prog.len == 32:
-      return stxNonStandard  # already covered as stxP2TR above
-    return stxWitnessUnknown
+    # A well-formed witness program whose canonical type was NOT matched above.
+    # Mirror Bitcoin Core's Solver() exactly (script/solver.cpp:154-178): once
+    # the recognised witness types are ruled out (P2WPKH/P2WSH for v0, P2TR for
+    # v1+32 — all handled by the isP2W*/isP2TR checks above), Core returns
+    #   * WITNESS_UNKNOWN for *any* program with witnessversion != 0
+    #     (future segwit versions are relay-standard to create — forward compat);
+    #   * NONSTANDARD for a v0 program with a non-{20,32} size.
+    # The previous code returned stxWitnessUnknown for v0 non-canonical sizes too,
+    # which over-relayed outputs that Core treats as NONSTANDARD. NON-consensus:
+    # relay standardness only.
+    discard prog  # length already constrained to 2..40 by isWitnessProgram
+    if ver != 0:
+      return stxWitnessUnknown
+    return stxNonStandard
   if isStandardOpReturn(script):
     return stxNullData
   if isStandardP2PK(script):
