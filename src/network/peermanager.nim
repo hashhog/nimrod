@@ -33,6 +33,11 @@ const
   ReconnectInterval* = 30  # seconds
   PingInterval* = 120      # seconds
   GetAddrInterval* = 300   # seconds
+  # Periodic addrman flush (Bitcoin Core net.cpp DumpAddresses /
+  # DUMP_PEERS_INTERVAL = 15min): the addrman is persisted to peers.dat on a
+  # 900s cadence WHILE RUNNING so a SIGKILL/OOM does not lose every address
+  # learned since boot (the graceful-shutdown save in stop() still runs too).
+  DumpPeersInterval* = 900 # seconds (Core DUMP_PEERS_INTERVAL = 15min)
   # Feeler connections (Bitcoin Core net.cpp): every ~FEELER_INTERVAL the
   # connection-open loop opens ONE short-lived FEELER to a NEW-table address,
   # completes the handshake, promotes it NEW->TRIED via addrman Good(), then
@@ -1332,6 +1337,7 @@ proc mainLoop*(pm: PeerManager) {.async.} =
   var lastPing = getTime()
   var lastGetAddr = getTime()
   var lastFeeler = getTime()
+  var lastAddrDump = getTime()
   var lastStalePeerCheck = chronos.Moment.now()
 
   info "peer manager main loop started"
@@ -1358,6 +1364,20 @@ proc mainLoop*(pm: PeerManager) {.async.} =
     if (now - lastFeeler).inSeconds >= FeelerInterval:
       await pm.tryFeelerConnection()
       lastFeeler = now
+
+    # Periodic addrman flush (Core DumpAddresses / DUMP_PEERS_INTERVAL=900s):
+    # persist peers.dat while running so a SIGKILL/OOM does not lose addresses
+    # learned since boot.  Atomic temp+rename, best-effort (never fatal).
+    if (now - lastAddrDump).inSeconds >= DumpPeersInterval:
+      if pm.addrMan != nil:
+        # save() is best-effort (atomic temp+rename, swallows its own
+        # CatchableError); guard here so a periodic-flush failure can never
+        # abort the async main loop.
+        try:
+          pm.addrMan.save(pm.dataDir)
+        except Exception:
+          discard
+      lastAddrDump = now
 
     # Run stale peer checks every second (the functions handle their own intervals)
     if nowMoment - lastStalePeerCheck >= chronos.seconds(1):
