@@ -136,6 +136,15 @@ type
     utxoCache*: Table[OutPoint, UtxoEntry]
     cacheSize*: int
     maxCacheSize*: int  ## Flush at 50000
+    ## Per-instance byte-eviction ceiling for the UTXO cache (default
+    ## MaxCacheBytes = 2 GiB). evictCleanEntries evicts down to half this
+    ## value. Tunable via --dbcache=<MiB> (setDbCache); 0/absent leaves the
+    ## compiled-in default untouched, so behavior is byte-for-byte unchanged.
+    maxCacheBytes*: int
+    ## Per-instance IBD entry-count flush target read by startIBD (default
+    ## 200_000). Tunable via --dbcache (setDbCache scales it from the byte
+    ## budget); default-preserving when the flag is absent.
+    ibdMaxCacheSize*: int
     undoMgr*: UndoFileManager  ## Manages flat file undo storage
     # IBD batching state
     ibdBatch*: WriteBatch        ## Persistent write batch for IBD
@@ -740,6 +749,10 @@ const
   IbdBatchFlushInterval* = 2000
   ## Estimated bytes per cache entry (OutPoint key ~60 bytes + UtxoEntry ~80 bytes + Table overhead ~32 bytes)
   EstimatedEntryBytes* = 172
+  ## Default IBD entry-count flush target (set by startIBD; was the inline
+  ## literal 200_000). Named so setDbCache can scale it from a byte budget
+  ## while leaving the default-flag path on this exact value.
+  IbdMaxCacheEntries* = 200_000
 
 proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
   ## Create a new ChainState with given path and consensus params
@@ -753,6 +766,8 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     utxoCache: initTable[OutPoint, UtxoEntry](),
     cacheSize: 0,
     maxCacheSize: DefaultMaxCacheSize,
+    maxCacheBytes: MaxCacheBytes,        # default 2 GiB — unchanged unless --dbcache set
+    ibdMaxCacheSize: IbdMaxCacheEntries, # default 200_000 IBD flush target
     undoMgr: newUndoFileManager(dbPath / "blocks"),
     ibdBatch: nil,
     ibdBatchBlocks: 0,
@@ -1204,8 +1219,12 @@ proc startIBD*(cs: var ChainState) =
   cs.ibdBatch = cs.db.db.newWriteBatch()
   cs.ibdBatchBlocks = 0
   cs.ibdDeletedUtxos = initTable[string, bool]()
-  # Increase cache size during IBD to reduce DB lookups
-  cs.maxCacheSize = 200_000
+  # Increase cache size during IBD to reduce DB lookups. Reads the
+  # per-instance target (default IbdMaxCacheEntries = 200_000, possibly
+  # raised by setDbCache via --dbcache) so every startIBD call site —
+  # block-import, P2P SyncManager, RPC — inherits the operator override
+  # without each path needing to thread `config`.
+  cs.maxCacheSize = cs.ibdMaxCacheSize
   # Disable WAL for faster writes (data is durable via periodic batch flushes)
   cs.db.db.disableWAL()
 
@@ -1215,14 +1234,18 @@ proc evictCleanEntries*(cs: var ChainState) =
   ## During IBD the cache grows unbounded because flushIBDBatch writes entries
   ## to RocksDB but never removes them from memory. This bounds RSS.
   let cacheBytes = cs.cacheSize * EstimatedEntryBytes
-  if cacheBytes <= MaxCacheBytes:
+  # Per-instance ceiling (default MaxCacheBytes = 2 GiB; raised by --dbcache
+  # via setDbCache). Evict target is half the ceiling, matching the original
+  # EvictTargetBytes = MaxCacheBytes div 2 relationship.
+  let evictTargetBytes = cs.maxCacheBytes div 2
+  if cacheBytes <= cs.maxCacheBytes:
     return
 
   var toRemove: seq[OutPoint] = @[]
   var currentBytes = cacheBytes
 
   for op, entry in cs.utxoCache:
-    if currentBytes <= EvictTargetBytes:
+    if currentBytes <= evictTargetBytes:
       break
     toRemove.add(op)
     currentBytes -= EstimatedEntryBytes
@@ -1319,6 +1342,34 @@ proc stopIBD*(cs: var ChainState) =
   cs.maxCacheSize = DefaultMaxCacheSize
   # Re-enable WAL for normal operation
   cs.db.db.enableWAL()
+
+proc setDbCache*(cs: var ChainState, dbcacheMiB: int) =
+  ## Apply an operator --dbcache=<MiB> override to this ChainState's UTXO
+  ## cache sizing. PERF-ONLY / CONSENSUS-NEUTRAL: cache sizing never changes
+  ## which blocks/txs validate — only how often the cache flushes/evicts.
+  ##
+  ## When `dbcacheMiB <= 0` this is a strict NO-OP, so omitting --dbcache
+  ## leaves both the byte-eviction ceiling (MaxCacheBytes = 2 GiB) and the
+  ## IBD entry-count target (IbdMaxCacheEntries = 200_000) at their compiled
+  ## defaults — behavior byte-for-byte unchanged.
+  ##
+  ## When set, it raises BOTH bounds together from one byte budget:
+  ##   - maxCacheBytes  = dbcacheMiB * 1 MiB (the evictCleanEntries ceiling)
+  ##   - ibdMaxCacheSize = budget / EstimatedEntryBytes (the startIBD flush
+  ##     target), so the IBD entry count scales with the byte budget rather
+  ##     than staying pinned at 200_000.
+  ## Both are floored at their defaults so --dbcache can only ever raise the
+  ## cache, never shrink it below the proven-good baseline.
+  if dbcacheMiB <= 0:
+    return
+  let budgetBytes = dbcacheMiB * 1024 * 1024
+  cs.maxCacheBytes = max(budgetBytes, MaxCacheBytes)
+  let derivedEntries = budgetBytes div EstimatedEntryBytes
+  cs.ibdMaxCacheSize = max(derivedEntries, IbdMaxCacheEntries)
+  # If we are already in IBD when the override lands, apply the new target
+  # immediately (startIBD already ran and set maxCacheSize from the old value).
+  if cs.ibdMode:
+    cs.maxCacheSize = cs.ibdMaxCacheSize
 
 proc scrubUnspendable*(cs: var ChainState):
     tuple[removed: uint64, bytesFreed: uint64] =

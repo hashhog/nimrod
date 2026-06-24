@@ -17,6 +17,7 @@ import ./rpc/server
 import ./rpc/rpc_thread
 import ./rpc/rest
 import ./crypto/[secp256k1, hashing]
+import ./perf/verify_pool
 import ./util/ops
 
 const NimrodVersion* = "0.1.0"
@@ -50,6 +51,9 @@ type
     metricsPort*: uint16  ## Prometheus metrics port (0 = disabled)
     ibdFlushInterval*: int ## Disk flush interval during IBD (0 = use default 2000)
     numVerifyWorkers*: int ## Script verify thread count for parallel IBD (0 = auto = CPU count)
+    dbcacheMiB*: int      ## --dbcache=<MiB>: UTXO cache budget in MiB (Core units).
+                          ## 0 = use compiled defaults (2 GiB byte ceiling +
+                          ## 200_000 IBD entry target). PERF-ONLY / consensus-neutral.
     # ---- Operational flags (Bitcoin Core parity) ----
     daemon*: bool         ## --daemon: detach via fork+setsid; suppresses console.
     pidFile*: string      ## --pid=<path>: PID file (default <datadir>/nimrod.pid)
@@ -264,6 +268,7 @@ proc defaultConfig*(): NimrodConfig =
     metricsPort: 9332,
     ibdFlushInterval: 0,  # 0 = use default (IbdBatchFlushInterval = 2000)
     numVerifyWorkers: 0,  # 0 = auto (CPU count via countProcessors())
+    dbcacheMiB: 0,        # 0 = use compiled cache defaults (default-preserving)
     daemon: false,
     pidFile: "",          # derived from dataDir if empty
     confFile: "",         # default <dataDir>/nimrod.conf
@@ -359,6 +364,12 @@ proc loadConfigFile*(config: var NimrodConfig) =
         let v = parseInt(value)
         if v >= 0 and v <= 256:
           config.numVerifyWorkers = v
+      except ValueError: discard
+    of "dbcache":
+      try:
+        let v = parseInt(value)
+        if v >= 0 and v <= 1048576:
+          config.dbcacheMiB = v
       except ValueError: discard
     of "daemon":
       config.daemon = value.toLowerAscii() in ["1", "true", "yes"]
@@ -487,6 +498,9 @@ Options:
                          the given byte budget (Bitcoin Core parity).
   --ibd-flush-interval=N Force memtables to disk every N blocks during IBD (default: 2000, max: 5000)
   --verify-threads=N     Script verify thread count for parallel IBD (default: 0 = auto/CPU count)
+  --dbcache=N            UTXO cache budget in MiB, Bitcoin Core units (default: 0 =
+                         compiled default ~2 GiB ceiling + 200000 IBD entry target;
+                         only raises the cache, never shrinks below the default)
 
 Operational:
   --daemon               Detach via fork+setsid (Bitcoin Core -daemon)
@@ -670,6 +684,16 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           result.config.numVerifyWorkers = v
         except ValueError:
           echo "Invalid verify-threads: " & p.val
+          quit(1)
+      of "dbcache":
+        try:
+          let v = parseInt(p.val)
+          if v < 0 or v > 1048576:
+            echo "dbcache must be 0-1048576 MiB (0 = compiled default ~2 GiB)"
+            quit(1)
+          result.config.dbcacheMiB = v
+        except ValueError:
+          echo "Invalid dbcache: " & p.val
           quit(1)
       of "daemon":
         # Accept --daemon and --daemon=0/1.
@@ -1749,6 +1773,9 @@ proc runBlockImport*(config: NimrodConfig) =
   var cs = newChainState(networkDir / "chainstate", params)
   if config.ibdFlushInterval > 0:
     cs.ibdDiskFlushInterval = config.ibdFlushInterval
+  # --dbcache override (no-op when 0); set on the instance so the startIBD
+  # below inherits the raised IBD entry-count target.
+  cs.setDbCache(config.dbcacheMiB)
 
   # Initialize genesis if needed
   if cs.bestHeight < 0:
@@ -2190,11 +2217,28 @@ proc startNode*(config: NimrodConfig) {.async.} =
   info "initializing crypto engine"
   state.crypto = newCryptoEngine()
 
+  # 1a. Pre-warm the secp256k1 verify context and spin up the static parallel
+  # script-verification worker pool (W167). initVerifyPool() calls
+  # initSecp256k1() on THIS (main) thread before any worker can touch the
+  # global context, closing the lazy-init TOCTOU race, then spawns the bounded
+  # pool sized from --verify-threads (0 = auto = countProcessors()-1, clamped
+  # to Core's MAX_SCRIPTCHECK_THREADS=15). verifyScripts auto-dispatches to the
+  # pool once it is up. Must run before IBD / any acceptBlock call.
+  let verifyWorkers = clampWorkers(config.numVerifyWorkers)
+  info "initializing parallel script-verify pool",
+    workers = verifyWorkers, requested = config.numVerifyWorkers
+  initVerifyPool(config.numVerifyWorkers)
+
   # 2. Open database and chainstate
   info "opening database", path = networkDir / "chainstate"
   state.chainState = newChainState(networkDir / "chainstate", params)
   if config.ibdFlushInterval > 0:
     state.chainState.ibdDiskFlushInterval = config.ibdFlushInterval
+  # --dbcache override (no-op when 0); set once on the single ChainState
+  # instance the daemon shares, so the SyncManager and RPC startIBD call
+  # sites inherit the raised byte ceiling + IBD entry target without each
+  # needing `config` plumbed through.
+  state.chainState.setDbCache(config.dbcacheMiB)
 
   # Check for genesis block
   if state.chainState.bestHeight < 0:

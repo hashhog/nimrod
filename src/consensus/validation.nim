@@ -7,6 +7,7 @@ import ../crypto/[hashing, secp256k1]
 import ../storage/chainstate
 import ../script/interpreter
 import ../perf/sig_cache
+import ../perf/verify_pool
 import ./params
 from ./pow import nil
 
@@ -1712,28 +1713,50 @@ proc validateBlock*(
 
   ok()
 
-proc scriptFlagsToUint32(flags: set[ScriptFlags]): uint32 =
+proc scriptFlagsToUint32(flags: set[ScriptFlags]): uint32 {.used.} =
   ## Convert script flags set to a uint32 for use as cache key
   result = 0
   for f in flags:
     result = result or (1u32 shl uint32(ord(f)))
 
 # Script verification for a block
-proc verifyScripts*(
+#
+# W167 parallel-verify refactor. The former monolithic `verifyScripts` is split
+# into two procs so the serial and parallel paths consume a BYTE-IDENTICAL list
+# of script checks (no behavioural drift between them):
+#
+#   collectChecks — the serial FIRST PASS. Resolves every input's coin (intra-
+#                   block UTXOs first, then the supplied view), tracks the intra-
+#                   block UTXO set in the SAME mutation order as before, collects
+#                   the BIP-341 allAmounts/allScriptPubKeys arrays per tx, and
+#                   emits one `ScriptCheck` per non-coinbase input. A missing
+#                   coin aborts the whole pass with `veInputsMissing` BEFORE any
+#                   script runs (Core resolves all coins via the view first).
+#                   Coinbase (tx 0) is skipped exactly as before.
+#
+#   runChecks     — runs the emitted checks serially OR across the static worker
+#                   pool (perf/verify_pool.nim). Any single failure → reject.
+#
+# This also fixes G21: the worker calls the 9-arg `verifyScript` with the full
+# Taproot arrays carried on each `ScriptCheck` (the dead parallel path dropped
+# them and computed the wrong multi-input Taproot sighash).
+
+proc collectChecks*(
   blk: Block,
   utxos: proc(op: OutPoint): Option[UtxoEntry],
   height: int32,
-  crypto: CryptoEngine,
-  params: ConsensusParams
+  params: ConsensusParams,
+  checksOut: var seq[ScriptCheck]
 ): ValidationResult[void] =
-  ## Verify all scripts in a block
-  ## This is typically called after validateBlock passes
+  ## Serial first pass: resolve coins + build the per-input ScriptCheck list.
+  ## Returns veInputsMissing (and leaves checksOut empty/partial) if any input's
+  ## coin cannot be resolved. On success checksOut holds every non-coinbase
+  ## input's check in chain order.
 
   # Compute block hash for script_flag_exceptions check
   let headerBytes = serialize(blk.header)
   let blockHash = $BlockHash(doubleSha256(headerBytes))
   let flags = getBlockScriptFlags(height, params, blockHash)
-  let flagsUint = scriptFlagsToUint32(flags)
 
   # Track intra-block UTXOs for script verification
   var intraBlockUtxos = initTable[string, UtxoEntry]()
@@ -1748,12 +1771,9 @@ proc verifyScripts*(
       isCoinbase: true
     )
 
-  # Verify scripts for non-coinbase transactions
+  # Build checks for non-coinbase transactions
   for i in 1 ..< blk.txs.len:
     let tx = blk.txs[i]
-    # Use wtxid (witness transaction ID) as the cache key so witness-malleated
-    # variants of the same txid map to distinct cache entries (W105 G7 fix).
-    let txidBytes = array[32, byte](tx.wtxid())
 
     # Pre-collect ALL input UTXOs for this tx (needed for BIP341 taproot sighash)
     var allAmounts: seq[Satoshi] = @[]
@@ -1779,14 +1799,12 @@ proc verifyScripts*(
       return voidErr(veInputsMissing)
 
     for inputIdx, inp in tx.inputs:
-      # W160 BUG-11 fix: the previous input-level sigcache shortcut here
-      # ("if globalSigCache.lookup(wtxid, inputIdx, flags): continue") was
-      # structurally unsafe for tapscript-multisig inputs (one input → many
-      # OP_CHECKSIG calls with different sig/pubkey/sighash tuples). It also
-      # could not be re-keyed on (sighash, pubkey, sig) at this layer because
-      # a single input has no single sighash. The per-sig cache is now
-      # consulted inside the OP_CHECKSIG / OP_CHECKSIGADD opcode handlers
-      # (script/interpreter.nim) — same shape as Core's CachingTransactionSignatureChecker.
+      # W160 BUG-11 fix: per-sig caching lives inside the OP_CHECKSIG /
+      # OP_CHECKSIGADD handlers (script/interpreter.nim), not at this layer —
+      # see the long note that used to live here. The full Taproot arrays
+      # (allAmounts/allScriptPubKeys) are committed onto every ScriptCheck so
+      # the parallel worker computes the SAME BIP-341 sighash the serial path
+      # would (G21 fix).
       let utxo = allUtxos[inputIdx]
 
       # Get witness data for this input
@@ -1794,22 +1812,17 @@ proc verifyScripts*(
       if inputIdx < tx.witnesses.len:
         witness = tx.witnesses[inputIdx]
 
-      # Verify the script (pass all amounts/scriptPubKeys for taproot sighash)
-      let verified = verifyScript(
-        inp.scriptSig,
-        utxo.output.scriptPubKey,
-        tx,
-        inputIdx,
-        utxo.output.value,
-        flags,
-        witness,
-        allAmounts,
-        allScriptPubKeys
-      )
-
-      if not verified:
-        return voidErr(veScriptVerifyFailed)
-      discard txidBytes  ## silence-unused; retained for future wtxid-keyed script-execution cache (Core's m_script_execution_cache, W105 G13).
+      checksOut.add(ScriptCheck(
+        scriptSig: inp.scriptSig,
+        scriptPubKey: utxo.output.scriptPubKey,
+        tx: tx,
+        inputIndex: inputIdx,
+        amount: utxo.output.value,
+        flags: flags,
+        witness: witness,
+        allAmounts: allAmounts,
+        allScriptPubKeys: allScriptPubKeys
+      ))
 
     # Remove spent UTXOs
     for inp in tx.inputs:
@@ -1825,6 +1838,30 @@ proc verifyScripts*(
         height: height,
         isCoinbase: false
       )
+
+  ok()
+
+proc verifyScripts*(
+  blk: Block,
+  utxos: proc(op: OutPoint): Option[UtxoEntry],
+  height: int32,
+  crypto: CryptoEngine,
+  params: ConsensusParams
+): ValidationResult[void] =
+  ## Verify all scripts in a block. Called after validateBlock passes.
+  ##
+  ## Two phases (W167): collectChecks (serial coin-resolution + check build) then
+  ## runChecks (serial OR static-pool parallel — auto-selected by whether the
+  ## pool was started at boot via initVerifyPool). Any single failure rejects.
+  ## The `crypto` parameter is retained for signature compatibility; signature
+  ## verification routes through the process-global secp context.
+  var checks: seq[ScriptCheck] = @[]
+  let collectRes = collectChecks(blk, utxos, height, params, checks)
+  if not collectRes.isOk:
+    return collectRes
+
+  if not runChecks(checks):
+    return voidErr(veScriptVerifyFailed)
 
   ok()
 
