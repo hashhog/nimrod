@@ -4056,6 +4056,182 @@ proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   except CatchableError as e:
     raise newRpcError(RpcInvalidParams, "invalid transaction: " & e.msg)
 
+proc uvTypeName(node: JsonNode): string =
+  ## Mirror of Bitcoin Core's univalue ``UniValue::typeName`` (univalue.cpp:34),
+  ## used to render the dispatcher type-error messages byte-for-byte. Core maps
+  ## VOBJ->"object", VARR->"array", VSTR->"string", VNUM->"number",
+  ## VBOOL->"bool", VNULL->"null".
+  case node.kind
+  of JObject: "object"
+  of JArray:  "array"
+  of JString: "string"
+  of JInt:    "number"
+  of JFloat:  "number"
+  of JBool:   "bool"
+  of JNull:   "null"
+
+proc handleCombineRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Combine multiple partially-signed versions of the SAME transaction into one
+  ## carrying the union of their signature data.
+  ##
+  ## Reference: bitcoin-core/src/rpc/rawtransaction.cpp combinerawtransaction
+  ## (impl body 605-668). Each element of ``txs`` is a hex-encoded raw tx with
+  ## the SAME inputs/outputs/version/locktime but DIFFERENT partial signatures.
+  ## The first variant is the structural template; per input we merge the
+  ## scriptSig + witness across all variants and write the combined result back.
+  ## Returns the witness-serialized hex.
+  ##
+  ## SCOPE (= the ouroboros f4c98ee reference): single-sig parity, the dominant
+  ## case. For an input where each variant carries a complete single-key
+  ## signature for a DIFFERENT subset of inputs (or a variant is unsigned), we
+  ## take, per input, the non-empty (signed) scriptSig + witness. This is
+  ## BYTE-IDENTICAL to Core for single-sig inputs (P2PKH / P2WPKH / P2SH-P2WPKH),
+  ## because Core's ``DataFromTransaction`` returns the variant's scriptSig +
+  ## scriptWitness verbatim once ``VerifyScript`` marks the input complete, and
+  ## ``MergeSignatureData`` adopts that complete sigdata wholesale.
+  ##
+  ## KNOWN LIMITATION (flagged, NOT faked): the FULL Core behavior also merges
+  ## PARTIAL multisig signatures WITHIN a single input (two variants each
+  ## holding one of M sigs for a bare/P2SH/P2WSH M-of-N) via the extracted
+  ## (pubkey -> sig) map. That needs Solver / VerifyScript-with-a-signature-
+  ## extracting-checker / sighash validation, which this handler does NOT
+  ## implement. For an input partially signed in BOTH variants (neither alone
+  ## complete) we keep the longer (more-signatures) scriptSig+witness rather
+  ## than splicing the two sig sets together; that input's output is therefore
+  ## NOT guaranteed byte-identical to Core. The single-sig pick IS byte-identical.
+  ##
+  ## DEVIATION (flagged): Core resolves every input's prevout from its own
+  ## UTXO + mempool ``CCoinsViewCache`` and throws RPC_VERIFY_ERROR (-25)
+  ## "Input not found or already spent" when a coin is missing/spent. This
+  ## handler does NOT consult chainstate — combine is a pure function of the
+  ## provided variants here — so it does NOT raise -25 for unresolvable
+  ## prevouts. The byte-identical SUCCESS vector must therefore be run against a
+  ## Core oracle whose UTXO actually resolves the prevouts (a scratch regtest).
+  ## The -22 empty / -22 decode-failure / -3 type error paths DO match Core.
+
+  # Param shape: Core renders ``txs`` via the RPCHelpMan named-arg validator,
+  # so a non-array surfaces as RPC_TYPE_ERROR (-3) with the "Wrong type passed"
+  # wrapper (verified against live Core 8332). Missing arg behaves the same.
+  if params.len < 1 or params[0].kind != JArray:
+    let got =
+      if params.len < 1: "null"
+      else: uvTypeName(params[0])
+    raise newRpcError(RpcTypeError,
+      "Wrong type passed:\n{\n    \"Position 1 (txs)\": " &
+      "\"JSON value of type " & got &
+      " is not of expected type array\"\n}")
+
+  let txsArr = params[0]
+
+  # 1. Decode every variant (witness-aware). Core: DecodeHexTx per idx; on
+  #    failure -> -22 "TX decode failed for tx %d. ..." (0-based idx).
+  #    Iterate by INDEX (a 2-var `for` over a JsonNode binds pairs() which
+  #    asserts JObject and raises a non-catchable Defect on a JArray).
+  var variants: seq[Transaction]
+  for idx in 0 ..< txsArr.len:
+    let item = txsArr[idx]
+    if item.kind != JString:
+      # Core reads each element with .get_str() -> type error.
+      raise newRpcError(RpcTypeError,
+        "JSON value of type " & uvTypeName(item) &
+        " is not of expected type string")
+    var decoded: Transaction
+    var ok = true
+    try:
+      let raw = hexToBytes(item.getStr())
+      decoded = deserializeTransaction(raw)
+      if decoded.inputs.len == 0:
+        ok = false
+    except CatchableError:
+      ok = false
+    if not ok:
+      raise newRpcError(RpcDeserializationError,
+        "TX decode failed for tx " & $idx &
+        ". Make sure the tx has at least one input.")
+    variants.add(decoded)
+
+  # 2. Empty array -> -22 "Missing transactions".
+  if variants.len == 0:
+    raise newRpcError(RpcDeserializationError, "Missing transactions")
+
+  # 3. mergedTx starts as a clone of the first variant (the template: its
+  #    version / locktime / vin / vout define the result; only each input's
+  #    scriptSig + witness get rebuilt below).
+  let templateTx = variants[0]
+
+  var mergedInputs: seq[TxIn]
+  var mergedWitnesses: seq[seq[seq[byte]]]
+  var anyWitness = false
+
+  for i in 0 ..< templateTx.inputs.len:
+    let base = templateTx.inputs[i]
+    var bestScriptSig: seq[byte] = @[]
+    var bestWitness: seq[seq[byte]] = @[]
+    var bestScore = -1  # rank candidates; higher = more complete
+
+    for v in 0 ..< variants.len:
+      let variant = variants[v]
+      if i >= variant.inputs.len:
+        continue
+      let ss = variant.inputs[i].scriptSig
+      var wit: seq[seq[byte]] = @[]
+      if i < variant.witnesses.len:
+        wit = variant.witnesses[i]
+      var witNonEmpty = false
+      var witLen = 0
+      for x in wit:
+        witLen += x.len
+        if x.len > 0:
+          witNonEmpty = true
+      let ssNonEmpty = ss.len > 0
+
+      # Score the candidate so we deterministically prefer the variant that
+      # actually carries signature data for this input. Tie-break by total
+      # signature-data length (longer = more sigs, matching the partial-
+      # multisig fallback note above). Equal length -> keep the earliest
+      # variant (Core's merge is order-stable for the complete single-sig case).
+      var score: int
+      if not ssNonEmpty and not witNonEmpty:
+        score = 0
+      else:
+        score = 1_000_000 + ss.len + witLen
+
+      if score > bestScore:
+        bestScore = score
+        bestScriptSig = ss
+        bestWitness = wit
+
+    var bestWitNonEmpty = false
+    for x in bestWitness:
+      if x.len > 0:
+        bestWitNonEmpty = true
+        break
+    if bestWitNonEmpty:
+      anyWitness = true
+
+    mergedInputs.add(TxIn(
+      prevOut: base.prevOut,
+      scriptSig: bestScriptSig,
+      sequence: base.sequence,
+    ))
+    mergedWitnesses.add(bestWitness)
+
+  # Core re-encodes WITH witness (TX_WITH_WITNESS) unconditionally; nimrod's
+  # writeTransaction only emits the segwit marker/flag when tx.witnesses has a
+  # non-empty stack, so mirror Core (whose CTransaction::HasWitness drives the
+  # marker): keep the per-input witnesses iff ANY input carries one, otherwise
+  # clear them so the serializer emits a legacy (non-segwit) encoding.
+  var merged = Transaction(
+    version: templateTx.version,
+    inputs: mergedInputs,
+    outputs: templateTx.outputs,
+    lockTime: templateTx.lockTime,
+  )
+  if anyWitness:
+    merged.witnesses = mergedWitnesses
+
+  %toHex(merged.serialize(includeWitness = true))
+
 proc buildP2SHWrapAddress(script: seq[byte], mainnet: bool,
                           regtest: bool = false): string =
   ## Compute P2SH-wrap address for a redeem script.
@@ -12724,6 +12900,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetRawTransaction(params)
   of "decoderawtransaction":
     rpc.handleDecodeRawTransaction(params)
+  of "combinerawtransaction":
+    rpc.handleCombineRawTransaction(params)
   of "decodescript":
     rpc.handleDecodeScript(params)
   of "sendrawtransaction":
