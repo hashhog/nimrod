@@ -219,6 +219,18 @@ type
     # forward reference to a generic variant type as a proc return type here).
     reorgVerifyHook*: proc(blk: Block, height: int32): tuple[ok: bool, err: string]
                           {.gcsafe, raises: [].}
+    # Optional tip-advance hook fired AFTER the active-chain tip pointer is
+    # durably advanced — on post-IBD connect (`connectBlock`), IBD connect
+    # (`connectBlockIBD`), and reorg (`handleReorg`, which atomically advances
+    # the tip across BOTH halves: disconnect-to-fork then connect-new-branch).
+    # Wired by the daemon (src/nimrod.nim) to the wait-family tip notifier
+    # (src/util/tip_notifier.nim) so `waitfornewblock` / `waitforblock` /
+    # `waitforblockheight` wake promptly on every tip change. Mirrors Bitcoin
+    # Core's KernelNotifications::blockTip / WaitTipChanged fan-out from
+    # validation.cpp (fired once per tip update, reorg included). Indirected
+    # through a callback so chainstate.nim does not import the RPC layer. nil
+    # when no notifier is wired (tests / degraded boot) — fire is then a no-op.
+    tipChangedHook*: proc() {.gcsafe, raises: [].}
 
   ## Result type for chainstate operations
   ChainStateResult*[T] = object
@@ -1211,6 +1223,12 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   if cs.shouldFlush():
     cs.flushCache()
 
+  # Wake the wait-family RPCs on this tip advance (Core KernelNotifications
+  # blockTip / WaitTipChanged). Best-effort — a notifier fault must never
+  # stall block connection.
+  if cs.tipChangedHook != nil:
+    cs.tipChangedHook()
+
   ok()
 
 proc startIBD*(cs: var ChainState) =
@@ -1749,6 +1767,11 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
 
   # Periodically force memtables to SST (memtable → disk, slower but durable)
   cs.flushToDiskIfNeeded()
+
+  # Wake the wait-family RPCs on this IBD tip advance (Core KernelNotifications
+  # blockTip / WaitTipChanged fires during IBD too). Best-effort.
+  if cs.tipChangedHook != nil:
+    cs.tipChangedHook()
 
   ok()
 
@@ -2469,6 +2492,14 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   # Flush cache if it grew above threshold during the reorg.
   if cs.shouldFlush():
     cs.flushCache()
+
+  # Wake the wait-family RPCs on this reorg tip advance. A reorg is a tip
+  # change (Core KernelNotifications blockTip / WaitTipChanged fires on reorg
+  # too); this single atomic commit advanced the tip across BOTH halves
+  # (disconnect-to-fork then connect-new-branch), so one fire covers it.
+  # Best-effort.
+  if cs.tipChangedHook != nil:
+    cs.tipChangedHook()
 
   ok()
 

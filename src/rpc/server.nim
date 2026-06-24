@@ -18,6 +18,7 @@ import ../crypto/[hashing, secp256k1, address, signmessage]
 import ../network/[peer, peermanager, banman, messages, asmap, netgroup]
 import ../mining/[fees, blocktemplate]
 import ../util/ops as opsMod
+import ../util/tip_notifier
 import ../wallet/wallet
 import ../wallet/descriptor
 import ../wallet/manager
@@ -89,6 +90,16 @@ type
                                           ## networks so mainnet/testnet4 hardcoded
                                           ## entries are never touched. loadtxoutset
                                           ## checks params.assumeutxoData ++ this.
+    tipNotifier*: TipNotifier            ## Wake-on-tip-advance primitive for the
+                                          ## wait-family RPCs (waitfornewblock /
+                                          ## waitforblock / waitforblockheight).
+                                          ## Fired from the chainstate connect /
+                                          ## reorg chokepoints (main thread), and
+                                          ## awaited here on the RPC thread. nil =
+                                          ## no notifier wired (tests / degraded
+                                          ## boot); the wait handlers then return
+                                          ## the current tip immediately rather
+                                          ## than block. See src/util/tip_notifier.nim.
     snapshotActivation*: SnapshotActivation ## Live snapshot/background dual-chainstate
                                             ## once `loadtxoutset` has activated a
                                             ## snapshot. nil = single normal chainstate.
@@ -12810,6 +12821,167 @@ proc handleGetRPCInfo(rpc: RpcServer): JsonNode =
   discard rpc
   %*{"active_commands": [], "logpath": ""}
 
+# ---------------------------------------------------------------------------
+# Wait-family RPCs: waitfornewblock / waitforblock / waitforblockheight
+#
+# Bitcoin Core rpc/blockchain.cpp lines 290-470. Block until the active-chain
+# tip satisfies a predicate (new tip / hash match / height >=) OR a millisecond
+# timeout elapses, then return the CURRENT tip {hash, height} in either case.
+# Mirrors the proven ouroboros pilot (src/ouroboros/rpc.py _wait_for_tip + the
+# three handlers), which byte-matched live Core.
+#
+# These are async (they await the cross-thread TipNotifier on the RPC thread's
+# chronos loop), unlike the synchronous handleMethod dispatch — so they are
+# routed by asyncHandleRequest below, before the synchronous case-dispatch.
+# ---------------------------------------------------------------------------
+
+proc currentTipDisplay(rpc: RpcServer): tuple[hash: string, height: int32] =
+  ## Authoritative active-chain tip, display (big-endian hex) form. Re-read on
+  ## every wait wake so a coalesced / missed notify can never yield a wrong
+  ## answer (Core reads ActiveChain().Tip() each loop iteration).
+  let h = reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash)))
+  (h, rpc.chainState.bestHeight)
+
+proc parseWaitTimeoutMs(params: JsonNode, idx: int): int =
+  ## Read the `timeout` arg (Core getInt<int>(): non-integral -> RPC_TYPE_ERROR
+  ## -3; negative -> RPC_MISC_ERROR -1 "Negative timeout"). Absent / null = 0
+  ## (no timeout). Returns milliseconds.
+  if params.kind != JArray or idx >= params.len or params[idx].kind == JNull:
+    return 0
+  let t = params[idx]
+  if t.kind != JInt:
+    raise newRpcError(RpcTypeError,
+      "JSON value of type " & (
+        case t.kind
+        of JString: "string"
+        of JFloat: "number"
+        of JBool: "bool"
+        of JObject: "object"
+        of JArray: "array"
+        else: "null"
+      ) & " is not of expected type number")
+  let ms = t.getInt()
+  if ms < 0:
+    raise newRpcError(RpcMiscError, "Negative timeout")
+  ms
+
+proc parseWaitHeight(params: JsonNode, idx: int): int =
+  ## Read the `height` arg for waitforblockheight (Core getInt<int>(): a
+  ## non-integral height -> RPC_TYPE_ERROR -3). Required (no default).
+  if params.kind != JArray or idx >= params.len or params[idx].kind == JNull:
+    raise newRpcError(RpcTypeError,
+      "JSON value of type null is not of expected type number")
+  let h = params[idx]
+  if h.kind != JInt:
+    raise newRpcError(RpcTypeError,
+      "JSON value of type " & (
+        case h.kind
+        of JString: "string"
+        of JFloat: "number"
+        of JBool: "bool"
+        of JObject: "object"
+        of JArray: "array"
+        else: "null"
+      ) & " is not of expected type number")
+  h.getInt()
+
+proc waitForTip(rpc: RpcServer,
+                predicate: proc(displayHash: string, height: int32): bool {.gcsafe, raises: [].},
+                timeoutMs: int): Future[JsonNode] {.async.} =
+  ## Core's wait-tip-changed loop (rpc/blockchain.cpp) shared by all three
+  ## wait-family RPCs. Returns the current tip {hash, height} once `predicate`
+  ## holds OR `timeoutMs` (0 = no timeout) elapses — Core returns the current
+  ## block in both cases. Re-reads the AUTHORITATIVE tip on every wake.
+  var (displayHash, height) = rpc.currentTipDisplay()
+  if predicate(displayHash, height):
+    return %*{"hash": displayHash, "height": height}
+
+  let notifier = rpc.tipNotifier
+  if notifier == nil:
+    # No notifier wired (degraded boot): cannot block on tip changes; return
+    # the current tip rather than hang. Defensive fallback only.
+    return %*{"hash": displayHash, "height": height}
+
+  # Absolute deadline in monotonic milliseconds (integer math avoids the
+  # std/times vs chronos `milliseconds` symbol clash). Unused when timeoutMs==0.
+  let deadlineMs = monotonicMs() + timeoutMs.int64
+
+  while true:
+    # Snapshot the generation BEFORE re-checking the predicate so a notify that
+    # races in between the check and the await is observed (no lost wakeup).
+    let gen = notifier.generation()
+    (displayHash, height) = rpc.currentTipDisplay()
+    if predicate(displayHash, height):
+      return %*{"hash": displayHash, "height": height}
+
+    var sliceMs = timeoutMs
+    if timeoutMs > 0:
+      let remaining = deadlineMs - monotonicMs()
+      if remaining <= 0:
+        # Timed out — return the current tip (Core's behaviour).
+        return %*{"hash": displayHash, "height": height}
+      sliceMs = int(remaining)
+
+    discard await notifier.waitTipChanged(gen, sliceMs)
+
+proc rpcWaitForNewBlock(rpc: RpcServer, params: JsonNode): Future[JsonNode] {.async.} =
+  ## Core waitfornewblock(timeout=0, current_tip?). Wait until the tip differs
+  ## from `current_tip` (or, if omitted, the tip at call entry); return the tip.
+  ## `timeout` is milliseconds (0 = no timeout). On timeout returns current tip.
+  let timeoutMs = parseWaitTimeoutMs(params, 0)
+
+  # Reference hash the new tip must differ from. When current_tip is supplied
+  # it is parsed as a 64-hex uint256 (Core ParseHashV("current_tip") -> -8 on
+  # malformed). When omitted, snapshot the live tip.
+  var refHash: string
+  if params.kind == JArray and params.len > 1 and params[1].kind != JNull:
+    let ct = params[1]
+    if ct.kind != JString:
+      raise newRpcError(RpcInvalidParameter,
+        "current_tip must be hexadecimal string (not '" & $ct & "')")
+    validateHashV(ct.getStr(), "current_tip")
+    refHash = ct.getStr().toLowerAscii()
+  else:
+    let (h, _) = rpc.currentTipDisplay()
+    refHash = h
+
+  let p = proc(displayHash: string, height: int32): bool {.gcsafe, raises: [].} =
+    displayHash.toLowerAscii() != refHash
+  return await rpc.waitForTip(p, timeoutMs)
+
+proc rpcWaitForBlock(rpc: RpcServer, params: JsonNode): Future[JsonNode] {.async.} =
+  ## Core waitforblock(blockhash, timeout=0). Wait until the tip's hash equals
+  ## `blockhash`; return the tip. `blockhash` is parsed FIRST (Core parses it
+  ## before reading timeout), so a malformed blockhash errors -8 even when a
+  ## negative timeout is also supplied. `timeout` is milliseconds (0 = none).
+  if params.kind != JArray or params.len < 1 or params[0].kind == JNull:
+    raise newRpcError(RpcInvalidParameter,
+      "blockhash must be hexadecimal string (not 'null')")
+  let bh = params[0]
+  if bh.kind != JString:
+    raise newRpcError(RpcInvalidParameter,
+      "blockhash must be hexadecimal string (not '" & $bh & "')")
+  validateHashV(bh.getStr(), "blockhash")
+  let target = bh.getStr().toLowerAscii()
+
+  # Parsed AFTER blockhash (Core order).
+  let timeoutMs = parseWaitTimeoutMs(params, 1)
+
+  let p = proc(displayHash: string, height: int32): bool {.gcsafe, raises: [].} =
+    displayHash.toLowerAscii() == target
+  return await rpc.waitForTip(p, timeoutMs)
+
+proc rpcWaitForBlockHeight(rpc: RpcServer, params: JsonNode): Future[JsonNode] {.async.} =
+  ## Core waitforblockheight(height, timeout=0). Wait until the tip height >=
+  ## `height`; return the tip. `height` is read as an int (non-int -> -3).
+  ## `timeout` is milliseconds (0 = no timeout). On timeout returns current tip.
+  let targetHeight = parseWaitHeight(params, 0)
+  let timeoutMs = parseWaitTimeoutMs(params, 1)
+
+  let p = proc(displayHash: string, height: int32): bool {.gcsafe, raises: [].} =
+    int(height) >= targetHeight
+  return await rpc.waitForTip(p, timeoutMs)
+
 proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
   case methodName
   # Blockchain
@@ -12849,6 +13021,40 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetIndexInfo(params)
   of "getblockfilter":
     rpc.handleGetBlockFilter(params)
+
+  # Wait-family RPCs (waitfornewblock / waitforblock / waitforblockheight).
+  # The blocking, event-driven path runs in asyncHandleRequest (the async
+  # front door) for single requests. These sync entries exist so the methods
+  # are recognised in a JSON-RPC BATCH (which the sync path serves) instead of
+  # erroring "method not found": they validate the params with Core's exact
+  # error codes (-8 / -1 / -3) and then return the current tip immediately
+  # (non-blocking — a synchronous block here would freeze the whole RPC
+  # thread's event loop, which is worse than not waiting inside a batch).
+  of "waitfornewblock":
+    discard parseWaitTimeoutMs(params, 0)
+    if params.kind == JArray and params.len > 1 and params[1].kind != JNull:
+      if params[1].kind != JString:
+        raise newRpcError(RpcInvalidParameter,
+          "current_tip must be hexadecimal string (not '" & $params[1] & "')")
+      validateHashV(params[1].getStr(), "current_tip")
+    let (h0, ht0) = rpc.currentTipDisplay()
+    %*{"hash": h0, "height": ht0}
+  of "waitforblock":
+    if params.kind != JArray or params.len < 1 or params[0].kind == JNull:
+      raise newRpcError(RpcInvalidParameter,
+        "blockhash must be hexadecimal string (not 'null')")
+    if params[0].kind != JString:
+      raise newRpcError(RpcInvalidParameter,
+        "blockhash must be hexadecimal string (not '" & $params[0] & "')")
+    validateHashV(params[0].getStr(), "blockhash")
+    discard parseWaitTimeoutMs(params, 1)
+    let (h1, ht1) = rpc.currentTipDisplay()
+    %*{"hash": h1, "height": ht1}
+  of "waitforblockheight":
+    discard parseWaitHeight(params, 0)
+    discard parseWaitTimeoutMs(params, 1)
+    let (h2, ht2) = rpc.currentTipDisplay()
+    %*{"hash": h2, "height": ht2}
 
   # Chain management
   of "invalidateblock":
@@ -13338,6 +13544,92 @@ proc handleRequest(rpc: RpcServer, body: string, reqPath: string = ""): string =
   # Neither object nor array - invalid
   return makeErrorResponse(newJNull(), RpcParseError, "Top-level object parse error")
 
+proc isWaitMethod(m: string): bool =
+  m == "waitfornewblock" or m == "waitforblock" or m == "waitforblockheight"
+
+proc handleRequestSafe(rpc: RpcServer, body: string, reqPath: string): string {.gcsafe.} =
+  ## `handleRequest` wrapper that catches the full `Exception` surface (the
+  ## sync path can raise non-Catchable Defects via deep JSON/codec calls) so it
+  ## can be called from the async front door, whose machinery only permits a
+  ## restricted raises set. Mirrors the processClient catch ladder. The original
+  ## processClient call site wrapped handleRequest in `{.gcsafe.}` for the same
+  ## reason; preserve that.
+  {.gcsafe.}:
+    try:
+      result = rpc.handleRequest(body, reqPath)
+    except CatchableError:
+      result = makeErrorResponse(newJNull(), RpcInternalError, "internal error")
+    except Exception:
+      result = makeErrorResponse(newJNull(), RpcParseError, "parse error")
+
+proc asyncHandleRequest(rpc: RpcServer, body: string,
+                        reqPath: string = ""): Future[string] {.async.} =
+  ## Async front door for the request path. The three wait-family RPCs must
+  ## AWAIT a tip change (yielding the RPC thread's event loop so concurrent
+  ## RPCs — e.g. a second connection's generate/submitblock — keep running),
+  ## which the synchronous `handleRequest` dispatch cannot do. This intercepts
+  ## a single-object request to one of those three methods and runs the async
+  ## handler with a proper JSON-RPC envelope; EVERYTHING ELSE (every other
+  ## method, all batch requests) delegates unchanged to the synchronous
+  ## `handleRequest`, so existing behaviour is byte-for-byte preserved.
+  var parsed: JsonNode
+  try:
+    parsed = parseJson(body)
+  except CatchableError:
+    # Let the sync path produce the exact parse-error envelope.
+    return rpc.handleRequestSafe(body, reqPath)
+
+  # Only single-object requests to a wait method take the async path.
+  if parsed.kind != JObject or not parsed.hasKey("method") or
+     parsed["method"].kind != JString or
+     not isWaitMethod(parsed["method"].getStr()):
+    return rpc.handleRequestSafe(body, reqPath)
+
+  # Set the per-request wallet context exactly as the sync path does (harmless
+  # for these non-wallet RPCs, but keeps the field consistent).
+  block setWallet:
+    var p = reqPath
+    let q = p.find('?')
+    if q >= 0: p = p[0 ..< q]
+    if p.startsWith("/wallet/"):
+      rpc.currentWalletName = decodeUrlPathSegment(p["/wallet/".len .. ^1])
+    else:
+      rpc.currentWalletName = ""
+
+  let methodName = parsed["method"].getStr()
+  var requestId: JsonNode = newJNull()
+  if parsed.hasKey("id"):
+    requestId = parsed["id"]
+
+  var params = newJArray()
+  if parsed.hasKey("params"):
+    params = parsed["params"]
+  if params.kind == JObject:
+    try:
+      params = transformNamedParams(methodName, params)
+    except RpcError as e:
+      return makeErrorResponse(requestId, e.code, e.msg)
+    except CatchableError as e:
+      return makeErrorResponse(requestId, RpcInvalidParams, e.msg)
+
+  try:
+    let res =
+      case methodName
+      of "waitfornewblock":    await rpc.rpcWaitForNewBlock(params)
+      of "waitforblock":       await rpc.rpcWaitForBlock(params)
+      of "waitforblockheight": await rpc.rpcWaitForBlockHeight(params)
+      else:                    newJNull()  # unreachable (isWaitMethod gate)
+    return $ %*{
+      "jsonrpc": "2.0",
+      "id": requestId,
+      "result": res,
+      "error": newJNull()
+    }
+  except RpcError as e:
+    return makeErrorResponse(requestId, e.code, e.msg)
+  except CatchableError as e:
+    return makeErrorResponse(requestId, RpcInternalError, "internal error: " & e.msg)
+
 proc checkAuth(rpc: RpcServer, authHeader: string): bool =
   ## Verify HTTP Basic auth credentials.
   ## Accepts either --rpcuser/--rpcpassword credentials or the auto-generated
@@ -13416,14 +13708,17 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
             # starved during heavy RPC calls like getblock or gettxoutsetinfo.
             await sleepAsync(0)
 
+            # asyncHandleRequest awaits a tip change for the wait-family RPCs
+            # (waitfornewblock / waitforblock / waitforblockheight), yielding
+            # the event loop so concurrent RPCs keep running; every other
+            # method delegates synchronously to handleRequest unchanged.
             var respResult: string
-            {.gcsafe.}:
-              try:
-                respResult = rpc.handleRequest(body, reqPath)
-              except CatchableError:
-                respResult = makeErrorResponse(newJNull(), RpcInternalError, "internal error")
-              except Exception:
-                respResult = makeErrorResponse(newJNull(), RpcParseError, "parse error")
+            try:
+              respResult = await rpc.asyncHandleRequest(body, reqPath)
+            except CatchableError:
+              respResult = makeErrorResponse(newJNull(), RpcInternalError, "internal error")
+            except Exception:
+              respResult = makeErrorResponse(newJNull(), RpcParseError, "parse error")
 
             let httpResponse = "HTTP/1.1 200 OK\r\n" &
                               "Content-Type: application/json\r\n" &
