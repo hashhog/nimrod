@@ -6322,6 +6322,88 @@ proc handleUptime(rpc: RpcServer): JsonNode =
   let now = getTime().toUnix()
   %int(now - rpc.startedAt)
 
+proc handleGetMemoryInfo(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getmemoryinfo ( "mode" )
+  ## Returns an object containing information about memory usage.
+  ##
+  ## Reference: Bitcoin Core src/rpc/node.cpp getmemoryinfo (:145-198) +
+  ## RPCLockedMemoryInfo (:113-124) + RPCMallocInfo (:126-143).
+  ##
+  ## IMPORTANT SEMANTICS: this RPC reports Core's SECURE LOCKED-MEMORY POOL
+  ## (`LockedPoolManager` — the `mlock()`-backed allocator that keeps sensitive
+  ## data such as wallet private keys OFF swap), NOT general process/heap memory.
+  ## Do not confuse the "locked" memory here with the transaction "memory pool"
+  ## (mempool).
+  ##
+  ## Param:
+  ##   mode (str, OPTIONAL, default "stats"): kind of information to return.
+  ##     - "stats":      general statistics about memory usage in the daemon.
+  ##     - "mallocinfo": an XML string describing low-level heap state (Core:
+  ##                     only available when compiled with glibc).
+  ##
+  ## Returns (mode-dependent, matching Core exactly):
+  ##   - mode == "stats" -> OBJECT
+  ##       { "locked": { "used": int, "free": int, "total": int,
+  ##                     "locked": int, "chunks_used": int, "chunks_free": int } }
+  ##     All six inner values are non-negative integers (Core `size_t`), in this
+  ##     exact pushKV order. nimrod has NO Core-style `mlock()`-backed secure pool
+  ##     (verified: no LockedPool / mlock / sodium_mlock / VirtualLock in the
+  ##     source), so the honest answer is all zeros — but the keys/structure are
+  ##     ALWAYS present and identical to Core. A node with an empty/absent locked
+  ##     pool legitimately reports zeros; shape-match parity holds. We do NOT
+  ##     fabricate nonzero values.
+  ##   - mode == "mallocinfo" -> Core returns a glibc `malloc_info(3)` XML string
+  ##     ONLY when built with glibc (HAVE_MALLOC_INFO); on every other build it
+  ##     raises -8 "mallocinfo mode not available". nimrod has no glibc
+  ##     `malloc_info` equivalent wired up, so we faithfully take Core's non-glibc
+  ##     path — the exact -8 error — rather than fabricate a stub XML string Core
+  ##     never emits.
+  ##
+  ## Errors:
+  ##   - Non-string mode -> RPC_TYPE_ERROR (-3), a standard type check BEFORE any
+  ##     handler logic (Core reads `mode` via `Arg<std::string_view>`).
+  ##   - Unknown mode -> RPC_INVALID_PARAMETER (-8), message "unknown mode <mode>"
+  ##     (Core node.cpp:194, `tfm::format("unknown mode %s", mode)`).
+  ##
+  ## Pure read-only introspection of the daemon's own memory accounting; no side
+  ## effects, no chain/mempool/peer locks. Safe at any lifecycle stage.
+
+  # mode is read by Core as Arg<std::string_view> — default "stats" when the
+  # param is omitted or JNull; a non-string value is a JSON type error (-3)
+  # before any handler logic runs.
+  var mode = "stats"
+  if params.len >= 1 and params[0].kind != JNull:
+    if params[0].kind != JString:
+      raise newRpcError(RpcTypeError,
+        "JSON value of type " & $params[0].kind & " is not of expected type string")
+    mode = params[0].getStr()
+
+  if mode == "stats":
+    # Core RPCLockedMemoryInfo() reads LockedPoolManager::Instance().stats() and
+    # emits the six counters under "locked" in this exact order. nimrod has no
+    # mlock'd secure allocator, so every counter is an honest 0. Keys are always
+    # present.
+    var locked = newJObject()
+    locked["used"] = %0
+    locked["free"] = %0
+    locked["total"] = %0
+    locked["locked"] = %0
+    locked["chunks_used"] = %0
+    locked["chunks_free"] = %0
+    result = newJObject()
+    result["locked"] = locked
+    return result
+
+  if mode == "mallocinfo":
+    # Core returns glibc malloc_info(3) XML ONLY when built with glibc
+    # (HAVE_MALLOC_INFO); otherwise it raises -8 "mallocinfo mode not available"
+    # (node.cpp). nimrod takes Core's non-glibc path — the exact -8 error —
+    # rather than fabricate a stub XML string Core never emits.
+    raise newRpcError(RpcInvalidParameter, "mallocinfo mode not available")
+
+  # Any other mode is Core's RPC_INVALID_PARAMETER (-8) "unknown mode %s".
+  raise newRpcError(RpcInvalidParameter, "unknown mode " & mode)
+
 proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
   ## getmininginfo
   ## Returns a json object containing mining-related information.
@@ -6524,6 +6606,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "walletcreatefundedpsbt [{...}] [{addr:amt},...] ( locktime options bip32derivs )",
     "",
     "== Control ==",
+    "getmemoryinfo ( \"mode\" )",
     "help ( \"command\" )",
     "stop",
     "uptime",
@@ -12581,6 +12664,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     %"nimrod server stopping"
   of "uptime":
     rpc.handleUptime()
+  of "getmemoryinfo":
+    rpc.handleGetMemoryInfo(params)
   of "help":
     rpc.handleHelp(params)
 
@@ -12628,6 +12713,7 @@ proc namedArgPositions(methodName: string): seq[string] =
   of "rescanblockchain": @["start_height", "stop_height"]
   of "getdescriptorinfo": @["descriptor"]
   of "deriveaddresses": @["descriptor", "range"]
+  of "getmemoryinfo": @["mode"]
   else:
     raise newRpcError(RpcInvalidParams,
       "Named parameters are not supported for method " & methodName &
