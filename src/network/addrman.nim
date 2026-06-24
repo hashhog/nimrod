@@ -457,6 +457,55 @@ proc newCount*(t: AddrManTable): int = t.nNew
 proc triedCount*(t: AddrManTable): int = t.nTried
 proc totalCount*(t: AddrManTable): int = t.mapInfo.len
 
+# ---------------------------------------------------------------------------
+# Per-network new/tried counts — backing for the getaddrmaninfo RPC.
+# Mirrors Core AddrMan::Size(net, in_new) (addrman.cpp Size_ :1006-1026): a
+# per-network split of the NEW and TRIED tables.  Core keys these by the
+# address' GetNetClass() (netaddress.cpp).  nimrod's bucketed addrman stores
+# every entry in the 16-byte IPv4-mapped / native-IPv6 form, so it can hold
+# the three networks representable in 16 bytes: ipv4 (::ffff:a.b.c.d), cjdns
+# (fc00::/8), and ipv6 (everything else routable).  Onion v3 (32-byte) and
+# I2P (32-byte) do NOT fit this 16-byte store and are never placed here, so
+# their counts are always 0 (the getaddrmaninfo handler still emits those
+# keys at 0/0/0 to keep Core's fixed 6-key shape).
+# ---------------------------------------------------------------------------
+proc netClassName(ip16: array[16, byte]): string =
+  ## Map a stored 16-byte addrman entry to its Core network-name string.
+  ## GetNetClass parity for the networks a 16-byte address can encode.
+  ## IPv4-mapped (::ffff:a.b.c.d) -> "ipv4"; fc00::/8 -> "cjdns"; otherwise
+  ## native IPv6 -> "ipv6".  (Unroutable entries are never stored — add()
+  ## gates on isRoutable — so no not_publicly_routable/internal mapping is
+  ## needed; those are excluded from getaddrmaninfo by construction.)
+  var isV4Mapped = true
+  for i in 0..<10:
+    if ip16[i] != 0: isV4Mapped = false; break
+  if isV4Mapped and (ip16[10] != 0xFF or ip16[11] != 0xFF):
+    isV4Mapped = false
+  if isV4Mapped:
+    return "ipv4"
+  if ip16[0] == 0xFC'u8:   # CJDNS fc00::/8 (checked before the ULA range)
+    return "cjdns"
+  "ipv6"
+
+proc networkCounts*(t: AddrManTable): Table[string, tuple[newCount, triedCount: int]] =
+  ## Per-(network, table) counts for getaddrmaninfo.  Returns a map keyed by
+  ## Core network name -> (new-table count, tried-table count).  Networks with
+  ## no stored entries are simply absent from the map; the RPC handler
+  ## pre-seeds the full Core key set at zero before merging this in.
+  ##
+  ## Iterates mapInfo (the id->entry store) once and bumps the matching
+  ## (network, in_new|in_tried) counter, exactly mirroring Core's per-network
+  ## Size(net, in_new) split.  O(n) over the addrman, pure read, no mutation.
+  result = initTable[string, tuple[newCount, triedCount: int]]()
+  for info in t.mapInfo.values:
+    let name = netClassName(info.ip)
+    var cur = result.getOrDefault(name, (0, 0))
+    if info.inTried:
+      cur.triedCount += 1
+    else:
+      cur.newCount += 1
+    result[name] = cur
+
 proc isInTried*(t: AddrManTable, ip16: array[16, byte], port: uint16): bool =
   let k: AddrKey = (ip16, port)
   t.mapAddr.hasKey(k) and t.mapInfo.hasKey(t.mapAddr[k]) and
