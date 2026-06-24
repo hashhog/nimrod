@@ -134,6 +134,8 @@ const
   RpcClientNodeNotAdded* = -24       # addnode "remove" of a never-added node
   RpcClientNodeNotConnected* = -29   # disconnectnode for a peer not connected
   RpcClientInvalidIpOrSubnet* = -30  # setban with an invalid IP/subnet string
+  RpcClientP2pDisabled* = -31        # P2P/connman unavailable (Core RPC_CLIENT_P2P_DISABLED;
+                                     # EnsureConnman throws this for setnetworkactive)
 
   # Default maxfeerate: 0.10 BTC/kvB = 10,000,000 sat/kvB = 10,000 sat/vB
   DefaultMaxFeeRate* = 0.10  # BTC/kvB
@@ -4874,6 +4876,40 @@ proc handleGetZmqNotifications(rpc: RpcServer): JsonNode =
   notifications
 
 # Network RPCs
+proc handleSetNetworkActive(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Disable/enable all p2p network activity.
+  ## Reference: Bitcoin Core rpc/net.cpp setnetworkactive (:889) +
+  ## CConnman::SetNetworkActive (net.cpp:3361).
+  ##
+  ## Param:
+  ##   state (bool, REQUIRED): true to enable networking, false to disable.
+  ##
+  ## Returns the value that was passed in (a bare JSON boolean), read back from
+  ## the peer manager after the toggle (Core returns GetNetworkActive(), which
+  ## absent a race equals `state`). Setting false suppresses NEW connection
+  ## establishment ONLY — existing peers are NOT disconnected. The `networkactive`
+  ## field of getnetworkinfo mirrors this flag.
+
+  # Required positional bool. Core reads request.params[0].get_bool(): a missing
+  # arg is RPC_INVALID_PARAMETER (-8); a non-bool (int/float/string) is a JSON
+  # type error (RPC_TYPE_ERROR, -3). get_bool() is strict — it does NOT coerce
+  # ints/floats, so we accept only JBool.
+  if params.len < 1 or params[0].kind == JNull:
+    raise newRpcError(RpcInvalidParameter, "Missing required argument: state")
+  if params[0].kind != JBool:
+    raise newRpcError(RpcTypeError,
+      "JSON value of type " & $params[0].kind & " is not of expected type bool")
+  let state = params[0].getBool()
+
+  # EnsureConnman parity (server_util.cpp): a missing peer manager is
+  # RPC_CLIENT_P2P_DISABLED (-31), NOT an empty success.
+  if rpc.peerManager == nil:
+    raise newRpcError(RpcClientP2pDisabled,
+      "Error: Peer-to-peer functionality missing or disabled")
+
+  # SetNetworkActive then return the read-back value (Core net.cpp:904-906).
+  newJBool(rpc.peerManager.setNetworkActive(state))
+
 proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
   ## Return information about P2P networking
   ## Reference: Bitcoin Core rpc/net.cpp getnetworkinfo
@@ -4944,6 +4980,13 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
   if (localServicesBits and NodeP2pV2) != 0:           localServicesNames.add(%"P2P_V2")
   let localServicesHex = toHex(localServicesBits, 16).toLowerAscii()
 
+  # networkactive mirrors the node-global P2P-active flag (Core
+  # CConnman::GetNetworkActive, surfaced at rpc/net.cpp getnetworkinfo). Toggled
+  # by setnetworkactive; defaults true. Falls back to true when no peer manager
+  # is wired (test rigs) so the field shape is unchanged.
+  let networkActive =
+    if rpc.peerManager != nil: rpc.peerManager.networkActiveState() else: true
+
   %*{
     "version": 210000,
     "subversion": "/nimrod:0.1.0/",
@@ -4952,7 +4995,7 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
     "localservicesnames": localServicesNames,
     "localrelay": true,
     "timeoffset": 0,
-    "networkactive": true,
+    "networkactive": networkActive,
     "connections": connCount,
     "connections_in": inCount,
     "connections_out": outCount,
@@ -6382,6 +6425,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "getzmqnotifications",
     "listbanned",
     "setban \"subnet\" \"command\" ( bantime absolute )",
+    "setnetworkactive state",
     "",
     "== Rawtransactions ==",
     "decoderawtransaction \"hexstring\"",
@@ -12285,6 +12329,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   # Network
   of "getnetworkinfo":
     rpc.handleGetNetworkInfo()
+  of "setnetworkactive":
+    rpc.handleSetNetworkActive(params)
   of "getpeerinfo":
     rpc.handleGetPeerInfo()
   of "getconnectioncount":

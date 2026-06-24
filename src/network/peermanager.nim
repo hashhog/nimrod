@@ -187,6 +187,19 @@ type
     # address book (which also holds gossiped/seed addresses); only
     # operator-pinned entries live here.
     addedNodes*: seq[string]
+    # Node-global "P2P network active" flag (Core CConnman.fNetworkActive,
+    # net.h:1164 / SetNetworkActive net.cpp:3361, default true).  Toggled by the
+    # `setnetworkactive` RPC and surfaced read-only as `networkactive` in
+    # getnetworkinfo.  When false we suppress NEW connection establishment ONLY —
+    # existing/established peers are NOT force-dropped (Core's contract):
+    # (a) inbound accepts are refused (handleInboundConnection, Core net.cpp:1786),
+    # (b) the outbound auto-dial refill / anchor / --connect-reconnect AND
+    # (c) DNS-seed / fixed-seed re-seeding are all skipped at the single
+    # startOutboundConnections chokepoint (Core's connect-loop gates net.cpp:
+    # 2351/3022/3219).  The disconnected-peer cleanup, ban cleanup and stale-peer
+    # health sweeps keep running unconditionally.  Not persisted; resets to
+    # enabled on restart.
+    networkActive*: bool
 
 # Forward declarations
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
@@ -230,6 +243,30 @@ proc addedNodesList*(pm: PeerManager): seq[string] =
   ## Snapshot of the current `addnode`-managed node strings (for
   ## getaddednodeinfo / tests). Mirrors reading CConnman::m_added_node_params.
   pm.addedNodes
+
+proc setNetworkActive*(pm: PeerManager, state: bool): bool =
+  ## Enable/disable all NEW P2P network activity. nimrod equivalent of Bitcoin
+  ## Core's CConnman::SetNetworkActive (src/net.cpp:3361).
+  ##
+  ## Idempotent: when the flag already equals `state` this logs + early-returns
+  ## the current value (no notification, no other side effect), exactly like
+  ## Core. Otherwise it flips the atomic flag. Does NOT disconnect existing /
+  ## established peers — it only suppresses establishing NEW connections (inbound
+  ## accept, outbound auto-dial refill / anchor / --connect-reconnect, and
+  ## DNS/fixed-seed re-seeding). Returns the read-back value (Core returns
+  ## GetNetworkActive(), which absent a race equals `state`). Not persisted;
+  ## resets to enabled on restart.
+  if pm.networkActive == state:
+    debug "SetNetworkActive (unchanged)", state = state
+    return pm.networkActive
+  pm.networkActive = state
+  info "SetNetworkActive", state = state
+  pm.networkActive
+
+proc networkActiveState*(pm: PeerManager): bool =
+  ## Read-back accessor for the node-global P2P-active flag (Core
+  ## CConnman::GetNetworkActive). Surfaced as `networkactive` in getnetworkinfo.
+  pm.networkActive
 
 # ─────────────────────────────────────────────────────────────────────────────
 # W117 BUG-3 FIX (FIX-56): proxy/network-type configuration helpers.
@@ -343,6 +380,9 @@ proc newPeerManager*(params: ConsensusParams,
     fallbackPeers: @[],
     connectPeers: @[],
     dnsSeedEnabled: true,
+    # Core CConnman.fNetworkActive defaults true; the gates are no-ops while true
+    # so default behavior is byte-for-byte identical to before this flag existed.
+    networkActive: true,
     ourHeight: 0,
     inFlightBlocks: initTable[BlockHash, InFlightBlock](),
     running: false,
@@ -887,6 +927,18 @@ proc connectToAnchors*(pm: PeerManager) {.async.} =
     discard await pm.connectToPeerWithType(address, port, pctBlockRelayOnly)
 
 proc startOutboundConnections*(pm: PeerManager) {.async.} =
+  # Network-active gate (Core net.cpp:2351/3022/3219): while networking is
+  # disabled (`setnetworkactive false`) the outbound connect path holds off
+  # establishing ANY new connection — this single chokepoint covers the pinned
+  # --connect reconnect, anchor dialing, DNS-seed + fixed-seed re-seeding, and
+  # the addrman auto-outbound refill alike. Existing peers stay up (the
+  # disconnected-peer cleanup, ban cleanup and stale-peer health sweeps run
+  # unconditionally elsewhere); only NEW establishment is suppressed. No-op when
+  # active (default), so behavior is identical to before this flag existed.
+  if not pm.networkActive:
+    debug "skipping outbound connections (networking inactive)"
+    return
+
   info "starting outbound connections",
        maxFullRelay = pm.maxOutboundFullRelay,
        maxBlockRelay = pm.maxOutboundBlockRelay
@@ -1007,6 +1059,14 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
 
   if pm.isBanned(address):
     debug "rejecting banned inbound connection", address = address
+    await transp.closeWait()
+    return
+
+  # Network-active gate (Core net.cpp:1786): while networking is disabled
+  # (`setnetworkactive false`) refuse NEW inbound connections. Existing peers are
+  # untouched — only new establishment is suppressed.
+  if not pm.networkActive:
+    debug "rejecting inbound connection (networking inactive)", address = address
     await transp.closeWait()
     return
 
