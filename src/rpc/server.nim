@@ -5323,6 +5323,113 @@ proc handleAddNode(rpc: RpcServer, params: JsonNode): JsonNode =
 
   newJNull()
 
+proc handleGetAddedNodeInfo(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getaddednodeinfo ( "node" )
+  ## Return information about the persistent `addnode`-managed list.
+  ##
+  ## Reference: Bitcoin Core rpc/net.cpp getaddednodeinfo (:486-558) +
+  ## CConnman::GetAddedNodeInfo (net.cpp:2914). Mirrors Core's exact shape:
+  ##
+  ##   [ { "addednode": <str>,          # node as provided to addnode
+  ##       "connected": <bool>,         # a current peer matches
+  ##       "addresses": [               # ALWAYS present; [] when not connected
+  ##         { "address": <str ip:port>,
+  ##           "connected": "inbound" | "outbound" } ] },  # at most ONE entry
+  ##     ... ]
+  ##
+  ## Param:
+  ##   node (str, OPTIONAL): if provided, return only the matching added node.
+  ##     Matching is exact-string equality against the value originally passed
+  ##     to `addnode` (Core: m_params.m_added_node == node). If it is NOT on the
+  ##     added list, raise -24 RPC_CLIENT_NODE_NOT_ADDED with the EXACT message
+  ##     "Error: Node has not been added." (net.cpp:534). If omitted, all added
+  ##     nodes are returned ([] when none). `onetry` adds are NOT on the list
+  ##     (Core parity — net.cpp:352-357; nimrod's handleAddNode "onetry" path
+  ##     does not touch addedNodes).
+  ##
+  ## nimrod stores the added-node registry as PeerManager.addedNodes, keyed by
+  ## the EXACT operator-supplied string (CConnman::m_added_node_params
+  ## equivalent). The `addednode` field reports that raw string. The optional
+  ## `node` filter matches it by exact string equality (Core), with a
+  ## normalized "host:port" fallback so `getaddednodeinfo "1.2.3.4"` also
+  ## matches a node added as "1.2.3.4:<defaultPort>". Pure read — no side
+  ## effects.
+
+  # EnsureConnman parity (server_util.cpp): a missing peer manager is a hard
+  # error, not an empty success.
+  if rpc.peerManager == nil:
+    raise newRpcError(RpcInternalError, "peer manager not available")
+
+  # Normalize a "host[:port]" string to the canonical "host:port" key form
+  # the live peer table uses (address & ":" & port), appending the default
+  # P2P port when none is supplied. Mirrors handleAddNode's host/port parse.
+  proc normalizeKey(nodeAddr: string): string =
+    let colonIdx = nodeAddr.rfind(':')
+    if colonIdx > 0:
+      let host = nodeAddr[0 ..< colonIdx]
+      try:
+        let port = uint16(parseInt(nodeAddr[colonIdx + 1 .. ^1]))
+        return host & ":" & $port
+      except ValueError:
+        return nodeAddr  # malformed: leave as-is; it just won't join a peer
+    nodeAddr & ":" & $rpc.params.defaultPort
+
+  # Snapshot the persistent added-node list. Insertion order is preserved
+  # (Core outputs m_added_node_params in insertion order).
+  var addedKeys = rpc.peerManager.addedNodesList()
+
+  # Build a lookup of currently-connected peers keyed by "host:port" -> inbound?
+  # (Core builds maps keyed by resolved CService and by addr_name.)
+  var connected = initTable[string, bool]()
+  for peer in rpc.peerManager.getReadyPeers():
+    connected[peer.address & ":" & $peer.port] = (peer.direction == pdInbound)
+
+  # Optional `node` filter: exact-string match against the raw added list
+  # (Core net.cpp:529-535), with a normalized "host:port" fallback so a
+  # port-appended stored entry matches a bare-host filter and vice versa.
+  if params.len >= 1 and params[0].kind != JNull:
+    if params[0].kind != JString:
+      raise newRpcError(RpcTypeError,
+        "JSON value of type " & $params[0].kind & " is not of expected type string")
+    let want = params[0].getStr()
+    var matched = ""
+    var found = false
+    for k in addedKeys:
+      if k == want:
+        matched = k
+        found = true
+        break
+    if not found:
+      let wantNorm = normalizeKey(want)
+      for k in addedKeys:
+        if normalizeKey(k) == wantNorm:
+          matched = k
+          found = true
+          break
+    if not found:
+      # Core net.cpp:534 — EXACT message, leading "Error: ", trailing period.
+      raise newRpcError(RpcClientNodeNotAdded, "Error: Node has not been added.")
+    addedKeys = @[matched]
+
+  var ret = newJArray()
+  for key in addedKeys:
+    let liveKey = normalizeKey(key)
+    let isConnected = connected.hasKey(liveKey)
+    var addresses = newJArray()
+    if isConnected:
+      addresses.add(%*{
+        "address": liveKey,
+        # Bare direction string per Core net.cpp:548 — "inbound"/"outbound",
+        # NOT "manual"/"feeler".
+        "connected": (if connected[liveKey]: "inbound" else: "outbound"),
+      })
+    ret.add(%*{
+      "addednode": key,
+      "connected": isConnected,
+      "addresses": addresses,
+    })
+  ret
+
 # Mining RPCs
 proc handleGetBlockTemplate(rpc: RpcServer, params: JsonNode): JsonNode =
   # Build a minimal coinbase script (OP_TRUE for regtest/testing)
@@ -12493,6 +12600,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetAddrmanInfo()
   of "addnode":
     rpc.handleAddNode(params)
+  of "getaddednodeinfo":
+    rpc.handleGetAddedNodeInfo(params)
   of "listbanned":
     rpc.handleListBanned()
   of "setban":
