@@ -1507,6 +1507,14 @@ proc addKnownAddress*(pm: PeerManager, address: NetAddress,
 proc getKnownAddresses*(pm: PeerManager): seq[NetAddress] =
   pm.knownAddresses
 
+proc addrmanNetworkCounts*(pm: PeerManager): Table[string, tuple[newCount, triedCount: int]] =
+  ## Per-network new/tried counts from the bucketed addrman — backing for the
+  ## getaddrmaninfo RPC.  Pure read.  Returns an empty map when the addrman is
+  ## absent (e.g. -connect mode), which the RPC handler renders as all-zero.
+  if pm.addrMan == nil:
+    return initTable[string, tuple[newCount, triedCount: int]]()
+  pm.addrMan.networkCounts()
+
 proc addrToIp16(address: string): array[16, byte] =
   ## Parse an address string into the 16-byte IPv4-mapped / native-IPv6 form
   ## used by the addrman tables.  Returns all-zero on parse failure.
@@ -1643,7 +1651,8 @@ proc dumpKnownAddresses*(pm: PeerManager, count: int,
   rows
 
 proc injectKnownAddress*(pm: PeerManager, address: string, port: uint16,
-                         services: uint64, time: uint32): bool =
+                         services: uint64, time: uint32,
+                         tried: bool = false): bool =
   ## Core-shaped addpeeraddress backend (rpc/net.cpp:992-1013): parse the IP
   ## literal, build the 16-byte IPv4-mapped / native-IPv6 form, stamp the
   ## supplied time, and insert into the known-address pool (deduped by ip+port).
@@ -1662,6 +1671,17 @@ proc injectKnownAddress*(pm: PeerManager, address: string, port: uint16,
     ipBytes[15] = ip.v4[3]
   if not isRoutable(ipBytes):
     return false
+  let stamp = (if time == 0: uint32(epochTime().int) else: time)
+  # Core's addpeeraddress inserts into the addrman (CAddrMan::Add), and when
+  # `tried` is set additionally marks it Good (NEW->TRIED).  Mirror that into
+  # the bucketed addrman so getaddrmaninfo sees these entries and the tried
+  # flag is honoured (previously a no-op — the addrman was never touched here).
+  if pm.addrMan != nil:
+    discard pm.addrMan.add(ipBytes, port, ipBytes, services,
+                           int64(stamp), pm.netGroupManager)
+    if tried:
+      discard pm.addrMan.good(ipBytes, port, getTime().toUnix(),
+                              pm.netGroupManager)
   # Dedup by ip+port (mirrors the addr-message insert path).
   for ka in pm.knownAddresses:
     if ka.ip == ipBytes and ka.port == port:
@@ -1670,7 +1690,7 @@ proc injectKnownAddress*(pm: PeerManager, address: string, port: uint16,
     services: services,
     ip: ipBytes,
     port: port,
-    lastSeen: (if time == 0: uint32(epochTime().int) else: time)))
+    lastSeen: stamp))
   true
 
 proc relayAddresses(pm: PeerManager, source: Peer) =

@@ -5173,8 +5173,12 @@ proc handleAddPeerAddress(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let addrString = params[0].getStr()
   let port = uint16(params[1].getInt())
-  # `tried` (params[2]) accepted for Core-shape parity; the nimrod addrman has no
-  # separate tried table, so the flag is a no-op (the insert always lands).
+  # `tried` (params[2], optional, default false): when true the address is also
+  # promoted NEW->TRIED in the bucketed addrman (Core marks it Good), so it
+  # lands in the tried table that getaddrmaninfo reports.
+  var tried = false
+  if params.len >= 3 and params[2].kind != JNull:
+    tried = params[2].getBool()
 
   # Optional `services` (positional 3) — lets the differential set a known
   # services bitfield. Core hardcodes NODE_NETWORK|NODE_WITNESS; we default to
@@ -5190,11 +5194,74 @@ proc handleAddPeerAddress(rpc: RpcServer, params: JsonNode): JsonNode =
     return obj
 
   let ok = rpc.peerManager.injectKnownAddress(
-    addrString, port, services, uint32(epochTime().int))
+    addrString, port, services, uint32(epochTime().int), tried)
   obj["success"] = %ok
   if not ok:
     obj["error"] = %"Invalid or non-routable IP address"
   obj
+
+proc handleGetAddrmanInfo(rpc: RpcServer): JsonNode =
+  ## Provide information about the node's address manager: per-network counts
+  ## of addresses in the `new` and `tried` tables plus their sum.
+  ## Byte-shape-faithful to Bitcoin Core (bitcoin-core/src/rpc/net.cpp:1080-1117
+  ## getaddrmaninfo + AddrMan::Size addrman.cpp:1006-1026).
+  ##
+  ## Params: NONE. Pure read-only snapshot of the addrman — no side effects, no
+  ## peers/sockets/disk touched.
+  ##
+  ## Returns a JSON OBJECT keyed by network name. The key set is FIXED and
+  ## always present (every routable network emitted unconditionally, even at
+  ## count 0), in Core's enum order:
+  ##     ipv4, ipv6, onion, i2p, cjdns, all_networks
+  ## Each value is an object with exactly three integer keys in order:
+  ##     { "new":   <count in new table for this network>,
+  ##       "tried": <count in tried table for this network>,
+  ##       "total": <new + tried> }
+  ## `all_networks` is the global sum across networks. NET_UNROUTABLE
+  ## (not_publicly_routable) and NET_INTERNAL (internal) are never emitted,
+  ## matching Core's loop that skips those two enum values.
+  ##
+  ## Invariants (oracle-free): per network total == new + tried;
+  ## all_networks.{new,tried,total} == Σ networks.{new,tried,total}.
+
+  # Fixed routable-network key order (Core enum NET_IPV4..NET_CJDNS, skipping
+  # NET_UNROUTABLE / NET_INTERNAL). Every key is emitted even when the count is
+  # zero — an IPv4-only node still reports onion/i2p/cjdns as 0/0/0.
+  const networkKeys = ["ipv4", "ipv6", "onion", "i2p", "cjdns"]
+
+  # Pre-seed all routable networks at zero so the key set is always complete,
+  # then merge in the addrman's per-network split.
+  var counts = initTable[string, tuple[newCount, triedCount: int]]()
+  for k in networkKeys:
+    counts[k] = (0, 0)
+
+  if rpc.peerManager != nil:
+    for name, c in rpc.peerManager.addrmanNetworkCounts():
+      if counts.hasKey(name):
+        var cur = counts[name]
+        cur.newCount += c.newCount
+        cur.triedCount += c.triedCount
+        counts[name] = cur
+
+  result = newJObject()
+  var totalNew = 0
+  var totalTried = 0
+  for k in networkKeys:
+    let nNew = counts[k].newCount
+    let nTried = counts[k].triedCount
+    var obj = newJObject()
+    obj["new"] = %nNew
+    obj["tried"] = %nTried
+    obj["total"] = %(nNew + nTried)
+    result[k] = obj
+    totalNew += nNew
+    totalTried += nTried
+
+  var allObj = newJObject()
+  allObj["new"] = %totalNew
+  allObj["tried"] = %totalTried
+  allObj["total"] = %(totalNew + totalTried)
+  result["all_networks"] = allObj
 
 proc handleGetConnectionCount(rpc: RpcServer): JsonNode =
   if rpc.peerManager != nil:
@@ -12339,6 +12406,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetNodeAddresses(params)
   of "addpeeraddress":
     rpc.handleAddPeerAddress(params)
+  of "getaddrmaninfo":
+    rpc.handleGetAddrmanInfo()
   of "addnode":
     rpc.handleAddNode(params)
   of "listbanned":
