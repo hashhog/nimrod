@@ -1345,12 +1345,36 @@ proc maintainConnections(pm: PeerManager) {.async.} =
          blockRelay = pm.outboundBlockRelayCount
     await pm.startOutboundConnections()
 
-proc pingPeers(pm: PeerManager) {.async.} =
+proc sendPingsNow*(pm: PeerManager) {.async.} =
+  ## Force a BIP-31 PING to be sent to EVERY connected (ready) peer, right now,
+  ## regardless of the keepalive interval. This is the on-demand primitive the
+  ## `ping` RPC drives.
+  ##
+  ## Reference: Bitcoin Core PeerManagerImpl::SendPings (net_processing.cpp:2237),
+  ## invoked by rpc/net.cpp ping (:84-107). Core's SendPings sets
+  ## m_ping_queued = true on EVERY peer unconditionally and returns; the actual
+  ## PING (fresh nonce) is emitted on the next message-processing pass. nimrod has
+  ## no per-message "send pass" — its keepalive (mainLoop -> pingPeers) calls the
+  ## SAME `peer.sendPing()` primitive — so the faithful equivalent of "queue a
+  ## ping on every peer now" is to fire `peer.sendPing()` directly per ready peer.
+  ## Each send records the nonce + lastPing (peer.sendPing) so the matching PONG
+  ## fills peer.latencyMs (handlePong, peer.nim:1296), surfaced by getpeerinfo as
+  ## pingtime / minping. Unconditional (does NOT consult shouldSendPing) to match
+  ## Core's force-queue semantics; the conditional, interval-gated keepalive is
+  ## the separate `sendPings` proc below. Fire-and-forget: a per-peer error is
+  ## swallowed so one dropped transport never aborts the fan-out (Core loops over
+  ## the whole map and returns). With zero ready peers this is a successful no-op.
   for peer in pm.getReadyPeers():
     try:
       await peer.sendPing()
     except CatchableError as e:
       debug "failed to ping peer", peer = $peer, error = e.msg
+
+proc pingPeers(pm: PeerManager) {.async.} =
+  ## Background keepalive tick (mainLoop). Forces a ping to every ready peer on
+  ## the PingInterval cadence via the same on-demand primitive the `ping` RPC
+  ## uses, so the keepalive and an RPC-triggered ping emit identical BIP-31 PINGs.
+  await pm.sendPingsNow()
 
 proc requestAddresses(pm: PeerManager) {.async.} =
   let msg = newGetAddr()
