@@ -19,6 +19,7 @@ import ./rpc/rest
 import ./crypto/[secp256k1, hashing]
 import ./perf/verify_pool
 import ./util/ops
+import ./util/tip_notifier
 
 const NimrodVersion* = "0.1.0"
 
@@ -182,6 +183,14 @@ type
                                  ## the temporary handle is dropped.
     crypto*: CryptoEngine
     running*: bool
+    tipNotifier*: TipNotifier         ## Wake-on-tip-advance primitive for the
+                                       ## wait-family RPCs (waitfornewblock /
+                                       ## waitforblock / waitforblockheight).
+                                       ## Created once at boot, shared by the
+                                       ## chainstate tipChangedHook (notify side,
+                                       ## main thread) and the RpcServer (wait
+                                       ## side, RPC thread). allocShared-backed,
+                                       ## never freed for the process lifetime.
     recentlyRejected*: HashSet[TxId]  ## Recently-rejected tx filter, cleared on new block
     orphanPool*: OrphanPool           ## Tx orphan pool: holds txs whose
                                        ## parents we haven't seen yet, for
@@ -2780,6 +2789,21 @@ proc startNode*(config: NimrodConfig) {.async.} =
       config.rpcPassword,
       cookiePass
     )
+    # Wire the wait-family tip notifier (Core KernelNotifications blockTip /
+    # WaitTipChanged). Created once here; the chainstate fires its
+    # tipChangedHook on every tip advance (post-IBD connect, IBD connect, and
+    # reorg — covering submitblock + generate, which both route through
+    # connectBlock/connectBlockIBD), and the RpcServer's wait handlers await it
+    # on the RPC thread. nil notifier (signal-create failure) degrades the wait
+    # RPCs to returning the current tip immediately, which is safe.
+    block:
+      let notifier = newTipNotifier()
+      state.tipNotifier = notifier
+      state.rpcServer.tipNotifier = notifier
+      if notifier != nil:
+        state.chainState.tipChangedHook = proc() {.gcsafe, raises: [].} =
+          notifier.notify()
+
     # Wire the BlockFileManager so getblockchaininfo and pruneblockchain
     # answer correctly. The handler also reads `pruner` (when non-nil) for
     # the actual delete path; see handlePruneBlockchain in src/rpc/server.nim.
