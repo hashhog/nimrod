@@ -186,6 +186,10 @@ const KnownDebugCategories* = [
   "sync", "peer", "wallet", "fees", "consensus"
 ]
 
+# Forward declarations: applyDebugCategories (boot path) seeds the live
+# active-set defined further below.
+proc setActiveDebugCategories*(cats: HashSet[string])
+
 proc parseDebugCategories*(spec: string): HashSet[string] =
   ## Split a `--debug=cat1,cat2` string into a set. `--debug=1` and
   ## `--debug=all` enable everything. `--debug=0` / blank disables.
@@ -212,9 +216,101 @@ proc applyDebugCategories*(cats: HashSet[string]) =
   if "all" in cats:
     # Nothing further to enable: lowering the log level is sufficient because
     # un-tagged (Normal) topics are gated only by the active log level.
+    setActiveDebugCategories(toHashSet(KnownDebugCategories))
     return
   for cat in cats:
     discard cr.setTopicState(cat, cr.TopicState.Enabled, LogLevel.DEBUG)
+  setActiveDebugCategories(cats)
+
+# ---------------------------------------------------------------------------
+# Live (runtime-mutable) active-category state — Core BCLog::Logger::m_categories
+# ---------------------------------------------------------------------------
+#
+# The `logging` RPC (Bitcoin Core rpc/node.cpp `logging`) reads and mutates the
+# set of currently-enabled debug categories AT RUNTIME, with the change taking
+# effect immediately (no restart): Core toggles the in-memory `m_categories`
+# bitmask and every subsequent `LogPrintf`/`LogDebug` consults it.
+#
+# nimrod's live logger is chronicles' runtime topic registry (`cr.setTopicState`
+# / `cr.setLogLevel`), which is itself mutable per-record. But chronicles only
+# tracks topics that have actually been *registered* (i.e. emitted at least one
+# log statement), and a never-yet-logged category has no registry entry to
+# query. So we keep our OWN authoritative live set here — the canonical "which
+# categories are on" — and mirror every change into the chronicles registry so
+# the toggle has REAL effect on emitted logs. The RPC consults this set on EVERY
+# call rather than snapshotting it, so a flip is honoured immediately (this is
+# the trap the reference fix called out: a filter that snapshots categories at
+# construction never honours a runtime toggle).
+#
+# The authoritative *name set* is `KnownDebugCategories` (fixed, mirrors Core's
+# `LOG_CATEGORIES_BY_STR`); `_activeDebugCategories` is a subset of it.
+
+var
+  gActiveDebugCats {.global.}: HashSet[string] = initHashSet[string]()
+  gActiveDebugLock {.global.}: Lock
+  gActiveDebugLockInit {.global.}: bool = false
+
+proc ensureActiveDebugLockInit() =
+  if not gActiveDebugLockInit:
+    initLock(gActiveDebugLock)
+    gActiveDebugLockInit = true
+
+proc setActiveDebugCategories*(cats: HashSet[string]) =
+  ## Replace the live active debug-category set (takes effect immediately).
+  ## Brings the chronicles runtime level to DEBUG when anything is active so
+  ## DEBUG records can be produced; the per-topic enables then gate WHICH ones.
+  ## When the set empties, raise the level back to INFO so DEBUG stops flowing
+  ## (Core: emptying `m_categories` stops every category's debug output).
+  ensureActiveDebugLockInit()
+  withLock gActiveDebugLock:
+    gActiveDebugCats = cats
+  if cats.len > 0:
+    cr.setLogLevel(LogLevel.DEBUG)
+    # Enable exactly the requested topics; disable the rest of the known set so
+    # a previously-enabled topic that was just removed actually stops emitting.
+    for cat in KnownDebugCategories:
+      if cat in cats:
+        discard cr.setTopicState(cat, cr.TopicState.Enabled, LogLevel.DEBUG)
+      else:
+        discard cr.setTopicState(cat, cr.TopicState.Normal, LogLevel.NONE)
+  else:
+    # Empty set: clear every per-topic enable and lift the floor back to INFO,
+    # which suppresses all DEBUG output (Core: no categories -> no debug logs).
+    for cat in KnownDebugCategories:
+      discard cr.setTopicState(cat, cr.TopicState.Normal, LogLevel.NONE)
+    cr.setLogLevel(LogLevel.INFO)
+
+proc getActiveDebugCategories*(): HashSet[string] =
+  ## Return a COPY of the currently-enabled debug categories (read live).
+  ensureActiveDebugLockInit()
+  withLock gActiveDebugLock:
+    result = gActiveDebugCats
+
+proc isDebugCategoryActive*(cat: string): bool =
+  ## True iff `cat` is currently being debug-logged. Reads the live set.
+  ensureActiveDebugLockInit()
+  withLock gActiveDebugLock:
+    result = cat in gActiveDebugCats
+
+proc enableDebugCategory*(cat: string) =
+  ## Core BCLog::Logger::EnableCategory: add one category to the live mask.
+  var cur = getActiveDebugCategories()
+  cur.incl(cat)
+  setActiveDebugCategories(cur)
+
+proc disableDebugCategory*(cat: string) =
+  ## Core BCLog::Logger::DisableCategory: remove one category from the live mask.
+  var cur = getActiveDebugCategories()
+  cur.excl(cat)
+  setActiveDebugCategories(cur)
+
+proc enableAllDebugCategories*() =
+  ## Core EnableCategory("all"/"1"/""): enable the whole mask.
+  setActiveDebugCategories(toHashSet(KnownDebugCategories))
+
+proc disableAllDebugCategories*() =
+  ## Core DisableCategory("all"/"1"/"")/"none"/"0": clear the whole mask.
+  setActiveDebugCategories(initHashSet[string]())
 
 # ---------------------------------------------------------------------------
 # Ready-FD notification (systemd `READY=1` style, but FD-based)
