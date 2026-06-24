@@ -17,6 +17,7 @@ import ../mempool/[mempool, package, persist, orphan]
 import ../crypto/[hashing, secp256k1, address, signmessage]
 import ../network/[peer, peermanager, banman, messages, asmap, netgroup]
 import ../mining/[fees, blocktemplate]
+import ../util/ops as opsMod
 import ../wallet/wallet
 import ../wallet/descriptor
 import ../wallet/manager
@@ -6552,6 +6553,112 @@ proc handleGetMemoryInfo(rpc: RpcServer, params: JsonNode): JsonNode =
   # Any other mode is Core's RPC_INVALID_PARAMETER (-8) "unknown mode %s".
   raise newRpcError(RpcInvalidParameter, "unknown mode " & mode)
 
+proc handleLogging(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## logging ( ["include_category",...] ["exclude_category",...] )
+  ## Gets and sets the debug-logging category configuration.
+  ##
+  ## Reference: Bitcoin Core src/rpc/node.cpp `logging` (:218-275) +
+  ## `EnableOrDisableLogCategories` (:200-216); src/logging.cpp
+  ## `LogCategoriesList` / `GetLogCategory` / `EnableCategory` /
+  ## `DisableCategory`.
+  ##
+  ## CATEGORY SET: nimrod has a REAL category-based debug-logging system — the
+  ## chronicles runtime topic registry (`chronicles/topics_registry`), gated
+  ## per-record by topic state + active log level (the same mechanism `--debug=`
+  ## drives at boot). The authoritative category NAME set is
+  ## `ops.KnownDebugCategories` (fixed, mirrors Core's `LOG_CATEGORIES_BY_STR`).
+  ## The names legitimately differ per node (Core has e.g. `kernel`/`txpackages`
+  ## that nimrod lacks; nimrod adds `p2p`/`sync`/`peer`/`wallet`/`fees`/
+  ## `consensus`) — only the SHAPE, param-semantics and the -8 error match Core.
+  ##
+  ## LIVE TOGGLE (no snapshot trap): this RPC mutates `ops`'s live active-set —
+  ## `enableDebugCategory`/`disableDebugCategory` flip the chronicles topic state
+  ## immediately, so a category enabled here makes its DEBUG logs actually start
+  ## flowing with NO restart (Core's in-memory `m_categories` mutation). The
+  ## returned map is rebuilt from the live set on every call, so it always
+  ## reflects the just-applied change.
+  ##
+  ## Params (both OPTIONAL, positional, Core order: include THEN exclude):
+  ##   include (array of category strings): categories to ENABLE.
+  ##   exclude (array of category strings): categories to DISABLE.
+  ## A param is acted on ONLY if it is an array (Core `request.params[i].isArray()`
+  ## guard); null/omitted/missing is a no-op for that slot, so `logging` with no
+  ## args is a pure read-and-report (no change). include is applied first, then
+  ## exclude, so a category named in BOTH ends up DISABLED ("exclude wins").
+  ##
+  ## Special input-only tokens (never emitted as output keys): `"all"`/`"1"`/`""`
+  ## expand to the full category mask; `"none"`/`"0"` clear it. In the include
+  ## slot they enable/clear; in the exclude slot they disable the whole mask
+  ## (Core's `GetLogCategory` maps ""/"1"/"all" -> ALL, and
+  ## DisableCategory(ALL) clears every bit — `logging [], ["all"]` => all false).
+  ##
+  ## Returns: a JSON OBJECT mapping every category name in `KnownDebugCategories`
+  ## -> bool (whether it is currently being debug logged), in ascending
+  ## ALPHABETICAL key order (Core iterates a std::map; alphabetical order makes
+  ## the output byte-stable). The all/1/none/0/"" tokens are never output keys.
+  ##
+  ## Errors:
+  ##   Unknown category in EITHER array -> RPC_INVALID_PARAMETER (-8), message
+  ##   "unknown logging category <cat>" (Core node.cpp:213). Thrown as soon as
+  ##   the bad name is hit; include is scanned fully (in order) THEN exclude, and
+  ##   any valid category BEFORE the bad one in the same call has ALREADY been
+  ##   applied (partial application, no rollback — Core parity).
+  ##   Non-string array element -> RPC_TYPE_ERROR (-3) (Core `get_str()`).
+  ##
+  ## Scope: mutates the running node's in-memory active set immediately; NOT
+  ## persisted to config — resets on restart to the `--debug=` startup flags.
+  ## Idempotent (enabling an already-on / disabling an already-off category
+  ## still returns the full list).
+
+  # Core special input-only tokens. ""/"1"/"all" -> whole mask (GetLogCategory).
+  # "none"/"0" -> clear (nimrod parseDebugCategories parity; Core reaches the
+  # same clear-all effect via DisableCategory of the ALL flag).
+  proc applyCats(arr: JsonNode, enable: bool) =
+    # Core EnableOrDisableLogCategories: only an ARRAY param is processed; the
+    # caller already guards on isArray, but be defensive.
+    if arr.isNil or arr.kind != JArray:
+      return
+    for item in arr:
+      if item.kind != JString:
+        # Core get_str() raises a JSON type error on a non-string element.
+        raise newRpcError(RpcTypeError,
+          "JSON value of type " & $item.kind & " is not of expected type string")
+      let cat = item.getStr()
+      if cat == "all" or cat == "1" or cat == "":
+        if enable: opsMod.enableAllDebugCategories()
+        else:      opsMod.disableAllDebugCategories()
+        continue
+      if cat == "none" or cat == "0":
+        # Clear-all token (input-only). Same effect in either slot.
+        opsMod.disableAllDebugCategories()
+        continue
+      if cat notin opsMod.KnownDebugCategories:
+        # Core node.cpp:213 — EnableCategory/DisableCategory return false for an
+        # unknown name -> -8 "unknown logging category <cat>". Partial-apply: the
+        # valid categories scanned before this point are already applied.
+        raise newRpcError(RpcInvalidParameter, "unknown logging category " & cat)
+      if enable: opsMod.enableDebugCategory(cat)
+      else:      opsMod.disableDebugCategory(cat)
+
+  # Core order: include (params[0]) first, then exclude (params[1]); each acted
+  # on only if it is an array (no-arg / null => report-only, no change).
+  if params.len >= 1 and params[0].kind == JArray:
+    applyCats(params[0], true)
+  if params.len >= 2 and params[1].kind == JArray:
+    applyCats(params[1], false)
+
+  # Emit the full {category: active} map for every REAL category, alphabetically
+  # sorted (Core std::map iteration order). Rebuilt from the LIVE active set so
+  # it reflects the change just applied. all/1/none/0/"" are never keys.
+  let active = opsMod.getActiveDebugCategories()
+  var names: seq[string] = @[]
+  for c in opsMod.KnownDebugCategories:
+    names.add(c)
+  names.sort()
+  result = newJObject()
+  for c in names:
+    result[c] = %(c in active)
+
 proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
   ## getmininginfo
   ## Returns a json object containing mining-related information.
@@ -6757,6 +6864,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "== Control ==",
     "getmemoryinfo ( \"mode\" )",
     "help ( \"command\" )",
+    "logging ( [\"include_category\",...] [\"exclude_category\",...] )",
     "stop",
     "uptime",
     "",
@@ -12819,6 +12927,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleUptime()
   of "getmemoryinfo":
     rpc.handleGetMemoryInfo(params)
+  of "logging":
+    rpc.handleLogging(params)
   of "help":
     rpc.handleHelp(params)
 
@@ -12867,6 +12977,7 @@ proc namedArgPositions(methodName: string): seq[string] =
   of "getdescriptorinfo": @["descriptor"]
   of "deriveaddresses": @["descriptor", "range"]
   of "getmemoryinfo": @["mode"]
+  of "logging": @["include", "exclude"]
   else:
     raise newRpcError(RpcInvalidParams,
       "Named parameters are not supported for method " & methodName &
