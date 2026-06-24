@@ -4876,6 +4876,41 @@ proc handleGetZmqNotifications(rpc: RpcServer): JsonNode =
   notifications
 
 # Network RPCs
+proc handlePing(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Requests that a ping be sent to all connected peers, to measure ping time.
+  ## Reference: Bitcoin Core rpc/net.cpp ping (:84-107) ->
+  ## PeerManager::SendPings (net_processing.cpp:2237).
+  ##
+  ## Params: none. Core takes {} and any argument is a dispatcher arity error.
+  ##
+  ## Behaviour: side-effect-only control method. Iterates every connected peer
+  ## and fires a BIP-31 P2P PING (fire-and-forget) via the same `sendPingsNow`
+  ## primitive the keepalive loop uses. It does NOT measure latency synchronously
+  ## or wait for the PONGs — the round-trip results surface LATER via
+  ## getpeerinfo's `pingtime` / `minping` fields. With zero peers it is a
+  ## successful no-op. Returns JSON null immediately (Core UniValue::VNULL).
+  ##
+  ## No method-specific arg validation: Core's ping takes no params and relies on
+  ## the dispatcher's arity check; extra params are ignored here (the dispatcher
+  ## already accepts/normalizes params before this handler runs).
+
+  # EnsurePeerman parity: a missing peer manager is P2P-disabled, code -31
+  # (Core RPC_CLIENT_P2P_DISABLED), NOT an empty success.
+  if rpc.peerManager == nil:
+    raise newRpcError(RpcClientP2pDisabled,
+      "Error: Peer-to-peer functionality missing or disabled")
+
+  # Fire-and-forget: queue/emit a PING to every ready peer and return immediately.
+  # Core only requests the ping (sets m_ping_queued) and returns; it does not
+  # block on the responses. asyncSpawn mirrors that non-blocking fan-out — a
+  # per-peer send error is swallowed inside sendPings and can never fail the RPC
+  # (peerless / dropped peers tolerated). On a peerless node this spawns a
+  # no-op loop over an empty peer set and still returns null.
+  asyncSpawn rpc.peerManager.sendPingsNow()
+
+  # Core returns UniValue::VNULL -> JSON null.
+  newJNull()
+
 proc handleSetNetworkActive(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Disable/enable all p2p network activity.
   ## Reference: Bitcoin Core rpc/net.cpp setnetworkactive (:889) +
@@ -5292,7 +5327,13 @@ proc handleAddNode(rpc: RpcServer, params: JsonNode): JsonNode =
       raise newRpcError(RpcInvalidParams, "invalid port number")
 
   proc connectAsync(pm: PeerManager, h: string, p: uint16) {.async.} =
-    discard await pm.connectToPeer(h, p)
+    # addnode peers are MANUAL connections (Core CConnman::ConnectNode with
+    # ConnectionType::MANUAL): they bypass the automatic-outbound routability
+    # gate (RFC1918/loopback skip) and slot limits, so an operator can force-dial
+    # a specific peer — including a loopback peer for testing. Using the
+    # full-relay path here silently dropped loopback addnode dials at the
+    # isRoutable() gate.
+    discard await pm.connectManualPeer(h, p)
 
   case command
   of "add":
@@ -6680,6 +6721,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "getpeerinfo",
     "getzmqnotifications",
     "listbanned",
+    "ping",
     "setban \"subnet\" \"command\" ( bantime absolute )",
     "setnetworkactive state",
     "",
@@ -12586,6 +12628,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   # Network
   of "getnetworkinfo":
     rpc.handleGetNetworkInfo()
+  of "ping":
+    rpc.handlePing(params)
   of "setnetworkactive":
     rpc.handleSetNetworkActive(params)
   of "getpeerinfo":
