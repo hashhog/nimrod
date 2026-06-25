@@ -13397,6 +13397,254 @@ proc rpcWaitForBlockHeight(rpc: RpcServer, params: JsonNode): Future[JsonNode] {
     int(height) >= targetHeight
   return await rpc.waitForTip(p, timeoutMs)
 
+proc handleVerifyChain(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## verifychain ( checklevel nblocks )
+  ##
+  ## Re-validates the last `nblocks` blocks of the active chain at the requested
+  ## `checklevel`, returning a JSON bool (true = all checks passed). This is the
+  ## nimrod analog of Bitcoin Core CVerifyDB::VerifyDB
+  ## (bitcoin-core/src/validation.cpp:4611) called from the verifychain RPC
+  ## (bitcoin-core/src/rpc/blockchain.cpp:1262).
+  ##
+  ## Arguments (positional, both optional):
+  ##   1. checklevel (int, default 3, clamped to 0..4) — how thorough:
+  ##        0  read block from disk (ReadBlock)
+  ##        1  + CheckBlock          (real context-free validation)
+  ##        2  + read & decode undo  (ReadBlockUndo + tx-count consistency)
+  ##        3  + disconnect-tip      (in-memory DisconnectBlock consistency)
+  ##        4  + reconnect           (real ConnectBlock-equivalent: full script
+  ##                                  verification via validateBlock)
+  ##   2. nblocks (int, default 6; 0 or > chain-height means ALL blocks)
+  ##
+  ## CRITICAL: this MUST NOT mutate the live chainstate. Core's VerifyDB works on
+  ## a throwaway CCoinsViewCache layered over the real coins view; nimrod mirrors
+  ## that with an in-memory `overlay` over `cs.getUtxo`. The live UTXO set, the
+  ## RocksDB block index, and the undo files are only ever READ. Levels 3 and 4
+  ## reconstruct the fork-point UTXO view by replaying each block's stored undo
+  ## into the overlay (disconnect) and then re-run validateBlock against that
+  ## overlay (reconnect) — the exact same CheckBlock/ConnectBlock machinery the
+  ## node uses during sync, never a constant-true stub.
+  let cs = rpc.chainState
+
+  # Core: const int check_level{params[0].isNull() ? DEFAULT_CHECKLEVEL : ...};
+  #       const int check_depth{params[1].isNull() ? DEFAULT_CHECKBLOCKS : ...};
+  var checkLevel = 3
+  if params.kind == JArray and params.len >= 1 and params[0].kind != JNull:
+    checkLevel = params[0].getInt()
+  var nBlocks = 6
+  if params.kind == JArray and params.len >= 2 and params[1].kind != JNull:
+    nBlocks = params[1].getInt()
+
+  # nCheckLevel = std::max(0, std::min(4, nCheckLevel));  (validation.cpp:4627)
+  checkLevel = max(0, min(4, checkLevel))
+
+  let tipHeight = cs.bestHeight
+
+  # Core: if chain tip is null or tip->pprev is null, return SUCCESS
+  # (validation.cpp:4619). Genesis-only or empty chain → nothing to verify.
+  if tipHeight <= 0:
+    return %true
+
+  # if (nCheckDepth <= 0 || nCheckDepth > chain.Height()) nCheckDepth = Height();
+  # (validation.cpp:4624). 0 = all; clamp to the chain height.
+  var checkDepth = nBlocks
+  if checkDepth <= 0 or checkDepth > tipHeight:
+    checkDepth = tipHeight
+
+  let startHeight = tipHeight - checkDepth + 1  # inclusive lower bound
+  info "verifychain: verifying blocks", lastN = checkDepth, level = checkLevel,
+       fromHeight = startHeight, toHeight = tipHeight
+
+  # In-memory sandbox UTXO view layered over the live coins view. value == none
+  # marks an outpoint as spent/absent in the sandbox; a present value shadows
+  # the live entry. Reads fall through to cs.getUtxo. Mutated ONLY in this proc.
+  var overlay = initTable[OutPoint, Option[UtxoEntry]]()
+
+  proc sandboxGetUtxo(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+    if overlay.hasKey(op):
+      try:
+        return overlay[op]
+      except KeyError:
+        discard  # unreachable: hasKey guaranteed membership above
+    try:
+      return cs.getUtxo(op)
+    except CatchableError:
+      return none(UtxoEntry)
+
+  # Stack of (block, prevIndex, height) for the disconnected range, so level 4
+  # can re-connect bottom-up (oldest first), exactly like Core's reconnect loop
+  # (validation.cpp:4716-4737 walks chain.Next(pindex) upward to the tip).
+  var disconnected: seq[tuple[blk: Block, prevIdx: BlockIndex, height: int32]] = @[]
+
+  # ---- Levels 0-3: walk DOWN from the tip (disconnect direction) ----------
+  var h = tipHeight
+  while h >= startHeight and h >= 1:
+    let hashOpt = cs.db.getBlockHashByHeight(h)
+    if hashOpt.isNone:
+      warn "verifychain: missing height->hash mapping", height = h
+      return %false
+    let blockHash = hashOpt.get()
+
+    let idxOpt = cs.db.getBlockIndex(blockHash)
+    if idxOpt.isNone:
+      warn "verifychain: missing block index", height = h
+      return %false
+    let idx = idxOpt.get()
+
+    # Level 0: ReadBlock from disk (read + deserialize).
+    let blkOpt = cs.db.getBlock(blockHash)
+    if blkOpt.isNone:
+      error "verifychain: ReadBlock failed", height = h, hash = $blockHash
+      return %false
+    let blk = blkOpt.get()
+
+    # Level 1: CheckBlock — the real context-free validator (PoW, merkle root,
+    # tx sanity, witness commitment). validation.cpp:4666.
+    if checkLevel >= 1:
+      let cbRes = checkBlock(blk, cs.params)
+      if not cbRes.isOk:
+        error "verifychain: found bad block (CheckBlock)", height = h,
+              hash = $blockHash, reason = $cbRes.error
+        return %false
+
+    # Read this block's prevIndex once (needed for level-4 validateBlock, and to
+    # build the parent header context). The parent is at height h-1.
+    let prevIdxOpt = cs.db.getBlockIndex(idx.prevHash)
+    var prevIdx: BlockIndex
+    if prevIdxOpt.isSome:
+      prevIdx = prevIdxOpt.get()
+    else:
+      # Genesis parent sentinel (height -1). Only reachable if startHeight==1
+      # and the parent is genesis whose index row may be a header-only stub.
+      prevIdx = BlockIndex(height: h - 1, hash: idx.prevHash)
+
+    # Level 2: read + decode the undo data (ReadBlockUndo) and check the
+    # block/undo tx-count consistency. validation.cpp:4672-4680.
+    var blockUndoOpt = none(BlockUndo)
+    if checkLevel >= 2:
+      blockUndoOpt = cs.getBlockUndoFromFile(idx, idx.prevHash)
+      # A non-coinbase-bearing block MUST have undo data on the active chain.
+      # (Genesis is excluded — h >= 1 here, but a coinbase-only block legitimately
+      #  has an empty undo set.)
+      if blk.txs.len > 1 and blockUndoOpt.isNone:
+        error "verifychain: found bad undo data (missing/undecodable)",
+              height = h, hash = $blockHash
+        return %false
+      if blockUndoOpt.isSome:
+        # One TxUndo per non-coinbase tx (Core validation.cpp:2190-2193).
+        if blockUndoOpt.get().txUndo.len + 1 != blk.txs.len:
+          error "verifychain: undo/block tx-count mismatch", height = h,
+                hash = $blockHash, undoEntries = blockUndoOpt.get().txUndo.len,
+                blockTxs = blk.txs.len
+          return %false
+
+    # Level 3: in-memory disconnect into the sandbox overlay. Mirrors Core
+    # DisconnectBlock (validation.cpp:4684-4701): remove the outputs this block
+    # created, restore the inputs it spent (from undo). Surfaces UTXO-set
+    # inconsistencies WITHOUT touching live state.
+    if checkLevel >= 3:
+      # (a) Remove created outputs. Each must currently exist in the sandbox view
+      #     (it is a live coin unless a younger block in this range already spent
+      #     it — but younger blocks are processed FIRST going down, so by the time
+      #     we disconnect this block its outputs are unspent in the sandbox).
+      for txi in 0 ..< blk.txs.len:
+        let tx = blk.txs[txi]
+        let txid = tx.txid()
+        let isCoinbaseTx = (txi == 0)
+        for voutIdx in 0 ..< tx.outputs.len:
+          if isUnspendable(tx.outputs[voutIdx].scriptPubKey):
+            continue  # never stored (Core SpendCoin skips unspendable)
+          let op = OutPoint(txid: txid, vout: uint32(voutIdx))
+          let cur = sandboxGetUtxo(op)
+          if cur.isNone:
+            error "verifychain: irrecoverable inconsistency (created output absent on disconnect)",
+                  height = h, hash = $blockHash, vout = voutIdx
+            return %false
+          # 4-field coin identity check (Core SpendCoin, validation.cpp:2218-2226).
+          let c = cur.get()
+          if c.output.value != tx.outputs[voutIdx].value or
+             c.output.scriptPubKey != tx.outputs[voutIdx].scriptPubKey or
+             c.height != h or c.isCoinbase != isCoinbaseTx:
+            error "verifychain: irrecoverable inconsistency (created output mismatch)",
+                  height = h, hash = $blockHash, vout = voutIdx
+            return %false
+          overlay[op] = none(UtxoEntry)  # mark spent/removed in sandbox
+
+      # (b) Restore spent inputs from the undo data (ApplyTxInUndo). For each
+      #     non-coinbase tx, undo.txUndo[i-1].prevOutputs aligns with tx.inputs.
+      if blockUndoOpt.isSome:
+        let bu = blockUndoOpt.get()
+        for txIdx in 1 ..< blk.txs.len:
+          let tx = blk.txs[txIdx]
+          let txUndo = bu.txUndo[txIdx - 1]
+          if txUndo.prevOutputs.len != tx.inputs.len:
+            error "verifychain: undo vin-count mismatch", height = h,
+                  hash = $blockHash, tx = txIdx
+            return %false
+          for i, spent in txUndo.prevOutputs:
+            let op = tx.inputs[i].prevOut
+            overlay[op] = some(UtxoEntry(
+              output: spent.output,
+              height: spent.height,
+              isCoinbase: spent.isCoinbase))
+
+      # Remember this block for the reconnect pass (level 4).
+      disconnected.add((blk, prevIdx, h))
+
+    dec h
+
+  # ---- Level 4: walk UP (reconnect direction), full re-validation ----------
+  # The overlay now represents the UTXO set as it was at startHeight-1 (the fork
+  # point). Re-run validateBlock with checkScripts=true bottom-up — the SAME
+  # ConnectBlock-equivalent machinery used during sync, including every input
+  # script verification. validation.cpp:4716-4737.
+  if checkLevel >= 4:
+    for i in countdown(disconnected.len - 1, 0):
+      let (blk, prevIdx, height) = disconnected[i]
+      let res = validateBlock(blk, prevIdx, cs.db, cs.params,
+                              checkScripts = true,
+                              checkPow = true,
+                              getUtxoOverride = sandboxGetUtxo)
+      if not res.isOk:
+        let bh = BlockHash(doubleSha256(serialize(blk.header)))
+        error "verifychain: found unconnectable block (ConnectBlock)",
+              height = height, hash = $bh, reason = $res.error
+        return %false
+
+      # Level 4 script verification: call verifyScripts separately, mirroring
+      # the sync path at validation.nim:2320 (acceptBlock step 4). validateBlock's
+      # checkScripts parameter is dead code -- verifyScripts is the real verifier.
+      # Core CVerifyDB::VerifyDB level 4 runs full ConnectBlock incl scripts.
+      let scriptRes = verifyScripts(blk, sandboxGetUtxo, height, rpc.crypto, cs.params)
+      if not scriptRes.isOk:
+        let bh2 = BlockHash(doubleSha256(serialize(blk.header)))
+        error "verifychain: found block with invalid scripts (verifyScripts)",
+              height = height, hash = $bh2, reason = $scriptRes.error
+        return %false
+
+      # Apply this block forward into the sandbox so the next (higher) block sees
+      # the coins it creates / spends — replays ConnectBlock's UTXO mutation in
+      # the overlay only (never the live DB), so input lookups stay correct as we
+      # climb back to the tip.
+      for txi in 0 ..< blk.txs.len:
+        let tx = blk.txs[txi]
+        let isCoinbaseTx = (txi == 0)
+        if not isCoinbaseTx:
+          for inp in tx.inputs:
+            overlay[inp.prevOut] = none(UtxoEntry)  # spend
+        let txid = tx.txid()
+        for voutIdx in 0 ..< tx.outputs.len:
+          if isUnspendable(tx.outputs[voutIdx].scriptPubKey):
+            continue
+          let op = OutPoint(txid: txid, vout: uint32(voutIdx))
+          overlay[op] = some(UtxoEntry(
+            output: tx.outputs[voutIdx],
+            height: height,
+            isCoinbase: isCoinbaseTx))
+
+  info "verifychain: no inconsistencies", lastN = checkDepth, level = checkLevel
+  %true
+
 proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
   case methodName
   # Blockchain
@@ -13436,6 +13684,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetIndexInfo(params)
   of "getblockfilter":
     rpc.handleGetBlockFilter(params)
+  of "verifychain":
+    rpc.handleVerifyChain(params)
 
   # Wait-family RPCs (waitfornewblock / waitforblock / waitforblockheight).
   # The blocking, event-driven path runs in asyncHandleRequest (the async
