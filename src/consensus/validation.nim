@@ -1746,12 +1746,19 @@ proc collectChecks*(
   utxos: proc(op: OutPoint): Option[UtxoEntry],
   height: int32,
   params: ConsensusParams,
-  checksOut: var seq[ScriptCheck]
+  checksOut: var seq[ScriptCheck],
+  txPrevoutsStore: var seq[TxPrevouts]
 ): ValidationResult[void] =
   ## Serial first pass: resolve coins + build the per-input ScriptCheck list.
   ## Returns veInputsMissing (and leaves checksOut empty/partial) if any input's
   ## coin cannot be resolved. On success checksOut holds every non-coinbase
   ## input's check in chain order.
+  ##
+  ## `txPrevoutsStore` receives one `TxPrevouts` per non-coinbase tx (in tx order).
+  ## Each `ScriptCheck.prevoutsPtr` points into this store — the BIP-341 arrays
+  ## are shared, not copied per input. CALLER must keep `txPrevoutsStore` alive
+  ## for as long as any check in `checksOut` is accessed (runChecks blocks until
+  ## all workers finish, so `verifyScripts` owns this contract automatically).
 
   # Compute block hash for script_flag_exceptions check
   let headerBytes = serialize(blk.header)
@@ -1770,6 +1777,11 @@ proc collectChecks*(
       height: height,
       isCoinbase: true
     )
+
+  # Pre-size the TxPrevouts store so that addr(store[i]) stays stable for the
+  # lifetime of the call: a seq realloc would move the backing array and
+  # invalidate every ptr already stored in checksOut.
+  txPrevoutsStore = newSeqOfCap[TxPrevouts](blk.txs.len - 1)
 
   # Build checks for non-coinbase transactions
   for i in 1 ..< blk.txs.len:
@@ -1798,13 +1810,20 @@ proc collectChecks*(
     if utxosMissing:
       return voidErr(veInputsMissing)
 
+    # Append one TxPrevouts for this tx (moving the seq storage in — no heap copy).
+    # The store was pre-sized above so this add() cannot trigger a realloc.
+    txPrevoutsStore.add(TxPrevouts(
+      allAmounts: move(allAmounts),
+      allScriptPubKeys: move(allScriptPubKeys)
+    ))
+    # Stable pointer into the last element (pre-sized, no realloc possible).
+    let txPrevoutsPtr = addr txPrevoutsStore[txPrevoutsStore.len - 1]
+
     for inputIdx, inp in tx.inputs:
       # W160 BUG-11 fix: per-sig caching lives inside the OP_CHECKSIG /
-      # OP_CHECKSIGADD handlers (script/interpreter.nim), not at this layer —
-      # see the long note that used to live here. The full Taproot arrays
-      # (allAmounts/allScriptPubKeys) are committed onto every ScriptCheck so
-      # the parallel worker computes the SAME BIP-341 sighash the serial path
-      # would (G21 fix).
+      # OP_CHECKSIGADD handlers (script/interpreter.nim), not at this layer.
+      # G21 fix is preserved: prevoutsPtr carries the full tx arrays so the
+      # parallel worker computes the SAME BIP-341 sighash as the serial path.
       let utxo = allUtxos[inputIdx]
 
       # Get witness data for this input
@@ -1820,8 +1839,7 @@ proc collectChecks*(
         amount: utxo.output.value,
         flags: flags,
         witness: witness,
-        allAmounts: allAmounts,
-        allScriptPubKeys: allScriptPubKeys
+        prevoutsPtr: txPrevoutsPtr
       ))
 
     # Remove spent UTXOs
@@ -1855,8 +1873,13 @@ proc verifyScripts*(
   ## pool was started at boot via initVerifyPool). Any single failure rejects.
   ## The `crypto` parameter is retained for signature compatibility; signature
   ## verification routes through the process-global secp context.
+  ##
+  ## `txPrevoutsStore` is declared HERE (not inside collectChecks) so that its
+  ## lifetime encloses the runChecks call: workers deref prevoutsPtr while running
+  ## and `runChecks` blocks until they all finish before this proc returns.
   var checks: seq[ScriptCheck] = @[]
-  let collectRes = collectChecks(blk, utxos, height, params, checks)
+  var txPrevoutsStore: seq[TxPrevouts] = @[]
+  let collectRes = collectChecks(blk, utxos, height, params, checks, txPrevoutsStore)
   if not collectRes.isOk:
     return collectRes
 

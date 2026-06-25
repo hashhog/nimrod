@@ -87,12 +87,35 @@ const
   MaxScriptCheckThreads* = 15
 
 type
+  TxPrevouts* = object
+    ## Per-transaction BIP-341 committed-prevout arrays. Mirrors Core's
+    ## `PrecomputedTransactionData` (specifically `m_spent_outputs` which backs
+    ## `m_spent_amounts_single_hash` / `m_spent_scripts_single_hash`).
+    ## One `TxPrevouts` is created per non-coinbase tx in `collectChecks` and
+    ## stored in a block-level `seq[TxPrevouts]` that lives on the master
+    ## thread's stack for the duration of `runChecks`. Every `ScriptCheck` for
+    ## the same tx holds a raw `ptr TxPrevouts` — zero-copy sharing.
+    ## SAFETY: `runChecks` (and its callers) blocks until all worker threads
+    ## have finished; the ptr is never dangled because the owning seq outlives
+    ## every worker access.
+    allAmounts*: seq[Satoshi]
+    allScriptPubKeys*: seq[seq[byte]]
+
   ScriptCheck* = object
     ## Self-contained, by-value description of ONE input's script verification.
     ## Equivalent to Core's `CScriptCheck` callable; it carries everything the
     ## 9-arg `verifyScript` needs so a worker thread can run it with no access
-    ## to the block / chainstate. `allAmounts` / `allScriptPubKeys` are the
-    ## BIP-341 committed-prevout arrays for the WHOLE tx (G21 fix).
+    ## to the block / chainstate.
+    ##
+    ## PERF FIX (per-ScriptCheck materialization overhead): the BIP-341
+    ## committed-prevout arrays (allAmounts / allScriptPubKeys) are now shared
+    ## across ALL inputs of the same tx via a raw pointer (`prevoutsPtr`) into a
+    ## block-level `seq[TxPrevouts]` owned by `verifyScripts`. The old design
+    ## copied the full seq arrays onto EVERY ScriptCheck — O(inputs^2) per tx —
+    ## causing the parallel path to allocate MORE than the serial path despite
+    ## doing the same work. With the pointer the materialization cost drops to
+    ## O(tx_count): one TxPrevouts per tx regardless of input count.
+    ## G21 fix is preserved: prevoutsPtr always points to the full tx arrays.
     scriptSig*: seq[byte]
     scriptPubKey*: seq[byte]
     tx*: Transaction
@@ -100,8 +123,7 @@ type
     amount*: Satoshi
     flags*: set[ScriptFlags]
     witness*: seq[seq[byte]]
-    allAmounts*: seq[Satoshi]
-    allScriptPubKeys*: seq[seq[byte]]
+    prevoutsPtr*: ptr TxPrevouts  ## shared per-tx; see TxPrevouts above
 
   VerifyPool = object
     threads: seq[Thread[int]]
@@ -132,13 +154,20 @@ proc clampWorkers*(requested: int): int {.gcsafe.} =
   clamp(base, 1, MaxScriptCheckThreads)
 
 ## Run one ScriptCheck. The {.cast(gcsafe).} is sound: the closure touches only
-## (a) by-value fields of `chk`, (b) the lock-protected globalSigCache, and
-## (c) the read-only randomized secp verify context. Mirrors Core's
-## CScriptCheck::operator() running on a worker thread.
+## (a) by-value fields of `chk`, (b) the read-only `prevoutsPtr` (written once
+## by collectChecks before any worker runs, never mutated again), (c) the
+## lock-protected globalSigCache, and (d) the read-only secp verify context.
+## Mirrors Core's CScriptCheck::operator() running on a worker thread.
 proc runOne(chk: ScriptCheck): bool {.gcsafe.} =
   {.cast(gcsafe).}:
     if gInstrument:
       recordThread()
+    # Deref the shared per-tx TxPrevouts. The ptr is guaranteed live: the
+    # block-level seq[TxPrevouts] lives in verifyScripts (on the master stack)
+    # and runChecks blocks until all workers finish before returning.
+    let prevouts = chk.prevoutsPtr
+    let amounts     = if prevouts != nil: prevouts[].allAmounts     else: @[chk.amount]
+    let scriptPKs   = if prevouts != nil: prevouts[].allScriptPubKeys else: @[chk.scriptPubKey]
     result = verifyScript(
       chk.scriptSig,
       chk.scriptPubKey,
@@ -147,8 +176,8 @@ proc runOne(chk: ScriptCheck): bool {.gcsafe.} =
       chk.amount,
       chk.flags,
       chk.witness,
-      chk.allAmounts,
-      chk.allScriptPubKeys
+      amounts,
+      scriptPKs
     )
 
 proc workerLoop(id: int) {.thread, gcsafe.} =
