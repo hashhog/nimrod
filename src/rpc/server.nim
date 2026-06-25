@@ -5492,6 +5492,44 @@ proc handleGetConnectionCount(rpc: RpcServer): JsonNode =
   else:
     %0
 
+proc handleGetNetTotals(rpc: RpcServer): JsonNode =
+  ## getnettotals
+  ## Reference: bitcoin-core/src/rpc/net.cpp::getnettotals (560)
+  ##
+  ## Core returns CConnman::GetTotalBytesRecv()/GetTotalBytesSent(), which are
+  ## GLOBAL cumulative counters across ALL connections including disconnected
+  ## peers. nimrod maintains only per-peer bytesSent/bytesRecv (the same
+  ## counters getpeerinfo surfaces) and has no manager-level cumulative total
+  ## that survives a disconnect, so we SUM the currently-connected peers. This
+  ## is an APPROXIMATION (bytes from departed peers are not retained) and is
+  ## noted as such — same data source as getpeerinfo's bytessent/bytesrecv.
+  var totalRecv: uint64 = 0
+  var totalSent: uint64 = 0
+  if rpc.peerManager != nil:
+    for peer in rpc.peerManager.getReadyPeers():
+      totalRecv += peer.bytesRecv
+      totalSent += peer.bytesSent
+
+  # timemillis: current unix epoch in milliseconds (Core SystemClock::now()).
+  let nowMs = int64(epochTime() * 1000.0)
+
+  # uploadtarget: nimrod has no -maxuploadtarget, so emit the Core-faithful
+  # zero shape (net.cpp with nMaxOutboundLimit==0): target 0, not reached,
+  # serving historical blocks, nothing left to count in the cycle.
+  result = %*{
+    "totalbytesrecv": totalRecv,
+    "totalbytessent": totalSent,
+    "timemillis": nowMs,
+    "uploadtarget": {
+      "timeframe": 86400,            # Core DEFAULT_MAX_UPLOAD_TIMEFRAME (24h)
+      "target": 0,
+      "target_reached": false,
+      "serve_historical_blocks": true,
+      "bytes_left_in_cycle": 0,
+      "time_left_in_cycle": 0
+    }
+  }
+
 proc handleAddNode(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 2:
     raise newRpcError(RpcInvalidParams, "missing node and command parameters")
@@ -7149,6 +7187,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "clearbanned",
     "disconnectnode \"address\"",
     "getconnectioncount",
+    "getnettotals",
     "getnetworkinfo",
     "getpeerinfo",
     "getzmqnotifications",
@@ -7158,6 +7197,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "setnetworkactive state",
     "",
     "== Rawtransactions ==",
+    "createrawtransaction [{\"txid\":\"id\",\"vout\":n},...] [{\"address\":amount},{\"data\":\"hex\"},...] ( locktime replaceable )",
     "decoderawtransaction \"hexstring\"",
     "getrawtransaction \"txid\" ( verbose )",
     "sendrawtransaction \"hexstring\"",
@@ -11114,6 +11154,243 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
       result["hex"] = %toHex(serialize(txOpt.get(), includeWitness = true))
 
 # ============================================================================
+# createrawtransaction
+# ============================================================================
+#
+# Reference: bitcoin-core/src/rpc/rawtransaction.cpp::createrawtransaction (377)
+#            → rawtransaction_util.cpp::ConstructTransaction / AddInputs /
+#              AddOutputs / ParseOutputs.
+#
+# Build an UNSIGNED raw tx from (inputs, outputs, locktime=0, replaceable=false)
+# and return its hex. REUSES the same machinery as walletcreatefundedpsbt's
+# input/output parsing: parseTxId (txid validation), decodeAddress +
+# scriptPubKeyForAddress (address → scriptPubKey), the OP_RETURN script builder,
+# and serialize() (the shared tx serializer, also used by sendrawtransaction /
+# decoderawtransaction). No coin selection and no signing — outputs are emitted
+# verbatim, witnesses stay empty so serialize() emits the legacy (no segwit
+# marker) encoding, exactly like Core's EncodeHexTx(CTransaction(rawTx)).
+
+proc fixedPointSatFromString(s: string): int64 =
+  ## Mirror util/strencodings.cpp ParseFixedPoint with decimals=8 and the
+  ## MoneyRange check from AmountFromValue, operating on the canonical decimal
+  ## string. Raises RpcTypeError (-3) like Core on a malformed/out-of-range
+  ## amount. Fixed-point only — no binary float — so the byte output is exact.
+  var str = s.strip()
+  if str.len == 0:
+    raise newRpcError(RpcTypeError, "Invalid amount")
+  var neg = false
+  var i = 0
+  if str[0] in {'+', '-'}:
+    neg = str[0] == '-'
+    i = 1
+  var whole: int64 = 0
+  var sawDigit = false
+  while i < str.len and str[i] in {'0'..'9'}:
+    whole = whole * 10 + int64(ord(str[i]) - ord('0'))
+    sawDigit = true
+    inc i
+    if whole > 21_000_000'i64 + 1:        # short-circuit overflow guard
+      raise newRpcError(RpcTypeError, "Amount out of range")
+  var frac: int64 = 0
+  var fracDigits = 0
+  if i < str.len and str[i] == '.':
+    inc i
+    while i < str.len and str[i] in {'0'..'9'}:
+      if fracDigits >= 8:
+        raise newRpcError(RpcTypeError, "Invalid amount")
+      frac = frac * 10 + int64(ord(str[i]) - ord('0'))
+      inc fracDigits
+      sawDigit = true
+      inc i
+  if i != str.len or not sawDigit:
+    raise newRpcError(RpcTypeError, "Invalid amount")
+  # Scale fractional part up to 8 digits.
+  while fracDigits < 8:
+    frac = frac * 10
+    inc fracDigits
+  var sats = whole * 100_000_000'i64 + frac
+  if neg: sats = -sats
+  # MoneyRange: 0 <= amount <= MAX_MONEY (21e6 * COIN).
+  if sats < 0 or sats > int64(MaxMoney):
+    raise newRpcError(RpcTypeError, "Amount out of range")
+  sats
+
+proc amountFromValueSat(v: JsonNode): int64 =
+  ## Core rpc/util.cpp AmountFromValue: BTC amount → satoshis.
+  ## - JString / JInt: parsed as fixed-point from the verbatim text (exact).
+  ## - JFloat: Nim's std/json already lost the source text to a float64, so
+  ##   round to the nearest satoshi (round-half-away-from-zero). This matches
+  ##   Core for any amount representable in <=8 decimals — e.g. 0.001 → 100000
+  ##   — which is the createrawtransaction contract (decimals=8). The result is
+  ##   then re-validated through the same fixed-point MoneyRange path.
+  case v.kind
+  of JString:
+    fixedPointSatFromString(v.getStr())
+  of JInt:
+    fixedPointSatFromString($v.getInt())
+  of JFloat:
+    let f = v.getFloat()
+    let scaled = f * 100_000_000.0
+    let sats = int64(if scaled >= 0: scaled + 0.5 else: scaled - 0.5)
+    if sats < 0 or sats > int64(MaxMoney):
+      raise newRpcError(RpcTypeError, "Amount out of range")
+    sats
+  else:
+    raise newRpcError(RpcTypeError, "Amount is not a number or string")
+
+proc handleCreateRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## createrawtransaction [{"txid","vout","sequence"?},...] {"address":amount,...}
+  ##                      ( locktime replaceable )
+  ##
+  ## Returns the hex string of an unsigned raw transaction.
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams,
+      "createrawtransaction requires inputs and outputs")
+  if params[0].kind != JArray:
+    raise newRpcError(RpcTypeError, "Expected type array for inputs")
+
+  # ---- locktime (param 2, default 0) ----
+  var locktime: uint32 = 0
+  if params.len >= 3 and params[2].kind != JNull:
+    if params[2].kind != JInt:
+      raise newRpcError(RpcTypeError, "Expected type number for locktime")
+    let lt = params[2].getInt()
+    if lt < 0 or lt > 0xffffffff'i64:
+      raise newRpcError(RpcInvalidParameter,
+        "Invalid parameter, locktime out of range")
+    locktime = uint32(lt)
+
+  # ---- replaceable (param 3) ----
+  # Core ConstructTransaction receives rbf as std::optional<bool>:
+  # createrawtransaction passes std::nullopt when the arg is ABSENT and the
+  # explicit bool when present (rawtransaction.cpp:398-401). AddInputs then
+  # picks the input sequence (rawtransaction_util.cpp:49-55):
+  #   rbf.value_or(true)              → MAX_BIP125_RBF_SEQUENCE  0xfffffffd
+  #   else if nLockTime != 0          → MAX_SEQUENCE_NONFINAL    0xfffffffe
+  #   else                            → SEQUENCE_FINAL           0xffffffff
+  # value_or(true) means BOTH "arg absent" AND "replaceable=true" → RBF default.
+  # (rustoshi FIX-70 / W120 BUG-3 documents the same Core default.)
+  var rbf = true  # std::nullopt → value_or(true)
+  if params.len >= 4 and params[3].kind != JNull:
+    if params[3].kind != JBool:
+      raise newRpcError(RpcTypeError, "Expected type bool for replaceable")
+    rbf = params[3].getBool()
+  let defaultSequence: uint32 =
+    if rbf: 0xfffffffd'u32
+    elif locktime != 0: 0xfffffffe'u32
+    else: 0xffffffff'u32
+
+  # ---- inputs ----
+  var inputs: seq[TxIn]
+  for inputObj in params[0]:
+    if inputObj.kind != JObject:
+      raise newRpcError(RpcTypeError, "Expected type object for input")
+    if not inputObj.hasKey("txid") or inputObj["txid"].kind != JString:
+      raise newRpcError(RpcInvalidParameter, "Invalid parameter, missing txid")
+    let txidHex = inputObj["txid"].getStr()
+    validateHashV(txidHex, "txid")  # Core ParseHashV: -8 on non-64-hex txid (BEFORE parseTxId, which would otherwise crash on a short/invalid string)
+    let txid = parseTxId(txidHex)
+    if not inputObj.hasKey("vout") or inputObj["vout"].kind != JInt:
+      raise newRpcError(RpcInvalidParameter,
+        "Invalid parameter, missing vout key")
+    let nOutput = inputObj["vout"].getInt()
+    if nOutput < 0:
+      raise newRpcError(RpcInvalidParameter,
+        "Invalid parameter, vout cannot be negative")
+    var sequence = defaultSequence
+    if inputObj.hasKey("sequence") and inputObj["sequence"].kind != JNull:
+      if inputObj["sequence"].kind != JInt:
+        raise newRpcError(RpcTypeError, "Expected type number for sequence")
+      let seqNr = inputObj["sequence"].getInt()
+      if seqNr < 0 or seqNr > 0xffffffff'i64:
+        raise newRpcError(RpcInvalidParameter,
+          "Invalid parameter, sequence number is out of range")
+      sequence = uint32(seqNr)
+    inputs.add(TxIn(
+      prevOut: OutPoint(txid: txid, vout: uint32(nOutput)),
+      scriptSig: @[],
+      sequence: sequence
+    ))
+
+  # ---- outputs ----
+  # Core NormalizeOutputs (rawtransaction_util.cpp:74-99): accept EITHER an
+  # object {address:amount,...,"data":hex} OR an array of single-key objects
+  # [{address:amount},{"data":hex}], translating the array form into an ordered
+  # (key,value) list. We normalize both into `normOutputs` so the downstream
+  # ParseOutputs logic (dup detection, OP_RETURN, address→spk) is identical.
+  var normOutputs: seq[(string, JsonNode)]
+  case params[1].kind
+  of JObject:
+    for k, v in params[1]:
+      normOutputs.add((k, v))
+  of JArray:
+    for entry in params[1]:
+      if entry.kind != JObject:
+        raise newRpcError(RpcInvalidParameter,
+          "Invalid parameter, key-value pair not an object as expected")
+      if entry.len != 1:
+        raise newRpcError(RpcInvalidParameter,
+          "Invalid parameter, key-value pair must contain exactly one key")
+      for k, v in entry:
+        normOutputs.add((k, v))
+  else:
+    raise newRpcError(RpcTypeError,
+      "Expected type object or array for outputs")
+
+  var outputs: seq[TxOut]
+  var seenData = false
+  var seenAddrs = initHashSet[string]()
+  for (k, v) in normOutputs:
+    if k == "data":
+      if seenData:
+        raise newRpcError(RpcInvalidParameter,
+          "Invalid parameter, duplicate key: data")
+      seenData = true
+      var data: seq[byte]
+      try:
+        data = hexToBytes(v.getStr())
+      except CatchableError:
+        raise newRpcError(RpcTypeError, "Data must be hexadecimal string")
+      # OP_RETURN <push data> — same builder as walletcreatefundedpsbt.
+      var script: seq[byte]
+      script.add(0x6a'u8)            # OP_RETURN
+      if data.len <= 75:
+        script.add(byte(data.len))
+      elif data.len <= 255:
+        script.add(0x4c'u8)         # OP_PUSHDATA1
+        script.add(byte(data.len))
+      else:
+        script.add(0x4d'u8)         # OP_PUSHDATA2 (LE length)
+        script.add(byte(data.len and 0xff))
+        script.add(byte((data.len shr 8) and 0xff))
+      script.add(data)
+      outputs.add(TxOut(value: Satoshi(0), scriptPubKey: script))
+    else:
+      let amount = amountFromValueSat(v)
+      var parsedAddr: Address
+      try:
+        parsedAddr = decodeAddress(k)
+      except AddressError:
+        raise newRpcError(RpcInvalidAddressOrKey,
+          "Invalid Bitcoin address: " & k)
+      if k in seenAddrs:
+        raise newRpcError(RpcInvalidParameter,
+          "Invalid parameter, duplicated address: " & k)
+      seenAddrs.incl(k)
+      let spk = scriptPubKeyForAddress(parsedAddr)
+      outputs.add(TxOut(value: Satoshi(amount), scriptPubKey: spk))
+
+  # ---- assemble unsigned tx (version 2, no witnesses → legacy serialization) ----
+  let rawTx = Transaction(
+    version: 2'i32,
+    inputs: inputs,
+    outputs: outputs,
+    witnesses: @[],
+    lockTime: locktime
+  )
+  %toHex(serialize(rawTx, includeWitness = true))
+
+# ============================================================================
 # fundrawtransaction
 # ============================================================================
 #
@@ -13242,6 +13519,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   # Raw transactions
   of "getrawtransaction":
     rpc.handleGetRawTransaction(params)
+  of "createrawtransaction":
+    rpc.handleCreateRawTransaction(params)
   of "decoderawtransaction":
     rpc.handleDecodeRawTransaction(params)
   of "combinerawtransaction":
@@ -13266,6 +13545,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetPeerInfo()
   of "getconnectioncount":
     rpc.handleGetConnectionCount()
+  of "getnettotals":
+    rpc.handleGetNetTotals()
   of "getnodeaddresses":
     rpc.handleGetNodeAddresses(params)
   of "addpeeraddress":
