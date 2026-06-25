@@ -50,9 +50,14 @@ proc p2pkhScript(pub: PublicKey): seq[byte] =
 # Mandatory-ish flag set for legacy P2PKH ECDSA verification (no taproot).
 const P2pkhFlags = {sfP2SH, sfDERSig, sfStrictEnc, sfLowS, sfNullFail}
 
-proc mkSignedP2pkhCheck(seed: int): ScriptCheck =
+proc mkSignedP2pkhCheck(seed: int,
+                        storeOut: var seq[TxPrevouts]): ScriptCheck =
   ## Build ONE fully-signed P2PKH input as a self-contained ScriptCheck doing
   ## real ECDSA verification — the dominant mainnet IBD workload.
+  ##
+  ## `storeOut` is a caller-owned seq that must outlive the returned ScriptCheck
+  ## (and any runChecks call using it).  One TxPrevouts entry is appended to it
+  ## and the check's prevoutsPtr points into that entry.
   let priv = mkPriv(byte((seed shr 8) and 0xff), byte(seed and 0xff))
   let pub = derivePublicKey(priv)
   let spk = p2pkhScript(pub)
@@ -74,6 +79,11 @@ proc mkSignedP2pkhCheck(seed: int): ScriptCheck =
   )
   signInputP2PKH(tx, 0, priv, pub)
 
+  storeOut.add(TxPrevouts(
+    allAmounts: @[Satoshi(0)],
+    allScriptPubKeys: @[spk]
+  ))
+
   ScriptCheck(
     scriptSig: tx.inputs[0].scriptSig,
     scriptPubKey: spk,
@@ -82,8 +92,7 @@ proc mkSignedP2pkhCheck(seed: int): ScriptCheck =
     amount: Satoshi(0),
     flags: P2pkhFlags,
     witness: @[],
-    allAmounts: @[Satoshi(0)],
-    allScriptPubKeys: @[spk]
+    prevoutsPtr: addr storeOut[storeOut.len - 1]
   )
 
 # ---------------------------------------------------------------------------
@@ -101,9 +110,11 @@ suite "W167 — pool engages >1 core on real ECDSA work":
 
     # Build a chunky batch of real ECDSA-signed checks so each worker has
     # meaningful work to claim. 4000 ECDSA verifications.
+    # `store` must outlive `checks` and the runChecks call below.
+    var store: seq[TxPrevouts] = newSeqOfCap[TxPrevouts](4000)
     var checks: seq[ScriptCheck] = @[]
     for i in 0 ..< 4000:
-      checks.add(mkSignedP2pkhCheck(i + 1))
+      checks.add(mkSignedP2pkhCheck(i + 1, store))
 
     enableInstrumentation()
     let okPar = runChecksParallel(checks)
@@ -124,9 +135,10 @@ suite "W167 — pool engages >1 core on real ECDSA work":
 
   test "SPEEDUP: parallel wall-clock beats serial on a script-heavy batch":
     initVerifyPool(0)
+    var store: seq[TxPrevouts] = newSeqOfCap[TxPrevouts](6000)
     var checks: seq[ScriptCheck] = @[]
     for i in 0 ..< 6000:
-      checks.add(mkSignedP2pkhCheck(100000 + i))
+      checks.add(mkSignedP2pkhCheck(100000 + i, store))
 
     # Serial baseline (wall clock).
     let t0 = epochTime()
@@ -160,17 +172,19 @@ suite "W167 — serial and parallel verdicts are identical":
 
   test "all-valid batch: both accept":
     initVerifyPool(0)
+    var store: seq[TxPrevouts] = newSeqOfCap[TxPrevouts](200)
     var checks: seq[ScriptCheck] = @[]
     for i in 0 ..< 200:
-      checks.add(mkSignedP2pkhCheck(500000 + i))
+      checks.add(mkSignedP2pkhCheck(500000 + i, store))
     check runChecksSerial(checks) == true
     check runChecksParallel(checks) == true
 
   test "one tampered sig in the batch: both reject":
     initVerifyPool(0)
+    var store: seq[TxPrevouts] = newSeqOfCap[TxPrevouts](200)
     var checks: seq[ScriptCheck] = @[]
     for i in 0 ..< 200:
-      checks.add(mkSignedP2pkhCheck(600000 + i))
+      checks.add(mkSignedP2pkhCheck(600000 + i, store))
     # Corrupt the scriptSig of one check so its ECDSA verify fails.
     var bad = checks[137]
     if bad.scriptSig.len > 5:
@@ -219,7 +233,12 @@ suite "W167 — G21: multi-input Taproot key-path uses the FULL prevout arrays":
                      sfDERSig, sfStrictEnc}
 
     # Build the TWO ScriptChecks exactly as collectChecks would — each carrying
-    # the FULL allAmounts/allScriptPubKeys (the G21 fix).
+    # the FULL allAmounts/allScriptPubKeys via a shared TxPrevouts (the G21 fix).
+    # One TxPrevouts covers both inputs of this 2-input tx.
+    var goodStore: seq[TxPrevouts] = @[TxPrevouts(
+      allAmounts: allAmounts,
+      allScriptPubKeys: allSpks
+    )]
     var goodChecks: seq[ScriptCheck] = @[]
     for idx in 0 ..< 2:
       goodChecks.add(ScriptCheck(
@@ -230,8 +249,7 @@ suite "W167 — G21: multi-input Taproot key-path uses the FULL prevout arrays":
         amount: allAmounts[idx],
         flags: TrFlags,
         witness: tx.witnesses[idx],
-        allAmounts: allAmounts,
-        allScriptPubKeys: allSpks
+        prevoutsPtr: addr goodStore[0]
       ))
 
     # Valid: serial AND parallel both accept (full arrays → correct BIP-341 sighash).
@@ -239,20 +257,50 @@ suite "W167 — G21: multi-input Taproot key-path uses the FULL prevout arrays":
     check runChecksParallel(goodChecks) == true
 
     # G21 GUARD: drop the array commitment for input 0 the way the dead 7-arg
-    # path did (single-amount fallback). The verifyScript fallback uses the
-    # single `amount` when allAmounts.len != tx.inputs.len, so the committed
-    # amounts no longer match what was signed → REJECT.
-    var droppedChecks = goodChecks
-    droppedChecks[0].allAmounts = @[allAmounts[0]]          # len 1 != 2 inputs
-    droppedChecks[0].allScriptPubKeys = @[allSpks[0]]
+    # path did (single-amount fallback). Build a separate store with a truncated
+    # TxPrevouts for input 0: verifyScript falls back to single-amount when
+    # allAmounts.len != tx.inputs.len, so the sighash no longer matches → REJECT.
+    var droppedStore: seq[TxPrevouts] = @[TxPrevouts(
+      allAmounts: @[allAmounts[0]],          # len 1 != 2 inputs
+      allScriptPubKeys: @[allSpks[0]]
+    )]
+    var droppedStore1: seq[TxPrevouts] = @[TxPrevouts(
+      allAmounts: allAmounts,
+      allScriptPubKeys: allSpks
+    )]
+    var droppedChecks: seq[ScriptCheck] = @[]
+    droppedChecks.add(ScriptCheck(
+      scriptSig: tx.inputs[0].scriptSig,
+      scriptPubKey: allSpks[0],
+      tx: tx, inputIndex: 0, amount: allAmounts[0], flags: TrFlags,
+      witness: tx.witnesses[0],
+      prevoutsPtr: addr droppedStore[0]   # truncated: len 1 != 2 → fallback
+    ))
+    droppedChecks.add(ScriptCheck(
+      scriptSig: tx.inputs[1].scriptSig,
+      scriptPubKey: allSpks[1],
+      tx: tx, inputIndex: 1, amount: allAmounts[1], flags: TrFlags,
+      witness: tx.witnesses[1],
+      prevoutsPtr: addr droppedStore1[0]  # full arrays, but input 0 broken
+    ))
     check runChecksSerial(droppedChecks) == false
     check runChecksParallel(droppedChecks) == false
 
     # G21 GUARD 2: tamper one committed amount (full-length array, wrong value).
     # The signed sighash committed to amt1; flipping it must REJECT.
-    var tamperedChecks = goodChecks
+    var tamperedStore: seq[TxPrevouts] = @[TxPrevouts(
+      allAmounts: @[amt0, amt1 + Satoshi(1)],
+      allScriptPubKeys: allSpks
+    )]
+    var tamperedChecks: seq[ScriptCheck] = @[]
     for idx in 0 ..< 2:
-      tamperedChecks[idx].allAmounts = @[amt0, amt1 + Satoshi(1)]
+      tamperedChecks.add(ScriptCheck(
+        scriptSig: tx.inputs[idx].scriptSig,
+        scriptPubKey: allSpks[idx],
+        tx: tx, inputIndex: idx, amount: allAmounts[idx], flags: TrFlags,
+        witness: tx.witnesses[idx],
+        prevoutsPtr: addr tamperedStore[0]
+      ))
     check runChecksSerial(tamperedChecks) == false
     check runChecksParallel(tamperedChecks) == false
 
