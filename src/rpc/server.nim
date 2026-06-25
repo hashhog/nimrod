@@ -13538,55 +13538,53 @@ proc handleVerifyChain(rpc: RpcServer, params: JsonNode): JsonNode =
                 blockTxs = blk.txs.len
           return %false
 
-    # Level 3: in-memory disconnect into the sandbox overlay. Mirrors Core
-    # DisconnectBlock (validation.cpp:4684-4701): remove the outputs this block
-    # created, restore the inputs it spent (from undo). Surfaces UTXO-set
-    # inconsistencies WITHOUT touching live state.
+    # Level 3: in-memory disconnect into the sandbox overlay, REUSING the SAME
+    # coin-level rewind machinery the production reorg path runs
+    # (chainstate.disconnectBlockIntoView — a faithful port of Core
+    # DisconnectBlock, validation.cpp:2179-2248). There is no verifychain-only
+    # disconnect copy: the undo conversion (blockUndoToUndoData) and the
+    # reverse-order SpendCoin/ApplyTxInUndo loop are exactly what
+    # `disconnectBlock(cs, blk)` uses during a real reorg — here they are driven
+    # against the in-memory overlay (NEVER live chainstate).
+    #
+    # The old hand-rolled copy walked transactions FORWARD and treated a
+    # legitimately-absent created output as fatal, so any block carrying an
+    # intra-block (chained / CPFP) spend — where a later tx consumes an output
+    # an earlier tx in the SAME block created — failed L3. Coinbase-only regtest
+    # never exercised it; real mainnet blocks do, which is why the live L3 spot
+    # check returned false. Reverse-order disconnect restores the intermediate
+    # output (via the later tx's undo) before the earlier tx removes it, so a
+    # valid chain disconnects cleanly (DISCONNECT_OK).
     if checkLevel >= 3:
-      # (a) Remove created outputs. Each must currently exist in the sandbox view
-      #     (it is a live coin unless a younger block in this range already spent
-      #     it — but younger blocks are processed FIRST going down, so by the time
-      #     we disconnect this block its outputs are unspent in the sandbox).
-      for txi in 0 ..< blk.txs.len:
-        let tx = blk.txs[txi]
-        let txid = tx.txid()
-        let isCoinbaseTx = (txi == 0)
-        for voutIdx in 0 ..< tx.outputs.len:
-          if isUnspendable(tx.outputs[voutIdx].scriptPubKey):
-            continue  # never stored (Core SpendCoin skips unspendable)
-          let op = OutPoint(txid: txid, vout: uint32(voutIdx))
-          let cur = sandboxGetUtxo(op)
-          if cur.isNone:
-            error "verifychain: irrecoverable inconsistency (created output absent on disconnect)",
-                  height = h, hash = $blockHash, vout = voutIdx
-            return %false
-          # 4-field coin identity check (Core SpendCoin, validation.cpp:2218-2226).
-          let c = cur.get()
-          if c.output.value != tx.outputs[voutIdx].value or
-             c.output.scriptPubKey != tx.outputs[voutIdx].scriptPubKey or
-             c.height != h or c.isCoinbase != isCoinbaseTx:
-            error "verifychain: irrecoverable inconsistency (created output mismatch)",
-                  height = h, hash = $blockHash, vout = voutIdx
-            return %false
-          overlay[op] = none(UtxoEntry)  # mark spent/removed in sandbox
-
-      # (b) Restore spent inputs from the undo data (ApplyTxInUndo). For each
-      #     non-coinbase tx, undo.txUndo[i-1].prevOutputs aligns with tx.inputs.
+      # Convert the L2-decoded BlockUndo into the per-(tx,vin)-aligned UndoData
+      # via the shared converter (same gates the reorg path applies).
+      var undoData = UndoData()
       if blockUndoOpt.isSome:
-        let bu = blockUndoOpt.get()
-        for txIdx in 1 ..< blk.txs.len:
-          let tx = blk.txs[txIdx]
-          let txUndo = bu.txUndo[txIdx - 1]
-          if txUndo.prevOutputs.len != tx.inputs.len:
-            error "verifychain: undo vin-count mismatch", height = h,
-                  hash = $blockHash, tx = txIdx
-            return %false
-          for i, spent in txUndo.prevOutputs:
-            let op = tx.inputs[i].prevOut
-            overlay[op] = some(UtxoEntry(
-              output: spent.output,
-              height: spent.height,
-              isCoinbase: spent.isCoinbase))
+        let undoConv = blockUndoToUndoData(blk, blockUndoOpt.get())
+        if not undoConv.isOk:
+          error "verifychain: irrecoverable inconsistency (undo conversion)",
+                height = h, hash = $blockHash, reason = undoConv.error
+          return %false
+        undoData = undoConv.value
+
+      # Overlay-backed view callbacks. value==none marks an outpoint spent/absent
+      # in the sandbox; a present value shadows the live entry. Reads fall
+      # through to the live coins view via sandboxGetUtxo. Writes touch ONLY the
+      # in-memory overlay.
+      let viewGet = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+        sandboxGetUtxo(op)
+      let viewSet = proc(op: OutPoint, entry: Option[UtxoEntry]) {.gcsafe, raises: [].} =
+        overlay[op] = entry
+
+      let dr = disconnectBlockIntoView(blk, h, blockHash, undoData, viewGet, viewSet)
+      # Core VerifyDB level 3: DISCONNECT_FAILED -> CORRUPTED_BLOCK_DB; a
+      # DISCONNECT_UNCLEAN sets pindexFailure which ALSO returns CORRUPTED_BLOCK_DB
+      # at the end of VerifyDB (validation.cpp:4688-4694, 4704-4706). Only a clean
+      # disconnect (drOk) is accepted — exactly Core's pindexFailure semantics.
+      if dr != drOk:
+        error "verifychain: irrecoverable inconsistency on disconnect",
+              height = h, hash = $blockHash, result = $dr
+        return %false
 
       # Remember this block for the reconnect pass (level 4).
       disconnected.add((blk, prevIdx, h))

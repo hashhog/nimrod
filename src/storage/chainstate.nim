@@ -1823,6 +1823,153 @@ proc isBip30UnspendableForDisconnect(height: int32, blockHash: BlockHash): bool 
   (height == 91722'i32 and array[32, byte](blockHash) == bip30Unspend1Hash) or
   (height == 91812'i32 and array[32, byte](blockHash) == bip30Unspend2Hash)
 
+type
+  DisconnectResult* = enum
+    ## Tri-valued outcome of a view-level block disconnect, mirroring Bitcoin
+    ## Core's `DisconnectResult` (validation.h). OK = clean rewind; UNCLEAN =
+    ## the rewind succeeded but a non-fatal inconsistency was observed (an
+    ## absent/mismatched created output, or an overwrite while restoring a
+    ## spent input) — Core continues and only flags it; FAILED = a fatal,
+    ## irrecoverable inconsistency (undo/body tx-count or vin-count mismatch,
+    ## or missing-metadata with no recoverable sibling) where the disconnect
+    ## cannot proceed.
+    drOk, drUnclean, drFailed
+
+proc disconnectBlockIntoView*(
+    blk: Block,
+    height: int32,
+    blockHash: BlockHash,
+    undo: UndoData,
+    viewGet: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].},
+    viewSet: proc(op: OutPoint, entry: Option[UtxoEntry]) {.gcsafe, raises: [].}
+  ): DisconnectResult {.gcsafe, raises: [].} =
+  ## Disconnect `blk` against an abstract UTXO view, restoring the fork-point
+  ## coin set. This is the canonical coin-level rewind semantics extracted from
+  ## the production `disconnectBlock` so that BOTH the on-disk reorg path AND
+  ## the read-only `verifychain` sandbox replay the SAME machinery — there is
+  ## no separate verifychain-only undo/disconnect copy.
+  ##
+  ## `viewGet`/`viewSet` abstract the coin store: the production reorg path
+  ## could back them with the RocksDB batch + cache; `verifychain` backs them
+  ## with an in-memory overlay layered over the live coins view (NEVER mutating
+  ## live chainstate). `undo` is the already-converted `UndoData` (the SAME
+  ## per-tx, per-vin aligned conversion the reorg path feeds to
+  ## `disconnectBlock(cs, blk, height, undo)`), so the undo decoding/alignment
+  ## lives in exactly one place too.
+  ##
+  ## Byte-for-byte Core parity (validation.cpp:2179-2248, DisconnectBlock):
+  ##  - transactions are unwound in REVERSE order (i = vtx.size()-1 .. 0). This
+  ##    is what makes intra-block spends correct: a later tx restores (via its
+  ##    undo) the very output an earlier tx in the same block created, BEFORE
+  ##    the earlier tx tries to remove it. The old verifychain copy walked
+  ##    FORWARD and treated the (legitimately) absent intermediate output as a
+  ##    fatal error — the live-mainnet L3 false (real blocks carry chained /
+  ##    CPFP spends; coinbase-only regtest never exercised this).
+  ##  - the created-output SpendCoin check (absent OR 4-field mismatch) is
+  ##    NON-FATAL: it sets the result to UNCLEAN and CONTINUES, exactly as Core
+  ##    sets `fClean = false` (validation.cpp:2218-2222). BIP-30 unspendable
+  ##    coinbases (h=91722/91812) are exempt.
+  ##  - inputs are restored in reverse vin order (validation.cpp:2233); an
+  ##    overwrite of a still-live coin is UNCLEAN, not fatal (ApplyTxInUndo,
+  ##    validation.cpp:2153). A tx-count or vin-count mismatch is FAILED
+  ##    (validation.cpp:2190-2192, 2229-2231).
+  var clean = true
+  let fEnforceBip30 = not isBip30UnspendableForDisconnect(height, blockHash)
+
+  # One TxUndo per non-coinbase tx (validation.cpp:2190-2193). The caller built
+  # `undo` from the aligned conversion, so spentOutputs cover exactly the
+  # non-coinbase inputs; we re-key them per-(tx,vin) below to honour reverse
+  # restore order.
+  if undo.spentOutputs.len != 0:
+    # Count expected non-coinbase inputs for a defensive vin-count gate.
+    var expectedInputs = 0
+    for i in 1 ..< blk.txs.len:
+      expectedInputs += blk.txs[i].inputs.len
+    if undo.spentOutputs.len != expectedInputs:
+      return drFailed  # block and undo data inconsistent (vin total mismatch)
+
+  # Index the converted undo by outpoint for O(1) restore lookups (the
+  # conversion preserved per-vin entries keyed by tx.inputs[j].prevOut).
+  var undoByOp = initTable[OutPoint, UtxoEntry]()
+  for (op, entry) in undo.spentOutputs:
+    undoByOp[op] = entry
+
+  # undo transactions in reverse order (validation.cpp:2205)
+  for i in countdown(blk.txs.len - 1, 0):
+    let tx = blk.txs[i]
+    let txId = tx.txid()
+    let isCoinbase = (i == 0)
+    let isBip30Exception = isCoinbase and not fEnforceBip30
+
+    # Check that all created outputs are available and match exactly; remove
+    # them. SpendCoin parity (validation.cpp:2213-2224).
+    for o in 0 ..< tx.outputs.len:
+      if isUnspendable(tx.outputs[o].scriptPubKey):
+        continue  # never stored on connect (validation.cpp:2214)
+      let outp = OutPoint(txid: txId, vout: uint32(o))
+      let cur = viewGet(outp)
+      let isSpent = cur.isSome
+      if not isSpent or
+         cur.get().output.value != tx.outputs[o].value or
+         cur.get().output.scriptPubKey != tx.outputs[o].scriptPubKey or
+         cur.get().height != height or
+         cur.get().isCoinbase != isCoinbase:
+        if not isBip30Exception:
+          clean = false  # transaction output mismatch (NON-FATAL, val:2218-2222)
+      # Remove the created output from the view regardless (Core SpendCoin
+      # erases the coin; a missing coin is a no-op).
+      viewSet(outp, none(UtxoEntry))
+
+    # restore inputs (validation.cpp:2226-2241), non-coinbase only
+    if i > 0:
+      # reverse vin order (validation.cpp:2233: for j = vin.size(); j > 0; --j)
+      for jj in countdown(tx.inputs.len - 1, 0):
+        let outp = tx.inputs[jj].prevOut
+        if not undoByOp.hasKey(outp):
+          # Undo data missing this input's prevout — block/undo inconsistent.
+          return drFailed
+        let restoreEntry =
+          try: undoByOp[outp]
+          except KeyError: return drFailed
+        # ApplyTxInUndo HaveCoin overwrite check (validation.cpp:2153): an
+        # already-live coin being restored is UNCLEAN, not fatal.
+        if viewGet(outp).isSome:
+          clean = false
+        viewSet(outp, some(restoreEntry))
+
+  if clean: drOk else: drUnclean
+
+proc blockUndoToUndoData*(blk: Block, blockUndo: BlockUndo): ChainStateResult[UndoData] =
+  ## Convert a decoded `BlockUndo` (one TxUndo per non-coinbase tx, prevOutputs
+  ## in forward vin order) into the per-(tx,vin)-aligned `UndoData` the
+  ## disconnect machinery consumes. Extracted so the on-disk reorg path and the
+  ## read-only verifychain replay share ONE undo-alignment + consistency-gate
+  ## implementation (no parallel copy that can drift).
+  ##
+  ## Gates mirror Bitcoin Core DisconnectBlock (validation.cpp:2190-2193 block/
+  ## undo tx-count; 2229-2232 per-tx vin count). The tx-count gate is
+  ## UNCONDITIONAL so a coinbase-only block carrying a stray txUndo is caught.
+  if blockUndo.txUndo.len + 1 != blk.txs.len:
+    return err(UndoData, "DisconnectBlock: block/undo tx count mismatch: block has " &
+               $blk.txs.len & " txs but undo has " & $blockUndo.txUndo.len &
+               " entries (expected " & $(blk.txs.len - 1) & ")")
+  var undo = UndoData()
+  for txIdx in 1 ..< blk.txs.len:  # Skip coinbase
+    let tx = blk.txs[txIdx]
+    let txUndo = blockUndo.txUndo[txIdx - 1]
+    if txUndo.prevOutputs.len != tx.inputs.len:
+      return err(UndoData, "DisconnectBlock: tx " & $txIdx &
+                 " vin count (" & $tx.inputs.len &
+                 ") != undo prevout count (" & $txUndo.prevOutputs.len & ")")
+    for i, spent in txUndo.prevOutputs:
+      let outpoint = tx.inputs[i].prevOut
+      let entry = UtxoEntry(
+        output: spent.output,
+        height: spent.height,
+        isCoinbase: spent.isCoinbase)
+      undo.spentOutputs.add((outpoint, entry))
+  ok(undo)
+
 proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoData,
                       fClean: ptr bool = nil): ChainStateResult[void] =
   ## Disconnect a block: restore spent outputs, remove created outputs.
@@ -2056,43 +2203,13 @@ proc disconnectBlock*(cs: var ChainState, blk: Block): ChainStateResult[void] =
   if not idx.undoPos.isNull:
     let (blockUndo, ok) = cs.undoMgr.readBlockUndo(idx.undoPos, blk.header.prevBlock, cs.params)
     if ok:
-      # Gate: blockUndo.txUndo.len + 1 must equal blk.txs.len (one TxUndo per
-      # non-coinbase tx).  Mismatch means the undo data is inconsistent with the
-      # block body — fail hard rather than silently restoring wrong inputs.
-      # Reference: Bitcoin Core validation.cpp:2190-2193.
-      #
-      # Note: must be UNCONDITIONAL — an early `blk.txs.len > 1` guard would
-      # let a coinbase-only block with a non-empty txUndo (corruption) slip
-      # through and silently restore phantom UTXOs.  Core's check fires for
-      # every block, including 1-tx coinbase-only blocks where vtxundo must be
-      # empty.
-      if blockUndo.txUndo.len + 1 != blk.txs.len:
-        return err("DisconnectBlock: block/undo tx count mismatch: block has " &
-                   $blk.txs.len & " txs but undo has " & $blockUndo.txUndo.len &
-                   " entries (expected " & $(blk.txs.len - 1) & ")")
-
-      # Convert BlockUndo to UndoData format for the existing disconnection logic.
-      # Each TxUndo's prevOutputs are in forward vin order; the per-tx index
-      # aligns spent[j] with vin[j] for outpoint reconstruction.
-      var undo = UndoData()
-      for txIdx in 1 ..< blk.txs.len:  # Skip coinbase
-        let tx = blk.txs[txIdx]
-        let txUndo = blockUndo.txUndo[txIdx - 1]
-        # Gate: per-tx vin count must equal txUndo.prevOutputs count.
-        # Reference: validation.cpp:2229-2232.
-        if txUndo.prevOutputs.len != tx.inputs.len:
-          return err("DisconnectBlock: tx " & $txIdx &
-                     " vin count (" & $tx.inputs.len &
-                     ") != undo prevout count (" & $txUndo.prevOutputs.len & ")")
-        for i, spent in txUndo.prevOutputs:
-          let outpoint = tx.inputs[i].prevOut
-          let entry = UtxoEntry(
-            output: spent.output,
-            height: spent.height,
-            isCoinbase: spent.isCoinbase
-          )
-          undo.spentOutputs.add((outpoint, entry))
-      return cs.disconnectBlock(blk, height, undo)
+      # Convert BlockUndo -> per-(tx,vin)-aligned UndoData via the SHARED helper
+      # (block/undo tx-count + per-tx vin-count gates, validation.cpp:2190-2193,
+      # 2229-2232). verifychain replays the same conversion.
+      let undoRes = blockUndoToUndoData(blk, blockUndo)
+      if not undoRes.isOk:
+        return err(undoRes.error)
+      return cs.disconnectBlock(blk, height, undoRes.value)
 
   # Fall back to RocksDB undo data
   let undoOpt = cs.db.getUndoData(blockHash)
