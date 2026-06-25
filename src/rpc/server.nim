@@ -6019,6 +6019,144 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     # Unexpected exception — use "rejected" catch-all per BIP-22.
     %"rejected"
 
+proc handleSubmitHeader(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## submitheader "hexdata"
+  ##
+  ## Decode the given hexdata as an 80-byte block header and submit it as a
+  ## candidate chain tip if valid. Throws when the header is invalid.
+  ##
+  ## Reference: bitcoin-core/src/rpc/mining.cpp submitheader() (RPCHelpMan).
+  ## Byte-identical error semantics with Bitcoin Core:
+  ##   * bad hex / wrong length  -> RPC_DESERIALIZATION_ERROR (-22)
+  ##                                "Block header decode failed"
+  ##   * parent unknown to node  -> RPC_VERIFY_ERROR (-25)
+  ##                                "Must submit previous header (<prevhash>) first"
+  ##                                where <prevhash> is the big-endian DISPLAY hex.
+  ##   * PoW / contextual reject -> RPC_VERIFY_ERROR (-25) with the reject reason.
+  ##   * success / already-known -> JSON null.
+  ##
+  ## This reuses nimrod's REAL headers-first validation path
+  ## (validation.validateBlockHeader = Core CheckBlockHeader; and
+  ## validation.contextualCheckBlockHeader = Core ContextualCheckBlockHeader),
+  ## the same procs the live P2P/AcceptBlock path runs. No parallel validator.
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing hexdata parameter")
+
+  let hexData = params[0].getStr()
+
+  # --- Step 1: decode the hex-encoded 80-byte header ----------------------
+  # Core: DecodeHexBlockHeader(h, request.params[0].get_str()):
+  #   IsHex(hex)  (even length + all hex chars)  AND
+  #   SpanReader{header_data} >> header           (needs >= 80 bytes; the
+  #   fixed-width CBlockHeader unserialize ignores any trailing bytes).
+  # Any failure -> RPC_DESERIALIZATION_ERROR -22 "Block header decode failed".
+  var header: BlockHeader
+  block decode:
+    # IsHex parity: reject odd-length or non-hex.
+    if hexData.len == 0 or (hexData.len mod 2) != 0:
+      raise newRpcError(RpcDeserializationError, "Block header decode failed")
+    for c in hexData:
+      if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+        raise newRpcError(RpcDeserializationError, "Block header decode failed")
+    var rawBytes: seq[byte]
+    try:
+      rawBytes = hexToBytes(hexData)
+    except CatchableError:
+      raise newRpcError(RpcDeserializationError, "Block header decode failed")
+    # SpanReader >> CBlockHeader needs at least the 80 header bytes.
+    if rawBytes.len < 80:
+      raise newRpcError(RpcDeserializationError, "Block header decode failed")
+    try:
+      header = deserializeBlockHeader(rawBytes[0 ..< 80])
+    except CatchableError:
+      raise newRpcError(RpcDeserializationError, "Block header decode failed")
+
+  # Compute this header's block hash (double-SHA256 of the 80-byte header,
+  # internal little-endian order — nimrod's BlockHash, == Core's uint256).
+  let headerBytes = serialize(header)
+  let blockHash = BlockHash(doubleSha256(headerBytes))
+
+  let cs = rpc.chainState
+  let prevHash = header.prevBlock
+  # Big-endian DISPLAY hex of prevhash, matching Core's h.hashPrevBlock.GetHex()
+  # (reverses the internal little-endian bytes). Same convention every other
+  # nimrod RPC uses for a block hash: reverseHex(toHex(<internal bytes>)).
+  let prevHashDisplay = reverseHex(toHex(array[32, byte](prevHash)))
+
+  # --- Step 2: parent-known check -----------------------------------------
+  # Core: LOCK(cs_main); if (!chainman.m_blockman.LookupBlockIndex(h.hashPrevBlock))
+  #   throw JSONRPCError(RPC_VERIFY_ERROR, "Must submit previous header (...) first").
+  # nimrod's single block index (cfBlockIndex) holds active-chain AND side-branch
+  # AND header-only entries (putBlockIndex / putBlockIndexHashOnly), so
+  # cs.db.getBlockIndex is the faithful LookupBlockIndex analog: the active tip
+  # is always indexed (connectBlock writes its row), and so is every header
+  # previously admitted via Step 5 below.
+  let prevIndexOpt = cs.db.getBlockIndex(prevHash)
+  if prevIndexOpt.isNone:
+    raise newRpcError(RpcTransactionError,
+      "Must submit previous header (" & prevHashDisplay & ") first")
+  let prevIndex = prevIndexOpt.get()
+
+  # --- Step 3: idempotency ------------------------------------------------
+  # Core's ProcessNewBlockHeaders is idempotent: a header already in the block
+  # index is a no-op that returns null (AcceptBlockHeader's "miSelf != end" path).
+  if cs.db.getBlockIndex(blockHash).isSome:
+    return newJNull()
+
+  # --- Step 4: real header validation -------------------------------------
+  # Core: ProcessNewBlockHeaders -> AcceptBlockHeader -> CheckBlockHeader
+  #       (PoW + time-too-new + prev-link) THEN ContextualCheckBlockHeader
+  #       (bad-diffbits, time-too-old MTP, BIP-94 timewarp, bad-version).
+  # Reuse nimrod's production procs for BOTH, in the same order:
+  #   validateBlockHeader        == CheckBlockHeader
+  #   contextualCheckBlockHeader == ContextualCheckBlockHeader
+  # On failure throw RPC_VERIFY_ERROR (-25) with the bip22 reject reason, which
+  # is Core's state.GetRejectReason() token (high-hash / bad-diffbits /
+  # time-too-old / time-too-new / bad-version / time-timewarp-attack).
+  let ctxFreeRes = validateBlockHeader(header, prevIndex, cs.params,
+                                       checkPow = true, minPowChecked = true)
+  if not ctxFreeRes.isOk:
+    raise newRpcError(RpcTransactionError, bip22String(ctxFreeRes.error))
+
+  let ctxRes = contextualCheckBlockHeader(header, prevIndex, cs.db, cs.params)
+  if not ctxRes.isOk:
+    raise newRpcError(RpcTransactionError, bip22String(ctxRes.error))
+
+  # --- Step 5: admit the validated header into the block index ------------
+  # Core's AcceptBlockHeader inserts the validated header into the block index
+  # (CBlockIndex with BLOCK_VALID_TREE). Mirror that with a hash-only block
+  # index row (the active height->hash slot is owned by the best chain; this is
+  # a header, not a connected block), so the parent-known and idempotency checks
+  # above see it on a subsequent submitheader. Cumulative work uses the SAME
+  # canonical chainstate work-per-block helper (calculateBlockWork) the
+  # side-branch arm uses, summed little-endian onto the parent's totalWork, so
+  # the persisted totalWork is self-consistent with cs.totalWork (one work
+  # universe). 256-bit LE add inlined here (chainstate's addWork is unexported,
+  # and its name collides with network/sync's value-returning addWork).
+  var hdrTotalWork = prevIndex.totalWork
+  block addBlockWork:
+    let blkWork = calculateBlockWork(header.bits)
+    var carry: uint32 = 0
+    for i in 0 ..< 32:
+      let s = uint32(hdrTotalWork[i]) + uint32(blkWork[i]) + carry
+      hdrTotalWork[i] = byte(s and 0xff)
+      carry = s shr 8
+  let hdrIdx = chainstate.BlockIndex(
+    hash: blockHash,
+    height: prevIndex.height + 1,
+    status: bsHeaderOnly,
+    prevHash: prevHash,
+    header: header,
+    totalWork: hdrTotalWork,
+    undoPos: FlatFilePos(fileNum: -1, pos: -1),
+    failureFlags: BLOCK_NO_FAILURE,
+    sequenceId: 0,
+    nTx: 0'i32
+  )
+  cs.db.putBlockIndexHashOnly(hdrIdx)
+
+  newJNull()  # success per Core: ProcessNewBlockHeaders state.IsValid() -> VNULL
+
 # ============================================================================
 # Wallet block-connect hook
 # ============================================================================
@@ -13158,6 +13296,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetBlockTemplate(params)
   of "submitblock":
     rpc.handleSubmitBlock(params)
+  of "submitheader":
+    rpc.handleSubmitHeader(params)
   of "prioritisetransaction":
     rpc.handlePrioritiseTransaction(params)
   of "getprioritisedtransactions":
