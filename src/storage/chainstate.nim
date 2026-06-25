@@ -865,7 +865,7 @@ proc addWork(total: var array[32, byte], work: array[32, byte]) =
     total[i] = byte(sum and 0xff)
     carry = sum shr 8
 
-proc calculateBlockWork(bits: uint32): array[32, byte] =
+proc calculateBlockWork*(bits: uint32): array[32, byte] =
   ## Calculate work from difficulty target
   ## Work = 2^256 / (target + 1)
   ## For simplicity, we approximate: work ≈ 2^(256-log2(target))
