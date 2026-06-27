@@ -1076,7 +1076,7 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let blkOpt = rpc.chainState.db.getBlock(blockHash)
   if blkOpt.isNone:
-    raise newRpcError(RpcInvalidParams, "block not found")
+    raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
 
   let b = blkOpt.get()
 
@@ -2225,8 +2225,10 @@ proc handleInvalidateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing blockhash parameter")
 
   let hashHex = params[0].getStr()
-  if hashHex.len != 64:
-    raise newRpcError(RpcInvalidAddressOrKey, "Invalid block hash")
+  # Core ParseHashV: a malformed (non-hex / wrong-length) blockhash is rejected
+  # at the parse boundary with -8 RPC_INVALID_PARAMETER (BEFORE any lookup), not
+  # the prior -5. A well-formed-but-absent hash stays -5 "Block not found" below.
+  validateHashV(hashHex, "blockhash")
 
   let blockHash = parseBlockHash(hashHex)
 
@@ -2288,8 +2290,10 @@ proc handleReconsiderBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing blockhash parameter")
 
   let hashHex = params[0].getStr()
-  if hashHex.len != 64:
-    raise newRpcError(RpcInvalidAddressOrKey, "Invalid block hash")
+  # Core ParseHashV: a malformed (non-hex / wrong-length) blockhash is rejected
+  # at the parse boundary with -8 RPC_INVALID_PARAMETER (BEFORE any lookup), not
+  # the prior -5. A well-formed-but-absent hash stays -5 "Block not found" below.
+  validateHashV(hashHex, "blockhash")
 
   let blockHash = parseBlockHash(hashHex)
 
@@ -2326,8 +2330,10 @@ proc handlePreciousBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing blockhash parameter")
 
   let hashHex = params[0].getStr()
-  if hashHex.len != 64:
-    raise newRpcError(RpcInvalidAddressOrKey, "Invalid block hash")
+  # Core ParseHashV: a malformed (non-hex / wrong-length) blockhash is rejected
+  # at the parse boundary with -8 RPC_INVALID_PARAMETER (BEFORE any lookup), not
+  # the prior -5. A well-formed-but-absent hash stays -5 "Block not found" below.
+  validateHashV(hashHex, "blockhash")
 
   let blockHash = parseBlockHash(hashHex)
 
