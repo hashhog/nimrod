@@ -14341,6 +14341,19 @@ proc asyncHandleRequest(rpc: RpcServer, body: string,
   except CatchableError as e:
     return makeErrorResponse(requestId, RpcInternalError, "internal error: " & e.msg)
 
+proc constantTimeEq(a, b: string): bool =
+  ## Constant-time string equality for credential comparison: time is
+  ## independent of the secret's content (no early-out on first mismatch),
+  ## closing the timing oracle plain `==` opens on RPC auth tokens. The length
+  ## comparison itself is low-sensitivity (token format/length is fixed).
+  var diff: uint8 = if a.len == b.len: 0'u8 else: 1'u8
+  let n = max(a.len, b.len)
+  for i in 0 ..< n:
+    let ca: uint8 = if i < a.len: uint8(a[i]) else: 0'u8
+    let cb: uint8 = if i < b.len: uint8(b[i]) else: 0'u8
+    diff = diff or (ca xor cb)
+  result = diff == 0
+
 proc checkAuth(rpc: RpcServer, authHeader: string): bool =
   ## Verify HTTP Basic auth credentials.
   ## Accepts either --rpcuser/--rpcpassword credentials or the auto-generated
@@ -14363,13 +14376,17 @@ proc checkAuth(rpc: RpcServer, authHeader: string): bool =
     let user = decoded[0 ..< colonIdx]
     let pass = decoded[colonIdx + 1 .. ^1]
 
-    # Cookie auth: username must be exactly "__cookie__"
+    # Cookie auth: username must be exactly "__cookie__" (public sentinel, not a
+    # secret). The cookie password is the secret -> constant-time compare.
     if user == "__cookie__" and hasCookie:
-      return pass == rpc.cookiePassword
+      return constantTimeEq(pass, rpc.cookiePassword)
 
-    # Regular user/password auth
+    # Regular user/password auth — constant-time on both, evaluated fully (no
+    # short-circuit) so neither leaks via timing.
     if hasUserPass:
-      return user == rpc.authUser and pass == rpc.authPass
+      let userOk = constantTimeEq(user, rpc.authUser)
+      let passOk = constantTimeEq(pass, rpc.authPass)
+      return userOk and passOk
 
     return false
   except CatchableError:
