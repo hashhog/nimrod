@@ -911,7 +911,10 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   # Reference: bitcoin-core/src/rpc/blockchain.cpp ComputeNextBlockAndDepth +
   # blockheaderToJSON:162-180.
   let activeHashAtHeight = rpc.chainState.db.getBlockHashByHeight(idx.height)
-  let inActiveChain = activeHashAtHeight.isSome and activeHashAtHeight.get() == idx.hash
+  # height > bestHeight cannot be on the active chain (getBlockHashByHeight may
+  # return a stale above-tip entry after a bare invalidateblock).
+  let inActiveChain = idx.height <= rpc.chainState.bestHeight and
+    activeHashAtHeight.isSome and activeHashAtHeight.get() == idx.hash
 
   # Core blockheaderToJSON key order (rpc/blockchain.cpp:159-176):
   #   hash, confirmations, height, version, versionHex, merkleroot, time,
@@ -1327,7 +1330,19 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   # the header section (before strippedsize).
   var response = newJObject()
   response["hash"]         = %reverseHex(toHex(computedHash))
-  response["confirmations"] = %int(rpc.chainState.bestHeight - height + 1)
+  # confirmations: Core ComputeNextBlockAndDepth (rpc/blockchain.cpp:116-123)
+  # returns -1 for a block NOT on the active chain (e.g. a reorged-out/stale
+  # block whose body still exists). Mirror getblockheader's membership check
+  # instead of returning best-height-height+1 unconditionally.
+  # A block whose height is above the current tip cannot be on the active chain
+  # (getBlockHashByHeight may still return a stale above-tip entry after a bare
+  # invalidateblock), so guard on height <= bestHeight before the hash compare.
+  let activeHashAtHeight = rpc.chainState.db.getBlockHashByHeight(height)
+  let inActiveChain = height <= rpc.chainState.bestHeight and
+    activeHashAtHeight.isSome and activeHashAtHeight.get() == blockHash
+  response["confirmations"] =
+    if inActiveChain: %int(rpc.chainState.bestHeight - height + 1)
+    else: %(-1)
   response["height"]       = %height
   response["version"]      = %b.header.version
   response["versionHex"]   = %versionHex
