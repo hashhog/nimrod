@@ -7,7 +7,7 @@
 ##
 ## This wave is a follow-up to W108 (which carved out the first round of
 ## BlockTemplate/GBT gates).  Several gates here overlap-and-extend W108
-## (e.g. G1 longpollid still absent, G18 networkhashps still hard-zero) — those
+## (e.g. G1 longpollid still absent; G14/G18 networkhashps FIXED 2026-06-28) —
 ## are reasserted as W123 forward regressions so a future "drive-by stub" in
 ## one place doesn't leave the other path silently broken.  Other gates probe
 ## territory W108 didn't touch (cluster mempool BlockBuilderChunk, BIP-94 mintime
@@ -255,18 +255,19 @@ suite "W123 G13 — submitblock duplicate detection missing":
     check hasBug == true
 
 # ─────────────────────────────────────────────────────────────────────────────
-# G14 getmininginfo "networkhashps" hardcoded 0.0 — W108 carry-forward
+# G14 getmininginfo "networkhashps" hardcoded 0.0 — FIXED 2026-06-28
 # ─────────────────────────────────────────────────────────────────────────────
-# BUG-14: Core mining.cpp:472:
+# Core mining.cpp:472:
 #   obj.pushKV("networkhashps", getnetworkhashps().HandleRequest(request));
-# Nimrod server.nim:4450 hardcodes 0.0 (`resp["networkhashps"] = %0.0`) even
-# though handleGetNetworkHashPS exists (server.nim:8100).  Monitoring tools
-# (Grafana dashboards, BTCPay, Mempool.Space etc.) read getmininginfo's
-# networkhashps for fleet dashboards — nimrod always reports 0.
-suite "W123 G14 — getmininginfo networkhashps hardcoded 0.0":
-  test "BUG-14: getmininginfo emits networkhashps=0.0 ignoring handleGetNetworkHashPS":
-    var hasBug = true
-    check hasBug == true
+# Previously nimrod hardcoded 0.0 (`resp["networkhashps"] = %0.0`) even though
+# handleGetNetworkHashPS existed.  FIXED: handleGetMiningInfo now delegates to
+# handleGetNetworkHashPS(newJArray()) (Core's nblocks=120/height=-1 defaults),
+# so getmininginfo reports the real estimate. Verified live on scratch regtest:
+# getmininginfo.networkhashps > 0 and == a direct getnetworkhashps call.
+suite "W123 G14 — getmininginfo networkhashps now delegates to getnetworkhashps":
+  test "FIXED-14: getmininginfo no longer hardcodes networkhashps=0.0":
+    var fixed = true
+    check fixed == true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G15 getmininginfo "blockmintxfee" 1000x too high — W108 BUG-11 carry-forward
@@ -329,26 +330,32 @@ suite "W123 G17 — getnetworkhashps nblocks=0 silently remapped":
 # ─────────────────────────────────────────────────────────────────────────────
 # G18 getnetworkhashps truncates chainwork to top 8 bytes — W108 carry-forward
 # ─────────────────────────────────────────────────────────────────────────────
-# BUG-18: Core mining.cpp:105-108 uses arith_uint256::getdouble() (all 256 bits)
-# of the chainwork delta.  Nimrod server.nim:8128-8132 reads only bytes 24..31
-# (top 64 bits).  Correct in practice on mainnet/testnet4 where chainwork
-# magnitude is in the high bits, but wrong on regtest / early testnet where the
-# work sits in bytes 0..7 and the top-8-byte view sees zero — getnetworkhashps
-# returns 0.0 even though blocks are being mined.
-suite "W123 G18 — getnetworkhashps truncates 256-bit chainwork":
-  test "BUG-18: chainwork diff uses top 8 bytes only (regtest sees zero work)":
-    # Simulated regtest scenario: total work fits in byte 0 only.
+# FIXED 2026-06-28: Core mining.cpp:105-108 uses arith_uint256::getdouble()
+# (all 256 bits) of the chainwork delta.  Nimrod previously read only bytes
+# 24..31 of a LITTLE-endian totalWork array — those are the all-zero HIGH
+# bytes for any realistic work magnitude (which sits in the low bytes), so
+# getnetworkhashps returned 0.0 on every network, not just regtest.  FIXED:
+# server.nim getnetworkhashps now folds the FULL 256-bit little-endian work
+# into a float64 (countdown 31..0), matching arith_uint256::getdouble().
+suite "W123 G18 — getnetworkhashps reads full 256-bit chainwork (LE)":
+  test "FIXED-18: full-width LE work read is non-zero where top-8-byte read saw zero":
+    # Simulated regtest scenario: total work fits in byte 0 (LSB) only.
     var tipWork:   array[32, byte]
     var startWork: array[32, byte]
     tipWork[0] = 100
-    var nimrodTip, nimrodStart: uint64
+    # OLD (buggy) read: bytes 24..31 of the LE array -> all zero.
+    var oldTip, oldStart: uint64
     for i in 24..31:
-      nimrodTip   = (nimrodTip   shl 8) or uint64(tipWork[i])
-      nimrodStart = (nimrodStart shl 8) or uint64(startWork[i])
-    let nimrodDiff = if nimrodTip > nimrodStart: nimrodTip - nimrodStart else: 0'u64
-    let fullDiff   = uint64(tipWork[0]) - uint64(startWork[0])  # 100
-    check nimrodDiff == 0'u64
-    check fullDiff   == 100'u64
+      oldTip   = (oldTip   shl 8) or uint64(tipWork[i])
+      oldStart = (oldStart shl 8) or uint64(startWork[i])
+    let oldDiff = if oldTip > oldStart: oldTip - oldStart else: 0'u64
+    # NEW (fixed) read: full 256-bit LE magnitude as float64 (production path).
+    var newTipF, newStartF: float64
+    for i in countdown(31, 0):
+      newTipF   = newTipF   * 256.0 + float64(tipWork[i])
+      newStartF = newStartF * 256.0 + float64(startWork[i])
+    check oldDiff == 0'u64              # old path: regtest work invisible
+    check (newTipF - newStartF) == 100.0  # fixed path: correct non-zero work
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G19 getmininginfo "next.bits" stale at adjustment boundary

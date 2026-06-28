@@ -7032,6 +7032,12 @@ proc handleLogging(rpc: RpcServer, params: JsonNode): JsonNode =
   for c in names:
     result[c] = %(c in active)
 
+# Forward declaration: the getnetworkhashps estimator is defined later in this
+# module (~line 13118), but getmininginfo (below) needs it to populate
+# networkhashps. Core parity: getmininginfo emits
+# getnetworkhashps().HandleRequest(request) (rpc/mining.cpp), not a hardcoded 0.
+proc handleGetNetworkHashPS(rpc: RpcServer, params: JsonNode): JsonNode
+
 proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
   ## getmininginfo
   ## Returns a json object containing mining-related information.
@@ -7076,7 +7082,7 @@ proc handleGetMiningInfo(rpc: RpcServer): JsonNode =
   resp["bits"]             = %bitsHex
   resp["difficulty"]       = diffNode
   resp["target"]           = %targetHex
-  resp["networkhashps"]    = %0.0
+  resp["networkhashps"]    = rpc.handleGetNetworkHashPS(newJArray())
   resp["pooledtx"]         = %rpc.mempool.count
   resp["blockmintxfee"]    = btcAmountNode(1)
   resp["chain"]            = %chainName
@@ -13143,13 +13149,22 @@ proc handleGetNetworkHashPS(rpc: RpcServer, params: JsonNode): JsonNode =
   let startIdx = startIdxOpt.get()
   let timeDiff = int64(tipIdx.header.timestamp) - int64(startIdx.header.timestamp)
   if timeDiff <= 0: return %0.0
-  var tipWork: uint64 = 0
-  var startWork: uint64 = 0
-  for i in 24..31:
-    tipWork = (tipWork shl 8) or uint64(tipIdx.totalWork[i])
-    startWork = (startWork shl 8) or uint64(startIdx.totalWork[i])
-  if tipWork <= startWork: return %0.0
-  %(float64(tipWork - startWork) / float64(timeDiff))
+  # totalWork is stored LITTLE-ENDIAN (byte 0 = LSB; see calculateWork in
+  # network/sync.nim — carry propagates low->high — and the LE summation in
+  # storage/chainstate.nim). The previous loop read bytes 24..31 as if the
+  # array were big-endian; those are the all-zero HIGH bytes for any realistic
+  # work value, so tipWork==startWork==0 and the result was ALWAYS 0.0.
+  # Read the full 256-bit magnitude as a float64 (ample range for 2^256≈1e77),
+  # matching Core's arith_uint256 (work_tip - work_start) / time. Network-
+  # agnostic: no 64-bit truncation that the old uint64 path would suffer on
+  # high-work chains.
+  var tipWorkF: float64 = 0.0
+  var startWorkF: float64 = 0.0
+  for i in countdown(31, 0):
+    tipWorkF = tipWorkF * 256.0 + float64(tipIdx.totalWork[i])
+    startWorkF = startWorkF * 256.0 + float64(startIdx.totalWork[i])
+  if tipWorkF <= startWorkF: return %0.0
+  %((tipWorkF - startWorkF) / float64(timeDiff))
 
 proc handleGetTxOutProof(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.kind != JArray or params.len < 1:
