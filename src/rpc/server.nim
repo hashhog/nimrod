@@ -1005,6 +1005,10 @@ proc handleGetBlockFromPeer(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams,
       "getblockfrompeer requires 2 parameters: blockhash, peer_id")
 
+  # Core ParseHashV (rpc/util.cpp): a malformed blockhash (non-hex / wrong-
+  # length) -> -8 RPC_INVALID_PARAMETER before any lookup, not the -32603 a
+  # bare parseBlockHash would raise.
+  validateHashV(params[0].getStr(), "blockhash")
   let blockHash = parseBlockHash(params[0].getStr())
   let peerId = params[1].getInt()
 
@@ -13162,7 +13166,9 @@ proc handleGetTxOutProof(rpc: RpcServer, params: JsonNode): JsonNode =
   var blkHeader: BlockHeader
   if params.len >= 2:
     let bhStr = params[1].getStr()
-    if bhStr.len != 64: raise newRpcError(RpcInvalidParams, "blockhash must be 64-char hex")
+    # Core ParseHashV: malformed blockhash -> -8 before lookup (was -32602 for
+    # wrong-length, -32603 for a 64-char non-hex). Unknown stays -5 below.
+    validateHashV(bhStr, "blockhash")
     let bh = parseBlockHash(bhStr)
     blkOpt = rpc.chainState.db.getBlock(bh)
     if blkOpt.isNone: raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
