@@ -21,14 +21,13 @@
 import std/options
 import ./params
 import ../primitives/types
+import ../primitives/uint256
 
 ## Two weeks in seconds — matches Bitcoin Core's TWO_WEEKS_IN_SECONDS constant.
-## Used to derive the block-count proxy for the safety guard.
+## Used for the GetBlockProofEquivalentTime safety guard (condition 6).
 const TwoWeeksInSeconds* = 60 * 60 * 24 * 7 * 2  # 1,209,600
 
-## Approximate number of blocks in two weeks at 10 min/block.
-## We use this as a proxy for the equivalent-work guard (condition 6)
-## when we do not have per-header timestamp data readily available.
+## Legacy block-count proxy (kept for documentation; no longer used in condition 6).
 const TwoWeeksInBlocks* = TwoWeeksInSeconds div 600  # 2016
 
 ## ScriptSkipReason documents why scripts will or will not be skipped.
@@ -82,6 +81,12 @@ type AssumeValidContext* = object
   bestHeaderHeight*: int32
   ## Best-header chainwork (256-bit, little-endian bytes).
   bestHeaderChainWork*: array[32, byte]
+  ## nBits of the best-known header tip, used by GetBlockProof in condition 6.
+  bestHeaderBits*: uint32
+  ## Cumulative chainwork of the block being connected (pindex.nChainWork).
+  ## Populated from the block index entry written during header sync (bsHeaderOnly).
+  ## Zero when not available (new block not yet in index); condition 6 still applies.
+  blockChainWork*: array[32, byte]
 
 proc compareWork(a, b: array[32, byte]): int =
   ## Compare two 256-bit little-endian chainwork values.
@@ -90,6 +95,21 @@ proc compareWork(a, b: array[32, byte]): int =
     if a[i] < b[i]: return -1
     elif a[i] > b[i]: return 1
   0
+
+proc getBlockProofFromBits(bits: uint32): UInt256 =
+  ## Compute the proof-of-work value for a compact nBits target.
+  ## Mirrors Bitcoin Core GetBitsProof (chain.cpp:121-133):
+  ##   proof = ~target / (target+1) + 1
+  ## Returns zero for invalid bits (zero target, negative flag, overflow).
+  ## A zero return means the caller must treat the check as "too recent" (fail-safe).
+  let target = setCompact(bits)
+  if target.isZero():
+    return initUInt256()
+  let notTarget = bitnot(target)
+  let targetPlus1 = target + initUInt256(1'u64)
+  if targetPlus1.isZero():
+    return initUInt256(1'u64)
+  (notTarget div targetPlus1) + initUInt256(1'u64)
 
 proc isZeroHash(h: BlockHash): bool =
   for b in array[32, byte](h):
@@ -152,12 +172,38 @@ proc shouldSkipScripts*(
   if compareWork(ctx.bestHeaderChainWork, params.minimumChainWork) < 0:
     return ssrBelowMinimumChainWork
 
-  # Condition 6: The best-known header is at least two weeks of equivalent work
-  # past the block being connected.
-  # Bitcoin Core uses GetBlockProofEquivalentTime to convert chainwork
-  # difference to seconds.  We approximate with block-count distance:
-  # if bestHeaderHeight - blockHeight >= TwoWeeksInBlocks the check passes.
-  if ctx.bestHeaderHeight - ctx.blockHeight < TwoWeeksInBlocks:
+  # Condition 6: GetBlockProofEquivalentTime(best_header, pindex, best_header, params)
+  # must be > TWO_WEEKS_IN_SECONDS (1 209 600 s).
+  #
+  # Exact formula per Bitcoin Core chain.cpp:136-151:
+  #   r = (best_header.nChainWork - pindex.nChainWork) * nPowTargetSpacing
+  #       / GetBlockProof(best_header.nBits)
+  # If r <= 1 209 600, the block is "too recent" → verify scripts.
+  #
+  # Uses nimrod's exact 256-bit UInt256 arithmetic (no float).
+  # A zero GetBlockProof (invalid bits → proof = 0) is treated as "too recent"
+  # (conservative fail-safe).
+  let proof = getBlockProofFromBits(ctx.bestHeaderBits)
+  if proof.isZero():
+    # bestHeaderBits unset or invalid → cannot compute → verify scripts
+    return ssrTooRecentForBestHeader
+
+  let bestWork = initUInt256(ctx.bestHeaderChainWork)
+  let pindexWork = initUInt256(ctx.blockChainWork)
+  if bestWork <= pindexWork:
+    # pindex work >= best-header work → no progress → equivalent time ≤ 0 → too recent
+    return ssrTooRecentForBestHeader
+
+  # workDiff * powTargetSpacing / proof.
+  # The multiplication may wrap a 256-bit value in extreme artificial scenarios
+  # (e.g. test vectors with workDiff = 2^256-1), but for any realistic Bitcoin
+  # chainwork the result is far below 2^256 and the division is exact.
+  let workDiff = bestWork - pindexWork
+  let r = workDiff * uint64(params.powTargetSpacing)
+  let equivalentTime = r div proof
+
+  let twoWeeks = initUInt256(uint64(TwoWeeksInSeconds))
+  if equivalentTime <= twoWeeks:
     return ssrTooRecentForBestHeader
 
   # All six conditions satisfied — scripts may be skipped.

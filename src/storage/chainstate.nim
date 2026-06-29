@@ -186,6 +186,16 @@ type
     # Reference: bitcoin-core/src/index/base.cpp::BaseIndex::BlockDisconnected.
     disconnectHook*: proc(blockHash: BlockHash, prevHash: BlockHash,
                           height: int32) {.raises: [].}
+    # Best-known header tip metadata — updated by SyncManager whenever the
+    # header chain advances (see updateBestHeaderInfo).  Used by the
+    # assumevalid skip gate (shouldSkipScripts conditions 4-6) so that
+    # acceptAndConnectBlock can apply the full Core gate rather than a
+    # height-only proxy.  Defaults to conservative values (zero chainwork,
+    # chain-tip height, zero bits) that cause conditions 4/6 to fail until
+    # the SyncManager has loaded/advanced the header chain.
+    bestHeaderChainWork*: array[32, byte]  ## Header-tip cumulative chainwork
+    bestHeaderBits*: uint32                ## Header-tip nBits (for GetBlockProof)
+    bestHeaderHeight*: int32               ## Header-tip height
     # Optional per-block script-verification hook fired by `handleReorg` while
     # connecting each promoted side-branch block, BEFORE that block's UTXO
     # mutation is staged. Closes the reorg false-accept (chain-split class):
@@ -788,7 +798,13 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     ibdBlocksSinceLastDiskFlush: 0,
     ibdDiskFlushInterval: IbdBatchFlushInterval,  # default: flush to disk every 2000 blocks
     reorgDeletedUtxos: nil,
-    disconnectHook: nil
+    disconnectHook: nil,
+    # Best-header info: conservative defaults until SyncManager calls
+    # updateBestHeaderInfo.  Zero chainwork → condition 4 fails →
+    # scripts verified (fail-safe).
+    bestHeaderChainWork: default(array[32, byte]),
+    bestHeaderBits: 0'u32,
+    bestHeaderHeight: cdb.bestHeight    # fallback: chain-tip height
   )
 
   # Load total work from DB if available
@@ -799,6 +815,16 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
 proc close*(cs: var ChainState) =
   cs.undoMgr.close()
   cs.db.close()
+
+proc updateBestHeaderInfo*(cs: ChainState, chainWork: array[32, byte],
+                           headerHeight: int32, bits: uint32) =
+  ## Update the best-known header tip metadata used by the assumevalid skip gate.
+  ## Called by SyncManager whenever the header chain advances (batch or single header).
+  ## Thread note: nimrod's sync + connect paths run on the same async executor thread,
+  ## so no lock is needed here.
+  cs.bestHeaderChainWork = chainWork
+  cs.bestHeaderHeight    = headerHeight
+  cs.bestHeaderBits      = bits
 
 # UTXO operations (ChainState - with cache management)
 
@@ -1037,22 +1063,49 @@ proc generateBlockUndo*(cs: ChainState, blk: Block, height: int32 = -1): BlockUn
 proc buildAssumeValidContext(cs: ChainState, blockHash: BlockHash,
                               height: int32): AssumeValidContext =
   ## Build an AssumeValidContext from ChainState for a block being connected.
-  ## The best-header is approximated by the current chain tip (cs.totalWork).
-  ## During IBD the chain tip IS the best-validated block, which is a safe
-  ## lower bound for the chainwork check.
+  ##
+  ## Best-header fields come from cs.bestHeaderChainWork / bestHeaderHeight /
+  ## bestHeaderBits, which are kept up-to-date by SyncManager via
+  ## updateBestHeaderInfo as the header chain advances.
+  ##
+  ## blockChainWork is the cumulative chainwork of the block being connected,
+  ## read from the block index entry written during header sync (bsHeaderOnly).
+  ## During IBD headers are synced well ahead of blocks, so this entry exists
+  ## with the correct totalWork before the body arrives.
   result = AssumeValidContext(
     blockHash: blockHash,
     blockHeight: height,
     assumeValidHeight: cs.params.assumeValidHeight,
-    # Best header: use chain tip height and accumulated work.
-    # This is conservative — if anything, it under-counts chainwork.
-    bestHeaderHeight: cs.bestHeight,
-    bestHeaderChainWork: cs.totalWork
+    bestHeaderHeight: cs.bestHeaderHeight,
+    bestHeaderChainWork: cs.bestHeaderChainWork,
+    bestHeaderBits: cs.bestHeaderBits,
+    # pindex.nChainWork: look up from the bsHeaderOnly block index entry.
+    # Defaults to all-zeros when the entry is absent (e.g. freshly mined
+    # block not yet in DB); condition 3 (active-chain check) will fail for
+    # such a block before condition 6 is reached, so zero is safe.
+    blockChainWork: block:
+      let idxOpt = cs.db.getBlockIndex(blockHash)
+      if idxOpt.isSome: idxOpt.get().totalWork
+      else: default(array[32, byte])
   )
   result.activeHashAtBlockHeight = cs.db.getBlockHashByHeight(height)
   if cs.params.assumeValidHeight > 0:
     result.activeHashAtAssumeValidHeight =
       cs.db.getBlockHashByHeight(cs.params.assumeValidHeight)
+
+proc computeSkipScripts*(cs: ChainState, blockHash: BlockHash, height: int32): bool =
+  ## Evaluate the full Bitcoin Core assumevalid ancestor-check gate for a block
+  ## about to be connected.  Returns true iff script verification may be skipped.
+  ##
+  ## Replaces the height-only proxy used in acceptAndConnectBlock: the old
+  ##   height <= assumeValidHeight
+  ## admitted FORK blocks below the assumevalid height (they pass the height
+  ## check but are NOT ancestors of the assumevalid block).  This gate adds:
+  ##   (3) active-chain ancestor check
+  ##   (4) best-header chainwork >= minimumChainWork
+  ##   (5) GetBlockProofEquivalentTime(best_header, pindex, ...) > 2 weeks
+  let ctx = buildAssumeValidContext(cs, blockHash, height)
+  shouldSkipScripts(ctx, cs.params) == ssrSkip
 
 proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateResult[void] =
   ## Connect a block: spend inputs, create outputs, update state
