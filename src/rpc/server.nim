@@ -5260,6 +5260,35 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
     "warnings": newJArray()
   }
 
+proc peerNetworkName*(address: string): string =
+  ## Derive the Bitcoin Core "network" string from a peer's address string.
+  ## Returns "ipv4", "ipv6", "onion", "i2p", "cjdns", or "not_publicly_routable".
+  ## Reference: bitcoin-core/src/netbase.cpp GetNetworkName() + CNetAddr::GetNetClass().
+  ## Called from handleGetPeerInfo to populate getpeerinfo[].network.
+  let a = address.strip()
+  # Tor (v2 and v3) .onion addresses
+  if a.endsWith(".onion"):
+    return "onion"
+  # I2P addresses (.b32.i2p or bare .i2p suffix)
+  if a.endsWith(".i2p"):
+    return "i2p"
+  # Try to parse as IP address (IPv4 or IPv6)
+  let ip = parseIpAddr(a)
+  if ip.isV6:
+    # IPv4-mapped-in-IPv6 (::ffff:a.b.c.d) — treat as IPv4
+    if ip.isIPv4Mapped():
+      return "ipv4"
+    # CJDNS: fc00::/8 — first byte 0xFC
+    if ip.v6[0] == 0xFC'u8:
+      return "cjdns"
+    return "ipv6"
+  else:
+    # parseIpAddr returns 0.0.0.0 when the string is not a valid IP, so
+    # treat that placeholder as unroutable (unless the address literally is 0.0.0.0).
+    if ip.v4 == [0'u8, 0, 0, 0] and a != "0.0.0.0":
+      return "not_publicly_routable"
+    return "ipv4"
+
 proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
   ## Return data about each connected network peer
   ## Reference: Bitcoin Core rpc/net.cpp getpeerinfo
@@ -5312,9 +5341,14 @@ proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
         else:
           0'u32
 
+      # Derive network name from peer address for getpeerinfo[].network.
+      # Reference: bitcoin-core/src/rpc/net.cpp:235 GetNetworkName(stats.m_network).
+      let peerNetwork = peerNetworkName(peer.address)
+
       peers.add(%*{
         "id": id,
         "addr": peer.address & ":" & $peer.port,
+        "network": peerNetwork,
         "services": servicesHex,
         "servicesnames": servicesNames,
         "relaytxes": peer.relay,
