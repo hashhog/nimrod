@@ -22,6 +22,8 @@ import ../src/network/peer
 import ../src/storage/chainstate
 import ../src/consensus/params
 
+# peerNetworkName is exported from server.nim for unit testing.
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -102,3 +104,56 @@ suite "getpeerinfo: Core v31.99 field set + wire order":
     let iPresync = keys.find("presynced_headers")
     check iHbFrom >= 0
     check iPresync == iHbFrom + 1
+
+  test "network field is present and equals 'ipv4' for IPv4 test peer":
+    ## Core ref: rpc/net.cpp:235 obj.pushKV("network", GetNetworkName(stats.m_network))
+    ## Test peer has address "127.0.0.1" which must map to "ipv4".
+    let rpc = rpcWithReadyPeer()
+    let row = rpc.handleMethod("getpeerinfo", %*[])[0]
+    check row.hasKey("network")
+    check row["network"].kind == JString
+    check row["network"].getStr() == "ipv4"
+
+  test "network field position: after addr, before services (Core wire order)":
+    ## Core emits: id, addr, [addrbind], [addrlocal], network, [mapped_as], services, ...
+    let rpc = rpcWithReadyPeer()
+    let row = rpc.handleMethod("getpeerinfo", %*[])[0]
+    let keys = toSeq(row.keys)
+    let iAddr    = keys.find("addr")
+    let iNetwork = keys.find("network")
+    let iSvc     = keys.find("services")
+    check iAddr >= 0
+    check iNetwork > iAddr
+    check iSvc > iNetwork
+
+# ---------------------------------------------------------------------------
+# peerNetworkName unit tests (exported from server.nim)
+# ---------------------------------------------------------------------------
+
+suite "peerNetworkName: address-string → Core network string":
+
+  test "IPv4 address → ipv4":
+    check peerNetworkName("1.2.3.4") == "ipv4"
+    check peerNetworkName("127.0.0.1") == "ipv4"
+    check peerNetworkName("192.168.1.1") == "ipv4"
+    check peerNetworkName("0.0.0.0") == "ipv4"
+
+  test ".onion address → onion":
+    check peerNetworkName("3g2upl4pq6kufc4m.onion") == "onion"
+    check peerNetworkName("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion") == "onion"
+
+  test ".i2p address → i2p":
+    check peerNetworkName("abcdef.b32.i2p") == "i2p"
+    check peerNetworkName("some.host.i2p") == "i2p"
+
+  test "IPv6 address → ipv6":
+    check peerNetworkName("2001:db8::1") == "ipv6"
+    check peerNetworkName("::1") == "ipv6"
+
+  test "CJDNS (fc00::/8) address → cjdns":
+    check peerNetworkName("fc00::1") == "cjdns"
+    check peerNetworkName("fcd5:1234:5678::1") == "cjdns"
+
+  test "unparseable address → not_publicly_routable":
+    check peerNetworkName("unknown-host") == "not_publicly_routable"
+    check peerNetworkName("") == "not_publicly_routable"
