@@ -202,7 +202,7 @@ proc mainnetParams*(): ConsensusParams =
   )
   # defaultAssumeValid: block hash up to which scripts are assumed valid
   result.assumeValidBlockHash = BlockHash(hexToBytes32(
-    "00000000000000000000d3fe741f903e19e548e7639ac89bc4461a0a84ed3bfd"  # 944000
+    "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"  # 938343
   ))
   # Well-known mainnet checkpoints (height -> hash)
   # These prevent long-range attacks by rejecting forks below these heights
@@ -334,9 +334,9 @@ proc testnet3Params*(): ConsensusParams =
     "0000000000000000000000000000000000000000000017dde1c649f3708d14b6"
   )
   result.assumeValidBlockHash = BlockHash(hexToBytes32(
-    "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"  # 123613
+    "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"  # 4842348
   ))
-  result.assumeValidHeight = 123613
+  result.assumeValidHeight = 4842348
   # Testnet3 checkpoints
   result.checkpoints = @[
     (546'u32, BlockHash(hexToBytes32("000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70")))
@@ -398,9 +398,9 @@ proc testnet4Params*(): ConsensusParams =
     "0000000000000000000000000000000000000000000009a0fe15d0177d086304"
   )
   result.assumeValidBlockHash = BlockHash(hexToBytes32(
-    "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"  # 4842348
+    "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"  # 123613
   ))
-  result.assumeValidHeight = 4842348
+  result.assumeValidHeight = 123613
   # Testnet4 has no historical checkpoints (fresh network)
   result.checkpoints = @[]
   # No assumeUTXO snapshots defined for testnet4 yet
