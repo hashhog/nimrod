@@ -2222,14 +2222,14 @@ proc disconnectBlock*(cs: var ChainState, blk: Block): ChainStateResult[void] =
 
 const
   ## Maximum reorg depth that nimrod will attempt to apply atomically.
-  ## Mirrors Bitcoin Core's MAX_REORG_LENGTH (validation.cpp) — Core
-  ## refuses to invalidate beyond this depth via `invalidateblock`. We
-  ## use the same limit as a guard rail on `handleReorg`'s single batch:
-  ## a 100-deep reorg with full undo data and bodies for both chains
-  ## fits comfortably in a RocksDB WriteBatch on commodity hardware,
-  ## while ruling out runaway batches that would exhaust memory or
-  ## block the writer thread for seconds.
-  MAX_REORG_DEPTH* = 100
+  ## Implementation-specific memory-safety bound: the entire reorg is staged
+  ## into ONE RocksDB WriteBatch, so an unbounded depth would exhaust memory
+  ## or block the writer thread for seconds. Bitcoin Core has NO reorg-depth
+  ## cap — it follows the most-work chain bounded only by prune/undo
+  ## retention. 288 = Core's MIN_BLOCKS_TO_KEEP (the pruned-node floor),
+  ## chosen so this limit aligns with Core's minimum undo-data retention
+  ## rather than being an arbitrary divergence from consensus behavior.
+  MAX_REORG_DEPTH* = 288
 
 proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block],
                   disconnectedTxs: var seq[Transaction]): ChainStateResult[void] =
@@ -2253,7 +2253,7 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   ## any error before commit, the snapshot taken at entry is restored —
   ## no torn state escapes this proc.
   ##
-  ## Disconnect depth is capped at MAX_REORG_DEPTH (100) to bound the
+  ## Disconnect depth is capped at MAX_REORG_DEPTH (288) to bound the
   ## batch size and protect the writer thread.
   ##
   ## forkPoint: the last common ancestor block hash
