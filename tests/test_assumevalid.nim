@@ -46,11 +46,18 @@ proc passingContext(blockHeight: int32, params: ConsensusParams): AssumeValidCon
     # This block IS on the active chain at its height
     activeHashAtBlockHeight: some(BlockHash(hexToBytes32(
       "0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d"))),
-    # Best header height is way above block (satisfies 2-week guard)
+    # Best header height is way above block (condition 4 check)
     bestHeaderHeight: blockHeight + 3000,
-    # Best header chainwork is max (satisfies minimumChainWork)
+    # Best header chainwork is max (satisfies minimumChainWork / condition 5)
     bestHeaderChainWork: hexToBytes32(
-      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+    # bestHeaderBits: easy regtest target → GetBlockProof ≈ 2.
+    # Combined with blockChainWork = 0 and bestHeaderChainWork = max, the
+    # exact GetBlockProofEquivalentTime result is astronomical >> 2 weeks
+    # (condition 6 passes).
+    bestHeaderBits: 0x207fffff'u32,
+    # blockChainWork = 0 → workDiff = max → equivalent time >> 2 weeks
+    blockChainWork: default(array[32, byte])
   )
 
 # ─── suite ────────────────────────────────────────────────────────────────────
@@ -213,10 +220,15 @@ suite "assumevalid ancestor-check semantics":
     check shouldSkipScripts(ctx, params) == ssrBelowMinimumChainWork
 
   # Additional: safety condition — best-header too close => verify
-  test "safety: best-header too close (< 2016 blocks above) => verify":
+  # With the exact formula, "too close" means the chainwork difference
+  # between best_header and pindex is <= 2 weeks of work.
+  # Setting blockChainWork == bestHeaderChainWork gives workDiff = 0,
+  # so equivalent_time = 0 ≤ TwoWeeksInSeconds → ssrTooRecentForBestHeader.
+  test "safety: best-header too close (≤ 2 weeks equiv. work diff) => verify":
     let params = mainnetParams()
     var ctx = passingContext(500_000, params)
-    ctx.bestHeaderHeight = ctx.blockHeight + 100  # only 100 blocks above
+    # Make blockChainWork equal to bestHeaderChainWork → zero work difference
+    ctx.blockChainWork = ctx.bestHeaderChainWork
     check shouldSkipScripts(ctx, params) == ssrTooRecentForBestHeader
 
   # Additional: block not in best-header chain
@@ -235,8 +247,9 @@ suite "assumevalid ancestor-check semantics":
 
   test "fleet hashes: testnet4 assumevalid matches v28.0 reference":
     let params = testnet4Params()
+    # Bitcoin Core testnet4 defaultAssumeValid = block 123613 (un-swapped 2026-06-29).
     let expected = BlockHash(hexToBytes32(
-      "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"))
+      "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"))
     check params.assumeValidBlockHash == expected
 
   test "fleet hashes: regtest assumevalid is zero":
@@ -271,7 +284,10 @@ suite "assumevalid ancestor-check semantics":
       activeHashAtAssumeValidHeight: some(params.assumeValidBlockHash),
       bestHeaderHeight: 944_962'i32,
       bestHeaderChainWork: hexToBytes32(
-        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+      # Exact condition 6: zero blockChainWork → max workDiff → >> 2 weeks
+      bestHeaderBits: 0x207fffff'u32,
+      blockChainWork: default(array[32, byte])
     )
     check shouldSkipScripts(ctx, params) == ssrSkip
 
@@ -328,7 +344,9 @@ suite "assumevalid ancestor-check semantics":
       activeHashAtAssumeValidHeight: some(params.assumeValidBlockHash),
       bestHeaderHeight: params.assumeValidHeight + 10_000'i32,
       bestHeaderChainWork: hexToBytes32(
-        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+      bestHeaderBits: 0x207fffff'u32,
+      blockChainWork: default(array[32, byte])
     )
     check shouldSkipScripts(ctx, params) == ssrSkip
 
@@ -359,3 +377,68 @@ suite "assumevalid ancestor-check semantics":
     var forkCtx = ctx
     forkCtx.activeHashAtAssumeValidHeight = some(wrongHash)
     check shouldSkipScripts(forkCtx, params) == ssrNotAncestorOfAssumeValid
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # EFFECTIVE test: the KEY regression this fix addresses.
+  #
+  # Before the fix: acceptAndConnectBlock used height-only skip —
+  #   height <= assumeValidHeight → skipScripts = true
+  # This INCORRECTLY skipped a FORK block at height ≤ av_height.
+  #
+  # After the fix: the full gate (shouldSkipScripts) requires the block to
+  # be on the ACTIVE CHAIN at its height.  A fork block at the same height
+  # has a DIFFERENT hash at that height → condition 3 fails → scripts verified.
+  # ────────────────────────────────────────────────────────────────────────────
+
+  test "EFFECTIVE/fork: fork block below av_height is NOW VERIFIED (was skipped by height-only)":
+    let params = mainnetParams()
+    let forkHeight: int32 = 500_000   # below assumeValidHeight (938343)
+    # The active chain at forkHeight has a DIFFERENT block than the fork block.
+    let forkBlockHash = makeHash(0xF0)
+    let activeChainHashAtForkHeight = makeHash(0xA0)  # active has a different block
+
+    # OLD gate: height-only → would skip (WRONG for a fork block)
+    let oldGateWouldSkip = params.assumeValidHeight > 0 and
+                           forkHeight <= params.assumeValidHeight
+    check oldGateWouldSkip == true  # confirms the old gate was broken for forks
+
+    # NEW gate: full ancestor check → must VERIFY scripts
+    let forkCtx = AssumeValidContext(
+      blockHash: forkBlockHash,
+      blockHeight: forkHeight,
+      assumeValidHeight: params.assumeValidHeight,
+      # Condition 3: active chain at forkHeight has a DIFFERENT block
+      activeHashAtBlockHeight: some(activeChainHashAtForkHeight),
+      activeHashAtAssumeValidHeight: some(params.assumeValidBlockHash),
+      bestHeaderHeight: params.assumeValidHeight + 5_000'i32,
+      bestHeaderChainWork: hexToBytes32(
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+      bestHeaderBits: 0x207fffff'u32,
+      blockChainWork: default(array[32, byte])
+    )
+    let reason = shouldSkipScripts(forkCtx, params)
+    check reason != ssrSkip          # NEW gate: correctly VERIFIES scripts
+    check reason == ssrNotAncestorOfAssumeValid  # fails at condition 3
+
+  test "EFFECTIVE/buried: on-chain buried block is still SKIPPED":
+    let params = mainnetParams()
+    let blockHeight: int32 = 500_000  # below assumeValidHeight (938343)
+    let blockHash = BlockHash(hexToBytes32(
+      "0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d"))
+
+    # On the active chain: the hash at blockHeight IS this block's hash
+    let ctx = AssumeValidContext(
+      blockHash: blockHash,
+      blockHeight: blockHeight,
+      assumeValidHeight: params.assumeValidHeight,
+      # Condition 3: active chain at blockHeight matches this block
+      activeHashAtBlockHeight: some(blockHash),
+      activeHashAtAssumeValidHeight: some(params.assumeValidBlockHash),
+      bestHeaderHeight: params.assumeValidHeight + 5_000'i32,
+      bestHeaderChainWork: hexToBytes32(
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+      # Condition 6 (exact): blockChainWork = 0 → huge workDiff → >> 2 weeks
+      bestHeaderBits: 0x207fffff'u32,
+      blockChainWork: default(array[32, byte])
+    )
+    check shouldSkipScripts(ctx, params) == ssrSkip  # buried on-chain block: skip

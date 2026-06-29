@@ -727,6 +727,15 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     # rebuilds forward from there).
     result.headerTip = result.headerChain.tip
     result.headerTipHeight = result.headerChain.tipHeight
+    # Seed best-header info on ChainState from the loaded header chain so
+    # the assumevalid skip gate has real values from the first block connect
+    # (before any live header messages arrive).
+    if chainState != nil and result.headerChain.headers.len > 0:
+      chainState.updateBestHeaderInfo(
+        result.headerChain.totalWork,
+        result.headerChain.tipHeight,
+        result.headerChain.headers[^1].bits
+      )
 
 proc selectSyncPeer*(sm: SyncManager): Peer =
   ## Select the best peer for syncing (highest reported height)
@@ -1474,6 +1483,17 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
     accepted += 1
 
   sm.lastSyncTime = getTime()
+
+  # Update best-header info on ChainState so the assumevalid skip gate
+  # (conditions 4/5/6) uses the REAL header-chain tip rather than the
+  # block-chain tip.  Done once per batch after the loop so only one
+  # proc call fires even for a 2000-header batch.
+  if sm.chainState != nil and accepted > 0 and sm.headerChain.headers.len > 0:
+    sm.chainState.updateBestHeaderInfo(
+      sm.headerChain.totalWork,
+      sm.headerChain.tipHeight,
+      sm.headerChain.headers[^1].bits
+    )
 
   info "processed headers", accepted = accepted,
        tipHeight = sm.headerChain.tipHeight,
@@ -2310,6 +2330,13 @@ proc processHeaders*(sync: BlockSync, headers: seq[BlockHeader]): int =
 
   if accepted > 0:
     sync.lastSyncTime = getTime()
+    # Update best-header info (mirrors the main handleHeaders path above).
+    if sync.chainState != nil and sync.headerChain.headers.len > 0:
+      sync.chainState.updateBestHeaderInfo(
+        sync.headerChain.totalWork,
+        sync.headerChain.tipHeight,
+        sync.headerChain.headers[^1].bits
+      )
 
   accepted
 

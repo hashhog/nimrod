@@ -2439,13 +2439,17 @@ proc acceptAndConnectBlock*(
   if source == bsSubmitBlockSide:
     return err("acceptAndConnectBlock: bsSubmitBlockSide must use validateForStorage")
 
-  # Compute skipScripts via simple assumevalid window (height-only). The
-  # ancestor-aware computation in sync.nim is for P2P where the header chain
-  # is fully synced; reindex/mining/submitblock-tip don't have that signal
-  # at the point of call. Height-only is conservative: it never skips MORE
-  # than the ancestor-aware path would.
-  let skipScripts = cs.params.assumeValidHeight > 0 and
-                    height <= cs.params.assumeValidHeight
+  # Compute skipScripts via the full Bitcoin Core assumevalid ancestor-check
+  # gate (validation.cpp:2346-2383).  This replaces the previous height-only
+  # proxy which incorrectly skipped scripts for FORK blocks at height ≤
+  # assumeValidHeight (they pass the height check but fail the active-chain
+  # ancestor check — condition 3).
+  #
+  # The gate requires the block's hash to evaluate the active-chain lookup,
+  # so compute it here (the same 80-byte serialisation used elsewhere).
+  let blockHashBytes = serialize(blk.header)
+  let blockHash = BlockHash(doubleSha256(blockHashBytes))
+  let skipScripts = cs.computeSkipScripts(blockHash, height)
 
   # UTXO lookup adapter for acceptBlock (BIP-30 + verifyScripts).
   let csRef = cs
