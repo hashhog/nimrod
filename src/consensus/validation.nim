@@ -529,6 +529,27 @@ proc getMtpForHeight*(utxos: ChainDb, height: int32): uint32 =
 
   getMedianTimePast(headers)
 
+proc getMtpForBlockIndex*(utxos: ChainDb, prevIndex: BlockIndex): uint32 =
+  ## Get Median Time Past by walking the hash-linked parent chain from prevIndex.
+  ##
+  ## This mirrors Core's GetMedianTimePast (chain.h:233-245) which walks
+  ## `pindex->pprev`, giving the correct MTP for any block — including side-branch
+  ## blocks whose ancestors are not at the expected active-chain heights.
+  ##
+  ## getMtpForHeight is unreliable for side-branch contexts because the height->hash
+  ## index is last-writer-wins per height and may point to a different block than
+  ## the one being validated.  Use this function wherever chain-context MTP is
+  ## needed for block-header or block validation (time-too-old, BIP-113 cutoff).
+  var headers: seq[BlockHeader]
+  var cur = prevIndex
+  for i in 0 ..< MedianTimeSpan:
+    headers.add(cur.header)
+    let parentOpt = utxos.getBlockIndex(cur.header.prevBlock)
+    if parentOpt.isNone:
+      break
+    cur = parentOpt.get()
+  getMedianTimePast(headers)
+
 # Get script flags for block validation
 ## Bitcoin Core script_flag_exceptions: blocks that violate current rules.
 ## BIP16 exception block (mainnet): this block contains a P2SH-violating tx
@@ -1003,8 +1024,9 @@ proc contextualCheckBlockHeader*(
 
   # Gate 2: time-too-old — timestamp must be strictly greater than MTP.
   # Core validation.cpp:4092-4093.
-  # getMtpForHeight(utxos, prevIndex.height) gives the MTP of the prev block.
-  let prevMtp = getMtpForHeight(utxos, prevIndex.height)
+  # getMtpForBlockIndex walks prevIndex via hash-linked parents (correct for
+  # side-branch blocks, mirrors Core's pindex->pprev walk in chain.h:233-245).
+  let prevMtp = getMtpForBlockIndex(utxos, prevIndex)
   if header.timestamp <= prevMtp:
     return voidErr(veBadTimestamp)
 
@@ -1566,9 +1588,11 @@ proc validateBlock*(
   let bip68Active = height >= int32(params.csvHeight)
 
   # Precompute the MTP of the previous block for sequence lock / IsFinalTx checking.
+  # Use getMtpForBlockIndex (hash-linked walk) not getMtpForHeight (height-indexed)
+  # so side-branch blocks get the correct ancestor timestamps.
   var prevBlockMtp: uint32 = 0
   if bip68Active and prevIndex.height >= 0:
-    prevBlockMtp = getMtpForHeight(utxos, prevIndex.height)
+    prevBlockMtp = getMtpForBlockIndex(utxos, prevIndex)
 
   # ContextualCheckBlock: enforce IsFinalTx for every transaction
   # (Bitcoin Core validation.cpp:4146). Consensus rule that must run even

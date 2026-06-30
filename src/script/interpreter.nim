@@ -2339,7 +2339,8 @@ proc verifyWitnessProgram*(
   amount: Satoshi,
   flags: set[ScriptFlags],
   allAmounts: seq[Satoshi] = @[],
-  allScriptPubKeys: seq[seq[byte]] = @[]
+  allScriptPubKeys: seq[seq[byte]] = @[],
+  isP2SH: bool = false
 ): bool
 
 proc verifyScript*(
@@ -2457,7 +2458,7 @@ proc verifyScript*(
         return false  # seWitnessMalleatedP2SH
       return verifyWitnessProgram(
         witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags,
-        ctxAmounts, ctxScriptPubKeys
+        ctxAmounts, ctxScriptPubKeys, isP2SH = true
       )
 
   # Clean stack check
@@ -2477,7 +2478,8 @@ proc verifyWitnessProgramWithError*(
   amount: Satoshi,
   flags: set[ScriptFlags],
   allAmounts: seq[Satoshi] = @[],
-  allScriptPubKeys: seq[seq[byte]] = @[]
+  allScriptPubKeys: seq[seq[byte]] = @[],
+  isP2SH: bool = false
 ): ScriptError
 
 proc verifyScriptWithError*(
@@ -2599,7 +2601,7 @@ proc verifyScriptWithError*(
         return seWitnessMalleatedP2SH
       return verifyWitnessProgramWithError(
         witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags,
-        ctxAmounts, ctxScriptPubKeys
+        ctxAmounts, ctxScriptPubKeys, isP2SH = true
       )
 
   # BIP141: if WITNESS flag is set and script is NOT a witness program,
@@ -2625,10 +2627,13 @@ proc verifyWitnessProgram*(
   amount: Satoshi,
   flags: set[ScriptFlags],
   allAmounts: seq[Satoshi] = @[],
-  allScriptPubKeys: seq[seq[byte]] = @[]
+  allScriptPubKeys: seq[seq[byte]] = @[],
+  isP2SH: bool = false
 ): bool =
   ## Verify a witness program
   ## allAmounts/allScriptPubKeys: for BIP341 taproot, ALL input prevout data
+  ## isP2SH: true when the witness program came from a P2SH redeemScript; gates
+  ## the Taproot verifier per Core interpreter.cpp:1947 (!is_p2sh)
 
   if version == 0:
     # SegWit v0
@@ -2735,6 +2740,14 @@ proc verifyWitnessProgram*(
     if program.len != 32:
       # Non-32-byte v1 programs (including P2A anchors) succeed unconditionally
       # per BIP 341 for forward compatibility
+      return true
+
+    # Core interpreter.cpp:1947: Taproot only applies to non-P2SH witness v1+32.
+    # A P2SH-wrapped v1+32 program is anyone-can-spend (forward soft-fork compat),
+    # matching Core's `!is_p2sh` gate on the Taproot branch.
+    if isP2SH:
+      if sfDiscourageUpgradableWitnessProgram in flags:
+        return false
       return true
 
     if witness.len == 0:
@@ -3009,9 +3022,12 @@ proc verifyWitnessProgramWithError*(
   amount: Satoshi,
   flags: set[ScriptFlags],
   allAmounts: seq[Satoshi] = @[],
-  allScriptPubKeys: seq[seq[byte]] = @[]
+  allScriptPubKeys: seq[seq[byte]] = @[],
+  isP2SH: bool = false
 ): ScriptError =
   ## Verify a witness program, returning the specific error on failure
+  ## isP2SH: true when the witness program came from a P2SH redeemScript; gates
+  ## the Taproot verifier per Core interpreter.cpp:1947 (!is_p2sh)
 
   if version == 0:
     # SegWit v0
@@ -3114,6 +3130,13 @@ proc verifyWitnessProgramWithError*(
 
   elif version == 1 and sfTaproot in flags and program.len == 32:
     # Taproot (SegWit v1, 32-byte program)
+    # Core interpreter.cpp:1947: Taproot only applies to non-P2SH witness v1+32.
+    # A P2SH-wrapped v1+32 program is anyone-can-spend (forward soft-fork compat).
+    if isP2SH:
+      if sfDiscourageUpgradableWitnessProgram in flags:
+        return seDiscourageUpgradableWitnessProgram
+      return seOk
+
     if witness.len == 0:
       return seWitnessProgramMismatch
 
