@@ -2085,7 +2085,8 @@ proc isBip30Unspendable*(height: int32, blockHash: array[32, byte]): bool =
 
 proc checkBip30*(blk: Block, height: int32, blockHash: array[32, byte],
                  params: ConsensusParams,
-                 hasUtxo: proc(op: OutPoint): bool {.gcsafe, raises: [].}): ValidationResult[void] =
+                 hasUtxo: proc(op: OutPoint): bool {.gcsafe, raises: [].},
+                 getAncestorHashAtHeight: proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} = nil): ValidationResult[void] =
   ## BIP-30: reject any block whose transactions would overwrite an existing
   ## unspent output in the UTXO set (CVE-2012-1909).
   ##
@@ -2098,12 +2099,15 @@ proc checkBip30*(blk: Block, height: int32, blockHash: array[32, byte],
   ##   Reference: validation.cpp:6189 IsBIP30Repeat().
   ##
   ## Gate 2 — BIP34 canonical-chain exemption: once BIP34 has activated at the
-  ##   canonical BIP34 height (params.bip34Height) and the block at that height
-  ##   matches params.bip34Hash, duplicate coinbases are practically impossible
-  ##   (height-in-coinbase ensures unique txids), so skip the expensive UTXO
-  ##   scan.  REQUIRES the bip34Hash to match: a chain with a different block at
-  ##   the BIP34 height is not proven safe and must still scan.
-  ##   If params.bip34Hash is all-zeros (regtest, testnet4) the hash check always
+  ##   canonical BIP34 height (params.bip34Height) AND the block stored at
+  ##   bip34Height on THIS block's own ancestry matches params.bip34Hash,
+  ##   duplicate coinbases are practically impossible (height-in-coinbase
+  ##   ensures unique txids), so skip the expensive UTXO scan.
+  ##   The ancestor hash is verified via the getAncestorHashAtHeight callback
+  ##   (mirrors Core's pindex->pprev->GetAncestor(BIP34Height)->GetBlockHash(),
+  ##   validation.cpp:2460-2462).  Without a callback the gate is conservative
+  ##   and keeps BIP30 enforced.
+  ##   If params.bip34Hash is all-zeros (regtest, testnet4) the check always
   ##   fails → BIP30 is always enforced, matching Core behaviour.
   ##   Reference: validation.cpp:2460-2462.
   ##
@@ -2122,21 +2126,25 @@ proc checkBip30*(blk: Block, height: int32, blockHash: array[32, byte],
   if isBip30Repeat(height, blockHash):
     return ok()
 
-  # Gate 2+3: BIP34 canonical-chain exemption (only if bip34Hash matches).
+  # Gate 2+3: BIP34 canonical-chain exemption.
   # fEnforceBIP30 starts true; BIP34 can clear it only when we can prove we are
-  # on the canonical chain (the block at bip34Height has the expected hash).
+  # on the canonical chain: the block at bip34Height on THIS block's own ancestry
+  # must have the expected hash (Core validation.cpp:2460-2462).
+  # A zero bip34Hash (regtest, testnet4) means "not set" → always enforce.
+  # Without a getAncestorHashAtHeight callback we cannot verify the ancestor →
+  # keep BIP30 enforced (conservative / fail-safe).
   var fEnforceBIP30 = true
   if height >= int32(params.bip34Height) and height < bip34ImpliesBip30Limit:
-    # Check the canonical BIP34Hash.  A zero bip34Hash (regtest/testnet4)
-    # means "not set" → the check always fails → BIP30 stays enforced.
     let zeroBip34Hash = default(array[32, byte])
-    if params.bip34Hash != zeroBip34Hash:
-      # Only suppress BIP30 when bip34Hash is non-zero (mainnet/testnet3) and
-      # would match the block stored at bip34Height on the canonical chain.
-      # The caller's UTXO DB anchors us to the canonical chain implicitly;
-      # the bip34Hash field carries the expected value verbatim from Core's
-      # chainparams.  If this chain agrees on that hash, BIP30 is safe to skip.
-      fEnforceBIP30 = false
+    if params.bip34Hash != zeroBip34Hash and getAncestorHashAtHeight != nil:
+      # Core: pindexBIP34height = pindex->pprev->GetAncestor(BIP34Height)
+      # fEnforceBIP30 = ... && (!pindexBIP34height ||
+      #   !(pindexBIP34height->GetBlockHash() == BIP34Hash))
+      # Clear BIP30 enforcement only when the on-chain ancestor at bip34Height
+      # carries the expected canonical hash.
+      let ancestorOpt = getAncestorHashAtHeight(int32(params.bip34Height))
+      if ancestorOpt.isSome and ancestorOpt.get() == params.bip34Hash:
+        fEnforceBIP30 = false
 
   if not fEnforceBIP30:
     return ok()
@@ -2361,7 +2369,16 @@ proc acceptBlock*(
     let bip30HasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
       try: getUtxo(op).isSome
       except: false
-    let bip30Result = checkBip30(blk, height, blkHashArr, params, bip30HasUtxo)
+    # Supply a chain-ancestry lookup so Gate 2 verifies the actual block hash
+    # at bip34Height on this chain (Core validation.cpp:2460-2462).
+    let dbRef = db
+    let bip30AncestorHash = proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} =
+      try:
+        let hashOpt = dbRef.getBlockHashByHeight(h)
+        if hashOpt.isSome: some(array[32, byte](hashOpt.get()))
+        else: none(array[32, byte])
+      except: none(array[32, byte])
+    let bip30Result = checkBip30(blk, height, blkHashArr, params, bip30HasUtxo, bip30AncestorHash)
     if not bip30Result.isOk:
       return bip30Result
 

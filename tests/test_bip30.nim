@@ -5,6 +5,7 @@
 ## Reference: Bitcoin Core validation.cpp:2397-2476, 4151-4158, 6189-6199
 ## + IsBIP30Repeat / IsBIP30Unspendable helpers (validation.cpp:6189-6199).
 
+import std/options
 import unittest2
 import ../src/consensus/[params, validation]
 import ../src/primitives/[types, serialize]
@@ -69,6 +70,16 @@ proc zeroHash(): array[32, byte] = default(array[32, byte])
 proc fakeHash(b: byte): array[32, byte] =
   ## Create a fake (non-canonical) block hash.
   result[0] = b
+
+proc canonicalAncestorHashFn(params: ConsensusParams): proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} =
+  ## Return an ancestor-hash callback that simulates the canonical chain:
+  ## at bip34Height it returns params.bip34Hash, elsewhere none.
+  ## Used to satisfy Gate 2's ancestor-hash check in checkBip30 for tests
+  ## that simulate the canonical mainnet / testnet3 chain.
+  let bip34Hash = params.bip34Hash
+  let bip34Ht = int32(params.bip34Height)
+  proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} =
+    if h == bip34Ht: some(bip34Hash) else: none(array[32, byte])
 
 # ---------------------------------------------------------------------------
 # Suite: isBip30Repeat (Gate 1 — height + hash check)
@@ -225,12 +236,15 @@ suite "checkBip30 — BIP-30 UTXO duplicate enforcement":
 
   test "Gate 2: post-BIP34 mainnet h=228000 skips BIP-30 (bip34Hash matches)":
     ## After bip34Height (227931) and before 1,983,702, BIP-30 is skipped when
-    ## params.bip34Hash is non-zero (mainnet/testnet3).
+    ## the block at bip34Height on this chain carries params.bip34Hash
+    ## (Core validation.cpp:2460-2462).  The ancestor callback must confirm
+    ## the canonical hash; without it checkBip30 is conservative (enforces).
     let params = mainnetParams()
     let tx = makeMinimalCoinbaseTx()
     let blk = makeBlockWithCoinbase(tx)
     let hasUtxo = makeHasUtxoForTx(tx)
-    let r = checkBip30(blk, 228_000'i32, zeroHash(), params, hasUtxo)
+    let ancestorFn = canonicalAncestorHashFn(params)
+    let r = checkBip30(blk, 228_000'i32, zeroHash(), params, hasUtxo, ancestorFn)
     check r.isOk  # BIP-34 canonical chain: skip BIP-30
 
   test "Gate 2: exactly at bip34Height (h=227931) skips BIP-30 on mainnet":
@@ -238,7 +252,8 @@ suite "checkBip30 — BIP-30 UTXO duplicate enforcement":
     let tx = makeMinimalCoinbaseTx()
     let blk = makeBlockWithCoinbase(tx)
     let hasUtxo = makeHasUtxoForTx(tx)
-    let r = checkBip30(blk, 227_931'i32, zeroHash(), params, hasUtxo)
+    let ancestorFn = canonicalAncestorHashFn(params)
+    let r = checkBip30(blk, 227_931'i32, zeroHash(), params, hasUtxo, ancestorFn)
     check r.isOk
 
   test "Gate 2 absent: regtest always enforces BIP-30 post-bip34Height (bip34Hash=zero)":
@@ -262,6 +277,36 @@ suite "checkBip30 — BIP-30 UTXO duplicate enforcement":
     check not r.isOk
     check r.error == veBip30DuplicateOutput
 
+  test "Gate 2 FIX: nil ancestor callback keeps BIP-30 enforced (conservative)":
+    ## Post-fix: without getAncestorHashAtHeight, checkBip30 cannot prove
+    ## canonical ancestry and stays conservative (enforces BIP30).
+    ## Pre-fix: bip34Hash!=zero alone was enough to skip BIP30 scanning.
+    let params = mainnetParams()
+    let tx = makeMinimalCoinbaseTx()
+    let blk = makeBlockWithCoinbase(tx)
+    let hasUtxo = makeHasUtxoForTx(tx)
+    # No ancestor callback → conservative → BIP30 enforced
+    let r = checkBip30(blk, 228_000'i32, zeroHash(), params, hasUtxo)
+    check not r.isOk
+    check r.error == veBip30DuplicateOutput
+
+  test "Gate 2 FIX: fork block with wrong ancestor hash enforces BIP-30 (EFFECTIVE)":
+    ## PRE-FIX: cleared fEnforceBIP30 whenever bip34Hash != zero, giving a
+    ## false-accept for fork blocks whose ancestor at bip34Height != bip34Hash.
+    ## POST-FIX: getAncestorHashAtHeight is consulted; a wrong hash keeps
+    ## fEnforceBIP30=true → duplicate UTXO is correctly rejected.
+    let params = mainnetParams()
+    let tx = makeMinimalCoinbaseTx()
+    let blk = makeBlockWithCoinbase(tx)
+    let hasUtxo = makeHasUtxoForTx(tx)
+    # Callback returns a wrong hash at bip34Height (simulates a fork chain)
+    let wrongHash = fakeHash(0xDE)
+    let forkAncestorFn = proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} =
+      some(wrongHash)
+    let r = checkBip30(blk, 228_000'i32, zeroHash(), params, hasUtxo, forkAncestorFn)
+    check not r.isOk   # POST-FIX: BIP30 enforced — fork block rejected
+    check r.error == veBip30DuplicateOutput
+
   # Gate 3: BIP34-implies-BIP30 limit (re-enable at h >= 1,983,702)
 
   test "Gate 3: h=1983702 re-enables BIP-30 scanning on mainnet":
@@ -278,7 +323,8 @@ suite "checkBip30 — BIP-30 UTXO duplicate enforcement":
     let tx = makeMinimalCoinbaseTx()
     let blk = makeBlockWithCoinbase(tx)
     let hasUtxo = makeHasUtxoForTx(tx)
-    let r = checkBip30(blk, 1_983_701'i32, zeroHash(), params, hasUtxo)
+    let ancestorFn = canonicalAncestorHashFn(params)
+    let r = checkBip30(blk, 1_983_701'i32, zeroHash(), params, hasUtxo, ancestorFn)
     check r.isOk  # Post-BIP34, below limit → skip
 
   test "Gate 3: h=2000000 (well above limit) enforces BIP-30":
