@@ -2156,9 +2156,14 @@ proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
   if not cbResult.isOk:
     return cbResult
 
-  # Check each non-coinbase transaction
-  for i, tx in blk.txs:
-    if i == 0: continue  # coinbase already checked above
+  # Check ALL transactions including coinbase.
+  # Bitcoin Core CheckBlock (validation.cpp) loops over ALL vtx including vtx[0]
+  # (coinbase). CheckTransaction enforces vout-empty / vout-negative / vout-toolarge
+  # / txouttotal-toolarge on the coinbase (gates G2, G4, G5, G6 in the proc above).
+  # The isCoinbase branch inside checkTransaction preserves the coinbase-specific
+  # allowances: null prevout is allowed (G9 is skipped) and scriptSig length is
+  # capped to 2..100 bytes (G8). Reference: bitcoin-core/src/consensus/tx_check.cpp:47-50.
+  for tx in blk.txs:
     let txResult = checkTransaction(tx, params)
     if not txResult.isOk:
       return txResult

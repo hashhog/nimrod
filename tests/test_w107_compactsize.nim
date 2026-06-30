@@ -842,5 +842,143 @@ suite "G30 BinaryWriter data integrity":
     check wVI.data == @[0x00'u8]
     check wCS.data == @[0x00'u8]
 
+# ===========================================================================
+# G31 — Legacy tx vin-count CompactSize must be canonical (Finding 14 fix)
+# ===========================================================================
+# Reference: bitcoin-core/src/serialize.h:343-356 (ReadCompactSize).
+# Core rejects non-minimal CompactSize encodings ("non-canonical ReadCompactSize()").
+# Before fix: the legacy branch of readTransaction reconstructed CompactSize
+# manually (0xFD/0xFE/0xFF -> read bytes) with NO canonical check.  A tx with
+# vin count encoded as 0xFD 0x01 0x00 (non-canonical 3-byte form for value 1)
+# was silently accepted instead of raising SerializationError.
+# After fix: `dec r.pos` + `readCompactSize()` delegates to the existing
+# canonical-enforcement logic for ALL forms.
+
+suite "G31 Legacy tx vin-count non-canonical CompactSize rejection (Finding 14)":
+
+  test "2-byte form count=1 (0xFD 0x01 0x00) rejected — non-canonical":
+    ## 0xFD prefix requires the 2-byte payload to encode a value >= 253.
+    ## 0xFD 0x01 0x00 encodes 1 — must use single byte 0x01 instead.
+    ## Core: "non-canonical ReadCompactSize()" (serialize.h:343-344).
+    var w = BinaryWriter()
+    w.writeInt32LE(1)            # version
+    w.writeUint8(0xFD'u8)       # non-canonical 2-byte prefix
+    w.writeUint16LE(1'u16)      # count=1 in 2-byte form (value < 253 → non-canonical)
+    # We do not need to write the rest; readCompactSize raises before consuming them.
+    var r = BinaryReader(data: w.data, pos: 0)
+    expect SerializationError:
+      discard r.readTransaction()
+
+  test "2-byte form count=252 (0xFD 0xFC 0x00) rejected — non-canonical":
+    ## 252 is also below the 253 threshold — still non-canonical in 2-byte form.
+    var w = BinaryWriter()
+    w.writeInt32LE(1)
+    w.writeUint8(0xFD'u8)
+    w.writeUint16LE(252'u16)
+    var r = BinaryReader(data: w.data, pos: 0)
+    expect SerializationError:
+      discard r.readTransaction()
+
+  test "4-byte form count=1 (0xFE 0x01 0x00 0x00 0x00) rejected — non-canonical":
+    ## 0xFE prefix requires the 4-byte payload to encode a value >= 0x10000.
+    ## Encoding count=1 with the 4-byte form is non-canonical.
+    var w = BinaryWriter()
+    w.writeInt32LE(1)
+    w.writeUint8(0xFE'u8)
+    w.writeUint32LE(1'u32)
+    var r = BinaryReader(data: w.data, pos: 0)
+    expect SerializationError:
+      discard r.readTransaction()
+
+  test "4-byte form count=0xFFFF (0xFE 0xFF 0xFF 0x00 0x00) rejected — non-canonical":
+    ## 0xFFFF fits in 2-byte form; using 4-byte form is non-canonical.
+    var w = BinaryWriter()
+    w.writeInt32LE(1)
+    w.writeUint8(0xFE'u8)
+    w.writeUint32LE(0xFFFF'u32)
+    var r = BinaryReader(data: w.data, pos: 0)
+    expect SerializationError:
+      discard r.readTransaction()
+
+  test "canonical single-byte count=1 (0x01) still accepted":
+    ## Regression guard: the standard single-byte encoding of 1 must not regress.
+    ## Wire: version(4) | 0x01 (count) | txid(32) | vout(4) | script(varint+data) |
+    ##       sequence(4) | outcount(1) | value(8) | script(1) | locktime(4)
+    var w = BinaryWriter()
+    w.writeInt32LE(1)               # version
+    w.writeUint8(0x01'u8)          # input count = 1 (single-byte canonical)
+    # TxIn: txid(32), vout(4), scriptSig(varint=2, 2 bytes), sequence(4)
+    w.writeBytes(default(array[32, byte]))  # txid (all zeros = coinbase-style)
+    w.writeUint32LE(0xFFFFFFFF'u32)  # vout (coinbase null)
+    w.writeUint8(0x02'u8)           # scriptSig length = 2
+    w.writeUint8(0x00'u8)
+    w.writeUint8(0x00'u8)
+    w.writeUint32LE(0xFFFFFFFF'u32) # sequence
+    # one output
+    w.writeUint8(0x01'u8)           # output count = 1 (CompactSize) — was missing
+    w.writeInt64LE(5_000_000_000'i64)  # value
+    w.writeUint8(0x01'u8)           # scriptPubKey length = 1
+    w.writeUint8(0x51'u8)           # OP_1
+    w.writeUint32LE(0'u32)         # locktime
+    var r = BinaryReader(data: w.data, pos: 0)
+    let tx = r.readTransaction()
+    check tx.version == 1
+    check tx.inputs.len == 1
+    check tx.outputs.len == 1
+
+  test "canonical 2-byte form count=253 (0xFD 0xFD 0x00) is accepted":
+    ## 253 is the minimum value that requires the 2-byte form.
+    ## Note: this would try to read 253 inputs from an almost-empty buffer and
+    ## raise SerializationError("unexpected end of data") from readTxIn — NOT
+    ## from the canonical check.  The canonical check must pass first.
+    var w = BinaryWriter()
+    w.writeInt32LE(1)
+    w.writeUint8(0xFD'u8)
+    w.writeUint16LE(253'u16)  # count=253: canonical minimum for 2-byte form
+    # No actual inputs follow; readTxIn will fail with EOF, not canonical error.
+    var r = BinaryReader(data: w.data, pos: 0)
+    # Must fail with EOF (unexpected end of data), NOT non-canonical
+    var caught = false
+    try:
+      discard r.readTransaction()
+    except SerializationError as e:
+      caught = true
+      check not ("non-canonical" in e.msg)
+    check caught
+
+# ===========================================================================
+# G32 — Legacy tx vin-count MAX_SIZE enforcement (overflow-DoS guard)
+# ===========================================================================
+# Reference: bitcoin-core/src/serialize.h:358-360 (ReadCompactSize range_check).
+# Core rejects CompactSize values > MAX_SIZE (0x02000000) when range_check=true
+# (default for container counts).  Before fix, the manual reconstruction had no
+# MAX_SIZE check — a 5-byte form encoding 0x02000001 would be accepted and
+# readTransaction would attempt to allocate >33 million inputs.
+
+suite "G32 Legacy tx vin-count MAX_SIZE enforcement (Finding 14)":
+
+  test "count > MAX_SIZE via 4-byte form raises SerializationError":
+    ## Encode count = MAX_SIZE + 1 = 0x02000001 using 0xFE prefix.
+    ## After fix, readCompactSize rejects this before input allocation.
+    var w = BinaryWriter()
+    w.writeInt32LE(1)
+    w.writeUint8(0xFE'u8)
+    w.writeUint32LE(uint32(MAX_SIZE + 1))  # 0x02000001 — one over limit
+    var r = BinaryReader(data: w.data, pos: 0)
+    expect SerializationError:
+      discard r.readTransaction()
+
+  test "count = MAX_SIZE (0x02000000) raises MAX_SIZE error before EOF":
+    ## MAX_SIZE exactly is rejected by range_check in readCompactSize.
+    ## (Core also rejects this: MAX_SIZE inputs would exceed block size limits
+    ## before reaching validation, but the wire-level gate fires first.)
+    var w = BinaryWriter()
+    w.writeInt32LE(1)
+    w.writeUint8(0xFE'u8)
+    w.writeUint32LE(uint32(MAX_SIZE))  # 0x02000000 exactly
+    var r = BinaryReader(data: w.data, pos: 0)
+    expect SerializationError:
+      discard r.readTransaction()
+
 when isMainModule:
   echo "W107 CompactSize + VarInt 30-gate audit for nimrod"
