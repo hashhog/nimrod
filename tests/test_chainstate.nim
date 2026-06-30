@@ -478,6 +478,145 @@ suite "ChainState coinbase maturity":
 
     cs.close()
 
+suite "ChainState coinbase maturity assume-valid bypass (FIX)":
+  ## Finding 1: connectBlock / connectBlockIBD / reorg-connect bypassed the
+  ## coinbase maturity check when shouldSkipScripts() == ssrSkip.  Bitcoin Core
+  ## Consensus::CheckTxInputs (tx_verify.cpp:179) NEVER skips maturity —
+  ## assume-valid only gates signature verification.
+  ## EFFECTIVE test: pre-fix allows, post-fix always rejects.
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "connectBlock rejects immature coinbase even when assume-valid is active (EFFECTIVE)":
+    ## Set up a ChainState with a non-zero assume-valid hash so
+    ## shouldSkipScripts() returns ssrSkip for the bad block.
+    ## PRE-FIX: the maturity check was skipped → connectBlock returned Ok.
+    ## POST-FIX: maturity always enforced → error("immature coinbase...").
+    var params = regtestParams()
+    # Non-zero AV hash (condition 1 of shouldSkipScripts)
+    var avHashArr: array[32, byte]
+    avHashArr[0] = 0xAA
+    params.assumeValidBlockHash = BlockHash(avHashArr)
+    params.assumeValidHeight = 500'i32
+    # minimumChainWork = 0 on regtest → condition 5 always passes
+
+    var cs = newChainState(TestDbPath, params)
+
+    # Write the AV block-index entry at h=500 so getBlockHashByHeight(500)
+    # returns avHashArr (satisfies condition 2 of shouldSkipScripts).
+    let avIdx = BlockIndex(
+      hash: BlockHash(avHashArr), height: 500'i32,
+      status: bsHeaderOnly,
+      prevHash: BlockHash(default(array[32, byte])),
+      header: BlockHeader(),
+      totalWork: default(array[32, byte]),
+      undoPos: FlatFilePos(fileNum: -1, pos: -1), nTx: 0
+    )
+    cs.db.putBlockIndex(avIdx)
+
+    # Set best-header fields so conditions 4/5/6 of shouldSkipScripts pass.
+    cs.bestHeaderHeight = 600'i32
+    var maxWork: array[32, byte]
+    for i in 0 .. 31: maxWork[i] = 0xFF'u8
+    cs.bestHeaderChainWork = maxWork
+    cs.bestHeaderBits = 0x207fffff'u32  # regtest easy target → large proof
+
+    # Connect genesis + seed coinbase at h=1
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+    let block1 = makeSimpleBlock(genesisHash, 1)
+    discard cs.connectBlock(block1, 1)
+    let block1Hash = getBlockHash(block1)
+    let coinbaseTxid = block1.txs[0].txid()
+
+    # Build chain to h=50 (coinbase at h=1 needs age>=100 to be mature)
+    var prevHash = block1Hash
+    for h in 2 ..< 51:
+      let blk = makeSimpleBlock(prevHash, int32(h))
+      discard cs.connectBlock(blk, int32(h))
+      prevHash = getBlockHash(blk)
+    check cs.bestHeight == 50
+
+    # Build a block at h=51 that spends the h=1 coinbase (age=50, immature)
+    let spendTx = makeTestTransaction(coinbaseTxid, 0, 4999000000, false)
+    let cb51 = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true)
+    let badBlock = makeTestBlock(prevHash, 51, @[cb51, spendTx])
+    let badBlockHash = getBlockHash(badBlock)
+
+    # Write the bad block's hash at h=51 so shouldSkipScripts condition 3
+    # passes (activeHashAtBlockHeight == blockHash → block is on AV ancestry).
+    let badIdx = BlockIndex(
+      hash: badBlockHash, height: 51'i32,
+      status: bsHeaderOnly,
+      prevHash: BlockHash(prevHash),
+      header: badBlock.header,
+      totalWork: default(array[32, byte]),  # 0 → workDiff=max → cond 6 passes
+      undoPos: FlatFilePos(fileNum: -1, pos: -1), nTx: 2
+    )
+    cs.db.putBlockIndex(badIdx)
+
+    let result = cs.connectBlock(badBlock, 51)
+    # POST-FIX: maturity always enforced, never bypassed by assume-valid.
+    check not result.isOk
+    check "immature" in result.error
+
+    cs.close()
+
+suite "ChainState in-block double-spend (FIX)":
+  ## Finding 3: steady-state connectBlock had no per-block spent-outpoint set.
+  ## Two txs spending the same DB-resident UTXO would both succeed: the first
+  ## spend queued batch.delete (uncommitted), so getUtxo fell through to
+  ## RocksDB and returned the coin as still-available for the second spend.
+  ## POST-FIX: spentThisBlock tracks spent outpoints; the second spend is
+  ## rejected as bad-txns-inputs-missingorspent.
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "connectBlock rejects second spend of same UTXO within the block (EFFECTIVE)":
+    ## PRE-FIX: batch.delete is uncommitted → second getUtxo hits RocksDB and
+    ## finds the coin → double-spend allowed (false-accept).
+    ## POST-FIX: spentThisBlock[key]=true after first spend → second spend
+    ## returns err("bad-txns-inputs-missingorspent").
+    var cs = newChainState(TestDbPath, regtestParams())
+
+    # Seed: genesis + coinbase at h=1
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+    let block1 = makeSimpleBlock(genesisHash, 1)
+    discard cs.connectBlock(block1, 1)
+    let block1Hash = getBlockHash(block1)
+    let coinbaseTxid = block1.txs[0].txid()
+
+    # Build chain to maturity: h=1 coinbase mature at h=101 (age=100)
+    var prevHash = block1Hash
+    for h in 2 ..< 101:
+      let blk = makeSimpleBlock(prevHash, int32(h))
+      discard cs.connectBlock(blk, int32(h))
+      prevHash = getBlockHash(blk)
+    check cs.bestHeight == 100
+
+    # Build a block at h=101 with TWO txs both spending coinbaseTxid:0.
+    # tx1 and tx2 have different output values → different txids → no
+    # duplicate-tx rejection in checkBlock (which is not called here).
+    let tx1 = makeTestTransaction(coinbaseTxid, 0, 2499000000, false)
+    let tx2 = makeTestTransaction(coinbaseTxid, 0, 2498000000, false)
+    let cb101 = makeTestTransaction(TxId(default(array[32, byte])), 0, 5000000000, true)
+    let doubleSpendBlock = makeTestBlock(prevHash, 101, @[cb101, tx1, tx2])
+
+    let result = cs.connectBlock(doubleSpendBlock, 101)
+    # POST-FIX: double-spend within block is caught and rejected.
+    check not result.isOk
+
+    cs.close()
+
 suite "ChainState disconnect and restore":
   setup:
     cleanupTestDb()

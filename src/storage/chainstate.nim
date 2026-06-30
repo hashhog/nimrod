@@ -1174,6 +1174,12 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   if height == 0:
     discard
   else:
+    # Per-block spent-outpoint set: mirrors Core's CCoinsViewCache tombstone-
+    # on-spend.  Populated as we process each non-coinbase input; prevents
+    # a later tx in the same block from re-spending an already-spent coin
+    # before the write batch commits to RocksDB.
+    var spentThisBlock = initTable[string, bool]()
+
     # Process each transaction
     for txIdx, tx in blk.txs:
       let txId = tx.txid()
@@ -1181,35 +1187,41 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
       # Spend inputs (skip coinbase which has no inputs to spend)
       if txIdx > 0:
         for input in tx.inputs:
+          # Per-block double-spend guard: mirrors Core's CCoinsViewCache
+          # tombstone-on-spend (coins.cpp:153-175 SpendCoin).  An input whose
+          # prevOut was already spent by an earlier tx in THIS block must be
+          # rejected as bad-txns-inputs-missingorspent.  Without this check,
+          # batch.delete is uncommitted so the RocksDB fallback in getUtxo
+          # returns the coin as still-spendable to the next tx.
+          let ckSpent = outpointKey(input.prevOut)
+          if ckSpent in spentThisBlock:
+            return err("bad-txns-inputs-missingorspent: double-spend within block at " &
+                       $input.prevOut.txid & ":" & $input.prevOut.vout)
+
           let utxoOpt = cs.getUtxo(input.prevOut)
           if utxoOpt.isNone:
             return err("missing input: " & $input.prevOut.txid)
 
           let entry = utxoOpt.get()
 
-          # Check coinbase maturity
+          # Check coinbase maturity.  Bitcoin Core's Consensus::CheckTxInputs
+          # (consensus/tx_verify.cpp:179) enforces this rule unconditionally;
+          # assume-valid only gates verifyScripts (signature checks), never
+          # economic / maturity rules.
           if entry.isCoinbase:
             let age = height - entry.height
             if age < int32(cs.params.coinbaseMaturity):
-              # Use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
-              # The maturity bypass only applies when the block is on the
-              # assumed-valid chain (ancestor check) — NOT a plain height check.
-              let avCtx = buildAssumeValidContext(cs, blockHash, height)
-              let skipReason = shouldSkipScripts(avCtx, cs.params)
-              if skipReason == ssrSkip:
-                warn "immature coinbase below assume-valid (allowing)",
-                     height = height, coinbaseHeight = entry.height,
-                     age = age, prevTxid = $input.prevOut.txid,
-                     prevVout = input.prevOut.vout
-              else:
-                return err("immature coinbase spend at height " & $height &
-                          ", coinbase height " & $entry.height &
-                          ", age " & $age & " < " & $cs.params.coinbaseMaturity)
+              return err("immature coinbase spend at height " & $height &
+                        ", coinbase height " & $entry.height &
+                        ", age " & $age & " < " & $cs.params.coinbaseMaturity)
 
           # Delete from DB and cache
           let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
           batch.delete(cfUtxo, key)
           cs.deleteUtxoCache(input.prevOut)
+          # Mark this outpoint as spent within the current block so later txs
+          # in the same block cannot re-spend it before the batch commits.
+          spentThisBlock[ckSpent] = true
 
       # Create outputs
       for voutIdx, output in tx.outputs:
@@ -1735,24 +1747,14 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
 
         let entry = utxoOpt.get()
 
-        # Check coinbase maturity
+        # Check coinbase maturity.  Assume-valid only gates script
+        # verification, never maturity (consensus/tx_verify.cpp:179).
         if entry.isCoinbase:
           let age = height - entry.height
           if age < int32(cs.params.coinbaseMaturity):
-            # Use ancestor-check assumevalid semantics (Bitcoin Core v28.0).
-            # Only bypass maturity enforcement when the block is on the
-            # assumed-valid chain (ancestor check) — NOT a plain height check.
-            let avCtx = buildAssumeValidContext(cs, blockHash, height)
-            let skipReason = shouldSkipScripts(avCtx, cs.params)
-            if skipReason == ssrSkip:
-              warn "immature coinbase below assume-valid (allowing)",
-                   height = height, coinbaseHeight = entry.height,
-                   age = age, prevTxid = $input.prevOut.txid,
-                   prevVout = input.prevOut.vout
-            else:
-              return err("immature coinbase spend at height " & $height &
-                        ", coinbase height " & $entry.height &
-                        ", age " & $age & " < " & $cs.params.coinbaseMaturity)
+            return err("immature coinbase spend at height " & $height &
+                      ", coinbase height " & $entry.height &
+                      ", age " & $age & " < " & $cs.params.coinbaseMaturity)
 
         # Delete from batch and cache
         let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
@@ -2561,22 +2563,15 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
 
           let entry = utxoOpt.get()
 
-          # Coinbase maturity check (matches connectBlock).
+          # Coinbase maturity check.  Assume-valid only gates script
+          # verification, never maturity (consensus/tx_verify.cpp:179).
           if entry.isCoinbase:
             let age = newHeight - entry.height
             if age < int32(cs.params.coinbaseMaturity):
-              let avCtx = buildAssumeValidContext(cs, blockHash, newHeight)
-              let skipReason = shouldSkipScripts(avCtx, cs.params)
-              if skipReason == ssrSkip:
-                warn "immature coinbase below assume-valid (allowing in reorg)",
-                     height = newHeight, coinbaseHeight = entry.height,
-                     age = age, prevTxid = $input.prevOut.txid,
-                     prevVout = input.prevOut.vout
-              else:
-                rollbackInMemory()
-                return err("immature coinbase spend during reorg at height " &
-                           $newHeight & ", coinbase height " & $entry.height &
-                           ", age " & $age & " < " & $cs.params.coinbaseMaturity)
+              rollbackInMemory()
+              return err("immature coinbase spend during reorg at height " &
+                         $newHeight & ", coinbase height " & $entry.height &
+                         ", age " & $age & " < " & $cs.params.coinbaseMaturity)
 
           let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
           batch.delete(cfUtxo, key)
