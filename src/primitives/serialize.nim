@@ -283,18 +283,15 @@ proc readTransaction*(r: var BinaryReader): Transaction =
       raise newException(SerializationError, "invalid segwit flag")
     isSegwit = true
   else:
-    # Legacy transaction - marker was actually the input count
-    # We need to handle this carefully since we already read the first byte
-    # Reconstruct the compact size
-    var inputCount: uint64
-    if marker < 0xFD:
-      inputCount = uint64(marker)
-    elif marker == 0xFD:
-      inputCount = uint64(r.readUint16LE())
-    elif marker == 0xFE:
-      inputCount = uint64(r.readUint32LE())
-    else:
-      inputCount = r.readUint64LE()
+    # Legacy transaction — `marker` was actually the first byte of the input-count
+    # CompactSize.  Back up one position and delegate to readCompactSize, which
+    # enforces canonical encoding ("non-canonical ReadCompactSize()") and the
+    # MAX_SIZE cap, exactly as Bitcoin Core serialize.h::ReadCompactSize does.
+    # Without this, non-minimal encodings such as 0xFD 0x01 0x00 (count=1 via the
+    # 2-byte form when a single byte 0x01 is required) were silently accepted.
+    # Reference: bitcoin-core/src/serialize.h:343-356.
+    dec r.pos  # un-consume the marker byte; readCompactSize will re-read it
+    let inputCount = r.readCompactSize()
 
     for i in 0 ..< int(inputCount):
       result.inputs.add(r.readTxIn())

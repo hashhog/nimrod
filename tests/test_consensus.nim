@@ -1192,3 +1192,131 @@ suite "W84 amount/MoneyRange constants":
   test "negative value is out of MoneyRange":
     let neg = Satoshi(-1)
     check int64(neg) < 0
+
+# ============================================================================
+# Finding 7 — checkBlock must call checkTransaction on coinbase (vtx[0])
+# ============================================================================
+# Reference: bitcoin-core/src/consensus/tx_check.cpp:11-58.
+# Core's CheckBlock loops over ALL vtx including vtx[0].  CheckTransaction
+# enforces vout-empty / vout-negative / vout-toolarge / txouttotal-toolarge
+# on the coinbase.  The coinbase-specific allowances (null prevout OK, scriptSig
+# 2..100 bytes via G8) are preserved by the isCoinbase branch inside
+# checkTransaction.
+#
+# Before fix: checkBlock skipped vtx[0] ("if i == 0: continue"); a coinbase
+# with 0 outputs or out-of-range values passed checkBlock → consensus divergence.
+# After fix: checkTransaction is called on every tx including the coinbase.
+
+proc mineRegtestBlock(txs: seq[Transaction]): Block =
+  ## Build a regtest block with correct merkle root and a PoW-valid nonce.
+  ## Scans nonces 0..4095; with bits=0x207fffff (~50% of hash space passes)
+  ## a valid nonce is found within the first few tries with overwhelmingly high
+  ## probability.
+  var txHashes: seq[array[32, byte]]
+  for tx in txs:
+    txHashes.add(array[32, byte](tx.txid()))
+  var header = BlockHeader(
+    version: 1,
+    prevBlock: BlockHash(default(array[32, byte])),
+    merkleRoot: merkleRoot(txHashes),
+    timestamp: 1296688602'u32,  # genesis-era timestamp; well in the past
+    bits: 0x207fffff'u32,       # regtest minimum difficulty
+    nonce: 0
+  )
+  for n in 0'u32 .. 4095'u32:
+    header.nonce = n
+    let h = BlockHash(doubleSha256(serialize(header)))
+    if hashMeetsTarget(h, header.bits):
+      break
+  Block(header: header, txs: txs)
+
+proc makeCbTxWithOutputs(outputs: seq[TxOut]): Transaction =
+  ## Build a coinbase-shaped transaction (null prevout) with the given outputs.
+  ## scriptSig is 2 bytes — the minimum valid length per Core tx_check.cpp:49.
+  Transaction(
+    version: 1,
+    inputs: @[TxIn(
+      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0xFFFFFFFF'u32),
+      scriptSig: @[0x01'u8, 0x00'u8],
+      sequence: 0xFFFFFFFF'u32
+    )],
+    outputs: outputs,
+    witnesses: @[],
+    lockTime: 0
+  )
+
+suite "Finding 7 — checkBlock coinbase output validation":
+
+  test "F7-accept: coinbase with valid output passes checkBlock":
+    ## Regression guard: a well-formed coinbase must continue to pass.
+    let params = regtestParams()
+    let cb = makeCbTxWithOutputs(
+      @[TxOut(value: Satoshi(5_000_000_000), scriptPubKey: @[])])
+    let blk = mineRegtestBlock(@[cb])
+    let res = checkBlock(blk, params)
+    check res.isOk == true
+
+  test "F7-G2: coinbase with 0 outputs -> veBadOutputValue (bad-txns-vout-empty)":
+    ## Core CheckTransaction G2: vout must not be empty, even for coinbase.
+    ## Before fix: checkBlock skipped coinbase → returned ok() (BUG).
+    ## After fix: checkTransaction runs on coinbase → veBadOutputValue.
+    let params = regtestParams()
+    let cb = makeCbTxWithOutputs(@[])
+    let blk = mineRegtestBlock(@[cb])
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veBadOutputValue
+
+  test "F7-G4: coinbase with negative output -> veNegativeOutput (bad-txns-vout-negative)":
+    ## Core CheckTransaction G4: output values must be >= 0.
+    let params = regtestParams()
+    let cb = makeCbTxWithOutputs(
+      @[TxOut(value: Satoshi(-1), scriptPubKey: @[])])
+    let blk = mineRegtestBlock(@[cb])
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veNegativeOutput
+
+  test "F7-G5: coinbase output > MAX_MONEY -> veOutputTooLarge (bad-txns-vout-toolarge)":
+    ## Core CheckTransaction G5: each output must be <= MAX_MONEY.
+    let params = regtestParams()
+    let cb = makeCbTxWithOutputs(
+      @[TxOut(value: Satoshi(int64(MaxMoney) + 1), scriptPubKey: @[])])
+    let blk = mineRegtestBlock(@[cb])
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veOutputTooLarge
+
+  test "F7-G6: coinbase total outputs > MAX_MONEY -> veTxOutTotalTooLarge":
+    ## Core CheckTransaction G6: running sum of outputs must stay <= MAX_MONEY.
+    let params = regtestParams()
+    let cb = makeCbTxWithOutputs(@[
+      TxOut(value: MaxMoney, scriptPubKey: @[]),
+      TxOut(value: Satoshi(1), scriptPubKey: @[])
+    ])
+    let blk = mineRegtestBlock(@[cb])
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veTxOutTotalTooLarge
+
+  test "F7-G8-preserved: coinbase scriptSig 2..100 bytes still checked":
+    ## Verify checkTransaction's G8 is still enforced on the coinbase after fix.
+    ## This was already enforced by validateCoinbaseSizeOnly; test proves no regression.
+    let params = regtestParams()
+    # Build a coinbase with a 1-byte scriptSig (too short)
+    let shortCb = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0xFFFFFFFF'u32),
+        scriptSig: @[0x00'u8],  # 1 byte — too short
+        sequence: 0xFFFFFFFF'u32
+      )],
+      outputs: @[TxOut(value: Satoshi(5_000_000_000), scriptPubKey: @[])],
+      witnesses: @[], lockTime: 0
+    )
+    # validateCoinbaseSizeOnly already catches this before the tx loop,
+    # so the error is veBadCoinbaseSize regardless of fix status.
+    let blk = mineRegtestBlock(@[shortCb])
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veBadCoinbaseSize
