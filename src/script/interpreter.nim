@@ -1226,6 +1226,12 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             return seMinimalData
         interp.push(pushData)
       pc += pushLen
+      # Core (interpreter.cpp:1221-1223) runs the stack-size limit at the
+      # bottom of the opcode loop after EVERY opcode, including data pushes.
+      # Enforce it here before `continue` so a script of >1000 pushes is
+      # rejected (SCRIPT_ERR_STACK_SIZE). Exactly 1000 stays valid.
+      if interp.combinedStackSize() > MaxStackElements:
+        return seStackSize
       continue
 
     elif opcode == OP_PUSHDATA1:
@@ -1246,6 +1252,9 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             return seMinimalData
         interp.push(pushData)
       pc += pushLen
+      # Core stack-size limit runs after every opcode, including pushes.
+      if interp.combinedStackSize() > MaxStackElements:
+        return seStackSize
       continue
 
     elif opcode == OP_PUSHDATA2:
@@ -1265,6 +1274,9 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             return seMinimalData
         interp.push(pushData)
       pc += pushLen
+      # Core stack-size limit runs after every opcode, including pushes.
+      if interp.combinedStackSize() > MaxStackElements:
+        return seStackSize
       continue
 
     elif opcode == OP_PUSHDATA4:
@@ -1285,6 +1297,9 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             return seMinimalData
         interp.push(pushData)
       pc += pushLen
+      # Core stack-size limit runs after every opcode, including pushes.
+      if interp.combinedStackSize() > MaxStackElements:
+        return seStackSize
       continue
 
     # Non-executing branch: only process control flow
@@ -2392,9 +2407,15 @@ proc verifyScript*(
   # Copy stack for P2SH
   let stackCopy = interp.stack
 
-  # Clear altstack and opcount between scriptSig and scriptPubKey execution
+  # Clear altstack and opcount between scriptSig and scriptPubKey execution.
+  # Core resets pbegincodehash to script.begin() at the start of each
+  # EvalScript (it is a local), so an OP_CODESEPARATOR in the scriptSig must
+  # NOT carry into the scriptPubKey's sighash subscript. Mirror the WithError
+  # variant (which already resets these) so the consensus bool path matches.
   interp.altStack = @[]
   interp.opCount = 0
+  interp.codesepPos = 0xFFFFFFFF'u32
+  interp.codesepByteOffset = 0xFFFFFFFF'u32
 
   # Execute scriptPubKey
   let err = interp.eval(scriptPubKey, ctx)
@@ -2460,6 +2481,15 @@ proc verifyScript*(
         witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags,
         ctxAmounts, ctxScriptPubKeys, isP2SH = true
       )
+
+  # BIP141: if WITNESS flag is set and the script is NOT a witness program,
+  # the witness must be empty (Core interpreter.cpp:2115-2116,
+  # SCRIPT_ERR_WITNESS_UNEXPECTED). Mirror the WithError variant so the
+  # consensus bool path rejects witness data on a non-witness input.
+  if sfWitness in flags:
+    let (isWit, _, _) = isWitnessProgram(scriptPubKey)
+    if not isWit and witness.len > 0:
+      return false  # seWitnessUnexpected
 
   # Clean stack check
   if sfCleanStack in flags:
