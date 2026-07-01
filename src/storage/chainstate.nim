@@ -2548,6 +2548,18 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     # Store full block data.
     batch.put(cfBlocks, blockKey(array[32, byte](blockHash)), serialize(blk))
 
+    # Accumulate this block's transaction fees so the coinbase-value ceiling
+    # (bad-cb-amount) can be enforced below, exactly as Bitcoin Core does in
+    # ConnectBlock (validation.cpp:2520-2613).  The main-chain extension path
+    # enforces this in validateBlock (skipConnectChecks=false); the side-branch
+    # store path runs with skipConnectChecks=true, so a reorg-promoted block's
+    # coinbase value is otherwise NEVER checked here — a heavier fork whose
+    # coinbase claims more than subsidy+fees would inflate the money supply.
+    # nFees = sum over non-coinbase txs of (sum(spent input values) -
+    # sum(output values)); mirrors CheckTxInputs' per-tx txfee accumulation.
+    var blockInputValue: int64 = 0
+    var blockOutputValueNonCoinbase: int64 = 0
+
     # Process each transaction.
     for txIdx, tx in blk.txs:
       let txId = tx.txid()
@@ -2573,10 +2585,17 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
                          $newHeight & ", coinbase height " & $entry.height &
                          ", age " & $age & " < " & $cs.params.coinbaseMaturity)
 
+          blockInputValue += int64(entry.output.value)
+
           let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
           batch.delete(cfUtxo, key)
           cs.deleteUtxoCache(input.prevOut)
           cs.reorgDeletedUtxos[][outpointKey(input.prevOut)] = true
+
+        # Sum ALL outputs of this non-coinbase tx (spendable or not — Core's
+        # GetValueOut counts every output) for the block-fee computation.
+        for output in tx.outputs:
+          blockOutputValueNonCoinbase += int64(output.value)
 
       # Create outputs.
       for voutIdx, output in tx.outputs:
@@ -2597,6 +2616,25 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
       # Index transaction.
       let loc = TxLocation(blockHash: blockHash, txIndex: uint32(txIdx))
       batch.put(cfTxIndex, txIndexKey(array[32, byte](txId)), serializeTxLocation(loc))
+
+    # Coinbase-value ceiling (bad-cb-amount).  Bitcoin Core ConnectBlock
+    # (validation.cpp:2610-2613):
+    #   blockReward = nFees + GetBlockSubsidy(height)
+    #   if (block.vtx[0]->GetValueOut() > blockReward) -> "bad-cb-amount"
+    # Enforced here on EVERY reorg-promoted block (this loop is nimrod's
+    # ConnectBlock equivalent); without it a heavier side branch could claim a
+    # coinbase larger than subsidy+fees and inflate the money supply.
+    let blockFees = blockInputValue - blockOutputValueNonCoinbase
+    let subsidy = int64(getBlockSubsidy(int(newHeight), cs.params))
+    let blockReward = subsidy + blockFees
+    var coinbaseValueOut: int64 = 0
+    for output in blk.txs[0].outputs:
+      coinbaseValueOut += int64(output.value)
+    if coinbaseValueOut > blockReward:
+      rollbackInMemory()
+      return err("bad-cb-amount: coinbase pays too much during reorg at height " &
+                 $newHeight & " (actual=" & $coinbaseValueOut &
+                 " vs limit=" & $blockReward & ")")
 
     # Add this block's work to the running total.
     let blockWork = calculateBlockWork(blk.header.bits)
