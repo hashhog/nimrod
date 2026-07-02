@@ -71,6 +71,14 @@ type
     reindex*: bool        ## --reindex: wipe chainstate before start (HONEST
                           ## PROGRESS — does NOT re-scan blk*.dat; we drop
                           ## chainstate so the next start triggers fresh IBD).
+    noAssumeValid*: bool  ## --assumevalid=0 / --noassumevalid: disable the
+                          ## assume-valid script-skip. Zeroes assumeValidHeight
+                          ## AND assumeValidBlockHash so EVERY block (incl.
+                          ## those below the hardcoded av height) runs full
+                          ## script verification. Mirrors Bitcoin Core's
+                          ## `-assumevalid=0`. Strictly MORE verification —
+                          ## consensus-safe in the reject direction. Used by the
+                          ## Track-4 mainnet-history replay harness.
     loadSnapshot*: string ## --load-snapshot=<path>: load a Bitcoin Core
                           ## byte-compatible UTXO snapshot before entering
                           ## the main loop (assumeUTXO fast-sync). Must
@@ -286,6 +294,7 @@ proc defaultConfig*(): NimrodConfig =
     logFile: "",
     readyFd: -1,
     reindex: false,
+    noAssumeValid: false,
     loadSnapshot: "",
     restEnabled: false,
     restPort: 0,            # 0 = derive from rpcPort (rpcPort + 1000)
@@ -396,6 +405,14 @@ proc loadConfigFile*(config: var NimrodConfig) =
       config.logFile = value
     of "reindex":
       config.reindex = value.toLowerAscii() in ["1", "true", "yes"]
+    of "noassumevalid":
+      config.noAssumeValid = value.toLowerAscii() in ["1", "true", "yes"]
+    of "assumevalid":
+      # Core semantics: -assumevalid=0 disables the skip. Any other value is
+      # treated as "keep the compiled-in assume-valid block" (nimrod does not
+      # support overriding the hash from config; 0 is the operational knob).
+      if value.strip() == "0":
+        config.noAssumeValid = true
     of "rest":
       config.restEnabled = value.toLowerAscii() in ["1", "true", "yes"]
     of "restport":
@@ -741,6 +758,21 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
           result.config.reindex = true
         else:
           result.config.reindex = p.val.toLowerAscii() in ["1", "true", "yes"]
+      of "noassumevalid":
+        # Bare flag or --noassumevalid=1 disables the assume-valid skip.
+        if p.val.len == 0:
+          result.config.noAssumeValid = true
+        else:
+          result.config.noAssumeValid = p.val.toLowerAscii() in ["1", "true", "yes"]
+      of "assumevalid":
+        # Core parity: --assumevalid=0 disables the skip (full script verify for
+        # all history). Any other value keeps the compiled-in assume-valid block
+        # (nimrod does not support supplying an alternate hash on the CLI).
+        if p.val.strip() == "0":
+          result.config.noAssumeValid = true
+        elif p.val.len == 0:
+          echo "Invalid --assumevalid: expected =0 to disable, or omit to keep default"
+          quit(1)
       of "load-snapshot", "loadsnapshot":
         if p.val.len == 0:
           echo "Invalid --load-snapshot: missing path"
@@ -911,15 +943,25 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
   # Only use file values if CLI didn't explicitly set them
   # (This is simplified - a proper impl would track which were set)
 
-proc getConsensusParams(config: NimrodConfig): ConsensusParams =
-  case config.network.toLowerAscii
-  of "mainnet", "main": mainnetParams()
-  of "testnet", "testnet3", "test": testnet3Params()
-  of "testnet4": testnet4Params()
-  of "regtest": regtestParams()
-  else:
-    echo "Unknown network: " & config.network
-    quit(1)
+proc getConsensusParams*(config: NimrodConfig): ConsensusParams =
+  result =
+    case config.network.toLowerAscii
+    of "mainnet", "main": mainnetParams()
+    of "testnet", "testnet3", "test": testnet3Params()
+    of "testnet4": testnet4Params()
+    of "regtest": regtestParams()
+    else:
+      echo "Unknown network: " & config.network
+      quit(1)
+  # --assumevalid=0 / --noassumevalid: force full script verification for the
+  # ENTIRE chain. Zero BOTH the hash (defeats the faithful 6-condition gate in
+  # assumevalid.nim — condition 1 returns ssrAssumeValidUnset) AND the height
+  # (defeats the height-only proxy on the submitblock/RPC connect path,
+  # rpc/server.nim: `assumeValidHeight > 0 and height <= assumeValidHeight`).
+  # Strictly MORE verification; consensus-safe in the reject direction.
+  if config.noAssumeValid:
+    result.assumeValidHeight = 0
+    result.assumeValidBlockHash = BlockHash(default(array[32, byte]))
 
 proc findLocatorFork(state: NodeState,
                      locatorHashes: seq[array[32, byte]]): int32 =

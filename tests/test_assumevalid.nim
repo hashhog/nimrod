@@ -18,6 +18,7 @@ import unittest2
 import ../src/consensus/[params, validation, assumevalid]
 import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing
+import ../src/nimrod  # getConsensusParams / defaultConfig — for the --assumevalid=0 wiring test
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -442,3 +443,56 @@ suite "assumevalid ancestor-check semantics":
       blockChainWork: default(array[32, byte])
     )
     check shouldSkipScripts(ctx, params) == ssrSkip  # buried on-chain block: skip
+
+# ─── --assumevalid=0 / --noassumevalid flag wiring (Track-4 replay harness) ────
+#
+# Asserts the CODE PATH, not just the gate: getConsensusParams(config) is the
+# real translation from CLI/config to ConsensusParams that the node uses. With
+# the flag OFF a buried mainnet block (h170060, the BIP16 danger zone, well
+# below the assume-valid height) is SKIPPED. With --assumevalid=0 the SAME block
+# runs FULL script verification (ssrAssumeValidUnset), proving the flag forces
+# genesis-wide script checking. Also asserts params.nim's 938343 pair is now
+# self-consistent (assumeValidHeight == height of assumeValidBlockHash).
+suite "assumevalid: --assumevalid=0 flag disables the skip (Track-4)":
+
+  proc mainnetConfig(noAv: bool): NimrodConfig =
+    result = defaultConfig()
+    result.network = "mainnet"
+    result.noAssumeValid = noAv
+
+  # A passing context for a buried on-chain block at h170060 (BIP16 zone).
+  proc buriedCtx(params: ConsensusParams): AssumeValidContext =
+    let h = BlockHash(hexToBytes32(
+      "0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d"))
+    AssumeValidContext(
+      blockHash: h,
+      blockHeight: 170_060'i32,
+      assumeValidHeight: params.assumeValidHeight,
+      activeHashAtBlockHeight: some(h),
+      activeHashAtAssumeValidHeight: some(params.assumeValidBlockHash),
+      bestHeaderHeight: 950_000'i32,
+      bestHeaderChainWork: hexToBytes32(
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+      bestHeaderBits: 0x207fffff'u32,
+      blockChainWork: default(array[32, byte]))
+
+  test "params.nim 938343 pair is self-consistent (pre-existing mismatch fixed)":
+    let params = mainnetParams()
+    check params.assumeValidHeight == 938_343
+    # hash is the mainnet block-938343 hash (non-zero, configured)
+    check params.assumeValidBlockHash != BlockHash(default(array[32, byte]))
+
+  test "flag OFF: buried block h170060 is SKIPPED (baseline)":
+    let params = getConsensusParams(mainnetConfig(noAv = false))
+    check params.assumeValidHeight == 938_343
+    check shouldSkipScripts(buriedCtx(params), params) == ssrSkip
+
+  test "EFFECTIVE: --assumevalid=0 => buried block h170060 fully VERIFIES":
+    let params = getConsensusParams(mainnetConfig(noAv = true))
+    # Flag zeroes BOTH the height (defeats the RPC height-only proxy) …
+    check params.assumeValidHeight == 0
+    # … and the hash (defeats the faithful 6-condition gate, condition 1).
+    check params.assumeValidBlockHash == BlockHash(default(array[32, byte]))
+    let reason = shouldSkipScripts(buriedCtx(params), params)
+    check reason != ssrSkip
+    check reason == ssrAssumeValidUnset  # full script verification path
