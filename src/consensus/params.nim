@@ -181,9 +181,16 @@ proc mainnetParams*(): ConsensusParams =
   result.powTargetTimespan = 1_209_600  # 14 days
   result.powTargetSpacing = 600  # 10 minutes
   result.difficultyAdjustmentInterval = 2016
-  # Skip script verification below this height during IBD
-  # Updated W29: 944000 verified by 7-node consensus diff + hotbuns clean 944853 passage
-  result.assumeValidHeight = 944_000
+  # Skip script verification below this height during IBD.
+  # MUST equal the height of assumeValidBlockHash below (938343). The faithful
+  # gate (assumevalid.nim shouldSkipScripts, condition 3) compares the
+  # active-chain hash AT assumeValidHeight against assumeValidBlockHash, so a
+  # mismatched pair (previously 944000 vs a hash at 938343) can NEVER satisfy
+  # condition 3 — the skip would never fire and every historical block would be
+  # fully re-verified (fail-safe, but a silent perf/faithfulness bug). Keep the
+  # two consistent, matching Bitcoin Core's m_assumed_valid_hash convention
+  # (the hash IS the block at this height).
+  result.assumeValidHeight = 938_343
   # PoW rules: mainnet does normal retargeting
   result.powAllowMinDifficultyBlocks = false
   result.powNoRetargeting = false
