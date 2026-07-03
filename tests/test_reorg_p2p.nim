@@ -32,6 +32,7 @@ import ../src/network/peer
 import ../src/consensus/params
 import ../src/primitives/[types, serialize, uint256]
 import ../src/crypto/hashing
+import ../src/storage/chainstate  # ChainState, MAX_REORG_DEPTH (pruning gate)
 
 proc hashOf(h: BlockHeader): BlockHash =
   BlockHash(doubleSha256(serialize(h)))
@@ -340,3 +341,118 @@ suite "Part 1: fork-aware download walk requests bridging fork bodies":
       check hashOf(h) notin queued
       check hashOf(h) notin sm.requestedHashes
     check sm.blockQueue.len == queueBefore
+
+# ===========================================================================
+# P2P fork-DEPTH-cap Core-parity: a heavier fork forking MORE than
+# MAX_REORG_DEPTH (288) below the active tip must, on an ARCHIVE node, have its
+# ENTIRE bridging span downloaded — Bitcoin Core (FindNextBlocksToDownload)
+# follows the most-work header chain to the fork point at any depth. Pre-fix the
+# descent's `while depth < MAX_REORG_DEPTH` cap fired unconditionally, so the
+# bottom bridging bodies were starved and the node stranded on the minority
+# chain. The cap is now gated on cs.pruningEnabled (mirrors handleReorg).
+#
+# The fork is populated DIRECTLY into headerChain.sideHeaders (bypassing
+# handleHeaders' presync/promotion machinery) so the descent's depth-cap gate is
+# exercised in isolation with deterministic heights + cumulative work.
+suite "Part 1: deep (>288) below-tip fork download is Core-parity work-based":
+
+  # Build a heavier fork of `forkLen` same-difficulty headers off genesis and
+  # install every header into sm.headerChain.sideHeaders keyed by its hash, with
+  # absolute height (1..forkLen) and genesis-cumulative totalWork. Returns the
+  # fork headers (ascending). The active chain A must already be shorter so the
+  # fork strictly out-works it.
+  proc installDeepFork(sm: SyncManager, genesisHash: BlockHash,
+                       startTime: uint32, forkLen: int): seq[BlockHeader] =
+    # baseWork = genesis-only cumulative work already in the header chain, so the
+    # fork's totalWork is directly comparable to the active chain's (both include
+    # the shared genesis base). Snapshot it BEFORE any active-chain extension by
+    # subtracting: initHeaderChain seeds totalWork with the genesis work, and
+    # extendActiveChain added chainA on top — so re-derive the base from a fresh
+    # walk instead. Simplest: compute the fork cumulatively from zero-work + each
+    # block; the comparison only needs fork(forkLen) > active(len(chainA)), which
+    # holds for equal difficulty because forkLen > len(chainA).
+    let fork = buildHeaderChain(genesisHash, startTime, forkLen)
+    var cum: array[32, byte]
+    for i, h in fork:
+      cum = addWork(cum, calculateWork(h.bits))
+      sm.headerChain.sideHeaders[hashOf(h)] = SideHeader(
+        header: h, height: int32(i + 1), totalWork: cum)
+    return fork
+
+  test "archive: deep heavier fork enqueues the FULL bridging span (no depth cap)":
+    let params = regtestParams()
+    let pm = newPeerManager(params, 8, 2, 117, "/tmp")
+    let peer = newPeer("203.0.113.40", 8333, params, pdInbound)
+    pm.peers["203.0.113.40:8333"] = peer
+    let sm = syncManagerAtGenesis(params)
+    sm.peerManager = pm
+    # Archive node: chainState nil (default) → forkDepthCap = unbounded.
+    let genesis = buildGenesisBlock(params)
+
+    # Small active chain A (height 10); chainTip == headerTip so the active-chain
+    # walk requests nothing and every enqueued body comes from the fork walk.
+    let chainA = buildHeaderChain(params.genesisBlockHash,
+                                  genesis.header.timestamp, 10)
+    sm.extendActiveChain(chainA)
+    sm.chainTip = hashOf(chainA[^1])
+    sm.chainTipHeight = 10
+
+    # Heavier fork off genesis, DEEPER than MAX_REORG_DEPTH: forkLen (300) >
+    # len(chainA) (10) same-difficulty blocks ⇒ strictly heavier. Its descent
+    # from the fork tip to the fork point (genesis) is 300 > 288.
+    const forkLen = MAX_REORG_DEPTH + 12  # 300
+    let fork = sm.installDeepFork(params.genesisBlockHash,
+                                  genesis.header.timestamp + 1, forkLen)
+    check sm.headerChain.sideHeaders.len == forkLen
+    let cand = sm.headerChain.heaviestSideTip()
+    check cand.isSome
+    check compareWork(cand.get().totalWork, sm.headerChain.totalWork) > 0
+
+    waitFor sm.requestBlocks(peer)
+
+    var queued = initHashSet[BlockHash]()
+    for h in sm.blockQueue.items:
+      queued.incl(h)
+
+    # Pre-fix: capped at 288 → the bottom bridging bodies (fork heights 1..12)
+    # were NEVER enqueued and the reorg could never bridge to the fork point.
+    # Post-fix: the full 300-block span is selected.
+    check sm.blockQueue.len >= forkLen
+    for h in fork:
+      check hashOf(h) in queued
+    # The very bottom bridging body (fork point's child, height 1) MUST be
+    # present — the exact block the depth cap starved.
+    check hashOf(fork[0]) in queued
+
+  test "pruned: same deep fork keeps the MAX_REORG_DEPTH cap (gate keys on pruning)":
+    let params = regtestParams()
+    let pm = newPeerManager(params, 8, 2, 117, "/tmp")
+    let peer = newPeer("203.0.113.41", 8333, params, pdInbound)
+    pm.peers["203.0.113.41:8333"] = peer
+    let sm = syncManagerAtGenesis(params)
+    sm.peerManager = pm
+    # Pruned node: a reorg past the retained undo window is un-appliable, so the
+    # download stays capped (matching handleReorg's pruning-gated cap).
+    sm.chainState = ChainState(pruningEnabled: true)
+    let genesis = buildGenesisBlock(params)
+
+    let chainA = buildHeaderChain(params.genesisBlockHash,
+                                  genesis.header.timestamp, 10)
+    sm.extendActiveChain(chainA)
+    sm.chainTip = hashOf(chainA[^1])
+    sm.chainTipHeight = 10
+
+    const forkLen = MAX_REORG_DEPTH + 12  # 300
+    let fork = sm.installDeepFork(params.genesisBlockHash,
+                                  genesis.header.timestamp + 1, forkLen)
+    check sm.headerChain.sideHeaders.len == forkLen
+
+    waitFor sm.requestBlocks(peer)
+
+    # Cap holds: no more than MAX_REORG_DEPTH fork bodies selected, and the
+    # bottom bridging body is NOT reached (deep reorg is un-appliable when pruned).
+    check sm.blockQueue.len <= MAX_REORG_DEPTH
+    var queued = initHashSet[BlockHash]()
+    for h in sm.blockQueue.items:
+      queued.incl(h)
+    check hashOf(fork[0]) notin queued

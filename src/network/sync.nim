@@ -1598,7 +1598,22 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     var cur = candidate.get().header
     var curHash = BlockHash(doubleSha256(serialize(cur)))
     var depth = 0
-    while depth < MAX_REORG_DEPTH and
+    # Fork-body descent depth cap — Core-parity, pruning-gated. Bitcoin Core
+    # (FindNextBlocksToDownload) follows the most-work header chain to the fork
+    # point at ANY depth; the anti-DoS is work-based, not a fork-depth ceiling.
+    # An ARCHIVE node retains all undo data and reorgs to any depth (handleReorg's
+    # own MAX_REORG_DEPTH cap is gated on cs.pruningEnabled), so its fork-body
+    # download must NOT be depth-capped — else a heavier fork forking >288 below
+    # the tip has its bottom bridging bodies (fork_point+1 ..) starved, the reorg
+    # never fires, and the node strands on the lower-work minority chain (a
+    # consensus-liveness divergence). Only a PRUNED node keeps the cap (a reorg
+    # past its retained undo window is un-appliable). The walk stays bounded
+    # per-call by MaxBlocksInFlight (the second condition) and terminates at the
+    # fork point / a have-body ancestor / an unknown parent regardless.
+    let forkDepthCap =
+      if sm.chainState != nil and sm.chainState.pruningEnabled: MAX_REORG_DEPTH
+      else: high(int)
+    while depth < forkDepthCap and
           sm.pendingBlocks + inventory.len + forkHashes.len < MaxBlocksInFlight:
       # Stop once we reach a block on the active chain — that is the fork point,
       # and everything at/below it is already connected.
