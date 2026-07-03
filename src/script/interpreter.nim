@@ -1183,6 +1183,15 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
   # once, matching `++opcode_pos` in Core.
   var opcodePos: uint32 = 0
 
+  # BIP-341/342: reset the tapscript codeseparator position to the "no
+  # codesep" sentinel at the start of every script evaluation, mirroring
+  # Core's `execdata.m_codeseparator_pos = 0xFFFFFFFF` at the top of each
+  # EvalScript (interpreter.cpp:433-434). The OP_CODESEPARATOR handler below
+  # overwrites it with the executed opcode index; the tapscript CHECKSIG/
+  # CHECKSIGADD sigmsg then commits that live value. This field is
+  # tapscript-only (legacy / SegWit-v0 use codesepByteOffset, untouched here).
+  interp.codesepPos = 0xFFFFFFFF'u32
+
   while pc < scriptLen:
     let opcode = script[pc]
     pc += 1
@@ -1947,9 +1956,17 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
               xonlyPk[i] = pubkey[i]
 
             let extFlag = if ctx.sigVersion == sigTapscript: 1'u8 else: 0'u8
+            # BIP-342 sigmsg commits the position of the LAST executed
+            # OP_CODESEPARATOR (Core: `ss << execdata.m_codeseparator_pos`,
+            # interpreter.cpp:1564-1565). That live value is tracked in
+            # interp.codesepPos (updated by the OP_CODESEPARATOR handler at
+            # the top of this proc, reset to 0xFFFFFFFF per-eval), NOT in the
+            # by-value ctx (which was constructed with the 0xFFFFFFFF sentinel
+            # and never synced). Reading ctx here stuck codesep_pos at
+            # 0xFFFFFFFF regardless of any executed OP_CODESEPARATOR.
             let sighash = computeSighashTaproot(
               ctx.tx, ctx.inputIndex, ctx.amounts, ctx.scriptPubKeys,
-              hashType, extFlag, ctx.annex, ctx.tapleafHash, ctx.codesepPos
+              hashType, extFlag, ctx.annex, ctx.tapleafHash, interp.codesepPos
             )
             # SIGHASH_SINGLE out-of-range output: computeSighashTaproot
             # returns the all-zero sentinel; treat as hard hashtype error
@@ -2294,9 +2311,12 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
           for i in 0 ..< 32:
             xonlyPk[i] = pubkey[i]
 
+          # BIP-342: commit the live executed OP_CODESEPARATOR position
+          # (interp.codesepPos), not the never-synced ctx sentinel. See the
+          # OP_CHECKSIG site above for the full rationale.
           let sighash = computeSighashTaproot(
             ctx.tx, ctx.inputIndex, ctx.amounts, ctx.scriptPubKeys,
-            hashType, 1, ctx.annex, ctx.tapleafHash, ctx.codesepPos
+            hashType, 1, ctx.annex, ctx.tapleafHash, interp.codesepPos
           )
           # SIGHASH_SINGLE out-of-range output: Core returns false from
           # SignatureHashSchnorr -> SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.

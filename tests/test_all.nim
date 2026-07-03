@@ -108,6 +108,7 @@ import ./test_w117_proxy_wireup
 import ./test_w135_standardness
 import ./test_w167_getblockstats
 import ./test_witness_consensus_fixes
+import ./test_w170_tapscript_codesep_sighash
 
 when isMainModule:
   echo "Running all tests..."
