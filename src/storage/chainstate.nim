@@ -146,6 +146,17 @@ type
     ## budget); default-preserving when the flag is absent.
     ibdMaxCacheSize*: int
     undoMgr*: UndoFileManager  ## Manages flat file undo storage
+    # True only when the daemon was started with --prune=N (N>0). Archive
+    # (default) leaves this false. Consulted by handleReorg to decide
+    # whether the MAX_REORG_DEPTH cap applies: an archive node retains ALL
+    # undo data and must follow the most-work valid chain to ANY depth
+    # (Core's ActivateBestChainStep walks to the fork point unbounded —
+    # MIN_BLOCKS_TO_KEEP=288 is a PRUNING floor, not a consensus reorg
+    # limit). Only a pruned node may legitimately lack the undo data for a
+    # too-deep reorg, and there the missing-undo detection already produces
+    # a controlled abort (matching Core's FatalError on missing undo).
+    # Wired by the daemon (src/nimrod.nim) when --prune > 0. Defaults false.
+    pruningEnabled*: bool
     # IBD batching state
     ibdBatch*: WriteBatch        ## Persistent write batch for IBD
     ibdBatchBlocks*: int         ## Blocks accumulated in current batch
@@ -791,6 +802,7 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     maxCacheBytes: MaxCacheBytes,        # default 2 GiB — unchanged unless --dbcache set
     ibdMaxCacheSize: IbdMaxCacheEntries, # default 200_000 IBD flush target
     undoMgr: newUndoFileManager(dbPath / "blocks"),
+    pruningEnabled: false,  # archive by default; daemon sets true under --prune
     ibdBatch: nil,
     ibdBatchBlocks: 0,
     ibdMode: false,
@@ -2340,11 +2352,23 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   var disconnectedBlocks: seq[(Block, UndoData, int32)] = @[]
 
   while currentHash != forkPoint and currentHeight >= 0:
-    # Cap the disconnect depth so the single batch never grows unbounded.
-    if disconnectedBlocks.len >= MAX_REORG_DEPTH:
+    # Reorg-depth cap — PRUNED nodes only. Bitcoin Core has NO reorg-depth
+    # limit: ActivateBestChainStep walks back to the fork point unbounded
+    # and follows the most-work valid chain to any depth. Core's
+    # MIN_BLOCKS_TO_KEEP (288) is a PRUNING floor (the minimum undo-data a
+    # pruned node retains), not a consensus reorg bound. On an archive node
+    # (pruning off = default) every block's undo data is present, so
+    # enforcing the cap would GRATUITOUSLY refuse a higher-work valid chain
+    # and strand the node on the lower-work minority chain — a Class-A
+    # consensus split. We therefore apply the cap ONLY when pruning is
+    # enabled; there a reorg deeper than the retained undo window cannot
+    # complete anyway and the missing-undo check below (`undoOpt.isNone`)
+    # produces the controlled abort that mirrors Core's FatalError on
+    # missing undo. Archive nodes reorg to any depth, exactly like Core.
+    if cs.pruningEnabled and disconnectedBlocks.len >= MAX_REORG_DEPTH:
       return err("reorg depth exceeds MAX_REORG_DEPTH=" & $MAX_REORG_DEPTH &
-                 " (refused to apply, current tip " & $cs.bestBlockHash &
-                 " forkPoint " & $forkPoint & ")")
+                 " while pruning (retained undo window exhausted, current tip " &
+                 $cs.bestBlockHash & " forkPoint " & $forkPoint & ")")
 
     # Get the block to disconnect
     let blkOpt = cs.db.getBlock(currentHash)

@@ -2335,6 +2335,11 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # unlink). Closes Cat-pruning RED for nimrod from
   # CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md.
   state.blockFileManager = newBlockFileManager(networkDir, params, state.chainState.db.db)
+  # Tell the chainstate whether pruning is on. This gates handleReorg's
+  # MAX_REORG_DEPTH cap: an archive node (pruneTarget == 0) follows the
+  # most-work valid chain to ANY depth (Core parity); only a pruned node
+  # keeps the cap because it may lack the undo data for a too-deep reorg.
+  state.chainState.pruningEnabled = config.pruneTarget > 0
   if config.pruneTarget > 0:
     state.pruner = newPruner(
       state.chainState,
