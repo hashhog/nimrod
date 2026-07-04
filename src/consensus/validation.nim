@@ -2200,6 +2200,27 @@ proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
     if not txResult.isOk:
       return txResult
 
+  # Context-free block-sigops cap (Core CheckBlock, validation.cpp:3971-3977).
+  # Sum GetLegacySigOpCount over ALL txs INCLUDING the coinbase and reject when
+  # nSigOps * WITNESS_SCALE_FACTOR > MAX_BLOCK_SIGOPS_COST → bad-blk-sigops.
+  # This UNDERESTIMATES the true cost (it counts neither witness nor P2SH sigops)
+  # — that fuller cost-model check lives in validateBlock (ConnectBlock parity,
+  # line ~1718) and runs only on the connect path.  Core keeps BOTH: the cheap
+  # legacy count here so it runs CONTEXT-FREE on EVERY path (tip-extend,
+  # side-branch storage via validateForStorage/skipConnectChecks, and reconnect),
+  # and the cost-model count at connect.  Before this, nimrod had only the
+  # cost-model check, which validateForStorage skips (skipConnectChecks=true),
+  # so a side-branch block whose coinbase carries >20000 OP_CHECKSIG outputs
+  # (legacy cost 20001*4 = 80004 > 80000) was accepted and reorged onto — a
+  # consensus fork vs Core, which rejects it context-free in CheckBlock.
+  # Counting is unchanged: getLegacySigOpCount already sums scriptSig +
+  # scriptPubKey sigops over every tx exactly as GetLegacySigOpCount does.
+  var legacySigOps = 0
+  for tx in blk.txs:
+    legacySigOps += getLegacySigOpCount(tx)
+  if legacySigOps * WitnessScaleFactor > MaxBlockSigopsCost:
+    return voidErr(veSigopExceeded)
+
   # Verify merkle root + CVE-2012-2459 mutation (Core CheckMerkleRoot).
   var txHashes: seq[array[32, byte]]
   for tx in blk.txs:

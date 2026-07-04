@@ -3,9 +3,10 @@
 import std/options
 import unittest2
 import ../src/consensus/[validation, params]
-import ../src/primitives/types
+import ../src/primitives/[types, serialize]
 import ../src/script/interpreter
 import ../src/storage/chainstate
+import ../src/crypto/hashing
 
 suite "sigop counting":
   test "countScriptSigops with OP_CHECKSIG":
@@ -417,3 +418,108 @@ suite "sigop boundary cases":
     check countScriptSigops(script, accurate = false) == 200 * MaxPubkeysPerMultisig  # = 4000
     # 4000 × 4 = 16000 = MaxStandardTxSigopsCost (exactly at limit, allowed)
     check (200 * MaxPubkeysPerMultisig * WitnessScaleFactor) == MaxStandardTxSigopsCost
+
+# ============================================================================
+# Context-free block-sigops cap in checkBlock (Core CheckBlock bad-blk-sigops)
+# ============================================================================
+#
+# Regression for the round-3 CONSENSUS-FORK: nimrod accepted + reorged onto a
+# side-branch block whose coinbase carried 20001 OP_CHECKSIG outputs (legacy
+# cost 20001*4 = 80004 > MAX_BLOCK_SIGOPS_COST 80000). Core rejects this
+# CONTEXT-FREE in CheckBlock (validation.cpp:3971-3977), so the block never
+# reaches the chain on any path. nimrod previously had ONLY the cost-model
+# sigops check inside validateBlock, gated by skipConnectChecks — which
+# validateForStorage (the side-branch storage path) passes as true, so the cap
+# was skipped and the bad block was stored and reorged onto.
+#
+# checkBlock is step 1 of acceptBlock, run UNCONDITIONALLY on EVERY acceptance
+# path (tip-extend applyBlock, submitblock, P2P, and side-branch storage via
+# validateForStorage — before skipConnectChecks is ever consulted). Exercising
+# checkBlock directly therefore covers the fork on all paths.
+proc buildCoinbaseWithCheckSigOutputs(nCheckSig: int): Transaction =
+  ## Coinbase with `nCheckSig` outputs, each scriptPubKey = [OP_CHECKSIG]
+  ## (1 legacy sigop each). scriptSig is a 2-byte filler (checkBlock only
+  ## enforces the 2..100 length floor context-free; BIP-34 encoding is
+  ## contextual and checked later in validateBlock).
+  var outs: seq[TxOut] = @[]
+  for _ in 0 ..< nCheckSig:
+    outs.add(TxOut(value: Satoshi(0'i64), scriptPubKey: @[byte(OP_CHECKSIG)]))
+  Transaction(
+    version: 1,
+    inputs: @[TxIn(
+      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0xFFFFFFFF'u32),
+      scriptSig: @[byte(0x01), byte(0x00)],
+      sequence: 0xFFFFFFFF'u32
+    )],
+    outputs: outs,
+    witnesses: @[],
+    lockTime: 0
+  )
+
+proc mineRegtestBlock(coinbase: Transaction): Block =
+  ## Single-tx regtest block; grind the nonce so checkBlock's PoW gate passes
+  ## (regtest target 0x207fffff is trivial — a handful of iterations).
+  let mroot = merkleRoot(@[array[32, byte](coinbase.txid())])
+  var hdr = BlockHeader(
+    version: 4,
+    prevBlock: BlockHash(default(array[32, byte])),
+    merkleRoot: mroot,
+    timestamp: 1_700_000_000'u32,
+    bits: 0x207fffff'u32,
+    nonce: 0'u32,
+  )
+  while not hashMeetsTarget(BlockHash(doubleSha256(serialize(hdr))), hdr.bits):
+    hdr.nonce = hdr.nonce + 1
+  Block(header: hdr, txs: @[coinbase])
+
+suite "block sigops cap — context-free checkBlock (bad-blk-sigops)":
+  let params = regtestParams()
+
+  test "boundary arithmetic: 20000 legacy sigops == MAX, 20001 exceeds":
+    check 20000 * WitnessScaleFactor == MaxBlockSigopsCost      # 80000
+    check 20001 * WitnessScaleFactor > MaxBlockSigopsCost       # 80004 > 80000
+
+  test "coinbase with 20000 OP_CHECKSIG outputs → checkBlock accepts (== 80000)":
+    let blk = mineRegtestBlock(buildCoinbaseWithCheckSigOutputs(20000))
+    let res = checkBlock(blk, params)
+    check res.isOk
+
+  test "coinbase with 20001 OP_CHECKSIG outputs → checkBlock rejects bad-blk-sigops (round-3 fork vector)":
+    # This is the exact live-Core diff vector (80004 cost). PRE-fix nimrod's
+    # checkBlock returned ok and the side-branch stored + reorged; POST-fix it
+    # rejects context-free, so validateForStorage rejects and no reorg happens.
+    let blk = mineRegtestBlock(buildCoinbaseWithCheckSigOutputs(20001))
+    let res = checkBlock(blk, params)
+    check (not res.isOk)
+    check res.error == veSigopExceeded
+
+  test "coinbase with 25000 OP_CHECKSIG outputs → checkBlock rejects bad-blk-sigops":
+    let blk = mineRegtestBlock(buildCoinbaseWithCheckSigOutputs(25000))
+    let res = checkBlock(blk, params)
+    check (not res.isOk)
+    check res.error == veSigopExceeded
+
+  test "sigops split across coinbase + a second tx is summed over ALL txs":
+    # Core sums GetLegacySigOpCount over every tx incl coinbase. 10001 sigops
+    # in the coinbase + 10000 in a second (non-coinbase) tx = 20001 total.
+    let coinbase = buildCoinbaseWithCheckSigOutputs(10001)
+    var outs2: seq[TxOut] = @[]
+    for _ in 0 ..< 10000:
+      outs2.add(TxOut(value: Satoshi(0'i64), scriptPubKey: @[byte(OP_CHECKSIG)]))
+    let tx2 = Transaction(
+      version: 1,
+      inputs: @[TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0'u32),
+        scriptSig: @[byte(0x51)],
+        sequence: 0xFFFFFFFF'u32)],
+      outputs: outs2, witnesses: @[], lockTime: 0)
+    let mroot = merkleRoot(@[array[32, byte](coinbase.txid()),
+                             array[32, byte](tx2.txid())])
+    var hdr = BlockHeader(version: 4, prevBlock: BlockHash(default(array[32, byte])),
+      merkleRoot: mroot, timestamp: 1_700_000_000'u32, bits: 0x207fffff'u32, nonce: 0'u32)
+    while not hashMeetsTarget(BlockHash(doubleSha256(serialize(hdr))), hdr.bits):
+      hdr.nonce = hdr.nonce + 1
+    let blk = Block(header: hdr, txs: @[coinbase, tx2])
+    let res = checkBlock(blk, params)
+    check (not res.isOk)
+    check res.error == veSigopExceeded
