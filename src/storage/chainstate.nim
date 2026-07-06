@@ -3,7 +3,7 @@
 ## Uses RocksDB column families for data separation
 ## Undo data stored in flat files (rev*.dat) for efficient reorg handling
 
-import std/[options, tables, os, algorithm]
+import std/[options, tables, os, algorithm, strutils]
 import ./db
 import ./undo
 import ../primitives/[types, serialize]
@@ -2554,8 +2554,11 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
         let verifyRes = cs.reorgVerifyHook(blk, newHeight)
         if not verifyRes.ok:
           rollbackInMemory()
-          return err("reorg connect rejected block " & $blockHash &
-                     " at height " & $newHeight & ": " & verifyRes.err)
+          # Lead with the canonical BIP-22 script-verify token (verifyRes.err is
+          # block-/mandatory-script-verify-flag-failed) so a failed heavier-branch
+          # reorg maps to a hard rejection, not "inconclusive" (bip22RejectToken).
+          return err(verifyRes.err & ": reorg connect rejected block " &
+                     $blockHash & " at height " & $newHeight)
 
     # Write undo to flat file (rev*.dat). This is durable independent of
     # the RocksDB batch, but committing it early is fine: on a mid-reorg
@@ -2594,8 +2597,8 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
           let utxoOpt = cs.getUtxo(input.prevOut)
           if utxoOpt.isNone:
             rollbackInMemory()
-            return err("missing input during connect at height " & $newHeight &
-                       ": " & $input.prevOut.txid)
+            return err("bad-txns-inputs-missingorspent: missing input during " &
+                       "connect at height " & $newHeight & ": " & $input.prevOut.txid)
 
           let entry = utxoOpt.get()
 
@@ -2605,7 +2608,8 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
             let age = newHeight - entry.height
             if age < int32(cs.params.coinbaseMaturity):
               rollbackInMemory()
-              return err("immature coinbase spend during reorg at height " &
+              return err("bad-txns-premature-spend-of-coinbase: immature " &
+                         "coinbase spend during reorg at height " &
                          $newHeight & ", coinbase height " & $entry.height &
                          ", age " & $age & " < " & $cs.params.coinbaseMaturity)
 
@@ -2776,6 +2780,26 @@ type
     sboRejected     ## not stored: unknown parent or validate-for-storage failed
                     ## (`token` = "rejected" or the bip22String of the error)
 
+proc bip22RejectToken(reason: string): string =
+  ## Return the leading BIP-22 reject token of `reason` — the substring before
+  ## the first ": " — iff it is a recognised consensus reject code, else "".
+  ## Used by the failed-heavier-reorg arm to tell a HARD consensus rejection
+  ## (map to sboRejected, matching Bitcoin Core, which never stores an invalid
+  ## block that a heavier fork tried to activate) apart from a transient/internal
+  ## failure (missing ancestor body, undo-write failure, reorg-in-progress),
+  ## which must stay "inconclusive".
+  let sep = reason.find(": ")
+  let tok = if sep >= 0: reason[0 ..< sep] else: reason
+  if tok.startsWith("bad-") or tok.startsWith("high-") or
+     tok.startsWith("non-") or tok.startsWith("time-") or
+     tok.startsWith("unexpected-") or
+     tok == "too-little-chainwork" or
+     tok == "block-script-verify-flag-failed" or
+     tok == "mandatory-script-verify-flag-failed":
+    tok
+  else:
+    ""
+
 proc acceptSideBranchBlock*(
     cs: var ChainState,
     blk: Block,
@@ -2902,7 +2926,17 @@ proc acceptSideBranchBlock*(
     # Core uses when AcceptBlock succeeds but ActivateBestChain later finds a
     # problem).  disconnectedTxs was reset by handleReorg's rollback.
     disconnectedTxs.setLen(0)
-    return (sboSideBranch, "inconclusive")
+    # If the reorg failed because the heavier branch is CONSENSUS-INVALID
+    # (bad-cb-amount, bad-txns-premature-spend-of-coinbase, missing/spent
+    # inputs, script-verify failure) reject it outright — Bitcoin Core never
+    # leaves such a block as an "inconclusive" side branch.  Only a
+    # transient/internal failure (missing ancestor body, undo-write failure,
+    # reorg-in-progress — none of which carry a BIP-22 token) stays inconclusive.
+    let tok = bip22RejectToken(reorgRes.error)
+    if tok.len > 0:
+      return (sboRejected, tok)
+    else:
+      return (sboSideBranch, "inconclusive")
 
   # Reorg succeeded — this branch is now the active tip.  Surface the connected
   # blocks for the caller's post-reorg mempool/fee/wallet refresh.
