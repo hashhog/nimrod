@@ -253,6 +253,22 @@ proc get*(mp: Mempool, txid: TxId): Option[MempoolEntry] =
   else:
     none(MempoolEntry)
 
+proc containsWtxid*(mp: Mempool, wtxid: TxId): bool =
+  ## BIP-339: is a transaction with this wtxid in the mempool?
+  ## For non-segwit txs wtxid == txid, so `byWtxid` covers both namespaces.
+  wtxid in mp.byWtxid
+
+proc getByWtxid*(mp: Mempool, wtxid: TxId): Option[MempoolEntry] =
+  ## Look up a mempool entry by its wtxid (BIP-339 MSG_WTX serving path).
+  ## A peer that announced a tx to us via `invWtx` requests it back with a
+  ## `getdata(MSG_WTX)` carrying the WTXID; we must resolve it through the
+  ## `byWtxid` index rather than the txid-keyed `entries` table.
+  let txidOpt = mp.byWtxid.getOrDefault(wtxid, TxId(default(array[32, byte])))
+  if wtxid in mp.byWtxid and txidOpt in mp.entries:
+    some(mp.entries[txidOpt])
+  else:
+    none(MempoolEntry)
+
 proc getTransaction*(mp: Mempool, txid: TxId): Option[Transaction] =
   if txid in mp.entries:
     some(mp.entries[txid].tx)

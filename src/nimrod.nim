@@ -1185,10 +1185,20 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
         # Both are stored on rejection (see mkTx handler), so this lookup
         # is correct regardless of which namespace the peer uses.
         let lookupHash = TxId(item.hash)
-        if not state.mempool.contains(lookupHash) and
-            lookupHash notin state.recentlyRejected:
-          # Request using MSG_WITNESS_TX getdata flag so we get witness data.
-          txInvs.add(InvVector(invType: invWitnessTx, hash: item.hash))
+        # Dedup against the mempool in the SAME namespace as the announcement:
+        # an invWtx item carries a wtxid (resolve via byWtxid), everything
+        # else carries a txid (resolve via the txid-keyed entries).
+        let alreadyInMempool =
+          if item.invType == invWtx: state.mempool.containsWtxid(lookupHash)
+          else: state.mempool.contains(lookupHash)
+        if not alreadyInMempool and lookupHash notin state.recentlyRejected:
+          # Echo the announcement's identifier namespace in the getdata type
+          # (BIP-339 / Core GetRequestsToSend): invWtx → MSG_WTX (invWtx),
+          # invTx/invWitnessTx → MSG_WITNESS_TX (invWitnessTx).  Requesting a
+          # wtxid under invWitnessTx (a TXID request) makes the peer miss for
+          # segwit txs and reply notfound — the tx would never be ingested.
+          let reqType = getdataTypeForAnnouncement(item.invType)
+          txInvs.add(InvVector(invType: reqType, hash: item.hash))
     if blockInvs.len > 0:
       asyncSpawn spawnSafe(peer.sendGetData(blockInvs))
     if txInvs.len > 0:
@@ -1286,6 +1296,23 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
             servedTxs.inc
           except CatchableError as e:
             debug "failed to serve tx", peer = $peer, error = e.msg
+        else:
+          notFound.add(item)
+      elif item.invType == invWtx:
+        # BIP-339 MSG_WTX getdata: the item hash is a WTXID, so resolve it
+        # through the mempool's wtxid index (Core serves MSG_WTX by wtxid).
+        # A wtxid-relay peer requests txs we announced via invWtx this way;
+        # looking it up as a txid would miss for every segwit tx.
+        let wtxid = TxId(item.hash)
+        let entryOpt = if state.mempool != nil: state.mempool.getByWtxid(wtxid)
+                      else: none(MempoolEntry)
+        if entryOpt.isSome:
+          let txMsg = newTxMsg(entryOpt.get().tx)
+          try:
+            await peer.sendMessage(txMsg)
+            servedTxs.inc
+          except CatchableError as e:
+            debug "failed to serve tx (wtxid)", peer = $peer, error = e.msg
         else:
           notFound.add(item)
       else:

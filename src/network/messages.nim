@@ -383,6 +383,21 @@ proc readInvVector*(r: var BinaryReader): InvVector =
   else: result.invType = invError
   result.hash = r.readHash()
 
+proc getdataTypeForAnnouncement*(annType: InvType): InvType =
+  ## BIP-339 getdata-type echo for a tx announcement.
+  ##
+  ## Bitcoin Core net_processing GetRequestsToSend requests each announced
+  ## tx as `gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | fetch_flags)`.  The request
+  ## MUST stay in the same identifier namespace as the announcement:
+  ##   - invWtx announcement (wtxid) → request MSG_WTX (invWtx); the serving
+  ##     peer resolves it via its wtxid index and MSG_WTX implies witness data.
+  ##   - invTx / invWitnessTx announcement (txid) → request MSG_WITNESS_TX
+  ##     (invWitnessTx) so we get the witness-serialized tx.
+  ## Requesting a WTXID under invWitnessTx (a TXID request) makes the peer
+  ## look the wtxid up as a txid — for segwit txs (txid != wtxid) that misses
+  ## and it replies notfound, so the tx is never ingested.
+  if annType == invWtx: invWtx else: invWitnessTx
+
 # VersionMsg serialization
 
 proc writeVersionMsg*(w: var BinaryWriter, msg: VersionMsg) =
