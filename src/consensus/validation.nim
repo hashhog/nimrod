@@ -43,6 +43,12 @@ type
     veBadTxVersion = "invalid transaction version"
     veDuplicateInput = "duplicate transaction input"
     veBadOutputValue = "invalid output value"
+    # CheckTransaction structural gates (consensus/tx_check.cpp) — distinct from
+    # the UTXO-context "missing inputs" case so an empty-vin/vout tx surfaces the
+    # correct bare Core reject token (bad-txns-vin-empty / bad-txns-vout-empty)
+    # instead of bad-txns-inputs-missingorspent.
+    veVinEmpty = "transaction has no inputs (bad-txns-vin-empty)"
+    veVoutEmpty = "transaction has no outputs (bad-txns-vout-empty)"
     veNegativeOutput = "negative output value"
     veOutputTooLarge = "output value exceeds MAX_MONEY"
     veFeeTooLow = "transaction fee too low"
@@ -160,6 +166,9 @@ proc bip22String*(e: ValidationError): string =
   of veTxOutTotalTooLarge: "bad-txns-txouttotal-toolarge"
   # bad-txns-prevout-null: non-coinbase input references null outpoint (tx_check.cpp:56)
   of veNullPrevout: "bad-txns-prevout-null"
+  # Empty vin/vout (consensus/tx_check.cpp:11-13, CheckTransaction).
+  of veVinEmpty: "bad-txns-vin-empty"
+  of veVoutEmpty: "bad-txns-vout-empty"
   # bad-txns-accumulated-fee-outofrange: sum of tx fees in block out of range (validation.cpp:2543)
   of veFeesOutOfRange: "bad-txns-accumulated-fee-outofrange"
   # incorrect proof of work: nBits doesn't match GetNextWorkRequired (validation.cpp:4089)
@@ -178,6 +187,24 @@ proc bip22String*(e: ValidationError): string =
   of veInsufficientChainWork: "too-little-chainwork"
   of veOk: ""
   else: "rejected"
+
+proc mempoolCheckTxToken*(e: ValidationError): string =
+  ## Map a CheckTransaction (consensus/tx_check.cpp) ValidationError to the
+  ## BARE Bitcoin Core reject token surfaced on the mempool RPC paths
+  ## (sendrawtransaction / testmempoolaccept, where Core reports
+  ## state.GetRejectReason()).  Only the errors that checkTransaction() can
+  ## actually return are enumerated; anything else falls back to bip22String.
+  case e
+  of veVinEmpty: "bad-txns-vin-empty"
+  of veVoutEmpty: "bad-txns-vout-empty"
+  of veTxOversize: "bad-txns-oversize"
+  of veNegativeOutput: "bad-txns-vout-negative"
+  of veOutputTooLarge: "bad-txns-vout-toolarge"
+  of veTxOutTotalTooLarge: "bad-txns-txouttotal-toolarge"
+  of veDuplicateInput: "bad-txns-inputs-duplicate"
+  of veNullPrevout: "bad-txns-prevout-null"
+  of veBadCoinbaseSize: "bad-cb-length"
+  else: bip22String(e)
 
 # Merkle root computation with Bitcoin's duplicate-last-if-odd rule.
 #
@@ -1950,11 +1977,14 @@ proc checkTransaction*(tx: Transaction, params: ConsensusParams): ValidationResu
   ## Reference: Bitcoin Core consensus/tx_check.cpp:11-58
 
   # G1: must have at least one input
+  # Core consensus/tx_check.cpp:11 → "bad-txns-vin-empty".  Must be distinct
+  # from the UTXO-context "missing inputs" reject so an empty-vin tx does not
+  # masquerade as bad-txns-inputs-missingorspent on the mempool RPC paths.
   if tx.inputs.len == 0:
-    return voidErr(veInputsMissing)
-  # G2: must have at least one output
+    return voidErr(veVinEmpty)
+  # G2: must have at least one output → "bad-txns-vout-empty" (tx_check.cpp:13).
   if tx.outputs.len == 0:
-    return voidErr(veBadOutputValue)
+    return voidErr(veVoutEmpty)
 
   # G3: transaction size check — base (non-witness) serialization * 4 must not exceed
   # MAX_BLOCK_WEIGHT. This is checked BEFORE output values per Core tx_check.cpp order.

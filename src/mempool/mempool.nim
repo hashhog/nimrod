@@ -992,7 +992,11 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # Basic structural validation (CheckTransaction).
   let basicResult = checkTransaction(tx, mp.params)
   if not basicResult.isOk:
-    return err(AtmpAcceptInfo, "invalid transaction: " & $basicResult.error)
+    # Surface the BARE Core reject token (rpc/mempool.cpp reports
+    # state.GetRejectReason()), e.g. bad-txns-vin-empty / bad-txns-vout-empty /
+    # bad-txns-vout-negative / bad-txns-inputs-duplicate / bad-txns-prevout-null,
+    # not the human-readable enum string.
+    return err(AtmpAcceptInfo, mempoolCheckTxToken(basicResult.error))
 
   # Coinbase txs cannot enter mempool. validation.cpp:803-804.
   if isCoinbase(tx):
@@ -1007,13 +1011,17 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # 400K WU policy limit.
   let weight = calculateWeight(tx)
   if weight > MaxStandardTxWeight:
-    return err(AtmpAcceptInfo, "transaction weight " & $weight & " exceeds max " &
-               $MaxStandardTxWeight)
+    # Core policy IsStandardTx emits the bare token "tx-size" for the
+    # oversize-weight case (policy/policy.cpp).
+    return err(AtmpAcceptInfo, "tx-size")
 
-  # IsStandardTx (policy/policy.cpp).
+  # IsStandardTx (policy/policy.cpp).  isStandardTx already returns the bare
+  # Core reject token (dust / version / bare-multisig / scriptpubkey /
+  # scriptsig-size / scriptsig-not-pushonly / datacarrier / tx-size); surface
+  # it verbatim rather than wrapping it in "non-standard tx (...)".
   let stdRes = isStandardTx(tx)
   if not stdRes.ok:
-    return err(AtmpAcceptInfo, "non-standard tx (" & stdRes.reason & ")")
+    return err(AtmpAcceptInfo, stdRes.reason)
 
   # W96 GAP #1: BIP-141 exists-by-wtxid / same-txid-different-wtxid duplicate
   # detection.  Bitcoin Core validation.cpp:823-830 distinguishes:
@@ -1109,7 +1117,12 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # CheckTxInputs paths feed back through the state object).
   let feeOpt = calculateFee(tx, mp)
   if feeOpt.isNone:
-    return err(AtmpAcceptInfo, "bad-txns-in-belowout / bad-txns-fee-outofrange")
+    # calculateFee returns none only when sum(inputs) < sum(outputs); the
+    # missing-prevout / bad-vout cases are already caught by the input walk
+    # above.  Core CheckTxInputs (consensus/tx_verify.cpp:196) reports
+    # "bad-txns-in-belowout" for this condition; the sibling
+    # "bad-txns-fee-outofrange" is documented unreachable (tx_verify.cpp:204).
+    return err(AtmpAcceptInfo, "bad-txns-in-belowout")
   let fee = feeOpt.get()
 
   # IsWitnessStandard (policy/policy.cpp:265-351).  Core orders this AFTER
@@ -1251,12 +1264,20 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # validation.cpp:948: `if (!bypass_limits && !args.m_package_feerates &&
   # !CheckFeeRate(...)) return false;`
   if not args.bypassLimits and not args.packageFeerates:
+    # Core CheckFeeRate (validation.cpp:699-712) runs TWO distinct gates with
+    # TWO distinct bare reject tokens:
+    #   1. the rolling mempool-min floor (GetMinFee), only when it is > 0,
+    #      emits "mempool min fee not met";
+    #   2. the static -minrelaytxfee floor emits "min relay fee not met".
+    # The decision is identical to the previous fused check — reject iff
+    # feeRate < max(minFeeRate, rollingFloor) — because feeRate >= 0 makes the
+    # (rollingFloor <= 0 and feeRate < rollingFloor) sub-case vacuous; only the
+    # surfaced token differs so the two Core reasons are reported separately.
     let rollingFloor = mp.getMinFee()
-    let effectiveMinFeeRate = max(mp.minFeeRate, rollingFloor)
-    if feeRate < effectiveMinFeeRate:
-      return err(AtmpAcceptInfo, "mempool min fee not met: feerate " & $feeRate &
-                 " < min " & $effectiveMinFeeRate &
-                 " (rolling floor: " & $rollingFloor & ")")
+    if rollingFloor > 0.0 and feeRate < rollingFloor:
+      return err(AtmpAcceptInfo, "mempool min fee not met")
+    if feeRate < mp.minFeeRate:
+      return err(AtmpAcceptInfo, "min relay fee not met")
 
   # W96 GAP #7: client_maxfeerate (validation.cpp:1368).
   # Core compares the effective feerate against the caller-supplied max

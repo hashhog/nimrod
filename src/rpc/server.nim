@@ -4719,6 +4719,16 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   except CatchableError as e:
     raise newRpcError(RpcInvalidParams, "TX decode failed: " & e.msg)
 
+proc testAcceptRejectReason*(reason: string): string =
+  ## Map an internal mempool reject reason to the token Bitcoin Core surfaces on
+  ## the testmempoolaccept RPC path.  Core remaps TX_MISSING_INPUTS to the bare
+  ## "missing-inputs" token there (rpc/mempool.cpp:399-400); every other reason
+  ## is passed through unchanged (state.GetRejectReason()).
+  if reason.startsWith("bad-txns-inputs-missingorspent"):
+    "missing-inputs"
+  else:
+    reason
+
 proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Dry-run mempool acceptance check for one or more raw transactions.
   ## Reference: Bitcoin Core testmempoolaccept RPC (rpc/mempool.cpp)
@@ -4852,7 +4862,7 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
       }
     else:
       txEntry["allowed"] = %false
-      txEntry["reject-reason"] = %res.error
+      txEntry["reject-reason"] = %testAcceptRejectReason(res.error)
 
     resultArr.add(txEntry)
 
@@ -4899,7 +4909,7 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
           "txid": txidHex,
           "wtxid": wtxidHex,
           "allowed": false,
-          "reject-reason": pkgResult.error
+          "reject-reason": testAcceptRejectReason(pkgResult.error)
         })
       return resultArr
 
@@ -4938,7 +4948,7 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
           }
       else:
         txEntry["allowed"] = %false
-        txEntry["reject-reason"] = %txResult.error
+        txEntry["reject-reason"] = %testAcceptRejectReason(txResult.error)
 
       resultArr.add(txEntry)
 

@@ -350,9 +350,10 @@ suite "Mempool fee policy":
     # Fee = 1 sat, weight ~= 400, vbytes ~= 100, rate ~= 0.01 sat/vbyte
     let result = mp.acceptTransaction(tx, crypto)
     check not result.isOk
-    # W96: rephrased to match Core "mempool min fee not met" path
-    # (validation.cpp:948 CheckFeeRate).
-    check "min fee not met" in result.error or
+    # W96: rephrased to match Core CheckFeeRate path (validation.cpp:699).
+    # On a fresh mempool the rolling floor is 0, so the static -minrelaytxfee
+    # gate governs and Core emits the bare token "min relay fee not met".
+    check "fee not met" in result.error or
           "fee rate" in result.error or
           "script" in result.error
 
@@ -2349,6 +2350,143 @@ suite "W75 ancestor/descendant/cluster limits":
     ## Regression: was incorrectly set to 100 before W75 fix.
     ## DefaultClusterLimit (mempool.nim) and MaxClusterSize (cluster.nim) must agree.
     check DefaultClusterLimit == 64
+
+# ============================================================================
+# Reject-reason token parity (campaign #7, 2026-07-08)
+# ----------------------------------------------------------------------------
+# The mempool RPC paths (sendrawtransaction / testmempoolaccept) must surface
+# Bitcoin Core's BARE canonical reject tokens, not nimrod-internal prose.  Each
+# test below pins one of the six discrepancy classes fixed in this pass.  These
+# assert EXACT-MATCH tokens because Core's reject-reason is the bare token.
+# ============================================================================
+
+proc buildSpendableCoinbase(cs: var ChainState): TxId =
+  ## Build a 101-block chain; return the height-1 coinbase txid (mature at the
+  ## tip, since genesis writes no UTXO — see W14 / Core parity note above).
+  let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+  discard cs.connectBlock(genesis, 0)
+  let genesisHash = getBlockHash(genesis)
+  let block1 = makeSimpleBlock(genesisHash, 1)
+  discard cs.connectBlock(block1, 1)
+  var prevHash = getBlockHash(block1)
+  for h in 2 .. 101:
+    let blk = makeSimpleBlock(prevHash, int32(h))
+    discard cs.connectBlock(blk, int32(h))
+    prevHash = getBlockHash(blk)
+  block1.txs[0].txid()
+
+suite "Reject-reason token parity (Core bare tokens)":
+  setup:
+    cleanupTestDb()
+  teardown:
+    cleanupTestDb()
+
+  test "class 5: empty vin -> bad-txns-vin-empty (not missingorspent)":
+    var cs = newChainState(TestDbPath, regtestParams())
+    var mp = newMempool(cs, regtestParams())
+    let crypto = newCryptoEngine()
+    let tx = Transaction(version: 1, inputs: @[],
+                         outputs: @[TxOut(value: Satoshi(100_000),
+                                          scriptPubKey: makeP2PKHScript())],
+                         witnesses: @[], lockTime: 0)
+    let r = mp.acceptTransaction(tx, crypto)
+    check not r.isOk
+    check r.error == "bad-txns-vin-empty"
+    cs.close()
+
+  test "class 5: empty vout -> bad-txns-vout-empty":
+    var cs = newChainState(TestDbPath, regtestParams())
+    var mp = newMempool(cs, regtestParams())
+    let crypto = newCryptoEngine()
+    var fake: array[32, byte]
+    fake[0] = 0x11
+    let tx = Transaction(version: 1,
+                         inputs: @[TxIn(prevOut: OutPoint(txid: TxId(fake), vout: 0),
+                                        scriptSig: @[byte(0x00)], sequence: 0xFFFFFFFF'u32)],
+                         outputs: @[], witnesses: @[], lockTime: 0)
+    let r = mp.acceptTransaction(tx, crypto)
+    check not r.isOk
+    check r.error == "bad-txns-vout-empty"
+    cs.close()
+
+  test "class 5: duplicate inputs -> bad-txns-inputs-duplicate":
+    var cs = newChainState(TestDbPath, regtestParams())
+    var mp = newMempool(cs, regtestParams())
+    let crypto = newCryptoEngine()
+    var fake: array[32, byte]
+    fake[0] = 0x22
+    let dupIn = TxIn(prevOut: OutPoint(txid: TxId(fake), vout: 0),
+                     scriptSig: @[byte(0x00)], sequence: 0xFFFFFFFF'u32)
+    let tx = Transaction(version: 1, inputs: @[dupIn, dupIn],
+                         outputs: @[TxOut(value: Satoshi(100_000),
+                                          scriptPubKey: makeP2PKHScript())],
+                         witnesses: @[], lockTime: 0)
+    let r = mp.acceptTransaction(tx, crypto)
+    check not r.isOk
+    check r.error == "bad-txns-inputs-duplicate"
+    cs.close()
+
+  test "class 1: non-standard version -> bare 'version' (not wrapped)":
+    var cs = newChainState(TestDbPath, regtestParams())
+    var mp = newMempool(cs, regtestParams(), minFeeRate = 0.0)
+    let crypto = newCryptoEngine()
+    var fake: array[32, byte]
+    fake[0] = 0x33
+    # version 99 is outside the standard 1..3 range → IsStandardTx "version".
+    # (This gate runs before any prevout lookup, so a fake input is fine.)
+    var tx = makeSpendTx(TxId(fake), 0, 100_000)
+    tx.version = 99
+    let r = mp.acceptTransaction(tx, crypto)
+    check not r.isOk
+    check r.error == "version"
+    cs.close()
+
+  test "class 3: oversize weight -> bare 'tx-size'":
+    var cs = newChainState(TestDbPath, regtestParams())
+    var mp = newMempool(cs, regtestParams(), minFeeRate = 0.0)
+    let crypto = newCryptoEngine()
+    var fake: array[32, byte]
+    fake[0] = 0x44
+    # ~3200 P2PKH outputs push the base size past 100_000 bytes, so
+    # weight = base*4 > MaxStandardTxWeight (400_000 WU) → "tx-size".
+    var outs: seq[TxOut]
+    for i in 0 ..< 3200:
+      outs.add(TxOut(value: Satoshi(1000), scriptPubKey: makeP2PKHScript()))
+    let tx = Transaction(version: 1,
+                         inputs: @[TxIn(prevOut: OutPoint(txid: TxId(fake), vout: 0),
+                                        scriptSig: @[byte(0x00)], sequence: 0xFFFFFFFF'u32)],
+                         outputs: outs, witnesses: @[], lockTime: 0)
+    check calculateWeight(tx) > MaxStandardTxWeight
+    let r = mp.acceptTransaction(tx, crypto)
+    check not r.isOk
+    check r.error == "tx-size"
+    cs.close()
+
+  test "class 2: outputs exceed inputs -> bad-txns-in-belowout (single token)":
+    var cs = newChainState(TestDbPath, regtestParams())
+    var mp = newMempool(cs, regtestParams(), minFeeRate = 0.0)
+    let crypto = newCryptoEngine()
+    let coinbaseTxid = buildSpendableCoinbase(cs)
+    # Coinbase is worth 5 BTC; spend 6 BTC → sum(out) > sum(in).
+    let tx = makeSpendTx(coinbaseTxid, 0, 6_000_000_000)
+    let r = mp.acceptTransaction(tx, crypto)
+    check not r.isOk
+    check r.error == "bad-txns-in-belowout"
+    cs.close()
+
+  test "class 4: fresh-mempool low fee -> 'min relay fee not met'":
+    var cs = newChainState(TestDbPath, regtestParams())
+    # Default minFeeRate = 0.1 sat/vB; rolling floor is 0 on a fresh mempool,
+    # so the static -minrelaytxfee gate governs → Core "min relay fee not met".
+    var mp = newMempool(cs, regtestParams())
+    let crypto = newCryptoEngine()
+    let coinbaseTxid = buildSpendableCoinbase(cs)
+    # 1-sat fee → feerate ~0.01 sat/vB, well below 0.1.
+    let tx = makeSpendTx(coinbaseTxid, 0, 4_999_999_999)
+    let r = mp.acceptTransaction(tx, crypto)
+    check not r.isOk
+    check r.error == "min relay fee not met"
+    cs.close()
 
 when isMainModule:
   # Run all tests

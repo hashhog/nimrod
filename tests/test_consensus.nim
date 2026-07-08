@@ -285,7 +285,7 @@ suite "transaction validation":
     )
     let res = checkTransaction(tx, params)
     check res.isOk == false
-    check res.error == veInputsMissing
+    check res.error == veVinEmpty
 
   test "transaction must have outputs":
     let params = mainnetParams()
@@ -302,7 +302,7 @@ suite "transaction validation":
     )
     let res = checkTransaction(tx, params)
     check res.isOk == false
-    check res.error == veBadOutputValue
+    check res.error == veVoutEmpty
 
   test "output value cannot exceed max money":
     let params = mainnetParams()
@@ -883,16 +883,18 @@ proc mkCoinbaseTxScriptSig(scriptSig: seq[byte]): Transaction =
 
 suite "W84 CheckTransaction gates (tx_check.cpp parity)":
 
-  test "G1: vin empty -> veInputsMissing / bad-txns-vin-empty":
+  test "G1: vin empty -> veVinEmpty / bad-txns-vin-empty":
     let params = mainnetParams()
     let tx = Transaction(version: 1, inputs: @[],
                          outputs: @[TxOut(value: Satoshi(1), scriptPubKey: @[])],
                          witnesses: @[], lockTime: 0)
     let res = checkTransaction(tx, params)
     check res.isOk == false
-    check res.error == veInputsMissing
+    check res.error == veVinEmpty
+    check bip22String(res.error) == "bad-txns-vin-empty"
+    check mempoolCheckTxToken(res.error) == "bad-txns-vin-empty"
 
-  test "G2: vout empty -> veBadOutputValue / bad-txns-vout-empty":
+  test "G2: vout empty -> veVoutEmpty / bad-txns-vout-empty":
     let params = mainnetParams()
     let tx = Transaction(version: 1,
                          inputs: @[TxIn(prevOut: OutPoint(txid: TxId([1'u8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]), vout: 0),
@@ -900,7 +902,9 @@ suite "W84 CheckTransaction gates (tx_check.cpp parity)":
                          outputs: @[], witnesses: @[], lockTime: 0)
     let res = checkTransaction(tx, params)
     check res.isOk == false
-    check res.error == veBadOutputValue
+    check res.error == veVoutEmpty
+    check bip22String(res.error) == "bad-txns-vout-empty"
+    check mempoolCheckTxToken(res.error) == "bad-txns-vout-empty"
 
   test "G3: tx base-size * 4 > MAX_BLOCK_WEIGHT -> veTxOversize / bad-txns-oversize":
     # Craft a tx whose base (non-witness) serialized size exceeds 1,000,000 bytes.
@@ -1256,16 +1260,16 @@ suite "Finding 7 — checkBlock coinbase output validation":
     let res = checkBlock(blk, params)
     check res.isOk == true
 
-  test "F7-G2: coinbase with 0 outputs -> veBadOutputValue (bad-txns-vout-empty)":
+  test "F7-G2: coinbase with 0 outputs -> veVoutEmpty (bad-txns-vout-empty)":
     ## Core CheckTransaction G2: vout must not be empty, even for coinbase.
     ## Before fix: checkBlock skipped coinbase → returned ok() (BUG).
-    ## After fix: checkTransaction runs on coinbase → veBadOutputValue.
+    ## After fix: checkTransaction runs on coinbase → veVoutEmpty.
     let params = regtestParams()
     let cb = makeCbTxWithOutputs(@[])
     let blk = mineRegtestBlock(@[cb])
     let res = checkBlock(blk, params)
     check res.isOk == false
-    check res.error == veBadOutputValue
+    check res.error == veVoutEmpty
 
   test "F7-G4: coinbase with negative output -> veNegativeOutput (bad-txns-vout-negative)":
     ## Core CheckTransaction G4: output values must be >= 0.
