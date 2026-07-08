@@ -478,7 +478,9 @@ suite "W96 ATMP args — bypass_limits (W96 GAP #8)":
     let normalArgs = defaultAtmpArgs()
     let r1 = mp.acceptTransactionWithArgs(tx, crypto, normalArgs)
     check not r1.isOk
-    check "min fee not met" in r1.error or "script verification" in r1.error or
+    # Bare Core reject tokens: "min relay fee not met" (static floor) or
+    # "mempool min fee not met" (rolling floor) — both contain "fee not met".
+    check "fee not met" in r1.error or "script verification" in r1.error or
           "fee rate" in r1.error
 
     var bypassArgs = defaultAtmpArgs()
@@ -486,7 +488,7 @@ suite "W96 ATMP args — bypass_limits (W96 GAP #8)":
     let r2 = mp.acceptTransactionWithArgs(tx, crypto, bypassArgs)
     # Should not fail on min-fee anymore; may still fail on script verify.
     if not r2.isOk:
-      check "min fee not met" notin r2.error
+      check "fee not met" notin r2.error
     cs.close()
 
 suite "W96 PolicyScriptChecks — script verify gates":
