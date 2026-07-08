@@ -110,6 +110,7 @@ import ./test_w135_standardness
 import ./test_w167_getblockstats
 import ./test_witness_consensus_fixes
 import ./test_w170_tapscript_codesep_sighash
+import ./test_wtxid_getdata
 
 when isMainModule:
   echo "Running all tests..."
