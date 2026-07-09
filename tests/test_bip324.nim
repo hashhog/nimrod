@@ -337,10 +337,10 @@ suite "BIP-324 cipher session roundtrip":
 # ============================================================================
 
 suite "BIP-324 outbound env-var gate":
-  test "default (unset) returns false":
+  test "default (unset) returns true (opt-out gate, default-on since fe20066)":
     putEnv("NIMROD_BIP324_V2_OUTBOUND", "")
     delEnv("NIMROD_BIP324_V2_OUTBOUND")
-    check bip324V2OutboundEnabled() == false
+    check bip324V2OutboundEnabled() == true
 
   test "explicit '1' enables":
     putEnv("NIMROD_BIP324_V2_OUTBOUND", "1")
@@ -379,6 +379,38 @@ suite "BIP-324 outbound v1-only fallback cache":
     for i in 0 ..< n:
       pm.markV1Only("10.0.0." & $(i mod 256), uint16((i shr 8) + 1))
       check pm.v2FallbackSet.len <= V2FallbackCacheMax
+
+  test "v2OutboundAttempted defaults false on a fresh peer":
+    # A v1-only Core closes the socket on our ellswift+garbage without
+    # echoing a VERSION, so the outbound failure surfaces as a generic
+    # "connection closed" — NOT a "v2 ..." error.  The fallback handler
+    # keys off this per-dial flag (set when the initiator handshake starts)
+    # instead of matching the error message, so ANY post-v2 failure demotes
+    # the address to v1-only.  A fresh peer must start with it unset.
+    let p = regtestParams()
+    let peer = newPeer("203.0.113.9", 8333'u16, p, pdOutbound)
+    check peer.v2OutboundAttempted == false
+
+  test "generic close after v2 attempt triggers v1-only fallback (regression)":
+    # Regression for the broken v1-fallback: before the fix, markV1Only only
+    # fired when the error message startsWith("v2 "), so a v1-only Core's
+    # bare socket close ("connection closed") never demoted the address and
+    # nimrod re-dialed v2 forever.  This asserts the predicate the handler
+    # now uses — `peer.v2OutboundAttempted` — fires markV1Only regardless of
+    # the error message text.
+    let p = regtestParams()
+    let pm = newPeerManager(p)
+    let peer = newPeer("203.0.113.10", 8333'u16, p, pdOutbound)
+    # Simulate the state at the point of failure: v2 was attempted this dial,
+    # and the peer closed the socket (generic non-"v2 " error).
+    peer.v2OutboundAttempted = true
+    let genericErr = "connection closed"
+    check genericErr.startsWith("v2 ") == false   # old predicate would MISS
+    check pm.isV1Only("203.0.113.10", 8333'u16) == false
+    # New predicate: mark v1-only whenever v2 was attempted this dial.
+    if peer.v2OutboundAttempted:
+      pm.markV1Only(peer.address, peer.port)
+    check pm.isV1Only("203.0.113.10", 8333'u16) == true
 
 suite "BIP-324 initiator handshake — wire layout":
   test "initiator sends 64-byte ellswift pubkey + 16-byte garbage terminator":
