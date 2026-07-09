@@ -849,15 +849,23 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
 
       return true
     except CatchableError as e:
-      # BIP-324 fallback bookkeeping: if the failure is in the v2 outbound
-      # path, mark the address v1-only so the next reconnect (driven by
-      # `mainLoop`'s ReconnectInterval) skips the v2 probe and goes
-      # straight to v1.  We can't retry inline because the v2 garbage on
-      # the wire is destructive on a v1 peer — the socket is poisoned.
-      # We detect by error-message prefix; the v2 paths in peer.nim raise
-      # PeerError with "v2 ..." messages, never anything ambiguous with
-      # v1.  Mirrors clearbit's `markV1Only` call (peer.zig:1899).
-      if e.msg.startsWith("v2 ") and bip324V2OutboundEnabled():
+      # BIP-324 fallback bookkeeping: if a v2 outbound handshake was attempted
+      # on THIS dial, mark the address v1-only so the next reconnect (driven
+      # by `mainLoop`'s ReconnectInterval) skips the v2 probe and goes straight
+      # to v1.  We can't retry inline because the v2 garbage on the wire is
+      # destructive on a v1 peer — the socket is poisoned.
+      #
+      # A real v1-only Core cannot parse our ellswift+garbage and simply
+      # CLOSES the socket without replying with a v1 VERSION header, so the
+      # failure surfaces as a generic "connection closed" (peer.nim
+      # fillRecvBuffer) or a timeout — NOT a "v2 ..." error.  Keying off the
+      # per-dial `v2OutboundAttempted` flag (set the instant the initiator
+      # handshake starts) covers every such case; the old "v2 " prefix match
+      # only caught peers that politely echoed a VERSION, which Core does not
+      # do on unparseable data.  Mirrors clearbit's `markV1Only`
+      # (peer.zig:1899).  markV1Only is bounded (V2FallbackCacheMax) so a
+      # transient v2 failure to a v2-capable peer only costs one v1 dial.
+      if peer.v2OutboundAttempted and bip324V2OutboundEnabled():
         debug "BIP-324 v2 outbound failed, marking v1-only",
               peer = $peer, error = e.msg
         pm.markV1Only(address, port)

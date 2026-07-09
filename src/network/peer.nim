@@ -89,6 +89,14 @@ type
     # this when the address is in the v1-only fallback set, so we don't
     # waste a connection retrying v2 on a known v1-only peer.
     v2OutboundDisabled*: bool
+    # BIP-324 outbound fallback bookkeeping: set true the moment the v2
+    # initiator handshake starts on THIS dial.  A real v1-only Core cannot
+    # parse our ellswift+garbage and simply closes the socket (it does NOT
+    # reply with a v1 VERSION header), so the failure surfaces as a generic
+    # "connection closed"/timeout rather than a "v2 ..." error.  PeerManager
+    # keys its markV1Only fallback off this flag so ANY post-v2 handshake
+    # failure demotes the address to v1 for the next dial.
+    v2OutboundAttempted*: bool
     # Peer info from version message
     version*: uint32
     services*: uint64
@@ -1120,6 +1128,12 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     # peermanager hasn't flagged this address v1-only.
     if peer.transportProto == tpV1 and not peer.v2OutboundDisabled and
        bip324V2OutboundEnabled():
+      # Record that v2 was attempted on THIS dial BEFORE any bytes hit the
+      # wire.  From here on, ANY handshake failure (v1-only peer closing the
+      # socket, timeout, decrypt error) must demote the address to v1-only so
+      # the next dial skips v2 — the ellswift+garbage we are about to send is
+      # destructive on a v1 peer and cannot be reused on this socket.
+      peer.v2OutboundAttempted = true
       let v2Fut = peer.performV2HandshakeInitiator()
       if not await v2Fut.withTimeout(ctimer.seconds(V2HandshakeTimeoutSec)):
         # Cancel the inflight handshake before raising so chronos doesn't
