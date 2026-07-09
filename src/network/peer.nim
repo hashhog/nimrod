@@ -871,17 +871,18 @@ proc performV2HandshakeResponder*(peer: Peer) {.async.} =
   info "BIP-324 v2 handshake complete (responder)", peer = $peer
 
 proc bip324V2OutboundEnabled*(): bool =
-  ## Gate for the BIP-324 v2 outbound probe.  Default OFF — opt-in via
-  ## `NIMROD_BIP324_V2_OUTBOUND=1` (or "true").  Anything else (unset,
-  ## "0", "false") keeps outbound v1-only, matching the pre-W90 behaviour.
-  ## We're conservative on outbound because (a) sending v2 garbage on a
-  ## fresh socket is destructive on a v1-only peer (we can't reuse the
-  ## socket on fallback), and (b) cross-impl interop has only been
-  ## verified for the inbound responder side so far.  Mirrors clearbit's
-  ## CLEARBIT_BIP324_V2 env var (peer.zig:653) but DEFAULTS OFF.
+  ## Gate for the BIP-324 v2 outbound probe.  Default ON — opt-OUT via
+  ## `NIMROD_BIP324_V2_OUTBOUND=0` (or "false"/"no"/"off").  Unset or any
+  ## truthy value initiates v2 on outbound dials, matching the inbound
+  ## responder side, Bitcoin Core (`-v2transport` default-on since v26),
+  ## and the rest of the fleet.  The prior default-OFF posture left nimrod
+  ## responding to v2 but never initiating it, which diverged from Core.
+  ## On a v1-only peer the outbound v2 probe falls back to v1 (the socket
+  ## is re-dialed for v1), so default-on is safe for interop.  Mirrors
+  ## clearbit's CLEARBIT_BIP324_V2 env var (peer.zig:653).
   let v = getEnv("NIMROD_BIP324_V2_OUTBOUND", "")
   if v.len == 0:
-    return false
+    return true
   let lv = v.toLowerAscii()
   lv == "1" or lv == "true" or lv == "yes" or lv == "on"
 
