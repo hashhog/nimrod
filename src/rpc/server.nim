@@ -375,6 +375,21 @@ proc buildDeployments*(rpc: RpcServer, targetHash: BlockHash, targetHeight: int3
   result["testdummy"] = bip9Deployment(testdummy, 0)
   result["taproot"]   = bip9Deployment(taproot,   1)
 
+proc dirBytes(path: string): uint64 =
+  ## Sum of regular-file sizes under `path` (recursive). Best-effort: any
+  ## walk/stat error is skipped so a transient FS hiccup can never fault the
+  ## RPC. Used to report size_on_disk from the actual on-disk chainstate/block
+  ## bytes for the RocksDB-backed store (Core's CalculateCurrentUsage analog).
+  if path.len == 0 or not dirExists(path):
+    return 0
+  var total: uint64 = 0
+  try:
+    for fpath in walkDirRec(path, yieldFilter = {pcFile, pcLinkToFile}):
+      try: total += uint64(getFileSize(fpath))
+      except CatchableError, OSError: discard
+  except CatchableError, OSError: discard
+  total
+
 # Blockchain RPCs
 proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   ## Return an object containing various state info regarding blockchain processing
@@ -428,6 +443,16 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
     sizeOnDisk = rpc.blockFileManager.calculateCurrentUsage()
     if pruned:
       pruneHeight = rpc.blockFileManager.getPruneHeight()
+
+  # size_on_disk fallback for the RocksDB-backed block/chainstate store.
+  # In archive mode the flat-file BlockFileManager tracks no blk*.dat/rev*.dat
+  # (block bodies live in the chainstate RocksDB), so calculateCurrentUsage
+  # returns 0 and getblockchaininfo reported size_on_disk:0 — a completeness
+  # stub vs Core, which reports the real on-disk block bytes. Populate it from
+  # the actual bytes of the chainstate directory (Core's CalculateCurrentUsage
+  # analog for this storage layout). Cosmetic/reporting only; no consensus path.
+  if sizeOnDisk == 0:
+    sizeOnDisk = dirBytes(rpc.chainState.storageDir())
 
   # bits: big-endian %08x of the compact nBits field (Core strprintf("%08x")),
   # matching getblockheader. The old little-endian cast emitted e.g. "ffff7f20"

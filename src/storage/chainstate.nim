@@ -787,6 +787,13 @@ const
   ## while leaving the default-flag path on this exact value.
   IbdMaxCacheEntries* = 200_000
 
+proc storageDir*(cs: ChainState): string =
+  ## Filesystem directory backing the chainstate/block RocksDB (the dbPath
+  ## passed to newChainState). Read-only; used by getblockchaininfo to report
+  ## size_on_disk from the actual on-disk bytes. Empty string if unavailable.
+  if cs != nil and cs.db != nil and cs.db.db != nil: cs.db.db.storagePath()
+  else: ""
+
 proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
   ## Create a new ChainState with given path and consensus params
   let cdb = openChainDb(dbPath)
