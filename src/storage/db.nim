@@ -385,6 +385,12 @@ proc openDatabase*(path: string, config: DatabaseConfig = defaultDbConfig()): Da
     if cfOpts[cf] != result.dbOpts:
       rocksdb_options_destroy(cfOpts[cf])
 
+proc storagePath*(db: Database): string =
+  ## Filesystem directory backing this RocksDB instance (the path passed to
+  ## openDatabase). Read-only accessor used by getblockchaininfo to report
+  ## size_on_disk from the actual on-disk chainstate/block bytes.
+  if db == nil: "" else: db.path
+
 proc closeUnsafe*(db: Database) =
   ## Close only the RocksDB handle without destroying options/cache/filter.
   ## Used in crash-simulation tests where we want to abandon the DB abruptly.

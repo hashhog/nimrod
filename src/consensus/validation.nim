@@ -1954,10 +1954,18 @@ proc checkBlockHeader*(
   if not hashMeetsTarget(BlockHash(hash), header.bits):
     return voidErr(veExceedsTarget)
 
-  # Check timestamp not too far in future
+  # Check timestamp not too far in future.
+  # Core CheckBlockHeader / AcceptBlockHeader reject a header whose time exceeds
+  # now + MAX_FUTURE_BLOCK_TIME with state token "time-too-new" (validation.cpp:
+  # 4108), NOT "time-too-old" (which is the MTP gate at 4092). Emitting
+  # veTimeTooNew here matches Core's BIP-22 reject token; the decision is
+  # unchanged (a future-timestamp block was, and still is, rejected). This is
+  # the same token validateBlockHeader already returns for the identical gate;
+  # checkBlockHeader (the context-free CheckBlock header pre-pass) previously
+  # mislabeled it, so submitblock reported time-too-old for a future block.
   let now = getTime().toUnix().uint32
   if header.timestamp > now + uint32(MaxFutureBlockTime):
-    return voidErr(veBadTimestamp)
+    return voidErr(veTimeTooNew)
 
   ok()
 
