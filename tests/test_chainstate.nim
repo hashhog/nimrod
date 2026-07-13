@@ -1617,6 +1617,10 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
                  {.gcsafe, raises: [].} = (ok: true, err: "")
   proc okVerify(b: Block, height: int32): tuple[ok: bool, err: string]
                {.gcsafe, raises: [].} = (ok: true, err: "")
+  # ConnectBlock-consensus stub (BIP-68 + BIP-30): pass, so the outcome stays
+  # decided by the work comparison + fork-point walk.
+  proc okConnectChecks(b: Block, height: int32): tuple[ok: bool, err: string]
+               {.gcsafe, raises: [].} = (ok: true, err: "")
 
   test "heavier fork below tip REORGS the active chain":
     var cs = newChainState(TestDbPath, regtestParams())
@@ -1643,18 +1647,18 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
     # 1B and 2B are at/below the active work -> stored as side branches.
     var dtx: seq[Transaction]
     var conn: seq[Block]
-    let r1 = cs.acceptSideBranchBlock(block1B, okValidate, okVerify, dtx, conn)
+    let r1 = cs.acceptSideBranchBlock(block1B, okValidate, okVerify, okConnectChecks, dtx, conn)
     check r1.outcome == sboSideBranch
     check r1.token == "inconclusive"
     check cs.bestHeight == 2            # tip unchanged
     check conn.len == 0
 
-    let r2 = cs.acceptSideBranchBlock(block2B, okValidate, okVerify, dtx, conn)
+    let r2 = cs.acceptSideBranchBlock(block2B, okValidate, okVerify, okConnectChecks, dtx, conn)
     check r2.outcome == sboSideBranch
     check cs.bestHeight == 2
 
     # 3B makes the fork strictly heavier -> REORG.
-    let r3 = cs.acceptSideBranchBlock(block3B, okValidate, okVerify, dtx, conn)
+    let r3 = cs.acceptSideBranchBlock(block3B, okValidate, okVerify, okConnectChecks, dtx, conn)
     check r3.outcome == sboReorged
     check r3.token == ""
     check cs.bestHeight == 3
@@ -1669,8 +1673,10 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
     check cs.getUtxo(OutPoint(txid: coinbase2A, vout: 0)).isNone
     check cs.getUtxo(OutPoint(txid: block3B.txs[0].txid(), vout: 0)).isSome
 
-    # reorgVerifyHook must be cleared after the reorg (try/finally invariant).
+    # reorgVerifyHook + reorgConnectChecksHook must be cleared after the reorg
+    # (try/finally invariant).
     check cs.reorgVerifyHook == nil
+    check cs.reorgConnectChecksHook == nil
     cs.close()
 
   test "equal/lighter fork is stored as a side branch, NOT reorged":
@@ -1692,8 +1698,8 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
 
     var dtx: seq[Transaction]
     var conn: seq[Block]
-    discard cs.acceptSideBranchBlock(block1B, okValidate, okVerify, dtx, conn)
-    let r2 = cs.acceptSideBranchBlock(block2B, okValidate, okVerify, dtx, conn)
+    discard cs.acceptSideBranchBlock(block1B, okValidate, okVerify, okConnectChecks, dtx, conn)
+    let r2 = cs.acceptSideBranchBlock(block2B, okValidate, okVerify, okConnectChecks, dtx, conn)
     check r2.outcome == sboSideBranch
     check r2.token == "inconclusive"
     # Active tip UNCHANGED; chain-A UTXO still present.
@@ -1716,7 +1722,7 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
 
     var dtx: seq[Transaction]
     var conn: seq[Block]
-    let r = cs.acceptSideBranchBlock(orphan, okValidate, okVerify, dtx, conn)
+    let r = cs.acceptSideBranchBlock(orphan, okValidate, okVerify, okConnectChecks, dtx, conn)
     check r.outcome == sboRejected
     check r.token == "rejected"
     check cs.db.getBlockIndex(getBlockHash(orphan)).isNone   # not stored
@@ -1737,7 +1743,7 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
 
     var dtx: seq[Transaction]
     var conn: seq[Block]
-    let r = cs.acceptSideBranchBlock(block1B, failValidate, okVerify, dtx, conn)
+    let r = cs.acceptSideBranchBlock(block1B, failValidate, okVerify, okConnectChecks, dtx, conn)
     check r.outcome == sboRejected
     check r.token == "bad-txns-in-belowout"
     # Validation failed BEFORE the store, so the body is not persisted.

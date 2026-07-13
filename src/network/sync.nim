@@ -1985,14 +1985,34 @@ proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
     if res.isOk: (ok: true, err: "")
     else: (ok: false, err: bip22String(res.error))
 
+  # Per-promoted-block ConnectBlock-consensus hook — re-runs the BIP-68
+  # sequence-lock + BIP-30 checks validateForStorage deferred, against the same
+  # fork-point UTXO view handleReorg rebuilds. Fired unconditionally (assume-valid
+  # gates only scripts). Closes nimrod#4 on the P2P body path too.
+  let reorgConnectChecksFn = proc(b: Block, height: int32): tuple[ok: bool, err: string]
+                                  {.gcsafe, raises: [].} =
+    let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+      try: csCapture.getUtxo(op)
+      except: none(UtxoEntry)
+    var res: ValidationResult[void]
+    try:
+      {.gcsafe.}:
+        res = reorgConnectChecks(b, height, utxoLookup, csCapture.db, reorgParams)
+    except CatchableError as e:
+      return (ok: false, err: e.msg)
+    except Exception as e:
+      return (ok: false, err: e.msg)
+    if res.isOk: (ok: true, err: "")
+    else: (ok: false, err: bip22String(res.error))
+
   var disconnectedTxs: seq[Transaction] = @[]
   var connectedBlocks: seq[Block] = @[]
   var sideResult: tuple[outcome: SideBranchOutcome, token: string]
   try:
     {.gcsafe.}:
       sideResult = acceptSideBranchBlock(sm.chainState, blk, validateForSide,
-                                         reorgVerify, disconnectedTxs,
-                                         connectedBlocks)
+                                         reorgVerify, reorgConnectChecksFn,
+                                         disconnectedTxs, connectedBlocks)
   except CatchableError as e:
     warn "side-branch block processing failed", hash = $hash, error = e.msg
     return false
