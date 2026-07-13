@@ -6099,11 +6099,34 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         if res.isOk: (ok: true, err: "")
         else: (ok: false, err: bip22String(res.error))
 
+      # Per-promoted-block ConnectBlock-consensus hook — re-runs the BIP-68
+      # sequence-lock + BIP-30 checks that validateForStorage deferred, against
+      # the same fork-point UTXO view (`csCapture.getUtxo`) handleReorg rebuilds.
+      # Fired unconditionally by handleReorg (assume-valid gates only scripts).
+      # Closes nimrod#4: a heavier side branch with a v2 tx whose BIP-68 relative
+      # timelock is unmet was previously promoted where Core rejects
+      # "bad-txns-nonfinal".
+      let reorgConnectChecksFn = proc(b: Block, height: int32): tuple[ok: bool, err: string]
+                                      {.gcsafe, raises: [].} =
+        let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+          try: csCapture.getUtxo(op)
+          except: none(UtxoEntry)
+        var res: ValidationResult[void]
+        try:
+          {.gcsafe.}:
+            res = reorgConnectChecks(b, height, utxoLookup, csCapture.db, reorgParams)
+        except CatchableError as e:
+          return (ok: false, err: e.msg)
+        except Exception as e:
+          return (ok: false, err: e.msg)
+        if res.isOk: (ok: true, err: "")
+        else: (ok: false, err: bip22String(res.error))
+
       var disconnectedTxs: seq[Transaction] = @[]
       var newChainBlocks: seq[Block] = @[]
       let sideResult = acceptSideBranchBlock(cs, blk, validateForSide,
-                                             reorgVerify, disconnectedTxs,
-                                             newChainBlocks)
+                                             reorgVerify, reorgConnectChecksFn,
+                                             disconnectedTxs, newChainBlocks)
 
       # Map the outcome to byte-identical BIP-22 tokens:
       #   sboRejected  -> the carried token ("rejected" or bip22String(error))

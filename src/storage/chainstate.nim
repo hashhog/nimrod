@@ -240,6 +240,34 @@ type
     # forward reference to a generic variant type as a proc return type here).
     reorgVerifyHook*: proc(blk: Block, height: int32): tuple[ok: bool, err: string]
                           {.gcsafe, raises: [].}
+    # Optional per-block ConnectBlock-checks hook fired by `handleReorg` while
+    # connecting each promoted side-branch block, BEFORE that block's UTXO
+    # mutation is staged and independent of the assume-valid script skip. Runs
+    # the two ConnectBlock consensus checks nimrod's side-branch STORE path
+    # defers and the reorg loop did NOT already inline (nimrod#4):
+    #   * BIP-68 relative sequence locks (Core validation.cpp:2557 ->
+    #     "bad-txns-nonfinal"), and
+    #   * BIP-30 duplicate-unspent-coinbase scan (validation.cpp:2467 ->
+    #     "bad-txns-BIP30").
+    # Bitcoin Core runs the SAME ConnectBlock on a reorg-connected block as on a
+    # tip-extend (ActivateBestChainStep -> ConnectTip -> ConnectBlock, no
+    # reorg-specific skip); the tip-extend path enforces these via
+    # validateBlock(skipConnectChecks=false) + acceptBlock-step-3, but the
+    # side-branch store path runs skipConnectChecks=true and defers them, so
+    # without this hook a strictly-heavier side branch carrying a v2 tx with an
+    # UNMET BIP-68 relative timelock (or a BIP-30 dup coinbase) was promoted onto
+    # the active chain where Core rejects it — a chain-split-class false-accept.
+    #
+    # Unlike reorgVerifyHook this is fired UNCONDITIONALLY (assume-valid gates
+    # only script verification, never BIP-68/BIP-30 — matching Core). Returning
+    # (ok: false) aborts the reorg and leaves the original tip intact.
+    # Indirected through a callback for the same import-cycle reason as
+    # reorgVerifyHook (chainstate cannot import consensus/validation). Wired by
+    # the layer that owns the ChainState + params (rpc/server.nim, network/sync.nim
+    # via acceptSideBranchBlock). When nil (tests, or before wiring) the loop
+    # behaves as before — but the production reorg path MUST wire it.
+    reorgConnectChecksHook*: proc(blk: Block, height: int32): tuple[ok: bool, err: string]
+                          {.gcsafe, raises: [].}
     # Optional tip-advance hook fired AFTER the active-chain tip pointer is
     # durably advanced — on post-IBD connect (`connectBlock`), IBD connect
     # (`connectBlockIBD`), and reorg (`handleReorg`, which atomically advances
@@ -2552,6 +2580,29 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     # the hook stays a pure "verify scripts for this block" callback (so
     # server.nim's wiring needs no assume-valid plumbing).
     #
+    # ---- ConnectBlock consensus checks (BIP-68 seqlocks + BIP-30) ----
+    # Core runs these in ConnectBlock for EVERY connected block, reorg-promoted
+    # ones included (ActivateBestChainStep -> ConnectTip -> ConnectBlock; no
+    # reorg-specific skip). nimrod's side-branch STORE path deferred them
+    # (validateForStorage skipConnectChecks=true), and the reorg loop never
+    # re-added them — so a strictly-heavier branch carrying a v2 tx with an
+    # UNMET BIP-68 relative timelock (Core: "bad-txns-nonfinal") or a BIP-30 dup
+    # coinbase ("bad-txns-BIP30") was promoted here where Core rejects it
+    # (nimrod#4, chain-split class). Fired at the SAME point as the script-verify
+    # hook and against the SAME live UTXO view (fork-point + already-connected
+    # earlier side-branch blocks; THIS block not yet applied), but UNCONDITIONALLY
+    # — assume-valid gates only script verification, never BIP-68/BIP-30. Run
+    # BEFORE the script hook so a multi-fault block's reject token matches Core's
+    # precedence (seqlock/BIP-30 return before the script-check queue is waited on).
+    # On failure the reorg aborts: rollbackInMemory() restores the pre-reorg state,
+    # the WriteBatch is never committed, and the original tip is left intact.
+    if cs.reorgConnectChecksHook != nil:
+      let connectRes = cs.reorgConnectChecksHook(blk, newHeight)
+      if not connectRes.ok:
+        rollbackInMemory()
+        return err(connectRes.err & ": reorg connect rejected block " &
+                   $blockHash & " at height " & $newHeight)
+
     # On the first script failure the reorg is aborted: rollbackInMemory()
     # restores the pre-reorg in-memory state, the WriteBatch is never
     # committed (defer destroy), and the original tip is left intact.
@@ -2814,6 +2865,8 @@ proc acceptSideBranchBlock*(
                  {.gcsafe, raises: [].},
     verifyHook: proc(blk: Block, height: int32): tuple[ok: bool, err: string]
                  {.gcsafe, raises: [].},
+    connectChecksHook: proc(blk: Block, height: int32): tuple[ok: bool, err: string]
+                 {.gcsafe, raises: [].},
     disconnectedTxs: var seq[Transaction],
     connectedBlocks: var seq[Block]
   ): tuple[outcome: SideBranchOutcome, token: string] =
@@ -2921,12 +2974,19 @@ proc acceptSideBranchBlock*(
   # ConnectBlock parity); validateFn deliberately skipped verifyScripts at store
   # time.  Set/clear in try/finally so it can never leak into a later,
   # unrelated handleReorg call with a stale captured crypto/params.
+  # connectChecksHook re-runs the deferred ConnectBlock consensus checks (BIP-68
+  # sequence locks + BIP-30) on each promoted block, fired unconditionally
+  # (assume-valid gates only scripts). Set/clear alongside reorgVerifyHook in the
+  # SAME try/finally so neither can leak a stale captured crypto/params/db into a
+  # later, unrelated handleReorg.
   cs.reorgVerifyHook = verifyHook
+  cs.reorgConnectChecksHook = connectChecksHook
   var reorgRes: ChainStateResult[void]
   try:
     reorgRes = cs.handleReorg(forkPoint, newChainBlocks, disconnectedTxs)
   finally:
     cs.reorgVerifyHook = nil
+    cs.reorgConnectChecksHook = nil
   if not reorgRes.isOk:
     # Storage of the side-branch block already succeeded; the reorg failure
     # leaves the original tip intact.  Surface as a side branch (same shape

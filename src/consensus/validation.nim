@@ -2199,6 +2199,97 @@ proc checkBip30*(blk: Block, height: int32, blockHash: array[32, byte],
         return voidErr(veBip30DuplicateOutput)
   ok()
 
+proc reorgConnectChecks*(
+  blk: Block,
+  height: int32,
+  utxos: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].},
+  db: ChainDb,
+  params: ConsensusParams
+): ValidationResult[void] =
+  ## The two ConnectBlock-level consensus checks that nimrod's side-branch STORE
+  ## path defers (validateForStorage runs validateBlock with skipConnectChecks=true,
+  ## and acceptBlock skips checkBip30 in the same mode) and that the reorg CONNECT
+  ## loop (storage/chainstate.handleReorg) must therefore re-run per promoted block
+  ## to match Bitcoin Core:
+  ##   ActivateBestChainStep -> ConnectTip -> ConnectBlock runs the SAME checks on
+  ##   a reorg-connected block as on a tip-extend (there is no reorg-specific skip):
+  ##     * BIP-68 relative sequence locks — validation.cpp:2540-2561, SequenceLocks(...)
+  ##       -> state.Invalid(..., "bad-txns-nonfinal", ...).
+  ##     * BIP-30 duplicate-unspent-coinbase scan — validation.cpp:2467-2472,
+  ##       view.HaveCoin(...) -> "bad-txns-BIP30".
+  ## The reorg loop already inlines the other ConnectBlock checks it needs
+  ## (missing-inputs, coinbase maturity, the bad-cb-amount ceiling, and — via the
+  ## script-verify hook — per-input script verification); these two were the gap
+  ## (nimrod#4). Assume-valid gates ONLY script verification, never BIP-68/BIP-30,
+  ## so the caller fires this unconditionally.
+  ##
+  ## `utxos` is the fork-point UTXO view rebuilt by handleReorg (cs.getUtxo, which
+  ## honours the in-flight reorgDeletedUtxos / utxoCache / DB layering), fired
+  ## BEFORE this block's own UTXO mutation is staged — exactly the view Core's
+  ## ConnectBlock sees. `db` supplies chain-context reads (parent MTP, ancestry).
+
+  # BIP-68 sequence locks. Mirrors validateBlock (skipConnectChecks=false),
+  # validation.nim:1615-1727: same activation gate (csvHeight + tx.version>=2),
+  # same prevBlockMtp / getMtpAtHeight sourcing, and the same intra-block UTXO
+  # tracking so a v2 tx spending an output created earlier in the SAME block is
+  # scored against the block's own height (Core builds prevheights from the view,
+  # where same-block coins already carry pindex->nHeight).
+  let bip68Active = height >= int32(params.csvHeight)
+  if bip68Active:
+    var prevBlockMtp: uint32 = 0
+    let parentOpt = db.getBlockIndex(blk.header.prevBlock)
+    if parentOpt.isSome and parentOpt.get().height >= 0:
+      prevBlockMtp = getMtpForBlockIndex(db, parentOpt.get())
+
+    proc getMtpAtHeight(h: int32): uint32 =
+      getMtpForHeight(db, h)
+
+    var intraBlockUtxos = initTable[string, UtxoEntry]()
+    # Seed the coinbase outputs (created at this height) so an intra-block spend
+    # of the coinbase is resolvable — identical to validateBlock's coinbase seed.
+    let coinbaseTxid = blk.txs[0].txid()
+    for vout, output in blk.txs[0].outputs:
+      let key = $array[32, byte](coinbaseTxid) & ":" & $vout
+      intraBlockUtxos[key] = UtxoEntry(output: output, height: height, isCoinbase: true)
+
+    for i in 1 ..< blk.txs.len:
+      let tx = blk.txs[i]
+      if bip68VersionActive(tx.version):
+        let seqLockResult = checkSequenceLocksForTx(
+          tx, utxos, height, prevBlockMtp, getMtpAtHeight, params, intraBlockUtxos)
+        if not seqLockResult.isOk:
+          return voidErr(seqLockResult.error)
+      # Maintain the intra-block UTXO set exactly as validateBlock does: drop
+      # this tx's spent inputs, then add its created outputs at the block height.
+      for inp in tx.inputs:
+        let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
+        intraBlockUtxos.del(key)
+      let thisTxid = tx.txid()
+      for vout, output in tx.outputs:
+        let key = $array[32, byte](thisTxid) & ":" & $vout
+        intraBlockUtxos[key] = UtxoEntry(output: output, height: height, isCoinbase: false)
+
+  # BIP-30 duplicate-coinbase scan. Mirrors acceptBlock step 3 (validation.nim:2419-2442):
+  # the SAME checkBip30 call, against the reorg fork-point view, fired before this
+  # block's outputs are staged. hasUtxo/getAncestorHashAtHeight wrapped to satisfy
+  # checkBip30's raises:[] callback signatures (belt-and-suspenders try/except).
+  let blkHeaderBytes = serialize(blk.header)
+  let blkHashArr = array[32, byte](doubleSha256(blkHeaderBytes))
+  let bip30HasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
+    try: utxos(op).isSome
+    except: false
+  let bip30AncestorHash = proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} =
+    try:
+      let hashOpt = db.getBlockHashByHeight(h)
+      if hashOpt.isSome: some(array[32, byte](hashOpt.get()))
+      else: none(array[32, byte])
+    except: none(array[32, byte])
+  let bip30Result = checkBip30(blk, height, blkHashArr, params, bip30HasUtxo, bip30AncestorHash)
+  if not bip30Result.isOk:
+    return bip30Result
+
+  ok()
+
 proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
   ## Context-free block validation (no UTXO access needed).
   ## Checks: header PoW, transaction sanity (including coinbase scriptSig 2..100
