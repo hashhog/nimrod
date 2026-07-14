@@ -617,8 +617,10 @@ proc processSubsidy(req: JsonNode): string =
 ## whose `bits` equal the block's nBits (so the non-retarget bad-diffbits gate
 ## passes for the real block) and a `timestamp` strictly below the block time
 ## (so the MTP time-too-old gate passes). The ChainDb's ibdIndexBy{Hash,Height}
-## shadow maps are populated with an 11-block synthetic prev window so
-## getMtpForHeight stays entirely inside the in-memory shadow and never
+## shadow maps are populated with a HASH-LINKED synthetic prev window so
+## getMtpForBlockIndex (the hash-linked parent walk validateBlock/
+## contextualCheckBlockHeader use since adf1ef2, NOT the old height-indexed
+## getMtpForHeight) stays entirely inside the in-memory shadow and never
 ## dereferences the nil `db` handle.
 ##
 ##   request:  {"op":"checkblock","block_hex":"<FINAL bytes>",
@@ -675,10 +677,24 @@ proc processCheckBlock(req: JsonNode): string =
   # the block's nBits (non-retarget => getNextWorkRequired returns this, so the
   # bad-diffbits gate passes). timestamp = one below the block time so the MTP
   # gate (single-window fallback) accepts.
+  # Deterministic synthetic hash per height for the hash-linked shadow window
+  # (below). The prevHeight slot reuses the block's real prevBlock so it also
+  # backs the prevIndex link; every other height is height-tagged.
+  proc synthHash(hh: int32): array[32, byte] =
+    if hh == prevHeight:
+      return array[32, byte](blk.header.prevBlock)
+    result[0] = byte(hh and 0xff)
+    result[1] = byte((hh shr 8) and 0xff)
+    result[2] = byte((hh shr 16) and 0xff)
+    result[3] = byte((hh shr 24) and 0xff)
   var prevHeader = default(BlockHeader)
   prevHeader.bits = blk.header.bits
   prevHeader.timestamp = (if blk.header.timestamp > 0'u32: blk.header.timestamp - 1'u32
                           else: 0'u32)
+  # Hash-link prevIndex to its synthetic parent so getMtpForBlockIndex's
+  # parent-hash walk resolves inside the shadow (adf1ef2 switched the MTP source
+  # from height-indexed getMtpForHeight to hash-linked getMtpForBlockIndex).
+  prevHeader.prevBlock = BlockHash(synthHash(prevHeight - 1))
   let prevIndex = chainstate.BlockIndex(
     hash: blk.header.prevBlock,
     height: prevHeight,
@@ -687,11 +703,12 @@ proc processCheckBlock(req: JsonNode): string =
   )
 
   # ChainDb via the OBJECT CTOR (no disk). db left nil; the ibd shadow maps are
-  # populated so every getMtpForHeight read stays in-memory and never touches
-  # the nil db handle. Seed an 11-block (MedianTimeSpan) synthetic window
-  # heights [prevHeight-10 .. prevHeight] with strictly-increasing timestamps
-  # all below the block time, so getMtpForHeight's 11-deep walk completes
-  # entirely inside the shadow.
+  # populated so every getMtpForBlockIndex read stays in-memory and never touches
+  # the nil db handle. Seed a HASH-LINKED synthetic window (MedianTimeSpan+2 deep)
+  # with strictly-increasing timestamps all below the block time. Each header's
+  # prevBlock points at the next-lower synthetic hash so getMtpForBlockIndex's
+  # parent-hash walk completes entirely inside the shadow; the deepest slot
+  # self-links so a walk one hop past the window still resolves in-memory.
   let db = ChainDb(
     db: nil,
     bestBlockHash: blk.header.prevBlock,
@@ -701,25 +718,21 @@ proc processCheckBlock(req: JsonNode): string =
   )
   block seedWindow:
     let baseTime = prevHeader.timestamp
-    for off in 0 ..< MedianTimeSpan:
+    let windowDepth = MedianTimeSpan + 2
+    for off in 0 ..< windowDepth:
       let h = prevHeight - int32(off)
       if h < 0: break
-      # Synthetic, internally-consistent hash per height (height-tagged); the
-      # height = prevHeight slot reuses the real prevBlock hash so it also
-      # backs the prevIndex link if anything reads it back.
-      var hArr: array[32, byte]
-      if off == 0:
-        hArr = array[32, byte](blk.header.prevBlock)
-      else:
-        hArr[0] = byte(h and 0xff)
-        hArr[1] = byte((h shr 8) and 0xff)
-        hArr[2] = byte((h shr 16) and 0xff)
-        hArr[3] = byte((h shr 24) and 0xff)
-      let bh = BlockHash(hArr)
+      let bh = BlockHash(synthHash(h))
       var wh = default(BlockHeader)
       wh.bits = blk.header.bits
       # Earlier heights get earlier timestamps so MTP < block time.
       wh.timestamp = if baseTime >= uint32(off): baseTime - uint32(off) else: 0'u32
+      # Hash-link to the synthetic parent so getMtpForBlockIndex stays in-shadow;
+      # deepest slot self-links so an extra hop never derefs the nil db handle.
+      if off == windowDepth - 1 or h - 1 < 0:
+        wh.prevBlock = bh
+      else:
+        wh.prevBlock = BlockHash(synthHash(h - 1))
       db.ibdIndexByHash[bh] = chainstate.BlockIndex(hash: bh, height: h, header: wh)
       db.ibdIndexByHeight[h] = bh
 
@@ -983,9 +996,21 @@ proc revalidateConnectBlock(blk: Block, spendHeight: int32,
   # window block is spaced one second lower so MTP stays below the block time.
   let gap = uint32(2 * params.powTargetSpacing + 1)
   let baseTime = if blk.header.timestamp > gap: blk.header.timestamp - gap else: 0'u32
+  # Deterministic synthetic hash per height for the hash-linked shadow window
+  # (below); prevHeight slot reuses the block's real prevBlock, others height-tagged.
+  proc synthHash(ht: int32): array[32, byte] =
+    if ht == prevHeight:
+      return array[32, byte](blk.header.prevBlock)
+    result[0] = byte(ht and 0xff)
+    result[1] = byte((ht shr 8) and 0xff)
+    result[2] = byte((ht shr 16) and 0xff)
+    result[3] = byte((ht shr 24) and 0xff)
   var prevHeader = default(BlockHeader)
   prevHeader.bits = blk.header.bits
   prevHeader.timestamp = baseTime
+  # Hash-link prevIndex to its synthetic parent so getMtpForBlockIndex's
+  # parent-hash walk resolves inside the shadow (adf1ef2: hash-linked MTP walk).
+  prevHeader.prevBlock = BlockHash(synthHash(prevHeight - 1))
   let prevIndex = chainstate.BlockIndex(
     hash: blk.header.prevBlock,
     height: prevHeight,
@@ -1000,21 +1025,20 @@ proc revalidateConnectBlock(blk: Block, spendHeight: int32,
     ibdIndexByHeight: initTable[int32, BlockHash]()
   )
   block seedWindow:
-    for off in 0 ..< MedianTimeSpan:
+    let windowDepth = MedianTimeSpan + 2
+    for off in 0 ..< windowDepth:
       let hh = prevHeight - int32(off)
       if hh < 0: break
-      var hArr: array[32, byte]
-      if off == 0:
-        hArr = array[32, byte](blk.header.prevBlock)
-      else:
-        hArr[0] = byte(hh and 0xff)
-        hArr[1] = byte((hh shr 8) and 0xff)
-        hArr[2] = byte((hh shr 16) and 0xff)
-        hArr[3] = byte((hh shr 24) and 0xff)
-      let bh = BlockHash(hArr)
+      let bh = BlockHash(synthHash(hh))
       var wh = default(BlockHeader)
       wh.bits = blk.header.bits
       wh.timestamp = if baseTime >= uint32(off): baseTime - uint32(off) else: 0'u32
+      # Hash-link to the synthetic parent so getMtpForBlockIndex stays in-shadow;
+      # deepest slot self-links so an extra hop never derefs the nil db handle.
+      if off == windowDepth - 1 or hh - 1 < 0:
+        wh.prevBlock = bh
+      else:
+        wh.prevBlock = BlockHash(synthHash(hh - 1))
       db.ibdIndexByHash[bh] = chainstate.BlockIndex(hash: bh, height: hh, header: wh)
       db.ibdIndexByHeight[hh] = bh
 
