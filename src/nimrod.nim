@@ -963,6 +963,15 @@ proc getConsensusParams*(config: NimrodConfig): ConsensusParams =
     result.assumeValidHeight = 0
     result.assumeValidBlockHash = BlockHash(default(array[32, byte]))
 
+  # HASHHOG_CAMPAIGN_ASSUMEUTXO=<abs-path.json>: read ONCE here, immediately
+  # after network-params selection, so both `getConsensusParams` callers
+  # (runBlockImport's CLI path and startNode's daemon path) and everything
+  # downstream that reads `params.assumeutxoData` (RPC loadtxoutset /
+  # dumptxoutset, the `--load-snapshot` CLI flag, the prune floor) see the
+  # merged allowlist uniformly. Unset => single getEnv, bit-identical.
+  # See receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md.
+  loadCampaignAssumeutxo(result)
+
 proc findLocatorFork(state: NodeState,
                      locatorHashes: seq[array[32, byte]]): int32 =
   ## Find the height of the latest block from `locatorHashes` that is in our
