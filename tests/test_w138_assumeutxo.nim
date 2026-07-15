@@ -365,9 +365,20 @@ suite "W138 G19 — per-network assumeutxoData (BUG-8)":
     let s = signetParams()
     check s.assumeutxoData.len == 0
 
-  test "G19 BUG-8c: regtest assumeutxoData seq is EMPTY (Core has 3)":
+  test "G19 PRESENT: regtest has all 3 Core entries":
+    ## Porter wave (regtest Core-parity assumeutxo, HASHHOG_CAMPAIGN_ASSUMEUTXO)
+    ## closed BUG-8c: regtestParams() now carries Core's 3 verbatim entries
+    ## (heights 110/200/299, kernel/chainparams.cpp CRegTestParams). Flipped
+    ## per the W138 xfail-regression-guard methodology (module docstring).
     let r = regtestParams()
-    check r.assumeutxoData.len == 0
+    check r.assumeutxoData.len == CORE_REGTEST_ASSUMEUTXO_COUNT
+    let heights = block:
+      var hs: seq[int] = @[]
+      for d in r.assumeutxoData:
+        hs.add(int(d.height))
+      hs
+    for h in CORE_REGTEST_ASSUMEUTXO_HEIGHTS:
+      check h in heights
 
   test "G19 testnet3 OK: empty (Core also empty)":
     let t3 = testnet3Params()

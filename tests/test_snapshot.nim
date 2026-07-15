@@ -728,8 +728,74 @@ suite "assumeutxo data":
   test "non-mainnet networks have empty assumeutxo data":
     check testnet3Params().assumeutxoData.len == 0
     check testnet4Params().assumeutxoData.len == 0
-    check regtestParams().assumeutxoData.len == 0
     check signetParams().assumeutxoData.len == 0
+
+  test "regtest carries Core's 3 Core-parity assumeutxo entries (110/200/299)":
+    ## Porter wave: regtestParams() now mirrors Core's CRegTestParams
+    ## m_assumeutxo_data verbatim (kernel/chainparams.cpp) — no longer empty.
+    ## See tests/test_w138_assumeutxo.nim "G19 PRESENT: regtest has all 3
+    ## Core entries" for the byte-for-byte hash/height assertions.
+    check regtestParams().assumeutxoData.len == 3
+
+# ----------------------------------------------------------------------------
+# HASHHOG_CAMPAIGN_ASSUMEUTXO — M2 boundary campaign flag
+# receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md
+# ----------------------------------------------------------------------------
+
+suite "loadCampaignAssumeutxo":
+  const campaignEnvVar = "HASHHOG_CAMPAIGN_ASSUMEUTXO"
+
+  setup:
+    delEnv(campaignEnvVar)  # never let a leftover value leak between tests
+
+  teardown:
+    delEnv(campaignEnvVar)
+
+  test "unset env var: bit-identical no-op":
+    var p = regtestParams()
+    let before = p.assumeutxoData
+    loadCampaignAssumeutxo(p)
+    check p.assumeutxoData == before
+
+  test "set env var: campaign entry is appended and resolvable":
+    let testDir = getTempDir() / "nimrod_campaign_assumeutxo_ok"
+    createDir(testDir)
+    defer: (try: removeDir(testDir) except OSError: discard)
+    let campaignPath = testDir / "campaign.json"
+    # A regtest height clear of the 3 built-in Core-parity entries
+    # (110/200/299) — mirrors the shared fixture format in
+    # tools/campaign-assumeutxo/*.json, display-order hex.
+    let blockhashHex = "11".repeat(32)          # 64 hex chars
+    let hashSerializedHex = "22".repeat(32)      # 64 hex chars
+    writeFile(campaignPath, "[{\"height\": 500, \"blockhash\": \"" &
+      blockhashHex & "\", \"hash_serialized\": \"" & hashSerializedHex &
+      "\", \"m_chain_tx_count\": 501}]")
+
+    putEnv(campaignEnvVar, campaignPath)
+    var p = regtestParams()
+    let builtinCount = p.assumeutxoData.len
+    loadCampaignAssumeutxo(p)
+
+    check p.assumeutxoData.len == builtinCount + 1
+    let added = p.assumeutxoData[^1]
+    check added.height == 500'i32
+    check added.chainTxCount == 501'u64
+    # All 32 bytes are 0x11 / 0x22 respectively, so display-order vs.
+    # internal (reversed) byte order is indistinguishable here — a uniform
+    # byte value round-trips through hexToBytes32's reversal unchanged.
+    var expectedBlockhash: array[32, byte]
+    for i in 0 ..< 32: expectedBlockhash[i] = 0x11'u8
+    var expectedHashSerialized: array[32, byte]
+    for i in 0 ..< 32: expectedHashSerialized[i] = 0x22'u8
+    check added.blockhash == BlockHash(expectedBlockhash)
+    check added.hashSerialized == expectedHashSerialized
+
+  test "empty env var: treated as unset":
+    putEnv(campaignEnvVar, "")
+    var p = regtestParams()
+    let before = p.assumeutxoData
+    loadCampaignAssumeutxo(p)
+    check p.assumeutxoData == before
 
 # ----------------------------------------------------------------------------
 # enum sanity, chainstate wrapper, background validation struct

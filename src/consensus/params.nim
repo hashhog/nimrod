@@ -2,7 +2,7 @@
 ## Network-specific constants for mainnet, testnet, regtest
 
 import ../primitives/types
-import std/strutils
+import std/[strutils, os, json]
 
 type
   Network* = enum
@@ -521,8 +521,47 @@ proc regtestParams*(): ConsensusParams =
   result.minimumChainWork = default(array[32, byte])  # No minimum work requirement
   result.assumeValidBlockHash = BlockHash(default(array[32, byte]))  # No assume-valid
   result.checkpoints = @[]  # No checkpoints for regtest
-  # No assumeUTXO snapshots for regtest (testing can create custom ones)
-  result.assumeutxoData = @[]
+  # assumeUTXO snapshot data — Core-parity regtest entries, verbatim from
+  # bitcoin-core/src/kernel/chainparams.cpp::CRegTestParams::m_assumeutxo_data.
+  # REGTEST ONLY — never widen mainnet/testnet4 tables with these. Unblocks
+  # tools/boot-smoke.sh (the height-299 fixture matches feature_assumeutxo.py's
+  # entry) and any unit/fuzz tooling built against the 110/200 entries.
+  result.assumeutxoData = @[
+    AssumeutxoData(
+      # For use by unit tests
+      height: 110'i32,
+      hashSerialized: hexToBytes32(
+        "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"
+      ),
+      chainTxCount: 111'u64,
+      blockhash: BlockHash(hexToBytes32(
+        "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"
+      ))
+    ),
+    AssumeutxoData(
+      # For use by fuzz target src/test/fuzz/utxo_snapshot.cpp
+      height: 200'i32,
+      hashSerialized: hexToBytes32(
+        "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a"
+      ),
+      chainTxCount: 201'u64,
+      blockhash: BlockHash(hexToBytes32(
+        "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9"
+      ))
+    ),
+    AssumeutxoData(
+      # For use by test/functional/feature_assumeutxo.py and
+      # test/functional/tool_bitcoin_chainstate.py
+      height: 299'i32,
+      hashSerialized: hexToBytes32(
+        "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"
+      ),
+      chainTxCount: 334'u64,
+      blockhash: BlockHash(hexToBytes32(
+        "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2"
+      ))
+    )
+  ]
   # Legacy aliases
   result.p2pPort = 18444
   result.rpcPort = 18443
@@ -534,6 +573,116 @@ proc getParams*(network: Network): ConsensusParams =
   of Testnet4: testnet4Params()
   of Regtest: regtestParams()
   of Signet: signetParams()
+
+const CampaignAssumeutxoEnvVar = "HASHHOG_CAMPAIGN_ASSUMEUTXO"
+
+proc campaignAssumeutxoFatal(path, msg: string) {.noreturn.} =
+  ## A malformed/colliding campaign file is a startup-fatal condition
+  ## (campaign data may never silently be dropped or override a production
+  ## entry). Mirrors the existing `echo ...; quit(1)` config-error pattern
+  ## used elsewhere in nimrod's startup path (see getConsensusParams).
+  echo "[CAMPAIGN-ASSUMEUTXO] " & path & ": " & msg
+  quit(1)
+
+proc loadCampaignAssumeutxo*(params: var ConsensusParams) =
+  ## `HASHHOG_CAMPAIGN_ASSUMEUTXO=<abs-path.json>` — read ONCE at startup,
+  ## after network-params selection. When set, parses the file and appends
+  ## its entries to the *running network's* assumeutxo allowlist
+  ## (`params.assumeutxoData`), which every lookup site in nimrod reads from
+  ## (RPC loadtxoutset/dumptxoutset, the `--load-snapshot` CLI path, and the
+  ## prune floor) — so merging here is a single chokepoint covering all of
+  ## them. Unset/empty => bit-identical to today: the only code executed is
+  ## a single `getEnv` call returning "".
+  ##
+  ## Fixture format (tools/campaign-assumeutxo/*.json), hex in Core DISPLAY
+  ## order exactly like the hardcoded tables above — converted with the same
+  ## `hexToBytes32` used for every other entry in this file:
+  ##   [ { "height": N, "blockhash": "...", "hash_serialized": "...",
+  ##       "m_chain_tx_count": N, ...optional extra keys ignored } ]
+  ##
+  ## On collision with a built-in (or already-loaded) entry, by height OR
+  ## blockhash: refuses to start. Campaign data may never override a
+  ## production hash. See receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md.
+  let path = getEnv(CampaignAssumeutxoEnvVar, "")
+  if path.len == 0:
+    return
+
+  let raw =
+    try:
+      readFile(path)
+    except IOError as e:
+      campaignAssumeutxoFatal(path, "failed to read: " & e.msg)
+  let root =
+    try:
+      parseJson(raw)
+    except CatchableError as e:
+      campaignAssumeutxoFatal(path, "failed to parse JSON: " & e.msg)
+
+  if root.kind != JArray:
+    campaignAssumeutxoFatal(path, "expected a top-level JSON array")
+
+  var loaded: seq[AssumeutxoData] = @[]
+  var heights: seq[string] = @[]
+
+  for entry in root.elems:
+    if entry.kind != JObject:
+      campaignAssumeutxoFatal(path, "each entry must be a JSON object")
+
+    for key in ["height", "blockhash", "hash_serialized", "m_chain_tx_count"]:
+      if not entry.hasKey(key):
+        campaignAssumeutxoFatal(path, "entry missing required key \"" & key & "\"")
+
+    let heightNode = entry["height"]
+    if heightNode.kind != JInt or heightNode.getBiggestInt() <= 0:
+      campaignAssumeutxoFatal(path, "\"height\" must be a positive integer")
+    let height = int32(heightNode.getBiggestInt())
+
+    let blockhashHex = entry["blockhash"].getStr("")
+    if blockhashHex.len != 64 or not blockhashHex.allCharsInSet(HexDigits):
+      campaignAssumeutxoFatal(path,
+        "\"blockhash\" at height " & $height & " must be 64 hex characters")
+
+    let hashSerializedHex = entry["hash_serialized"].getStr("")
+    if hashSerializedHex.len != 64 or not hashSerializedHex.allCharsInSet(HexDigits):
+      campaignAssumeutxoFatal(path,
+        "\"hash_serialized\" at height " & $height & " must be 64 hex characters")
+
+    let chainTxCountNode = entry["m_chain_tx_count"]
+    if chainTxCountNode.kind != JInt or chainTxCountNode.getBiggestInt() < 0:
+      campaignAssumeutxoFatal(path,
+        "\"m_chain_tx_count\" at height " & $height & " must be a non-negative integer")
+    let chainTxCount = uint64(chainTxCountNode.getBiggestInt())
+
+    let data = AssumeutxoData(
+      height: height,
+      hashSerialized: hexToBytes32(hashSerializedHex),
+      chainTxCount: chainTxCount,
+      blockhash: BlockHash(hexToBytes32(blockhashHex))
+    )
+
+    # Collision refusal: never let campaign data override/duplicate a
+    # built-in entry, or a different entry already merged from this same
+    # campaign file, by height OR blockhash.
+    for existing in params.assumeutxoData:
+      if existing.height == data.height or existing.blockhash == data.blockhash:
+        campaignAssumeutxoFatal(path,
+          "entry at height " & $height &
+          " collides with a built-in assumeutxo entry — refusing to start")
+    for existing in loaded:
+      if existing.height == data.height or existing.blockhash == data.blockhash:
+        campaignAssumeutxoFatal(path,
+          "duplicate entry at height " & $height & " within campaign file")
+
+    loaded.add(data)
+    heights.add($height)
+
+  params.assumeutxoData.add(loaded)
+
+  # Loud, greppable startup banner (tools/fleet-monitor.sh alerts if this
+  # ever appears in a production log — the flag must only be used for the
+  # M2 boundary campaign, never on a launcher-started production node).
+  echo "[CAMPAIGN-ASSUMEUTXO] loaded " & $loaded.len & " entries from " &
+    path & " heights=[" & heights.join(", ") & "]"
 
 proc getBlockSubsidy*(height: int, params: ConsensusParams): Satoshi =
   ## Calculate block subsidy at given height
