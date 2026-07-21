@@ -1,7 +1,7 @@
 ## HD Wallet implementation
 ## BIP-32/39/44/84/86 key derivation, transaction creation and signing
 
-import std/[tables, options, strutils, sysrand, algorithm, times]
+import std/[tables, options, strutils, sysrand, algorithm, times, math]
 import nimcrypto/[sha2, hmac, pbkdf2]
 import ../primitives/[types, serialize]
 import ../crypto/[hashing, secp256k1, address, base58]
@@ -668,7 +668,8 @@ proc derivePath(wallet: Wallet, purpose, coinType, account, chain, index: uint32
   else:
     raise newException(WalletError, "unsupported purpose: " & $purpose)
 
-  result.addressStr = encodeAddress(result.address, wallet.mainnet)
+  result.addressStr = encodeAddress(result.address, wallet.mainnet,
+                                    wallet.params.network == Regtest)
 
 proc addAccount*(wallet: var Wallet, purpose: uint32 = 84, accountIndex: uint32 = 0, gap: int = 20) =
   ## Add a new account to the wallet
@@ -834,7 +835,8 @@ proc getNewAddress*(wallet: var Wallet, addrType: AddressType = P2WPKH,
 proc getNewAddressStr*(wallet: var Wallet, addrType: AddressType = P2WPKH,
                        accountIdx: int = -1, isChange: bool = false): string =
   ## Get a new address as a string
-  encodeAddress(wallet.getNewAddress(addrType, accountIdx, isChange), wallet.mainnet)
+  encodeAddress(wallet.getNewAddress(addrType, accountIdx, isChange),
+                wallet.mainnet, wallet.params.network == Regtest)
 
 proc getNewAddressByTypeName*(wallet: var Wallet, typeName: string,
                                isChange: bool = false): string =
@@ -959,12 +961,13 @@ proc importPrivateKey*(wallet: var Wallet, privKey: PrivateKey,
     let spk = scriptPubKeyForAddress(addr0)
     # Idempotent: don't double-register a script we already own.
     if wallet.findKeyForScript(spk).isSome:
-      return encodeAddress(addr0, wallet.mainnet)
+      return encodeAddress(addr0, wallet.mainnet, wallet.params.network == Regtest)
     let dk = DerivedKey(
       extKey: extKey,
       path: "imported",
       address: addr0,
-      addressStr: encodeAddress(addr0, wallet.mainnet))
+      addressStr: encodeAddress(addr0, wallet.mainnet,
+                                wallet.params.network == Regtest))
     wallet.importedKeys.add(dk)
     dk.addressStr
 
@@ -1393,15 +1396,58 @@ proc createTransaction*(wallet: var Wallet, outputs: seq[TxOut],
   else:
     0'i32
 
-  # Select coins (skipping immature coinbase)
-  let selection = if useAdvancedCoinSelection:
+  # ---- Determine change output type (same type as the first recipient) ----
+  var changeAddrType = P2WPKH
+  if outputs.len > 0:
+    let spk = outputs[0].scriptPubKey
+    if spk.len == 22 and spk[0] == 0x00:
+      changeAddrType = P2WPKH
+    elif spk.len == 34 and spk[0] == 0x51:
+      changeAddrType = P2TR
+    elif spk.len == 25 and spk[0] == 0x76:
+      changeAddrType = P2PKH
+    elif spk.len == 23 and spk[0] == 0xa9:
+      changeAddrType = P2SH
+
+  # ---- Non-input fee (Bitcoin Core parity) ----
+  # The BnB/knapsack coin selector accounts ONLY for INPUT fees (a coin's
+  # effective value is value - input_fee). The fixed non-input cost — tx
+  # overhead (version/locktime/segwit marker + in/out counts) plus every
+  # recipient output plus the change output — has to be charged on top, or the
+  # transaction pays only feeRate * input_vsize and lands far below the
+  # requested feeRate (the fee_rate-ignored / fee-off-fixed-size class). We size
+  # the non-input portion explicitly (non-witness serialized bytes: 8-byte value
+  # + 1-byte scriptlen varint + scriptPubKey) and add feeRate * that to BOTH the
+  # coin-selection target (so enough value is reserved) AND the final fee.
+  let changeOutputVbytes =
+    case changeAddrType
+    of P2TR: 8 + 1 + 34
+    of P2PKH: 8 + 1 + 25
+    of P2SH: 8 + 1 + 23
+    else: 8 + 1 + 22    # P2WPKH / P2WSH
+  var nonInputVbytes = (TxOverheadWeight + 3) div 4
+  for o in outputs:
+    nonInputVbytes += 8 + 1 + o.scriptPubKey.len
+  nonInputVbytes += changeOutputVbytes
+  let nonInputFee = Satoshi(int64(ceil(float64(nonInputVbytes) * feeRate)))
+
+  # Select coins (skipping immature coinbase). The advanced selector's target
+  # must include the non-input fee so it reserves value for the outputs +
+  # overhead, not just the inputs. selectCoinsSimple already estimates a full-tx
+  # fee itself, so it keeps the plain target and its own (full) fee.
+  var selection: CoinSelectionResult
+  var totalFee: Satoshi
+  if useAdvancedCoinSelection:
     try:
-      selectCoinsAdvanced(wallet, totalOut, feeRate, currentHeight)
+      selection = selectCoinsAdvanced(wallet, totalOut + nonInputFee, feeRate, currentHeight)
+      totalFee = Satoshi(int64(selection.fee) + int64(nonInputFee))
     except CoinSelectionError:
       # Fall back to simple selection
-      selectCoinsSimple(wallet, totalOut, feeRate, currentHeight)
+      selection = selectCoinsSimple(wallet, totalOut, feeRate, currentHeight)
+      totalFee = selection.fee
   else:
-    selectCoinsSimple(wallet, totalOut, feeRate, currentHeight)
+    selection = selectCoinsSimple(wallet, totalOut, feeRate, currentHeight)
+    totalFee = selection.fee
 
   # Build transaction
   result.version = 2
@@ -1422,21 +1468,8 @@ proc createTransaction*(wallet: var Wallet, outputs: seq[TxOut],
     result.outputs.add(output)
 
   # Add change output if needed
-  let change = selection.totalIn - totalOut - selection.fee
+  let change = selection.totalIn - totalOut - totalFee
   if selection.needsChange and int64(change) > int64(wallet.params.dustLimit):
-    # Use same address type as first output for change
-    var changeAddrType = P2WPKH
-    if outputs.len > 0:
-      let spk = outputs[0].scriptPubKey
-      if spk.len == 22 and spk[0] == 0x00:
-        changeAddrType = P2WPKH
-      elif spk.len == 34 and spk[0] == 0x51:
-        changeAddrType = P2TR
-      elif spk.len == 25 and spk[0] == 0x76:
-        changeAddrType = P2PKH
-      elif spk.len == 23 and spk[0] == 0xa9:
-        changeAddrType = P2SH
-
     let changeAddr = wallet.getNewAddress(changeAddrType, -1, true)
     result.outputs.add(TxOut(
       value: change,

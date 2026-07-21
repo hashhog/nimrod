@@ -1231,21 +1231,27 @@ proc toString*(desc: Descriptor, includeChecksum: bool = true,
 # =============================================================================
 
 proc deriveAddresses*(desc: Descriptor, start: int = 0, count: int = 1,
-                      mainnet: bool = true): seq[string] =
+                      mainnet: bool = true, regtest: bool = false): seq[string] =
   ## Derive addresses from a descriptor
   ## For ranged descriptors, derives addresses at positions [start, start+count)
+  ##
+  ## `regtest` selects the "bcrt" bech32 HRP for segwit addresses; without it
+  ## regtest segwit addresses collapse onto the shared testnet "tb" HRP (the
+  ## deriveaddresses RPC then diverges from Core's bcrt1... output). It defaults
+  ## to false so non-regtest callers are unaffected. Base58 (P2PKH/P2SH) testnet
+  ## and regtest prefixes are identical, so this only affects the bech32 paths.
   result = @[]
 
   if desc.node.isRange():
     for i in start ..< start + count:
       let expanded = expandNode(desc.node, i)
       for addr in expanded.addresses:
-        result.add(encodeAddress(addr, mainnet))
+        result.add(encodeAddress(addr, mainnet, regtest))
   else:
     # Non-ranged descriptor - derive only at position 0
     let expanded = expandNode(desc.node, 0)
     for addr in expanded.addresses:
-      result.add(encodeAddress(addr, mainnet))
+      result.add(encodeAddress(addr, mainnet, regtest))
 
 proc deriveScripts*(desc: Descriptor, start: int = 0, count: int = 1): seq[seq[byte]] =
   ## Derive scriptPubKeys from a descriptor
