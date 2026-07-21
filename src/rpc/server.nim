@@ -9916,6 +9916,7 @@ proc handleDeriveAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
 
   # Determine network from server params
   let mainnet = rpc.params.network == Mainnet
+  let regtest = rpc.params.network == Regtest
 
   try:
     let desc = parseDescriptor(descriptorStr)
@@ -9942,7 +9943,7 @@ proc handleDeriveAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
         else:
           raise newRpcError(RpcInvalidParams, "range must be int or [start, end]")
 
-      let addresses = deriveAddresses(desc, start, count, mainnet)
+      let addresses = deriveAddresses(desc, start, count, mainnet, regtest)
       var result = newJArray()
       for addr in addresses:
         result.add(%addr)
@@ -9952,7 +9953,7 @@ proc handleDeriveAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
       if params.len >= 2:
         raise newRpcError(RpcInvalidParams, "range not allowed for non-ranged descriptor")
 
-      let addresses = deriveAddresses(desc, 0, 1, mainnet)
+      let addresses = deriveAddresses(desc, 0, 1, mainnet, regtest)
       var result = newJArray()
       for addr in addresses:
         result.add(%addr)
