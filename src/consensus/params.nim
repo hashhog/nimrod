@@ -281,6 +281,19 @@ proc mainnetParams*(): ConsensusParams =
       blockhash: BlockHash(hexToBytes32(
         "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"
       ))
+    ),
+    AssumeutxoData(
+      # Track-B WINDOWED replay: last pre-segwit block (segwit activates 481824).
+      # hashSerialized + chainTxCount from the boundary-snapshot result JSON
+      # (Core dumptxoutset rollback=481823). blockhash = the 481823 header hash.
+      height: 481823'i32,
+      hashSerialized: hexToBytes32(
+        "25429c30cfa0b6051106c29d15b188d746d8e7ecd184bf34fae1cebe2ea447f4"
+      ),
+      chainTxCount: 249036369'u64,
+      blockhash: BlockHash(hexToBytes32(
+        "000000000000000000cbeff0b533f8e1189cf09dfbebf57a8ebe349362811b80"
+      ))
     )
   ]
   # Legacy aliases
