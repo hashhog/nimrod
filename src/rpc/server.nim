@@ -10518,6 +10518,30 @@ proc handleSignRawTransactionWithWallet(rpc: RpcServer,
       except CatchableError:
         continue
 
+  # BIP-341 taproot sighash (SignatureHashSchnorr) hashes the amounts AND
+  # scriptPubKeys of ALL prevouts, not just the input being signed. Pre-gather
+  # them in input order using the same three-tier resolution (prevtxs -> wallet
+  # utxos -> chainstate) so the P2TR branch below can compute a correct
+  # sighash. A missing prevout leaves a zero placeholder; that input already
+  # fails resolution in the signing loop, and a taproot input cannot be signed
+  # correctly if any sibling prevout is unknown (Core requires the full prevout
+  # set too — validation.cpp PrecomputedTransactionData).
+  var allAmounts = newSeq[Satoshi](tx.inputs.len)
+  var allSpks = newSeq[seq[byte]](tx.inputs.len)
+  for j, tin in tx.inputs:
+    let pk = (tin.prevOut.txid, tin.prevOut.vout)
+    if pk in prevTable:
+      allAmounts[j] = prevTable[pk].value
+      allSpks[j] = prevTable[pk].scriptPubKey
+    elif tin.prevOut in w.utxos:
+      allAmounts[j] = w.utxos[tin.prevOut].output.value
+      allSpks[j] = w.utxos[tin.prevOut].output.scriptPubKey
+    elif rpc.chainState != nil:
+      let uo = rpc.chainState.getUtxo(tin.prevOut)
+      if uo.isSome:
+        allAmounts[j] = uo.get().output.value
+        allSpks[j] = uo.get().output.scriptPubKey
+
   # Sign each input independently. Failures append to `errors` but do not
   # abort the loop (Core parity).
   var errors = newJArray()
@@ -10741,14 +10765,26 @@ proc handleSignRawTransactionWithWallet(rpc: RpcServer,
           })
 
     elif spk.len == 34 and spk[0] == 0x51 and spk[1] == 0x20:
-      # P2TR — Schnorr signing not yet wired; report as un-signable.
-      errors.add(%*{
-        "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
-        "vout": txin.prevOut.vout,
-        "scriptSig": "",
-        "sequence": txin.sequence,
-        "error": "P2TR signing not yet implemented in this wallet"
-      })
+      # P2TR BIP-86 keypath spend. Reuses the wallet-layer signer
+      # (wallet.signInputP2TR -> signSchnorr with BIP-86 empty-merkle-root
+      # TapTweak, aux_rand nonce, self-verify) — the SAME primitive the
+      # wallet-only signTransaction() path already uses. SIGHASH_DEFAULT (0x00)
+      # -> 64-byte witness, per BIP-341 recommendation. `dkey.extKey.key` is the
+      # UNtweaked internal seckey; signInputP2TR applies the BIP-86 TapTweak.
+      # Closes the RPC-side leg of the 6-WAVE Schnorr-sign carry-forward
+      # (W127->W161): the wallet layer signed P2TR, but this RPC path still
+      # filed "not yet implemented" — a pure wiring gap.
+      try:
+        signInputP2TR(tx, i, dkey.extKey.key, allAmounts, allSpks, 0'u32)
+        inc signedCount
+      except CatchableError as e:
+        errors.add(%*{
+          "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+          "vout": txin.prevOut.vout,
+          "scriptSig": "",
+          "sequence": txin.sequence,
+          "error": "Signing failed: " & e.msg
+        })
     else:
       errors.add(%*{
         "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
