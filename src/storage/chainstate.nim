@@ -1414,10 +1414,18 @@ proc flushIBDBatch*(cs: var ChainState) =
     cs.ibdBatch.put(cfMeta, metaKey("height"), w.data)
     cs.ibdBatch.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
 
-    # Also flush cached UTXOs into the batch
-    for op, entry in cs.utxoCache:
-      let key = utxoKey(array[32, byte](op.txid), op.vout)
-      cs.ibdBatch.put(cfUtxo, key, serializeUtxoEntry(entry))
+    # UTXO mutations are ALREADY staged in the batch incrementally by
+    # connectBlockIBD: every created output is `put` at creation time and every
+    # spend is `delete`d when the input is processed (symmetric writes). The
+    # batch therefore already carries exactly the DIRTY set for this interval —
+    # there is no whole-cache rescan here. Rescanning `utxoCache` (the old
+    # behavior) re-serialized and re-wrote every RESIDENT coin on every flush;
+    # once the cache is retained across batches (below) that resident set is the
+    # entire hot working set, so the rescan would re-write millions of already-
+    # durable coins every 2000 blocks. Core's CCoinsViewDB::BatchWrite writes
+    # only DIRTY coins for the same reason. Staging at mutation time keeps the
+    # write volume identical to the old wipe path while letting the read cache
+    # stay hot.
 
     # Commit the entire batch atomically AND crash-durably (WAL + fsync).
     # See the proc docstring: a plain `write` is only memtable-durable while
@@ -1439,14 +1447,27 @@ proc flushIBDBatch*(cs: var ChainState) =
     cs.db.bestBlockHash = cs.bestBlockHash
     cs.db.bestHeight = cs.bestHeight
 
-    # Clear the entire UTXO cache after flush — all entries are now persisted
-    # to RocksDB. Keeping them around wastes memory during IBD since the
-    # working set moves forward (subsequent blocks rarely reference old UTXOs).
-    # This bounds RSS to O(batch_interval * block_size) instead of O(chain_size).
-    let evictedEntries = cs.cacheSize
-    cs.utxoCache.clear()
-    cs.cacheSize = 0
-    info "flushed IBD batch", height = cs.bestHeight, evicted = evictedEntries,
+    # Every resident coin has now been staged into the batch at mutation time
+    # and durably committed by the writeSynced above, so ALL cache entries are
+    # CLEAN: dropping one loses no UTXO — a later read falls through to the DB
+    # (getUtxo cache-miss → db.getUtxo), a later spend stages a delete off the
+    # DB value + records it in ibdDeletedUtxos. So instead of WIPING the whole
+    # cache every batch — the old behavior threw away the hot working set 119
+    # times across a 238k-block replay, forcing cold DB re-reads of the very
+    # outputs the next batches immediately reference — byte-bound it: keep hot
+    # entries resident and only evict down to target when we exceed the
+    # MaxCacheBytes ceiling (raised by --dbcache via setDbCache). This mirrors
+    # Bitcoin Core's CCoinsViewCache, which never discards hot entries on a
+    # periodic flush (see CCoinsViewCache::Flush / Sync in coins.cpp — it clears
+    # only when actually syncing the whole view, and normal operation trims by
+    # memory, not on a fixed block interval). CONSENSUS-NEUTRAL: eviction only
+    # changes which entries are resident, never which UTXO getUtxo returns —
+    # evicted entries are re-read from RocksDB, and only clean (already-flushed)
+    # entries are ever evicted, so no dirty write is ever dropped.
+    let cacheBefore = cs.cacheSize
+    cs.evictCleanEntries()
+    info "flushed IBD batch", height = cs.bestHeight,
+         cacheBefore = cacheBefore, cacheAfter = cs.cacheSize,
          batchBlocks = IbdBatchFlushInterval
 
 proc flushToDiskIfNeeded*(cs: var ChainState, force: bool = false) =
@@ -1822,6 +1843,15 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
       )
       let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
       cs.putUtxoCache(outpoint, entry)
+      # Stage the create into the batch NOW (symmetric with the spend `delete`
+      # above), so flushIBDBatch no longer has to rescan the whole resident
+      # cache to persist it. This is what lets the read cache stay hot across
+      # flushes without inflating write volume: the batch carries exactly the
+      # dirty set, the cache carries the hot set. Byte-identical to the value
+      # the old whole-cache flush loop would have written (an output is created
+      # once and never mutated before it is spent).
+      let outKey = utxoKey(array[32, byte](txId), uint32(voutIdx))
+      cs.ibdBatch.put(cfUtxo, outKey, serializeUtxoEntry(entry))
       # Remove from deleted tracking if re-created
       let ck = outpointKey(outpoint)
       if ck in cs.ibdDeletedUtxos:
