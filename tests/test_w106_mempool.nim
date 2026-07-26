@@ -316,8 +316,11 @@ suite "G3 ancestor count limit = 25":
     let (count, _) = mp.calculateAncestorStats(makeSpend(prevTxid, 0, 90_000_000), 150)
     check count == 25  ## exactly at limit
 
-  test "G3b: chain of 25 (26 including self) violates limit":
-    ## BUG-PROBE: should return error "exceeds ancestor limit: 26 > 25".
+  test "G3b: chain of 25 (26 including self) is ACCEPTED under v31 cluster limits":
+    ## Core v31 removed the ancestor-count limit from mempool acceptance
+    ## (-limitancestorcount is deprecated, init.cpp:650; `too-long-mempool-chain`
+    ## no longer exists).  A 26-long chain of 600 WU txs is 15,600 WU — far
+    ## under the 404,000 WU cluster bound — and 26 <= 64, so it is accepted.
     ## NOTE: this only checks checkPackageLimits; it does NOT go through acceptTransaction
     ## (which requires script verification against seeded UTXOs).
     let mp = makeTestMempool(TestDbPath & "_g3b")
@@ -334,8 +337,10 @@ suite "G3 ancestor count limit = 25":
       prevTxid = txid
     let overTx = makeSpend(prevTxid, 0, 190_000_000_000, 0xFFFFFFFE'u32)
     let res = mp.checkPackageLimits(overTx, 600)
-    check not res.isOk
-    check res.error.contains("ancestor limit")
+    check res.isOk
+    let (cCount, cSize) = mp.calculateClusterStats(overTx, 600)
+    check cCount == 26
+    check cSize == 26 * 600
 
 # ===========================================================================
 # G4 — ancestor SIZE limit (DEFAULT_ANCESTOR_SIZE_LIMIT_KVB * 1000 = 101,000 vbytes)
@@ -363,7 +368,11 @@ suite "G4 ancestor vsize limit = 101,000 vbytes":
     let (_, totalVsize) = mp.calculateAncestorStats(childTx, 150)
     check totalVsize == 101_000
 
-  test "G4b: total ancestor vsize exceeding 101,000 is rejected by checkPackageLimits":
+  test "G4b: cluster weight exceeding 404,000 WU is rejected by checkPackageLimits":
+    ## The surviving size bound is the CLUSTER size in WEIGHT units:
+    ## 101,000 vB * WITNESS_SCALE_FACTOR = 404,000 WU (txmempool.cpp:181).
+    ## Parent alone is 404,000 WU, so the 600 WU child pushes the cluster to
+    ## 404,600 WU and the bare token "too-large-cluster" is returned.
     let mp = makeTestMempool(TestDbPath & "_g4b")
     let parentTxid = makeTxid(0xDD)
     seedUtxo(mp, parentTxid, value = 100_000_000)
@@ -376,9 +385,11 @@ suite "G4 ancestor vsize limit = 101,000 vbytes":
       ancestorSize: 101_000)
     mp.spentBy[makeOutpoint(parentTxid)] = bigParentTxid
     let childTx = makeSpend(bigParentTxid, 0, 98_000_000)
+    let (_, cSize) = mp.calculateClusterStats(childTx, 600)
+    check cSize == 404_600                 ## 404,000 + 600, summed in weight
     let res = mp.checkPackageLimits(childTx, 600)  ## 600 WU = 150 vbytes
     check not res.isOk
-    check res.error.contains("ancestor size limit")
+    check res.error == "too-large-cluster"  ## bare token, empty debug string
 
 # ===========================================================================
 # G5 — descendant count limit (DEFAULT_DESCENDANT_LIMIT = 25)
@@ -460,16 +471,17 @@ suite "G5 descendant count limit = 25":
       mp.spentBy[makeOutpoint(prevTxid)] = childTxid
       prevTxid = childTxid
 
-    ## rootMpTxid now has 24 descendants → calculateDescendantStats(rootMpTxid).count = 25 = limit.
-    ## A new tx spending prevTxid (24th child) would have 25 ancestors (including itself) = ancestor limit.
-    ## But rootMpTxid would gain a new descendant → descCount = 26 > 25.
-    ## The ancestor limit check fires first (26 ancestors including self > 25).
-    ## Test confirms the limit fires - either ancestor or descendant.
+    ## rootMpTxid now has 24 descendants, so the chain is 25 long and the new
+    ## tx makes 26.  Under Core v31 BOTH the ancestor-count and the
+    ## descendant-count limits are gone (-limitdescendantcount is deprecated,
+    ## init.cpp:656), so this is accepted: 26 <= 64 and the cluster weighs
+    ## 800 + 24*600 + 600 = 15,800 WU, far under the 404,000 WU bound.
     let overTx = makeSpend(prevTxid, 0, 85_000_000_000, 0xFFFFFFFE'u32)
     let res = mp.checkPackageLimits(overTx, 600)
-    check not res.isOk
-    ## Error can be ancestor limit (26 ancestors incl self > 25) since the chain is linear
-    check res.error.contains("ancestor limit") or res.error.contains("descendant limit")
+    check res.isOk
+    let (cCount, cSize) = mp.calculateClusterStats(overTx, 600)
+    check cCount == 26
+    check cSize == 800 + 24 * 600 + 600
 
 # ===========================================================================
 # G6 — EXTRA_DESCENDANT_TX_SIZE_LIMIT exception (policy/policy.h:90)
@@ -500,13 +512,15 @@ suite "G6 EXTRA_DESCENDANT_TX_SIZE_LIMIT exception":
     let res = mp.checkPackageLimits(childTx, 600)  ## 600/4 = 150 vbytes
     check res.isOk   ## should pass despite ancestor+child = 101,000 vbytes
 
-  test "G6b: large child (> 10,000 vbytes) with 1 ancestor does NOT get exception":
-    ## BUG-PROBE: exception only applies if child vsize <= ExtraDescendantTxSizeLimit.
-    ## Design: parent (150 vbytes) already has an existing large child (90,700 vbytes),
-    ## making parent's current descendant size = 150 + 90,700 = 90,850 vbytes.
-    ## New big child: 10,201 vbytes (> 10,000 → exception does NOT apply).
-    ## Ancestor size of new child: parent(150) + self(10,201) = 10,351 ≤ 101,000 (G2 OK).
-    ## Parent descendant size after add: 90,850 + 10,201 = 101,051 > 101,000 → G4 fires.
+  test "G6b: a large sibling still counts toward the cluster size":
+    ## EXTRA_DESCENDANT_TX_SIZE_LIMIT is now a dead definition in Core
+    ## (policy.h:90, no remaining uses), so there is no exception to grant.
+    ## What survives is the cluster bound — and the new child's SIBLING
+    ## (which is neither its ancestor nor its descendant) must be counted:
+    ##   parent 600 WU + existing child 362,800 WU + new child 40,804 WU
+    ##   = 404,204 WU > 404,000 WU → reject.
+    ## An ancestor-scoped size proxy would see only 600 + 40,804 = 41,404 WU
+    ## and wrongly accept.
     let mp = makeTestMempool(TestDbPath & "_g6b")
     let rootTxid = makeTxid(0x11)
     seedUtxo(mp, rootTxid, value = 100_000_000)
@@ -543,9 +557,14 @@ suite "G6 EXTRA_DESCENDANT_TX_SIZE_LIMIT exception":
                      sequence: 0xFFFFFFFE'u32)],
       outputs: @[TxOut(value: Satoshi(97_000_000), scriptPubKey: makeP2WPKHScript())],
       witnesses: @[@[@[]]], lockTime: 0)
+    ## Cluster = parent + existing large sibling + new big child.
+    let (cCount, cSize) = mp.calculateClusterStats(bigChildTx, bigChildWeight)
+    check cCount == 3
+    check cSize == 600 + existingChildVsize * 4 + bigChildWeight
+    check cSize == 404_204
     let res = mp.checkPackageLimits(bigChildTx, bigChildWeight)
-    check not res.isOk  ## descendant vsize check must fire
-    check res.error.contains("descendant size limit")
+    check not res.isOk  ## cluster size check must fire
+    check res.error == "too-large-cluster"
 
 # ===========================================================================
 # G7 — descendant VSIZE limit (DEFAULT_DESCENDANT_SIZE_LIMIT_KVB * 1000 = 101,000)
