@@ -577,26 +577,100 @@ proc getMtpForBlockIndex*(utxos: ChainDb, prevIndex: BlockIndex): uint32 =
     cur = parentOpt.get()
   getMedianTimePast(headers)
 
-# Get script flags for block validation
-## Bitcoin Core script_flag_exceptions: blocks that violate current rules.
-## BIP16 exception block (mainnet): this block contains a P2SH-violating tx
-## that was mined before P2SH enforcement. Bitcoin Core uses SCRIPT_VERIFY_NONE.
+# ============================================================================
+# Per-block script verification flags — faithful port of Bitcoin Core
+# GetBlockScriptFlags (validation.cpp:2249-2289).
+#
+# Core's sequence is THREE steps and the ORDER IS LOAD-BEARING:
+#
+#   1. BASE      seed P2SH | WITNESS | TAPROOT unconditionally, for every
+#                block at every height (validation.cpp:2262).  Core has had no
+#                BIP16Height and no taprootHeight in this path since v23 — the
+#                two historical rule violators are handled by step 2, NOT by a
+#                height gate.  Any height gate on these three is a consensus bug.
+#   2. EXCEPTION on a block-hash hit in consensusparams.script_flag_exceptions,
+#                REPLACE the whole flag set with the table's value
+#                (validation.cpp:2264-2267).  This is an assignment, NOT an
+#                early return.
+#   3. HEIGHT    OR the four still-height-gated flags ON TOP of step 2's result
+#                (validation.cpp:2268-2286): DERSIG (BIP66), CLTV (BIP65),
+#                CSV (BIP68/112/113) and NULLDUMMY (BIP147, rides SegWit).
+#
+# Why step 3 must run AFTER step 2: block 692261's exception value is
+# P2SH|WITNESS.  Returning early there would drop DERSIG|CLTV|CSV|NULLDUMMY,
+# all four of which ARE active at height 692261 — a false-accept of scripts
+# Core rejects under BIP-66/65/112/147.
+#
+# NEVER add policy flags here.  NULLFAIL, CLEANSTACK, LOW_S, STRICTENC,
+# MINIMALDATA, MINIMALIF and WITNESS_PUBKEYTYPE are STANDARD_SCRIPT_VERIFY_FLAGS
+# (policy/policy.h:125) and belong only in mempool policy checks.
+# ============================================================================
+
+## SCRIPT_VERIFY_NONE — the empty consensus flag set.
+const ScriptVerifyNone*: set[ScriptFlags] = {}
+
+## Bitcoin Core script_flag_exceptions: historical blocks that violate a rule
+## which is otherwise enforced unconditionally (kernel/chainparams.cpp:85-88,
+## 210-211).
+##
+## BYTE ORDER: these keys are in DISPLAY order (big-endian hex, leading zeros
+## first) because that is exactly what `$BlockHash` emits — it walks the
+## internal little-endian array backwards (primitives/types.nim:28-31).  Every
+## production caller derives its key with `$BlockHash(doubleSha256(...))`, so
+## the orientations match.  Do not "byte-swap" these constants; see the
+## reversed-hash negative control in tests/test_script_flag_exceptions.nim.
+
+## BIP16 exception block (mainnet height 170060): contains a P2SH-violating tx
+## mined before P2SH enforcement.  Core maps it to SCRIPT_VERIFY_NONE.
 const BIP16_EXCEPTION_HASH* = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
 
-## Taproot exception block (mainnet): uses P2SH+WITNESS only (no TAPROOT).
+## Taproot exception block (mainnet height 692261): violated the Taproot rules
+## before activation.  Core maps it to SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS.
 const TAPROOT_EXCEPTION_HASH* = "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
+
+## BIP16 exception block (testnet3): the same P2SH violation, retroactively
+## applied to testnet (kernel/chainparams.cpp:210-211).  Core maps it to
+## SCRIPT_VERIFY_NONE.
+const TESTNET3_BIP16_EXCEPTION_HASH* = "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"
+
+proc scriptFlagException*(network: Network, blockHash: string): Option[set[ScriptFlags]] =
+  ## Look up `blockHash` in this network's script_flag_exceptions table.
+  ## Returns the REPLACEMENT flag set when the block is an exception, else none.
+  ## Mainnet and testnet3 are the only networks with entries in Core.
+  if blockHash.len == 0:
+    return none(set[ScriptFlags])
+  case network
+  of Mainnet:
+    if blockHash == BIP16_EXCEPTION_HASH:
+      return some(ScriptVerifyNone)
+    if blockHash == TAPROOT_EXCEPTION_HASH:
+      return some({sfP2SH, sfWitness})
+  of Testnet3:
+    if blockHash == TESTNET3_BIP16_EXCEPTION_HASH:
+      return some(ScriptVerifyNone)
+  else:
+    discard
+  none(set[ScriptFlags])
 
 proc getBlockScriptFlags*(height: int32, params: ConsensusParams,
                           blockHash: string = ""): set[ScriptFlags] =
-  ## Get consensus-only script verification flags for a block at given height
-  ## CRITICAL: Only use consensus flags, not policy flags
+  ## Consensus-only script verification flags for the block at `height` whose
+  ## hash is `blockHash` (display-order hex, i.e. `$BlockHash(...)`).
+  ##
+  ## `blockHash` defaults to "" ONLY so the mempool can ask for "the flags the
+  ## next block will enforce" (Core MemPoolAccept::ConsensusScriptChecks passes
+  ## the tip index, which is never an exception block).  Every BLOCK-validation
+  ## caller MUST pass the real hash — omitting it silently skips step 2.
 
-  # Check script_flag_exceptions first (matching Bitcoin Core)
-  if blockHash == BIP16_EXCEPTION_HASH:
-    return {}  # SCRIPT_VERIFY_NONE for this block
+  # Step 1 — BASE.  Unconditional; no height gate on any of these three.
+  result = {sfP2SH, sfWitness, sfTaproot}
 
-  # P2SH active from BIP16 (mainnet: 170060, but treat as always-on for simplicity)
-  result = {sfP2SH}
+  # Step 2 — EXCEPTION.  Replaces the entire set; does NOT return early.
+  let exception = scriptFlagException(params.network, blockHash)
+  if exception.isSome:
+    result = exception.get()
+
+  # Step 3 — HEIGHT gates, OR-ed on top of step 2's result.
 
   # DERSIG (BIP66)
   if height >= int32(params.bip66Height):
@@ -606,20 +680,15 @@ proc getBlockScriptFlags*(height: int32, params: ConsensusParams,
   if height >= int32(params.bip65Height):
     result.incl(sfCheckLockTimeVerify)
 
-  # CHECKSEQUENCEVERIFY (BIP112) - activated with CSV (BIP68/112/113)
+  # CHECKSEQUENCEVERIFY (BIP112) — activated with CSV (BIP68/112/113)
   if height >= int32(params.csvHeight):
     result.incl(sfCheckSequenceVerify)
 
-  # SegWit (BIP141/143/147) — WITNESS + NULLDUMMY are consensus rules.
-  # sfNullFail and sfWitnessPubkeyType are policy-only (STANDARD_SCRIPT_VERIFY_FLAGS
-  # per Bitcoin Core policy/policy.h:125,128) and must NOT appear here.
+  # NULLDUMMY (BIP147) — activated simultaneously with SegWit.
+  # NOTE: WITNESS itself is NOT gated here (step 1 sets it unconditionally,
+  # matching Core); only NULLDUMMY rides the SegWit activation height.
   if height >= int32(params.segwitHeight):
-    result.incl(sfWitness)
     result.incl(sfNullDummy)
-
-  # Taproot (BIP340/341/342) — activated at taprootHeight
-  if blockHash != TAPROOT_EXCEPTION_HASH and height >= int32(params.taprootHeight):
-    result.incl(sfTaproot)
 
 # ============================================================================
 # BIP68 Sequence Lock Functions
@@ -1431,14 +1500,22 @@ proc countBlockSigopsCost*(blk: Block,
   ## Count total sigop cost for a block with proper witness discount
   ## This matches Bitcoin Core's ConnectBlock sigops check
   ##
-  ## Uses:
-  ## - P2SH sigops if height >= p2shHeight (always on mainnet)
-  ## - Witness sigops if height >= segwitHeight
+  ## Core calls GetTransactionSigOpCost(tx, view, FLAGS) where FLAGS is the
+  ## SAME exception-aware set produced by GetBlockScriptFlags — not a raw
+  ## height comparison (validation.cpp:2419).  P2SH sigops are gated on
+  ## SCRIPT_VERIFY_P2SH (consensus/tx_verify.cpp:150-152) and CountWitnessSigOps
+  ## returns 0 whenever SCRIPT_VERIFY_WITNESS is clear
+  ## (script/interpreter.cpp:2141-2143).  So on an exception block such as
+  ## mainnet 170060 (flags = SCRIPT_VERIFY_NONE) Core counts NEITHER P2SH nor
+  ## witness sigops.  Deriving these booleans from heights instead would
+  ## over-count on exactly those blocks.
   ##
   ## Returns Result to propagate UTXO lookup errors
 
-  let useP2SH = true  # P2SH always active
-  let useWitness = height >= int32(params.segwitHeight)
+  let blockHash = $BlockHash(doubleSha256(serialize(blk.header)))
+  let flags = getBlockScriptFlags(height, params, blockHash)
+  let useP2SH = sfP2SH in flags
+  let useWitness = sfWitness in flags
 
   var totalCost = 0
 
@@ -1665,8 +1742,22 @@ proc validateBlock*(
     var intraBlockUtxos = initTable[string, UtxoEntry]()
     var totalSigopCost = 0  # Track sigop cost with witness discount
 
-    # Determine which sigop rules apply at this height
-    let useWitnessSigops = height >= int32(params.segwitHeight)
+    # Determine which sigop rules apply to THIS block.
+    #
+    # Core gates sigop counting on the final, exception-aware script flags —
+    # GetTransactionSigOpCost(tx, view, GetBlockScriptFlags(...))
+    # (validation.cpp:2419).  P2SH sigops are counted only when
+    # SCRIPT_VERIFY_P2SH is set (consensus/tx_verify.cpp:150-152) and
+    # CountWitnessSigOps returns 0 when SCRIPT_VERIFY_WITNESS is clear
+    # (script/interpreter.cpp:2141-2143).  Using raw height booleans here would
+    # over-count on the script_flag_exceptions blocks (mainnet 170060 →
+    # SCRIPT_VERIFY_NONE), which is a consensus divergence in the block sigop
+    # limit.  Sigops are counted on EVERY connect (including assumevalid IBD
+    # and reorg replay), so this must not live behind a "skip scripts" guard.
+    let blockScriptFlags = getBlockScriptFlags(
+      height, params, $BlockHash(doubleSha256(serialize(blk.header))))
+    let useP2SHSigops = sfP2SH in blockScriptFlags
+    let useWitnessSigops = sfWitness in blockScriptFlags
 
     # Add coinbase outputs to intra-block UTXOs and count coinbase sigops
     let coinbaseTxid = blk.txs[0].txid()
@@ -1713,7 +1804,7 @@ proc validateBlock*(
         return voidErr(veFeesOutOfRange)
 
       # Count sigops for this transaction with proper witness discount
-      let sigopResult = getTransactionSigOpCost(tx, lookupUtxo, useP2SH = true, useWitness = useWitnessSigops)
+      let sigopResult = getTransactionSigOpCost(tx, lookupUtxo, useP2SH = useP2SHSigops, useWitness = useWitnessSigops)
       if sigopResult.isOk:
         totalSigopCost += sigopResult.value
       # Note: If sigop counting fails (missing UTXO), validation would have already failed above

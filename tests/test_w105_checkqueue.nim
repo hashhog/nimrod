@@ -172,17 +172,25 @@ suite "G5 — parallel verifier now accepts chainParams (fixed)":
   ## backwards compatibility with existing call sites, but callers must now
   ## explicitly pass the correct params for any non-mainnet network.
 
-  test "G5a: regtest flags at height 1 include sfTaproot; mainnet flags do not":
-    ## Regtest activates Taproot at height 0; mainnet at 709632.
-    ## Confirm the network divergence that made the bug dangerous:
+  test "G5a: regtest and mainnet flags at height 1 diverge on the height gates":
+    ## UPDATED to Core semantics.  This test previously asserted
+    ## `(sfTaproot in flagsMainnet) == false` at height 1, which encoded
+    ## nimrod's old taprootHeight gate.  Core seeds P2SH|WITNESS|TAPROOT
+    ## unconditionally (validation.cpp:2262) — TAPROOT is set on BOTH networks
+    ## at height 1.  The real network divergence is in the four height-gated
+    ## flags: regtest activates BIP65/66/CSV at height 1 and SegWit at 0,
+    ## mainnet at 388381/363725/419328/481824.
     let flagsMainnet = getBlockScriptFlags(1'i32, mainnetParams())
     let flagsRegtest = getBlockScriptFlags(1'i32, regtestParams())
-    check (sfTaproot in flagsRegtest) == true     ## regtest has Taproot at h=1
-    check (sfTaproot in flagsMainnet) == false    ## mainnet Taproot starts at 709632
+    check (sfTaproot in flagsRegtest) == true     ## unconditional base flag
+    check (sfTaproot in flagsMainnet) == true     ## unconditional base flag
+    check (sfDERSig in flagsRegtest) == true      ## regtest BIP66Height = 1
+    check (sfDERSig in flagsMainnet) == false     ## mainnet BIP66Height = 363725
+    check flagsRegtest != flagsMainnet
 
   test "G5b: verifyScriptsParallel called with regtestParams uses regtest flags":
-    ## After the fix, the caller passes regtestParams() and gets Taproot flags
-    ## at low heights — the parallel path now behaves correctly on regtest.
+    ## After the fix, the caller passes regtestParams() and gets regtest
+    ## activation heights — the parallel path now behaves correctly on regtest.
     let h = 100'i32
     let rgtFlags = getBlockScriptFlags(h, regtestParams())
     let mntFlags = getBlockScriptFlags(h, mainnetParams())
