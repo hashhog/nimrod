@@ -29,6 +29,12 @@ type
     ancestorWeight*: int    ## Total weight of this tx plus all unconfirmed ancestors
     ancestorCount*: int     ## Count of ancestors including self (cached for O(1) checks)
     ancestorSize*: int      ## Total vsize of ancestors including self in vbytes (cached)
+    sigopCost*: int64       ## Sigop cost of this tx (Core CTxMemPoolEntry::sigOpCost).
+                            ## Feeds the cluster-size contribution
+                            ## max(weight, sigopCost * bytesPerSigop); see
+                            ## clusterSizeContribution below.  Zero-valued
+                            ## entries behave exactly as before (contribution
+                            ## collapses to plain weight).
 
   ## Optional caller-supplied knobs for acceptTransaction.  Mirrors a subset of
   ## Bitcoin Core's `ATMPArgs` (validation.cpp:594-) — only the parts that are
@@ -126,6 +132,12 @@ const
   DefaultClusterLimit* = 64             ## Max transactions per cluster (DEFAULT_CLUSTER_LIMIT)
   DefaultClusterSizeLimitKvB* = 101     ## Max total cluster vsize in kvB (DEFAULT_CLUSTER_SIZE_LIMIT_KVB)
   DefaultClusterSizeLimit* = DefaultClusterSizeLimitKvB * 1000  ## 101,000 vbytes
+  ## The bound actually ENFORCED, in weight units.  Core keeps the limit in
+  ## vbytes (MemPoolLimits::cluster_size_vbytes, kernel/mempool_limits.h:22 —
+  ## and that is also what getmempoolinfo's `limitclustersize` reports) but
+  ## multiplies by WITNESS_SCALE_FACTOR when handing it to TxGraph
+  ## (txmempool.cpp:181), so every cluster comparison happens in WEIGHT.
+  DefaultClusterSizeLimitWeight* = DefaultClusterSizeLimit * WitnessScaleFactor  ## 404,000 WU
 
   ## Extra descendant allowance for CPFP packages (policy/policy.h:90):
   ## a tx with exactly 1 in-mempool ancestor is accepted even if it would
@@ -873,86 +885,149 @@ proc calculateDescendantStats*(mp: Mempool, txid: TxId): (int, int) =
 
   (len(descendants) + 1, totalVsize)  # +1 for self
 
-# Check package limits for a new transaction
-proc checkPackageLimits*(mp: Mempool, tx: Transaction, weight: int): MempoolResult[void] =
-  ## Check if adding this transaction would violate ancestor/descendant/cluster limits.
+# ---------------------------------------------------------------------------
+# Cluster accounting — Bitcoin Core v31 cluster mempool.
+#
+# This is mempool POLICY, not consensus.  Nothing here may affect block
+# validation: a block containing a 100-tx chain is consensus-valid regardless
+# of what these limits say.
+#
+# Core v31 replaced the ancestor/descendant count+size limits with two CLUSTER
+# limits, where a "cluster" is the CONNECTED COMPONENT of the mempool spend
+# graph — not an ancestor set.  In WEIGHT UNITS throughout:
+#
+#   per-tx contribution := max(weight, sigopCost * DefaultBytesPerSigop)
+#                          (GetSigOpsAdjustedWeight, policy/policy.cpp:390-393;
+#                           fed to TxGraph as FeePerWeight, txmempool.cpp:1017)
+#   cluster_size        := Σ per-tx contribution   -- NO per-tx division,
+#                                                     NO per-tx rounding
+#   reject if cluster_size  > 404,000  (= cluster_size_vbytes 101,000 * 4,
+#                                       txmempool.cpp:181)
+#   reject if cluster_count > 64       (DEFAULT_CLUSTER_LIMIT, policy.h:72)
+#
+# Strictness is `>` on both, per txgraph.cpp:2059:
+#   total_count > m_max_cluster_count || total_size > m_max_cluster_size
+# so 64 tx ACCEPTS / 65 REJECTS, and 404,000 WU ACCEPTS / 404,001 REJECTS.
+#
+# Summing sigop-adjusted WEIGHT rather than Σ⌈wᵢ/4⌉ vbytes is deliberate:
+# per-tx ceiling satisfies Σ⌈wᵢ/4⌉ >= (Σwᵢ)/4 and would therefore be
+# systematically STRICTER than Core, always in the same direction.  Do not
+# "simplify" this back into vbytes.
+# ---------------------------------------------------------------------------
+
+proc clusterSizeContribution*(weight: int, sigopCost: int64): int64 =
+  ## One transaction's contribution to its cluster's size, in WEIGHT units.
+  ## Core: GetSigOpsAdjustedWeight(GetTransactionWeight(tx), sigops_cost,
+  ## nBytesPerSigOp) — policy/policy.cpp:390-393, called at txmempool.cpp:1017.
+  getSigOpsAdjustedWeight(int64(weight), sigopCost, DefaultBytesPerSigop)
+
+proc maxClusterSizeWeight*(mp: Mempool): int64 =
+  ## The enforced cluster-size bound in WEIGHT units.
+  ## Core txmempool.cpp:181: max_cluster_size = cluster_size_vbytes *
+  ## WITNESS_SCALE_FACTOR.  `mp.clusterSizeLimit` stays denominated in vbytes
+  ## to mirror MemPoolLimits::cluster_size_vbytes and getmempoolinfo's
+  ## `limitclustersize` (rpc/mempool.cpp:1062), which Core reports in vbytes.
+  int64(mp.clusterSizeLimit) * int64(WitnessScaleFactor)
+
+proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
+                            sigopCost: int64 = 0): (int, int64) =
+  ## Returns (cluster tx count including `tx`, cluster size in WEIGHT units
+  ## including `tx`) for the cluster that `tx` would join.
   ##
-  ## Gates enforced (matching Bitcoin Core policy/policy.h + validation.cpp):
-  ##   G1  ancestor count  <= ancestorLimit (default 25)
-  ##   G2  ancestor vsize  <= ancestorSizeLimit (default 101,000 vB)
-  ##   G3  each ancestor's descendant count after add  <= descendantLimit (25)
-  ##   G4  each ancestor's descendant vsize after add  <= descendantSizeLimit (101,000 vB)
-  ##       … with EXTRA_DESCENDANT_TX_SIZE_LIMIT exception (G5):
-  ##   G5  if tx has exactly 1 in-mempool ancestor AND vsize <= 10,000 vB, skip G4
-  ##       (EXTRA_DESCENDANT_TX_SIZE_LIMIT, policy/policy.h:90)
-  ##   G6  cluster count (tx + all ancestors) <= clusterLimit (default 64)
-  ##   G7  cluster vsize  <= clusterSizeLimit (default 101,000 vB)
-  ##
-  ## Returns ok(()) if all limits are satisfied, err(msg) otherwise.
+  ## The cluster is the connected component of `tx` in the UNDIRECTED mempool
+  ## spend graph: parents, children, and anything reachable through them.
+  ## Walking ancestors only would UNDER-count — two children of a shared
+  ## parent live in the same cluster although neither is an ancestor of the
+  ## other.  Core merges clusters on any dependency (txgraph.cpp Merge/
+  ## GroupClusters), so an ancestor-scoped proxy silently accepts fan-outs
+  ## Core rejects.
+  var visited = initHashSet[TxId]()
+  var toVisit: seq[TxId]
+  let selfTxid = tx.txid()
 
-  let vsize = (weight + 3) div 4
+  # Self is always in its own cluster, even when the mempool side is empty.
+  var totalCount = 1
+  var totalSize = clusterSizeContribution(weight, sigopCost)
 
-  # Calculate ancestor stats for the new transaction
-  let (ancestorCount, ancestorSize) = mp.calculateAncestorStats(tx, vsize)
-
-  # G1: ancestor count limit (including self)
-  if ancestorCount > mp.ancestorLimit:
-    return err(void, "exceeds ancestor limit: " & $ancestorCount & " > " & $mp.ancestorLimit)
-
-  # G2: ancestor size limit
-  if ancestorSize > mp.ancestorSizeLimit:
-    return err(void, "exceeds ancestor size limit: " & $ancestorSize & " vB > " & $mp.ancestorSizeLimit & " vB")
-
-  # Compute the ancestor set once (used in G3/G4/G5/G6/G7).
-  let ancestors = mp.calculateAncestors(tx)
-
-  # G5 precondition: tx qualifies for extra-descendant allowance if it has
-  # exactly 1 in-mempool ancestor AND its own vsize <= ExtraDescendantTxSizeLimit.
-  # When the allowance applies we skip the descendant VSIZE check (G4) for that
-  # ancestor — but we still enforce the descendant COUNT check (G3).
-  # Core reference: policy/policy.h:90 EXTRA_DESCENDANT_TX_SIZE_LIMIT comment.
-  let extraDescAllowed = (ancestors.len == 1) and (vsize <= ExtraDescendantTxSizeLimit)
-
-  # G3/G4: Check descendant limits for each ancestor.
-  # Adding this tx increases each ancestor's descendant count by 1 and size by vsize.
-  for ancestorTxid in ancestors:
-    let (descCount, descSize) = mp.calculateDescendantStats(ancestorTxid)
-
-    # G3: descendant count
-    if descCount + 1 > mp.descendantLimit:
-      return err(void, "would exceed descendant limit for ancestor " & $ancestorTxid &
-                       ": " & $(descCount + 1) & " > " & $mp.descendantLimit)
-
-    # G4 (with G5 exception): descendant vsize
-    if not extraDescAllowed:
-      if descSize + vsize > mp.descendantSizeLimit:
-        return err(void, "would exceed descendant size limit for ancestor " & $ancestorTxid &
-                         ": " & $(descSize + vsize) & " vB > " & $mp.descendantSizeLimit & " vB")
-
-  # Also check immediate parents (mempool entries this tx spends from) in case
-  # calculateAncestors missed an edge (shouldn't happen, belt-and-braces).
+  # Seed: in-mempool parents of the candidate, plus any in-mempool tx already
+  # spending one of the candidate's outputs.
   for input in tx.inputs:
     if input.prevOut.txid in mp.entries:
-      let parentTxid = input.prevOut.txid
-      if parentTxid notin ancestors:
-        let (descCount, descSize) = mp.calculateDescendantStats(parentTxid)
-        if descCount + 1 > mp.descendantLimit:
-          return err(void, "would exceed descendant limit for parent " & $parentTxid)
-        if not extraDescAllowed:
-          if descSize + vsize > mp.descendantSizeLimit:
-            return err(void, "would exceed descendant size limit for parent " & $parentTxid)
+      toVisit.add(input.prevOut.txid)
+  for vout in 0 ..< tx.outputs.len:
+    let op = OutPoint(txid: selfTxid, vout: uint32(vout))
+    if op in mp.spentBy:
+      toVisit.add(mp.spentBy[op])
 
-  # G6: cluster count — the cluster of this tx consists of itself + all ancestors.
-  # (In a full cluster-mempool implementation the cluster boundary includes all
-  # transactions connected via ancestor/descendant links; here we conservatively
-  # use the ancestor-set + self as a lower-bound proxy.)
-  let clusterCount = ancestors.len + 1  # +1 for the tx itself
+  while toVisit.len > 0:
+    let cur = toVisit.pop()
+    if cur == selfTxid or cur in visited or cur notin mp.entries:
+      continue
+    visited.incl(cur)
+
+    let entry = mp.entries[cur]
+    inc totalCount
+    totalSize += clusterSizeContribution(entry.weight, entry.sigopCost)
+
+    # Expand in BOTH directions — this is what makes it a component walk.
+    for input in entry.tx.inputs:
+      if input.prevOut.txid in mp.entries and input.prevOut.txid notin visited:
+        toVisit.add(input.prevOut.txid)
+    for vout in 0 ..< entry.tx.outputs.len:
+      let op = OutPoint(txid: cur, vout: uint32(vout))
+      if op in mp.spentBy:
+        let child = mp.spentBy[op]
+        if child notin visited:
+          toVisit.add(child)
+
+  (totalCount, totalSize)
+
+# Check cluster limits for a new transaction
+proc checkPackageLimits*(mp: Mempool, tx: Transaction, weight: int,
+                         sigopCost: int64 = 0): MempoolResult[void] =
+  ## Check whether adding this transaction would violate the CLUSTER limits.
+  ## This is mempool POLICY, not consensus — it must never affect block
+  ## validation.
+  ##
+  ## Gates enforced, both from Core's CheckMemPoolPolicyLimits →
+  ## TxGraph::IsOversized (txmempool.cpp:1072-1080, txgraph.cpp:2059):
+  ##   C1  cluster tx count <= clusterLimit          (64 → 64 accepts, 65 rejects)
+  ##   C2  cluster size     <= clusterSizeLimit * 4  (404,000 WEIGHT units)
+  ##
+  ## Both reject with the bare token "too-large-cluster" and an EMPTY debug
+  ## string, matching validation.cpp:1024, :1116, :1343, :1521.
+  ##
+  ## The pre-v31 ancestor/descendant count and size gates are GONE, matching
+  ## Core v31:
+  ##   * `-limitancestorcount` / `-limitdescendantcount` are documented as
+  ##     "Deprecated … replaced by cluster limits … only used by wallet for
+  ##     coin selection" (init.cpp:650, :656).  MemPoolLimits still carries
+  ##     ancestor_count/descendant_count (mempool_limits.h:24, :26) but the
+  ##     mempool acceptance path no longer consults them — only
+  ##     node/interfaces.cpp:715 does, for the wallet.
+  ##   * ancestor/descendant SIZE limits no longer exist in MemPoolLimits at all.
+  ##   * `too-long-mempool-chain` is absent from the entire Core tree.
+  ##   * EXTRA_DESCENDANT_TX_SIZE_LIMIT (policy.h:90) is a dead definition with
+  ##     no remaining use, so the old G5 CPFP allowance has nothing to waive.
+  ##
+  ## The ONLY surviving ancestor/descendant enforcement is TRUC/v3's
+  ## 2-ancestor / 2-descendant rule (TrucAncestorLimit / TrucDescendantLimit,
+  ## used at :452 and :487 here and in package.nim:433/:442) — untouched.
+  ##
+  ## Returns ok(()) if both limits are satisfied, err("too-large-cluster")
+  ## otherwise.
+  let (clusterCount, clusterSize) =
+    mp.calculateClusterStats(tx, weight, sigopCost)
+
+  # C1: cluster transaction count.  Strict `>` — a cluster of exactly
+  # clusterLimit transactions is accepted.
   if clusterCount > mp.clusterLimit:
-    return err(void, "too-large-cluster: cluster count " & $clusterCount & " > " & $mp.clusterLimit)
+    return err(void, "too-large-cluster")
 
-  # G7: cluster vsize (ancestor vsize including self already computed as ancestorSize)
-  if ancestorSize > mp.clusterSizeLimit:
-    return err(void, "too-large-cluster: cluster vsize " & $ancestorSize & " vB > " & $mp.clusterSizeLimit & " vB")
+  # C2: cluster size, in WEIGHT units, summed with no per-tx rounding.
+  # Strict `>` — exactly 404,000 WU is accepted.
+  if clusterSize > mp.maxClusterSizeWeight():
+    return err(void, "too-large-cluster")
 
   MempoolResult[void](isOk: true)
 
@@ -1255,6 +1330,15 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     if sigopResult.value > MaxStandardTxSigopsCost:
       return err(AtmpAcceptInfo, "bad-txns-too-many-sigops")
 
+  # Retained for cluster accounting: Core stores sigops_cost on the mempool
+  # entry (CTxMemPoolEntry::sigOpCost) and feeds
+  # GetSigOpsAdjustedWeight(weight, sigops_cost, nBytesPerSigOp) to TxGraph as
+  # the transaction's cluster-size contribution (txmempool.cpp:1017).  When the
+  # sigop count could not be computed we fall back to 0, which makes the
+  # contribution collapse to plain weight — never an under-count of the weight
+  # term itself.
+  let txSigopCost: int64 = if sigopResult.isOk: int64(sigopResult.value) else: 0'i64
+
   # W96 GAP #5: modified-fee aware vsize.  Core computes m_modified_fees from
   # m_base_fees plus PrioritiseTransaction deltas (Core validation.cpp:930):
   # PreChecks calls m_pool.ApplyDelta(hash, ws.m_modified_fees) so a delta set
@@ -1442,10 +1526,12 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   if conflictsToRemove.len > 0:
     mp.removeConflicts(conflictsToRemove)
 
-  # Package + cluster limits.
-  let packageLimitsResult = mp.checkPackageLimits(tx, weight)
+  # Cluster limits.  Core surfaces the BARE token with an empty debug string
+  # (validation.cpp:1024, :1116, :1343, :1521), so pass the error through
+  # verbatim rather than prefixing it.
+  let packageLimitsResult = mp.checkPackageLimits(tx, weight, txSigopCost)
   if not packageLimitsResult.isOk:
-    return err(AtmpAcceptInfo, "too-large-cluster: " & packageLimitsResult.error)
+    return err(AtmpAcceptInfo, packageLimitsResult.error)
 
   let (ancestorFee, ancestorWeight) = mp.calculateAncestorFeesAndWeight(tx, modifiedFee, weight)
   let (ancestorCount, ancestorSize) = mp.calculateAncestorStats(tx, vsizeInt)
@@ -1509,7 +1595,8 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     ancestorFee: ancestorFee,
     ancestorWeight: ancestorWeight,
     ancestorCount: ancestorCount,
-    ancestorSize: ancestorSize
+    ancestorSize: ancestorSize,
+    sigopCost: txSigopCost
   )
 
   mp.entries[txid] = entry
