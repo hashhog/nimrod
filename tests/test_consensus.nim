@@ -612,11 +612,22 @@ suite "witness commitment":
 
 suite "script flags":
   test "early block flags":
+    ## UPDATED to Core semantics (validation.cpp:2262): P2SH, WITNESS and
+    ## TAPROOT are seeded UNCONDITIONALLY for every block — Core has had no
+    ## BIP16Height and no taprootHeight in GetBlockScriptFlags since v23, and
+    ## SegwitHeight gates only NULLDUMMY.  The previous assertions
+    ## (`sfWitness notin flags` at height 1) encoded nimrod's old height gates,
+    ## which is a consensus divergence from Core.
     let params = mainnetParams()
     let flags = getBlockScriptFlags(1, params)
     check sfP2SH in flags
+    check sfWitness in flags
+    check sfTaproot in flags
+    # The four genuinely height-gated flags are all inactive at height 1.
     check sfDERSig notin flags
-    check sfWitness notin flags
+    check sfCheckLockTimeVerify notin flags
+    check sfCheckSequenceVerify notin flags
+    check sfNullDummy notin flags
 
   test "post-BIP66 flags":
     let params = mainnetParams()
@@ -644,6 +655,14 @@ suite "script flags":
     let params = mainnetParams()
     let flags = getBlockScriptFlags(int32(params.taprootHeight), params)
     check sfTaproot in flags
+
+  test "taproot is NOT height-gated (Core validation.cpp:2262)":
+    ## Core seeds SCRIPT_VERIFY_TAPROOT unconditionally; the single mainnet
+    ## Taproot violator (692261) is handled by script_flag_exceptions, not by a
+    ## height gate.  Pin that TAPROOT is set well below params.taprootHeight.
+    let params = mainnetParams()
+    check sfTaproot in getBlockScriptFlags(int32(params.taprootHeight) - 1, params)
+    check sfTaproot in getBlockScriptFlags(0, params)
 
   test "regtest all flags from genesis":
     let params = regtestParams()

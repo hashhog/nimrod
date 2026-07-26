@@ -111,6 +111,7 @@ import ./test_w167_getblockstats
 import ./test_witness_consensus_fixes
 import ./test_w170_tapscript_codesep_sighash
 import ./test_wtxid_getdata
+import ./test_script_flag_exceptions
 
 when isMainModule:
   echo "Running all tests..."

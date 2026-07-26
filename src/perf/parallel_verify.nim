@@ -90,8 +90,16 @@ proc verifyScriptsParallel*(
   ## correct for this network (regtest/testnet4/mainnet).  Callers MUST pass
   ## the actual chain params — the mainnetParams() default is kept for
   ## backwards-compatible call sites that only exist in tests.
+  ##
+  ## When `blockHash` is empty we derive it from `blk.header` rather than
+  ## falling through to a hash-blind flag computation: a hash-less block path
+  ## can never honour Core's script_flag_exceptions and would silently
+  ## hard-fork on mainnet 170060 / 692261.
 
-  let flags = getBlockScriptFlags(height, chainParams, blockHash)
+  let effectiveHash =
+    if blockHash.len > 0: blockHash
+    else: $BlockHash(doubleSha256(serialize(blk.header)))
+  let flags = getBlockScriptFlags(height, chainParams, effectiveHash)
 
   # Track intra-block UTXOs for transactions that spend outputs created earlier in same block
   var intraBlockUtxos: seq[tuple[txid: TxId, vout: uint32, entry: UtxoEntry]]
@@ -188,14 +196,18 @@ proc verifyScriptsParallelBatch*(
   ## batchSize = 0 uses auto-tuning based on CPU count
   ##
   ## chainParams and blockHash must match the block being validated — see
-  ## verifyScriptsParallel for rationale.
+  ## verifyScriptsParallel for rationale.  An empty blockHash is derived from
+  ## blk.header so this path can never be exception-blind.
 
   let effectiveBatchSize = if batchSize == 0:
     max(16, countProcessors() * 4)
   else:
     batchSize
 
-  let flags = getBlockScriptFlags(height, chainParams, blockHash)
+  let effectiveHash =
+    if blockHash.len > 0: blockHash
+    else: $BlockHash(doubleSha256(serialize(blk.header)))
+  let flags = getBlockScriptFlags(height, chainParams, effectiveHash)
 
   # Collect all verification tasks across the block
   var allTasks: seq[InputVerificationTask]
