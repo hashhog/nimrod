@@ -388,6 +388,12 @@ proc loadConfigFile*(config: var NimrodConfig) =
         let v = parseInt(value)
         if v >= 0 and v <= 1048576:
           config.dbcacheMiB = v
+          # Also size the RocksDB cfUtxo block cache. Without this, --dbcache
+          # reached ONLY ChainState's in-memory CoinsViewCache and the RocksDB
+          # block cache stayed pinned at the 512 MiB compile-time const — the
+          # flag was dead for the storage engine. Quarter of the budget to the
+          # block cache, the rest stays with the coins cache.
+          if v > 0: utxoCacheOverrideMiB = max(v div 4, 256)
       except ValueError: discard
     of "daemon":
       config.daemon = value.toLowerAscii() in ["1", "true", "yes"]
@@ -718,6 +724,9 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
             echo "dbcache must be 0-1048576 MiB (0 = compiled default ~2 GiB)"
             quit(1)
           result.config.dbcacheMiB = v
+          # See the note at the other --dbcache parse site: this is what makes
+          # the flag reach RocksDB at all.
+          if v > 0: utxoCacheOverrideMiB = max(v div 4, 256)
         except ValueError:
           echo "Invalid dbcache: " & p.val
           quit(1)

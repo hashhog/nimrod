@@ -15,7 +15,8 @@ const LibRocksDb* = "librocksdb.so"
 
 # Performance tuning constants
 const
-  BlockCacheSize* = 512 * 1024 * 1024'u64       # 512 MiB shared block cache
+  BlockCacheSize* = 512 * 1024 * 1024'u64       # 512 MiB default UTXO block cache
+  ColdCacheSize* = 128 * 1024 * 1024'u64        # 128 MiB shared cache for the cold CFs
   WriteBufferSize* = 64 * 1024 * 1024'u64       # 64 MiB write buffer
   MaxWriteBufferNumber* = 3                      # 3 write buffers max
   BloomFilterBits* = 10                          # 10-bit bloom filter
@@ -206,7 +207,8 @@ type
       ## periodic IBD chainstate checkpoint can be made atomically crash-
       ## durable even while WAL is globally off. See `writeSynced`.
     readOpts: RocksDbReadOptionsPtr
-    blockCache: RocksDbCachePtr
+    blockCache: RocksDbCachePtr    ## cfUtxo only (hot working set)
+    coldCache: RocksDbCachePtr     ## every other CF (write-once / streamed)
     bloomFilter: RocksDbFilterPolicyPtr
     cfTableOpts: array[ColumnFamily, RocksDbBlockBasedOptionsPtr]
 
@@ -216,17 +218,38 @@ type
 
   DatabaseConfig* = object
     ## Configuration for database performance tuning
-    blockCacheSize*: uint64
+    blockCacheSize*: uint64      ## cfUtxo (hot) block cache
+    coldCacheSize*: uint64       ## shared cache for all other CFs
     writeBufferSize*: uint64
     maxWriteBuffers*: int
     bloomFilterBits*: int
     useCompression*: bool
     syncWrites*: bool
 
+var utxoCacheOverrideMiB*: int = 0
+  ## Operator override for the cfUtxo block cache, in MiB, set from --dbcache
+  ## before the database is opened.
+  ##
+  ## WHY A MODULE GLOBAL: --dbcache used to be a DEAD FLAG for RocksDB. It
+  ## reached only ChainState's in-memory CoinsViewCache (chainstate.nim
+  ## setDbCache), while newChainState -> openChainDb(dbPath) ->
+  ## openDatabase(path) opened RocksDB with bare defaults, so the block cache
+  ## was always the compile-time 512 MiB const no matter what the operator
+  ## passed. nimrod's own RPC even reported that const as the coins-DB budget.
+  ## Threading the value down would mean changing newChainState's signature and
+  ## every caller; setting this global at flag-parse time (which happens before
+  ## any DB open) fixes the flag with no signature churn.
+  ##
+  ## PERF-ONLY / CONSENSUS-NEUTRAL: a block cache sits below the key/value
+  ## interface, so reads return identical bytes regardless of its size.
+
 proc defaultDbConfig*(): DatabaseConfig =
   ## Default performance-tuned configuration
   DatabaseConfig(
-    blockCacheSize: BlockCacheSize,
+    blockCacheSize: (if utxoCacheOverrideMiB > 0:
+                       uint64(utxoCacheOverrideMiB) * 1024'u64 * 1024'u64
+                     else: BlockCacheSize),
+    coldCacheSize: ColdCacheSize,
     writeBufferSize: WriteBufferSize,
     maxWriteBuffers: MaxWriteBufferNumber,
     bloomFilterBits: BloomFilterBits,
@@ -246,6 +269,7 @@ proc cfNames(): array[ColumnFamily, string] =
 
 proc createCfOptions(config: DatabaseConfig, cf: ColumnFamily,
                       blockCache: RocksDbCachePtr,
+                      coldCache: RocksDbCachePtr,
                       bloomFilter: RocksDbFilterPolicyPtr): tuple[opts: RocksDbOptionsPtr, tableOpts: RocksDbBlockBasedOptionsPtr] =
   ## Create optimized options for each column family
   result.opts = rocksdb_options_create()
@@ -289,9 +313,15 @@ proc createCfOptions(config: DatabaseConfig, cf: ColumnFamily,
   # Block-based table options with bloom filter and cache
   result.tableOpts = rocksdb_block_based_options_create()
 
-  # Set block cache (shared across CFs)
-  if blockCache != nil:
-    rocksdb_block_based_options_set_block_cache(result.tableOpts, blockCache)
+  # CACHE ISOLATION: the hot cfUtxo gets its own cache; every other CF shares
+  # a small one. Previously ALL CFs were handed the single `blockCache`, so
+  # write-once/streamed data (block_index, blocks, tx_index, undo, ...)
+  # competed for the same LRU as the UTXO working set and evicted it. Measured
+  # on the live from-genesis rig: the shared 512 MiB was already 93% full at
+  # height 230,873, with block_index (158 MB) resident against utxo (184 MB).
+  let cfCache = if cf == cfUtxo: blockCache else: coldCache
+  if cfCache != nil:
+    rocksdb_block_based_options_set_block_cache(result.tableOpts, cfCache)
 
   # Bloom filter for UTXO lookups (critical for performance)
   if cf == cfUtxo and bloomFilter != nil:
@@ -308,8 +338,9 @@ proc openDatabase*(path: string, config: DatabaseConfig = defaultDbConfig()): Da
 
   result = Database(path: path)
 
-  # Create shared block cache (512MB default)
+  # Two caches: hot (cfUtxo) and cold (everything else). See createCfOptions.
   result.blockCache = rocksdb_cache_create_lru(csize_t(config.blockCacheSize))
+  result.coldCache = rocksdb_cache_create_lru(csize_t(config.coldCacheSize))
 
   # Create bloom filter policy (10-bit default)
   result.bloomFilter = rocksdb_filterpolicy_create_bloom_full(cint(config.bloomFilterBits))
@@ -361,7 +392,8 @@ proc openDatabase*(path: string, config: DatabaseConfig = defaultDbConfig()): Da
 
   for cf in ColumnFamily:
     cfNamePtrs[cf] = cstring(cfNamesList[cf])
-    let (opts, tableOpts) = createCfOptions(config, cf, result.blockCache, result.bloomFilter)
+    let (opts, tableOpts) = createCfOptions(config, cf, result.blockCache,
+                                            result.coldCache, result.bloomFilter)
     cfOpts[cf] = opts
     cfTableOpts[cf] = tableOpts
 
@@ -444,6 +476,9 @@ proc close*(db: Database) =
   if db.blockCache != nil:
     rocksdb_cache_destroy(db.blockCache)
     db.blockCache = nil
+  if db.coldCache != nil:
+    rocksdb_cache_destroy(db.coldCache)
+    db.coldCache = nil
   # Note: bloomFilter is owned by cfTableOpts after set_filter_policy; do NOT destroy separately
 
 proc get*(db: Database, cf: ColumnFamily, key: openArray[byte]): Option[seq[byte]] =
