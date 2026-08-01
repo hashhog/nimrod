@@ -244,20 +244,30 @@ suite "Trickling behavior":
     check state.nextTrickleTime >= now
 
 suite "Inventory item types":
-  test "tx items use witness tx type":
+  test "tx inv type follows BIP-339 per-peer wtxidrelay":
+    # Core RelayTransaction (net_processing.cpp): wtxid-relay peers are
+    # announced MSG_WTX with the wtxid; legacy peers MSG_TX with the txid.
+    # MSG_WITNESS_TX is a getdata request type, never an inv type.
     let rm = newRelayManager()
-    let peer = newPeer("127.0.0.1", 8333, mainnetParams(), pdOutbound)
+    let legacyPeer = newPeer("127.0.0.1", 8333, mainnetParams(), pdOutbound)
+    let wtxPeer = newPeer("127.0.0.2", 8333, mainnetParams(), pdOutbound)
+    wtxPeer.wtxidRelay = true
 
-    rm.registerPeer(peer)
+    rm.registerPeer(legacyPeer)
+    rm.registerPeer(wtxPeer)
 
     var txHash: array[32, byte]
     txHash[0] = 0x66
 
     rm.queueTxInv(txHash)
 
-    let state = rm.getPeerState(peer)
-    check state.invQueue.len == 1
-    check state.invQueue[0].invType == invWitnessTx
+    let legacyState = rm.getPeerState(legacyPeer)
+    check legacyState.invQueue.len == 1
+    check legacyState.invQueue[0].invType == invTx
+
+    let wtxState = rm.getPeerState(wtxPeer)
+    check wtxState.invQueue.len == 1
+    check wtxState.invQueue[0].invType == invWtx
 
 suite "RelayManager lifecycle":
   test "start and stop":

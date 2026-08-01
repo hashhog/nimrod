@@ -317,13 +317,13 @@ suite "W124 datadir + supervision + ops UX (G21-G30)":
 
   test "G29 BUG-13 (P2): getnetworkinfo version drift":
     ## Three sources of truth:
-    ##   src/nimrod.nim:21               NimrodVersion = "0.1.0"
-    ##   src/network/messages.nim:22     UserAgent = "/nimrod:0.1.0/"
-    ##   src/rpc/server.nim:3418-3419    "version": 210000, "subversion": "/nimrod:0.1.0/"
+    ##   src/nimrod.nim:24               NimrodVersion = "1.0.0"
+    ##   src/network/messages.nim:22     UserAgent = "/nimrod:1.0.0/"
+    ##   src/rpc/server.nim:5274-5275    "version": 210000, "subversion": "/nimrod:1.0.0/"
     ## No cross-reference: bumping NimrodVersion will NOT update the handshake.
     let rpcSrc = readFile("src/rpc/server.nim")
     check "\"version\": 210000" in rpcSrc
-    check "\"subversion\": \"/nimrod:0.1.0/\"" in rpcSrc
+    check "\"subversion\": \"/nimrod:1.0.0/\"" in rpcSrc
     # The drift: nothing in handleGetNetworkInfo references NimrodVersion.
     check "NimrodVersion" notin rpcSrc
 

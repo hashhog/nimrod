@@ -19,7 +19,7 @@ const
   MaxGetAddrCount* = 1000          # Cap for getaddr response (matches Bitcoin Core)
   MaxPkgTxnsCount* = 25            # BIP-331: max txs per pkgtxns (== mempool ancestor limit)
   ProtocolVersion* = 70016'u32
-  UserAgent* = "/nimrod:0.1.0/"
+  UserAgent* = "/nimrod:1.0.0/"
   NodeNetwork* = 1'u64
   NodeBloom* = 4'u64           ## BIP-111 / BIP-35: served bloom filters + mempool
   NodeWitness* = 8'u64

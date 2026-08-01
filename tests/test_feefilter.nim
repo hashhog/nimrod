@@ -44,19 +44,24 @@ suite "FeeFilterRounder":
   test "round provides privacy by quantizing":
     let rounder = newFeeFilterRounder()
 
-    # Two close values should often round to the same bucket
+    # Two close values share the same adjacent bucket pair, so the dithered
+    # results (2/3 round-down, 1/3 exact bucket — Core block_policy_estimator.cpp
+    # FeeFilterRounder::round) differ by at most one bucket spacing (~10%).
+    # This bound is deterministic; the per-call reseed makes a strict
+    # frequency threshold flaky.
     var sameCount = 0
     for _ in 0 ..< 100:
       let base = 5000'i64
       let r1 = rounder.round(base)
       let r2 = rounder.round(base + 100)  # Small difference
 
-      # Not always the same due to randomization, but often
+      check abs(r1 - r2) <= int64(ceil(5100.0 * (FeeFilterSpacing - 1.0))) + 1
       if r1 == r2:
         inc sameCount
 
-    # Should be same bucket most of the time
-    check sameCount > 50
+    # Dither sanity: the two coincide a non-trivial share of the time
+    # (expected ~5/9 of draws under independence; conservative floor).
+    check sameCount > 25
 
 suite "Fee rate calculation":
   test "calculateFeeRate computes sat/kvB":

@@ -228,9 +228,10 @@ proc mainnetParams*(): ConsensusParams =
     (279000'u32, BlockHash(hexToBytes32("0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40"))),
     (295000'u32, BlockHash(hexToBytes32("00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983")))
   ]
-  # assumeUTXO snapshot data — verbatim from Bitcoin Core
+  # assumeUTXO snapshot data — first four entries verbatim from Bitcoin Core
   # bitcoin-core/src/kernel/chainparams.cpp::CMainParams::m_assumeutxo_data
-  # (commit pinned by the bitcoin-core/ submodule). All four mainnet entries.
+  # (commit pinned by the bitcoin-core/ submodule). The 944183 and 481823
+  # entries are nimrod's own snapshot-campaign additions (not in Core).
   result.assumeutxoData = @[
     AssumeutxoData(
       height: 840000'i32,

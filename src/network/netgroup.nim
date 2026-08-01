@@ -334,21 +334,22 @@ proc isRoutable*(ip: array[16, byte]): bool =
 
 proc getNetGroup*(ip: IpAddr): NetGroup =
   ## Get the network group for this IP address
-  ## Reference: Bitcoin Core netgroup.cpp GetGroup()
+  ## Reference: Bitcoin Core netgroup.cpp NetGroupManager::GetGroup()
   ##
   ## For IPv4: /16 group (first 2 octets)
   ## For IPv6: /32 group (first 4 bytes)
   ## For privacy networks (Tor, I2P): first 4 bits
-  ## For localhost: all in same group
-  ## For unroutable: all in same group
+  ## For localhost AND unroutable: all addresses within an address family
+  ## share one group — the bare net-class byte, with no address bits
+  ## (Core: "all local addresses belong to the same group" /
+  ##  "all other unroutable addresses belong to the same group",
+  ##  vchRet.push_back(address.GetNetClass())).
 
-  if ip.isLocal():
-    # All localhost addresses in same group
-    return NetGroup(data: @[NetLocal])
-
-  if not ip.isRoutable():
-    # All unroutable in same group
-    return NetGroup(data: @[NetUnroutable])
+  if ip.isLocal() or not ip.isRoutable():
+    if ip.isV6 and not ip.isIPv4Mapped():
+      return NetGroup(data: @[NetIPv6])
+    # IPv4 and IPv4-mapped IPv6 are the same family (Core HasLinkedIPv4).
+    return NetGroup(data: @[NetIPv4])
 
   if ip.isV6:
     if ip.isIPv4Mapped():

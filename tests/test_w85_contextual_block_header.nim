@@ -533,12 +533,16 @@ suite "W85 time-too-new overflow fix (validateBlockHeader)":
     let prevHash = getBlockHash(blk0)
     let prevIdx = cs.db.getBlockIndex(prevHash).get()
 
-    let nearFuture = uint32(getTime().toUnix()) + 7199'u32
+    # Drive the boundary through validateBlockHeader's injected deterministic
+    # clock: with checkPow=false and no injected clock, the wall-clock
+    # future-time gate is intentionally relaxed (validation.nim:1046-1054),
+    # so validateBlock can never surface veTimeTooNew on this path.
+    let nowSec = getTime().toUnix()
+    let nearFuture = uint32(nowSec) + 7199'u32
     let goodBlk = makeBlk(prevHash, 1, nearFuture)
-    let res = validateBlock(goodBlk, prevIdx, cs.db, regtestParams(),
-                            checkScripts=false, checkPow=false)
-    if not res.isOk:
-      check res.error != veTimeTooNew
+    let res = validateBlockHeader(goodBlk.header, prevIdx, regtestParams(),
+                                  checkPow=false, currentTime=nowSec)
+    check res.isOk
 
   test "timestamp > MAX_FUTURE_BLOCK_TIME is rejected":
     ## A block with timestamp = now + 7201s must fail with veTimeTooNew.
@@ -552,10 +556,11 @@ suite "W85 time-too-new overflow fix (validateBlockHeader)":
     let prevHash = getBlockHash(blk0)
     let prevIdx = cs.db.getBlockIndex(prevHash).get()
 
-    let farFuture = uint32(getTime().toUnix()) + 7201'u32
+    let nowSec = getTime().toUnix()
+    let farFuture = uint32(nowSec) + 7201'u32
     let badBlk = makeBlk(prevHash, 1, farFuture)
-    let res = validateBlock(badBlk, prevIdx, cs.db, regtestParams(),
-                            checkScripts=false, checkPow=false)
+    let res = validateBlockHeader(badBlk.header, prevIdx, regtestParams(),
+                                  checkPow=false, currentTime=nowSec)
     check (not res.isOk)
     check res.error == veTimeTooNew
 

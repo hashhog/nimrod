@@ -1,7 +1,12 @@
-## Tests for peer misbehavior scoring
-## Validates Bitcoin Core compatible misbehavior tracking
+## Tests for peer misbehavior handling
+## Validates Bitcoin Core compatible misbehavior tracking.
+##
+## Core PR #25974 (v24.0): score accumulation was REMOVED — Misbehaving()
+## now sets m_should_discourage unconditionally on the first call. nimrod
+## mirrors this: misbehaving() sets peer.shouldDisconnect = true and the
+## misbehaviorScore field is no longer accumulated (peer.nim:1708-1721).
 
-import unittest
+import unittest2
 import std/times
 import ../src/network/peer
 import ../src/consensus/params
@@ -13,53 +18,50 @@ suite "misbehavior scoring":
     check peer.misbehaviorScore == 0
     check peer.shouldDisconnect == false
 
-  test "misbehaving adds score":
+  test "misbehaving flags peer for discourage (PR #25974)":
     let params = mainnetParams()
     var peer = newPeer("192.168.1.1", 8333, params)
     misbehaving(peer, 10, "test violation")
-    check peer.misbehaviorScore == 10
-    check peer.shouldDisconnect == false
+    # Any Misbehaving call discourages immediately — no accumulation
+    check peer.shouldDisconnect == true
+    check peer.shouldBan() == true
 
-  test "scores accumulate":
+  test "repeated misbehavior keeps discourage flag (no accumulation)":
     let params = mainnetParams()
     var peer = newPeer("192.168.1.1", 8333, params)
     misbehaving(peer, 10, "first")
     misbehaving(peer, 20, "second")
     misbehaving(peer, 30, "third")
-    check peer.misbehaviorScore == 60
-    check peer.shouldDisconnect == false
+    # Core removed the score counter; the flag is set exactly once
+    check peer.misbehaviorScore == 0
+    check peer.shouldDisconnect == true
 
-  test "threshold triggers disconnect flag":
+  test "single low-score violation triggers disconnect flag (PR #25974)":
     let params = mainnetParams()
     var peer = newPeer("192.168.1.1", 8333, params)
-    misbehaving(peer, 50, "first")
-    check peer.shouldDisconnect == false
-    misbehaving(peer, 50, "second - reaches threshold")
-    check peer.misbehaviorScore == 100
+    misbehaving(peer, 1, "minor violation")
     check peer.shouldDisconnect == true
 
   test "instant ban with high score":
     let params = mainnetParams()
     var peer = newPeer("192.168.1.1", 8333, params)
-    # Invalid block header = 100 points = instant ban
+    # Invalid block header = instant discourage
     misbehaving(peer, ScoreInvalidBlockHeader, "invalid block header")
-    check peer.misbehaviorScore == 100
     check peer.shouldDisconnect == true
     check peer.shouldBan() == true
 
-  test "score capped at threshold":
+  test "score field stays zero (accumulation removed by PR #25974)":
     let params = mainnetParams()
     var peer = newPeer("192.168.1.1", 8333, params)
     misbehaving(peer, 200, "excessive")
-    check peer.misbehaviorScore == 100  # Capped at threshold
+    check peer.misbehaviorScore == 0
+    check peer.shouldBan() == true
 
-  test "shouldBan returns true at threshold":
+  test "shouldBan mirrors the discourage flag":
     let params = mainnetParams()
     var peer = newPeer("192.168.1.1", 8333, params)
     check peer.shouldBan() == false
-    misbehaving(peer, 99, "almost there")
-    check peer.shouldBan() == false
-    misbehaving(peer, 1, "one more")
+    misbehaving(peer, 1, "one violation is enough")
     check peer.shouldBan() == true
 
   test "resetMisbehavior clears score":

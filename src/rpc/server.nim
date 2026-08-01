@@ -309,7 +309,10 @@ proc buildDeployments*(rpc: RpcServer, targetHash: BlockHash, targetHeight: int3
   ## Build canonical deployment state for both getblockchaininfo.softforks and
   ## getdeploymentinfo.deployments.  Returns a JSON object keyed by fork id.
   ##
-  ## Buried deployments: active = (targetHeight >= activationHeight)
+  ## Buried deployments: active = (targetHeight + 1 >= activationHeight)
+  ##   Core reports "active" via DeploymentActiveAfter(tip, dep) — "active
+  ##   from when the chain height is one below the activation height"
+  ##   (deploymentstatus.h, rpc/blockchain.cpp getdeploymentinfo).
   ## BIP9  deployments: state is derived by running the BIP9 state machine
   ##                    against the live chain (chainState.db), not from any
   ##                    hard-coded table.
@@ -318,7 +321,7 @@ proc buildDeployments*(rpc: RpcServer, targetHash: BlockHash, targetHeight: int3
   proc buriedDeployment(activationHeight: int, currentHeight: int32): JsonNode =
     result = newJObject()
     result["type"] = %"buried"
-    result["active"] = %(currentHeight >= int32(activationHeight))
+    result["active"] = %(currentHeight + 1 >= int32(activationHeight))
     result["height"] = %activationHeight
 
   result = newJObject()
@@ -5272,7 +5275,7 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
 
   %*{
     "version": 210000,
-    "subversion": "/nimrod:0.1.0/",
+    "subversion": "/nimrod:1.0.0/",
     "protocolversion": 70016,
     "localservices": localServicesHex,
     "localservicesnames": localServicesNames,

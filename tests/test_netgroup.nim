@@ -1,39 +1,59 @@
 ## Tests for network group computation (eclipse protection)
-## Reference: Bitcoin Core netgroup.cpp GetGroup()
+## Reference: Bitcoin Core netgroup.cpp NetGroupManager::GetGroup()
+##
+## Core semantics: local AND unroutable addresses carry no address bits in
+## their group — they all share the bare net-class byte within an address
+## family. /16 (IPv4) and /32 (IPv6) grouping only applies to ROUTABLE
+## addresses.
 
-import unittest
+import unittest2
 import std/strutils
 import ../src/network/netgroup
 
 suite "network group computation":
   test "IPv4 /16 grouping":
-    # Same /16 subnet should have same group
-    let ip1 = parseIpAddr("192.168.1.1")
-    let ip2 = parseIpAddr("192.168.2.1")
-    let ip3 = parseIpAddr("192.169.1.1")
+    # Same /16 subnet should have same group (routable addresses — Core
+    # only groups routable IPv4 by /16; unroutable collapses to one group)
+    let ip1 = parseIpAddr("8.8.1.1")
+    let ip2 = parseIpAddr("8.8.2.1")
+    let ip3 = parseIpAddr("8.9.1.1")
 
     let ng1 = getNetGroup(ip1)
     let ng2 = getNetGroup(ip2)
     let ng3 = getNetGroup(ip3)
 
-    # 192.168.x.x should be in same group
+    # 8.8.x.x should be in same group
     check ng1 == ng2
-    # 192.169.x.x should be different
+    # 8.9.x.x should be different
     check ng1 != ng3
 
   test "IPv4 different /16 subnets":
-    let ip1 = parseIpAddr("10.0.0.1")
-    let ip2 = parseIpAddr("10.1.0.1")
-    let ip3 = parseIpAddr("172.16.0.1")
+    # Routable addresses: different /16 -> different groups
+    let ip1 = parseIpAddr("10.0.0.1")  # RFC1918: unroutable
+    let ip2 = parseIpAddr("1.2.3.4")
+    let ip3 = parseIpAddr("8.8.8.8")
 
     let ng1 = getNetGroup(ip1)
     let ng2 = getNetGroup(ip2)
     let ng3 = getNetGroup(ip3)
 
-    # Different /16 should have different groups
+    # Unroutable 10.x collapses to [NetIPv4]; routable get [NetIPv4, a, b]
     check ng1 != ng2
     check ng1 != ng3
     check ng2 != ng3
+
+  test "unroutable IPv4 addresses share one group (Core)":
+    # Core netgroup.cpp: "all other unroutable addresses belong to the same
+    # group" — no address bits, just the net-class byte.
+    let ng1 = getNetGroup(parseIpAddr("10.0.0.1"))
+    let ng2 = getNetGroup(parseIpAddr("10.1.0.1"))
+    let ng3 = getNetGroup(parseIpAddr("172.16.0.1"))
+    let ng4 = getNetGroup(parseIpAddr("192.168.1.1"))
+
+    check ng1 == ng2
+    check ng1 == ng3
+    check ng1 == ng4
+    check ng1.data == @[NetIPv4]
 
   test "IPv6 /32 grouping":
     # Same /32 prefix should have same group
@@ -51,26 +71,33 @@ suite "network group computation":
     check ng1 != ng3
 
   test "IPv4-mapped IPv6 uses IPv4 rules":
-    # Pure IPv4 address
-    let ipv4 = parseIpAddr("192.168.1.1")
+    # Pure routable IPv4 address
+    let ipv4 = parseIpAddr("8.8.8.8")
     check ipv4.isV6 == false
 
     let ng4 = getNetGroup(ipv4)
     # Check that IPv4 group uses NetIPv4 type and has /16 data
     check ng4.data.len == 3
     check ng4.data[0] == NetIPv4
-    check ng4.data[1] == 192
-    check ng4.data[2] == 168
+    check ng4.data[1] == 8
+    check ng4.data[2] == 8
 
-    # IPv4-mapped IPv6 should also use IPv4 rules
+    # IPv4-mapped IPv6 should also use IPv4 rules (Core HasLinkedIPv4)
     var ipv6mapped: IpAddr
-    ipv6mapped = IpAddr(isV6: true, v6: [0'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 192, 168, 1, 1])
+    ipv6mapped = IpAddr(isV6: true, v6: [0'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 8, 8, 8, 8])
     check ipv6mapped.isIPv4Mapped() == true
 
     let ng6 = getNetGroup(ipv6mapped)
     check ng6.data.len == 3
     check ng6.data[0] == NetIPv4
     check ng6 == ng4  # Should match the IPv4 version
+
+    # Unroutable mapped address: no address bits, bare class byte (Core:
+    # unroutable addresses share one group per family)
+    var mappedPriv: IpAddr
+    mappedPriv = IpAddr(isV6: true, v6: [0'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 192, 168, 1, 1])
+    let ngPriv = getNetGroup(mappedPriv)
+    check ngPriv.data == @[NetIPv4]
 
   test "localhost grouping":
     let ip1 = parseIpAddr("127.0.0.1")
@@ -89,10 +116,10 @@ suite "network group computation":
     let ip = parseIpAddr("::1")
     let ng = getNetGroup(ip)
 
-    # Should be in local group
+    # Local IPv6 collapses to the bare family class byte (Core netgroup.cpp:
+    # local addresses share one group — the net-class byte)
     check ip.isLocal()
-    check ng.data.len >= 1
-    check ng.data[0] == NetLocal
+    check ng.data == @[NetIPv6]
 
   test "unroutable addresses":
     # 0.0.0.0 is truly unroutable
@@ -103,13 +130,13 @@ suite "network group computation":
     let ip2 = parseIpAddr("224.0.0.1")
     check ip2.isRoutable() == false
 
-    # Private addresses ARE routable for netgroup purposes
-    # (they route within their private networks)
+    # Private (RFC1918) addresses are NOT routable per Core
+    # CNetAddr::IsRoutable (!IsRFC1918() && ...)
     let ip3 = parseIpAddr("10.0.0.1")
-    check ip3.isRoutable() == true
+    check ip3.isRoutable() == false
 
     let ip4 = parseIpAddr("192.168.1.1")
-    check ip4.isRoutable() == true
+    check ip4.isRoutable() == false
 
   test "routable addresses":
     let ip1 = parseIpAddr("8.8.8.8")
@@ -119,10 +146,12 @@ suite "network group computation":
     check ip2.isRoutable() == true
 
   test "same netgroup check":
+    # Unroutable IPv4 all share one group (Core); routable group by /16
     check sameNetGroup("192.168.1.1", "192.168.2.2") == true
-    check sameNetGroup("192.168.1.1", "192.169.1.1") == false
-    check sameNetGroup("10.0.1.1", "10.0.2.2") == true
-    check sameNetGroup("10.0.1.1", "10.1.1.1") == false
+    check sameNetGroup("192.168.1.1", "8.8.8.8") == false
+    check sameNetGroup("10.0.1.1", "10.1.1.1") == true
+    check sameNetGroup("8.8.1.1", "8.8.2.2") == true
+    check sameNetGroup("8.8.1.1", "8.9.1.1") == false
 
   test "netgroup from string with port":
     # Should strip port correctly
@@ -141,9 +170,9 @@ suite "network group computation":
     check kg1 == kg2
 
   test "keyed netgroup different for different netgroups":
-    # Different /16 subnets should have different keyed netgroups
-    let ip1 = parseIpAddr("192.168.1.1")
-    let ip2 = parseIpAddr("10.0.0.1")
+    # Different routable /16 subnets should have different keyed netgroups
+    let ip1 = parseIpAddr("8.8.8.8")
+    let ip2 = parseIpAddr("1.2.3.4")
     let key = 0x1234567890abcdef'u64
 
     let kg1 = getKeyedNetGroup(ip1, key)
@@ -153,8 +182,8 @@ suite "network group computation":
 
   test "keyed netgroup same for same netgroup":
     # Same /16 subnet should have same keyed netgroup
-    let ip1 = parseIpAddr("192.168.1.1")
-    let ip2 = parseIpAddr("192.168.2.2")
+    let ip1 = parseIpAddr("8.8.1.1")
+    let ip2 = parseIpAddr("8.8.2.2")
     let key = 0x1234567890abcdef'u64
 
     let kg1 = getKeyedNetGroup(ip1, key)

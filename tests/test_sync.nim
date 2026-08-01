@@ -2,7 +2,8 @@
 ## Validates work calculation, header validation, and chain management
 ## Includes anti-DoS header sync (PRESYNC/REDOWNLOAD) tests
 
-import std/[unittest, tables, options, times]
+import unittest2
+import std/[tables, options, times]
 import ../src/network/sync
 import ../src/network/headerssync
 import ../src/consensus/params
