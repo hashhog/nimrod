@@ -16,7 +16,19 @@ jobs:
       - uses: jiro4989/setup-nim-action@v2
         with:
           nim-version: '2.2.8'  # nimble 0.20.1; newer nimble (0.22.x) breaks `nimble setup`
-      - run: sudo apt-get update && sudo apt-get install -y libsecp256k1-dev librocksdb-dev libsnappy-dev liblz4-dev libsqlite3-dev zlib1g-dev
+      - run: sudo apt-get update && sudo apt-get install -y librocksdb-dev libsnappy-dev liblz4-dev libsqlite3-dev zlib1g-dev
+      # Distro libsecp256k1 is too old for BIP-324 (no ellswift symbols) —
+      # build v0.6.0 from source instead. Do NOT install libsecp256k1-dev:
+      # it would shadow /usr/local/lib in ld's default search order.
+      - name: Build libsecp256k1 with ellswift
+        run: |
+          git clone --depth 1 --branch v0.6.0 https://github.com/bitcoin-core/secp256k1 /tmp/secp256k1
+          cd /tmp/secp256k1
+          ./autogen.sh
+          ./configure --enable-module-recovery --enable-module-extrakeys --enable-module-schnorrsig --enable-module-ellswift
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
       - run: nimble setup -y
       - run: nimble build -d:release -y
       - name: Package
