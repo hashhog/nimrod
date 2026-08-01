@@ -17,7 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jiro4989/setup-nim-action@v2
-      - run: sudo apt-get update && sudo apt-get install -y librocksdb-dev
+        with:
+          nim-version: '2.2.8'  # nimble 0.20.1; newer nimble (0.22.x) breaks `nimble setup`
+      - run: sudo apt-get update && sudo apt-get install -y libsecp256k1-dev librocksdb-dev libsnappy-dev liblz4-dev libsqlite3-dev zlib1g-dev
       - run: nimble setup -y
       - run: nimble build -d:release -y
 
@@ -27,7 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jiro4989/setup-nim-action@v2
-      - run: sudo apt-get update && sudo apt-get install -y librocksdb-dev
+        with:
+          nim-version: '2.2.8'  # nimble 0.20.1; newer nimble (0.22.x) breaks `nimble setup`
+      - run: sudo apt-get update && sudo apt-get install -y libsecp256k1-dev librocksdb-dev libsnappy-dev liblz4-dev libsqlite3-dev zlib1g-dev
       - run: nimble setup -y
       - run: nimble test -y
 
