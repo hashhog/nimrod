@@ -1,5 +1,5 @@
 # Package
-version       = "0.1.0"
+version       = "1.0.0"
 author        = "nimrod-dev"
 description   = "A Bitcoin full node in Nim"
 license       = "MIT"

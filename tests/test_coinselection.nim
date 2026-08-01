@@ -1,7 +1,8 @@
 ## Tests for Coin Selection Algorithms
 ## BnB (Branch-and-Bound) and Knapsack
 
-import std/[unittest, options, random, algorithm]
+import unittest2
+import std/[options, random, algorithm]
 import ../src/wallet/coinselection
 import ../src/primitives/types
 

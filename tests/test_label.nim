@@ -1,6 +1,7 @@
 ## Tests for address labels
 
-import std/[unittest, tables, algorithm, options]
+import unittest2
+import std/[tables, algorithm, options]
 import ../src/wallet/wallet
 import ../src/wallet/db_sqlite
 import ../src/primitives/types

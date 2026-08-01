@@ -8,7 +8,7 @@
 ## verifies it leaves a PID file behind.
 
 import unittest2
-import std/[os, osproc, posix, sets, strutils, tempfiles]
+import std/[os, osproc, posix, sets, strutils, tempfiles, hashes]
 
 import ../src/util/ops
 import ../src/nimrod
@@ -159,9 +159,13 @@ suite "ops: --daemon end-to-end smoke":
     let pidPath = tmp / "nimrod.pid"
     let logPath = tmp / "debug.log"
     let confPath = tmp / "alt.conf"
-    # Use a wholly-isolated regtest config: random unused-port-ish numbers
-    # well clear of the live mainnet/testnet4 fleet.
-    writeFile(confPath, "regtest=1\nrpcport=29945\nport=29944\nnorpc=0\n")
+    # Use a wholly-isolated regtest config. Ports are derived from the temp
+    # dir hash so a daemon leaked by an interrupted earlier run can never
+    # collide with this run's daemon (a bind crash would leave daemonPid=0
+    # and the signals below would hit our own process group).
+    let portSeed = hash(tmp) mod 20000 + 20000  # unique per temp dir, 20000..39999
+    writeFile(confPath, "regtest=1\nrpcport=" & $(portSeed + 1) &
+              "\nport=" & $portSeed & "\nnorpc=0\n")
 
     let cmd = bin & " start" &
               " --datadir=" & tmp &
@@ -189,8 +193,31 @@ suite "ops: --daemon end-to-end smoke":
       except ValueError: 0
     check daemonPid > 0
 
+    if daemonPid <= 0:
+      # Never signal Pid(0): that targets OUR OWN process group. A missing/
+      # unparsable PID means the daemon crashed at startup (its debug.log
+      # has the cause) — fail the test here instead of killing the suite.
+      if fileExists(logPath):
+        echo readFile(logPath)
+      fail()
+      removeDir(tmp)
+      return
+
     # PID must be alive
     check kill(Pid(daemonPid), 0) == 0
+
+    # Wait until the daemon has entered startNode: setupSignalHandlers runs
+    # immediately before it, and startNode logs "starting nimrod" on entry.
+    # Signalling before that point hits the DEFAULT disposition (SIGHUP would
+    # kill the daemon outright, SIGTERM would skip removePidFile), which
+    # makes the assertions below racy under load.
+    var started = false
+    for _ in 0 .. 100:
+      if fileExists(logPath) and readFile(logPath).contains("starting nimrod"):
+        started = true
+        break
+      sleep(100)
+    check started
 
     # Should NOT be a child of the test runner: real daemon parent is init/PID 1
     # (we don't assert getppid here from outside, but the kill(0) success +
@@ -212,9 +239,9 @@ suite "ops: --daemon end-to-end smoke":
       sleep(100)
     check gone
     # PID file must have been removed by the shutdown handler.
-    # Allow a small grace window.
+    # Allow a grace window (shutdown flush can lag process exit under load).
     var pidGone = false
-    for _ in 0 .. 20:
+    for _ in 0 .. 100:
       if not fileExists(pidPath):
         pidGone = true
         break

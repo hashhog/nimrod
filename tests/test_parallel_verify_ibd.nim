@@ -8,7 +8,8 @@
 ##    blocks with many inputs (the work that matters during mainnet IBD)
 ## 4. Assumevalid gate: with assumevalidBlockHash configured, no scripts fire
 
-import std/[unittest, options, times, cpuinfo, threadpool, os, tempfiles]
+import unittest2
+import std/[options, times, cpuinfo, threadpool, os, tempfiles]
 import ../src/perf/parallel_verify
 import ../src/consensus/[validation, params, assumevalid]
 import ../src/primitives/[types, serialize]
@@ -518,6 +519,10 @@ suite "parallel verify — assumevalid gate":
       # Give best header plenty of work (set high bytes)
       ctx.bestHeaderChainWork[31] = 0xFF
       ctx.bestHeaderChainWork[30] = 0xFF
+      # Condition 6 (faithful gate, commit 69dbc76): GetBlockProofEquivalentTime
+      # needs a valid nBits on the best header — left at zero the proof is
+      # zero and the gate fail-safes to ssrTooRecentForBestHeader.
+      ctx.bestHeaderBits = 0x1d00ffff'u32
 
       let reason = shouldSkipScripts(ctx, params)
       echo "shouldSkipScripts result: ", $reason
@@ -562,6 +567,10 @@ suite "parallel verify — assumevalid gate":
       )
       ctx.bestHeaderChainWork[31] = 0xFF
       ctx.bestHeaderChainWork[30] = 0xFF
+      # Condition 6 (faithful gate, commit 69dbc76): GetBlockProofEquivalentTime
+      # needs a valid nBits on the best header — left at zero the proof is
+      # zero and the gate fail-safes to ssrTooRecentForBestHeader.
+      ctx.bestHeaderBits = 0x1d00ffff'u32
 
       let skipReason = shouldSkipScripts(ctx, params)
       let skipScripts = skipReason == ssrSkip

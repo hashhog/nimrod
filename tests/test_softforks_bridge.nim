@@ -161,13 +161,13 @@ suite "softforks bridge: getblockchaininfo and getdeploymentinfo share one data 
       check di.hasKey(id)
 
   test "buried forks reflect regtest activation heights at genesis (getdeploymentinfo)":
-    ## On regtest segwit/taproot activate at height 0 (active from genesis);
-    ## csv/bip34/bip65/bip66 activate at height 1, so on a genesis-only chain
-    ## (height 0) csv is NOT yet active. buriedDeployment(height, 0): active iff
-    ## 0 >= activationHeight.
+    ## On regtest all buried deployments activate at height 1 (params.nim).
+    ## Core's getdeploymentinfo reports active = DeploymentActiveAfter(tip)
+    ## = (tip.height + 1) >= activationHeight, so on a genesis-only chain
+    ## (height 0) they are ALREADY reported active (deploymentstatus.h).
     let depInfo = rpc.handleGetDeploymentInfo(newJArray())
     check depInfo["deployments"]["segwit"]["active"].getBool() == true
-    check depInfo["deployments"]["csv"]["active"].getBool() == false
+    check depInfo["deployments"]["csv"]["active"].getBool() == true
 
   test "taproot is active on regtest (AlwaysActive BIP9)":
     let depInfo = rpc.handleGetDeploymentInfo(newJArray())

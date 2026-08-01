@@ -1,6 +1,7 @@
 ## Tests for Miniscript parsing, type checking, compilation, and satisfaction
 
-import std/[unittest, tables, options, sequtils, strutils]
+import unittest2
+import std/[tables, options, sequtils, strutils]
 import ../src/wallet/miniscript
 import ../src/crypto/hashing
 import ../src/script/interpreter

@@ -354,7 +354,7 @@ suite "RPC network info format":
                           "networkactive", "relayfee"]
     let networkInfo = %*{
       "version": 210000,
-      "subversion": "/nimrod:0.1.0/",
+      "subversion": "/nimrod:1.0.0/",
       "protocolversion": 70016,
       "localservices": "0000000000000409",
       "localrelay": true,
@@ -928,9 +928,11 @@ suite "RPC getdeploymentinfo":
 
   # Simulate the buried-deployment builder (mirrors server.nim logic)
   proc makeBuried(activationHeight: int, currentHeight: int32): JsonNode =
+    # Core DeploymentActiveAfter (deploymentstatus.h): active for the block
+    # AFTER the tip, i.e. from one below the activation height.
     result = newJObject()
     result["type"] = %"buried"
-    result["active"] = %(currentHeight >= int32(activationHeight))
+    result["active"] = %(currentHeight + 1 >= int32(activationHeight))
     result["height"] = %activationHeight
 
   # Simulate the top-level getdeploymentinfo response for regtest at height 0
@@ -1018,11 +1020,14 @@ suite "RPC getdeploymentinfo":
   test "getdeploymentinfo buried fields correct on regtest at height 0":
     let info = fakeDeploymentInfo(rp, 0)
     let deps = info["deployments"]
-    # csv and segwit both have activation height 0 on regtest -> active at height 0
+    # Core rpc/blockchain.cpp: active = DeploymentActiveAfter(tip, dep) =
+    # (tip.height + 1) >= activationHeight — "active from when the chain
+    # height is one below the activation height". On regtest all buried
+    # deployments activate at height 1 (params.nim; Core kernel/chainparams.cpp
+    # regtest), so at tip height 0 they are already reported active.
     check deps["csv"]["active"].getBool() == true
     check deps["segwit"]["active"].getBool() == true
-    # bip34 activation height is 500 on regtest -> not active at height 0
-    check deps["bip34"]["active"].getBool() == false
+    check deps["bip34"]["active"].getBool() == true
     check deps["bip34"]["height"].getInt() == rp.bip34Height
 
   test "versionbits stateName helper produces correct strings":

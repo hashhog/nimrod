@@ -14,7 +14,8 @@
 ## Reference siblings (live-verified byte-identical to Core): blockbrew
 ## internal/rpc/getblockstats_methods.go, hotbuns src/rpc/server.ts getBlockStats.
 
-import std/[unittest, json, options]
+import unittest2
+import std/[json, options]
 import ../src/primitives/[types, serialize]
 import ../src/consensus/[params, validation]
 import ../src/rpc/server

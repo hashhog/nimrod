@@ -1422,7 +1422,18 @@ suite "handleReorg single-batch atomicity (Pattern D)":
     # Build an active chain longer than MAX_REORG_DEPTH and try to
     # reorg it all the way back to genesis. handleReorg must refuse
     # before staging anything, leaving disk state untouched.
+    #
+    # The depth cap applies to PRUNED nodes only: an archive node retains
+    # all undo data and must follow the most-work valid chain to ANY depth
+    # (Core's ActivateBestChainStep walks back to the fork point unbounded;
+    # MIN_BLOCKS_TO_KEEP=288 is a pruning floor, not a consensus reorg
+    # limit). Enable the pruning flag to exercise the cap here.
     var cs = newChainState(TestDbPath, regtestParams())
+    # Free the RocksDB handle even if a check/defect aborts mid-test —
+    # a leaked handle fails every later suite with 'LOCK: No locks
+    # available' (same-process RocksDB path lock).
+    defer: cs.close()
+    cs.pruningEnabled = true
 
     let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
     discard cs.connectBlock(genesis, 0)

@@ -19,7 +19,8 @@ suite "pre-handshake message rejection (Bitcoin Core compatible)":
       var testPeer = newPeer("127.0.0.1", 18444, params, pdInbound)
       let result = validatePreHandshakeMessage(testPeer, kind)
       check result == marDropMisbehave
-      check testPeer.misbehaviorScore > 0
+      # Core PR #25974: discourage flag, not score accumulation
+      check testPeer.shouldDisconnect == true
 
   test "unsupported message prior to verack":
     # Reference: net_processing.cpp line 4016-4018
@@ -52,7 +53,8 @@ suite "pre-handshake message rejection (Bitcoin Core compatible)":
     # Second version is duplicate
     result = validatePreHandshakeMessage(peer, mkVersion)
     check result == marDropMisbehave
-    check peer.misbehaviorScore == ScoreDuplicateVersion
+    # Core PR #25974: discourage flag, not score accumulation
+    check peer.shouldDisconnect == true
 
   test "ignoring redundant verack message":
     # Reference: net_processing.cpp line 3822-3824

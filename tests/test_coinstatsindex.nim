@@ -1,6 +1,7 @@
 ## Tests for Coin Stats Index (coinstatsindex)
 
-import std/[unittest, os, options, tempfiles]
+import unittest2
+import std/[os, options, tempfiles]
 import ../src/storage/indexes/coinstatsindex
 import ../src/storage/indexes/base
 import ../src/storage/db

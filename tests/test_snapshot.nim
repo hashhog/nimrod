@@ -2,7 +2,8 @@
 ## Covers VARINT, CompressAmount/Script, per-coin layout, file round-trip,
 ## metadata validation, and assumeutxo data wiring.
 
-import std/[os, options, tables, unittest, strutils, json]
+import unittest2
+import std/[os, options, tables, strutils, json]
 import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing
 import ../src/crypto/muhash
@@ -604,13 +605,19 @@ suite "snapshot dump via ChainState":
 # ----------------------------------------------------------------------------
 
 suite "assumeutxo data":
-  test "mainnet has all 4 Core entries":
+  test "mainnet has the 4 Core entries plus nimrod campaign entries":
     let p = mainnetParams()
-    check p.assumeutxoData.len == 4
+    check p.assumeutxoData.len == 6
+    # Core kernel/chainparams.cpp mainnet m_assumeutxo_data, verbatim
     let heights = [840000'i32, 880000, 910000, 935000]
     for i, h in heights:
       check p.assumeutxoData[i].height == h
       check p.assumeutxoData[i].chainTxCount > 0
+    # nimrod's own snapshot campaign points (not in Core): the 944183
+    # campaign snapshot and the Track-B pre-segwit boundary entry (481823,
+    # INERT per commit 9be207b)
+    check p.assumeutxoData[4].height == 944183'i32
+    check p.assumeutxoData[5].height == 481823'i32
 
   test "mainnet 840k blockhash matches Core":
     let p = mainnetParams()
@@ -2067,7 +2074,8 @@ suite "gettxoutsetinfo Core-byte-parity":
       discard rpc.handleGetTxOutSetInfo(%*["not-a-real-type"])
     except RpcError as e:
       code = e.code
-    check code == RpcInvalidParams
+    # Core rpc/blockchain.cpp gettxoutsetinfo: RPC_INVALID_PARAMETER (-8)
+    check code == RpcInvalidParameter
 
 # ============================================================================
 # W102 AssumeUTXO snapshot loading gate audit
@@ -2523,19 +2531,15 @@ suite "W102 AssumeUTXO per-coin validation gates":
       port = 18443'u16, chainState = cs, mempool = mp,
       peerManager = nil, feeEstimator = fe, params = regtest
     )
-    # Dispatch "getchainstates" through the RPC router. The router
-    # must currently produce a method-not-found or unimplemented error.
-    var code = 0
-    try:
-      discard rpc.handleMethod("getchainstates", %*[])
-    except RpcError as e:
-      code = e.code
-    except Exception:
-      code = -1  # any crash/unhandled exception
-    # BUG: `getchainstates` is not in the dispatch table; the call silently
-    # returns nil or raises RpcMethodNotFound.
-    # When implemented, this test should verify the response shape instead.
-    check code != 0  # non-zero = currently unimplemented
+    # B10 CLOSED: `getchainstates` is now implemented (Core v31.99 parity;
+    # dedicated coverage in tests/test_getchainstates.nim). Dispatch through
+    # the RPC router and verify the Core response shape.
+    let res = rpc.handleMethod("getchainstates", %*[])
+    check res.hasKey("headers")
+    check res.hasKey("chainstates")
+    check res["chainstates"].kind == JArray
+    check res["chainstates"].len == 1  # single active chainstate (no snapshot loaded)
+    check res["chainstates"][0].hasKey("validated")
 
 # ----------------------------------------------------------------------------
 # FIX-D — snapshot-load atomicity via SNAPSHOT_LOAD_IN_PROGRESS marker.

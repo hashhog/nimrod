@@ -12,17 +12,19 @@ import ../src/mining/blocktemplate
 suite "Block Template":
 
   test "BIP-34 height encoding for various heights":
+    # Mirrors Core CScript() << int64_t(nHeight) (script/script.h
+    # push_int64): 0 -> OP_0, 1..16 -> OP_1..OP_16, else minimal CScriptNum.
     # Height 0
     let enc0 = encodeBip34Height(0)
-    check enc0 == @[0x01'u8, 0x00]
+    check enc0 == @[0x00'u8]  # OP_0
 
     # Height 1
     let enc1 = encodeBip34Height(1)
-    check enc1 == @[0x01'u8, 0x01]
+    check enc1 == @[0x51'u8]  # OP_1
 
     # Height 16
     let enc16 = encodeBip34Height(16)
-    check enc16 == @[0x01'u8, 0x10]
+    check enc16 == @[0x60'u8]  # OP_16
 
     # Height 127
     let enc127 = encodeBip34Height(127)

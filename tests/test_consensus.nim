@@ -834,13 +834,17 @@ suite "BIP-22 submitblock result strings":
     # BIP22ValidationResult returns the raw reject reason string.
     check bip22String(veScriptVerifyFailed) == "block-script-verify-flag-failed"
 
+  test "insufficient chainwork -> too-little-chainwork":
+    # Core validation.cpp:4231: state.Invalid(BLOCK_HEADER_LOW_WORK,
+    #   "too-little-chainwork") — explicit reject reason, not the catch-all.
+    check bip22String(veInsufficientChainWork) == "too-little-chainwork"
+
   test "catch-all errors -> rejected":
     # Variants not explicitly listed in bip22String fall to the else branch → "rejected".
     # NOTE: veBadTimestamp → "time-too-old" and veSequenceLockNotSatisfied →
     # "bad-txns-nonfinal" are explicitly mapped, so they are NOT in this list.
     check bip22String(veBlockOverweight) == "rejected"
     check bip22String(vePrevBlockMissing) == "rejected"
-    check bip22String(veInsufficientChainWork) == "rejected"
     check bip22String(veCheckpointMismatch) == "rejected"
 
   # W84: new error codes

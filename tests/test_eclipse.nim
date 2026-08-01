@@ -1,7 +1,7 @@
 ## Integration tests for eclipse attack protections
 ## Tests network group diversity, anchor connections, and inbound eviction
 
-import unittest
+import unittest2
 import std/[times, sets, options, strutils]
 import ../src/network/netgroup
 import ../src/network/eviction
@@ -14,16 +14,17 @@ suite "eclipse attack protections":
     # Simulate tracking outbound netgroups
     var outboundNetGroups: HashSet[NetGroup]
 
-    # Add first peer from 192.168.x.x
-    let ng1 = getNetGroup("192.168.1.1")
+    # Add first peer from 8.8.x.x (routable — Core only groups routable
+    # IPv4 by /16; unroutable collapses to a single group per family)
+    let ng1 = getNetGroup("8.8.1.1")
     outboundNetGroups.incl(ng1)
 
     # Second peer from same /16 should be rejected
-    let ng2 = getNetGroup("192.168.2.2")
+    let ng2 = getNetGroup("8.8.2.2")
     check (ng2 in outboundNetGroups) == true  # Collision!
 
     # Peer from different /16 should be allowed
-    let ng3 = getNetGroup("10.0.0.1")
+    let ng3 = getNetGroup("8.9.0.1")
     check (ng3 in outboundNetGroups) == false  # No collision
 
   test "8 full-relay peers can be diverse":
@@ -146,7 +147,9 @@ suite "eclipse attack protections":
 
     check ng1 == ng2
     check ng1 == ng3
-    check ng1.data[0] == NetLocal
+    # Core netgroup.cpp: local addresses share one group — the bare
+    # net-class byte (NET_IPV4 for the IPv4 family), no address bits.
+    check ng1.data == @[NetIPv4]
 
   test "unroutable peers grouped together":
     let ng1 = getNetGroup("0.0.0.0")

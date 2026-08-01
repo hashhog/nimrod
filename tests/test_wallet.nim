@@ -1,7 +1,8 @@
 ## Tests for HD Wallet functionality
 ## BIP-32 test vectors, BIP-84 addresses, P2WPKH signing, block scan
 
-import std/[unittest, strutils, tables]
+import unittest2
+import std/[strutils, tables]
 import ../src/wallet/wallet
 import ../src/primitives/types
 import ../src/crypto/[hashing, secp256k1, address]

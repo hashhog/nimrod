@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM nimlang/nim:2.0.2 AS builder
+FROM nimlang/nim:2.2.8 AS builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     librocksdb-dev && \

@@ -1,7 +1,8 @@
 ## Tests for PSBT (BIP174/370) implementation
 ## Partially Signed Bitcoin Transactions
 
-import std/[unittest, strutils, tables, options, base64, sets]
+import unittest2
+import std/[strutils, tables, options, base64, sets]
 import ../src/wallet/psbt
 import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing

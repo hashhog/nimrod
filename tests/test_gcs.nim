@@ -1,7 +1,8 @@
 ## Tests for GCS (Golomb-Coded Set) filters (BIP 158)
 ## W90: BIP-157/158 comprehensive audit
 
-import std/[unittest, sequtils, random, strutils]
+import unittest2
+import std/[sequtils, random, strutils]
 import ../src/storage/indexes/gcs
 import ../src/crypto/siphash
 import ../src/crypto/hashing

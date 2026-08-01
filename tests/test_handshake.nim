@@ -60,7 +60,9 @@ suite "pre-handshake message rejection":
     # Send ping before version
     let result = validatePreHandshakeMessage(peer, mkPing)
     check result == marDropMisbehave
-    check peer.misbehaviorScore == ScorePreHandshakeMessage
+    # Core PR #25974: score accumulation removed — any Misbehaving call sets
+    # the discourage flag instead of adding points.
+    check peer.shouldDisconnect == true
 
   test "validate version before version returns accept":
     let params = regtestParams()
@@ -77,7 +79,8 @@ suite "pre-handshake message rejection":
 
     let result = validatePreHandshakeMessage(peer, mkVersion)
     check result == marDropMisbehave
-    check peer.misbehaviorScore == ScoreDuplicateVersion
+    # Core PR #25974: duplicate version flags the peer for discourage.
+    check peer.shouldDisconnect == true
 
   test "redundant verack dropped silently":
     let params = regtestParams()

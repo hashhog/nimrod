@@ -19,11 +19,7 @@ suite "BinaryWriter and BinaryReader":
 
     # Four byte values (0xFE prefix)
     w.writeCompactSize(0x10000)
-    w.writeCompactSize(0xFFFFFFFF'u64)
-
-    # Eight byte values (0xFF prefix)
-    w.writeCompactSize(0x100000000'u64)
-    w.writeCompactSize(0xFFFFFFFFFFFFFFFF'u64)
+    w.writeCompactSize(0x02000000'u64)  # exactly MAX_SIZE — still in range
 
     var r = BinaryReader(data: w.data, pos: 0)
 
@@ -32,9 +28,20 @@ suite "BinaryWriter and BinaryReader":
     check r.readCompactSize() == 253'u64
     check r.readCompactSize() == 0xFFFF'u64
     check r.readCompactSize() == 0x10000'u64
-    check r.readCompactSize() == 0xFFFFFFFF'u64
-    check r.readCompactSize() == 0x100000000'u64
-    check r.readCompactSize() == 0xFFFFFFFFFFFFFFFF'u64
+    check r.readCompactSize() == 0x02000000'u64
+
+    # Values above MAX_SIZE (0x02000000) require range_check=false: Core's
+    # ReadCompactSize defaults to range_check=true and throws
+    # "CompactSize(): size too large" (bitcoin-core/src/serialize.h).
+    # The raw encoding round-trip is still well-defined without the check.
+    var w2 = BinaryWriter()
+    w2.writeCompactSize(0xFFFFFFFF'u64)
+    w2.writeCompactSize(0x100000000'u64)
+    w2.writeCompactSize(0xFFFFFFFFFFFFFFFF'u64)
+    var r2 = BinaryReader(data: w2.data, pos: 0)
+    check r2.readCompactSize(range_check = false) == 0xFFFFFFFF'u64
+    check r2.readCompactSize(range_check = false) == 0x100000000'u64
+    check r2.readCompactSize(range_check = false) == 0xFFFFFFFFFFFFFFFF'u64
 
   test "little endian integer round-trip":
     var w = BinaryWriter()

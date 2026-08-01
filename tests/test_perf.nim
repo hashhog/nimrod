@@ -1,7 +1,8 @@
 ## Performance tests for nimrod
 ## Tests benchmarking utilities and performance-critical components
 
-import std/[unittest, options, times, random, strutils]
+import unittest2
+import std/[options, times, random, strutils]
 import ../src/perf/[bench, utxo_cache]
 import ../src/primitives/types
 import ../src/storage/chainstate

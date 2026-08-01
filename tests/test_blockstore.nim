@@ -498,7 +498,7 @@ suite "prune constants":
     check MinDiskSpaceForBlockFiles == uint64(550 * 1024 * 1024)  # 550 MiB
 
   test "minimum blocks to keep":
-    check MinBlocksToKeep == 288'i32  # ~2 weeks of blocks
+    check blockstore.MinBlocksToKeep == 288'i32  # ~2 weeks of blocks
 
   test "undo file name format":
     check undoFileName(0) == "rev00000.dat"

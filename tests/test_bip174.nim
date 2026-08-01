@@ -1,7 +1,8 @@
 ## BIP174 Test Vectors
 ## Official test vectors from the BIP174 specification
 
-import std/[unittest, strutils, options, base64, tables]
+import unittest2
+import std/[strutils, options, base64, tables]
 import ../src/wallet/psbt
 import ../src/primitives/[types, serialize]
 

@@ -1,7 +1,7 @@
 ## Tests for anchor connection persistence
 ## Reference: Bitcoin Core net.cpp ANCHORS_DATABASE_FILENAME
 
-import unittest
+import unittest2
 import std/[os, times, options, strutils]
 import ../src/network/anchors
 import ../src/network/netgroup

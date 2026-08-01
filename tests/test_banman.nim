@@ -1,7 +1,7 @@
 ## Tests for ban manager
 ## Validates persistent ban list with jsony storage
 
-import unittest
+import unittest2
 import std/[times, os, tables]
 import ../src/network/banman
 

@@ -21,7 +21,7 @@ import ./perf/verify_pool
 import ./util/ops
 import ./util/tip_notifier
 
-const NimrodVersion* = "0.1.0"
+const NimrodVersion* = "1.0.0"
 
 type
   Command* = enum
@@ -612,6 +612,25 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
   result.cmd = cmdStart  # Default command
   result.args = @[]
 
+  # First pass: resolve --datadir/--conf so the config file is loaded BEFORE
+  # CLI flags are applied (CLI overrides the file, matching Bitcoin Core's
+  # init.cpp precedence). Without this the conf load below would have to run
+  # after the CLI pass and could not tell defaults from explicit CLI values.
+  var pre = initOptParser()
+  while true:
+    pre.next()
+    case pre.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      case pre.key.toLowerAscii
+      of "datadir", "d":
+        result.config.dataDir = pre.val
+      of "conf":
+        result.config.confFile = pre.val
+      else: discard
+    else: discard
+  loadConfigFile(result.config)
+
   var p = initOptParser()
   var cmdParsed = false
 
@@ -944,13 +963,8 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
         # Additional args for the command
         result.args.add(p.key)
 
-  # Load config file after parsing CLI (CLI overrides config file)
-  var fileConfig = result.config
-  loadConfigFile(fileConfig)
-
-  # Merge: CLI takes precedence
-  # Only use file values if CLI didn't explicitly set them
-  # (This is simplified - a proper impl would track which were set)
+  # The config file was already loaded (first pass above, before CLI flags
+  # were applied), so file values are in place and CLI has taken precedence.
 
 proc getConsensusParams*(config: NimrodConfig): ConsensusParams =
   result =
