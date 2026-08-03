@@ -144,6 +144,18 @@ proc bip22String*(e: ValidationError): string =
   of veNonFinalTx, veSequenceLockNotSatisfied: "bad-txns-nonfinal"
   of veBip30DuplicateOutput: "bad-txns-BIP30"
   of veBadCoinbase: "bad-cb-height"
+  # First transaction is not a coinbase. Core CheckBlock (validation.cpp:3952)
+  # emits "bad-cb-missing" / "first tx is not coinbase". veNoCoinbase had no
+  # arm here, so it fell through to the `else: "rejected"` catch-all below.
+  #
+  # Found by the 2026-08-02 corpus sweep, entry F-coinbase-prevout-nonnull: a
+  # coinbase with a non-null prevout fails IsCoinBase(). SEVEN of ten impls
+  # answered the generic form on that entry — only beamchain and rustoshi were
+  # correct — so this is a shared gap, not a nimrod quirk. Equivalents:
+  # blockbrew 72a5519, ouroboros a8f40ab, hotbuns 7c8a950.
+  #
+  # Decision unchanged (rejected either way): R2 reason-code parity.
+  of veNoCoinbase: "bad-cb-missing"
   of veBadCoinbaseSize: "bad-cb-length"
   of veInputsMissing: "bad-txns-inputs-missingorspent"
   of veScriptVerifyFailed: "block-script-verify-flag-failed"
