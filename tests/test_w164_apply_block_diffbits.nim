@@ -199,9 +199,17 @@ suite "W164: applyBlock validates difficulty against the real parent header":
                             bits = EASY_BITS_ALT)   # != parent's bits
     check badBlk6.header.bits != tip.header.bits
 
-    check sm.processHeaders(@[badBlk6.header]) == 1
+    # W168: header admission now runs the bad-diffbits gate too (Core
+    # validation.cpp:4088 inside AcceptBlockHeader), so this header no longer
+    # even reaches the header chain.  Before W168 the header path skipped the
+    # difficulty check entirely on regtest (`if params.network != Regtest`) and
+    # this returned 1 — the body path was the only thing rejecting it.
+    check sm.processHeaders(@[badBlk6.header]) == 0
+    check sm.headerChain.tipHeight == 5
 
-    # Must be rejected; chain tip must not advance.
+    # The BODY path must still reject it independently (defence in depth: the
+    # W164 fix is about applyBlock's prevIndex, and that must keep working even
+    # though the header never got in).  Chain tip must not advance.
     check (not sm.applyBlock(badBlk6, 6))
     check sm.chainTipHeight == 5
     check sm.chainTip == hashOf(tip.header)

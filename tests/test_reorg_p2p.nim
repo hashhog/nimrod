@@ -114,11 +114,19 @@ suite "Part 1: below-tip heavier fork header is ACCEPTED, peer NOT banned":
     check sm.headerChain.tipHeight == 10
     let workA = sm.headerChain.totalWork
 
-    # Chain B: 15 HARDER-difficulty headers forking at GENESIS (below the
-    # active tip).  Smaller bits → more work per header → heavier total.
+    # Chain B: 15 headers forking at GENESIS (below the active tip) — LONGER
+    # than chain A's 10, so at equal difficulty it is strictly heavier.
+    #
+    # W168: this used to make chain B heavier with `bits = 0x207ffffe`.  That
+    # is not a difficulty a competing chain may legally declare — regtest's
+    # GetNextWorkRequired mandates the powLimit compact here — and now that the
+    # bad-diffbits gate (Core validation.cpp:4088) runs on the fork arm too,
+    # such headers are correctly rejected.  A real heavier fork out-works the
+    # active chain with more blocks at the REQUIRED difficulty, which is what
+    # this builds.  `startTime + 1` keeps chain B's headers distinct from
+    # chain A's (same prev + same time + same bits would hash identically).
     let chainB = buildHeaderChain(params.genesisBlockHash,
-                                  genesis.header.timestamp, 15,
-                                  bits = 0x207ffffe'u32)
+                                  genesis.header.timestamp + 1, 15)
 
     # Pre-fix this banned the peer on chainB[0] ("unlinked header").
     waitFor sm.handleHeaders(peer, chainB)
@@ -158,9 +166,10 @@ suite "Part 1: below-tip heavier fork header is ACCEPTED, peer NOT banned":
     sm.extendActiveChain(chainA)
 
     # Fork from height 5 (chainA[4]) — a known below-tip ancestor.
+    # W168: same-difficulty headers (the difficulty regtest actually requires);
+    # `+ 1` on the start time keeps fork[0] distinct from chainA[5].
     let forkPoint = hashOf(chainA[4])
-    let fork = buildHeaderChain(forkPoint, chainA[4].timestamp, 8,
-                                bits = 0x207ffffe'u32)
+    let fork = buildHeaderChain(forkPoint, chainA[4].timestamp + 1, 8)
     waitFor sm.handleHeaders(peer, fork)
 
     check not pm.isBanned("203.0.113.22")
@@ -247,10 +256,11 @@ suite "Part 1: fork-aware download walk requests bridging fork bodies":
     sm.chainTip = hashOf(chainA[^1])
     sm.chainTipHeight = 10
 
-    # Heavier chain B (15 headers) forking at genesis, accepted as side branch.
+    # Heavier chain B (15 headers vs A's 10, same required difficulty) forking
+    # at genesis, accepted as a side branch.  W168: see the note in the first
+    # test — heavier now means LONGER, not an illegally-declared nBits.
     let chainB = buildHeaderChain(params.genesisBlockHash,
-                                  genesis.header.timestamp, 15,
-                                  bits = 0x207ffffe'u32)
+                                  genesis.header.timestamp + 1, 15)
     waitFor sm.handleHeaders(peer, chainB)
     check sm.headerChain.sideHeaders.len == 15
 

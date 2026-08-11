@@ -415,6 +415,187 @@ proc heaviestSideTip*(hc: HeaderChain): Option[SideHeader] =
   best
 
 # =============================================================================
+# bad-diffbits AT HEADER ADMISSION  (Bitcoin Core validation.cpp:4083-4089)
+#
+# THE RULE.  ContextualCheckBlockHeader's FIRST check — before time-too-old,
+# before the BIP94 timewarp floor, before bad-version:
+#
+#     assert(pindexPrev != nullptr);                              // :4083
+#     const int nHeight = pindexPrev->nHeight + 1;                // :4084
+#     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
+#         return state.Invalid(..., "bad-diffbits", ...);         // :4088-4089
+#
+# and Core runs it for EVERY header, active-extension or competing fork, on
+# EVERY network, from AcceptBlockHeader (validation.cpp:4224).
+#
+# This is NOT the high-hash check.  CheckBlockHeader (validation.cpp:3832 ->
+# CheckProofOfWork) only proves the hash meets the target the header ITSELF
+# declares — for a difficulty-1 claim that is almost no work at all.  The gate
+# here compares the DECLARED nBits against the REQUIRED nBits.  Without it a
+# peer can hand us an arbitrarily long difficulty-1 header chain, which is
+# exactly the unbounded block-index growth Core documents at
+# validation.cpp:4076-4078 (bitcoincore.org/en/2024/07/03/disclose-header-spam).
+#
+# WHAT WAS WRONG HERE (pre-fix):
+#   * the FORK arm (acceptForkHeader) ran no nBits check at all, on any
+#     network — a below-tip branch of difficulty-1 headers was admitted 2000
+#     at a time into an unbounded `sideHeaders` Table and persisted to RocksDB;
+#   * the ACTIVE arm delegated the non-retarget case on testnet3/testnet4 to
+#     `permittedDifficultyTransition`, which returns `true` UNCONDITIONALLY
+#     when powAllowMinDifficultyBlocks (pow.nim:216-217).  That proc is a
+#     faithful port of Core pow.cpp:89-91, but Core only uses it as the
+#     PRESYNC commitment heuristic (headerssync.cpp:189,237) and NEVER as the
+#     admission gate — so any nBits was accepted at any non-retarget height;
+#   * the whole retarget check was skipped when `params.network == Regtest`,
+#     while Core enforces bad-diffbits on regtest too.
+#
+# ANCESTOR RESOLUTION — POINTER WALK ONLY.  Core resolves retarget ancestors
+# with CBlockIndex::GetAncestor / pprev (pow.cpp:33, pow.cpp:44), i.e. by
+# following parent POINTERS.  The resolution below does the same: every hop is
+# `lookupHeaderByHash(cur.header.prevBlock)`.  It NEVER indexes by a height
+# number.  A height->hash / height->header index (`hc.headers[h]`,
+# `hc.hashes[h]`, `chainDb.getBlockHashByHeight`) describes OUR ACTIVE CHAIN,
+# not the candidate's ancestry, and does not contain entries above the
+# validated tip — consulting it at a boundary hands back an unrelated block,
+# so the honest header is rejected and an attacker who matched the poisoned
+# answer is ADMITTED.  (The pre-fix `validateDifficultyRetarget` read
+# `hc.headers[prevHeight]` / `hc.headers[intervalStart]`; it was sound only by
+# accident of its caller having already proved active-tip extension.)
+#
+# "INVALID" vs "WE CANNOT EVALUATE".  Core has no unresolvable case: a header
+# whose parent is absent is rejected as "prev-blk-not-found"
+# (validation.cpp:4215-4217) BEFORE ContextualCheckBlockHeader, which then
+# asserts pindexPrev != nullptr.  nimrod's in-memory index CAN be short of an
+# ancestor the rule needs (a fork header stored before a restart, a
+# snapshot-truncated header chain).  That is OUR gap, not evidence of peer
+# misbehaviour, so it gets its own outcome: drop the header, ask for the
+# bridging headers, apply NO peer penalty.
+# =============================================================================
+
+type
+  DiffbitsOutcome* = enum
+    ## Verdict of the Core validation.cpp:4088 gate for a single header.
+    dboOk            ## header.nBits == GetNextWorkRequired -> gate passed
+    dboBadDiffbits   ## header.nBits != GetNextWorkRequired -> header is
+                     ## INVALID; rejecting it (and penalising the sender) is
+                     ## fair.  Core token: "bad-diffbits".
+    dboUnevaluable   ## an ancestor the rule needs is not in OUR index, so we
+                     ## cannot compute the required nBits.  The header is NOT
+                     ## known-invalid — drop it, request the bridging headers,
+                     ## and do NOT penalise the peer.
+
+const HeaderErrCannotEvaluate* = "cannot-evaluate-diffbits"
+  ## `validateHeader` error token for dboUnevaluable.  Callers MUST treat this
+  ## as "our gap", never as peer misbehaviour (see `isUnevaluableHeaderError`).
+
+proc isUnevaluableHeaderError*(err: string): bool {.inline.} =
+  ## True when `validateHeader`'s rejection means "we could not evaluate the
+  ## rule", not "the header is invalid".  Never ban/penalise on this.
+  err == HeaderErrCannotEvaluate
+
+proc lookupHeaderByHash*(hc: HeaderChain, hash: BlockHash):
+    Option[tuple[header: BlockHeader, height: int32]] =
+  ## Resolve a header BY HASH across the active chain and the competing-fork
+  ## map — nimrod's equivalent of Core's single CBlockIndex map lookup
+  ## (m_block_index.find(hash), validation.cpp:4214).
+  ##
+  ## The active chain is a flat seq whose position IS the height, so the index
+  ## returned by `byHash` doubles as the height.  Note the direction: the array
+  ## slot is derived FROM THE HASH.  This is a hash lookup, not a height
+  ## lookup; no caller passes a height number in.
+  if hash in hc.byHash:
+    let idx = hc.byHash[hash]
+    if idx >= 0 and idx < hc.headers.len:
+      return some((header: hc.headers[idx], height: int32(idx)))
+  if hash in hc.sideHeaders:
+    let sh = hc.sideHeaders[hash]
+    return some((header: sh.header, height: sh.height))
+  none(tuple[header: BlockHeader, height: int32])
+
+proc requiredBitsForHeader*(hc: HeaderChain, header: BlockHeader,
+                            params: ConsensusParams):
+    tuple[outcome: DiffbitsOutcome, required: uint32] =
+  ## Compute GetNextWorkRequired for `header` against ITS OWN parent chain.
+  ##
+  ## Reuses `pow.getNextWorkRequired` (pow.nim:124-183) — the existing,
+  ## Core-faithful, separately-tested retarget implementation (min-difficulty
+  ## rule, walk-back to the last non-powLimit ancestor, BIP94 first-block-bits
+  ## anchoring).  No consensus math is re-implemented here; this proc only
+  ## supplies the parent and the ancestor walk.
+  ##
+  ## Height comes from the RESOLVED PARENT (`parent.height + 1` inside
+  ## pow.getNextWorkRequired via `lastIndex.height + 1`, mirroring
+  ## validation.cpp:4084) — never from a batch counter or queue position.
+  let parentOpt = hc.lookupHeaderByHash(header.prevBlock)
+  if parentOpt.isNone:
+    # Core would already have rejected this as "prev-blk-not-found"; for us it
+    # may simply be an ancestor we have not stored.  Not our call to make here.
+    return (dboUnevaluable, 0'u32)
+  let parent = parentOpt.get()
+
+  # `hc` is captured through a pointer so the closure environment does not copy
+  # the whole header chain (seq + tables) on every header.  The closure never
+  # escapes this proc — getNextWorkRequired calls it synchronously.
+  let hcp = unsafeAddr hc
+  var resolveFailed = false
+
+  proc getAncestor(idx: pow.BlockIndex, targetHeight: int32): pow.BlockIndex =
+    ## Core CBlockIndex::GetAncestor, done by PREV-POINTER hops.
+    ## Each step follows `cur.header.prevBlock`; nothing is looked up by
+    ## height.  A missing link sets `resolveFailed` (checked by the caller)
+    ## and returns a stub AT the requested height purely so the callers' loops
+    ## terminate — the stub value is never trusted, because any resolveFailed
+    ## forces dboUnevaluable below.
+    var cur = idx
+    while cur.height > targetHeight:
+      let up = hcp[].lookupHeaderByHash(cur.header.prevBlock)
+      if up.isNone or up.get().height >= cur.height:
+        resolveFailed = true
+        return pow.BlockIndex(height: targetHeight,
+                              header: default(BlockHeader),
+                              hash: default(BlockHash))
+      let p = up.get()
+      cur = pow.BlockIndex(height: p.height, header: p.header,
+                           hash: cur.header.prevBlock)
+    cur
+
+  let powPrev = pow.BlockIndex(height: parent.height, header: parent.header,
+                               hash: header.prevBlock)
+  let powParams = headerssync.toPowParams(params)
+
+  # `pow.GetAncestorFn` carries no `raises` annotation, so the compiler cannot
+  # prove this call is exception-free and the effect would leak all the way up
+  # into the async `handleHeaders`.  The walk itself is pure seq/Table reads and
+  # arithmetic; if anything ever did escape, the only safe reading is "we could
+  # not evaluate the rule" — fail closed on the header, never on the peer.
+  # The `cast(gcsafe)` is for the same reason: an unannotated `proc` type is
+  # assumed neither gcsafe nor raises-free.  `getAncestor` touches only the
+  # header chain handed in and its own locals — no globals, no thread-shared
+  # state — so the cast asserts something the walk genuinely satisfies.
+  var required = 0'u32
+  {.cast(gcsafe).}:
+    try:
+      required = pow.getNextWorkRequired(powPrev, header.timestamp, powParams,
+                                         getAncestor)
+    except Exception:
+      resolveFailed = true
+
+  if resolveFailed:
+    return (dboUnevaluable, 0'u32)
+  (dboOk, required)
+
+proc checkHeaderDiffbits*(hc: HeaderChain, header: BlockHeader,
+                          params: ConsensusParams): DiffbitsOutcome =
+  ## Bitcoin Core validation.cpp:4086-4089 — the bad-diffbits gate.
+  ## `if (block.nBits != GetNextWorkRequired(pindexPrev, &block, params))`.
+  let r = hc.requiredBitsForHeader(header, params)
+  if r.outcome != dboOk:
+    return r.outcome
+  if header.bits != r.required:
+    return dboBadDiffbits
+  dboOk
+
+# =============================================================================
 # Header validation
 # =============================================================================
 
@@ -460,58 +641,25 @@ proc validateHeaderMTP*(header: BlockHeader, hc: HeaderChain, height: int32): bo
 
 proc validateDifficultyRetarget*(header: BlockHeader, hc: HeaderChain,
                                   height: int32, params: ConsensusParams): bool =
-  ## Validate difficulty adjustment at retarget boundaries (every 2016 blocks)
-  ## Also handles testnet special rules
-
+  ## DEPRECATED — kept only so out-of-tree callers keep compiling.
+  ##
+  ## This used to be the header path's difficulty check, and it was wrong twice
+  ## over:  (a) it resolved the retarget base through the HEIGHT INDEX
+  ## (`hc.headers[prevHeight]`, `hc.headers[intervalStart]`), which describes
+  ## our ACTIVE chain rather than the candidate header's own ancestry, and
+  ## (b) on powAllowMinDifficultyBlocks networks it delegated the non-retarget
+  ## case to `permittedDifficultyTransition`, which returns `true`
+  ## unconditionally there (pow.nim:216-217) — Core uses that proc only as the
+  ## PRESYNC heuristic (headerssync.cpp:189,237), never as the admission gate.
+  ##
+  ## It now forwards to the single pointer-walk implementation so there is only
+  ## one copy of the rule.  Note the collapse of dboUnevaluable to `false`:
+  ## that is why this wrapper must NOT be used for admission decisions — the
+  ## admission path needs to tell "invalid header" apart from "we cannot
+  ## evaluate the rule".  Use `checkHeaderDiffbits` instead.
   if height == 0:
-    return true  # Genesis
-
-  let prevHeight = height - 1
-  if prevHeight >= int32(hc.headers.len):
-    return false
-
-  let prevHeader = hc.headers[prevHeight]
-
-  # Check if this is a retarget boundary
-  if height mod int32(params.difficultyAdjustmentInterval) != 0:
-    # Not a retarget block
-    if params.powAllowMinDifficultyBlocks:
-      # Testnet special rules: min-difficulty blocks are allowed when timestamp
-      # is more than 2*targetSpacing after the previous block. Also, difficulty
-      # can revert to the last non-min-difficulty block's value.
-      # Use permittedDifficultyTransition which already handles this correctly.
-      let powParams = toPowParams(params)
-      return permittedDifficultyTransition(powParams, int32(height),
-                                           prevHeader.bits, header.bits)
-    # Mainnet/Signet: difficulty must stay the same
-    return header.bits == prevHeader.bits
-
-  # This is a retarget block - calculate expected difficulty
-  let intervalStart = height - int32(params.difficultyAdjustmentInterval)
-  if intervalStart < 0 or intervalStart >= int32(hc.headers.len):
-    return false
-
-  let firstHeader = hc.headers[intervalStart]
-  let lastHeader = prevHeader
-
-  # Calculate actual timespan
-  var actualTimespan = int64(lastHeader.timestamp) - int64(firstHeader.timestamp)
-
-  # Clamp timespan
-  let minTimespan = int64(params.powTargetTimespan) div 4
-  let maxTimespan = int64(params.powTargetTimespan) * 4
-
-  if actualTimespan < minTimespan:
-    actualTimespan = minTimespan
-  elif actualTimespan > maxTimespan:
-    actualTimespan = maxTimespan
-
-  # Calculate new target
-  # BIP94 (testnet4): use the first block's bits to prevent time-warp attack
-  let bitsForCalc = if params.enforceBIP94: firstHeader.bits else: prevHeader.bits
-  let expectedBits = calculateNextTarget(bitsForCalc, actualTimespan, params)
-
-  header.bits == expectedBits
+    return true  # Genesis has no parent to measure against.
+  checkHeaderDiffbits(hc, header, params) == dboOk
 
 proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
                      params: ConsensusParams,
@@ -539,7 +687,13 @@ proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
   if not validateHeaderPoW(header):
     return (false, "invalid proof of work")
 
-  # Check chain linkage for non-genesis
+  # Check chain linkage for non-genesis.
+  # Core's "prev-blk-not-found" (validation.cpp:4215-4217) — the lookup that
+  # runs BEFORE ContextualCheckBlockHeader and is what lets Core assert
+  # pindexPrev != nullptr at validation.cpp:4083.  This is the ACTIVE-arm
+  # variant: the header must extend our current tip.  (The height index is
+  # used here only to name "our tip"; it plays no part in resolving the
+  # candidate's retarget ancestors below.)
   if height > 0:
     if height - 1 >= int32(hc.hashes.len):
       return (false, "previous header not found")
@@ -548,19 +702,33 @@ proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
     if not validateHeaderChainLinkByHash(header, prevHash):
       return (false, "header does not link to previous")
 
-    # Check MTP
+    # ------------------------------------------------------------------
+    # ContextualCheckBlockHeader, in Bitcoin Core's order.
+    # ------------------------------------------------------------------
+
+    # Gate 1 — bad-diffbits.  THE FIRST contextual check, validation.cpp:4086-4089,
+    # ahead of time-too-old / BIP94 timewarp / time-too-new / bad-version.
+    # Ancestors resolved by prev-pointer hops, never by height (see
+    # `requiredBitsForHeader`).
+    case checkHeaderDiffbits(hc, header, params)
+    of dboOk:
+      discard
+    of dboBadDiffbits:
+      # The header IS invalid — Core's "bad-diffbits" / BLOCK_INVALID_HEADER.
+      return (false, "bad-diffbits")
+    of dboUnevaluable:
+      # WE cannot evaluate the rule (an ancestor is missing from our index).
+      # Not a peer offence: the caller must drop without penalty.
+      return (false, HeaderErrCannotEvaluate)
+
+    # Gate 2 — time-too-old (MTP).  Core validation.cpp:4092-4093.
     if not validateHeaderMTP(header, hc, height):
       return (false, "timestamp not greater than MTP")
 
-  # Check timestamp not too far in future
+  # time-too-new.  Core validation.cpp:4108.
   let now = getTime().toUnix().uint32
   if header.timestamp > now + uint32(MaxFutureBlockTime):
     return (false, "timestamp too far in future")
-
-  # Check difficulty retarget (skip for regtest which has simpler rules)
-  if params.network != Regtest:
-    if not validateDifficultyRetarget(header, hc, height, params):
-      return (false, "invalid difficulty adjustment")
 
   (true, "")
 
@@ -1132,22 +1300,40 @@ proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
 
 type ForkHeaderOutcome* = enum
   ## Result of trying to accept a header that does NOT extend the active tip.
-  fhoAccepted    ## stored as a competing-fork header (do NOT ban)
-  fhoNotFork     ## parent is unknown — caller treats as a genuine bad header
-  fhoBadPow      ## PoW failed — caller bans (genuine-bad)
+  fhoAccepted        ## stored as a competing-fork header (do NOT ban)
+  fhoNotFork         ## parent is unknown — caller treats as a genuine bad header
+  fhoBadPow          ## PoW failed — caller bans (genuine-bad)
+  fhoBadDiffbits     ## nBits != GetNextWorkRequired — the header IS invalid
+                     ## (Core "bad-diffbits", validation.cpp:4088); caller bans
+  fhoCannotEvaluate  ## an ancestor the difficulty rule needs is missing from
+                     ## OUR index.  The header is NOT known-invalid — caller
+                     ## drops it, asks for the bridging headers, and applies
+                     ## NO peer penalty.  Our gap is not peer misbehaviour.
 
 proc acceptForkHeader*(sm: SyncManager, header: BlockHeader,
                        hash: BlockHash,
                        minPowChecked: bool): ForkHeaderOutcome =
   ## Try to accept a header that branches BELOW the active tip (a competing
-  ## fork) WITHOUT banning the peer.  Mirrors the Bitcoin Core header/AcceptBlock
-  ## split: AcceptBlockHeader runs only PoW + parent-exists + cumulative-work
-  ## here (OPTION A from the design plan); the contextual MTP/retarget checks
-  ## are deferred to the BODY path (validateForStorage, which is DB-backed and
-  ## fork-correct).  Genuine-bad headers are still rejected:
+  ## fork) WITHOUT banning the peer.
+  ##
+  ## Checks applied, in Bitcoin Core's AcceptBlockHeader order:
+  ##   * sub-minimumChainWork      -> fhoNotFork, PRESYNC-gated (anti-DoS)
   ##   * PoW-invalid               -> fhoBadPow  (ban)
   ##   * no resolvable parent      -> fhoNotFork (caller falls back to ban)
-  ##   * sub-minimumChainWork      -> fhoNotFork, PRESYNC-gated (anti-DoS)
+  ##   * nBits != required         -> fhoBadDiffbits (ban)
+  ##   * required not computable   -> fhoCannotEvaluate (drop, NO penalty)
+  ##
+  ## W168: the bad-diffbits gate was previously ABSENT from this arm on every
+  ## network.  The original design note here claimed Core defers the contextual
+  ## checks on the header path — it does not.  AcceptBlockHeader calls
+  ## ContextualCheckBlockHeader for EVERY header (validation.cpp:4224), fork
+  ## headers included, and bad-diffbits is its FIRST check (validation.cpp:4088).
+  ## Deferring it to the body path left the exact header-spam DoS Core warns
+  ## about at validation.cpp:4076-4078: each admitted header costs an unevicted
+  ## `sideHeaders` entry plus a persisted RocksDB row, and a difficulty-1 chain
+  ## is free to produce, so memory and disk grow without bound.  (It could never
+  ## flip the tip — the work comparison still governs that — so the impact was
+  ## resource exhaustion, not chain takeover.)
   ##
   ## On fhoAccepted the header is stored in `headerChain.sideHeaders` AND, like
   ## the active-extension arm, written to the DB block index as a bsHeaderOnly
@@ -1178,6 +1364,19 @@ proc acceptForkHeader*(sm: SyncManager, header: BlockHeader,
   let parent = sm.headerChain.resolveParentWork(header.prevBlock)
   if parent.isNone:
     return fhoNotFork
+
+  # Gate 1 — bad-diffbits (Core validation.cpp:4086-4089), run for fork headers
+  # exactly as for active ones.  Ancestors are resolved by prev-pointer hops
+  # across the active chain AND sideHeaders, so the required nBits is computed
+  # from THIS CANDIDATE's ancestry — never from our active chain's height index,
+  # which at a fork point describes a different branch entirely.
+  case sm.headerChain.checkHeaderDiffbits(header, sm.params)
+  of dboOk:
+    discard
+  of dboBadDiffbits:
+    return fhoBadDiffbits
+  of dboUnevaluable:
+    return fhoCannotEvaluate
 
   let p = parent.get()
   let forkHeight = p.height + 1
@@ -1389,7 +1588,18 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
           # do NOT ban, just move to the next header in the batch.
           accepted += 1
           continue
-        of fhoNotFork, fhoBadPow:
+        of fhoCannotEvaluate:
+          # OUR index is missing an ancestor the difficulty rule needs (a fork
+          # header stored before a restart, a snapshot-truncated chain).  The
+          # header is not known-invalid, so penalising the peer would punish it
+          # for our gap (see the W168 note on ForkHeaderOutcome).  Drop the
+          # batch and ask for the bridging headers instead — one request per
+          # inbound message, so this cannot amplify.
+          info "cannot evaluate fork header difficulty — requesting bridging headers",
+               peer = $peer, prevBlock = $header.prevBlock
+          await sm.requestHeaders(peer)
+          return
+        of fhoNotFork, fhoBadPow, fhoBadDiffbits:
           # Genuine unlinked/orphan header or PoW-invalid fork: ban as before.
           warn "received unlinked header", peer = $peer,
                expected = $prevHashOpt.get(), got = $header.prevBlock,
@@ -1410,6 +1620,16 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
     let (valid, error) = validateHeader(header, sm.headerChain, expectedHeight,
                                         sm.params, minPowChecked = minPowChecked)
     if not valid:
+      if isUnevaluableHeaderError(error):
+        # W168: "we could not evaluate the rule", NOT "the header is invalid".
+        # An ancestor the difficulty computation needs is missing from our
+        # index; that is our gap, so no misbehaviour score, no disconnect.
+        # Ask for the bridging headers and stop processing this batch — one
+        # request per inbound message, so this cannot amplify.
+        info "cannot evaluate header difficulty — requesting bridging headers",
+             peer = $peer, height = expectedHeight
+        await sm.requestHeaders(peer)
+        return
       warn "invalid header", peer = $peer, height = expectedHeight, error = error
       # G17 (W99): use Misbehaving framework so noBan/manual guards are
       # respected.  Bitcoin Core: Misbehaving(peer, 100, "invalid header received").
