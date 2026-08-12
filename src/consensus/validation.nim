@@ -119,12 +119,34 @@ proc err*(T: typedesc, e: ValidationError): ValidationResult[T] =
 template voidErr*(e: ValidationError): ValidationResult[void] =
   ValidationResult[void](isOk: false, error: e)
 
-proc bip22String*(e: ValidationError): string =
+proc badVersionToken*(nVersion: int32): string =
+  ## Format the Core "bad-version(0x%08x)" reject reason.
+  ##
+  ## Core ContextualCheckBlockHeader (validation.cpp:4116) emits
+  ##   strprintf("bad-version(0x%08x)", block.nVersion)
+  ## where nVersion is a signed int32 reinterpreted as UNSIGNED and printed
+  ## lowercase, zero-padded to exactly 8 hex digits. The discriminating cases
+  ## are the high-bit (0x80000000) and -1 (0xffffffff) versions — a signed
+  ## print would emit "0x-80000000" / "0x000000-1". Reinterpret via cast so both
+  ## match Core byte-for-byte.
+  const hexd = "0123456789abcdef"
+  let u = cast[uint32](nVersion)
+  var s = newString(8)
+  for i in 0 ..< 8:
+    s[7 - i] = hexd[int((u shr (uint32(i) * 4)) and 0xF'u32)]
+  "bad-version(0x" & s & ")"
+
+proc bip22String*(e: ValidationError, blockVersion: int32 = 0'i32): string =
   ## Map a ValidationError to the canonical BIP-22 result string.
   ##
   ## Per BIP-22 and Bitcoin Core BIP22ValidationResult() in
   ## src/rpc/mining.cpp, submitblock must return short ASCII strings for
   ## known rejection reasons.  Unknown or structural errors map to "rejected".
+  ##
+  ## `blockVersion` supplies the header nVersion for the bad-version case, which
+  ## Core prints as "bad-version(0x%08x)". Callers that can surface
+  ## veBadBlockVersion (the block-acceptance pipeline) pass blk.header.version;
+  ## for every other error the argument is ignored.
   case e
   of veBadPow, veExceedsTarget: "high-hash"
   of veBadMerkleRoot: "bad-txnmrklroot"
@@ -158,6 +180,11 @@ proc bip22String*(e: ValidationError): string =
   of veNoCoinbase: "bad-cb-missing"
   of veBadCoinbaseSize: "bad-cb-length"
   of veInputsMissing: "bad-txns-inputs-missingorspent"
+  # CVE-2018-17144: a tx listing the same prevout twice. Core CheckTransaction
+  # (consensus/tx_check.cpp:44) → state.Invalid(TX_CONSENSUS,
+  # "bad-txns-inputs-duplicate"), BEFORE any UTXO/double-spend check. Without
+  # this arm veDuplicateInput fell through to the catch-all "rejected".
+  of veDuplicateInput: "bad-txns-inputs-duplicate"
   of veScriptVerifyFailed: "block-script-verify-flag-failed"
   of veDoubleSpend: "bad-txns-inputs-spent"
   of veBadTimestamp: "time-too-old"
@@ -189,8 +216,9 @@ proc bip22String*(e: ValidationError): string =
   of veTimeWarpAttack: "time-timewarp-attack"
   # time-too-new: block timestamp too far in the future (validation.cpp:4109)
   of veTimeTooNew: "time-too-new"
-  # bad-version: obsolete block version after BIP34/66/65 activation (validation.cpp:4116)
-  of veBadBlockVersion: "bad-version"
+  # bad-version: obsolete block version after BIP34/66/65 activation (validation.cpp:4116).
+  # Core prints the offending nVersion: strprintf("bad-version(0x%08x)", block.nVersion).
+  of veBadBlockVersion: badVersionToken(blockVersion)
   # fTooFarAhead: block height > ActiveHeight + MIN_BLOCKS_TO_KEEP (validation.cpp:4334)
   # Core returns false (not an error string) for this case; map to "rejected" per BIP-22.
   of veTooFarAhead: "rejected"
@@ -1593,6 +1621,14 @@ proc isFinalTxEarly(tx: Transaction, blockHeight: uint32, lockTimeCutoff: uint32
       return false
   true
 
+# Forward declaration: validateBlock runs the BIP-30 dup-unspent-output scan
+# (defined below) at the top of its ConnectBlock section, mirroring Core's order
+# where BIP-30 (validation.cpp:2467) precedes the per-tx CheckTxInputs loop.
+proc checkBip30*(blk: Block, height: int32, blockHash: array[32, byte],
+                 params: ConsensusParams,
+                 hasUtxo: proc(op: OutPoint): bool {.gcsafe, raises: [].},
+                 getAncestorHashAtHeight: proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} = nil): ValidationResult[void]
+
 # Full block validation
 proc validateBlock*(
   blk: Block,
@@ -1748,6 +1784,36 @@ proc validateBlock*(
   # ContextualCheckBlock for any block at accept time; ConnectBlock only during
   # ActivateBestChainStep.
   if not skipConnectChecks:
+    # BIP-30 dup-unspent-output scan (CVE-2012-1909). Core ConnectBlock runs this
+    # BEFORE the per-tx CheckTxInputs loop (validation.cpp:2467-2476), so a block
+    # that re-includes a transaction whose txid collides with an existing UNSPENT
+    # output is rejected "bad-txns-BIP30" — NOT "bad-txns-inputs-missingorspent"
+    # from the later input-spend check. On a BIP34-active regtest chain the dup tx
+    # also re-spends an already-spent input, so without this ordering the missing-
+    # input reject fires first and diverges from Core's reason. Uses the same
+    # cache-aware UTXO view (getUtxoOverride → ChainDb) that the tx loop below and
+    # the connect path use.
+    block:
+      let blkHashArr = array[32, byte](doubleSha256(serialize(blk.header)))
+      let bip30HasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
+        try:
+          if getUtxoOverride != nil: getUtxoOverride(op).isSome
+          else: utxos.getUtxo(op).isSome
+        except CatchableError: false
+        except Exception: false
+      let dbRef = utxos
+      let bip30AncestorHash = proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} =
+        try:
+          let hashOpt = dbRef.getBlockHashByHeight(h)
+          if hashOpt.isSome: some(array[32, byte](hashOpt.get()))
+          else: none(array[32, byte])
+        except CatchableError: none(array[32, byte])
+        except Exception: none(array[32, byte])
+      let bip30Result = checkBip30(blk, height, blkHashArr, params,
+                                   bip30HasUtxo, bip30AncestorHash)
+      if not bip30Result.isOk:
+        return bip30Result
+
     # Validate transactions and track fees
     # CRITICAL: Maintain intra-block UTXOs for txs that spend outputs from earlier txs in same block
     var totalFees = int64(0)
@@ -2603,37 +2669,17 @@ proc acceptBlock*(
   if not validateResult.isOk:
     return validateResult
 
-  # Step 3: BIP-30 cross-block dup-UTXO check (CVE-2012-1909).
-  # Skipped when skipConnectChecks=true (side-branch acceptance): the active-tip
-  # UTXO view cannot reliably detect a dup-coinbase for a block whose fork-point
-  # state differs from the active tip. BIP-30 is checked at connect time when
-  # the fork-point UTXO view is available (handleReorg → connectBlock).
-  # Core AcceptBlock does not call ConnectBlock (which contains BIP-30) for
+  # Step 3: BIP-30 cross-block dup-UTXO check (CVE-2012-1909) now runs INSIDE
+  # validateBlock's ConnectBlock section (gated on the same `not skipConnectChecks`
+  # and fed the same `getUtxo` view), positioned BEFORE the per-tx CheckTxInputs
+  # loop to match Core's ConnectBlock order (validation.cpp:2467 precedes 2500+).
+  # Previously it ran here, AFTER validateBlock had already returned
+  # "bad-txns-inputs-missingorspent" for a BIP-30 dup that also re-spends an
+  # already-spent input — diverging from Core's "bad-txns-BIP30" reason.
+  # Skipped when skipConnectChecks=true (side-branch acceptance): BIP-30 is
+  # re-checked at connect time (handleReorg → reorgConnectChecks) against the
+  # fork-point UTXO view. Core AcceptBlock does not run ConnectBlock for
   # non-best-chain blocks (validation.cpp:4298-4396).
-  if not skipConnectChecks:
-    # Compute this block's hash for the IsBIP30Repeat gate (height+hash check).
-    # The header serialization is 80 bytes; doubleSha256 yields the block hash.
-    let blkHeaderBytes = serialize(blk.header)
-    let blkHashArr = array[32, byte](doubleSha256(blkHeaderBytes))
-    # Wrap the getUtxo proc into the bool-returning hasUtxo signature that
-    # checkBip30 requires.  The try/except in the closure is needed to satisfy
-    # raises: [] — getUtxo already declares raises: [] so this is belt-and-
-    # suspenders.
-    let bip30HasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
-      try: getUtxo(op).isSome
-      except: false
-    # Supply a chain-ancestry lookup so Gate 2 verifies the actual block hash
-    # at bip34Height on this chain (Core validation.cpp:2460-2462).
-    let dbRef = db
-    let bip30AncestorHash = proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} =
-      try:
-        let hashOpt = dbRef.getBlockHashByHeight(h)
-        if hashOpt.isSome: some(array[32, byte](hashOpt.get()))
-        else: none(array[32, byte])
-      except: none(array[32, byte])
-    let bip30Result = checkBip30(blk, height, blkHashArr, params, bip30HasUtxo, bip30AncestorHash)
-    if not bip30Result.isOk:
-      return bip30Result
 
   # Step 4: script verification (skipped when assumevalid covers this block).
   # verifyScripts takes the same getUtxo proc for UTXO lookups during input

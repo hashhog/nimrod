@@ -856,6 +856,25 @@ suite "BIP-22 submitblock result strings":
   test "accumulated fees out of range -> bad-txns-accumulated-fee-outofrange":
     check bip22String(veFeesOutOfRange) == "bad-txns-accumulated-fee-outofrange"
 
+  # version-dup corpus reason-string parity (Core validation.cpp:4116 /
+  # consensus/tx_check.cpp:44).
+  test "duplicate inputs within tx -> bad-txns-inputs-duplicate":
+    check bip22String(veDuplicateInput) == "bad-txns-inputs-duplicate"
+
+  test "bad block version -> bad-version(0x%08x) with nVersion":
+    # Core strprintf("bad-version(0x%08x)", block.nVersion): unsigned, lowercase,
+    # zero-padded to 8 hex digits. High-bit and -1 are the signed/unsigned cases.
+    check bip22String(veBadBlockVersion, 1'i32) == "bad-version(0x00000001)"
+    check bip22String(veBadBlockVersion, 2'i32) == "bad-version(0x00000002)"
+    check bip22String(veBadBlockVersion, 3'i32) == "bad-version(0x00000003)"
+    check bip22String(veBadBlockVersion, cast[int32](0x80000000'u32)) == "bad-version(0x80000000)"
+    check bip22String(veBadBlockVersion, -1'i32) == "bad-version(0xffffffff)"
+
+  test "badVersionToken formats unsigned 8-hex lowercase":
+    check badVersionToken(0'i32) == "bad-version(0x00000000)"
+    check badVersionToken(4'i32) == "bad-version(0x00000004)"
+    check badVersionToken(0x7fffffff'i32) == "bad-version(0x7fffffff)"
+
 # ============================================================================
 # W84 — CheckTransaction + CheckTxInputs + CVE-2018-17144 + GetBlockSubsidy
 # ============================================================================

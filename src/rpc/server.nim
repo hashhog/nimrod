@@ -5888,6 +5888,19 @@ proc handleGetBlockTemplate(rpc: RpcServer, params: JsonNode): JsonNode =
 proc bip22ChainError(errMsg: string): string =
   ## Map a chainstate error string to a BIP-22 result token.
   ## Chainstate errors are free-form strings; we look for known substrings.
+  ##
+  ## connectBlock now emits canonical Core reject tokens as the LEADING word of
+  ## the error string (e.g. "bad-txns-inputs-missingorspent: double-spend within
+  ## block at ...", "bad-cb-amount: ...", "bad-txns-premature-spend-of-coinbase:
+  ## ..."). Pass that leading "bad-..." token through verbatim so the exact
+  ## BIP-22 reason reaches submitblock instead of collapsing to "rejected".
+  ## Without this the double-spend-two-txs block (caught at chainstate.nim:1245
+  ## as "bad-txns-inputs-missingorspent: ...") reported the generic "rejected".
+  if errMsg.len >= 4 and errMsg[0 ..< 4] == "bad-":
+    var i = 0
+    while i < errMsg.len and errMsg[i] != ':' and errMsg[i] != ' ':
+      inc i
+    return errMsg[0 ..< i]
   if "missing input" in errMsg or "missing or spent" in errMsg:
     return "bad-txns-inputs-missingorspent"
   if "immature coinbase" in errMsg:
@@ -5918,7 +5931,7 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     # BIP22ValidationResult() in src/rpc/mining.cpp.
     let checkResult = checkBlock(blk, rpc.params)
     if not checkResult.isOk:
-      return %bip22String(checkResult.error)
+      return %bip22String(checkResult.error, blk.header.version)
 
     # Check prevhash connects to a known block
     # Reference: Bitcoin Core AcceptBlockHeader -> check prev block exists
@@ -5968,7 +5981,7 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
                                      getUtxo = utxoForAccept,
                                      crypto = rpc.crypto)
       if not acceptResult.isOk:
-        return %bip22String(acceptResult.error)
+        return %bip22String(acceptResult.error, blk.header.version)
 
       # Use IBD fast path when far from tip (>1000 blocks behind assume-valid)
       let useIBD = cs.params.assumeValidHeight > 0 and
@@ -6071,7 +6084,7 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         except Exception:
           return (ok: false, err: "rejected")
         if vr.isOk: (ok: true, err: "")
-        else: (ok: false, err: bip22String(vr.error))
+        else: (ok: false, err: bip22String(vr.error, b.header.version))
 
       # Per-promoted-block script-verify hook — `handleReorg` fires it against
       # the UTXO view it rebuilds to the fork point (Core ConnectTip ->
@@ -6275,7 +6288,7 @@ proc handleSubmitHeader(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let ctxRes = contextualCheckBlockHeader(header, prevIndex, cs.db, cs.params)
   if not ctxRes.isOk:
-    raise newRpcError(RpcTransactionError, bip22String(ctxRes.error))
+    raise newRpcError(RpcTransactionError, bip22String(ctxRes.error, header.version))
 
   # --- Step 5: admit the validated header into the block index ------------
   # Core's AcceptBlockHeader inserts the validated header into the block index
