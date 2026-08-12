@@ -838,10 +838,21 @@ suite "BIP-22 submitblock result strings":
     # Variants not explicitly listed in bip22String fall to the else branch → "rejected".
     # NOTE: veBadTimestamp → "time-too-old" and veSequenceLockNotSatisfied →
     # "bad-txns-nonfinal" are explicitly mapped, so they are NOT in this list.
+    # veInsufficientChainWork was removed from this list when b3b377c mapped it
+    # to Core's "too-little-chainwork" (validation.cpp:4229) — the assertion
+    # here was stale.
     check bip22String(veBlockOverweight) == "rejected"
     check bip22String(vePrevBlockMissing) == "rejected"
-    check bip22String(veInsufficientChainWork) == "rejected"
+    check bip22String(veInsufficientChainWork) == "too-little-chainwork"
     check bip22String(veCheckpointMismatch) == "rejected"
+
+  test "bwmc coinbase-structure tokens (Core CheckBlock parity)":
+    # Core validation.cpp:3947-3955 — size limits / coinbase presence /
+    # coinbase multiplicity tokens (corpus bwmc A2/A3/A4/A5/A6).
+    check bip22String(veBadBlockLength) == "bad-blk-length"
+    check bip22String(veNoCoinbase) == "bad-cb-missing"
+    check bip22String(veMultipleCoinbase) == "bad-cb-multiple"
+    check bip22String(veBadCoinbaseSize) == "bad-cb-length"
 
   # W84: new error codes
   test "tx oversize -> bad-txns-oversize":
@@ -1362,3 +1373,103 @@ suite "Finding 7 — checkBlock coinbase output validation":
     let res = checkBlock(blk, params)
     check res.isOk == false
     check res.error == veBadCoinbaseSize
+
+proc makeSpendTx(scriptSigLen: int): Transaction =
+  ## Build a non-coinbase transaction (real prevout) with a scriptSig of the
+  ## given length. A typical P2PKH spend scriptSig is ~107 bytes — over the
+  ## coinbase 2..100 cap, which is exactly the trap the bwmc A3/A4 corpus
+  ## entries exercise: the length check must NOT run before the coinbase
+  ## presence check.
+  var prevTxid: array[32, byte]
+  prevTxid[0] = 0x01
+  Transaction(
+    version: 1,
+    inputs: @[TxIn(
+      prevOut: OutPoint(txid: TxId(prevTxid), vout: 0'u32),
+      scriptSig: newSeq[byte](scriptSigLen),
+      sequence: 0xFFFFFFFF'u32
+    )],
+    outputs: @[TxOut(value: Satoshi(1_000_000), scriptPubKey: @[])],
+    witnesses: @[],
+    lockTime: 0
+  )
+
+suite "bwmc — Core CheckBlock structure ordering (validation.cpp:3947-3955)":
+  ## Reject-token parity for the coinbase-structure cluster, matching Core's
+  ## CheckBlock order: merkle -> size limits (bad-blk-length) -> coinbase
+  ## presence (bad-cb-missing) -> coinbase multiplicity (bad-cb-multiple) ->
+  ## per-tx CheckTransaction (bad-cb-length). Corpus: tools/diff-test-corpus/bwmc.
+
+  test "A2: empty block -> veBadBlockLength (bad-blk-length), not bad-cb-missing":
+    ## Core validation.cpp:3947: block.vtx.empty() trips the size-limits check
+    ## BEFORE the coinbase presence check at :3951.
+    let params = regtestParams()
+    let blk = mineRegtestBlock(@[])
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veBadBlockLength
+
+  test "A3/A4: first tx not coinbase -> veNoCoinbase (bad-cb-missing), not bad-cb-length":
+    ## Before the fix, checkBlock ran the coinbase scriptSig 2..100 length
+    ## check on txs[0] before verifying it IS a coinbase, so a spend with a
+    ## 107-byte scriptSig reported bad-cb-length. Core: bad-cb-missing.
+    let params = regtestParams()
+    let blk = mineRegtestBlock(@[makeSpendTx(107)])
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veNoCoinbase
+
+  test "A5: two coinbases -> veMultipleCoinbase (bad-cb-multiple), not bad-cb-height":
+    let params = regtestParams()
+    let cb1 = makeCbTxWithOutputs(
+      @[TxOut(value: Satoshi(5_000_000_000), scriptPubKey: @[])])
+    # Distinct output value → distinct txid, so the duplicate-txid merkle
+    # mutation check (CVE-2012-2459) does not fire first.
+    let cb2 = makeCbTxWithOutputs(
+      @[TxOut(value: Satoshi(4_999_999_999), scriptPubKey: @[])])
+    let blk = mineRegtestBlock(@[cb1, cb2])
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veMultipleCoinbase
+
+  test "A6: coinbase at index 2 -> veMultipleCoinbase (bad-cb-multiple)":
+    ## [coinbase, spend, coinbase] — the second coinbase is at index 2.
+    let params = regtestParams()
+    let cb1 = makeCbTxWithOutputs(
+      @[TxOut(value: Satoshi(5_000_000_000), scriptPubKey: @[])])
+    let cb2 = makeCbTxWithOutputs(
+      @[TxOut(value: Satoshi(4_999_999_999), scriptPubKey: @[])])
+    let blk = mineRegtestBlock(@[cb1, makeSpendTx(50), cb2])
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veMultipleCoinbase
+
+  test "A7: coinbase scriptSig 1 byte -> veBadCoinbaseSize (bad-cb-length) still":
+    ## The length cap now surfaces from checkTransaction G8 inside the per-tx
+    ## loop (Core's position, consensus/tx_check.cpp:50) — token unchanged.
+    let params = regtestParams()
+    var cb = makeCbTxWithOutputs(
+      @[TxOut(value: Satoshi(5_000_000_000), scriptPubKey: @[])])
+    cb.inputs[0].scriptSig = @[0x00'u8]
+    let blk = mineRegtestBlock(@[cb])
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veBadCoinbaseSize
+
+  test "merkle mismatch still rejects ahead of structure checks (Core :3936)":
+    ## Core checks the merkle root BEFORE size limits — "all potential-
+    ## corruption validation must be done before transaction validation".
+    let params = regtestParams()
+    var blk = mineRegtestBlock(@[makeSpendTx(107)])
+    var wrongRoot: array[32, byte]
+    wrongRoot[0] = 0xAB
+    blk.header.merkleRoot = wrongRoot
+    # Re-mine the nonce: tampering with the merkle root changed the header
+    # hash, and checkBlockHeader's PoW gate runs before the merkle check.
+    for n in 0'u32 .. 4095'u32:
+      blk.header.nonce = n
+      if hashMeetsTarget(BlockHash(doubleSha256(serialize(blk.header))), blk.header.bits):
+        break
+    let res = checkBlock(blk, params)
+    check res.isOk == false
+    check res.error == veBadMerkleRoot

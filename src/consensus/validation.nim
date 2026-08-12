@@ -73,6 +73,18 @@ type
     # Core CheckMerkleRoot rejects bad-txns-duplicate when ComputeMerkleRoot's
     # `mutated` flag is set (identical adjacent pair at some level).
     veMutatedMerkleTree = "merkle tree mutated (bad-txns-duplicate)"
+    # Core CheckBlock size limits (validation.cpp:3947): empty vtx, tx count
+    # * 4 over the weight cap, or base (no-witness) serialized size * 4 over
+    # the weight cap → "bad-blk-length" ("size limits failed"). Fires BEFORE
+    # the coinbase presence check, so an empty block is bad-blk-length, NOT
+    # bad-cb-missing (corpus bwmc/A2-empty-block).
+    veBadBlockLength = "block size limits failed (bad-blk-length)"
+    # Core CheckBlock (validation.cpp:3953-3955): a coinbase at index >= 1
+    # → "bad-cb-multiple" ("more than one coinbase"). Distinct from
+    # veBadCoinbase (BIP-34 height mismatch → bad-cb-height); reusing that
+    # enum here made two-coinbase blocks report bad-cb-height (corpus
+    # bwmc/A5-two-coinbases, A6-coinbase-at-index2).
+    veMultipleCoinbase = "more than one coinbase (bad-cb-multiple)"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -178,6 +190,12 @@ proc bip22String*(e: ValidationError, blockVersion: int32 = 0'i32): string =
   #
   # Decision unchanged (rejected either way): R2 reason-code parity.
   of veNoCoinbase: "bad-cb-missing"
+  # More than one coinbase in the block. Core CheckBlock (validation.cpp:3955)
+  # emits "bad-cb-multiple" / "more than one coinbase".
+  of veMultipleCoinbase: "bad-cb-multiple"
+  # Size limits failed (empty vtx / too many txs / oversized base
+  # serialization). Core CheckBlock (validation.cpp:3948) → "bad-blk-length".
+  of veBadBlockLength: "bad-blk-length"
   of veBadCoinbaseSize: "bad-cb-length"
   of veInputsMissing: "bad-txns-inputs-missingorspent"
   # CVE-2018-17144: a tx listing the same prevout twice. Core CheckTransaction
@@ -1686,18 +1704,22 @@ proc validateBlock*(
   if not ctxResult.isOk:
     return voidErr(ctxResult.error)
 
-  # Block must have at least one transaction (coinbase)
+  # Block must have at least one transaction. Core's size-limits check
+  # (CheckBlock, validation.cpp:3947 — "block.vtx.empty() || ..." →
+  # bad-blk-length) fires BEFORE the coinbase presence check at :3951, so an
+  # empty block is bad-blk-length, NOT bad-cb-missing (corpus bwmc/A2).
   if blk.txs.len == 0:
-    return voidErr(veNoCoinbase)
+    return voidErr(veBadBlockLength)
 
-  # First transaction must be coinbase
+  # First transaction must be coinbase (Core :3951 → bad-cb-missing)
   if not isCoinbase(blk.txs[0]):
     return voidErr(veNoCoinbase)
 
-  # No other transaction can be coinbase
+  # No other transaction can be coinbase (Core :3953-3955 → bad-cb-multiple;
+  # was veBadCoinbase, which mapped to bad-cb-height — corpus bwmc/A5, A6)
   for i in 1 ..< blk.txs.len:
     if isCoinbase(blk.txs[i]):
-      return voidErr(veBadCoinbase)
+      return voidErr(veMultipleCoinbase)
 
   let height = prevIndex.height + 1
 
@@ -2459,6 +2481,14 @@ proc reorgConnectChecks*(
 
   ok()
 
+proc compactSizeLen(n: uint64): int =
+  ## Serialized length in bytes of a Bitcoin CompactSize integer
+  ## (bitcoin-core/src/serialize.h::GetSizeOfCompactSize).
+  if n < 0xfd'u64: 1
+  elif n <= 0xffff'u64: 3
+  elif n <= 0xffff_ffff'u64: 5
+  else: 9
+
 proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
   ## Context-free block validation (no UTXO access needed).
   ## Checks: header PoW, transaction sanity (including coinbase scriptSig 2..100
@@ -2474,17 +2504,57 @@ proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
   if not headerResult.isOk:
     return voidErr(headerResult.error)
 
-  # Must have at least one transaction (coinbase)
-  if blk.txs.len == 0:
-    return voidErr(veNoCoinbase)
+  # Check the merkle root + CVE-2012-2459 mutation (Core CheckMerkleRoot,
+  # called at validation.cpp:3936 — BEFORE the size/coinbase structure checks:
+  # "All potential-corruption validation must be done before we do any
+  # transaction validation, as otherwise we may mark the header as invalid
+  # because we receive the wrong transactions for it."). An empty tx list
+  # hashes to all-zeros, exactly like Core's ComputeMerkleRoot on an empty
+  # vector, so an empty block with a zero merkleRoot falls through to the
+  # size-limits check below.
+  var txHashes: seq[array[32, byte]]
+  for tx in blk.txs:
+    txHashes.add(array[32, byte](tx.txid()))
+  var rootMutated = false
+  let computedRoot = computeMerkleRootMutated(txHashes, rootMutated)
+  if computedRoot != blk.header.merkleRoot:
+    return voidErr(veBadMerkleRoot)
+  # Duplicate-txid mutation (CVE-2012-2459): reject identically to a bad merkle
+  # root. Core CheckBlock -> CheckMerkleRoot, bad-txns-duplicate.
+  if rootMutated:
+    return voidErr(veMutatedMerkleTree)
 
-  # Validate coinbase scriptSig: must be 2..100 bytes per consensus/tx_check.cpp:49.
-  # Use a height of 0 here so only the byte-length cap fires; the BIP-34 height
-  # prefix check is contextual (needs the actual height) and is run later in
-  # validateBlock / handleSubmitBlock.
-  let cbResult = validateCoinbaseSizeOnly(blk.txs[0])
-  if not cbResult.isOk:
-    return cbResult
+  # Size limits (Core validation.cpp:3947):
+  #   block.vtx.empty()
+  #   || block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+  #   || GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+  # → "bad-blk-length". This fires BEFORE the coinbase presence check: the
+  # empty-block reject token is bad-blk-length, NOT bad-cb-missing
+  # (corpus bwmc/A2-empty-block).
+  if blk.txs.len == 0 or blk.txs.len * WitnessScaleFactor > MaxBlockWeight:
+    return voidErr(veBadBlockLength)
+  # Base (no-witness) serialized block size: 80-byte header + CompactSize tx
+  # count + legacy tx serializations (Core GetSerializeSize(TX_NO_WITNESS(...))).
+  var baseBlockSize = 80 + compactSizeLen(uint64(blk.txs.len))
+  for tx in blk.txs:
+    baseBlockSize += serializeLegacy(tx).len
+  if baseBlockSize * WitnessScaleFactor > MaxBlockWeight:
+    return voidErr(veBadBlockLength)
+
+  # First transaction must be coinbase (Core :3951 → bad-cb-missing), the rest
+  # must not be (Core :3953-3955 → bad-cb-multiple). Ordering matters: these
+  # run BEFORE the per-tx CheckTransaction loop, so a non-coinbase first tx
+  # yields bad-cb-missing — not bad-cb-length from its (typically >100-byte)
+  # scriptSig (corpus bwmc/A3-no-coinbase-single-tx, A4-first-tx-not-coinbase)
+  # — and a second coinbase yields bad-cb-multiple (A5, A6). The coinbase
+  # scriptSig 2..100-byte cap (bad-cb-length) is enforced by checkTransaction
+  # gate G8 inside the loop below, exactly where Core surfaces it
+  # (consensus/tx_check.cpp:50 via CheckBlock's CheckTransaction loop).
+  if not isCoinbase(blk.txs[0]):
+    return voidErr(veNoCoinbase)
+  for i in 1 ..< blk.txs.len:
+    if isCoinbase(blk.txs[i]):
+      return voidErr(veMultipleCoinbase)
 
   # Check ALL transactions including coinbase.
   # Bitcoin Core CheckBlock (validation.cpp) loops over ALL vtx including vtx[0]
@@ -2519,19 +2589,8 @@ proc checkBlock*(blk: Block, params: ConsensusParams): ValidationResult[void] =
   if legacySigOps * WitnessScaleFactor > MaxBlockSigopsCost:
     return voidErr(veSigopExceeded)
 
-  # Verify merkle root + CVE-2012-2459 mutation (Core CheckMerkleRoot).
-  var txHashes: seq[array[32, byte]]
-  for tx in blk.txs:
-    txHashes.add(array[32, byte](tx.txid()))
-
-  var rootMutated = false
-  let computedRoot = computeMerkleRootMutated(txHashes, rootMutated)
-  if computedRoot != blk.header.merkleRoot:
-    return voidErr(veBadMerkleRoot)
-  # Duplicate-txid mutation (CVE-2012-2459): reject identically to a bad merkle
-  # root. Core CheckBlock -> CheckMerkleRoot, bad-txns-duplicate.
-  if rootMutated:
-    return voidErr(veMutatedMerkleTree)
+  # Merkle root + CVE-2012-2459 mutation are checked ABOVE (Core order:
+  # CheckMerkleRoot runs before the size/coinbase/transaction checks).
 
   # Witness commitment check is intentionally absent here.
   # Bitcoin Core CheckBlock() is context-free and explicitly defers witness
