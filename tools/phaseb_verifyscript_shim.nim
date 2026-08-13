@@ -558,6 +558,45 @@ proc processMerkleRoot(req: JsonNode): string =
   let mutatedStr = if mutated: "true" else: "false"
   result = """{"root":"""" & displayRoot & """","mutated":""" & mutatedStr & "}"
 
+## Byte-exact legacy SignatureHash op `sighash` (Core sighash.json, 500
+## vectors). Drives nimrod's REAL legacy sighash —
+## src/script/interpreter.nim:721 computeSighashLegacy — the SAME proc the
+## interpreter's CHECKSIG / CHECKMULTISIG sigBase paths call
+## (interpreter.nim:1850, :2106): opcode-aware OP_CODESEPARATOR strip
+## (stripCodeSeparators), ANYONECANPAY/NONE/SINGLE serialization incl. the
+## SIGHASH_SINGLE nIn>=nOuts "hash of one" bug (0x01 + 31 zero bytes
+## internal), and the uint32 hashtype 4-byte LE footer. The shim reimplements
+## NOTHING: tx_hex goes through the SAME deserializeTransaction `verifytx`
+## uses, script_hex is passed verbatim (the impl strips codeseps itself), and
+## the JSON SIGNED hashtype is lowered to the uint32 the impl's signature
+## takes (= hashtype & 0xFFFFFFFF, exactly the raw byte-truncation its
+## interpreter applies at sig[^1]) — the & 0x1f / & 0x80 mode bits are
+## derived INSIDE the impl, never here.
+##
+## The returned digest is INTERNAL byte order; it is reversed ONCE at this
+## boundary (displayHexFromInternalHash) to Core's GetHex/display order —
+## the digest is the ONLY thing reversed (prevout txids inside tx_hex stay
+## internal/wire order).
+##
+##   request:  {"op":"sighash","tx_hex":"...","script_hex":"...",
+##              "input_index":<int>,"hashtype":<signed int>}
+##   response: {"sighash":"<64-hex, Core GetHex/display order>"}
+##             {"error":"..."}   (cannot compute -> scored as FAIL by the
+##                                driver: Core hashes every vector)
+proc processSighash(req: JsonNode): string =
+  let txBytes = hexDecode(req["tx_hex"].getStr())
+  let tx = deserializeTransaction(txBytes)
+  let scriptCode = hexDecode(req["script_hex"].getStr())
+  let nIn = int(req["input_index"].getBiggestInt())
+  # Signed JSON int -> the uint32 computeSighashLegacy takes (its CHECKSIG
+  # caller passes uint32(sig[^1])); truncation IS the & 0xFFFFFFFF footer.
+  let hashType = uint32(req["hashtype"].getBiggestInt() and 0xFFFFFFFF'i64)
+
+  # nimrod's REAL legacy sighash (src/script/interpreter.nim:721), internal
+  # byte order; reverse once to display order for the Core-side comparison.
+  let digest = computeSighashLegacy(tx, nIn, scriptCode, hashType)
+  result = """{"sighash":"""" & displayHexFromInternalHash(digest) & "\"}"
+
 ## Block-subsidy differential op `subsidy`. Drives nimrod's REAL PRIMARY
 ## consensus subsidy fn (src/consensus/validation.nim:256
 ## getBlockSubsidy(height: int32, params)) — the one block validation /
@@ -1320,6 +1359,7 @@ proc process(line: string): string =
   of "verifyscript": processVerifyScript(req)
   of "verifytx": processVerifyTx(req)
   of "checktx": processCheckTx(req)
+  of "sighash": processSighash(req)
   of "connecttx": processConnectTx(req)
   of "nextwork": processNextWork(req)
   of "merkleroot": processMerkleRoot(req)
