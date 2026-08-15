@@ -1907,6 +1907,98 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
 
   ok()
 
+proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateResult[void] =
+  ## Marker-lag repair: adopt a block whose UTXO mutations are ALREADY durable
+  ## in the DB while the recorded chain tip still points at its parent.
+  ##
+  ## WHY THIS STATE EXISTS: during IBD the WAL is disabled (`startIBD` →
+  ## `disableWAL`) and RocksDB flushes memtables on its own schedule, so a
+  ## SIGKILL can land after a block's staged UTXO writes became durable but
+  ## before the batch's tip-pointer meta write did. On restart, replaying that
+  ## block rejects "missing input" — its spends are already deleted — which is
+  ## byte-for-byte indistinguishable from corruption UNLESS probed. Observed
+  ## live 2026-08-15: genesis rig SIGKILLed mid-shutdown-flush at 838704; the
+  ## durable UTXO set was exactly ONE block ahead (838705 fully applied).
+  ##
+  ## POSITIVE-EVIDENCE PROBE: an outpoint (txid, vout) is unique to the block
+  ## that created it — the txid commits to the whole transaction, which exists
+  ## only in this block. So finding ANY of this block's own outputs in the
+  ## UTXO set proves ITS connect batch committed; false positives are
+  ## impossible. A genuinely un-applied block (its "missing input" is real
+  ## corruption or an invalid spend) has none of its outputs present and
+  ## keeps the normal reject path.
+  ##
+  ## Core analogue: `ReplayBlocks`' tolerant roll-forward
+  ## (validation.cpp::RollforwardBlock re-adds coins with possible_overwrite
+  ## and tolerates already-spent inputs). Fleet precedent: blockbrew
+  ## `AdoptAppliedBlock` (e7d0afe), live-validated over 791 blocks.
+  ##
+  ## Adoption performs connectBlockIBD's bookkeeping tail (work, block-index
+  ## row, unflushed shadow, tip fields, batch/flush cadence) but SKIPS the
+  ## UTXO mutations — they are already durable. IBD-mode only: the disease
+  ## arises on the WAL-less IBD path, and the bookkeeping below stages into
+  ## `ibdBatch`.
+  let headerBytes = serialize(blk.header)
+  let blockHash = BlockHash(doubleSha256(headerBytes))
+
+  if cs.ibdBatch == nil:
+    return err("adoption requires IBD mode (no ibdBatch)")
+  if height != cs.bestHeight + 1 or cs.bestBlockHash != blk.header.prevBlock:
+    return err("adoption precondition violated: block does not extend tip " &
+               $cs.bestBlockHash & " at height " & $cs.bestHeight)
+
+  # Positive-evidence probe over the block's own outputs. The coinbase output
+  # is the strongest witness (unspendable for coinbaseMaturity blocks, so an
+  # applied frontier block ALWAYS still has it), but any hit suffices.
+  var evidence = 0
+  var probed = 0
+  for txIdx, tx in blk.txs:
+    let txId = tx.txid()
+    for voutIdx, output in tx.outputs:
+      if isUnspendable(output.scriptPubKey):
+        continue
+      inc probed
+      if cs.getUtxo(OutPoint(txid: txId, vout: uint32(voutIdx))).isSome:
+        inc evidence
+  if evidence == 0:
+    return err("no adoption evidence: 0/" & $probed &
+               " of the block's own outputs present at height " & $height)
+
+  info "adoption evidence found", height = height, hash = $blockHash,
+       evidence = evidence, probed = probed
+
+  # ── connectBlockIBD bookkeeping tail (UTXO mutations intentionally absent) ──
+  let blockWork = calculateBlockWork(blk.header.bits)
+  addWork(cs.totalWork, blockWork)
+
+  let idx = BlockIndex(
+    hash: blockHash,
+    height: height,
+    status: bsValidated,   # the block WAS fully validated when it connected
+    prevHash: blk.header.prevBlock,
+    header: blk.header,
+    totalWork: cs.totalWork,
+    undoPos: FlatFilePos(fileNum: -1, pos: -1),
+    nTx: int32(blk.txs.len)
+  )
+  cs.ibdBatch.put(cfBlockIndex, blockKey(array[32, byte](blockHash)), serializeBlockIndex(idx))
+  cs.ibdBatch.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](blockHash)))
+  cs.db.ibdIndexByHash[blockHash] = idx
+  cs.db.ibdIndexByHeight[height] = blockHash
+
+  cs.bestBlockHash = blockHash
+  cs.bestHeight = height
+
+  cs.ibdBatchBlocks += 1
+  cs.ibdBlocksSinceLastDiskFlush += 1
+  if cs.ibdBatchBlocks >= IbdBatchFlushInterval:
+    cs.flushIBDBatch()
+  cs.flushToDiskIfNeeded()
+  if cs.tipChangedHook != nil:
+    cs.tipChangedHook()
+
+  ok()
+
 proc getUtxoIBD*(cs: ChainState, op: OutPoint): Option[UtxoEntry] =
   ## Get UTXO during IBD - checks deletions tracking
   # Check if deleted in current batch

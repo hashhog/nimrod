@@ -2012,7 +2012,7 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
     # UTXOs, so it is correct to run it before acceptAndConnectBlock (which
     # does the accept + connect). Cheap: a few cache/DB lookups.
     var undoForFilter = chainstate.BlockUndo()
-    let captureUndo = (sm.filterIndex != nil and sm.filterIndex.enabled) or
+    var captureUndo = (sm.filterIndex != nil and sm.filterIndex.enabled) or
                       (sm.coinStatsIndex != nil and sm.coinStatsIndex.enabled)
     if captureUndo:
       try:
@@ -2038,6 +2038,48 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
     except Exception as e:
       acceptOk = false
       acceptErr = e.msg
+    if not acceptOk:
+      # Marker-lag adoption probe (Core ReplayBlocks tolerant roll-forward
+      # analogue; fleet precedent blockbrew e7d0afe). A SIGKILL between a
+      # block's durable UTXO writes and the tip-pointer meta write (the WAL
+      # is off during IBD) leaves the UTXO set AHEAD of the recorded tip;
+      # replaying that block then rejects "missing input" — its spends are
+      # already deleted — which looks exactly like a corrupt/invalid block.
+      # adoptAppliedBlock probes for positive evidence (the block's OWN
+      # outputs present in the UTXO set — outpoints are unique to their
+      # creating block, so false positives are impossible) and, on evidence,
+      # performs the connect bookkeeping without re-applying UTXO mutations.
+      # Negative probe ⇒ the genuine reject below stands.
+      if ("missing input" in acceptErr) or
+         ("transaction inputs missing" in acceptErr):
+        var adopted = false
+        var adoptErr = ""
+        try:
+          {.gcsafe.}:
+            let adoptRes = adoptAppliedBlock(sm.chainState, blk, height)
+            if adoptRes.isOk:
+              adopted = true
+            else:
+              adoptErr = adoptRes.error
+        except CatchableError as e:
+          adoptErr = e.msg
+        except Exception as e:
+          adoptErr = e.msg
+        if adopted:
+          info "adopted already-applied block (marker-lag repair)",
+               height = height, hash = $hash
+          # Fall through the normal success tail. Filter/coinstats fan-out is
+          # suppressed: undo data for an already-applied block cannot be
+          # regenerated (its inputs are already spent); those optional
+          # indexes backfill via their own height->hash walk on restart.
+          # txospenderindex (outside the captureUndo gate) needs no undo and
+          # stays correct.
+          acceptOk = true
+          captureUndo = false
+        else:
+          if adoptErr.len > 0:
+            info "adoption probe negative — genuine reject stands",
+                 height = height, probeResult = adoptErr
     if not acceptOk:
       warn "block failed consensus checks (IBD applyBlock)", height = height,
            error = acceptErr
