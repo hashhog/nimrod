@@ -9,14 +9,16 @@ its authoritative hash are recorded when `v0.1.0-rc1` is cut.
 
 | | |
 |---|---|
-| Commit | `eaaf8bf` (HEAD at the time of this note) |
+| Commit | `7d49b7a` (rc1 pin candidate) |
 | Binary | `nimrod/bin/nimrod` |
-| **sha256** | `12904c0bb522978eba43d1385c054c3bcfa9002224ac86225505ed9304ad2aaf` |
+| **sha256** | `fafdc54740d3a681706fe986608d673438f63ffc34b127b55b28615f349a7917` |
 | Toolchain | `Nim 2.2.8`, `nimble 0.20.1` |
 | Target | `Linux amd64` |
-| Build | `nimble build -d:release -y` |
+| Build | `./build-all.sh nimrod` (canonical; equivalent to `nimble build -d:release -y`) |
 
-> At tag time, re-record this table for the pinned rc commit.
+> Recorded 2026-08-15 from the canonical `build-all.sh nimrod` rebuild at `7d49b7a`
+> (marker-lag crash-recovery repair + headers-field fix included).
+> If the rc tag lands on a different commit, re-record this table.
 
 ## Build
 
