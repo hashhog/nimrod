@@ -1801,20 +1801,41 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
                $cs.bestBlockHash & " != block.prevBlock " &
                $blk.header.prevBlock & " (height " & $height & ")")
 
-  # Process each transaction - UTXO updates only
+  # ── PASS 1: validate EVERY input resolves BEFORE mutating anything. ──────
+  #
+  # The old single-pass loop deleted inputs / created outputs as it walked and
+  # returned err() mid-block on the first missing input — leaving a PARTIAL
+  # mutation prefix in the cache, the write batch and ibdDeletedUtxos with no
+  # rollback. Every failed retry of the same block re-staged that prefix, and
+  # a later flush (shutdown included) committed the poison durably: observed
+  # live 2026-08-15 on the genesis rig, where retries of a rejected 838705
+  # left a durable prefix of its mutations (1718/18516 outputs) under a tip
+  # marker of 838704. Core can mutate-then-fail because CCoinsViewCache +
+  # undo data let it roll back; the WAL-less IBD path has neither, so the
+  # nimrod-shaped equivalent is: verify first, mutate only when the whole
+  # block is known to connect. A failed connect is now mutation-free.
+  #
+  # Intra-block topology is honoured exactly like the mutation walk did:
+  # outputs created by earlier txs in THIS block are spendable by later txs
+  # (tracked in intraCreated), and an in-block double-spend is caught via
+  # intraSpent.
+  var intraCreated = initTable[string, UtxoEntry]()
+  var intraSpent = initTable[string, bool]()
   for txIdx, tx in blk.txs:
     let txId = tx.txid()
-
-    # Spend inputs (skip coinbase)
     if txIdx > 0:
       for input in tx.inputs:
-        let utxoOpt = cs.getUtxo(input.prevOut)
-        if utxoOpt.isNone:
-          # Also check ibdDeletedUtxos - if already deleted, it's a double-spend
+        let ck = outpointKey(input.prevOut)
+        if ck in intraSpent:
+          return err("double spend within block: " & $input.prevOut.txid)
+        var entryOpt: Option[UtxoEntry]
+        if ck in intraCreated:
+          entryOpt = some(intraCreated[ck])
+        else:
+          entryOpt = cs.getUtxo(input.prevOut)
+        if entryOpt.isNone:
           return err("missing input: " & $input.prevOut.txid)
-
-        let entry = utxoOpt.get()
-
+        let entry = entryOpt.get()
         # Check coinbase maturity.  Assume-valid only gates script
         # verification, never maturity (consensus/tx_verify.cpp:179).
         if entry.isCoinbase:
@@ -1823,7 +1844,20 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
             return err("immature coinbase spend at height " & $height &
                       ", coinbase height " & $entry.height &
                       ", age " & $age & " < " & $cs.params.coinbaseMaturity)
+        intraSpent[ck] = true
+    for voutIdx, output in tx.outputs:
+      if isUnspendable(output.scriptPubKey):
+        continue
+      intraCreated[outpointKey(OutPoint(txid: txId, vout: uint32(voutIdx)))] =
+        UtxoEntry(output: output, height: height, isCoinbase: txIdx == 0)
 
+  # ── PASS 2: apply mutations (guaranteed to succeed by pass 1). ───────────
+  for txIdx, tx in blk.txs:
+    let txId = tx.txid()
+
+    # Spend inputs (skip coinbase)
+    if txIdx > 0:
+      for input in tx.inputs:
         # Delete from batch and cache
         let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
         cs.ibdBatch.delete(cfUtxo, key)
@@ -1933,11 +1967,12 @@ proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainSta
   ## and tolerates already-spent inputs). Fleet precedent: blockbrew
   ## `AdoptAppliedBlock` (e7d0afe), live-validated over 791 blocks.
   ##
-  ## Adoption performs connectBlockIBD's bookkeeping tail (work, block-index
-  ## row, unflushed shadow, tip fields, batch/flush cadence) but SKIPS the
-  ## UTXO mutations — they are already durable. IBD-mode only: the disease
-  ## arises on the WAL-less IBD path, and the bookkeeping below stages into
-  ## `ibdBatch`.
+  ## Adoption = raw-DB evidence gate + TOLERANT RE-APPLY of every mutation
+  ## (idempotent deletes, deterministic overwrite puts — converges partial,
+  ## full, or poisoned states to the exact post-block state), then
+  ## connectBlockIBD's bookkeeping tail with an IMMEDIATE atomic flush.
+  ## IBD-mode only: the disease arises on the WAL-less IBD path, and the
+  ## mutations below stage into `ibdBatch`.
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
@@ -1947,9 +1982,23 @@ proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainSta
     return err("adoption precondition violated: block does not extend tip " &
                $cs.bestBlockHash & " at height " & $cs.bestHeight)
 
-  # Positive-evidence probe over the block's own outputs. The coinbase output
-  # is the strongest witness (unspendable for coinbaseMaturity blocks, so an
-  # applied frontier block ALWAYS still has it), but any hit suffices.
+  # Positive-evidence probe over the block's own outputs — against the RAW
+  # DB (cs.db.getUtxo), NEVER the ChainState view. The cached view is
+  # polluted by this session's own failed connect attempts (before the
+  # two-pass rework a failed connect left a partial mutation prefix in the
+  # cache; even after it, adoption must attest what is DURABLE, not what is
+  # staged). Reading the cache here turned the probe into a false-positive
+  # machine: it confirmed the residue of the very attempt that just failed
+  # (observed live 2026-08-15: evidence=1718/18516 was the in-memory prefix
+  # of a partial pre-crash apply, not a fully-durable block).
+  #
+  # Outputs spent WITHIN the block are legitimately absent after a full
+  # apply, so they are excluded from the probe set.
+  var intraSpentProbe = initTable[string, bool]()
+  for txIdx, tx in blk.txs:
+    if txIdx > 0:
+      for input in tx.inputs:
+        intraSpentProbe[outpointKey(input.prevOut)] = true
   var evidence = 0
   var probed = 0
   for txIdx, tx in blk.txs:
@@ -1957,17 +2006,50 @@ proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainSta
     for voutIdx, output in tx.outputs:
       if isUnspendable(output.scriptPubKey):
         continue
+      let op = OutPoint(txid: txId, vout: uint32(voutIdx))
+      if outpointKey(op) in intraSpentProbe:
+        continue
       inc probed
-      if cs.getUtxo(OutPoint(txid: txId, vout: uint32(voutIdx))).isSome:
+      if cs.db.getUtxo(op).isSome:
         inc evidence
   if evidence == 0:
     return err("no adoption evidence: 0/" & $probed &
-               " of the block's own outputs present at height " & $height)
+               " of the block's own outputs durable at height " & $height)
 
-  info "adoption evidence found", height = height, hash = $blockHash,
+  info "adoption evidence found (durable)", height = height, hash = $blockHash,
        evidence = evidence, probed = probed
 
-  # ── connectBlockIBD bookkeeping tail (UTXO mutations intentionally absent) ──
+  # ── Tolerant roll-forward (Core validation.cpp::RollforwardBlock). ────────
+  # The durable state may hold only a PREFIX of this block's mutations (a
+  # crash mid-flush, or poison from pre-two-pass failed retries). Skipping
+  # re-apply ("adopt the tip and move on") would freeze that partial state
+  # under a tip that claims the block is done — every later block spending
+  # one of the missing outputs then wedges. Instead, re-apply EVERY mutation
+  # tolerantly: deletes are idempotent (spending an already-deleted input is
+  # a no-op), creates are deterministic overwrites (same outpoint ⇒ same
+  # bytes). This converges prefix, full, or empty-suffix states to exactly
+  # the full post-block state.
+  for txIdx, tx in blk.txs:
+    let txId = tx.txid()
+    if txIdx > 0:
+      for input in tx.inputs:
+        let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
+        cs.ibdBatch.delete(cfUtxo, key)
+        cs.deleteUtxoCache(input.prevOut)
+        cs.ibdDeletedUtxos[outpointKey(input.prevOut)] = true
+    for voutIdx, output in tx.outputs:
+      if isUnspendable(output.scriptPubKey):
+        continue
+      let entry = UtxoEntry(output: output, height: height, isCoinbase: txIdx == 0)
+      let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
+      cs.putUtxoCache(outpoint, entry)
+      cs.ibdBatch.put(cfUtxo, utxoKey(array[32, byte](txId), uint32(voutIdx)),
+                      serializeUtxoEntry(entry))
+      let ck = outpointKey(outpoint)
+      if ck in cs.ibdDeletedUtxos:
+        cs.ibdDeletedUtxos.del(ck)
+
+  # ── connectBlockIBD bookkeeping tail ──
   let blockWork = calculateBlockWork(blk.header.bits)
   addWork(cs.totalWork, blockWork)
 
@@ -1991,11 +2073,18 @@ proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainSta
 
   cs.ibdBatchBlocks += 1
   cs.ibdBlocksSinceLastDiskFlush += 1
-  if cs.ibdBatchBlocks >= IbdBatchFlushInterval:
-    cs.flushIBDBatch()
+  # Flush IMMEDIATELY (deviation from connectBlockIBD's every-2000 cadence,
+  # deliberate): adoption exists because a crash left tip and UTXO set out of
+  # step. Committing the converged block + tip pointer as one atomic
+  # writeSynced batch NOW closes the window where another crash would
+  # re-poison the same frontier. One extra batch per adoption is noise.
+  cs.flushIBDBatch()
   cs.flushToDiskIfNeeded()
   if cs.tipChangedHook != nil:
     cs.tipChangedHook()
+
+  info "rolled forward already-applied block", height = height,
+       hash = $blockHash
 
   ok()
 
