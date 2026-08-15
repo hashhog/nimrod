@@ -2896,6 +2896,19 @@ proc startNode*(config: NimrodConfig) {.async.} =
         state.chainState.tipChangedHook = proc() {.gcsafe, raises: [].} =
           notifier.notify()
 
+    # Wire the live header-chain tip into the RPC layer (Core: getblockchaininfo
+    # reads chainman.m_best_header). Without this, `headers` reported the
+    # CONNECTED tip height, which is wrong in both directions: it hides the
+    # header lead during headers-first sync, and on a fresh --load-snapshot
+    # chainstate it claims base-height headers exist before header sync has
+    # accepted a single one (the M2 campaign harness gates its window feed on
+    # this field — see rpcBestHeaderHeight in rpc/server.nim).
+    block:
+      let sync = state.syncManager
+      if sync != nil:
+        state.rpcServer.headerTipProvider = proc(): int32 {.gcsafe, raises: [].} =
+          sync.headerChain.tipHeight
+
     # Wire the BlockFileManager so getblockchaininfo and pruneblockchain
     # answer correctly. The handler also reads `pruner` (when non-nil) for
     # the actual delete path; see handlePruneBlockchain in src/rpc/server.nim.

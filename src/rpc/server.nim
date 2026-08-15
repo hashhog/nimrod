@@ -105,6 +105,18 @@ type
                                             ## snapshot. nil = single normal chainstate.
                                             ## Read by getchainstates (validated +
                                             ## snapshot_blockhash).
+    headerTipProvider*: proc(): int32 {.gcsafe, raises: [].}
+                                          ## Live header-chain tip height from the
+                                          ## sync manager (Core: m_best_header).
+                                          ## Wired by startNode. nil = fall back to
+                                          ## the connected tip height (pre-wiring
+                                          ## behaviour). Needed because the header
+                                          ## chain genuinely runs AHEAD of the
+                                          ## connected tip mid-sync, and BEHIND it
+                                          ## on a fresh `--load-snapshot` chainstate
+                                          ## whose header sync hasn't reached the
+                                          ## snapshot base yet — reporting
+                                          ## bestHeight for `headers` masked both.
 
   RpcRequest = object
     jsonrpc: string
@@ -391,6 +403,21 @@ proc dirBytes(path: string): uint64 =
   total
 
 # Blockchain RPCs
+proc rpcBestHeaderHeight(rpc: RpcServer): int32 =
+  ## `headers` field source (Core: chainman.m_best_header->nHeight — the best
+  ## KNOWN header). The header chain runs AHEAD of the connected tip during
+  ## headers-first sync, and BEHIND it on a fresh `--load-snapshot` chainstate
+  ## whose header sync has not yet reached the snapshot base. Report the sync
+  ## manager's live header-chain tip when wired; fall back to the connected
+  ## tip height otherwise (tests / degraded boot). The M2 boundary-campaign
+  ## harness gates its window feed on this field reaching the base — the old
+  ## bestHeight passthrough let the feed fire before any header existed
+  ## (run 20260815T204551Z, 11 false DIVERGENCE rows).
+  if rpc.headerTipProvider != nil:
+    rpc.headerTipProvider()
+  else:
+    rpc.chainState.bestHeight
+
 proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   ## Return an object containing various state info regarding blockchain processing
   ## Reference: Bitcoin Core rpc/blockchain.cpp getblockchaininfo
@@ -474,7 +501,7 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   var response = %*{
     "chain": chainName,
     "blocks": rpc.chainState.bestHeight,
-    "headers": rpc.chainState.bestHeight,
+    "headers": rpcBestHeaderHeight(rpc),
     "bestblockhash": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
     "bits": bitsHexBE,
     "target": reverseHex(toHex(target)),
@@ -528,12 +555,13 @@ proc handleGetChainStates(rpc: RpcServer): JsonNode =
   ## is trivially "most-work (active) chainstate last".
 
   # headers: number of headers seen so far (Core: chainman.m_best_header->nHeight,
-  # or -1 if none). nimrod connects headers and blocks together — it does not keep
-  # a header index that runs ahead of the connected tip — so the best-header height
-  # equals the active tip height. -1 only if there is genuinely no tip (no genesis).
+  # or -1 if none). Sourced from the sync manager's live header chain via
+  # rpcBestHeaderHeight — the header chain runs ahead of the connected tip
+  # mid-sync (and behind it on a fresh --load-snapshot chainstate). The old
+  # claim here that "nimrod connects headers and blocks together" was rot.
   let headers: int32 =
     if rpc.chainState.bestHeight < 0: -1'i32
-    else: rpc.chainState.bestHeight
+    else: rpcBestHeaderHeight(rpc)
 
   # Active chainstate tip → bits/difficulty/target. Mirror handleGetBlockchainInfo:
   # read the tip block's nBits, falling back to the network genesis bits if the tip
