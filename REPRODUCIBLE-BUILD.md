@@ -9,15 +9,15 @@ its authoritative hash are recorded when `v0.1.0-rc1` is cut.
 
 | | |
 |---|---|
-| Commit | `7d49b7a` (rc1 pin candidate) |
+| Commit | `7fa74aa` (rc1 pin candidate) |
 | Binary | `nimrod/bin/nimrod` |
-| **sha256** | `fafdc54740d3a681706fe986608d673438f63ffc34b127b55b28615f349a7917` |
+| **sha256** | `b0fd0535b62a5a5b885300e2e57e6488bacacfb0f516cfe82cabbff3e9b91e57` |
 | Toolchain | `Nim 2.2.8`, `nimble 0.20.1` |
 | Target | `Linux amd64` |
 | Build | `./build-all.sh nimrod` (canonical; equivalent to `nimble build -d:release -y`) |
 
-> Recorded 2026-08-15 from the canonical `build-all.sh nimrod` rebuild at `7d49b7a`
-> (marker-lag crash-recovery repair + headers-field fix included).
+> Recorded 2026-08-16 from the canonical `build-all.sh nimrod` rebuild at `7fa74aa`
+> (marker-lag crash-recovery repair, headers-field fix, and the IBD cache-accounting fix included).
 > If the rc tag lands on a different commit, re-record this table.
 
 ## Build
