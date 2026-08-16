@@ -808,8 +808,23 @@ const
   EvictTargetBytes* = MaxCacheBytes div 2
   ## IBD batch flush interval: write batch to memtable every N blocks
   IbdBatchFlushInterval* = 2000
-  ## Estimated bytes per cache entry (OutPoint key ~60 bytes + UtxoEntry ~80 bytes + Table overhead ~32 bytes)
-  EstimatedEntryBytes* = 172
+  ## Bytes per resident cache entry, used by `evictCleanEntries` to decide when
+  ## the UTXO cache has exceeded its budget. This is the ONLY bound on the cache
+  ## during IBD, so an underestimate here is not a rounding error — it silently
+  ## disables eviction entirely and lets RSS grow until the host OOMs.
+  ##
+  ## MEASURED, not estimated: `tests/measure_utxo_entry_bytes.nim` inserts 2M
+  ## entries with realistic mainnet script sizes (P2WPKH/P2PKH/P2TR/P2SH) into
+  ## the same Table shape and reports the MARGINAL RSS cost — 336 B/entry on
+  ## Nim 2.2.8 / Linux amd64. Re-run that harness if the entry types or the
+  ## allocator change.
+  ##
+  ## The previous value (172) was a hand-derived guess and was ~2x too low, so
+  ## `cacheSize * EstimatedEntryBytes` never reached the ceiling: the 2026-08-15
+  ## mainnet genesis rig held 38.5M entries / 37 GiB RSS against a configured
+  ## --dbcache=8192 with cacheAfter == cacheBefore on all 14 flushes — eviction
+  ## had never once fired. It OOM-killed a neighbouring node twice.
+  EstimatedEntryBytes* = 336
   ## Default IBD entry-count flush target (set by startIBD; was the inline
   ## literal 200_000). Named so setDbCache can scale it from a byte budget
   ## while leaving the default-flag path on this exact value.
@@ -1466,8 +1481,14 @@ proc flushIBDBatch*(cs: var ChainState) =
     # entries are ever evicted, so no dirty write is ever dropped.
     let cacheBefore = cs.cacheSize
     cs.evictCleanEntries()
+    # Report the BUDGET alongside the counts. Without it, "cacheAfter ==
+    # cacheBefore" on every flush is indistinguishable from "cache is healthily
+    # under budget" — which is precisely how a 2x-low EstimatedEntryBytes hid
+    # unbounded growth for 38.5M entries / 37 GiB on the 2026-08-15 rig.
     info "flushed IBD batch", height = cs.bestHeight,
          cacheBefore = cacheBefore, cacheAfter = cs.cacheSize,
+         cacheMiB = (cs.cacheSize * EstimatedEntryBytes) div (1024 * 1024),
+         budgetMiB = cs.maxCacheBytes div (1024 * 1024),
          batchBlocks = IbdBatchFlushInterval
 
 proc flushToDiskIfNeeded*(cs: var ChainState, force: bool = false) =
