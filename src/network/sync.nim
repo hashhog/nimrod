@@ -124,6 +124,12 @@ type
     # CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
     # (Pattern B).
     unconnectingHeaders*: Table[int64, int]  ## peerId -> count
+    # Chain height at which the last header-tip repair was ATTEMPTED.  Guards
+    # reconcileHeaderTip from re-running the O(bestHeight) block-index walk on
+    # every sync-loop iteration when the persisted index cannot close the gap
+    # (a truncated/corrupt index prefix).  A successful repair makes the cheap
+    # invariant check short-circuit, so this only bounds the failing case.
+    headerTipRepairAt*: int32   ## chainTipHeight of last repair attempt
     # Optional BIP-157 basic block-filter index — populated alongside each
     # connectBlock/connectBlockIBD when --blockfilterindex is set.  nil
     # when disabled.  Mirrors Core's `g_indexes` BaseIndex hook list:
@@ -852,6 +858,7 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     receivedBlocks: initTable[int32, Block](),
     requestedHashes: initHashSet[BlockHash](),
     unconnectingHeaders: initTable[int64, int](),
+    headerTipRepairAt: -1'i32,
     numVerifyWorkers: numVerifyWorkers,
     filterIndex: filterIndex,
     coinStatsIndex: coinStatsIndex,
@@ -905,6 +912,78 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
         result.headerChain.headers[^1].bits
       )
 
+proc reconcileHeaderTip*(sm: SyncManager): bool =
+  ## LIVENESS FIX (A), self-heal half.  `headerChain.tipHeight < chainTipHeight`
+  ## is an INVARIANT VIOLATION: the validated chain cannot legitimately be ahead
+  ## of the header index, because a block can only be connected after its header
+  ## was accepted.  Bitcoin Core cannot even express this state — AcceptBlock's
+  ## first act is AcceptBlockHeader (validation.cpp:4308), which inserts the
+  ## CBlockIndex that IS the header index, so headers and connected blocks are
+  ## the same objects in the same `m_block_index`.  nimrod keeps two structures,
+  ## and its side-branch/reorg arm writes only one of them.
+  ##
+  ## When the violation is observed, re-seed the header chain from the persisted
+  ## block index — exactly what boot does (`newSyncManager` ->
+  ## `loadHeaderChainFromDb`), which is why a restart cleared the mainnet wedge
+  ## instantly ("first batch accepted=9 tipHeight=963741").  Doing it at runtime
+  ## is the whole fix: the recovery already existed, it was just unreachable
+  ## without a process restart.
+  ##
+  ## Returns true if a repair was performed.  Cheap to call: the guard is an
+  ## int comparison, and the O(bestHeight) walk only runs on a real violation.
+  if sm.chainTipHeight <= sm.headerChain.tipHeight:
+    return false
+  if sm.chainDb == nil:
+    return false
+  # A repair that could not close the gap (truncated/corrupt index prefix) must
+  # not be retried until the chain moves, or we would walk the whole index on
+  # every sync-loop iteration.
+  if sm.headerTipRepairAt == sm.chainTipHeight:
+    return false
+  sm.headerTipRepairAt = sm.chainTipHeight
+
+  let staleHeight = sm.headerChain.tipHeight
+  warn "INVARIANT VIOLATION: header tip is BEHIND the validated chain — " &
+       "re-seeding header chain from the block index",
+       headerTipHeight = staleHeight,
+       chainTipHeight = sm.chainTipHeight,
+       behindBy = sm.chainTipHeight - staleHeight,
+       sideHeaders = sm.headerChain.sideHeaders.len
+
+  var rebuilt = loadHeaderChainFromDb(sm.chainDb, sm.params)
+  if rebuilt.tipHeight <= staleHeight:
+    error "header-chain re-seed FAILED to advance the header tip — " &
+          "block index cannot cover the validated chain",
+          headerTipHeight = staleHeight,
+          chainTipHeight = sm.chainTipHeight,
+          reloadedTipHeight = rebuilt.tipHeight
+    return false
+
+  # Carry forward only GENUINE competing forks.  Any sideHeaders entry whose
+  # hash is now on the rebuilt active chain was a real-chain header that the
+  # fork arm mis-filed; leaving it would keep `hasAnyHeader` reporting "already
+  # known" for headers we want to (re)connect, which is the poisoned state that
+  # produced accepted=0 on every batch.
+  for hash, sh in sm.headerChain.sideHeaders:
+    if hash notin rebuilt.byHash:
+      rebuilt.sideHeaders[hash] = sh
+
+  let carried = rebuilt.sideHeaders.len
+  let dropped = sm.headerChain.sideHeaders.len - carried
+
+  sm.headerChain = rebuilt
+  sm.headerTip = rebuilt.tip
+  sm.headerTipHeight = rebuilt.tipHeight
+
+  if sm.chainState != nil and rebuilt.headers.len > 0:
+    sm.chainState.updateBestHeaderInfo(
+      rebuilt.totalWork, rebuilt.tipHeight, rebuilt.headers[^1].bits)
+
+  warn "header chain re-seeded from the validated chain (self-heal, no restart)",
+       fromHeight = staleHeight, toHeight = rebuilt.tipHeight,
+       sideHeadersDropped = dropped, sideHeadersKept = carried
+  true
+
 proc selectSyncPeer*(sm: SyncManager): Peer =
   ## Select the best peer for syncing (highest reported height)
   sm.peerManager.getBestPeer()
@@ -929,7 +1008,17 @@ proc buildLocatorFromHeight*(sm: SyncManager, startHeight: int32):
   var height = startHeight
 
   while height >= 0:
-    let hashOpt = sm.headerChain.getHashByHeight(height)
+    # LIVENESS FIX (A).  Resolve the height against the header chain FIRST,
+    # then fall back to the persisted block index.  Bitcoin Core has only one
+    # index to resolve against: LocatorEntries walks CBlockIndex pointers via
+    # GetAncestor (chain.cpp:26-44), and those same objects carry both the
+    # header and the validation status.  nimrod's in-memory `headerChain` is a
+    # PROJECTION of that index which can be short (a truncated reload prefix,
+    # or a tip advanced through the side-branch/reorg arm), so a header-chain
+    # miss must not silently drop the entry from the locator.
+    var hashOpt = sm.headerChain.getHashByHeight(height)
+    if hashOpt.isNone and sm.chainDb != nil and height <= sm.chainDb.bestHeight:
+      hashOpt = sm.chainDb.getBlockHashByHeight(height)
     if hashOpt.isSome:
       result.add(array[32, byte](hashOpt.get()))
 
@@ -944,10 +1033,38 @@ proc buildLocatorFromHeight*(sm: SyncManager, startHeight: int32):
   if result.len == 0 or result[^1] != genesisHash:
     result.add(genesisHash)
 
+proc locatorStartHeight*(sm: SyncManager): int32 =
+  ## The height the getheaders locator is seeded from.
+  ##
+  ## LIVENESS FIX (A) — THE INVARIANT: the locator must NEVER be seeded BEHIND
+  ## the validated chain.  Bitcoin Core states this literally in
+  ## `ChainstateManager::RecalculateBestHeader` (validation.cpp:6256-6264):
+  ##
+  ##     m_best_header = ActiveChain().Tip();
+  ##     for (auto& entry : m_blockman.m_block_index)
+  ##         if (!(entry.second.nStatus & BLOCK_FAILED_VALID) &&
+  ##             m_best_header->nChainWork < entry.second.nChainWork)
+  ##             m_best_header = &entry.second;
+  ##
+  ## i.e. the header pointer that every getheaders locator is built from
+  ## (net_processing.cpp:2657, :3106, :4110 — `GetLocator(m_best_header)`) is
+  ## SEEDED FROM THE ACTIVE TIP and can only go up from there.  The same
+  ## floor is re-applied defensively at net_processing.cpp:5771-5772.
+  ##
+  ## nimrod tracks `headerChain.tipHeight` separately from `chainTipHeight`,
+  ## and the side-branch/reorg arm advances the chain tip WITHOUT extending the
+  ## header chain (see the "Update chain tip (NOT header tip ...)" comment in
+  ## applyBlock and the sboReorged arm of processSideBranchBody).  On mainnet
+  ## 2026-08-16..23 that left headerTip=962722 while the chain reached 963732:
+  ## every getheaders was seeded 1,010 blocks behind, so peers answered with
+  ## headers the node already had, every batch graded accepted=0, and the node
+  ## livelocked for a week.  max() is the cheap structural floor.
+  max(sm.headerChain.tipHeight, sm.chainTipHeight)
+
 proc buildBlockLocator*(sm: SyncManager): seq[array[32, byte]] =
   ## Build block locator with exponential backoff
   ## Returns hashes at heights: tip, tip-1, ..., tip-9, tip-11, tip-15, ..., 0
-  sm.buildLocatorFromHeight(sm.headerChain.tipHeight)
+  sm.buildLocatorFromHeight(sm.locatorStartHeight())
 
 # =============================================================================
 # Anti-DoS Header Sync (PRESYNC/REDOWNLOAD)
@@ -1279,6 +1396,13 @@ proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
   ## from sendMessageV1 → sendGetHeaders → requestHeaders → startHeaderSync
   ## → syncLoop killed the node. Log + clear syncPeer to rotate on next
   ## iteration; do not re-raise.
+  # LIVENESS FIX (A): never emit a getheaders whose locator is seeded behind
+  # the validated chain.  This is the one choke point every header request
+  # passes through, so the invariant is enforced here rather than sprinkled
+  # over the call sites (Core enforces it at the source instead, by keeping
+  # m_best_header >= ActiveChain().Tip() — validation.cpp:6256-6264).
+  discard sm.reconcileHeaderTip()
+
   let locator = sm.buildBlockLocator()
   let hashStop = default(array[32, byte])  # Get as many as possible
 
@@ -1418,6 +1542,14 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
   ## Validate PoW, chain linkage, MTP, difficulty retarget
   ## Implements PRESYNC/REDOWNLOAD anti-DoS protection for low-work headers
   ## Request more if 2000 headers received, tip reached if < 2000
+
+  # LIVENESS FIX (A): enforce the header-tip invariant on the INBOUND edge as
+  # well as the outbound one (requestHeaders).  Without this the wedge only
+  # clears on the next getheaders; with it, the first batch that arrives while
+  # the pointer is behind heals it and is then processed against the repaired
+  # chain — which is exactly what a restart did for free on 2026-08-23
+  # ("first batch accepted=9 tipHeight=963741").
+  discard sm.reconcileHeaderTip()
 
   if headers.len == 0:
     # No headers = we're at tip (or peer has nothing more)
@@ -1767,13 +1899,35 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
     info "reached header tip", height = sm.headerChain.tipHeight
     sm.state = ssDownloadingBlocks
 
+# Forward declaration: connectStoredBlocks needs applyBlock, which is defined
+# below requestBlocks.
+proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [CatchableError].}
+
 proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   ## Request blocks for validated headers
   ## During IBD, distributes requests across multiple peers for parallel download
   var inventory: seq[InvVector]
 
+  # LIVENESS FIX (B): before deciding what to FETCH, connect whatever is
+  # already ON DISK.  The walk below skips any height whose body
+  # `chainDb.getBlock(hash)` already returns — correct on its own, fatal
+  # without a counterpart that connects it.  Bitcoin Core's
+  # FindNextBlocksToDownload skips BLOCK_HAVE_DATA for exactly the same reason
+  # and is safe because ActivateBestChain / setBlockIndexCandidates connect
+  # from disk independently of the network.  nimrod had no such path: its ONLY
+  # connect trigger was a block arriving over P2P, so a body that reached disk
+  # without connecting became a permanent hole — skipped by the downloader,
+  # connected by nobody.  `acceptSideBranchBlock` does exactly that
+  # (storage/chainstate.nim:3152 `cs.db.storeBlock(blk)` then a possible
+  # `sboSideBranch` return), which wedged mainnet on 2026-08-23: chainTip
+  # 963733, headerTip 963741, pendingBlocks=0, and not one getdata in 25 min.
+  # A restart does NOT clear this — the bodies are on disk.
+  discard sm.connectStoredBlocks()
+
   # Find blocks we need (headers we have but blocks we don't)
   var height = sm.chainTipHeight + 1
+  var storedSkipped = 0
+  var noHeaderHash = 0
 
   while height <= sm.headerTipHeight and
         sm.pendingBlocks + inventory.len < MaxBlocksInFlight:
@@ -1787,13 +1941,21 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
       # Check if we already have this block in the database
       # Skip DB lookup during IBD - we know we don't have blocks above chain tip
       if sm.chainState != nil and sm.chainState.ibdMode or
-         sm.chainDb.getBlock(hash).isNone:
+         sm.chainDb == nil or sm.chainDb.getBlock(hash).isNone:
         inventory.add(InvVector(
           invType: invWitnessBlock,
           hash: array[32, byte](hash)
         ))
         sm.requestedHashes.incl(hash)
         sm.blockQueue.addLast(hash)
+      else:
+        # Body already on disk but not connected.  connectStoredBlocks above
+        # should have taken it; if we still land here the block is unusable
+        # (connect failed, or it is above an un-connectable gap) — count it so
+        # the no-op below can say WHY nothing was requested.
+        storedSkipped += 1
+    else:
+      noHeaderHash += 1
     height += 1
 
   # ---------------------------------------------------------------------------
@@ -1867,6 +2029,22 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
       sm.blockQueue.addLast(h)
 
   if inventory.len == 0:
+    # OBSERVABILITY (B): this `return` used to be silent.  That is why the
+    # 2026-08-23 mainnet stall left ZERO evidence: the node sat in
+    # ssDownloadingBlocks with an 8-block gap and pendingBlocks=0, emitting
+    # nothing but a 60s "sync timeout, resetting" whose reset cleared state it
+    # was never going to re-derive.  A downloader that declines to download
+    # while it is behind must say so.
+    if sm.chainTipHeight < sm.headerTipHeight:
+      warn "block download idle with an OPEN GAP — nothing enqueued",
+           chainTipHeight = sm.chainTipHeight,
+           headerTipHeight = sm.headerTipHeight,
+           gap = sm.headerTipHeight - sm.chainTipHeight,
+           pendingBlocks = sm.pendingBlocks,
+           bodyOnDiskSkipped = storedSkipped,
+           headerHashMissing = noHeaderHash,
+           inFlight = sm.requestedHashes.len,
+           buffered = sm.receivedBlocks.len
     return
 
   # During IBD, distribute block requests across all available peers
@@ -2178,6 +2356,55 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
 
   true
 
+proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [CatchableError].} =
+  ## LIVENESS FIX (B).  Connect successors of the chain tip whose bodies are
+  ## ALREADY persisted, without waiting for them to arrive over the network.
+  ##
+  ## This is nimrod's missing equivalent of Bitcoin Core's
+  ## `ActivateBestChain`: Core's block-download scheduler skips any index entry
+  ## flagged BLOCK_HAVE_DATA (net_processing.cpp FindNextBlocksToDownload)
+  ## because connection is driven by `setBlockIndexCandidates` from disk, not
+  ## by message arrival.  nimrod skipped the same blocks but only ever
+  ## connected on a network `block` message, so any body that reached disk
+  ## un-connected became a permanent hole in the chain: never re-requested
+  ## (we "have" it), never connected (nothing arrived).  `acceptSideBranchBlock`
+  ## persists every side-branch body it accepts
+  ## (storage/chainstate.nim:3152) and can return `sboSideBranch` without
+  ## connecting, which is precisely how mainnet wedged at 963733/963741 on
+  ## 2026-08-23 — and, unlike the header-tip freeze, a restart does NOT clear
+  ## it because the state is on disk.
+  ##
+  ## Returns the number of blocks connected.  Bounded per call so a large
+  ## on-disk backlog cannot block the async sync loop.
+  const MaxStoredConnectPerCall = 64
+  result = 0
+  if sm.chainDb == nil:
+    return 0
+  while result < MaxStoredConnectPerCall and
+        sm.chainTipHeight < sm.headerTipHeight:
+    let nextHeight = sm.chainTipHeight + 1
+    let hashOpt = sm.headerChain.getHashByHeight(nextHeight)
+    if hashOpt.isNone:
+      break
+    let blkOpt = sm.chainDb.getBlock(hashOpt.get())
+    if blkOpt.isNone:
+      break                       # not on disk: the normal download path owns it
+    let blk = blkOpt.get()
+    # Only connect a DIRECT successor of the current tip.  Guards against
+    # connecting across a gap if the header chain and the chain tip ever
+    # disagree (the syncLoop rollback arm handles that case).
+    if blk.header.prevBlock != sm.chainTip:
+      break
+    if not sm.applyBlock(blk, nextHeight):
+      warn "stored block failed to connect", height = nextHeight,
+           hash = $hashOpt.get()
+      break
+    result += 1
+  if result > 0:
+    info "connected already-stored blocks from disk (no network fetch)",
+         count = result, chainTipHeight = sm.chainTipHeight,
+         headerTipHeight = sm.headerTipHeight
+
 proc drainBlockBuffer(sm: SyncManager) =
   ## Process buffered out-of-order blocks sequentially starting from chainTip+1
   while true:
@@ -2431,6 +2658,11 @@ proc startHeaderSync*(sm: SyncManager) {.async.} =
     sm.state = ssIdle
     return
 
+  # Reconcile BEFORE the log line so `currentHeight` is honest (the mainnet
+  # incident logged "currentHeight=962722 peerHeight=963740" for a week while
+  # the node's real chain was at 963732).
+  discard sm.reconcileHeaderTip()
+
   info "starting header sync", peer = $sm.syncPeer,
        currentHeight = sm.headerChain.tipHeight,
        peerHeight = sm.syncPeer.startHeight
@@ -2560,6 +2792,14 @@ proc syncLoop*(sm: SyncManager) {.async.} =
       sm.requestedHashes.clear()
       sm.receivedBlocks.clear()
 
+      # A "reset" that only CLEARS state cannot break a wedge — the mainnet
+      # stall survived 29 (then a further 5, post-restart) of these.  Re-derive
+      # instead: repair the header pointer if it is behind the validated chain
+      # (A), and connect anything already on disk (B).  Both are guarded no-ops
+      # in the healthy case.
+      discard sm.reconcileHeaderTip()
+      discard sm.connectStoredBlocks()
+
       # Reset timer so we don't immediately timeout again on next iteration
       sm.lastSyncTime = getTime()
 
@@ -2588,6 +2828,11 @@ proc getBlockLocator*(sync: BlockSync): seq[BlockHash] =
 
 proc processHeaders*(sync: BlockSync, headers: seq[BlockHeader]): int =
   ## Legacy sync interface - process headers
+  # LIVENESS FIX (A): same invariant as handleHeaders — a header batch must
+  # never be graded against a header chain that is behind the validated chain,
+  # or every header in it grades "does not connect" and the tip never moves.
+  discard sync.reconcileHeaderTip()
+
   var accepted = 0
 
   for header in headers:
