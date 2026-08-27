@@ -954,35 +954,78 @@ proc addWork(total: var array[32, byte], work: array[32, byte]) =
     carry = sum shr 8
 
 proc calculateBlockWork*(bits: uint32): array[32, byte] =
-  ## Calculate work from difficulty target
-  ## Work = 2^256 / (target + 1)
-  ## For simplicity, we approximate: work ≈ 2^(256-log2(target))
-  ## A more accurate implementation would use big integer division
+  ## Calculate work from difficulty target: EXACT 2^256 / (target + 1)
+  ## (Core arith_uint256 GetBlockProof, chain.cpp).
+  ##
+  ## #53 (2026-08-27): this used to QUANTISE work to a single bit
+  ## ("for simplicity, set one bit at position 256-log2(target)") while
+  ## network/sync.nim's calculateWork was exact — the second-implementation
+  ## trap, on the STORAGE-side selection path. Quantised work makes two
+  ## chains whose true works differ by up to 2x compare EQUAL (and lets a
+  ## lighter branch tie or win at compareWork256), exactly the close-work
+  ## 1-block-race case chain selection exists to decide. Now byte-identical
+  ## math to sync.calculateWork (duplicated here because importing network
+  ## from storage is a module cycle; pinned equal by test).
+  ##
+  ## NOTE: totalWork rows persisted BEFORE this fix carry quantised
+  ## increments. Relative comparisons at the tip remain sound (competing
+  ## branches share the same stored base row); absolute historical values
+  ## are approximate until a backfill — same documented posture as
+  ## clearbit's placeholder-base convention.
   let target = compactToTarget(bits)
 
-  # Find the highest non-zero byte to estimate difficulty
-  var highestBit = 0
-  for i in countdown(31, 0):
-    if target[i] != 0:
-      highestBit = i * 8
-      var b = target[i]
-      while b != 0:
-        inc highestBit
-        b = b shr 1
+  var isZero = true
+  for b in target:
+    if b != 0:
+      isZero = false
       break
+  if isZero:
+    return default(array[32, byte])
 
-  # Work is approximately 2^(256 - highestBit)
-  # For simplicity, set one bit at position (256 - highestBit)
-  result = default(array[32, byte])
-  if highestBit > 0 and highestBit < 256:
-    let workBit = 256 - highestBit
-    let bytePos = workBit div 8
-    let bitPos = workBit mod 8
-    if bytePos < 32:
-      result[bytePos] = byte(1 shl bitPos)
-  else:
-    # Minimum work
+  # target + 1
+  var targetPlusOne: array[32, byte]
+  var carry: uint16 = 1
+  for i in 0 ..< 32:
+    let sum = uint16(target[i]) + carry
+    targetPlusOne[i] = byte(sum and 0xFF)
+    carry = sum shr 8
+  if carry != 0:
     result[0] = 1
+    return result
+
+  # Long division: 2^256 / targetPlusOne
+  var dividend: array[33, byte]
+  dividend[32] = 1
+  var remainder: array[33, byte]
+  for i in countdown(32, 0):
+    for j in countdown(32, 1):
+      remainder[j] = remainder[j - 1]
+    remainder[0] = dividend[i]
+    if i < 32:
+      var quotient: byte = 0
+      while true:
+        var ge = true
+        for k in countdown(32, 0):
+          let rByte = if k < 33: remainder[k] else: 0'u8
+          let tByte = if k < 32: targetPlusOne[k] else: 0'u8
+          if rByte != tByte:
+            ge = rByte > tByte
+            break
+        if not ge:
+          break
+        # remainder -= targetPlusOne
+        var borrow: int16 = 0
+        for k in 0 ..< 33:
+          let tByte = if k < 32: int16(targetPlusOne[k]) else: 0'i16
+          var diff = int16(remainder[k]) - tByte - borrow
+          if diff < 0:
+            diff += 256
+            borrow = 1
+          else:
+            borrow = 0
+          remainder[k] = byte(diff)
+        inc quotient
+      result[i] = quotient
 
 proc compareWork256(a, b: array[32, byte]): int =
   ## Compare two 256-bit work values stored little-endian.  Returns -1 if a < b,
