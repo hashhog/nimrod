@@ -1970,7 +1970,10 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
     let addrs = pm.buildGetAddrResponse(peer)
     if addrs.len > 0:
       let response = newAddr(addrs)
-      asyncSpawn peer.sendMessage(response)
+      # #74: raw asyncSpawn promotes a transport error into a
+      # process-killing FutureDefect (see spawnSafe's doc) — every other
+      # spawned send here already wraps.
+      asyncSpawn spawnSafe(peer.sendMessage(response))
   of mkFeeFilter:
     # Already handled in peer.handleMessage
     discard

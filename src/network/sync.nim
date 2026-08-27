@@ -2940,6 +2940,27 @@ proc selectPeerForRequest*(dl: BlockDownloader): Peer =
 
   bestPeer
 
+proc revertFailedBatch(dl: BlockDownloader, invs: seq[InvVector], peer: Peer) =
+  ## #74 (2026-08-27): the getdata never left the process — undo the
+  ## optimistic assignment. scheduleDownloads commits pendingRequests +
+  ## inFlight BEFORE the send; on a send exception the old code only
+  ## logged, stranding the blocks against a request that was never on the
+  ## wire until the stall sweep. Mirror the sweep's own re-queue
+  ## (pendingRequests.del + pull nextDownloadHeight back) and the
+  ## SyncManager path's requestedHashes.excl revert.
+  let key = peerKey(peer)
+  for inv in invs:
+    let h = BlockHash(inv.hash)
+    if h in dl.pendingRequests:
+      let req = dl.pendingRequests[h]
+      if req.height < dl.nextDownloadHeight:
+        dl.nextDownloadHeight = req.height
+      dl.pendingRequests.del(h)
+  if key in dl.peerStates:
+    var ps = dl.peerStates[key]
+    ps.inFlight = max(0, ps.inFlight - invs.len)
+    dl.peerStates[key] = ps
+
 proc requestBlocks*(dl: BlockDownloader) {.async.} =
   ## Request blocks using round-robin getdata(invWitnessBlock) across peers
   ## Batches multiple inv items per message for efficiency
@@ -3011,7 +3032,9 @@ proc requestBlocks*(dl: BlockDownloader) {.async.} =
         await peer.sendGetData(peerRequests[key].inv)
         trace "sent batched getdata", peer = $peer, count = peerRequests[key].inv.len
       except CatchableError as e:
-        warn "failed to send getdata", peer = $peer, error = e.msg
+        warn "failed to send getdata — reverting batch assignment",
+             peer = $peer, count = peerRequests[key].inv.len, error = e.msg
+        dl.revertFailedBatch(peerRequests[key].inv, peer)
       peerRequests[key].inv = @[]
 
     height += 1
@@ -3023,7 +3046,9 @@ proc requestBlocks*(dl: BlockDownloader) {.async.} =
         await batch.peer.sendGetData(batch.inv)
         trace "sent batched getdata", peer = $batch.peer, count = batch.inv.len
       except CatchableError as e:
-        warn "failed to send getdata", peer = $batch.peer, error = e.msg
+        warn "failed to send getdata — reverting batch assignment",
+             peer = $batch.peer, count = batch.inv.len, error = e.msg
+        dl.revertFailedBatch(batch.inv, batch.peer)
 
   dl.nextDownloadHeight = height
 
