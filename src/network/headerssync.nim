@@ -496,26 +496,13 @@ proc processNextHeaders*(
   if not (result.success and result.requestMore):
     state.finalize()
 
-proc nextHeadersRequestLocator*(state: HeadersSyncState): seq[BlockHash] =
-  ## Build block locator for next getheaders request
-  ## Returns hashes to use in the locator
-
-  result = @[]
-
-  if state.downloadState == Done:
-    return
-
-  if state.downloadState == Presync:
-    # Continue from last received header
-    result.add(state.lastHeaderHash)
-
-  if state.downloadState == Redownload:
-    # Continue from last redownloaded header
-    result.add(state.redownloadBufferLastHash)
-
-  # Always include chain start
-  result.add(state.chainStartHash)
-
+# NOTE(2026-08-27, meta #72): nextHeadersRequestLocator was deleted — it
+# returned the 2-hash [last_received, chain_start] shape and its ONLY live
+# call site computed it and threw it away. The real PRESYNC/REDOWNLOAD
+# continuation locator is sync.nim's buildPresyncLocator (full exponential
+# walk from chain_start, genesis-terminated), which is what actually gets
+# sent. Deleted as a second-implementation trap with tests defending a dead
+# path.
 proc getState*(state: HeadersSyncState): SyncPhase =
   state.downloadState
 

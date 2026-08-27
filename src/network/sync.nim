@@ -1242,13 +1242,11 @@ proc isContinuationOfLowWorkHeadersSync*(sm: SyncManager, peer: Peer,
       sm.presyncBestWork = syncState.getPresyncWork()
       sm.presyncBestPeer = peerId
 
-    # Request more headers if needed
-    if result.requestMore:
-      let locator = syncState.nextHeadersRequestLocator()
-      if locator.len > 0:
-        debug "requesting more headers for low-work sync",
-              peer = $peer, locatorLen = locator.len
-        # Note: caller should send getheaders with this locator
+    # Continuation getheaders for low-work sync are driven by the
+    # requestHeaders flow using buildPresyncLocator (the full exponential
+    # walk). The old code here computed headerssync's 2-hash locator and
+    # THREW IT AWAY ("caller should send...") — deleted 2026-08-27 along
+    # with that dead builder (meta #72).
   else:
     # Sync complete
     info "low-work header sync complete",

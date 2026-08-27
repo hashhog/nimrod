@@ -249,50 +249,6 @@ suite "HeadersSyncState Transitions":
     check not result.success  # Empty is failure
 
 suite "HeadersSyncState Block Locator":
-  test "locator includes last header hash":
-    let params = regtestParams()
-    let genesis = buildGenesisBlock(params)
-    let genesisBytes = serialize(genesis.header)
-    let genesisHash = BlockHash(doubleSha256(genesisBytes))
-
-    let state = newHeadersSyncState(
-      peerId = 1,
-      params = params,
-      chainStartHeight = 0,
-      chainStartHash = genesisHash,
-      chainStartBits = genesis.header.bits,
-      chainStartWork = initUInt256(1),
-      minimumRequiredWork = initUInt256(1000)
-    )
-
-    let locator = state.nextHeadersRequestLocator()
-
-    check locator.len >= 1
-    check locator[^1] == genesisHash  # Chain start always included
-
-  test "locator empty when done":
-    let params = regtestParams()
-    let genesis = buildGenesisBlock(params)
-    let genesisBytes = serialize(genesis.header)
-    let genesisHash = BlockHash(doubleSha256(genesisBytes))
-
-    let state = newHeadersSyncState(
-      peerId = 1,
-      params = params,
-      chainStartHeight = 0,
-      chainStartHash = genesisHash,
-      chainStartBits = genesis.header.bits,
-      chainStartWork = initUInt256(1),
-      minimumRequiredWork = initUInt256(1000)
-    )
-
-    # Force to Done state
-    state.downloadState = Done
-
-    let locator = state.nextHeadersRequestLocator()
-    check locator.len == 0
-
-suite "Anti-DoS Properties":
   test "max commitments bound is set":
     let params = mainnetParams()
     let genesis = buildGenesisBlock(params)

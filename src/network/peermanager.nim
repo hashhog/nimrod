@@ -1273,12 +1273,12 @@ proc broadcastInventory*(pm: PeerManager, inventory: seq[InvVector]) {.async.} =
     except CatchableError as e:
       debug "failed to broadcast inv", peer = $peer, error = e.msg
 
-proc buildBlockLocator*(pm: PeerManager, tip: BlockHash): seq[array[32, byte]] =
-  result = @[]
-  result.add(array[32, byte](tip))
-  let genesisHash = array[32, byte](pm.params.genesisBlockHash)
-  if result[^1] != genesisHash:
-    result.add(genesisHash)
+# NOTE(2026-08-27, meta #72): a `buildBlockLocator*(pm, tip)` helper used to
+# live here returning the 2-hash [tip, genesis] shape — the degenerate-locator
+# anti-pattern (fixed live in six sibling nodes). It had ZERO callers and was
+# deleted as a second-implementation trap. The live locator builders are
+# sync.nim's buildBlockLocator/buildPresyncLocator (exponential, persisted,
+# genesis-terminated) and buildBlockLocatorFromChain below.
 
 proc buildBlockLocatorFromChain*(heights: proc(h: int32): Option[BlockHash],
                                   tipHeight: int32,
