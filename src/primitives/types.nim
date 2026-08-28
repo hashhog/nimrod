@@ -106,3 +106,38 @@ proc isUnspendable*(scriptPubKey: openArray[byte]): bool {.inline.} =
   ## filter for legacy datadirs that may have OP_RETURN coins persisted.
   (scriptPubKey.len > 0 and scriptPubKey[0] == 0x6a'u8) or
     scriptPubKey.len > MaxScriptSizeBytes
+
+func utxoMapKey*(txid: array[32, byte], vout: uint32): string {.inline.} =
+  ## Compact BINARY key for the in-memory intra-block UTXO maps
+  ## (validation / chainstate / undo).  36 bytes: 32-byte txid + 4-byte
+  ## little-endian vout.
+  ##
+  ## PERF (2026-08-27): the previous idiom was
+  ##   `$array[32, byte](txid) & ":" & $vout`
+  ## which renders the txid through Nim's array `$` as a DECIMAL LIST —
+  ## "[12, 45, 200, ...]" — roughly 160 characters, allocated and then hashed
+  ## on EVERY outpoint insert and lookup.  On a modern ~1 MB block (≈4,400
+  ## inputs) that dominated block validation: nimrod took >150 s where
+  ## blockbrew took 0.43 s, haskoin 0.85 s and clearbit 2.72 s on the exact
+  ## same block (distilled-corpus pack 419328).  These maps are function-local
+  ## and NEVER persisted, so the encoding is free to change — no on-disk
+  ## format implication.
+  ##
+  ## Injective, exactly like the string form: distinct (txid, vout) pairs map
+  ## to distinct 36-byte keys.
+  result = newString(36)
+  for i in 0 ..< 32:
+    result[i] = char(txid[i])
+  result[32] = char(vout and 0xFF'u32)
+  result[33] = char((vout shr 8) and 0xFF'u32)
+  result[34] = char((vout shr 16) and 0xFF'u32)
+  result[35] = char((vout shr 24) and 0xFF'u32)
+
+func utxoMapKey*(txid: TxId, vout: uint32): string {.inline.} =
+  utxoMapKey(array[32, byte](txid), vout)
+
+func utxoMapKey*(txid: TxId, vout: int): string {.inline.} =
+  utxoMapKey(array[32, byte](txid), uint32(vout))
+
+func utxoMapKey*(txid: array[32, byte], vout: int): string {.inline.} =
+  utxoMapKey(txid, uint32(vout))

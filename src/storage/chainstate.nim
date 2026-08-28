@@ -523,6 +523,13 @@ proc getBlockIndex*(cdb: ChainDb, hash: BlockHash): Option[BlockIndex] =
     let shadow = cdb.ibdIndexByHash.getOrDefault(hash, BlockIndex(height: -1))
     if shadow.height >= 0:
       return some(shadow)
+  # Same nil-db guard as getBlockHashByHeight: a nil handle means no persisted
+  # index (harness/offline contexts), so report "no row" instead of passing nil
+  # into the RocksDB C API (uncatchable SIGSEGV).  Callers treat none
+  # conservatively — getAncestor stops its retarget walk, checkBip30 keeps
+  # BIP-30 enforced.
+  if cdb.db == nil:
+    return none(BlockIndex)
   let data = cdb.db.get(cfBlockIndex, blockKey(array[32, byte](hash)))
   if data.isSome:
     return some(deserializeBlockIndex(data.get()))
@@ -1080,7 +1087,7 @@ proc generateUndoData*(cs: ChainState, blk: Block, height: int32 = -1): UndoData
       for vout, output in tx.outputs:
         if isUnspendable(output.scriptPubKey):
           continue
-        let key = $array[32, byte](cbTxid) & ":" & $vout
+        let key = utxoMapKey(cbTxid, vout)
         intra[key] = UtxoEntry(
           output: output, height: coinHeight,
           isCoinbase: true
@@ -1088,7 +1095,7 @@ proc generateUndoData*(cs: ChainState, blk: Block, height: int32 = -1): UndoData
       continue
 
     for input in tx.inputs:
-      let intraKey = $array[32, byte](input.prevOut.txid) & ":" & $input.prevOut.vout
+      let intraKey = utxoMapKey(input.prevOut.txid, input.prevOut.vout)
       if intraKey in intra:
         result.spentOutputs.add((input.prevOut, intra[intraKey]))
         intra.del(intraKey)
@@ -1102,7 +1109,7 @@ proc generateUndoData*(cs: ChainState, blk: Block, height: int32 = -1): UndoData
     for vout, output in tx.outputs:
       if isUnspendable(output.scriptPubKey):
         continue
-      let key = $array[32, byte](thisTxid) & ":" & $vout
+      let key = utxoMapKey(thisTxid, vout)
       intra[key] = UtxoEntry(
         output: output, height: coinHeight,
         isCoinbase: false
@@ -1129,7 +1136,7 @@ proc generateBlockUndo*(cs: ChainState, blk: Block, height: int32 = -1): BlockUn
       for vout, output in tx.outputs:
         if isUnspendable(output.scriptPubKey):
           continue
-        let key = $array[32, byte](cbTxid) & ":" & $vout
+        let key = utxoMapKey(cbTxid, vout)
         intra[key] = UtxoEntry(
           output: output, height: coinHeight,
           isCoinbase: true
@@ -1138,7 +1145,7 @@ proc generateBlockUndo*(cs: ChainState, blk: Block, height: int32 = -1): BlockUn
 
     var txUndo = TxUndo()
     for input in tx.inputs:
-      let intraKey = $array[32, byte](input.prevOut.txid) & ":" & $input.prevOut.vout
+      let intraKey = utxoMapKey(input.prevOut.txid, input.prevOut.vout)
       if intraKey in intra:
         let entry = intra[intraKey]
         txUndo.prevOutputs.add(SpentOutput(
@@ -1163,7 +1170,7 @@ proc generateBlockUndo*(cs: ChainState, blk: Block, height: int32 = -1): BlockUn
     for vout, output in tx.outputs:
       if isUnspendable(output.scriptPubKey):
         continue
-      let key = $array[32, byte](thisTxid) & ":" & $vout
+      let key = utxoMapKey(thisTxid, vout)
       intra[key] = UtxoEntry(
         output: output, height: coinHeight,
         isCoinbase: false

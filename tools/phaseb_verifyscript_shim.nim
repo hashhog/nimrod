@@ -768,10 +768,18 @@ proc processCheckBlock(req: JsonNode): string =
       wh.timestamp = if baseTime >= uint32(off): baseTime - uint32(off) else: 0'u32
       # Hash-link to the synthetic parent so getMtpForBlockIndex stays in-shadow;
       # deepest slot self-links so an extra hop never derefs the nil db handle.
-      if off == windowDepth - 1 or h - 1 < 0:
-        wh.prevBlock = bh
-      else:
-        wh.prevBlock = BlockHash(synthHash(h - 1))
+      # The deepest slot's parent is deliberately NOT inserted into the index:
+      # getBlockIndex then returns none and getAncestor STOPS (best-effort
+      # zero index).  A previous revision self-linked this slot
+      # (wh.prevBlock = bh) "so an extra hop never derefs the nil db handle" —
+      # but a self-link makes getAncestor's `while cur.height > targetHeight`
+      # loop FOREVER, since the parent hop never lowers the height.  That only
+      # bites at difficulty-retarget boundaries (height %% 2016 == 0), where
+      # getNextWorkRequired walks back 2016 blocks: corpus packs 419328,
+      # 481824 and 709632 each hung >150 s while their neighbours took 0.5 s.
+      # The nil-deref it guarded against is now handled properly by the
+      # nil-db guards in chainstate.getBlockIndex / getBlockHashByHeight.
+      wh.prevBlock = BlockHash(synthHash(h - 1))
       db.ibdIndexByHash[bh] = chainstate.BlockIndex(hash: bh, height: h, header: wh)
       db.ibdIndexByHeight[h] = bh
 

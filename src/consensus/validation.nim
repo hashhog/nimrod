@@ -888,7 +888,7 @@ proc checkSequenceLocksForTx*(
   var prevHeights = newSeq[int32](tx.inputs.len)
 
   for i, input in tx.inputs:
-    let intraKey = $array[32, byte](input.prevOut.txid) & ":" & $input.prevOut.vout
+    let intraKey = utxoMapKey(input.prevOut.txid, input.prevOut.vout)
     var utxoOpt: Option[UtxoEntry]
 
     if intraKey in intraBlockUtxos:
@@ -932,7 +932,7 @@ proc validateTransaction*(
   # Check for duplicate inputs (CVE-2018-17144)
   var seenInputs = initTable[string, bool]()
   for inp in tx.inputs:
-    let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
+    let key = utxoMapKey(inp.prevOut.txid, inp.prevOut.vout)
     if key in seenInputs:
       return err(int64, veDuplicateInput)
     seenInputs[key] = true
@@ -961,7 +961,7 @@ proc validateTransaction*(
   var totalInput = int64(0)
   for inp in tx.inputs:
     # First check intra-block UTXOs (outputs created earlier in this block)
-    let intraKey = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
+    let intraKey = utxoMapKey(inp.prevOut.txid, inp.prevOut.vout)
     var utxoOpt: Option[UtxoEntry]
 
     if intraKey in intraBlockUtxos:
@@ -1584,7 +1584,7 @@ proc countBlockSigopsCost*(blk: Block,
   for txIdx, tx in blk.txs:
     # Create lookup that includes intra-block UTXOs
     proc lookupUtxo(op: OutPoint): Option[UtxoEntry] =
-      let key = $array[32, byte](op.txid) & ":" & $op.vout
+      let key = utxoMapKey(op.txid, op.vout)
       if key in intraBlockUtxos:
         return some(intraBlockUtxos[key])
       utxos(op)
@@ -1598,7 +1598,7 @@ proc countBlockSigopsCost*(blk: Block,
     # Add this tx's outputs to intra-block UTXOs
     let thisTxid = tx.txid()
     for vout, output in tx.outputs:
-      let key = $array[32, byte](thisTxid) & ":" & $vout
+      let key = utxoMapKey(thisTxid, vout)
       intraBlockUtxos[key] = UtxoEntry(
         output: output,
         height: height,
@@ -1862,7 +1862,7 @@ proc validateBlock*(
     # Add coinbase outputs to intra-block UTXOs and count coinbase sigops
     let coinbaseTxid = blk.txs[0].txid()
     for vout, output in blk.txs[0].outputs:
-      let key = $array[32, byte](coinbaseTxid) & ":" & $vout
+      let key = utxoMapKey(coinbaseTxid, vout)
       intraBlockUtxos[key] = UtxoEntry(
         output: output,
         height: height,
@@ -1885,7 +1885,7 @@ proc validateBlock*(
       # supplied by acceptBlock) so mid-IBD blocks see UTXOs created by
       # not-yet-flushed recent blocks; otherwise the raw ChainDb (DB-only).
       proc lookupUtxo(op: OutPoint): Option[UtxoEntry] =
-        let key = $array[32, byte](op.txid) & ":" & $op.vout
+        let key = utxoMapKey(op.txid, op.vout)
         if key in intraBlockUtxos:
           return some(intraBlockUtxos[key])
         if getUtxoOverride != nil:
@@ -1919,13 +1919,13 @@ proc validateBlock*(
 
       # Mark spent UTXOs (remove from intra-block set or mark for removal from UTXO set)
       for inp in tx.inputs:
-        let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
+        let key = utxoMapKey(inp.prevOut.txid, inp.prevOut.vout)
         intraBlockUtxos.del(key)
 
       # Add this transaction's outputs to intra-block UTXOs
       let thisTxid = tx.txid()
       for vout, output in tx.outputs:
-        let key = $array[32, byte](thisTxid) & ":" & $vout
+        let key = utxoMapKey(thisTxid, vout)
         intraBlockUtxos[key] = UtxoEntry(
           output: output,
           height: height,
@@ -2013,7 +2013,7 @@ proc collectChecks*(
   # Add coinbase outputs
   let coinbaseTxid = blk.txs[0].txid()
   for vout, output in blk.txs[0].outputs:
-    let key = $array[32, byte](coinbaseTxid) & ":" & $vout
+    let key = utxoMapKey(coinbaseTxid, vout)
     intraBlockUtxos[key] = UtxoEntry(
       output: output,
       height: height,
@@ -2035,7 +2035,7 @@ proc collectChecks*(
     var allUtxos: seq[UtxoEntry] = @[]
     var utxosMissing = false
     for inp in tx.inputs:
-      let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
+      let key = utxoMapKey(inp.prevOut.txid, inp.prevOut.vout)
       var utxoOpt: Option[UtxoEntry]
       if key in intraBlockUtxos:
         utxoOpt = some(intraBlockUtxos[key])
@@ -2086,13 +2086,13 @@ proc collectChecks*(
 
     # Remove spent UTXOs
     for inp in tx.inputs:
-      let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
+      let key = utxoMapKey(inp.prevOut.txid, inp.prevOut.vout)
       intraBlockUtxos.del(key)
 
     # Add new outputs
     let thisTxid = tx.txid()
     for vout, output in tx.outputs:
-      let key = $array[32, byte](thisTxid) & ":" & $vout
+      let key = utxoMapKey(thisTxid, vout)
       intraBlockUtxos[key] = UtxoEntry(
         output: output,
         height: height,
@@ -2209,7 +2209,7 @@ proc checkTransaction*(tx: Transaction, params: ConsensusParams): ValidationResu
   # O(n) with a hash set — same asymptotic complexity as Core's std::set insert.
   var seenInputs = initTable[string, bool]()
   for inp in tx.inputs:
-    let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
+    let key = utxoMapKey(inp.prevOut.txid, inp.prevOut.vout)
     if key in seenInputs:
       return voidErr(veDuplicateInput)
     seenInputs[key] = true
@@ -2440,7 +2440,7 @@ proc reorgConnectChecks*(
     # of the coinbase is resolvable — identical to validateBlock's coinbase seed.
     let coinbaseTxid = blk.txs[0].txid()
     for vout, output in blk.txs[0].outputs:
-      let key = $array[32, byte](coinbaseTxid) & ":" & $vout
+      let key = utxoMapKey(coinbaseTxid, vout)
       intraBlockUtxos[key] = UtxoEntry(output: output, height: height, isCoinbase: true)
 
     for i in 1 ..< blk.txs.len:
@@ -2453,11 +2453,11 @@ proc reorgConnectChecks*(
       # Maintain the intra-block UTXO set exactly as validateBlock does: drop
       # this tx's spent inputs, then add its created outputs at the block height.
       for inp in tx.inputs:
-        let key = $array[32, byte](inp.prevOut.txid) & ":" & $inp.prevOut.vout
+        let key = utxoMapKey(inp.prevOut.txid, inp.prevOut.vout)
         intraBlockUtxos.del(key)
       let thisTxid = tx.txid()
       for vout, output in tx.outputs:
-        let key = $array[32, byte](thisTxid) & ":" & $vout
+        let key = utxoMapKey(thisTxid, vout)
         intraBlockUtxos[key] = UtxoEntry(output: output, height: height, isCoinbase: false)
 
   # BIP-30 duplicate-coinbase scan. Mirrors acceptBlock step 3 (validation.nim:2419-2442):

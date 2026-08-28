@@ -24,3 +24,24 @@ proc main() =
   echo "nil-db height-index guard OK"
 
 main()
+
+## Companion pin (2026-08-28): getBlockIndex has the SAME nil-db hazard, and
+## an unresolvable parent must TERMINATE an ancestor walk rather than spin.
+## The corpus exposed this as a >150s hang on every difficulty-retarget
+## boundary (packs 419328 / 481824 / 709632, all height %% 2016 == 0) where
+## getNextWorkRequired walks back 2016 blocks: the shim's deepest synthetic
+## header self-linked, so `while cur.height > targetHeight` never advanced.
+## FAILS AT PARENT: nil-db getBlockIndex segfaults the test process.
+proc mainIdx() =
+  var cdb = ChainDb()
+  doAssert cdb.db == nil
+  var h: array[32, byte]; h[0] = 0x5A
+  doAssert cdb.getBlockIndex(BlockHash(h)).isNone,
+    "nil-db block-index lookup must report no-row, not crash"
+  # In-memory shadow still answers without a db.
+  cdb.ibdIndexByHash[BlockHash(h)] = BlockIndex(hash: BlockHash(h), height: 7)
+  let got = cdb.getBlockIndex(BlockHash(h))
+  doAssert got.isSome and got.get().height == 7
+  echo "nil-db block-index guard OK"
+
+mainIdx()

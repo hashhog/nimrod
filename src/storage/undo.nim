@@ -353,13 +353,13 @@ proc generateBlockUndo*(blk: Block, utxoLookup: UtxoLookup,
       # OP_RETURN entries are simply never read.
       let cbTxid = tx.txid()
       for vout, output in tx.outputs:
-        let key = $array[32, byte](cbTxid) & ":" & $vout
+        let key = utxoMapKey(cbTxid, vout)
         intra[key] = (output, coinHeight, true)
       continue
 
     var txUndo = TxUndo()
     for input in tx.inputs:
-      let intraKey = $array[32, byte](input.prevOut.txid) & ":" & $input.prevOut.vout
+      let intraKey = utxoMapKey(input.prevOut.txid, input.prevOut.vout)
       if intraKey in intra:
         let (output, h, isCb) = intra[intraKey]
         txUndo.prevOutputs.add(SpentOutput(
@@ -382,7 +382,7 @@ proc generateBlockUndo*(blk: Block, utxoLookup: UtxoLookup,
     # After this tx, add its outputs to the intra-block index.
     let thisTxid = tx.txid()
     for vout, output in tx.outputs:
-      let key = $array[32, byte](thisTxid) & ":" & $vout
+      let key = utxoMapKey(thisTxid, vout)
       intra[key] = (output, coinHeight, false)
 
 # ============================================================================
