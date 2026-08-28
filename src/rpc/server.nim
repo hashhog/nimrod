@@ -11508,6 +11508,18 @@ proc handleCreateRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
       raise newRpcError(RpcInvalidParameter,
         "Invalid parameter, missing vout key")
     let nOutput = inputObj["vout"].getInt()
+    # Core reads vout with getInt<int>() -- a 32-BIT int -- so the RANGE check
+    # fires BEFORE the sign test, and an out-of-int32 value surfaces as
+    # univalue's own "JSON integer out of range" at RPC_MISC_ERROR rather than
+    # a vout-specific error. That ordering is Core's, not the obvious one.
+    #
+    # Without the upper bound, `uint32(nOutput)` below TRUNCATED: on the live
+    # mainnet node vout 2^32 AND vout 2^33 both became vout 0, so a request to
+    # spend one outpoint silently became a request to spend a DIFFERENT,
+    # probably real one -- returned as success, with no log line.
+    # (bitcoin-core/src/rpc/rawtransaction_util.cpp AddInputs:41-45.)
+    if nOutput < low(int32).int64 or nOutput > high(int32).int64:
+      raise newRpcError(RpcMiscError, "JSON integer out of range")
     if nOutput < 0:
       raise newRpcError(RpcInvalidParameter,
         "Invalid parameter, vout cannot be negative")
