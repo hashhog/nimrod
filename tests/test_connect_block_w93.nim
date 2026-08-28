@@ -430,3 +430,85 @@ suite "W93 — BIP-30 regression":
     var hash: array[32, byte] = default(array[32, byte])
     let res = val.checkBip30(blk, 1_983_800'i32, hash, params, hasUtxo)
     check res.isOk
+
+# ---------------------------------------------------------------------------
+# #64 — REORG CONNECT PATH with an intra-block tx chain
+#
+# The fleet audit (2026-08-24) found that 0 of 10 impls exercise an
+# intra-block chain on the reorg CONNECT side: every reorg suite connects
+# coinbase-only blocks.  nimrod already had the right BLOCK SHAPE in this
+# file — @[coinbase, tx1, tx2] where tx2 spends tx1 — but wired to
+# connectBlock, never to handleReorg.  The reorg path is a SECOND
+# implementation of intra-block resolution in most of these codebases, and
+# it was tested only against blocks that cannot exercise it.  That is exactly
+# the code that broke in haskoin (bea8d11), ouroboros (78fc20f), camlcoin
+# (388b65f) and rustoshi (d086a76).
+#
+# This routes the same shape through handleReorg and asserts the resulting
+# UTXO set, which is what a coinbase-only reorg test can never do.
+# ---------------------------------------------------------------------------
+suite "#64 — reorg CONNECT path resolves an intra-block tx chain":
+  setup:
+    cleanupTestDb()
+  teardown:
+    cleanupTestDb()
+
+  test "handleReorg connects a block whose tx2 spends tx1 from the same block":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let (h0, _, cbTxid) = seedChain(cs)
+
+    # Bury the height-1 coinbase past COINBASE MATURITY (100).  Every existing
+    # intra-block test in this file only builds UNDO data, which does not
+    # enforce maturity — this is the first one that actually CONNECTS such a
+    # block, so it is the first that has to respect it.  (Verified: without
+    # the burial connectBlock rejects the block outright, which would have
+    # made this test look like a reorg bug when it is a fixture bug.)
+    var h = h0
+    var tipHash = getBlockHash(makeBlock(BlockHash(default(array[32, byte])), 0,
+                                         @[makeCoinbaseTx(0)]))
+    tipHash = cs.bestBlockHash
+    for i in 1 .. 101:
+      let filler = makeBlock(tipHash, h + 1, @[makeCoinbaseTx(h + 1, extra = 1000 + int32(i))])
+      doAssert cs.connectBlock(filler, h + 1).isOk
+      tipHash = getBlockHash(filler)
+      h = h + 1
+    let forkHash = tipHash
+
+    # Chain A (to be disconnected): one coinbase-only block on top of the fork.
+    let aBlock = makeBlock(forkHash, h + 1, @[makeCoinbaseTx(h + 1, extra = 7)])
+    check cs.connectBlock(aBlock, h + 1).isOk
+    check cs.bestBlockHash == getBlockHash(aBlock)
+
+    # Chain B (to be connected by the reorg): TWO blocks, the first carrying a
+    # real intra-block chain — tx1 spends the height-1 coinbase, tx2 spends
+    # tx1's output while tx1 is still only in this same block.
+    let bCoinbase1 = makeCoinbaseTx(h + 1, extra = 21)
+    let tx1 = makeSpendingTx(cbTxid, 0, value = 4_500_000_000)
+    let tx2 = makeSpendingTx(tx1.txid(), 0, value = 4_000_000_000)
+    let b1 = makeBlock(forkHash, h + 1, @[bCoinbase1, tx1, tx2])
+    let b2 = makeBlock(getBlockHash(b1), h + 2, @[makeCoinbaseTx(h + 2, extra = 22)])
+
+    check cs.handleReorg(forkHash, @[b1, b2]).isOk
+
+    # The reorg took: tip is chain B.
+    check cs.bestBlockHash == getBlockHash(b2)
+
+    # --- the assertions a coinbase-only reorg test cannot make ---
+    # tx1's output was created AND spent inside the connected block, so it must
+    # NOT survive in the UTXO set.  A reorg connect path that resolves
+    # intra-block spends in two passes (all outputs, then all inputs) leaves
+    # this coin behind as a phantom.
+    check cs.getUtxo(OutPoint(txid: tx1.txid(), vout: 0)).isNone
+
+    # tx2's output IS unspent and must be present.
+    let tx2Utxo = cs.getUtxo(OutPoint(txid: tx2.txid(), vout: 0))
+    check tx2Utxo.isSome
+    if tx2Utxo.isSome:
+      check tx2Utxo.get().output.value == Satoshi(4_000_000_000)
+
+    # The height-1 coinbase that tx1 consumed must be gone.
+    check cs.getUtxo(OutPoint(txid: cbTxid, vout: 0)).isNone
+
+    # Chain A's coinbase was disconnected, so its output must be gone too.
+    check cs.getUtxo(OutPoint(txid: aBlock.txs[0].txid(), vout: 0)).isNone
+    cs.close()
