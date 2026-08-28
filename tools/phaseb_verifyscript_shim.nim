@@ -676,6 +676,24 @@ proc processCheckBlock(req: JsonNode): string =
   let blk = deserializeBlock(blockBytes)
   let spendHeight = int32(req["spend_height"].getBiggestInt())
   let skipPow = if req.hasKey("skip_pow"): req["skip_pow"].getBool() else: true
+  # OPTIONAL difficulty-retarget context (corpus boundary packs, height %% 2016
+  # == 0).  Core recomputes nBits from pindexLast (height-1) and pindexFirst
+  # (height-2016): without pindexFirst's TIME the retarget cannot be verified
+  # at all, and the synthetic window is far too shallow for getAncestor to
+  # reach that height.  Supplying it makes the bad-diffbits gate REAL here.
+  var haveRetarget = false
+  var rtFirstHeight: int32 = 0
+  var rtFirstTime: uint32 = 0
+  var rtLastBits: uint32 = 0
+  var rtLastTime: uint32 = 0
+  if req.hasKey("retarget") and req["retarget"].kind == JObject:
+    let rt = req["retarget"]
+    if rt.hasKey("first_height") and rt.hasKey("first_time") and rt.hasKey("last_bits"):
+      rtFirstHeight = int32(rt["first_height"].getBiggestInt())
+      rtFirstTime = uint32(rt["first_time"].getBiggestInt())
+      rtLastBits = uint32(parseHexInt(rt["last_bits"].getStr()))
+      rtLastTime = if rt.hasKey("last_time"): uint32(rt["last_time"].getBiggestInt()) else: 0'u32
+      haveRetarget = true
   let skipScripts = if req.hasKey("skip_scripts"): req["skip_scripts"].getBool()
                     else: false
 
@@ -727,9 +745,15 @@ proc processCheckBlock(req: JsonNode): string =
     result[2] = byte((hh shr 16) and 0xff)
     result[3] = byte((hh shr 24) and 0xff)
   var prevHeader = default(BlockHeader)
-  prevHeader.bits = blk.header.bits
-  prevHeader.timestamp = (if blk.header.timestamp > 0'u32: blk.header.timestamp - 1'u32
-                          else: 0'u32)
+  # Non-retarget heights: the parent's bits ARE the block's bits (that is what
+  # getNextWorkRequired returns).  AT a retarget boundary they differ — the
+  # block carries the NEWLY computed value — so use the real parent bits/time
+  # when the corpus supplies them, or the check is guaranteed to mismatch.
+  prevHeader.bits = if haveRetarget: rtLastBits else: blk.header.bits
+  prevHeader.timestamp =
+    if haveRetarget and rtLastTime > 0'u32: rtLastTime
+    elif blk.header.timestamp > 0'u32: blk.header.timestamp - 1'u32
+    else: 0'u32
   # Hash-link prevIndex to its synthetic parent so getMtpForBlockIndex's
   # parent-hash walk resolves inside the shadow (adf1ef2 switched the MTP source
   # from height-indexed getMtpForHeight to hash-linked getMtpForBlockIndex).
@@ -782,6 +806,23 @@ proc processCheckBlock(req: JsonNode): string =
       wh.prevBlock = BlockHash(synthHash(h - 1))
       db.ibdIndexByHash[bh] = chainstate.BlockIndex(hash: bh, height: h, header: wh)
       db.ibdIndexByHeight[h] = bh
+
+    # At a retarget boundary, extend the synthetic chain all the way down to
+    # pindexFirst (height-2016) so getAncestor can actually reach it.  Only the
+    # BOTTOM entry's timestamp feeds CalculateNextWorkRequired; the rest exist
+    # purely so the parent-hash walk terminates at the right height.
+    if haveRetarget:
+      let windowBottom = prevHeight - int32(windowDepth) + 1
+      var h = windowBottom - 1
+      while h >= rtFirstHeight:
+        let bh = BlockHash(synthHash(h))
+        var wh = default(BlockHeader)
+        wh.bits = rtLastBits
+        wh.timestamp = if h == rtFirstHeight: rtFirstTime else: rtFirstTime + uint32(h - rtFirstHeight)
+        wh.prevBlock = BlockHash(synthHash(h - 1))
+        db.ibdIndexByHash[bh] = chainstate.BlockIndex(hash: bh, height: h, header: wh)
+        db.ibdIndexByHeight[h] = bh
+        dec h
 
   # Step 1+2+3: CheckBlock (context-free) + ContextualCheckBlock + the
   # ConnectBlock monetary/sigop/weight/witness gates, all inside validateBlock.
