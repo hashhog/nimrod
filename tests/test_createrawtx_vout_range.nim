@@ -358,3 +358,139 @@ suite "createrawtransaction — contradiction check must not outrank earlier err
       %*[oneInput(SeqFinal), %*{"notanaddress": 1.0}, 0, true]))
     check r.code == -5
     check r.msg == "Invalid Bitcoin address: notanaddress"
+
+
+## ============================================================================
+## createrawtransaction — a PRESENT but NON-NUMERIC `sequence` is IGNORED
+## ============================================================================
+##
+## THE DEFECT
+## ----------
+## nimrod answered -3 "Expected type number for sequence" to a call Bitcoin
+## Core ACCEPTS.  A client that sends `"sequence": null` (trivially produced by
+## any library that serialises an unset optional field) got a hard type error
+## instead of a transaction.
+##
+## WHAT BITCOIN CORE DOES
+## ----------------------
+## AddInputs guards the ENTIRE read with a type test, and there is no `else`
+## (bitcoin-core/src/rpc/rawtransaction_util.cpp:57-65):
+##
+##     const UniValue& sequenceObj = o.find_value("sequence");
+##     if (sequenceObj.isNum()) {
+##         int64_t seqNr64 = sequenceObj.getInt<int64_t>();
+##         if (seqNr64 < 0 || seqNr64 > CTxIn::SEQUENCE_FINAL) {
+##             throw JSONRPCError(RPC_INVALID_PARAMETER,
+##                 "Invalid parameter, sequence number is out of range");
+##         } else { nSequence = (uint32_t)seqNr64; }
+##     }
+##
+## A string, bool, object, array or null never enters the branch, so the
+## default computed a few lines above simply survives.
+##
+## THE ASSERTION IS ON THE EMITTED SEQUENCE, NOT ON MERE ACCEPTANCE
+## ----------------------------------------------------------------
+## This is a TWO-SIDED trap and "the call succeeded" does not distinguish the
+## sides.  With `replaceable` absent, rbf.value_or(true) is TRUE, so the
+## surviving default is MAX_BIP125_RBF_SEQUENCE (0xfffffffd) and the built
+## transaction is REPLACEABLE.  An implementation that fell through to
+## SEQUENCE_FINAL (0xffffffff) would also "accept" — while quietly handing back
+## a NON-replaceable transaction.  rustoshi originally did exactly that.  Every
+## row below therefore decodes the returned hex and asserts the sequence that
+## actually reached the wire bytes.
+##
+## THE FLOAT ROW is the one a dynamically-typed implementation cannot express
+## and Nim can.  univalue keeps the raw token and converts with
+## std::from_chars, which stops at the '.' or the 'e' and leaves trailing
+## characters, so the conversion FAILS.  Verified against the live Core node
+## (2026-08-28): `sequence: 1.5` AND `sequence: 100.0` are both
+## -1 "JSON integer out of range" — neither ignored nor accepted.
+##
+## Oracle rows below were captured from the live Core node on 2026-08-28:
+##   sequence "nope" / true / false / null / {} / []   ACCEPT, emits 0xfffffffd
+##   the same with replaceable=false                   ACCEPT, emits 0xffffffff
+##   sequence 1.5 / 100.0                              REJECT -1
+##   sequence 4294967296 / -1  (NUMERIC)               REJECT -8  (unchanged)
+
+proc inputWithSeq(seqNode: JsonNode): JsonNode =
+  ## One well-formed input whose `sequence` key carries an ARBITRARY JSON
+  ## node, built explicitly rather than through `%*` so the non-numeric JSON
+  ## types (object, array, null) reach the handler exactly as they arrive off
+  ## the wire.
+  let o = newJObject()
+  o["txid"] = %TestTxid
+  o["vout"] = %0
+  o["sequence"] = seqNode
+  result = newJArray()
+  result.add(o)
+
+suite "createrawtransaction — non-numeric sequence is ignored (Core parity)":
+
+  test "string sequence is ignored; default RBF sequence reaches the bytes":
+    let hex = callCreateRaw(inputWithSeq(%"nope")).getStr()
+    check inputSequences(hex) == @[0xfffffffd'u32]
+
+  test "bool true sequence is ignored; default RBF sequence reaches the bytes":
+    let hex = callCreateRaw(inputWithSeq(%true)).getStr()
+    check inputSequences(hex) == @[0xfffffffd'u32]
+
+  test "bool false sequence is ignored; default RBF sequence reaches the bytes":
+    let hex = callCreateRaw(inputWithSeq(%false)).getStr()
+    check inputSequences(hex) == @[0xfffffffd'u32]
+
+  test "null sequence is ignored; default RBF sequence reaches the bytes":
+    ## An unset optional serialised as JSON null is the realistic client bug
+    ## this row protects.
+    let hex = callCreateRaw(inputWithSeq(newJNull())).getStr()
+    check inputSequences(hex) == @[0xfffffffd'u32]
+
+  test "object sequence is ignored; default RBF sequence reaches the bytes":
+    let hex = callCreateRaw(inputWithSeq(newJObject())).getStr()
+    check inputSequences(hex) == @[0xfffffffd'u32]
+
+  test "array sequence is ignored; default RBF sequence reaches the bytes":
+    let hex = callCreateRaw(inputWithSeq(newJArray())).getStr()
+    check inputSequences(hex) == @[0xfffffffd'u32]
+
+  test "ignored sequence leaves the REAL default in charge (rbf=false)":
+    ## Proves the fall-through reaches the default COMPUTATION, not a
+    ## hard-coded 0xfffffffd: with replaceable explicitly false and locktime 0,
+    ## AddInputs picks SEQUENCE_FINAL.
+    let hex = callCreateRawFull(
+      %*[inputWithSeq(%"nope"), outputsObj(), 0, false]).getStr()
+    check inputSequences(hex) == @[0xffffffff'u32]
+
+  test "FLOAT sequence 1.5 -> -1 JSON integer out of range (isNum, but no int)":
+    let r = captureRpcError(callCreateRaw(inputWithSeq(%1.5)))
+    check r.code == -1
+    check r.msg == "JSON integer out of range"
+
+  test "FLOAT sequence 100.0 -> -1 (from_chars stops at the '.', integral or not)":
+    ## Integral VALUE, non-integral TOKEN. Core rejects it just the same,
+    ## because univalue converts the raw token, not the parsed double.
+    let r = captureRpcError(callCreateRaw(inputWithSeq(%100.0)))
+    check r.code == -1
+    check r.msg == "JSON integer out of range"
+
+suite "createrawtransaction — NUMERIC sequence rejections must be untouched":
+
+  test "CONTROL: numeric sequence 4294967296 is still -8 out of range":
+    ## Without this control the fix above is satisfiable by deleting the range
+    ## check outright.
+    let r = captureRpcError(callCreateRaw(
+      %*[{"txid": TestTxid, "vout": 0, "sequence": TwoPow32}]))
+    check r.code == -8
+    check r.msg == "Invalid parameter, sequence number is out of range"
+
+  test "CONTROL: numeric sequence -1 is still -8 out of range":
+    let r = captureRpcError(callCreateRaw(
+      %*[{"txid": TestTxid, "vout": 0, "sequence": -1}]))
+    check r.code == -8
+    check r.msg == "Invalid parameter, sequence number is out of range"
+
+  test "CONTROL: an ordinary numeric sequence still reaches the tx bytes":
+    ## Proves the numeric branch still ASSIGNS, so "ignore everything" is not
+    ## a passing implementation.
+    let hex = callCreateRaw(
+      %*[{"txid": TestTxid, "vout": 0, "sequence": 12345}]).getStr()
+    check inputSequences(hex) == @[12345'u32]

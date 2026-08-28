@@ -11532,14 +11532,48 @@ proc handleCreateRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
       raise newRpcError(RpcInvalidParameter,
         "Invalid parameter, vout cannot be negative")
     var sequence = defaultSequence
-    if inputObj.hasKey("sequence") and inputObj["sequence"].kind != JNull:
-      if inputObj["sequence"].kind != JInt:
-        raise newRpcError(RpcTypeError, "Expected type number for sequence")
-      let seqNr = inputObj["sequence"].getInt()
-      if seqNr < 0 or seqNr > 0xffffffff'i64:
-        raise newRpcError(RpcInvalidParameter,
-          "Invalid parameter, sequence number is out of range")
-      sequence = uint32(seqNr)
+    # Core guards the ENTIRE sequence read with `if (sequenceObj.isNum())`
+    # (rawtransaction_util.cpp:57-65) and there is no `else`:
+    #
+    #     const UniValue& sequenceObj = o.find_value("sequence");
+    #     if (sequenceObj.isNum()) {
+    #         int64_t seqNr64 = sequenceObj.getInt<int64_t>();
+    #         if (seqNr64 < 0 || seqNr64 > CTxIn::SEQUENCE_FINAL) throw ...;
+    #         else nSequence = (uint32_t)seqNr64;
+    #     }
+    #
+    # So a `sequence` that is PRESENT but NOT a number -- a string, bool,
+    # object, array or null -- is simply IGNORED, and the default chosen above
+    # survives.  Core ACCEPTS such a call; nimrod rejected it with -3
+    # "Expected type number for sequence".
+    #
+    # The DEFAULT is the point, not merely the acceptance.  With `replaceable`
+    # absent, rbf.value_or(true) is TRUE, so the surviving default is
+    # MAX_BIP125_RBF_SEQUENCE (0xfffffffd) and the built transaction is
+    # REPLACEABLE.  Falling through to SEQUENCE_FINAL would also "accept"
+    # while quietly producing a NON-replaceable transaction -- the other side
+    # of the same trap, and the one rustoshi originally landed on.
+    #
+    # JFloat is the case a dynamically-typed impl cannot see and nimrod can.
+    # univalue keeps the raw token and getInt<int64_t> converts it with
+    # std::from_chars, which stops at the '.' or the 'e' and leaves trailing
+    # characters, so the conversion FAILS: `sequence: 1.5` and `sequence:
+    # 100.0` are both -1 "JSON integer out of range" on the live Core node
+    # (probed 2026-08-28), NOT ignored and NOT accepted.  Nim's parser only
+    # produces JFloat for a token carrying a fraction or an exponent, so
+    # JFloat maps onto exactly that set.
+    if inputObj.hasKey("sequence"):
+      case inputObj["sequence"].kind
+      of JInt:
+        let seqNr = inputObj["sequence"].getInt()
+        if seqNr < 0 or seqNr > 0xffffffff'i64:
+          raise newRpcError(RpcInvalidParameter,
+            "Invalid parameter, sequence number is out of range")
+        sequence = uint32(seqNr)
+      of JFloat:
+        raise newRpcError(RpcMiscError, "JSON integer out of range")
+      else:
+        discard  # present but non-numeric -> ignored, default stands
     inputs.add(TxIn(
       prevOut: OutPoint(txid: txid, vout: uint32(nOutput)),
       scriptSig: @[],
