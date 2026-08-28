@@ -176,3 +176,185 @@ suite "createrawtransaction — CONTROLS (an over-tight bound must fail here)":
     let hex = callCreateRaw(%*[{"txid": TestTxid, "vout": 7}]).getStr()
     check hex.len > 0
     check firstInputVout(hex) == 7'u32
+
+## ============================================================================
+## createrawtransaction — `replaceable=true` must REJECT contradicting sequences
+## ============================================================================
+##
+## THE DEFECT
+## ----------
+## Nine of the ten nodes in this repo (nimrod included, before this suite)
+## silently ACCEPT a request that contradicts itself:
+##
+##     createrawtransaction '[{"txid":…,"vout":0,"sequence":4294967295}]' \
+##                          '{"data":"deadbeef"}' 0 true
+##                                                  ^^^^ replaceable = true
+##
+## The caller has asked for two incompatible things: "make this replaceable"
+## and "pin every input to SEQUENCE_FINAL", which is precisely the encoding
+## that opts OUT of replacement.  nimrod resolved the conflict in favour of the
+## explicit sequence, returned a well-formed hex, and said NOTHING.  The
+## resulting transaction cannot be fee-bumped; the caller finds out only when
+## it is stuck at a low feerate and `bumpfee` refuses it.  Core does not guess
+## between two arguments that disagree — it refuses the request:
+##
+##     -8  Invalid parameter combination: Sequence number(s) contradict
+##         replaceable option
+##
+## WHAT BITCOIN CORE DOES
+## ----------------------
+## bitcoin-core/src/rpc/rawtransaction_util.cpp, ConstructTransaction, at the
+## very END — after AddInputs AND AddOutputs:
+##
+##     if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+##         !SignalsOptInRBF(CTransaction(rawTx))) {
+##         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter
+##             combination: Sequence number(s) contradict replaceable option");
+##     }
+##
+## bitcoin-core/src/util/rbf.cpp:
+##
+##     bool SignalsOptInRBF(const CTransaction &tx) {
+##         for (const CTxIn &txin : tx.vin)
+##             if (txin.nSequence <= MAX_BIP125_RBF_SEQUENCE) return true;
+##         return false;
+##     }
+##
+## with MAX_BIP125_RBF_SEQUENCE = 0xfffffffd (bitcoin-core/src/util/rbf.h).
+## So ALL THREE must hold to reject: rbf EXPLICITLY true, at least one input,
+## and NO input signalling.
+##
+## THE ABSENT-vs-EXPLICIT ASYMMETRY (row 1 — the easy one to get wrong)
+## --------------------------------------------------------------------
+## An ABSENT `replaceable` still DEFAULTS to RBF when *choosing* the sequence
+## (`AddInputs` uses `rbf.value_or(true)`), yet it does NOT arm this check,
+## which is gated on `rbf.has_value()`.  That asymmetry is deliberate: a caller
+## who never mentioned `replaceable` has asserted nothing, so an explicit
+## `sequence` is simply their wish and there is nothing to contradict.  Only a
+## caller who SAID `true` while ALSO pinning a non-signalling sequence has
+## stated two incompatible things.  A check written against a bare `rbf` breaks
+## row 1 — the plain `createrawtransaction inputs outputs` with a final
+## sequence, which Core accepts.
+##
+## TEETH
+## -----
+## Four of the eight rows are ACCEPTS, and they are not padding: a check
+## written as "explicit true ⇒ reject any explicit sequence" would still pass
+## every REJECT row while breaking ordinary RBF usage.  Row 6 (mixed inputs:
+## ONE signals, one does not) pins the "ANY input" semantics of
+## SignalsOptInRBF against the tempting "ALL inputs" misreading; row 2 pins the
+## boundary at `<=` 0xfffffffd rather than `<`.  Every ACCEPT row DECODES the
+## returned hex with the node's own deserializer and asserts the sequence that
+## actually reached the wire bytes — "no exception raised" alone would let a
+## handler that quietly rewrote the sequence pass.
+##
+## Every row below was verified against a LIVE Bitcoin Core node.
+##
+## References:
+##   bitcoin-core/src/rpc/rawtransaction_util.cpp  ConstructTransaction (tail)
+##   bitcoin-core/src/util/rbf.cpp                 SignalsOptInRBF
+##   bitcoin-core/src/util/rbf.h                   MAX_BIP125_RBF_SEQUENCE
+##   bitcoin-core/src/rpc/protocol.h               RPC_INVALID_PARAMETER = -8
+
+const
+  SeqRbf         = 4294967293'i64  # 0xfffffffd  MAX_BIP125_RBF_SEQUENCE
+  SeqNonFinal    = 4294967294'i64  # 0xfffffffe  MAX_SEQUENCE_NONFINAL
+  SeqFinal       = 4294967295'i64  # 0xffffffff  SEQUENCE_FINAL
+  ContradictMsg  =
+    "Invalid parameter combination: Sequence number(s) contradict replaceable option"
+
+proc inputSequences(txHex: string): seq[uint32] =
+  ## Decode with the node's own transaction deserializer and report the
+  ## sequences that actually reached the wire bytes.
+  for txIn in deserializeTransaction(hexToBytesLocal(txHex)).inputs:
+    result.add(txIn.sequence)
+
+proc oneInput(sequence: int64 = -1): JsonNode =
+  ## One well-formed input; `sequence` < 0 means "omit the key entirely", which
+  ## is how row 8 exercises the defaulting path.
+  if sequence < 0:
+    %*[{"txid": TestTxid, "vout": 0}]
+  else:
+    %*[{"txid": TestTxid, "vout": 0, "sequence": sequence}]
+
+proc callWithRbf(inputs: JsonNode, replaceable: bool): JsonNode =
+  ## locktime must be passed positionally (0) to reach the 4th argument.
+  callCreateRawFull(%*[inputs, outputsObj(), 0, replaceable])
+
+suite "createrawtransaction — replaceable vs sequence contradiction (Core parity)":
+
+  test "row 1: rbf ABSENT + sequence 0xffffffff -> ACCEPT (has_value() is false)":
+    ## The asymmetry row. Absent still defaults to RBF for CHOOSING the
+    ## sequence, but never arms the check. A check on a bare `rbf` fails here.
+    let hex = callCreateRawFull(%*[oneInput(SeqFinal), outputsObj(), 0]).getStr()
+    check inputSequences(hex) == @[0xffffffff'u32]
+    # JSON null is Core's other spelling of "absent" (isNull() -> nullopt).
+    let hexNull = callCreateRawFull(
+      %*[oneInput(SeqFinal), outputsObj(), 0, newJNull()]).getStr()
+    check inputSequences(hexNull) == @[0xffffffff'u32]
+    # ...and with the argument omitted entirely (2-arg form).
+    let hexShort = callCreateRawFull(%*[oneInput(SeqFinal), outputsObj()]).getStr()
+    check inputSequences(hexShort) == @[0xffffffff'u32]
+
+  test "row 2: rbf true + sequence 0xfffffffd -> ACCEPT (<= is inclusive)":
+    ## Pins the boundary: MAX_BIP125_RBF_SEQUENCE itself SIGNALS. A `<`
+    ## instead of `<=` in SignalsOptInRBF fails exactly here.
+    let hex = callWithRbf(oneInput(SeqRbf), true).getStr()
+    check inputSequences(hex) == @[0xfffffffd'u32]
+
+  test "row 3: rbf true + sequence 0xfffffffe -> REJECT -8":
+    ## One past the signalling boundary: nonfinal, but NOT replaceable.
+    let r = captureRpcError(callWithRbf(oneInput(SeqNonFinal), true))
+    check r.code == -8
+    check r.msg == ContradictMsg
+
+  test "row 4: rbf true + sequence 0xffffffff -> REJECT -8":
+    ## SEQUENCE_FINAL — the flagship case, and what nine of ten nodes accept.
+    let r = captureRpcError(callWithRbf(oneInput(SeqFinal), true))
+    check r.code == -8
+    check r.msg == ContradictMsg
+
+  test "row 5: rbf true + NO inputs -> ACCEPT (vin.size() > 0 is false)":
+    ## An empty vin cannot signal, yet Core does not reject: the guard demands
+    ## at least one input. Decoded with the LEGACY-FORCED reader because a
+    ## zero-input tx's `00` vin count is otherwise misread as a segwit marker.
+    let hex = callWithRbf(newJArray(), true).getStr()
+    let tx = deserializeTransactionLegacyForced(hexToBytesLocal(hex))
+    check tx.inputs.len == 0
+    check tx.outputs.len == 1
+
+  test "row 6: rbf true + inputs (0xffffffff, 0) -> ACCEPT (ANY input signals)":
+    ## SignalsOptInRBF is ANY, not ALL: one signalling input makes the whole
+    ## transaction replaceable, so a mixed set is NOT a contradiction. A check
+    ## that demands every input signal fails here — and would break the real
+    ## multi-party use BIP-125 has this rule for.
+    let inputs = %*[
+      {"txid": TestTxid, "vout": 0, "sequence": SeqFinal},
+      {"txid": TestTxid, "vout": 1, "sequence": 0}
+    ]
+    let hex = callWithRbf(inputs, true).getStr()
+    check inputSequences(hex) == @[0xffffffff'u32, 0'u32]
+
+  test "row 7: rbf FALSE + sequence 0xffffffff -> ACCEPT (rbf.value() is false)":
+    ## Explicitly opting OUT and pinning a final sequence agree with each
+    ## other; there is nothing to contradict.
+    let hex = callWithRbf(oneInput(SeqFinal), false).getStr()
+    check inputSequences(hex) == @[0xffffffff'u32]
+
+  test "row 8: rbf true + NO explicit sequence -> ACCEPT (default IS 0xfffffffd)":
+    ## The ordinary, overwhelmingly common RBF call. The default sequence
+    ## picked by AddInputs already signals, so the tail check is satisfied.
+    ## This is the row an over-eager "explicit true rejects" check breaks.
+    let hex = callWithRbf(oneInput(), true).getStr()
+    check inputSequences(hex) == @[0xfffffffd'u32]
+
+suite "createrawtransaction — contradiction check must not outrank earlier errors":
+
+  test "an OUTPUT error still wins over the contradiction (Core's ordering)":
+    ## Core runs the check AFTER AddOutputs, so a bad output is reported
+    ## first even though the rbf/sequence pair also contradicts. Moving the
+    ## check earlier (e.g. right after input parsing) flips this message.
+    let r = captureRpcError(callCreateRawFull(
+      %*[oneInput(SeqFinal), %*{"notanaddress": 1.0}, 0, true]))
+    check r.code == -5
+    check r.msg == "Invalid Bitcoin address: notanaddress"

@@ -11484,11 +11484,19 @@ proc handleCreateRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   #   else                            → SEQUENCE_FINAL           0xffffffff
   # value_or(true) means BOTH "arg absent" AND "replaceable=true" → RBF default.
   # (rustoshi FIX-70 / W120 BUG-3 documents the same Core default.)
-  var rbf = true  # std::nullopt → value_or(true)
+  #
+  # The optional-ness itself is LOAD-BEARING and must survive parsing: the
+  # contradiction check at the tail of this proc is gated on has_value(), NOT
+  # on the value_or(true) default, so "absent" and "explicit true" behave
+  # DIFFERENTLY there even though they pick the same sequence here. Collapsing
+  # them into one bool loses that, so track presence alongside the value.
+  var rbf = true            # std::nullopt → value_or(true)
+  var rbfExplicit = false   # rbf.has_value()
   if params.len >= 4 and params[3].kind != JNull:
     if params[3].kind != JBool:
       raise newRpcError(RpcTypeError, "Expected type bool for replaceable")
     rbf = params[3].getBool()
+    rbfExplicit = true
   let defaultSequence: uint32 =
     if rbf: 0xfffffffd'u32
     elif locktime != 0: 0xfffffffe'u32
@@ -11605,6 +11613,53 @@ proc handleCreateRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
       seenAddrs.incl(k)
       let spk = scriptPubKeyForAddress(parsedAddr)
       outputs.add(TxOut(value: Satoshi(amount), scriptPubKey: spk))
+
+  # ---- replaceable/sequence CONTRADICTION (Core ConstructTransaction tail) ----
+  # Core runs this LAST -- after AddInputs AND AddOutputs -- and so do we, so an
+  # output-parsing error still wins over it (bitcoin-core/src/rpc/
+  # rawtransaction_util.cpp ConstructTransaction:163-168):
+  #
+  #     AddInputs(rawTx, inputs_in, rbf);
+  #     AddOutputs(rawTx, outputs_in);
+  #     if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+  #         !SignalsOptInRBF(CTransaction(rawTx)))
+  #         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter
+  #             combination: Sequence number(s) contradict replaceable option");
+  #
+  # SignalsOptInRBF (bitcoin-core/src/util/rbf.cpp) is "ANY input signals":
+  # true as soon as one input has nSequence <= MAX_BIP125_RBF_SEQUENCE
+  # (0xfffffffd, bitcoin-core/src/util/rbf.h). One signalling input is enough
+  # for the whole transaction, so a mixed tx (one final input, one at 0) is
+  # NOT a contradiction and must be ACCEPTED.
+  #
+  # WHY THIS MATTERS: nine of the ten nodes in this repo silently ACCEPT the
+  # contradiction today. A caller who explicitly asks for replaceable=true and
+  # also pins a final sequence (0xfffffffe / 0xffffffff) gets back a perfectly
+  # well-formed transaction that CANNOT be fee-bumped, with no error and no log
+  # line -- the node quietly resolves the contradiction in favour of the
+  # sequence and says nothing. The caller learns the truth only when the tx is
+  # stuck at a low feerate and bumpfee refuses it. Core does not guess between
+  # two arguments that disagree; it refuses the request.
+  #
+  # THE ABSENT-vs-EXPLICIT ASYMMETRY IS DELIBERATE, NOT AN OVERSIGHT: absent
+  # (std::nullopt) also DEFAULTS to RBF for CHOOSING the sequence above, via
+  # rbf.value_or(true) -- but it does not arm this check, because has_value()
+  # is false. Rationale: a caller who never mentioned `replaceable` has not
+  # asserted anything, so an explicit `sequence` is simply the caller's wish
+  # and there is nothing to contradict. Only a caller who SAID `true` while
+  # ALSO pinning a non-signalling sequence has stated two incompatible things.
+  # Hence `rbfExplicit and rbf`, never a bare `rbf`.
+  if rbfExplicit and rbf and inputs.len > 0:
+    var signalsOptInRbf = false
+    for txIn in inputs:
+      # UNSIGNED comparison, same as mempool.signalsRbf:
+      # 0xfffffffd < 0xfffffffe < 0xffffffff.
+      if txIn.sequence <= MaxBip125RbfSequence:
+        signalsOptInRbf = true
+        break
+    if not signalsOptInRbf:
+      raise newRpcError(RpcInvalidParameter,
+        "Invalid parameter combination: Sequence number(s) contradict replaceable option")
 
   # ---- assemble unsigned tx (version 2, no witnesses → legacy serialization) ----
   let rawTx = Transaction(
