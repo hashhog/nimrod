@@ -539,6 +539,12 @@ proc getBlockHashByHeight*(cdb: ChainDb, height: int32): Option[BlockHash] =
   ## blocks with "bad-txns-nonfinal".
   if cdb.ibdIndexByHeight.len > 0 and height in cdb.ibdIndexByHeight:
     return some(cdb.ibdIndexByHeight[height])
+  # A nil db handle means no persisted index exists (harness/offline contexts;
+  # never the case in the running node).  Report "no row" rather than passing
+  # a nil handle into the RocksDB C API (uncatchable SIGSEGV).  Callers treat
+  # none conservatively — e.g. checkBip30 keeps BIP-30 ENFORCED (fail-safe).
+  if cdb.db == nil:
+    return none(BlockHash)
   let data = cdb.db.get(cfBlockIndex, blockIndexKey(height))
   if data.isSome and data.get().len >= 32:
     var hash: array[32, byte]
