@@ -5949,10 +5949,35 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let blockHex = params[0].getStr()
 
+  # --- Core DecodeHexBlk parity (rpc/mining.cpp:1079-1081) ----------------
+  # A block that does not DESERIALIZE is not a BIP-22 consensus rejection.
+  # Core runs DecodeHexBlk BEFORE any validation and, on failure, throws
+  #     JSONRPCError(RPC_DESERIALIZATION_ERROR, "Block decode failed")
+  # (rpc/mining.cpp:1080).  The underlying std::ios_base::failure text —
+  # "non-canonical ReadCompactSize()" (serialize.h:344 / :350 / :356) —
+  # is swallowed by DecodeHexBlk and never reaches the client.
+  #
+  # This decode MUST sit OUTSIDE the `try` below, whose catch-all
+  # `except CatchableError -> %"rejected"` previously absorbed every
+  # deserialization failure (RpcError is itself `object of CatchableError`,
+  # server.nim:33, so raising from inside would be re-swallowed).  That
+  # catch-all is why nimrod answered reject:rejected where Core answers
+  # reject:block-decode-failed on all 4 rows of diff-test corpus
+  # _tierc-guards-2026-07-06/C1-noncanonical-compactsize.  Decision was
+  # never in question — both REJECT, tip unchanged — this is R2 reason-token
+  # parity only.
+  #
+  # Same shape handleSubmitHeader already uses below for the -22
+  # "Block header decode failed" ladder.
+  var blk: Block
   try:
     let blockBytes = hexToBytes(blockHex)
-    let blk = deserializeBlock(blockBytes)
+    blk = deserializeBlock(blockBytes)
+  except CatchableError as decodeErr:
+    debug "submitblock: block decode failed", err = decodeErr.msg
+    raise newRpcError(RpcDeserializationError, "Block decode failed")
 
+  try:
     # Full block validation (PoW, merkle root, transaction structure).
     # Reference: Bitcoin Core ProcessNewBlock -> CheckBlock.
     # Return canonical BIP-22 result strings per BIP-22 and Bitcoin Core
