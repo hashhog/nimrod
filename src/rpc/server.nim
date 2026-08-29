@@ -11538,6 +11538,39 @@ proc handleCreateRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
         "Invalid parameter, locktime out of range")
     locktime = uint32(lt)
 
+  # ---- version (param 4, default 2) ----
+  # Core's 5th argument (rpc/rawtransaction.cpp:122), read as
+  # self.Arg<uint32_t>("version") and bounded to
+  # [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+  # (policy/policy.h:152-153) inside ConstructTransaction
+  # (rawtransaction_util.cpp:158-161), then ASSIGNED to the transaction.
+  #
+  # This handler hardcoded `version: 2'i32` and ignored the argument, so a
+  # caller asking for version 3 got a version 2 transaction and a success
+  # reply, and version 4 -- which Core rejects -- was accepted. Version 3 is
+  # TRUC (BIP 431) and carries different policy rules, so the returned
+  # transaction had different relay behaviour from the one requested.
+  #
+  # THE WIDTH IS UNSIGNED, unlike the int32 used for vout: 2147483648 fits a
+  # uint32, survives the conversion and reaches the DOMAIN error (-8), while
+  # -1 and 4294967296 fail the CONVERSION first (-1).
+  #
+  # `params[4].kind != JInt` is checked explicitly because Nim's getInt()
+  # silently returns 0 for any node that is not a JInt -- a float or a string
+  # would otherwise become version 0 and be reported as out of domain rather
+  # than as a type error.
+  var txVersion: int32 = 2
+  if params.len >= 5 and params[4].kind != JNull:
+    if params[4].kind != JInt:
+      raise newRpcError(RpcMiscError, "JSON integer out of range")
+    let vv = params[4].getInt()
+    if vv < 0 or vv > 0xffffffff'i64:
+      raise newRpcError(RpcMiscError, "JSON integer out of range")
+    if vv < 1 or vv > 3:
+      raise newRpcError(RpcInvalidParameter,
+        "Invalid parameter, version out of range(1~3)")
+    txVersion = int32(vv)
+
   # ---- replaceable (param 3) ----
   # Core ConstructTransaction receives rbf as std::optional<bool>:
   # createrawtransaction passes std::nullopt when the arg is ABSENT and the
@@ -11759,9 +11792,9 @@ proc handleCreateRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
       raise newRpcError(RpcInvalidParameter,
         "Invalid parameter combination: Sequence number(s) contradict replaceable option")
 
-  # ---- assemble unsigned tx (version 2, no witnesses → legacy serialization) ----
+  # ---- assemble unsigned tx (no witnesses → legacy serialization) ----
   let rawTx = Transaction(
-    version: 2'i32,
+    version: txVersion,
     inputs: inputs,
     outputs: outputs,
     witnesses: @[],
