@@ -682,10 +682,49 @@ proc handleGetBlockHash(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing height parameter")
 
-  let height = params[0].getInt()
+  # Core reads the height with getInt<int>() (rpc/blockchain.cpp getblockhash):
+  # univalue parses into a 32-bit int and fails for anything that is not an
+  # exact integer inside int32, surfacing as RPC_MISC_ERROR (-1) "JSON integer
+  # out of range" BEFORE the range-vs-tip check below.
+  #
+  # `params[0].getInt()` returned 0 for every JSON number Nim's parser does not
+  # store as JInt -- and 0 is a VALID height -- so the node answered the REAL
+  # mainnet genesis hash with error:null to nonsense input:
+  #
+  #   1.5                   -> JFloat  -> getInt() = 0 -> genesis
+  #   9223372036854775808   -> JString -> getInt() = 0 -> genesis  (> int64.high)
+  #   18446744073709551616  -> JString -> getInt() = 0 -> genesis
+  #
+  # and `int32(height)` truncated whatever did parse as JInt, because range
+  # checks are compiled out of the release build.  Handing back a genuine,
+  # valid block hash is worse than an error: nothing downstream looks wrong,
+  # so a caller that computed a height incorrectly gets a confident answer
+  # about a completely different block.
+  #
+  # Nim's parser stores an integer literal too large for int64 as a JString,
+  # which is why a numeric overflow and a genuine string argument arrive the
+  # same way here; both are -1 in Core, only the message differs.
+  if params[0].kind == JFloat:
+    raise newRpcError(RpcMiscError, "JSON integer out of range")
+  if params[0].kind == JString:
+    let raw = params[0].getStr()
+    var allDigits = raw.len > 0
+    for i, c in raw:
+      if not (c in '0'..'9' or (i == 0 and (c == '-' or c == '+'))):
+        allDigits = false
+        break
+    if allDigits:
+      raise newRpcError(RpcMiscError, "JSON integer out of range")
+    raise newRpcError(RpcMiscError, "JSON value is not an integer as expected")
+  if params[0].kind != JInt:
+    raise newRpcError(RpcMiscError, "JSON value is not an integer as expected")
+  let height64 = params[0].getBiggestInt()
+  if height64 < low(int32).int64 or height64 > high(int32).int64:
+    raise newRpcError(RpcMiscError, "JSON integer out of range")
+  let height = int32(height64)
   # Use ChainState.getBlockHashByHeight which also checks the IBD in-memory map,
   # covering heights not yet flushed to RocksDB (up to 2000 blocks).
-  let hashOpt = rpc.chainState.getBlockHashByHeight(int32(height))
+  let hashOpt = rpc.chainState.getBlockHashByHeight(height)
   if hashOpt.isNone:
     # Core rpc/blockchain.cpp::getblockhash raises RPC_INVALID_PARAMETER (-8)
     # with this exact message when nHeight < 0 || nHeight > active tip height,
