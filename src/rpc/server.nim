@@ -171,6 +171,28 @@ proc newRpcError(code: int, msg: string): ref RpcError =
   result = newException(RpcError, msg)
   result.code = code
 
+proc coreInt32Bound*(v: int64): int =
+  ## Core reads numeric RPC arguments with `UniValue::getInt<int>()`, which
+  ## parses the raw JSON token with std::from_chars INTO THE DESTINATION WIDTH.
+  ## The width check therefore lives INSIDE the conversion and fires BEFORE the
+  ## handler's own domain test: out of int32 is RPC_MISC_ERROR (-1) "JSON
+  ## integer out of range", and only values that survive reach a -8 range check.
+  ##
+  ## Nim's `getInt` returns a 64-bit `int` here, so nothing overflows and this
+  ## bound is the only thing enforcing Core's width.
+  if v < low(int32).int64 or v > high(int32).int64:
+    raise newRpcError(RpcMiscError, "JSON integer out of range")
+  int(v)
+
+proc coreUint32Bound*(v: int64): int =
+  ## `getInt<uint32_t>()` parity (gettxout's `n`): std::from_chars accepts no
+  ## sign for an unsigned destination, so a NEGATIVE value fails the conversion
+  ## with the same -1 as one above 2^32-1.
+  if v < 0 or v > 4294967295'i64:
+    raise newRpcError(RpcMiscError, "JSON integer out of range")
+  int(v)
+
+
 proc newRpcServer*(
   port: uint16,
   chainState: ChainState,
@@ -5517,8 +5539,10 @@ proc handleGetNodeAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
   ## recognized: <raw>". The result is shuffled (non-deterministic order).
 
   # 1. count (default 1; 0 = all). Negative → RPC_INVALID_PARAMETER (-8).
+  # getInt<int> BEFORE the handler's own -8 range test: an out-of-int32 count
+  # fails the CONVERSION (-1) while an in-range negative one reaches -8.
   let hasCount = params.len >= 1 and params[0].kind != JNull
-  let count = if hasCount: params[0].getInt() else: 1
+  let count = if hasCount: coreInt32Bound(params[0].getBiggestInt()) else: 1
   if count < 0:
     raise newRpcError(RpcInvalidParameter, "Address count out of range")
 
@@ -7322,7 +7346,9 @@ proc handleGetTxOut(rpc: RpcServer, params: JsonNode): JsonNode =
   # txid still returns JSON null below.
   validateHashV(txidHex, "txid")
 
-  let voutNum = params[1].getInt()
+  # Core reads n as getInt<uint32_t> (rpc/blockchain.cpp), so a negative vout is
+  # a CONVERSION failure, not a lookup that returns null.
+  let voutNum = coreUint32Bound(params[1].getBiggestInt())
   let includeMempool = if params.len >= 3: params[2].getBool() else: true
 
   # Parse txid (reverse display byte order → internal order)
@@ -13698,7 +13724,8 @@ proc parseWaitTimeoutMs(params: JsonNode, idx: int): int =
         of JArray: "array"
         else: "null"
       ) & " is not of expected type number")
-  let ms = t.getInt()
+  # The width check runs BEFORE the negative-timeout test.
+  let ms = coreInt32Bound(t.getBiggestInt())
   if ms < 0:
     raise newRpcError(RpcMiscError, "Negative timeout")
   ms
@@ -13721,7 +13748,7 @@ proc parseWaitHeight(params: JsonNode, idx: int): int =
         of JArray: "array"
         else: "null"
       ) & " is not of expected type number")
-  h.getInt()
+  coreInt32Bound(h.getBiggestInt())
 
 proc waitForTip(rpc: RpcServer,
                 predicate: proc(displayHash: string, height: int32): bool {.gcsafe, raises: [].},
