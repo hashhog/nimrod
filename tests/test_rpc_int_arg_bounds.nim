@@ -83,6 +83,31 @@ suite "getnodeaddresses count is getInt<int>, then -8":
     check callErr("getnodeaddresses", %*[-1]) ==
       (code: -8, msg: "Address count out of range")
 
+suite "estimatesmartfee conf_target / estimate_mode":
+  # These were NOT in the hostile-integer findings: the differential's CONTROL
+  # (an in-range call with the baseline "" mode) is what exposed the mode being
+  # ignored, and the conf_target error carried our own code and text.
+  test "conf_target outside int32 -> -1":
+    for v in OutOfInt32:
+      check callErr("estimatesmartfee", %*[v]) == RangeErr
+
+  test "conf_target outside [1,1008] -> -8 with Core's message":
+    for v in [0, -1, 1009, 99999]:
+      check callErr("estimatesmartfee", %*[v]) ==
+        (code: -8, msg: "Invalid conf_target, must be between 1 and 1008")
+
+  test "an unknown estimate_mode is rejected, not ignored":
+    for m in ["", "garbage", "ECONOMICALLY"]:
+      check callErr("estimatesmartfee", %*[6, m]) ==
+        (code: -8, msg: "Invalid estimate_mode parameter, must be one of: " &
+                        "\"unset\", \"economical\", \"conservative\"")
+
+  test "CONTROL the three fee modes and in-range targets are accepted":
+    for m in ["unset", "economical", "CONSERVATIVE", "Economical"]:
+      check callErr("estimatesmartfee", %*[6, m]).code == 0
+    for v in [1, 6, 1008]:
+      check callErr("estimatesmartfee", %*[v]).code == 0
+
 suite "gettxout n is getInt<uint32_t>":
   test "a negative or >uint32 vout is a conversion failure":
     for v in [-1'i64, -2147483649'i64, 4294967296'i64]:

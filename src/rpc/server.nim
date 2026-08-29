@@ -6769,10 +6769,30 @@ proc handleEstimateSmartFee(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing conf_target parameter")
 
-  let confTarget = params[0].getInt()
+  # getInt<int> first (the CONVERSION), then Core's domain test.
+  let confTarget = coreInt32Bound(params[0].getBiggestInt())
 
   if confTarget < 1 or confTarget > 1008:
-    raise newRpcError(RpcInvalidParams, "conf_target out of range (1-1008)")
+    # Core: ParseConfirmTarget (rpc/util.cpp) raises RPC_INVALID_PARAMETER with
+    # this exact text -- it was RpcInvalidParams (-32602) here, and the message
+    # was ours rather than Core's.
+    raise newRpcError(RpcInvalidParameter,
+      "Invalid conf_target, must be between 1 and 1008")
+
+  # estimate_mode (positional 1): Core validates it with FeeModeFromString
+  # (common/messages.cpp), case-insensitively, and rejects anything else.
+  # Ignoring the argument returned an estimate for whatever the caller passed --
+  # found by the differential's CONTROL, not by a hostile-integer case.
+  if params.len >= 2 and params[1].kind != JNull:
+    if params[1].kind != JString:
+      raise newRpcError(RpcTypeError,
+        "JSON value of type number is not of expected type string")
+    case params[1].getStr().toUpperAscii()
+    of "UNSET", "ECONOMICAL", "CONSERVATIVE": discard
+    else:
+      raise newRpcError(RpcInvalidParameter,
+        "Invalid estimate_mode parameter, must be one of: " &
+        "\"unset\", \"economical\", \"conservative\"")
 
   var feeRate: float64 = 0.0
   if rpc.feeEstimator != nil:
