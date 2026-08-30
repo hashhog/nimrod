@@ -1241,7 +1241,9 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     # serve blocks below tip - MIN_BLOCKS_TO_KEEP (288).  Mirrors Core's
     # net_processing.cpp short-circuit; emits notfound rather than reading
     # a possibly-deleted block file.
-    const MinBlocksToKeep: int32 = 288
+    # Uses params.MinBlocksToKeep (imported at the top of this module).
+    # This was a THIRD function-local copy of the same 288 that nobody
+    # updating the pruning margin would have thought to look for.
     let pruneActive = pruneModeAdvertiseEnabled()
     var pruneHorizon: int32 = -1
     if pruneActive and state.chainState != nil and

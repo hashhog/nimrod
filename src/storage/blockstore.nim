@@ -72,7 +72,14 @@ const
 
   # Pruning constants (matching Bitcoin Core)
   MinDiskSpaceForBlockFiles* = uint64(550 * 1024 * 1024)  ## 550 MiB minimum prune target
-  MinBlocksToKeep* = 288            ## Keep at least 288 blocks from tip (safety margin for reorgs)
+
+  # MinBlocksToKeep (288, Core's MIN_BLOCKS_TO_KEEP) is NOT redefined here.
+  # It used to be, shadowing the identical constant this module already gets
+  # from `../consensus/params` (imported above) -- so the safety margin the
+  # pruner enforces and the one the block store enforced were two separate
+  # constants that merely happened to agree. pruner.nim had already worked
+  # around the clash by qualifying its uses as `params.MinBlocksToKeep`.
+  # Single source of truth now; the uses below resolve through the import.
 
   # Block status flags (matching Bitcoin Core)
   BlockHaveData* = 8'u8
