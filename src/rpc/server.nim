@@ -1183,7 +1183,13 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing blockhash parameter")
 
   let hashHex = params[0].getStr()
-  let verbosity = if params.len >= 2: params[1].getInt() else: 1
+  # Core reads verbosity with getInt<int>, whose width check lives INSIDE the
+  # conversion -- so an out-of-int32 value is -1 before the block is looked up.
+  # nimrod looked the block up first and answered -5 "Block not found".
+  let verbosity =
+    if params.len >= 2 and params[1].kind == JInt: coreInt32Bound(params[1].getBiggestInt())
+    elif params.len >= 2: params[1].getInt()
+    else: 1
 
   # Core ParseHashV (blockchain.cpp:842, name "blockhash"): a malformed
   # blockhash is RPC_INVALID_PARAMETER (-8) before any lookup. A well-formed-
@@ -1795,7 +1801,9 @@ proc handleGetChainTxStats(rpc: RpcServer, params: JsonNode): JsonNode =
   if not hasNblocks:
     blockcount = max(0, min(blockcount, int(height) - 1))
   else:
-    blockcount = params[0].getInt()
+    # getInt<int> fails in the CONVERSION: an out-of-int32 nblocks never
+    # reaches the domain test below, which answered -8 where Core answers -1.
+    blockcount = coreInt32Bound(params[0].getBiggestInt())
     if blockcount < 0 or (blockcount > 0 and blockcount >= int(height)):
       raise newRpcError(RpcInvalidParameter,
         "Invalid block count: should be between 0 and the block's height - 1")
@@ -4029,7 +4037,9 @@ proc handleGetRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     if params[1].kind == JBool:
       verbosity = if params[1].getBool(): 1 else: 0
     elif params[1].kind == JInt:
-      verbosity = params[1].getInt()
+      # Conversion before the tx lookup: this answered -5 "No such mempool
+      # transaction" for a value Core refuses with -1.
+      verbosity = coreInt32Bound(params[1].getBiggestInt())
     elif params[1].kind == JNull:
       discard  # Keep default 0
     else:
@@ -7024,15 +7034,28 @@ proc handleSetBan(rpc: RpcServer, params: JsonNode): JsonNode =
 
   case command
   of "add":
+    # Core checks IsBanned FIRST, before bantime is read at all (rpc/net.cpp).
+    # nimrod had no already-banned check, so a re-ban silently succeeded where
+    # Core answers -23.
+    if rpc.peerManager.isBanned(address):
+      raise newRpcError(RpcClientNodeAlreadyAdded, "Error: IP/Subnet already banned")
+
     var bantime = int64(24 * 60 * 60)  # Default 24 hours
     var absolute = false
 
     if params.len >= 3:
       bantime = params[2].getBiggestInt()
+      # Core: bantime 0 means "use the default", not a zero-length ban.
+      if bantime == 0:
+        bantime = int64(24 * 60 * 60)
     if params.len >= 4:
       absolute = params[3].getBool()
 
     if absolute:
+      # Core refuses an absolute timestamp already in the past (net.cpp,
+      # strictly `banTime < GetTime()`) instead of recording an expired ban.
+      if bantime < getTime().toUnix():
+        raise newRpcError(RpcInvalidParameter, "Error: Absolute timestamp is in the past")
       # bantime is absolute unix timestamp
       rpc.peerManager.banManager.banAbsolute(address, bantime, brManuallyAdded)
     else:
@@ -7042,7 +7065,9 @@ proc handleSetBan(rpc: RpcServer, params: JsonNode): JsonNode =
 
   of "remove":
     if not rpc.peerManager.unbanPeer(address):
-      raise newRpcError(RpcInvalidParams, "address not found in ban list")
+      # Core: RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) with this exact wording.
+      raise newRpcError(RpcClientInvalidIpOrSubnet,
+        "Error: Unban failed. Requested address/subnet was not previously manually banned.")
 
   else:
     raise newRpcError(RpcInvalidParams, "invalid command: " & command & " (expected add or remove)")
@@ -7059,13 +7084,34 @@ proc handleDisconnectNode(rpc: RpcServer, params: JsonNode): JsonNode =
   ## disconnectnode "address" ( nodeid )
   ## Force disconnect a connected peer by address or nodeid.
   ## Reference: Bitcoin Core src/rpc/net.cpp::disconnectnode
-  if params.len < 1 or params[0].getStr() == "":
-    raise newRpcError(RpcInvalidParams, "missing address parameter")
-
-  let node = params[0].getStr()
-
   if rpc.peerManager == nil:
     raise newRpcError(RpcInternalError, "peer manager not available")
+
+  # Core takes EITHER address or nodeid and requires strictly one: "to
+  # disconnect by nodeid, either set address to the empty string, or call using
+  # the named nodeid argument only".  nimrod's docstring advertised nodeid but
+  # the handler never read params[1], so every by-id call -- the form
+  # getpeerinfo's "id" field exists to feed -- was refused with -32602.
+  let haveAddress = params.len >= 1 and params[0].kind == JString and params[0].getStr() != ""
+  let haveNodeid = params.len >= 2 and params[1].kind != JNull
+
+  if haveNodeid and not haveAddress:
+    let nodeid = params[1].getBiggestInt()
+    # getpeerinfo reports id as the index into getReadyPeers(); by-id
+    # disconnect must use the SAME mapping or the two disagree.
+    let ready = rpc.peerManager.getReadyPeers()
+    if nodeid < 0 or nodeid >= ready.len:
+      raise newRpcError(RpcClientNodeNotConnected, "Node not found in connected nodes")
+    asyncSpawn rpc.peerManager.removePeer(ready[int(nodeid)])
+    return newJNull()
+
+  if haveAddress and haveNodeid:
+    raise newRpcError(RpcInvalidParams, "Only one of address and nodeid should be provided.")
+
+  if not haveAddress:
+    raise newRpcError(RpcInvalidParams, "Only one of address and nodeid should be provided.")
+
+  let node = params[0].getStr()
 
   # Parse host:port
   var host = node
