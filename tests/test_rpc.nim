@@ -930,7 +930,10 @@ suite "RPC getdeploymentinfo":
   proc makeBuried(activationHeight: int, currentHeight: int32): JsonNode =
     result = newJObject()
     result["type"] = %"buried"
-    result["active"] = %(currentHeight >= int32(activationHeight))
+    # Call the PRODUCTION rule (src/rpc/server.nim buriedDeploymentActive), never
+    # a local copy.  A byte-identical copy lived here until 2026-08-30 and made
+    # this suite blind to the production off-by-one it was supposed to catch.
+    result["active"] = %buriedDeploymentActive(activationHeight, currentHeight)
     result["height"] = %activationHeight
 
   # Simulate the top-level getdeploymentinfo response for regtest at height 0
@@ -1018,12 +1021,29 @@ suite "RPC getdeploymentinfo":
   test "getdeploymentinfo buried fields correct on regtest at height 0":
     let info = fakeDeploymentInfo(rp, 0)
     let deps = info["deployments"]
-    # csv and segwit both have activation height 0 on regtest -> active at height 0
+    # Core regtest (kernel/chainparams.cpp CRegTestParams): BIP34/65/66 = 1,
+    # CSV = 1, Segwit = 0.  getdeploymentinfo reports DeploymentActiveAfter, so
+    # at chain height 0 every one of them is ACTIVE (0 + 1 >= 1).
     check deps["csv"]["active"].getBool() == true
     check deps["segwit"]["active"].getBool() == true
-    # bip34 activation height is 500 on regtest -> not active at height 0
-    check deps["bip34"]["active"].getBool() == false
+    check deps["bip34"]["active"].getBool() == true
+    check deps["bip65"]["active"].getBool() == true
+    check deps["bip66"]["active"].getBool() == true
     check deps["bip34"]["height"].getInt() == rp.bip34Height
+
+  # --- PIN (#95): buried "active" is DeploymentActiveAfter, not ActiveAt -------
+  # Fails at the parent commit, where the rule was (height >= activationHeight).
+  test "buried deployment is active one block BEFORE its activation height":
+    # Core deploymentstatus.h:17 -> (pindexPrev->nHeight + 1) >= DeploymentHeight
+    check buriedDeploymentActive(419328, 419327'i32) == true   # the boundary
+    check buriedDeploymentActive(419328, 419326'i32) == false  # one earlier
+    check buriedDeploymentActive(419328, 419328'i32) == true   # at activation
+    # regtest CSV = 1: active at chain height 0, the case getdeploymentinfo hits
+    check buriedDeploymentActive(1, 0'i32) == true
+    # An activation height of 0 (Core regtest Segwit) is active everywhere.
+    check buriedDeploymentActive(0, 0'i32) == true
+    # Boundary must not wrap at the int32 edge (the +1 is computed in int64).
+    check buriedDeploymentActive(int(high(int32)), high(int32)) == true
 
   test "versionbits stateName helper produces correct strings":
     check stateName(tsDefined)  == "defined"

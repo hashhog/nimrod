@@ -343,7 +343,13 @@ proc buildDeployments*(rpc: RpcServer, targetHash: BlockHash, targetHeight: int3
   ## Build canonical deployment state for both getblockchaininfo.softforks and
   ## getdeploymentinfo.deployments.  Returns a JSON object keyed by fork id.
   ##
-  ## Buried deployments: active = (targetHeight >= activationHeight)
+  ## Buried deployments: active = DeploymentActiveAfter(target), i.e.
+  ##                    (targetHeight + 1 >= activationHeight).  Core reports a
+  ##                    buried fork ACTIVE once the chain height is one below the
+  ##                    activation height, because the flag describes the NEXT
+  ##                    block.  Reference: bitcoin-core/src/rpc/blockchain.cpp
+  ##                    SoftForkDescPushBack -> DeploymentActiveAfter, and
+  ##                    src/deploymentstatus.h (ActiveAfter == ActiveAt(h + 1)).
   ## BIP9  deployments: state is derived by running the BIP9 state machine
   ##                    against the live chain (chainState.db), not from any
   ##                    hard-coded table.
@@ -352,7 +358,7 @@ proc buildDeployments*(rpc: RpcServer, targetHash: BlockHash, targetHeight: int3
   proc buriedDeployment(activationHeight: int, currentHeight: int32): JsonNode =
     result = newJObject()
     result["type"] = %"buried"
-    result["active"] = %(currentHeight >= int32(activationHeight))
+    result["active"] = %buriedDeploymentActive(activationHeight, currentHeight)
     result["height"] = %activationHeight
 
   result = newJObject()

@@ -920,3 +920,26 @@ proc verifyGenesisBlock*(blk: Block, params: ConsensusParams): bool =
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
   hash == params.genesisBlockHash
+
+# ==========================================================================
+# Buried deployment activation semantics (Core deploymentstatus.h)
+# ==========================================================================
+
+proc buriedDeploymentActive*(activationHeight: int, currentHeight: int32): bool =
+  ## Core's DeploymentActiveAfter for a BURIED deployment.
+  ##
+  ## Core reports a buried fork ACTIVE once the chain height is one BELOW the
+  ## activation height, because the flag describes the NEXT block:
+  ##   deploymentstatus.h:17
+  ##     return (pindexPrev == nullptr ? 0 : pindexPrev->nHeight + 1)
+  ##            >= params.DeploymentHeight(dep);
+  ##   rpc/blockchain.cpp SoftForkDescPushBack:
+  ##     rv.pushKV("active", DeploymentActiveAfter(blockindex, chainman, dep));
+  ##
+  ## This is the SINGLE point of truth for the rule.  Tests must call this proc
+  ## rather than re-deriving it — a test-local copy of the comparison cannot
+  ## detect a change to the production rule (that is exactly how the pre-2026-08-30
+  ## off-by-one survived: tests/test_rpc.nim carried a byte-identical copy).
+  ##
+  ## int64 so the +1 cannot overflow int32 at the domain edge.
+  int64(currentHeight) + 1'i64 >= int64(activationHeight)

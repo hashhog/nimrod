@@ -161,13 +161,24 @@ suite "softforks bridge: getblockchaininfo and getdeploymentinfo share one data 
       check di.hasKey(id)
 
   test "buried forks reflect regtest activation heights at genesis (getdeploymentinfo)":
-    ## On regtest segwit/taproot activate at height 0 (active from genesis);
-    ## csv/bip34/bip65/bip66 activate at height 1, so on a genesis-only chain
-    ## (height 0) csv is NOT yet active. buriedDeployment(height, 0): active iff
-    ## 0 >= activationHeight.
+    ## Core regtest (kernel/chainparams.cpp CRegTestParams): Segwit = 0,
+    ## CSV/BIP34/BIP65/BIP66 = 1.
+    ##
+    ## getdeploymentinfo reports DeploymentActiveAFTER, not ActiveAt — the flag
+    ## describes the NEXT block, so a fork reads active once the chain height is
+    ## one BELOW its activation height (deploymentstatus.h:17,
+    ## rpc/blockchain.cpp SoftForkDescPushBack).  On a genesis-only regtest
+    ## chain (height 0) that makes csv ACTIVE: 0 + 1 >= 1.
+    ##
+    ## This test previously asserted csv == false and documented the rule as
+    ## "active iff 0 >= activationHeight" — it was written from the
+    ## implementation rather than from Core, and so kept the off-by-one green.
     let depInfo = rpc.handleGetDeploymentInfo(newJArray())
     check depInfo["deployments"]["segwit"]["active"].getBool() == true
-    check depInfo["deployments"]["csv"]["active"].getBool() == false
+    check depInfo["deployments"]["csv"]["active"].getBool() == true
+    check depInfo["deployments"]["bip34"]["active"].getBool() == true
+    check depInfo["deployments"]["bip65"]["active"].getBool() == true
+    check depInfo["deployments"]["bip66"]["active"].getBool() == true
 
   test "taproot is active on regtest (AlwaysActive BIP9)":
     let depInfo = rpc.handleGetDeploymentInfo(newJArray())
