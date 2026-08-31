@@ -27,14 +27,34 @@ suite "BinaryWriter and BinaryReader":
 
     var r = BinaryReader(data: w.data, pos: 0)
 
+    # Reading is RANGE-CHECKED by default, exactly as Core does:
+    #   serialize.h:359  if (range_check && nSizeRet > MAX_SIZE)
+    #                        throw ... "ReadCompactSize(): size too large";
+    # with MAX_SIZE = 0x02000000 (serialize.h:34).  So only the first five
+    # values here round-trip; the last three are above the cap and MUST raise.
+    # (This test used to assert that all eight round-tripped, which would have
+    # meant nimrod accepting a length prefix Core rejects — an allocation DoS.)
     check r.readCompactSize() == 0'u64
     check r.readCompactSize() == 252'u64
     check r.readCompactSize() == 253'u64
     check r.readCompactSize() == 0xFFFF'u64
     check r.readCompactSize() == 0x10000'u64
-    check r.readCompactSize() == 0xFFFFFFFF'u64
-    check r.readCompactSize() == 0x100000000'u64
-    check r.readCompactSize() == 0xFFFFFFFFFFFFFFFF'u64
+
+    for expected in [0xFFFFFFFF'u64, 0x100000000'u64, 0xFFFFFFFFFFFFFFFF'u64]:
+      let before = r.pos
+      var raised = false
+      try:
+        discard r.readCompactSize()
+      except SerializationError as e:
+        raised = true
+        check e.msg == "ReadCompactSize(): size too large"   # Core's wording
+      check raised
+      # Re-read the same field with the cap disabled — Core's
+      # ReadCompactSize(s, /*range_check=*/false) escape hatch, used where the
+      # value is not a container length — and confirm the ENCODING was fine and
+      # it was only the range check that objected.
+      r.pos = before
+      check r.readCompactSize(range_check = false) == expected
 
   test "little endian integer round-trip":
     var w = BinaryWriter()

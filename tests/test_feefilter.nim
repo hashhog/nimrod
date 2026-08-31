@@ -2,7 +2,7 @@
 ## Tests fee filter quantization, peer filtering, and incremental relay fee
 
 import unittest2
-import std/[random, math, tables, strutils]
+import std/[random, math, tables, strutils, sets]
 import chronos
 import ../src/network/relay
 import ../src/network/peer
@@ -41,22 +41,52 @@ suite "FeeFilterRounder":
     let rounded = rounder.round(hugeRate)
     check rounded <= hugeRate
 
-  test "round provides privacy by quantizing":
+  test "round matches Bitcoin Core's published feerounder vectors":
+    ## Replaces a statistical assertion that was FLAKY BY CONSTRUCTION: it drew
+    ## 100 samples of `round(5000) == round(5100)` and required > 50 matches,
+    ## while the expected count is 100 * ((1/3)^2 + (2/3)^2) = 55.6 with
+    ## sd ~= 5.0 — roughly a 1-in-8 failure, which is exactly what it did.
+    ##
+    ## Core has the same problem and solves it by seeding deterministically
+    ## (test/feerounder_tests.cpp: FastRandomContext rng{/*fDeterministic=*/true}).
+    ## nimrod cannot do that yet because round() re-seeds the global RNG on every
+    ## call, so instead assert Core's published VALUES, which are exact.
+    ##
+    ##   FeeFilterRounder fee_rounder{CFeeRate{1000}, rng};
+    ##   // check that 1000 rounds to 974 or 1071
+    ##   BOOST_CHECK_EQUAL(*results.begin(),   974);
+    ##   BOOST_CHECK_EQUAL(*++results.begin(), 1071);
+    ##   BOOST_CHECK_EQUAL(fee_rounder.round(-0),        0);
+    ##   BOOST_CHECK_EQUAL(fee_rounder.round(-1),        0);
+    ##   BOOST_CHECK_EQUAL(fee_rounder.round(MAX_MONEY), 9170997);
+    let rounder = newFeeFilterRounder(1000)
+
+    var seen = initHashSet[int64]()
+    for _ in 0 ..< 2000:
+      seen.incl(rounder.round(1000))
+    # Exactly the two adjacent buckets Core names — no third value, ever.
+    check seen.len == 2
+    check 974'i64 in seen
+    check 1071'i64 in seen
+
+    check rounder.round(0) == 0'i64
+    check rounder.round(-1) == 0'i64
+    check rounder.round(2_100_000_000_000_000'i64) == 9_170_997'i64   # MAX_MONEY
+
+  test "round quantizes: a value only ever lands on an adjacent bucket":
+    ## The privacy property the old test was reaching for, stated so it cannot
+    ## flake: whatever the coin flip, the answer is one of the two buckets
+    ## bracketing the input — never the exact input, never something further out.
     let rounder = newFeeFilterRounder()
-
-    # Two close values should often round to the same bucket
-    var sameCount = 0
-    for _ in 0 ..< 100:
-      let base = 5000'i64
-      let r1 = rounder.round(base)
-      let r2 = rounder.round(base + 100)  # Small difference
-
-      # Not always the same due to randomization, but often
-      if r1 == r2:
-        inc sameCount
-
-    # Should be same bucket most of the time
-    check sameCount > 50
+    for input in [1000'i64, 5000'i64, 5100'i64, 123_456'i64]:
+      var lo = 0.0
+      var hi = 0.0
+      for b in rounder.feeBuckets:
+        if b <= float64(input): lo = b
+        elif hi == 0.0: hi = b
+      for _ in 0 ..< 200:
+        let r = rounder.round(input)
+        check (r == int64(lo) or r == int64(hi))
 
 suite "Fee rate calculation":
   test "calculateFeeRate computes sat/kvB":

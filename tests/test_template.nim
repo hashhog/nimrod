@@ -12,17 +12,30 @@ import ../src/mining/blocktemplate
 suite "Block Template":
 
   test "BIP-34 height encoding for various heights":
-    # Height 0
+    # Core builds the expected scriptSig prefix as `CScript() << nHeight`
+    # (validation.cpp ContextualCheckBlock, "bad-cb-height"), and CScript's
+    # push_int64 (script.h) uses the SMALL-INTEGER OPCODES for 0 and 1..16:
+    #     n == 0        -> OP_0            = 0x00        (one byte)
+    #     n in 1..16    -> OP_1..OP_16     = 0x50 + n    (one byte)
+    #     otherwise     -> CScriptNum::serialize push
+    # so these three are single opcodes, NOT one-byte data pushes.  A block
+    # whose coinbase began 0x01 0x10 at height 16 would be rejected by Core.
+
+    # Height 0 -> OP_0
     let enc0 = encodeBip34Height(0)
-    check enc0 == @[0x01'u8, 0x00]
+    check enc0 == @[0x00'u8]
 
-    # Height 1
+    # Height 1 -> OP_1
     let enc1 = encodeBip34Height(1)
-    check enc1 == @[0x01'u8, 0x01]
+    check enc1 == @[0x51'u8]
 
-    # Height 16
+    # Height 16 -> OP_16 (the last small-integer opcode)
     let enc16 = encodeBip34Height(16)
-    check enc16 == @[0x01'u8, 0x10]
+    check enc16 == @[0x60'u8]
+
+    # Height 17 -> first height that takes the CScriptNum data-push path
+    let enc17 = encodeBip34Height(17)
+    check enc17 == @[0x01'u8, 0x11]
 
     # Height 127
     let enc127 = encodeBip34Height(127)

@@ -8,11 +8,44 @@ import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing
 import ../src/consensus/params
 
-const TestDbPath = "/tmp/nimrod_chainstate_test"
+const BaseTestDbPath = "/tmp/nimrod_chainstate_test"
 
-proc cleanupTestDb() =
-  if dirExists(TestDbPath):
-    removeDir(TestDbPath)
+# Every test gets its OWN RocksDB directory.
+#
+# These tests used to share one path.  RocksDB takes a process-level LOCK on it,
+# and `cleanupTestDb` only removed the directory — it never closed the handle.
+# So a test that failed BEFORE reaching its `cs.close()` leaked the lock, and
+# every later test in the file died with
+#   "IO error: lock hold by current process ... LOCK: No locks available".
+# On 2026-08-30 exactly that happened: the MAX_REORG_DEPTH test failed, died on
+# the following line, and cascaded into SEVEN more failures that had nothing
+# wrong with them.  One test bug, eight red tests.
+#
+# The global `TestDbPath` is deliberately gone: each test must open with
+# `let TestDbPath = freshTestDb()`, so a test that forgets fails to COMPILE
+# rather than silently sharing a directory with its neighbours.
+var testDbCounter = 0
+
+proc freshTestDb(): string =
+  inc testDbCounter
+  result = BaseTestDbPath & "_" & $testDbCounter
+  if dirExists(result):
+    removeDir(result)
+
+proc cleanupAllTestDbs() =
+  ## /tmp on maxbox is tmpfs (RAM), so leaving these behind costs memory.
+  var i = 0
+  while true:
+    inc i
+    let d = BaseTestDbPath & "_" & $i
+    if not dirExists(d):
+      if i > testDbCounter + 8: break
+      continue
+    removeDir(d)
+  if dirExists(BaseTestDbPath):
+    removeDir(BaseTestDbPath)
+
+cleanupAllTestDbs()
 
 proc makeTestTransaction(
   prevTxid: TxId,
@@ -75,9 +108,13 @@ proc makeTestBlock(prevHash: BlockHash, height: int32, txs: seq[Transaction]): B
     txs: txs
   )
 
-proc makeSimpleBlock(prevHash: BlockHash, height: int32, extra: uint32 = 0): Block =
+proc makeSimpleBlock(prevHash: BlockHash, height: int32, extra: uint32 = 0,
+                     value: int64 = 5_000_000_000'i64): Block =
   ## Create a simple block with just a coinbase (height+extra in scriptSig for unique txid)
-  ## Use 'extra' to distinguish alternative fork blocks at the same height
+  ## Use 'extra' to distinguish alternative fork blocks at the same height.
+  ## Pass 'value' when the block sits at or beyond a halving — regtest halves
+  ## every 150 blocks, so a hard-coded 50 BTC coinbase is over-paying from
+  ## height 150 on and validation correctly rejects it as bad-cb-amount.
   let heightBytes = @[byte(height and 0xff), byte((height shr 8) and 0xff), byte((height shr 16) and 0xff), byte((height shr 24) and 0xff)]
   let extraBytes = @[byte(extra and 0xff), byte((extra shr 8) and 0xff), byte((extra shr 16) and 0xff), byte((extra shr 24) and 0xff)]
   let coinbase = Transaction(
@@ -88,7 +125,7 @@ proc makeSimpleBlock(prevHash: BlockHash, height: int32, extra: uint32 = 0): Blo
       sequence: 0xFFFFFFFF'u32
     )],
     outputs: @[TxOut(
-      value: Satoshi(5000000000),
+      value: Satoshi(value),
       scriptPubKey: @[byte(0x51)]  # OP_1
     )],
     witnesses: @[],
@@ -122,12 +159,13 @@ proc seedSpendableCoinbase(
 
 suite "ChainState UTXO management":
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "create and close chainstate":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     check cs != nil
     check cs.bestHeight == -1
@@ -135,6 +173,7 @@ suite "ChainState UTXO management":
     cs.close()
 
   test "connect genesis block (height==0 skips UTXO mutation, Core parity)":
+    let TestDbPath = freshTestDb()
     ## Bitcoin Core skips ConnectBlock entirely for the genesis block
     ## (`bitcoin-core/src/validation.cpp:2337-2343`); the genesis coinbase
     ## output never enters Core's UTXO set. nimrod mirrors this by skipping
@@ -162,6 +201,7 @@ suite "ChainState UTXO management":
     cs.close()
 
   test "genesis coinbase NOT in UTXO set (W14 writer-side regression)":
+    let TestDbPath = freshTestDb()
     ## Regression test pinning the W14 fix: after `connectBlock(genesis, 0)`,
     ## walking `cfUtxo` must yield zero entries. `computeUtxoSetInfo` should
     ## then return `txOuts == 0` even without the reader-side filter.
@@ -186,6 +226,7 @@ suite "ChainState UTXO management":
     cs.close()
 
   test "connect chain of blocks":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
 
     # Connect genesis
@@ -222,12 +263,13 @@ suite "ChainState unspendable filter (CScript::IsUnspendable)":
   ## chainstate must do the same so the UTXO set — and therefore
   ## dumptxoutset — matches Core byte-for-byte.
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "OP_RETURN coinbase witness-commitment output not added to UTXO":
+    let TestDbPath = freshTestDb()
     # This mirrors what Core-mined regtest blocks at height >= 1 carry:
     # a spendable P2W* output PLUS a witness-commitment OP_RETURN output.
     # The OP_RETURN output must NOT enter the chainstate.
@@ -271,6 +313,7 @@ suite "ChainState unspendable filter (CScript::IsUnspendable)":
     cs.close()
 
   test "oversize scriptPubKey (> MAX_SCRIPT_SIZE) not added to UTXO":
+    let TestDbPath = freshTestDb()
     # MAX_SCRIPT_SIZE = 10000 bytes per Core script.h:40. Anything strictly
     # larger is provably unspendable and never enters the chainstate.
     var cs = newChainState(TestDbPath, regtestParams())
@@ -317,12 +360,13 @@ suite "ChainState scrubunspendable (legacy datadir cleanup)":
   ## These tests synthesize a "pre-fix" chainstate by writing the orphans
   ## directly via `cs.db.putUtxo`, bypassing the new filter.
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "scrubUnspendable removes OP_RETURN + oversize coins, keeps spendable":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
 
     # Connect a real spendable coinbase via the normal path.
@@ -372,6 +416,7 @@ suite "ChainState scrubunspendable (legacy datadir cleanup)":
     cs.close()
 
   test "scrubUnspendable is idempotent (second call removes zero)":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
 
     discard seedSpendableCoinbase(cs)
@@ -409,12 +454,13 @@ suite "ChainState scrubunspendable (legacy datadir cleanup)":
 
 suite "ChainState coinbase maturity":
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "cannot spend immature coinbase":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
 
     # Seed: genesis (h=0, no UTXO per Core parity) + fixture coinbase at h=1.
@@ -441,6 +487,7 @@ suite "ChainState coinbase maturity":
     cs.close()
 
   test "can spend mature coinbase":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
 
     # Seed: genesis (h=0, no UTXO per Core parity) + fixture coinbase at h=1.
@@ -485,12 +532,13 @@ suite "ChainState coinbase maturity assume-valid bypass (FIX)":
   ## assume-valid only gates signature verification.
   ## EFFECTIVE test: pre-fix allows, post-fix always rejects.
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "connectBlock rejects immature coinbase even when assume-valid is active (EFFECTIVE)":
+    let TestDbPath = freshTestDb()
     ## Set up a ChainState with a non-zero assume-valid hash so
     ## shouldSkipScripts() returns ssrSkip for the bad block.
     ## PRE-FIX: the maturity check was skipped → connectBlock returned Ok.
@@ -574,12 +622,13 @@ suite "ChainState in-block double-spend (FIX)":
   ## POST-FIX: spentThisBlock tracks spent outpoints; the second spend is
   ## rejected as bad-txns-inputs-missingorspent.
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "connectBlock rejects second spend of same UTXO within the block (EFFECTIVE)":
+    let TestDbPath = freshTestDb()
     ## PRE-FIX: batch.delete is uncommitted → second getUtxo hits RocksDB and
     ## finds the coin → double-spend allowed (false-accept).
     ## POST-FIX: spentThisBlock[key]=true after first spend → second spend
@@ -619,12 +668,13 @@ suite "ChainState in-block double-spend (FIX)":
 
 suite "ChainState disconnect and restore":
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "disconnect block restores UTXO":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
 
     # Seed: genesis + h=1 fixture coinbase (genesis coinbase intentionally
@@ -673,12 +723,13 @@ suite "ChainState disconnect and restore":
 
 suite "ChainState 2-block reorg":
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "handle 2-block reorg":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
 
     # Connect genesis
@@ -785,12 +836,13 @@ suite "UndoData serialization":
 
 suite "ChainState cache management":
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "cache size tracking":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     cs.maxCacheSize = 10  # Small cache for testing
 
@@ -811,6 +863,7 @@ suite "ChainState cache management":
     cs.close()
 
   test "flush clears cache":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
 
     # Genesis writes no UTXOs (W14 / Core parity); seed with h=1 fixture.
@@ -830,6 +883,7 @@ suite "ChainState cache management":
     cs.close()
 
   test "persistence across reopens":
+    let TestDbPath = freshTestDb()
     # Create and connect blocks
     block:
       var cs = newChainState(TestDbPath, regtestParams())
@@ -879,12 +933,13 @@ suite "ChainState cache management":
 
 suite "Side-branch block index persistence (Pattern Y storage layer)":
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "putBlockIndexHashOnly stores hash entry but preserves height->hash":
+    let TestDbPath = freshTestDb()
     # Build the database that submit_block's side-branch arm uses for
     # parent lookup.  Active chain: G -> A1.  Side-branch: B1 sharing
     # parent G.  After putBlockIndexHashOnly, both A1 and B1 should be
@@ -948,6 +1003,7 @@ suite "Side-branch block index persistence (Pattern Y storage layer)":
     cs.close()
 
   test "side-branch chain B1->B2 — child can find parent in index":
+    let TestDbPath = freshTestDb()
     # The exact failure mode Pattern Y exhibited in nimrod: even when B1
     # is accepted as a side-branch and returns "inconclusive", the storage
     # invariant must hold so that a follow-up B2 (parent = B1) can look up
@@ -997,12 +1053,13 @@ suite "Side-branch block index persistence (Pattern Y storage layer)":
 
 suite "Reorg via side-branch extension (Pattern Y end-to-end)":
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "heavier 3-block side-branch overtakes 2-block active chain":
+    let TestDbPath = freshTestDb()
     # Mirrors the full corpus scenario `regression/reorg-via-submitblock`:
     # active chain G->A1->A2 (h=2); submit B1, B2, B3 as a competing chain
     # rooted at G; expect tip to flip to B3 with the displaced A blocks
@@ -1091,12 +1148,13 @@ suite "handleReorg disconnected-tx collection (Pattern B)":
   ## CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
 
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "coinbase-only disconnect leaves disconnectedTxs empty":
+    let TestDbPath = freshTestDb()
     # Sanity check: when every disconnected block has only a coinbase
     # transaction, the out-parameter must be empty (coinbase is filtered).
     var cs = newChainState(TestDbPath, regtestParams())
@@ -1125,6 +1183,7 @@ suite "handleReorg disconnected-tx collection (Pattern B)":
     cs.close()
 
   test "non-coinbase txs from disconnected blocks are collected in fork-first order":
+    let TestDbPath = freshTestDb()
     # Build active chain: genesis + 100 coinbase-only blocks (matures the
     # genesis coinbase), then A1 = coinbase + T1 (T1 spends genesis
     # coinbase), then A2 = coinbase + T2 (T2 spends block-1 coinbase, also
@@ -1268,12 +1327,13 @@ suite "handleReorg single-batch atomicity (Pattern D)":
   ##      the bound and again leaves on-disk state unchanged.
 
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "single batch covers N disconnects + M connects (Pattern D)":
+    let TestDbPath = freshTestDb()
     # Build active chain genesis + A1 + A2 + A3 (3 blocks). Reorg to
     # B1..B4 (4 blocks). Total = 3 disconnects + 4 connects = 7 blocks.
     # Verify the post-reorg disk state is fully on the new chain (no
@@ -1356,6 +1416,7 @@ suite "handleReorg single-batch atomicity (Pattern D)":
       cs2.close()
 
   test "staging error rolls back in-memory + disk untouched (crash-pre-commit proxy)":
+    let TestDbPath = freshTestDb()
     # Force a staging-phase failure by passing a forkPoint that does NOT
     # exist on the active chain. The disconnect walk will exhaust the
     # active chain back to genesis and emit an "failed to reach fork
@@ -1419,10 +1480,23 @@ suite "handleReorg single-batch atomicity (Pattern D)":
       cs2.close()
 
   test "MAX_REORG_DEPTH cap refuses oversized reorg (memory cap)":
+    let TestDbPath = freshTestDb()
     # Build an active chain longer than MAX_REORG_DEPTH and try to
     # reorg it all the way back to genesis. handleReorg must refuse
     # before staging anything, leaving disk state untouched.
     var cs = newChainState(TestDbPath, regtestParams())
+
+    # The cap is GATED ON PRUNING (chainstate.nim: `if cs.pruningEnabled and
+    # disconnectedBlocks.len >= MAX_REORG_DEPTH`), and newChainState defaults to
+    # archive mode.  An archive node deliberately has NO cap — it keeps every
+    # undo record, so it can always walk back, which is also what Core does
+    # (Core has no maximum reorg depth at all).  Only a pruned node must refuse,
+    # because it no longer holds the data to undo that far.
+    #
+    # This test previously left the default (archive) and so asserted a refusal
+    # that the node is not supposed to make; it failed, died on the `res.error`
+    # read below, and leaked its RocksDB lock into seven later tests.
+    cs.pruningEnabled = true
 
     let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
     discard cs.connectBlock(genesis, 0)
@@ -1449,9 +1523,13 @@ suite "handleReorg single-batch atomicity (Pattern D)":
 
     let res = cs.handleReorg(genesisHash, @[b1, b2])
     check (not res.isOk)
-    # The error should mention MAX_REORG_DEPTH so the operator can
-    # diagnose without grepping source.
-    check "MAX_REORG_DEPTH" in res.error
+    # Read .error only when it exists — reading it on an ok Result raises a
+    # FieldDefect that aborts the test before its teardown, which is how the
+    # original failure cascaded.
+    if not res.isOk:
+      # The error should mention MAX_REORG_DEPTH so the operator can
+      # diagnose without grepping source.
+      check "MAX_REORG_DEPTH" in res.error
 
     # Tip unchanged in-memory.
     check cs.bestBlockHash == preTipHash
@@ -1465,6 +1543,52 @@ suite "handleReorg single-batch atomicity (Pattern D)":
       check cs2.bestBlockHash == preTipHash
       check cs2.bestHeight == preTipHeight
       cs2.close()
+
+  test "archive node has NO reorg-depth cap (control for the pruned case)":
+    ## The CONTROL for the test above.  Without it, that test passes for the
+    ## wrong reason: an implementation that refused every deep reorg — pruned or
+    ## not — would look correct, and nimrod would silently diverge from Core,
+    ## which has no maximum reorg depth at all.
+    ##
+    ## An archive node keeps every undo record, so it must ACCEPT the same
+    ## reorg the pruned node refuses.
+    let TestDbPath = freshTestDb()
+    var cs = newChainState(TestDbPath, regtestParams())
+    check cs.pruningEnabled == false   # newChainState default: archive
+
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    discard cs.connectBlock(genesis, 0)
+    let genesisHash = getBlockHash(genesis)
+
+    let activeLen = MAX_REORG_DEPTH + 1
+    var prevHash = genesisHash
+    for h in 1 .. activeLen:
+      let blk = makeSimpleBlock(prevHash, int32(h), extra = 0xAA)
+      check cs.connectBlock(blk, int32(h)).isOk
+      prevHash = getBlockHash(blk)
+    check cs.bestHeight == int32(activeLen)
+
+    # Same oversized reorg the pruned node refused, but heavier than the active
+    # chain so it is actually adopted.
+    var forkBlocks: seq[Block] = @[]
+    var forkPrev = genesisHash
+    for h in 1 .. activeLen + 2:
+      # Pay the SCHEDULED subsidy: this fork runs past regtest's 150-block
+      # halving, and handleReorg validates the coinbase amount of every block
+      # it connects (bad-cb-amount).  A flat 50 BTC would be refused here for a
+      # reason that has nothing to do with the depth cap under test.
+      let blk = makeSimpleBlock(forkPrev, int32(h), extra = 0xBB,
+                                value = int64(getBlockSubsidy(h, regtestParams())))
+      forkBlocks.add(blk)
+      forkPrev = getBlockHash(blk)
+
+    let res = cs.handleReorg(genesisHash, forkBlocks)
+    check res.isOk                       # NOT refused: no cap in archive mode
+    if not res.isOk:
+      echo "archive reorg unexpectedly refused: ", res.error
+    check cs.bestHeight == int32(activeLen + 2)
+    check cs.bestBlockHash == forkPrev
+    cs.close()
 
 # ============================================================================
 # disconnectHook firing tests (BIP-157 Phase 2 reorg-aware filter chain)
@@ -1480,12 +1604,13 @@ suite "handleReorg single-batch atomicity (Pattern D)":
 
 suite "ChainState disconnectHook (BIP-157 reorg-aware filter chain)":
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   test "disconnectBlock fires hook with (hash, prevHash, height)":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     # Build chain to maturity so we can spend the fixture coinbase
     # (h=1 — genesis coinbase intentionally absent per W14).
@@ -1524,6 +1649,7 @@ suite "ChainState disconnectHook (BIP-157 reorg-aware filter chain)":
     cs.close()
 
   test "disconnectBlock with nil hook does not crash (default-init)":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     check cs.disconnectHook == nil
 
@@ -1548,6 +1674,7 @@ suite "ChainState disconnectHook (BIP-157 reorg-aware filter chain)":
     cs.close()
 
   test "handleReorg fires hook for every disconnected block in tip-to-fork order":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
     discard cs.connectBlock(genesis, 0)
@@ -1607,9 +1734,9 @@ suite "ChainState disconnectHook (BIP-157 reorg-aware filter chain)":
 
 suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
   setup:
-    cleanupTestDb()
+    cleanupAllTestDbs()
   teardown:
-    cleanupTestDb()
+    cleanupAllTestDbs()
 
   # Stub callbacks: accept-for-storage and script-verify both succeed, so the
   # outcome is decided purely by the work comparison + fork-point walk.
@@ -1623,6 +1750,7 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
                {.gcsafe, raises: [].} = (ok: true, err: "")
 
   test "heavier fork below tip REORGS the active chain":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
     discard cs.connectBlock(genesis, 0)
@@ -1680,6 +1808,7 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
     cs.close()
 
   test "equal/lighter fork is stored as a side branch, NOT reorged":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
     discard cs.connectBlock(genesis, 0)
@@ -1711,6 +1840,7 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
     cs.close()
 
   test "unknown-parent block is rejected (not stored)":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
     discard cs.connectBlock(genesis, 0)
@@ -1729,6 +1859,7 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
     cs.close()
 
   test "validate-for-storage failure rejects with its bip22 token":
+    let TestDbPath = freshTestDb()
     var cs = newChainState(TestDbPath, regtestParams())
     let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
     discard cs.connectBlock(genesis, 0)

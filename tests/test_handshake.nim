@@ -60,7 +60,13 @@ suite "pre-handshake message rejection":
     # Send ping before version
     let result = validatePreHandshakeMessage(peer, mkPing)
     check result == marDropMisbehave
-    check peer.misbehaviorScore == ScorePreHandshakeMessage
+    # Core 2022 PR #25974 removed misbehaviour SCORE accumulation: Misbehaving()
+    # now sets m_should_discourage unconditionally, whatever the old point value
+    # was.  nimrod matches that (peer.nim misbehaving() -> shouldDisconnect), so
+    # peer.misbehaviorScore never moves and asserting on it tests nothing —
+    # the `== 0` variants below were passing vacuously for the same reason.
+    # Assert the flag that actually carries the decision.
+    check peer.shouldDisconnect == true
 
   test "validate version before version returns accept":
     let params = regtestParams()
@@ -68,7 +74,7 @@ suite "pre-handshake message rejection":
 
     let result = validatePreHandshakeMessage(peer, mkVersion)
     check result == marAccept
-    check peer.misbehaviorScore == 0
+    check peer.shouldDisconnect == false   # control: no discourage on the happy path
 
   test "duplicate version message gets misbehavior":
     let params = regtestParams()
@@ -77,7 +83,7 @@ suite "pre-handshake message rejection":
 
     let result = validatePreHandshakeMessage(peer, mkVersion)
     check result == marDropMisbehave
-    check peer.misbehaviorScore == ScoreDuplicateVersion
+    check peer.shouldDisconnect == true
 
   test "redundant verack dropped silently":
     let params = regtestParams()
@@ -87,7 +93,7 @@ suite "pre-handshake message rejection":
 
     let result = validatePreHandshakeMessage(peer, mkVerack)
     check result == marDropSilent
-    check peer.misbehaviorScore == 0  # No misbehavior
+    check peer.shouldDisconnect == false  # dropped SILENTLY: no discourage
 
   test "wtxidrelay after verack causes disconnect":
     let params = regtestParams()

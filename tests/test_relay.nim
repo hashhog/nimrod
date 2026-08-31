@@ -244,20 +244,38 @@ suite "Trickling behavior":
     check state.nextTrickleTime >= now
 
 suite "Inventory item types":
-  test "tx items use witness tx type":
-    let rm = newRelayManager()
-    let peer = newPeer("127.0.0.1", 8333, mainnetParams(), pdOutbound)
+  test "tx invs are MSG_WTX to wtxid-relay peers and MSG_TX to legacy peers":
+    ## Core net_processing RelayTransaction:
+    ##   CInv inv{peer.m_wtxid_relay ? MSG_WTX : MSG_TX, hash}
+    ## MSG_WITNESS_TX (0x40000001) is a GETDATA type — Core never announces it
+    ## in an inv.  This test used to assert invWitnessTx, which nimrod correctly
+    ## never produces (see the BIP-339 note on queueTxInv).
+    var wtxid: array[32, byte]
+    wtxid[0] = 0x66
+    var txid: array[32, byte]
+    txid[0] = 0x77
 
-    rm.registerPeer(peer)
+    block legacyPeer:
+      let rm = newRelayManager()
+      let peer = newPeer("127.0.0.1", 8333, mainnetParams(), pdOutbound)
+      check peer.wtxidRelay == false        # not negotiated
+      rm.registerPeer(peer)
+      rm.queueTxInv(wtxid, txid)
+      let state = rm.getPeerState(peer)
+      check state.invQueue.len == 1
+      check state.invQueue[0].invType == invTx     # MSG_TX = 1
+      check state.invQueue[0].hash == txid         # ...carrying the TXID
 
-    var txHash: array[32, byte]
-    txHash[0] = 0x66
-
-    rm.queueTxInv(txHash)
-
-    let state = rm.getPeerState(peer)
-    check state.invQueue.len == 1
-    check state.invQueue[0].invType == invWitnessTx
+    block wtxidRelayPeer:
+      let rm = newRelayManager()
+      var peer = newPeer("127.0.0.1", 8333, mainnetParams(), pdOutbound)
+      peer.wtxidRelay = true
+      rm.registerPeer(peer)
+      rm.queueTxInv(wtxid, txid)
+      let state = rm.getPeerState(peer)
+      check state.invQueue.len == 1
+      check state.invQueue[0].invType == invWtx    # MSG_WTX = 5 (BIP-339)
+      check state.invQueue[0].hash == wtxid        # ...carrying the WTXID
 
 suite "RelayManager lifecycle":
   test "start and stop":

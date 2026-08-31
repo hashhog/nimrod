@@ -552,12 +552,32 @@ suite "W85 time-too-new overflow fix (validateBlockHeader)":
     let prevHash = getBlockHash(blk0)
     let prevIdx = cs.db.getBlockIndex(prevHash).get()
 
-    let farFuture = uint32(getTime().toUnix()) + 7201'u32
+    let now = getTime().toUnix()
+    let farFuture = uint32(now) + 7201'u32   # MAX_FUTURE_BLOCK_TIME is 7200s
     let badBlk = makeBlk(prevHash, 1, farFuture)
-    let res = validateBlock(badBlk, prevIdx, cs.db, regtestParams(),
-                            checkScripts=false, checkPow=false)
+
+    # Exercise validateBlockHeader with an INJECTED clock.
+    #
+    # The wall-clock future-time check is deliberately gated
+    # (`if currentTime != 0 or checkPow`): with checkPow=false and no injected
+    # clock it is relaxed alongside the PoW hash check, so that crafted /
+    # synthetic vectors dated past 2038 still validate.  This test used to call
+    # validateBlock(checkPow=false) with no clock, which disabled the very check
+    # it asserts — the block was then rejected further down the pipeline as
+    # bad-cb-height (its synthetic coinbase carries no BIP-34 height), so the
+    # test failed while the node was behaving exactly as documented.
+    let res = validateBlockHeader(badBlk.header, prevIdx, regtestParams(),
+                                  checkPow = false, currentTime = now)
     check (not res.isOk)
     check res.error == veTimeTooNew
+    check bip22String(res.error) == "time-too-new"
+
+    # Control: one second inside the window is accepted, so the assertion above
+    # is pinning the boundary and not just "anything in the future is refused".
+    let okBlk = makeBlk(prevHash, 1, uint32(now) + 7200'u32)
+    let okRes = validateBlockHeader(okBlk.header, prevIdx, regtestParams(),
+                                    checkPow = false, currentTime = now)
+    check okRes.isOk
 
 # ============================================================================
 # Suite 6: bip22String mappings
@@ -574,8 +594,14 @@ suite "W85 bip22String mappings":
   test "veTimeTooNew -> time-too-new":
     check bip22String(veTimeTooNew) == "time-too-new"
 
-  test "veBadBlockVersion -> bad-version":
-    check bip22String(veBadBlockVersion) == "bad-version"
+  test "veBadBlockVersion -> bad-version(0x%08x)":
+    # Core does NOT emit a bare "bad-version": ContextualCheckBlockHeader uses
+    #   strprintf("bad-version(0x%08x)", block.nVersion)
+    # so the token carries the offending version.  nimrod matches via
+    # badVersionToken(); this test predates that parity work.
+    check bip22String(veBadBlockVersion, 1'i32) == badVersionToken(1'i32)
+    check badVersionToken(1'i32) == "bad-version(0x00000001)"
+    check badVersionToken(-1'i32) == "bad-version(0xffffffff)"
 
   test "veBadTimestamp -> time-too-old (regression)":
     check bip22String(veBadTimestamp) == "time-too-old"
