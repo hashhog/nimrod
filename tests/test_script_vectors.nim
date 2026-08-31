@@ -17,8 +17,33 @@ import ../src/script/interpreter
 import ../src/crypto/hashing
 import ../src/crypto/secp256k1
 
+proc findVectorFile(name: string): string =
+  ## Locate a Bitcoin Core test-vector file.
+  ##
+  ## This was hard-coded to "/home/max/hashhog/bitcoin/src/test/data/..." — a
+  ## developer laptop that does not exist on the build host — so the suite died
+  ## in readFile before checking a single vector. It is also one of the ~112
+  ## files tests/test_all.nim never imports, so nothing ran it and nothing
+  ## noticed. Found 2026-08-30 fixing the same class of breakage in clearbit.
+  ##
+  ## Search several depths so the lookup works whether the cwd is the repo
+  ## root, this submodule, or a nimcache subdirectory, and FAIL LOUDLY naming
+  ## every path tried — a vector harness that cannot find its vectors must
+  ## never look like a pass.
+  var tried: seq[string] = @[]
+  for depth in 0 .. 4:
+    let prefix = "../".repeat(depth)
+    for rel in ["bitcoin-core/src/test/data/", "resources/"]:
+      let p = prefix & rel & name
+      tried.add(p)
+      if fileExists(p): return p
+  stderr.writeLine("FATAL: could not find test vectors '" & name & "'. Tried:")
+  for t in tried: stderr.writeLine("  " & t)
+  quit(1)
+
+
 const
-  vectorPath = "/home/max/hashhog/bitcoin/src/test/data/script_tests.json"
+  vectorName = "script_tests.json"
 
   # BIP341 internal key: generator point x-coordinate (x-only)
   TAPROOT_INTERNAL_KEY: array[32, byte] = [
@@ -375,7 +400,7 @@ proc makeSpendingTx(creditTx: Transaction, scriptSig: seq[byte],
 # ---------------------------------------------------------------------------
 
 proc main() =
-  let data = readFile(vectorPath)
+  let data = readFile(findVectorFile(vectorName))
   let vectors = parseJson(data)
 
   var passed = 0
