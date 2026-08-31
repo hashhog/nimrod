@@ -113,6 +113,7 @@ import ./test_w170_tapscript_codesep_sighash
 import ./test_wtxid_getdata
 import ./test_script_flag_exceptions
 import ./test_createrawtx_vout_range
+import ./test_dispatcher_arity
 
 when isMainModule:
   echo "Running all tests..."

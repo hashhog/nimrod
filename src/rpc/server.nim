@@ -14165,7 +14165,58 @@ proc handleVerifyChain(rpc: RpcServer, params: JsonNode): JsonNode =
   info "verifychain: no inconsistencies", lastN = checkDepth, level = checkLevel
   %true
 
+# ============================================================================
+# Dispatcher arity check (Core rpc/util.cpp:644 -> IsValidNumArgs at :733)
+# ============================================================================
+#
+# Core validates argument COUNT centrally, before any handler runs:
+#     if (GET_HELP || !IsValidNumArgs(request.params.size())) throw HelpResult{...}
+#     IsValidNumArgs = num_required <= n && n <= num_declared
+# and the violation surfaces as error -1 carrying the method's help text.
+#
+# nimrod's handlers deliberately do NOT check arity — see the note at
+# `ping` ("Core's ping takes no params and relies on the dispatcher's arity
+# check; extra params are ignored here"). That was correct about Core and wrong
+# about nimrod: THE DISPATCHER HAD NO SUCH CHECK. Every handler was deferring to
+# a safeguard nobody had written, so extra arguments were silently ignored --
+# savemempool failed this in 10 of 10 fleet implementations and clearbanned in
+# 9 of 10 (tools/r5_probe.py, 2026-08-31).
+#
+# The table is DERIVED FROM CORE by tools/core-arity.py (`help <method>`, whose
+# signature line parenthesises optional arguments) rather than hand-written, and
+# was validated by calling Core with declared+1 arguments on nine read-only
+# methods: all nine returned -1, as predicted.
+#
+# COVERAGE: 87 of the 103 operator-subset methods. A method ABSENT from the
+# table is NOT checked. That is deliberate and must stay that way -- treating an
+# unknown method as zero-arg would reject calls Core accepts, which is a worse
+# failure than the one being fixed.
+const CoreArityJson = staticRead("core-arity.json")
+
+let CoreArity*: Table[string, tuple[required, declared: int]] = (proc(): Table[string, tuple[required, declared: int]] =
+  result = initTable[string, tuple[required, declared: int]]()
+  let j = parseJson(CoreArityJson)
+  for name, spec in j.pairs:
+    result[name] = (required: spec["required"].getInt, declared: spec["declared"].getInt)
+)()
+
+proc checkCoreArity*(methodName: string, params: JsonNode) =
+  ## Reject a call whose positional argument count Core would refuse.
+  if params.isNil or params.kind != JArray:
+    return                       # named/absent params: not this check's business
+  if not CoreArity.hasKey(methodName):
+    return                       # unknown method: fail OPEN (see COVERAGE above)
+  let a = CoreArity[methodName]
+  let n = params.len
+  if n < a.required or n > a.declared:
+    raise newRpcError(RpcMiscError,
+      methodName & " takes " &
+      (if a.required == a.declared: $a.declared
+       else: $a.required & " to " & $a.declared) &
+      " argument(s), got " & $n)
+
 proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
+  checkCoreArity(methodName, params)
   case methodName
   # Blockchain
   of "getblockchaininfo":
