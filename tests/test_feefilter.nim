@@ -5,6 +5,7 @@ import unittest2
 import std/[random, math, tables, strutils, sets]
 import chronos
 import ../src/network/relay
+import ../src/util/rng
 import ../src/network/peer
 import ../src/network/messages
 import ../src/consensus/params
@@ -72,6 +73,38 @@ suite "FeeFilterRounder":
     check rounder.round(0) == 0'i64
     check rounder.round(-1) == 0'i64
     check rounder.round(2_100_000_000_000_000'i64) == 9_170_997'i64   # MAX_MONEY
+
+  test "round is REPRODUCIBLE under a pinned seed (was impossible before)":
+    ## This test could not exist before src/util/rng.nim.
+    ##
+    ## round() used to call std/random's randomize() on every invocation, which
+    ## overwrote any seed a test set, so the generator could never be pinned —
+    ## which is why the test above it has to be phrased as a property rather
+    ## than a value, and why the older version of it was flaky about one run in
+    ## eight. Core has the same randomness and pins it the same way:
+    ##   src/test/feerounder_tests.cpp
+    ##     FastRandomContext rng{/*fDeterministic=*/true};
+    ##
+    ## Seeding now works, so the same seed must reproduce the same sequence.
+    let rounder = newFeeFilterRounder(1000)
+
+    proc sequence(seed: int64): seq[int64] =
+      seedNodeRngForTest(seed)
+      for _ in 0 ..< 64:
+        result.add(rounder.round(1000))
+
+    let a = sequence(20260830)
+    let b = sequence(20260830)
+    check a == b                       # same seed -> same sequence
+    check a.len == 64
+
+    # Control: a DIFFERENT seed must not reproduce it, otherwise the check
+    # above would pass for a generator that ignores the seed entirely.
+    let c = sequence(20260831)
+    check c != a
+
+    # And every draw is still one of Core's two published buckets.
+    for v in a: check v == 974'i64 or v == 1071'i64
 
   test "round quantizes: a value only ever lands on an adjacent bucket":
     ## The privacy property the old test was reaching for, stated so it cannot

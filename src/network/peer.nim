@@ -3,6 +3,7 @@
 ## Uses chronos for async networking
 
 import std/[strformat, random, hashes, tables, os, strutils, options]
+import ../util/rng
 import std/times as stdtimes
 import chronos
 import chronos/timer as ctimer
@@ -185,7 +186,6 @@ type
 
 proc newPeer*(address: string, port: uint16, params: ConsensusParams,
               direction: PeerDirection = pdOutbound): Peer =
-  randomize()
   let now = chronos.Moment.now()
   Peer(
     address: address,
@@ -216,7 +216,7 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     versionSent: false,
     verackReceived: false,
     verackSent: false,
-    localNonce: uint64(rand(high(int))),  # Generate unique nonce for self-connection detection
+    localNonce: uint64(nodeRng().rand(high(int))),  # Generate unique nonce for self-connection detection
     remoteNonce: 0,
     # BIP 152 compact blocks
     compactBlockState: newCompactBlockState(),
@@ -667,8 +667,7 @@ proc sendVerack*(peer: Peer) {.async.} =
 
 proc sendPing*(peer: Peer) {.async.} =
   ## Send a ping and record the nonce/time for latency measurement
-  randomize()
-  peer.pingNonce = uint64(rand(high(int)))
+  peer.pingNonce = uint64(nodeRng().rand(high(int)))
   peer.lastPing = stdtimes.getTime()
   await peer.sendMessage(newPing(peer.pingNonce))
 
@@ -768,11 +767,10 @@ proc performV2HandshakeResponder*(peer: Peer) {.async.} =
   #    BIP-324 allows 0..4095 bytes of garbage; small bound (0..32)
   #    keeps wire-overhead low while still exercising the AAD-binding
   #    path of the version packet.
-  randomize()
-  let ourGarbageLen = rand(32)
+  let ourGarbageLen = nodeRng().rand(32)
   var ourGarbage = newSeq[byte](ourGarbageLen)
   for i in 0 ..< ourGarbageLen:
-    ourGarbage[i] = byte(rand(255))
+    ourGarbage[i] = byte(nodeRng().rand(255))
 
   let ourPubKey = peer.v2Cipher.getOurPubKey()
   var keyAndGarbage = newSeq[byte](EllSwiftPubKeySize + ourGarbageLen)
@@ -938,11 +936,10 @@ proc performV2HandshakeInitiator*(peer: Peer) {.async.} =
   #    initiator's garbage upper bound is MaxGarbageLen, but a small
   #    bound keeps wire-overhead low while still exercising the
   #    AAD-binding path.
-  randomize()
-  let ourGarbageLen = rand(32)
+  let ourGarbageLen = nodeRng().rand(32)
   var ourGarbage = newSeq[byte](ourGarbageLen)
   for i in 0 ..< ourGarbageLen:
-    ourGarbage[i] = byte(rand(255))
+    ourGarbage[i] = byte(nodeRng().rand(255))
 
   let ourPubKey = peer.v2Cipher.getOurPubKey()
   var keyAndGarbage = newSeq[byte](EllSwiftPubKeySize + ourGarbageLen)

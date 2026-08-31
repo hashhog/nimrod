@@ -13,6 +13,7 @@
 ## Reference: Bitcoin Core /src/node/txreconciliation.cpp
 
 import std/[tables, random, hashes, options]
+import ../util/rng
 import chronos
 import chronicles
 import ../primitives/[types, serialize]
@@ -149,8 +150,7 @@ proc preRegisterPeer*(tracker: var TxReconciliationTracker, peerId: int64): uint
   ## Returns the local salt to send in sendtxrcncl message
   ## Reference: Bitcoin Core TxReconciliationTracker::PreRegisterPeer()
 
-  randomize()
-  let localSalt = uint64(rand(high(int64)))
+  let localSalt = uint64(nodeRng().rand(high(int64)))
 
   # Store for later registration
   tracker.preSalts[peerId] = localSalt

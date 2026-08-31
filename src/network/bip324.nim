@@ -10,6 +10,7 @@
 ## Reference: BIP-324, Bitcoin Core bip324.cpp
 
 import std/[endians, random, tables, strutils, sysrand]
+import ../util/rng
 import ../crypto/[secp256k1, hkdf, chacha20poly1305]
 import ../consensus/params
 
@@ -413,11 +414,10 @@ proc decodeV2Message*(content: openArray[byte]):
 
 proc generateGarbage*(): seq[byte] =
   ## Generate random garbage data of random length (0 to MaxGarbageLen)
-  randomize()
-  let length = rand(MaxGarbageLen)
+  let length = nodeRng().rand(MaxGarbageLen)
   result = newSeq[byte](length)
   for i in 0..<length:
-    result[i] = byte(rand(255))
+    result[i] = byte(nodeRng().rand(255))
 
 proc checkV1Magic*(data: openArray[byte], magic: uint32): bool =
   ## Check if the first bytes look like a v1 protocol message

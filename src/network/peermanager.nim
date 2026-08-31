@@ -11,6 +11,7 @@
 ## Reference: Bitcoin Core net.cpp, node/eviction.cpp
 
 import std/[tables, sets, sequtils, random, times, net, strutils, algorithm, options]
+import ../util/rng
 import chronos
 import chronicles
 import ./peer
@@ -362,7 +363,6 @@ proc newPeerManager*(params: ConsensusParams,
                      maxIn: int = DefaultMaxInbound,
                      dataDir: string = ".",
                      netGroupMgr: NetGroupManager = nil): PeerManager =
-  randomize()
   let now = chronos.Moment.now()
   result = PeerManager(
     params: params,
@@ -423,7 +423,7 @@ proc newPeerManager*(params: ConsensusParams,
     timestamp: getTime().toUnix(),
     addrRecv: NetAddress(services: NodeNetwork, port: params.defaultPort),
     addrFrom: NetAddress(services: NodeNetwork or NodeWitness, port: params.defaultPort),
-    nonce: uint64(rand(high(int))),
+    nonce: uint64(nodeRng().rand(high(int))),
     userAgent: UserAgent,
     startHeight: 0,
     relay: true
@@ -670,7 +670,7 @@ proc resolveDnsSeeds*(pm: PeerManager): Future[seq[string]] {.async.} =
         debug "DNS resolution failed", host = host, error = e.msg
 
     if addresses.len > 0:
-      shuffle(addresses)
+      nodeRng().shuffle(addresses)
   else:
     debug "DNS seeding disabled (--nodnsseed): falling back to fixed seeds"
 
@@ -1675,7 +1675,7 @@ proc dumpKnownAddresses*(pm: PeerManager, count: int,
 
   # Shuffle — Core returns a shuffled CAddress vector; callers/tests must be
   # order-insensitive.
-  shuffle(rows)
+  nodeRng().shuffle(rows)
 
   # count == 0 → all; otherwise cap.
   if count > 0 and rows.len > count:
@@ -1737,7 +1737,7 @@ proc relayAddresses(pm: PeerManager, source: Peer) =
       candidates.add(p)
   if candidates.len == 0:
     return
-  shuffle(candidates)
+  nodeRng().shuffle(candidates)
   let n = min(2, candidates.len)
 
   # Build legacy addr payload (IPv4/IPv6 only)

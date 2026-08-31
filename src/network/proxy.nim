@@ -7,6 +7,7 @@
 ## RFC 1928 (SOCKS5), RFC 1929 (SOCKS5 username/password)
 
 import std/[strformat, strutils, random, tables, base64, options, os]
+import ../util/rng
 import nimcrypto/sha2
 import chronos
 import chronicles
@@ -769,8 +770,7 @@ proc connectSam*(session: I2PSession): Future[void] {.async.} =
 
 proc createSession*(session: I2PSession): Future[void] {.async.} =
   ## Create an I2P streaming session
-  randomize()
-  session.sessionId = "nimrod" & $rand(999999)
+  session.sessionId = "nimrod" & $nodeRng().rand(999999)
 
   # Load or generate private key
   if session.config.privateKeyFile.len > 0 and

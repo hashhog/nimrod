@@ -8,6 +8,7 @@
 ## Reference: Bitcoin Core net_processing.cpp SendMessages(), MaybeSendFeefilter()
 
 import std/[tables, random, math, algorithm, sets]
+import ../util/rng
 import chronos
 import chronicles
 import ./peer
@@ -154,8 +155,7 @@ proc round*(rounder: FeeFilterRounder, currentMinFee: int64): int64 =
     return int64(rounder.feeBuckets[0])
 
   # 2/3 of the time, round down to the previous bucket
-  randomize()
-  if rand(2) != 0:  # 2/3 probability (rand(2) returns 0, 1, or 2)
+  if nodeRng().rand(2) != 0:  # 2/3 probability (rand(2) returns 0, 1, or 2)
     return int64(rounder.feeBuckets[lo - 1])
   else:
     return int64(rounder.feeBuckets[lo])
@@ -194,8 +194,7 @@ proc newRelayManager*(): RelayManager =
 proc calculatePoissonDelay*(meanInterval: float64): Duration =
   ## Calculate Poisson-distributed delay: -ln(rand) * mean
   ## This produces exponentially distributed intervals with given mean
-  randomize()
-  let r = rand(1.0)
+  let r = nodeRng().rand(1.0)
   # Avoid ln(0) by clamping to small positive value
   let safeR = max(r, 1e-10)
   let delaySeconds = -ln(safeR) * meanInterval
@@ -341,8 +340,7 @@ proc flushTrickle(state: PeerRelayState) {.async.} =
     return
 
   # Randomize order for privacy
-  randomize()
-  shuffle(state.invQueue)
+  nodeRng().shuffle(state.invQueue)
 
   # Take up to InventoryBroadcastMax items, filtering by feefilter
   let peerFeeFilter = int64(state.peer.feeFilterRate)
@@ -572,8 +570,7 @@ proc maybeSendFeefilter*(rm: RelayManager, state: PeerRelayState) {.async.} =
       let maxChangeDelay = milliseconds(int(MaxFeefilterChangeDelay * 1000))
       if now + maxChangeDelay < state.nextSendFeefilter:
         # Reschedule to within 5 minutes (random)
-        randomize()
-        let randomDelay = milliseconds(rand(int(MaxFeefilterChangeDelay * 1000)))
+        let randomDelay = milliseconds(nodeRng().rand(int(MaxFeefilterChangeDelay * 1000)))
         state.nextSendFeefilter = now + randomDelay
         trace "rescheduled feefilter due to significant change",
               peer = $state.peer,

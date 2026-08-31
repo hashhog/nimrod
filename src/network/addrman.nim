@@ -32,6 +32,7 @@
 ## golden test pins THIS impl's chosen hash.
 
 import std/[tables, strutils, times, options, random, os]
+import ../util/rng
 import ./netgroup
 import ../crypto/hashing
 
@@ -197,7 +198,7 @@ proc newAddrManTable*(): AddrManTable =
   ## Create an empty table with a random salt.
   var nkey: array[32, byte]
   for i in 0..<32:
-    nkey[i] = byte(rand(255))
+    nkey[i] = byte(nodeRng().rand(255))
   newAddrManTableWithKey(nkey)
 
 # ---------------------------------------------------------------------------
@@ -302,7 +303,7 @@ proc add*(t: AddrManTable, ip16: array[16, byte], port: uint16,
       # stochastic multiplicity gate: 2^refcount harder each time.
       if t.mapInfo[id].refCount > 0:
         let factor = 1'u32 shl t.mapInfo[id].refCount
-        if uint32(rand(int(factor) - 1)) != 0'u32:
+        if uint32(nodeRng().rand(int(factor) - 1)) != 0'u32:
           return false
   else:
     # Bounded-ceiling guard: never allocate past the table capacity.
@@ -434,12 +435,12 @@ proc select*(t: AddrManTable, newOnly: bool = false): Option[AddrKey] =
   let searchTried =
     if newOnly or t.nTried == 0: false
     elif t.nNew == 0: true
-    else: rand(1) == 1
+    else: nodeRng().rand(1) == 1
 
   let bucketCount = if searchTried: AddrmanTriedBucketCount else: AddrmanNewBucketCount
 
-  let startBucket = rand(bucketCount - 1)
-  let initialPos = rand(AddrmanBucketSize - 1)
+  let startBucket = nodeRng().rand(bucketCount - 1)
+  let initialPos = nodeRng().rand(AddrmanBucketSize - 1)
   for nb in 0..<bucketCount:
     let bucket = (startBucket + nb) mod bucketCount
     for i in 0..<AddrmanBucketSize:

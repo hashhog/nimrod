@@ -3,6 +3,7 @@
 ## Reference: Bitcoin Core /src/wallet/coinselection.cpp
 
 import std/[algorithm, options, random]
+import ../util/rng
 import ../primitives/types
 
 type
@@ -270,7 +271,7 @@ proc knapsackSolver*(utxos: var seq[SelectableCoin], target: Satoshi,
   let minChangeVal = int64(minChange)
 
   # Shuffle UTXOs for randomization
-  shuffle(utxos)
+  nodeRng().shuffle(utxos)
 
   # Check for exact match
   for utxo in utxos:
