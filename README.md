@@ -6,6 +6,8 @@ A Bitcoin full node written from scratch in Nim. Part of the [Hashhog](https://g
 
 ### Build from Source
 
+Toolchain: Nim >= 2.0.0 (`nimrod.nimble`); the Docker image pins `nimlang/nim:2.0.2` (`Dockerfile`) and the tagged validator was built with Nim 2.2.8 / nimble 0.20.1 (`REPRODUCIBLE-BUILD.md`). Install Nim via [choosenim](https://github.com/dom96/choosenim) or a release tarball — the Debian `nim` package is not verified for this project. `nimble setup` fetches the Nim deps (chronos, chronicles, stew, nimcrypto, httpbeast, jsony) from the network.
+
 ```bash
 # Install dependencies (Debian/Ubuntu)
 sudo apt-get install -y librocksdb-dev libsecp256k1-dev libsqlite3-dev
