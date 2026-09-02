@@ -11,7 +11,7 @@ to height 958,794 with its assumevalid gate off, serialized its entire UTXO set,
 and produced the byte string
 `29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` over
 166,180,925 coins — the same value Bitcoin Core's `dumptxoutset` produced at that
-height. A single wrong coin anywhere in fifteen years changes that hash. The git
+height. A single wrong coin anywhere in fifteen years changes that hash — the *capture* is unfakeable. **The lineage under it is not checkable from a clone:** what the ledger row records is height, hash and coin count; that the chain beneath was built from genesis with assumevalid off rests on the row's `lineage receipt` column, and four of the five rows point at logs under `/home/work/genesis-ibd/logs/` — outside any repository and uncommitted — while blockbrew's says only `--commit` (`receipts/TRUST-ANCHOR.md:141-145`). The git
 tag `v0.1.0-rc1` (`receipts/RELEASE-v1.0-FREEZE.md`) marks the same bar: `rc` in this
 project certifies that reproduction and nothing else
 (`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
@@ -24,8 +24,10 @@ operator probe run 2026-09-01T18:26:42Z
 (`SKIP-REGTEST`) for every node including Core. Cite the run, not "the score":
 the probe ten minutes earlier
 (`tools/diff-test-artifacts/r5-probe/20260901T181552Z.json`) scored nimrod 51
-with no deploy in between, and several nimrod failures are RPC timeouts rather
-than wrong answers.
+with no deploy in between. **Two** of nimrod's 33 failures are RPC timeouts rather
+than wrong answers (`getblockstats`, `getchaintxstats`); the other 31 are wrong
+answers, wrong error codes or wrong shapes. An earlier draft of this line said
+"several", which softened the score with a count the artifact does not support.
 
 **Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
 unit suite is *measured, not fixed* — 17 failing tests across
@@ -44,6 +46,12 @@ snapshot-boot gate is a declared carve-out for nimrod
 
 > Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
 > the hashhog meta-repo, not to this repository.
+> **Two notes on the citations above.** The R5 probe JSON is **gitignored** in the
+> meta-repo (`.gitignore:60  tools/diff-test-artifacts/`), so a stranger cloning
+> either repository cannot read it; regenerate it with `python3 tools/r5_probe.py`
+> against a running fleet. The nightly `diffguard-*.log` files are likewise
+> gitignored (`.gitignore:43  *.log`). Paths under `receipts/`, `docs/` and
+> `CORE-PARITY-AUDIT/` are tracked, but in the **meta-repo**, not here.
 
 ## Quick Start
 
