@@ -9328,12 +9328,17 @@ proc handleListUnspent(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
   let mainnet = rpc.params.network == Mainnet
+  # Regtest has its own bech32 HRP ("bcrt"); without this flag segwit
+  # addresses here collapse onto the shared testnet "tb" HRP and no longer
+  # match what getnewaddress handed the caller.
+  # Reference: bitcoin-core/src/kernel/chainparams.cpp:642 (regtest bech32_hrp)
+  let regtest = rpc.params.network == Regtest
 
   var utxoArray = newJArray()
   for _, utxo in w.utxos:
     let confs = if utxo.height > 0: currentHeight - utxo.height + 1 else: 0
     if confs >= minconf and confs <= maxconf:
-      let addrOpt = extractAddressFromScript(utxo.output.scriptPubKey, mainnet)
+      let addrOpt = extractAddressFromScript(utxo.output.scriptPubKey, mainnet, regtest)
       # Immature coinbase coins are listed but flagged non-spendable/unsafe,
       # matching Core's AvailableCoins semantics (a coinbase at height H is
       # spendable once currentHeight - H >= COINBASE_MATURITY, i.e. it has
@@ -9642,6 +9647,9 @@ proc buildTxLegs(rpc: RpcServer, rec: WalletTxRecord, fLong: bool,
   ## block (used by listtransactions). labelFilter "*" = no filter.
   result = @[]
   let mainnet = rpc.params.network == Mainnet
+  # Regtest bech32 HRP is "bcrt", not the shared testnet "tb".
+  # Reference: bitcoin-core/src/kernel/chainparams.cpp:642
+  let regtest = rpc.params.network == Regtest
   # Fee (positive) = debit - valueOut, only meaningful when the wallet sent.
   let fee = if rec.fromMe: int64(rec.debit) - int64(rec.valueOut) else: 0'i64
 
@@ -9649,7 +9657,7 @@ proc buildTxLegs(rpc: RpcServer, rec: WalletTxRecord, fLong: bool,
   if labelFilter == "*":
     for d in rec.details:
       if not d.isSend: continue
-      let addrOpt = extractAddressFromScript(d.scriptPubKey, mainnet)
+      let addrOpt = extractAddressFromScript(d.scriptPubKey, mainnet, regtest)
       var entry = newJObject()
       if addrOpt.isSome: entry["address"] = %addrOpt.get()
       entry["category"] = %"send"
@@ -9663,7 +9671,7 @@ proc buildTxLegs(rpc: RpcServer, rec: WalletTxRecord, fLong: bool,
   # Received legs.
   for d in rec.details:
     if d.isSend or not d.isMine: continue
-    let addrOpt = extractAddressFromScript(d.scriptPubKey, mainnet)
+    let addrOpt = extractAddressFromScript(d.scriptPubKey, mainnet, regtest)
     let addressStr = if addrOpt.isSome: addrOpt.get() else: ""
     if labelFilter != "*":
       if addressStr == "": continue

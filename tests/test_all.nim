@@ -114,6 +114,7 @@ import ./test_wtxid_getdata
 import ./test_script_flag_exceptions
 import ./test_createrawtx_vout_range
 import ./test_dispatcher_arity
+import ./test_listunspent_regtest_hrp
 
 when isMainModule:
   echo "Running all tests..."
