@@ -2,6 +2,49 @@
 
 A Bitcoin full node written from scratch in Nim. Part of the [Hashhog](https://github.com/hashhog/hashhog) project.
 
+## Status — v1.0.0
+
+**Label: "Validated — reproduced Core's UTXO set from genesis with all scripts
+verified"** (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That
+label means one specific thing: nimrod connected every mainnet block from block 0
+to height 958,794 with its assumevalid gate off, serialized its entire UTXO set,
+and produced the byte string
+`29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` over
+166,180,925 coins — the same value Bitcoin Core's `dumptxoutset` produced at that
+height. A single wrong coin anywhere in fifteen years changes that hash. The git
+tag `v0.1.0-rc1` (`receipts/RELEASE-v1.0-FREEZE.md`) marks the same bar: `rc` in this
+project certifies that reproduction and nothing else
+(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
+or fund-custody readiness — see `SECURITY.md`.
+
+**Operator RPC parity: 52 of Bitcoin Core's 85.** From the 103-method R5
+operator probe run 2026-09-01T18:26:42Z
+(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): nimrod 52 PASS /
+33 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
+(`SKIP-REGTEST`) for every node including Core. Cite the run, not "the score":
+the probe ten minutes earlier
+(`tools/diff-test-artifacts/r5-probe/20260901T181552Z.json`) scored nimrod 51
+with no deploy in between, and several nimrod failures are RPC timeouts rather
+than wrong answers.
+
+**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
+unit suite is *measured, not fixed* — 17 failing tests across
+`test_misbehavior` (6), `test_netgroup` (5), `test_eviction` (1),
+`test_eclipse` (1), `test_parallel_verify_ibd` (1) and `test_snapshot` (3), each
+recorded as test-bug-vs-node-bug NOT VERIFIED. These sit in modules using the
+stdlib `unittest`, whose failures the "2177/2177 green" `unittest2` summary
+never counted. 112 of the 223 `tests/test_*.nim` files are never imported by
+`tests/test_all.nim`, and 8 of those do not compile. The nightly assumeUTXO
+snapshot-boot gate is a declared carve-out for nimrod
+(`BOOTSMOKE_EXPECTED_FAIL=rustoshi nimrod`,
+`receipts/boot-smoke-4-red-triaged-2026-08-16.md:91-118`), not a passing gate.
+
+**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
+[hashhog meta-repo](https://github.com/hashhog/hashhog).
+
+> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
+> the hashhog meta-repo, not to this repository.
+
 ## Quick Start
 
 ### Build from Source
@@ -123,6 +166,12 @@ nimrod reads `$datadir/nimrod.conf` in key=value format:
 | `getnewaddress` | Get new receiving address |
 
 ## RPC API
+
+> **Parity note.** These methods are modelled on Bitcoin Core's, but shape parity is not
+> behaviour parity. On the 2026-09-01T18:26:42Z operator probe nimrod answers 52 of the
+> 103 probed methods correctly against Core's 85, and 33 probes fail — some of them RPC
+> timeouts rather than wrong answers
+> (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
 
 ### Blockchain
 
