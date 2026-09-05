@@ -27,8 +27,9 @@
 ## `ScriptCompression`, `CompressAmount`, `CompressScript`
 ## (`bitcoin-core/src/coins.h`, `bitcoin-core/src/compressor.{h,cpp}`).
 
-import std/[options, tables, os, algorithm, posix]
+import std/[options, tables, os, algorithm, posix, strutils]
 import chronos
+import chronicles
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 import ../crypto/muhash
@@ -673,6 +674,24 @@ proc createSnapshot*(
 # Snapshot loading (loadtxoutset)
 # ============================================================================
 
+## DEVELOPMENT-ONLY escape hatch from the assumeutxo chainparams whitelist.
+##
+## `loadtxoutset` is a TRUST SHORTCUT for end users — that is precisely why
+## Core hardcodes the base-blockhash anchors in chainparams and refuses any
+## snapshot that does not match one. This project, however, needs to validate
+## arbitrary block ranges in parallel from a locally generated snapshot
+## ladder; correctness there is established by checking each range's OUTPUT
+## utxo hash against an independent commitment, NOT by trusting the input
+## snapshot. When this variable is UNSET (the shipped default) behaviour is
+## byte-for-byte what it was before, so production trust semantics are
+## intact.
+const UnsafeSnapshotHeightEnvVar* = "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT"
+
+proc unsafeSnapshotHeightRaw*(): string =
+  ## Raw value of `HASHHOG_UNSAFE_SNAPSHOT_HEIGHT` ("" when unset). Empty =>
+  ## the whitelist gate below behaves exactly as it always has.
+  getEnv(UnsafeSnapshotHeightEnvVar, "")
+
 proc validateSnapshotMetadata*(
     meta: SnapshotMetadata,
     params: ConsensusParams,
@@ -687,6 +706,14 @@ proc validateSnapshotMetadata*(
   for d in assumeutxoData:
     if d.blockhash == meta.baseBlockhash:
       return (true, some(d), "")
+  # DEV-ONLY whitelist escape (see UnsafeSnapshotHeightEnvVar above). The
+  # base blockhash is unknown to chainparams, but the operator has opted in,
+  # so accept the metadata and hand back `none` — the caller then supplies
+  # the base height from the env var (the whitelist entry normally supplies
+  # it) and skips the hardcoded hash_serialized comparison. Nothing else is
+  # relaxed: magic, format, coin count and per-coin parsing all still run.
+  if unsafeSnapshotHeightRaw().len > 0:
+    return (true, none(AssumeutxoData), "")
   # Blockhash not in the assumeutxo whitelist. Core reports the snapshot's
   # block height; we don't have that locally for an unknown blockhash, so we
   # report 0 to signal "not recognized". The error format matches Core
@@ -749,7 +776,29 @@ proc loadSnapshot*(
   let validation = validateSnapshotMetadata(sf.metadata, params, assumeutxoData)
   if not validation.valid:
     return (false, 0'u64, validation.error)
-  let assumeData = validation.data.get()
+  let assumeDataOpt = validation.data
+
+  # Base height normally comes from the matched whitelist entry. Under the
+  # DEV-ONLY escape (UnsafeSnapshotHeightEnvVar) there is no entry, so the
+  # env var supplies it instead.
+  var baseHeight: int32
+  if assumeDataOpt.isSome:
+    baseHeight = assumeDataOpt.get().height
+  else:
+    let rawUnsafe = unsafeSnapshotHeightRaw()
+    try:
+      baseHeight = int32(parseInt(rawUnsafe))
+    except ValueError:
+      return (false, 0'u64,
+              UnsafeSnapshotHeightEnvVar & " is not an integer: " & rawUnsafe)
+    warn "UNVERIFIED SNAPSHOT ACCEPTED — assumeutxo whitelist BYPASSED",
+      envVar = UnsafeSnapshotHeightEnvVar,
+      baseHeight = baseHeight,
+      baseBlockhash = $sf.metadata.baseBlockhash,
+      detail = "base blockhash is NOT a chainparams trust anchor; the " &
+               "hardcoded hash_serialized comparison was SKIPPED. This " &
+               "snapshot's UTXO set is UNVERIFIED. DEVELOPMENT ONLY — " &
+               "NEVER use this in production."
 
   # B8: Work-exceeds-active-chainstate pre-check
   # (bitcoin-core/src/validation.cpp:5787-5788, PopulateAndValidateSnapshot).
@@ -757,10 +806,8 @@ proc loadSnapshot*(
   # that case the snapshot's work cannot exceed the active tip's work, so
   # loading it would corrupt the state. We approximate with height since
   # AssumeutxoData does not store chainwork.
-  if targetCs.bestHeight > 0 and targetCs.bestHeight >= assumeData.height:
+  if targetCs.bestHeight > 0 and targetCs.bestHeight >= baseHeight:
     return (false, 0'u64, "Work does not exceed active chainstate")
-
-  let baseHeight = assumeData.height
 
   # ----------------------------------------------------------
   # FIX-D Phase 1 — write the SNAPSHOT_LOAD_IN_PROGRESS marker
@@ -882,8 +929,13 @@ proc loadSnapshot*(
   # byte stream. Both sides are uint256 in Core; their `ToString()` is the
   # byte-reversed hex display. We replicate that display so error messages
   # copy/paste 1:1 against Core's RPC output and assumeutxoData literals.
+  #
+  # Under the DEV-ONLY escape there is no whitelist entry and therefore no
+  # hardcoded commitment to compare against, so this ONE check is skipped.
+  # Every other gate above (magic, format, coin count, per-coin B1/B2/B3/B4,
+  # trailing bytes) has already run unchanged.
   let computedHash = hw.finalizeHash()
-  if computedHash != assumeData.hashSerialized:
+  if assumeDataOpt.isSome and computedHash != assumeDataOpt.get().hashSerialized:
     proc dispHex(b: array[32, byte]): string =
       const hexDigits = "0123456789abcdef"
       result = newStringOfCap(64)
@@ -892,7 +944,7 @@ proc loadSnapshot*(
         result.add(hexDigits[int(b[k] and 0x0F)])
     return (false, coinsLoaded,
             "Bad snapshot content hash: expected " &
-            dispHex(assumeData.hashSerialized) & ", got " &
+            dispHex(assumeDataOpt.get().hashSerialized) & ", got " &
             dispHex(computedHash))
 
   # ----------------------------------------------------------
@@ -908,15 +960,15 @@ proc loadSnapshot*(
   # just-loaded snapshot on next open).
   # ----------------------------------------------------------
   targetCs.bestBlockHash = sf.metadata.baseBlockhash
-  targetCs.bestHeight = assumeData.height
+  targetCs.bestHeight = baseHeight
   targetCs.db.bestBlockHash = sf.metadata.baseBlockhash
-  targetCs.db.bestHeight = assumeData.height
+  targetCs.db.bestHeight = baseHeight
   let commitBatch = targetCs.db.db.newWriteBatch()
   defer: commitBatch.destroy()
   commitBatch.put(cfMeta, metaKey("bestblock"),
                   @(array[32, byte](sf.metadata.baseBlockhash)))
   var hw2 = BinaryWriter()
-  hw2.writeInt32LE(assumeData.height)
+  hw2.writeInt32LE(baseHeight)
   commitBatch.put(cfMeta, metaKey("height"), hw2.data)
   commitBatch.delete(cfMeta, metaKey(SnapshotLoadMarkerKey))
   targetCs.db.db.writeSynced(commitBatch)
@@ -959,6 +1011,17 @@ proc activateSnapshot*(
       snapshotCs.targetUtxoHash = some(d.hashSerialized)
       snapshotCs.role = csrSnapshot
       return (true, "")
+  # DEV-ONLY whitelist escape (see UnsafeSnapshotHeightEnvVar): `loadSnapshot`
+  # above already accepted the unknown base blockhash and warned loudly, so
+  # this second whitelist scan must not re-reject it. There is no chainparams
+  # commitment to target, so `targetUtxoHash` stays `none` and the snapshot
+  # remains auUnvalidated — background validation can never flip it to
+  # auValidated, which is the honest state for an unverified snapshot.
+  if unsafeSnapshotHeightRaw().len > 0:
+    snapshotCs.assumeutxo = auUnvalidated
+    snapshotCs.snapshotBlockhash = some(snapshotCs.chainState.bestBlockHash)
+    snapshotCs.role = csrSnapshot
+    return (true, "")
   return (false, "snapshot hash not found in assumeutxo data")
 
 # ============================================================================
