@@ -2330,6 +2330,29 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # 2. Open database and chainstate
   info "opening database", path = networkDir / "chainstate"
   state.chainState = newChainState(networkDir / "chainstate", params)
+
+  # scripts-on evidence banner (--noassumevalid / --assumevalid=0).
+  # Read off the EFFECTIVE params now owned by the ChainState the connect path
+  # uses, NOT off the CLI bool: getConsensusParams zeroes BOTH assumeValidHeight
+  # and assumeValidBlockHash, and both consumers of the skip decision
+  # short-circuit on that ChainState copy --
+  #   * the faithful gate, consensus/assumevalid.nim: a zero
+  #     assumeValidBlockHash returns ssrAssumeValidUnset (no skip), and a zero
+  #     assumeValidHeight additionally fails the height check for every block
+  #     above genesis;
+  #   * the height-only proxy on the RPC/submitblock connect path,
+  #     rpc/server.nim: `assumeValidHeight > 0 and height <= assumeValidHeight`.
+  # So when this line prints, every connected block has its input scripts
+  # verified. The config.noAssumeValid conjunct keeps the line DISCRIMINATING:
+  # regtest has assumeValidHeight 0 by construction, so the params test alone
+  # would print without the flag and prove nothing.
+  # Consumed by the boundary campaign's ack check:
+  # tools/lib/campaign-impl-lib.sh `_campaign_scripts_on_ack_re` (meta-repo).
+  if config.noAssumeValid and
+     state.chainState.params.assumeValidHeight == 0 and
+     state.chainState.params.assumeValidBlockHash ==
+       BlockHash(default(array[32, byte])):
+    info "assumevalid DISABLED (--noassumevalid): verifying ALL scripts from genesis"
   if config.ibdFlushInterval > 0:
     state.chainState.ibdDiskFlushInterval = config.ibdFlushInterval
   # --dbcache override (no-op when 0); set once on the single ChainState
