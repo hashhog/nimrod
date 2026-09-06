@@ -27,7 +27,8 @@
 ## snapshot chainstate), so `chainstates` is a 1-element array whose entry has
 ## validated=true and NO snapshot_blockhash key.
 
-import std/[unittest, os, strutils, json]
+import unittest2
+import std/[os, strutils, json]
 import ../src/primitives/[types, serialize]
 import ../src/consensus/params
 import ../src/storage/[db, chainstate]

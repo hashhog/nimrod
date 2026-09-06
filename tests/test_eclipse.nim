@@ -1,7 +1,7 @@
 ## Integration tests for eclipse attack protections
 ## Tests network group diversity, anchor connections, and inbound eviction
 
-import unittest
+import unittest2
 import std/[times, sets, options, strutils]
 import ../src/network/netgroup
 import ../src/network/eviction

@@ -35,7 +35,8 @@
 ## Reference: bitcoin-core/src/rpc/blockchain.cpp getblockfrompeer
 ##            bitcoin-core/src/net_processing.cpp PeerManagerImpl::FetchBlock
 
-import std/[unittest, os, options, json, tables]
+import unittest2
+import std/[os, options, json, tables]
 import ../src/primitives/[types, serialize]
 import ../src/consensus/params
 import ../src/storage/chainstate

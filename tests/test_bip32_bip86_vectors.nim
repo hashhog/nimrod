@@ -9,7 +9,8 @@
 ##   BIP-32: https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki
 ##   BIP-86: https://github.com/bitcoin/bips/blob/master/bip-0086.mediawiki
 
-import std/[unittest, strutils]
+import unittest2
+import std/[strutils]
 import ../src/wallet/[wallet, descriptor]
 import ../src/crypto/[secp256k1, address]
 

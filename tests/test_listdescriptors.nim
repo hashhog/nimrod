@@ -22,7 +22,8 @@
 ## Run ONLY this test:
 ##   nim c --nimcache:/tmp -r tests/test_listdescriptors.nim
 
-import std/[os, options, tables, unittest, strutils, json, algorithm]
+import unittest2
+import std/[os, options, tables, strutils, json, algorithm]
 import ../src/consensus/params
 import ../src/storage/chainstate
 import ../src/mempool/mempool

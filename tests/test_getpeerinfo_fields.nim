@@ -15,7 +15,8 @@
 ## This is RPC response shape only — non-consensus, never reachable from
 ## block/tx/script validation.
 
-import std/[unittest, json, strutils, times, sequtils, tables]
+import unittest2
+import std/[json, strutils, times, sequtils, tables]
 import ../src/rpc/server
 import ../src/network/peermanager
 import ../src/network/peer

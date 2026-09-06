@@ -19,7 +19,8 @@
 ##   bitcoin-core/src/rpc/net.cpp        addnode / setban / disconnectnode
 ##   rustoshi ee86d76 / 7b94ef1 / 980a31d / 845f7e4
 
-import std/[unittest, os, json]
+import unittest2
+import std/[os, json]
 import ../src/rpc/server
 import ../src/network/peermanager
 import ../src/consensus/params

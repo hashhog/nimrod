@@ -1,7 +1,7 @@
 ## Tests for ping timeout handling
 ## Reference: Bitcoin Core net_processing.cpp MaybeSendPing
 
-import unittest
+import unittest2
 import std/times
 import chronos
 import ../src/network/peer

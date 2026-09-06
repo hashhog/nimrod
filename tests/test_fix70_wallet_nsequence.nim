@@ -34,7 +34,8 @@
 ##   - bitcoin-core/src/rpc/rawtransaction.cpp:1620-1642 — createpsbt
 ##   - bitcoin-core/src/wallet/rpc/spend.cpp:1748 — walletcreatefundedpsbt rbf
 
-import std/[unittest, options, json, os, strutils]
+import unittest2
+import std/[options, json, os, strutils]
 import ../src/rpc/server
 import ../src/mempool/mempool
 import ../src/storage/chainstate

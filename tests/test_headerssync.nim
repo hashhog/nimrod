@@ -2,7 +2,8 @@
 ## Validates the two-phase header sync protection mechanism
 ## W88 additions: 7 bugs audited; gate list below.
 
-import std/[unittest, deques, times]
+import unittest2
+import std/[deques, times]
 import ../src/network/headerssync
 import ../src/consensus/params
 import ../src/primitives/[types, serialize, uint256]

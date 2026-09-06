@@ -39,7 +39,8 @@
 ## "PRESENT" or "MATCHES CORE" asserts the gate is wired; a test prefixed
 ## "PARTIAL" or "MISSING" runs `skip()` with a TODO referencing BUG-N.
 
-import std/[strutils, unittest]
+import unittest2
+import std/[strutils]
 import ../src/script/interpreter
 import ../src/primitives/types
 import ../src/primitives/serialize

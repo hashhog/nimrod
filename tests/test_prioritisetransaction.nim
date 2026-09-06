@@ -18,7 +18,8 @@
 ## Proven-teeth: builds a real RpcServer, inserts a real MempoolEntry, drives
 ## both RPCs via handleMethod, and asserts the exact JSON shape and values.
 
-import std/[unittest, os, options, json, times, tables]
+import unittest2
+import std/[os, options, json, times, tables]
 import ../src/primitives/[types, serialize]
 import ../src/consensus/params
 import ../src/storage/chainstate

@@ -9,7 +9,8 @@
 ##   nim c --nimcache:/tmp/psbtnim -r tests/test_psbt_convert_join.nim
 ## then delete the compiled binary it leaves in tests/.
 
-import std/[unittest, options, base64, tables, sets, sequtils, algorithm, strutils]
+import unittest2
+import std/[options, base64, tables, sets, sequtils, algorithm, strutils]
 import ../src/rpc/server
 import ../src/wallet/psbt
 import ../src/primitives/[types, serialize]

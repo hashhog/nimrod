@@ -31,7 +31,8 @@
 ## Reference:
 ##   bitcoin/bips/bip-0078.mediawiki §"Sender" + §"Checking the Proposal"
 
-import std/[unittest, options, strutils, tables, json, sets]
+import unittest2
+import std/[options, strutils, tables, json, sets]
 import chronos
 import ../src/wallet/payjoin
 import ../src/wallet/wallet

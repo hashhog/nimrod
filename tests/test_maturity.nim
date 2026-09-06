@@ -1,7 +1,8 @@
 ## Tests for coinbase maturity enforcement
 ## Coinbase outputs require 100 confirmations before spending
 
-import std/[unittest, tables]
+import unittest2
+import std/[tables]
 import ../src/wallet/wallet
 import ../src/primitives/types
 import ../src/crypto/[hashing, address, secp256k1]

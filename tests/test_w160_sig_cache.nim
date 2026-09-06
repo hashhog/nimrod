@@ -19,7 +19,7 @@
 ## backward-compatibility shims for older tests; both forms map to distinct
 ## cache slots provided their identifying inputs differ.
 
-import std/unittest
+import unittest2
 import ../src/perf/sig_cache
 
 suite "W160 BUG-11 — SigCache key folds in sighash + pubkey + sig":

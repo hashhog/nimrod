@@ -36,7 +36,8 @@
 ##   bitcoin-core/src/rpc/blockchain.cpp            gettxout n is uint32_t
 ##   bitcoin-core/src/rpc/net.cpp                   getnodeaddresses count
 
-import std/[unittest, json]
+import unittest2
+import std/[json]
 import ../src/rpc/server
 
 const TestTxid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"

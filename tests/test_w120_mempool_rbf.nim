@@ -207,7 +207,8 @@
 ##   - 10x unit bug: BUG-1, BUG-7, BUG-10 — every layer compounds a
 ##     missing /10 from kvB→vB conversion error.
 
-import std/[unittest, options, tables, times, sets, os, strutils]
+import unittest2
+import std/[options, tables, times, sets, os, strutils]
 import ../src/mempool/mempool
 import ../src/mempool/cluster
 import ../src/storage/[db, chainstate]

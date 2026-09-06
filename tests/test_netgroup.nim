@@ -1,7 +1,7 @@
 ## Tests for network group computation (eclipse protection)
 ## Reference: Bitcoin Core netgroup.cpp GetGroup()
 
-import unittest
+import unittest2
 import std/strutils
 import ../src/network/netgroup
 

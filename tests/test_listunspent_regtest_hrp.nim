@@ -23,7 +23,8 @@
 ## These are behaviour pins, not error-absence pins: they assert the exact
 ## address string, amount and entry count the RPC must return.
 
-import std/[unittest, json, os, strutils, tables]
+import unittest2
+import std/[json, os, strutils, tables]
 import ../src/rpc/server
 import ../src/mempool/mempool
 import ../src/storage/chainstate

@@ -32,7 +32,8 @@
 ##   bitcoin-core/src/wallet/rpc/encrypt.cpp    wallet enc-state codes
 ##   audit/w125_rpc_error_parity.md             full audit + gate table
 
-import std/[unittest, json, strutils]
+import unittest2
+import std/[json, strutils]
 import ../src/rpc/server
 
 # ---------------------------------------------------------------------------

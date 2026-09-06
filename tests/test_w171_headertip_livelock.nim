@@ -87,7 +87,8 @@
 ## a genuine fail-before / pass-after regression test rather than a test of
 ## new API.
 
-import std/[unittest, options, os, tables, sets]
+import unittest2
+import std/[options, os, tables, sets]
 import chronos
 import ../src/network/sync
 import ../src/network/peer

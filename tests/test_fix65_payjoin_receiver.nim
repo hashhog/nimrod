@@ -29,7 +29,8 @@
 ##   src/wallet/payjoin.nim (module under test)
 ##   src/rpc/rest.nim       (POST dispatch + handleRestPayJoin)
 
-import std/[unittest, options, strutils, tables, times, sets]
+import unittest2
+import std/[options, strutils, tables, times, sets]
 import ../src/wallet/payjoin
 import ../src/wallet/wallet
 import ../src/wallet/psbt

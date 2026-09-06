@@ -23,7 +23,8 @@
 ## unit cleanup); FIX-79 (validateRbfDiagram dead-helper); FIX-70
 ## (wallet default nSequence).
 
-import std/[unittest, options, tables, times, sets, os, strutils, math]
+import unittest2
+import std/[options, tables, times, sets, os, strutils, math]
 import ../src/wallet/feebumper
 import ../src/mempool/mempool
 import ../src/storage/[db, chainstate]

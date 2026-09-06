@@ -143,7 +143,8 @@
 ##     test-covered in `test_psbt.nim` / `test_bip174.nim` (G15-G16 in
 ##     W118). A PayJoin retrofit would not need PSBT plumbing.
 
-import std/[unittest, options, strutils]
+import unittest2
+import std/[options, strutils]
 import ../src/wallet/psbt
 import ../src/wallet/feebumper
 import ../src/wallet/wallet

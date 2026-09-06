@@ -37,7 +37,8 @@
 ##   3. The exact `mkInv` filtering decision: block invs always pass, tx
 ##      invs are dropped while IBD, kept when synced.
 
-import std/[unittest, os]
+import unittest2
+import std/[os]
 import ../src/network/sync
 import ../src/network/messages
 import ../src/consensus/params

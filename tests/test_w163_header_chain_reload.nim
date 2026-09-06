@@ -31,7 +31,8 @@
 ## never re-downloading; ThreadOpenConnections dials peers in its own thread,
 ## fully decoupled from chain sync.
 
-import std/[unittest, tables, options, os]
+import unittest2
+import std/[tables, options, os]
 import ../src/network/sync
 import ../src/network/headerssync
 import ../src/consensus/params

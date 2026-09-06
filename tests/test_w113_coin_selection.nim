@@ -2,7 +2,8 @@
 ## Tests BnB, Knapsack, OutputGroup, waste metric, anti-fee-sniping, CoinControl
 ## Reference: Bitcoin Core /src/wallet/coinselection.{h,cpp}, spend.cpp, coincontrol.h
 
-import std/[unittest, options, random, algorithm, times]
+import unittest2
+import std/[options, random, algorithm, times]
 import ../src/wallet/coinselection
 import ../src/primitives/types
 

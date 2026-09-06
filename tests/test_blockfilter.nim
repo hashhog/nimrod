@@ -1,6 +1,7 @@
 ## Tests for Block Filter Index (blockfilterindex)
 
-import std/[unittest, os, options, tempfiles]
+import unittest2
+import std/[os, options, tempfiles]
 import ../src/storage/indexes/blockfilterindex
 import ../src/storage/indexes/gcs
 import ../src/storage/indexes/base

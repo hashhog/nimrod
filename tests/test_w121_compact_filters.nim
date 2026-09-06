@@ -12,7 +12,8 @@
 ## MISSING gates: `check not compiles(<symbol>)` so this file fails to
 ## compile once the gap is closed in a follow-up fix.
 
-import std/[unittest, strutils]
+import unittest2
+import std/[strutils]
 import chronos
 import ../src/storage/indexes/[gcs, blockfilterindex, base]
 import ../src/crypto/siphash

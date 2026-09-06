@@ -7,6 +7,7 @@
 ## FAILS AT PARENT: this test process dies with SIGSEGV instead of asserting.
 ## The guard returns none(BlockHash) -> checkBip30 keeps BIP-30 ENFORCED
 ## (the documented conservative fail-safe).
+import unittest2
 import std/[options, tables]
 import ../src/primitives/types
 import ../src/storage/chainstate
@@ -23,7 +24,6 @@ proc main() =
   doAssert r2.isSome and r2.get() == BlockHash(h)
   echo "nil-db height-index guard OK"
 
-main()
 
 ## Companion pin (2026-08-28): getBlockIndex has the SAME nil-db hazard, and
 ## an unresolvable parent must TERMINATE an ancestor walk rather than spin.
@@ -44,4 +44,12 @@ proc mainIdx() =
   doAssert got.isSome and got.get().height == 7
   echo "nil-db block-index guard OK"
 
-mainIdx()
+# Both guards run as counted unittest2 cases so that `nimble test` reports them.
+# Before 2026-09-06 this file was never imported by tests/test_all.nim, and even
+# when imported its bare `main()` / `mainIdx()` calls would have executed
+# uncounted -- work the [Summary] line could not see.
+suite "nil-db index guards (corpus-replay SIGSEGV pins)":
+  test "getBlockHashByHeight with a nil db reports no-row instead of crashing":
+    main()
+  test "getBlockIndex with a nil db reports no-row instead of crashing":
+    mainIdx()

@@ -1,7 +1,7 @@
 ## Tests for stale peer eviction
 ## Reference: Bitcoin Core net_processing.cpp ConsiderEviction, EvictExtraOutboundPeers
 
-import unittest
+import unittest2
 import std/[times, options]
 import chronos
 import ../src/network/peer

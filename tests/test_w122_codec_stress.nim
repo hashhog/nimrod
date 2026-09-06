@@ -22,7 +22,8 @@
 ##   bitcoin-core/src/test/data/blockfilters.json
 ##   BIP-158
 
-import std/[unittest, strutils, os]
+import unittest2
+import std/[strutils, os]
 import ../src/storage/indexes/gcs
 import ../src/primitives/types
 import ../src/crypto/hashing

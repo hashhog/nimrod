@@ -21,7 +21,8 @@
 ##                Each closure of a MISSING gate must flip the corresponding
 ##                assertion to `compiles(...)`.
 
-import std/[unittest, os, strutils, sets, tempfiles, posix]
+import unittest2
+import std/[os, strutils, sets, tempfiles, posix]
 
 import ../src/nimrod as nimrod_main
 import ../src/util/ops

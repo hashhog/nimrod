@@ -45,7 +45,8 @@
 ##                            buildPayJoinPostUrl, payjoinReceive)
 ##   tests/test_fix65_payjoin_receiver.nim (helpers re-used in spirit)
 
-import std/[unittest, options, strutils, times, tables]
+import unittest2
+import std/[options, strutils, times, tables]
 import ../src/wallet/payjoin
 import ../src/wallet/wallet
 import ../src/wallet/psbt

@@ -25,7 +25,8 @@
 ##   bitcoin-core/src/httpserver.cpp — libevent + OpenSSL pattern.
 ##   BIP-78 §Protocol — HTTPS or .onion required for clearnet PayJoin.
 
-import std/[unittest, os, osproc, strutils, random]
+import unittest2
+import std/[os, osproc, strutils, random]
 import chronos
 import chronos/streams/[asyncstream, tlsstream]
 

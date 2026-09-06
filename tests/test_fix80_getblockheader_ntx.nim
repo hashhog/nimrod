@@ -26,7 +26,8 @@
 ##   block storage. nimrod's equivalent must traverse every available
 ##   block-source so legacy data does not present as nTx=0.
 
-import std/[unittest, os, strutils, options, json]
+import unittest2
+import std/[os, strutils, options, json]
 import ../src/primitives/[types, serialize]
 import ../src/consensus/params
 import ../src/storage/[db, chainstate, blockstore]

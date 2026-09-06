@@ -39,7 +39,8 @@
 ## returns pindexLast->nBits) + validation.cpp::ContextualCheckBlockHeader
 ## (bad-diffbits gate compares block.nBits to GetNextWorkRequired).
 
-import std/[unittest, options, os]
+import unittest2
+import std/[options, os]
 import ../src/network/sync
 import ../src/consensus/[params, validation, chain]
 import ../src/storage/chainstate

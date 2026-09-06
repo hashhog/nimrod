@@ -10,7 +10,8 @@
 ##
 ## Numbering: BUG-N-W129 (W129 namespace; does NOT overlap with W113).
 
-import std/[unittest, options, algorithm]
+import unittest2
+import std/[options, algorithm]
 import ../src/wallet/coinselection
 import ../src/primitives/types
 

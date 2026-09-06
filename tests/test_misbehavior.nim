@@ -1,7 +1,7 @@
 ## Tests for peer misbehavior scoring
 ## Validates Bitcoin Core compatible misbehavior tracking
 
-import unittest
+import unittest2
 import std/times
 import ../src/network/peer
 import ../src/consensus/params

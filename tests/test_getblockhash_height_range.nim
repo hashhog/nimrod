@@ -36,7 +36,8 @@
 ##   bitcoin-core/src/rpc/protocol.h  RPC_MISC_ERROR = -1,
 ##                                    RPC_INVALID_PARAMETER = -8
 
-import std/[unittest, json]
+import unittest2
+import std/[json]
 import ../src/rpc/server
 
 proc minimalRpcServer(): RpcServer =

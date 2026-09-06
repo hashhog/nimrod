@@ -8,7 +8,8 @@
 ##    blocks with many inputs (the work that matters during mainnet IBD)
 ## 4. Assumevalid gate: with assumevalidBlockHash configured, no scripts fire
 
-import std/[unittest, options, times, cpuinfo, threadpool, os, tempfiles]
+import unittest2
+import std/[options, times, cpuinfo, threadpool, os, tempfiles]
 import ../src/perf/parallel_verify
 import ../src/consensus/[validation, params, assumevalid]
 import ../src/primitives/[types, serialize]

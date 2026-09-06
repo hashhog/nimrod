@@ -2,7 +2,8 @@
 ## Covers VARINT, CompressAmount/Script, per-coin layout, file round-trip,
 ## metadata validation, and assumeutxo data wiring.
 
-import std/[os, options, tables, unittest, strutils, json]
+import unittest2
+import std/[os, options, tables, strutils, json]
 import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing
 import ../src/crypto/muhash

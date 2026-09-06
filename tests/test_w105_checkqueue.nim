@@ -49,7 +49,8 @@
 ##
 ## Total: 29 bugs (G23 OK)
 
-import std/[unittest, options, tables, sets, cpuinfo]
+import unittest2
+import std/[options, tables, sets, cpuinfo]
 import ../src/perf/[parallel_verify, sig_cache]
 import ../src/consensus/[validation, params]
 import ../src/primitives/[types, serialize]

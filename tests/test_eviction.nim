@@ -1,7 +1,7 @@
 ## Tests for inbound peer eviction with protections
 ## Reference: Bitcoin Core node/eviction.cpp SelectNodeToEvict()
 
-import unittest
+import unittest2
 import std/[times, options, sequtils]
 import ../src/network/eviction
 import ../src/network/netgroup

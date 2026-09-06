@@ -24,7 +24,8 @@
 ##   bitcoin-core/src/rpc/blockchain.cpp:639,842,1224 "hash"/"blockhash"/"txid"
 ##   bitcoin-core/src/rpc/mempool.cpp:844            "txid"
 
-import std/[unittest, json, strutils]
+import unittest2
+import std/[json, strutils]
 import ../src/rpc/server
 
 proc minimalRpcServer(): RpcServer =

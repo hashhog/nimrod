@@ -15,7 +15,8 @@
 ##     `bip125-replaceable` from `IsRBFOptIn(tx, pool)` (line 560-567)
 ##   - BIP-125
 
-import std/[unittest, options, tables, times, sets, os, json]
+import unittest2
+import std/[options, tables, times, sets, os, json]
 import ../src/mempool/mempool
 import ../src/storage/[db, chainstate]
 import ../src/primitives/types

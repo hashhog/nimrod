@@ -18,7 +18,8 @@
 ## / `check not compiles(Bip21Uri)` assertions, which are now invalidated
 ## by the existence of `src/wallet/bip21.nim`.
 
-import std/[unittest, options, math]
+import unittest2
+import std/[options, math]
 import ../src/wallet/bip21
 
 # ---------------------------------------------------------------------------

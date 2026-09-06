@@ -2,7 +2,7 @@
 ## Reference: bitcoin-core/src/net_processing.cpp
 ## Gates: G1-G30 per W99 audit checklist
 
-import unittest
+import unittest2
 import std/[tables, sets, times, options]
 import ../src/network/peer
 import ../src/network/messages

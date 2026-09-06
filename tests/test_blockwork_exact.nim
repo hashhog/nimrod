@@ -4,7 +4,7 @@
 ## compare EQUAL at compareWork256 (the close-work 1-block-race case).
 ## FAILS AT PARENT: difficulty-1 work quantises to 0x0100000000 there;
 ## the exact value is 0x0100010001 (Core arith_uint256 GetBlockProof).
-import unittest
+import unittest2
 import ../src/storage/chainstate
 import ../src/network/sync
 

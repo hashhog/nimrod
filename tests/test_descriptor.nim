@@ -1,7 +1,8 @@
 ## Tests for output descriptors (BIP380-386)
 ## Tests checksum computation, parsing, and address derivation
 
-import std/[unittest, strutils, options]
+import unittest2
+import std/[strutils, options]
 import ../src/wallet/descriptor
 import ../src/wallet/wallet
 import ../src/crypto/[secp256k1, address, hashing]

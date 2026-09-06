@@ -22,7 +22,8 @@
 ## (toUgly), never an order-insensitive key lookup — Nim's std/json is
 ## OrderedTable-backed so the insertion order in the handler is the wire order.
 
-import std/[unittest, json, strutils]
+import unittest2
+import std/[json, strutils]
 import ../src/rpc/server
 import ../src/network/peermanager
 import ../src/consensus/params

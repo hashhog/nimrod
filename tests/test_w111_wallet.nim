@@ -37,7 +37,8 @@
 ##                  descriptor with tr(KEY,something(...)) hangs the parser.
 ##                  FIXED in FIX-38: inc pos added alongside inc depth for '('.
 
-import std/[unittest, strutils, tables, options, base64]
+import unittest2
+import std/[strutils, tables, options, base64]
 import ../src/wallet/wallet
 import ../src/wallet/descriptor
 import ../src/wallet/psbt

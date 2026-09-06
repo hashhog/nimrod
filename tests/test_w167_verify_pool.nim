@@ -22,7 +22,8 @@
 ## Run:
 ##   nim c -r --threads:on --mm:arc -d:release tests/test_w167_verify_pool.nim
 
-import std/[unittest, options, times, cpuinfo]
+import unittest2
+import std/[options, times, cpuinfo]
 import ../src/perf/verify_pool
 import ../src/consensus/[validation, params]
 import ../src/storage/chainstate

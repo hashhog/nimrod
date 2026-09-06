@@ -46,7 +46,8 @@
 ## IsFinalTx for every tx with nBlockTime = the block's MTP (BIP-113);
 ## consensus/tx_verify.cpp::IsFinalTx.
 
-import std/[unittest, options, os, tables]
+import unittest2
+import std/[options, os, tables]
 import ../src/network/sync
 import ../src/consensus/[params, validation, chain]
 import ../src/storage/chainstate

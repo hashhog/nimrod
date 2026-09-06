@@ -41,7 +41,8 @@
 ##   bitcoin-core/src/rpc/rawtransaction_util.cpp:158-161  bound + assign
 ##   bitcoin-core/src/policy/policy.h:152-153              [1, 3]
 
-import std/[unittest, json, strutils]
+import unittest2
+import std/[json, strutils]
 import ../src/primitives/[types, serialize]
 import ../src/rpc/server
 

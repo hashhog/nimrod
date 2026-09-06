@@ -1,7 +1,8 @@
 ## Tests for wallet encryption
 ## AES-256-CBC encryption, passphrase-based key derivation
 
-import std/[unittest, strutils]
+import unittest2
+import std/[strutils]
 import ../src/wallet/crypter
 import ../src/wallet/wallet
 import ../src/primitives/types

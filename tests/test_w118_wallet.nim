@@ -75,7 +75,8 @@
 ##     transactions through createTransaction's 0xfffffffd sequence, so
 ##     no fresh two-pipeline closure is needed in this wave.
 
-import std/[unittest, strutils, options, tables, os, times, sets]
+import unittest2
+import std/[strutils, options, tables, os, times, sets]
 import ../src/wallet/wallet
 import ../src/wallet/descriptor
 import ../src/wallet/psbt

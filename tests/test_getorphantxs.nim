@@ -19,7 +19,8 @@
 ##
 ## Reference: bitcoin-core/src/rpc/mempool.cpp getorphantxs / OrphanToJSON.
 
-import std/[unittest, os, options, json, strutils]
+import unittest2
+import std/[os, options, json, strutils]
 import ../src/primitives/[types, serialize]
 import ../src/consensus/params
 import ../src/consensus/validation

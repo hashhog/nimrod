@@ -37,7 +37,8 @@
 ## W127 BUG-6 reverification: gate G16 below confirms `multi_a()` is
 ## now PRESENT in both descriptor.nim + miniscript.nim.
 
-import std/[unittest, strutils, options]
+import unittest2
+import std/[strutils, options]
 import ../src/wallet/descriptor
 import ../src/wallet/miniscript
 import ../src/crypto/secp256k1

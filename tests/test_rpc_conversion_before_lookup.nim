@@ -33,7 +33,8 @@
 ## assertion here, so each suite carries a CONTROL that must SUCCEED, and the
 ## by-nodeid control asserts the RIGHT peer was selected.
 
-import std/[unittest, json, os, tempfiles, times]
+import unittest2
+import std/[json, os, tempfiles, times]
 import ../src/rpc/server
 import ../src/network/peermanager
 import ../src/storage/chainstate
