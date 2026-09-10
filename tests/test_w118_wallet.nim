@@ -885,8 +885,11 @@ suite "W118 G27-G30 UTXO + coin selection":
                    isCoinbase = true)
     # At height 50, far from 100 confirms → spendable balance excludes it
     check wallet.getSpendableBalance(50'i32) == Satoshi(0)
-    # At height 100, the coinbase has 100 confs → mature → spendable
-    check wallet.getSpendableBalance(100'i32) == Satoshi(5_000_000_000)
+    # Wallet isMatureCoinbase requires confirmations >= CoinbaseMaturity+1
+    # (one block more conservative than the mempool gate; wallet.nim:1035).
+    # Height 1 at tip 100 is 100 confs → still locked; tip 101 → spendable.
+    check wallet.getSpendableBalance(100'i32) == Satoshi(0)
+    check wallet.getSpendableBalance(101'i32) == Satoshi(5_000_000_000)
     # CoinbaseMaturity constant must be exactly 100 (Core consensus)
     check CoinbaseMaturity == 100
 

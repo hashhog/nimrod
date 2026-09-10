@@ -221,11 +221,10 @@ suite "W128 G11 — AddedNodesContain shadow-check (BUG-8)":
     check "isAddedNode"       notin peermanagerSrc
 
   test "G11 BUG-8 cont: no m_added_node_params list":
-    ## Core uses m_added_node_params (CRITICAL_SECTION).  Nimrod has
-    ## no equivalent — pctManual peers don't form a separate list,
-    ## they're inline in pm.peers.
-    check "addedNodeParams"  notin peermanagerSrc
-    check "added_node_params" notin peermanagerSrc
+    ## Core uses m_added_node_params. nimrod tracks the same set as
+    ## `addedNodes*: seq[string]` (comments still cite Core's name).
+    check "addedNodes*: seq[string]" in peermanagerSrc
+    check "proc addedNodesList" in peermanagerSrc
 
 # ---------------------------------------------------------------------------
 # G12 — -onlynet reachability gate (BUG-9)
@@ -270,13 +269,11 @@ suite "W128 G13 — SanityCheckASMap (PRESENT, W115 closure)":
 suite "W128 G14 — asmap version stamp in peers.dat (BUG-10)":
 
   test "G14 BUG-10: no peers.dat at all → no asmap version stamp":
-    ## addrman_impl.h Format::V2_ASMAP stamps the asmap SHA-256
-    ## into the peers.dat header so reload triggers re-bucketing.
-    ## Nimrod has no peers.dat (W104 G21), so no version stamp path.
-    check "peers.dat" notin peermanagerSrc
-    check "V2_ASMAP"  notin peermanagerSrc
-    check "savePeers" notin peermanagerSrc
-    check "loadPeers" notin peermanagerSrc
+    ## peers.dat is persisted via AddrMan.save (AXIS #2). The remaining
+    ## gap is Core's V2_ASMAP asmap-version stamp in the file header.
+    check "peers.dat" in peermanagerSrc
+    check "addrMan.save" in peermanagerSrc
+    check "V2_ASMAP" notin peermanagerSrc
 
 # ---------------------------------------------------------------------------
 # G15-G16 — m_network_counts + GetReachableEmptyNetworks (BUG-11)
@@ -284,9 +281,10 @@ suite "W128 G14 — asmap version stamp in peers.dat (BUG-10)":
 suite "W128 G15-G16 — m_network_counts + GetReachableEmptyNetworks (BUG-11)":
 
   test "G15 BUG-11: no per-network m_network_counts index":
-    ## addrman_impl.h:226-232.  Used to O(1) answer Size(net).
-    check "m_network_counts" notin peermanagerSrc
-    check "networkCounts"    notin peermanagerSrc
+    ## addrman_impl.h:226-232. nimrod exposes this as addrmanNetworkCounts /
+    ## addrMan.networkCounts() for getaddrmaninfo.
+    check "proc addrmanNetworkCounts" in peermanagerSrc
+    check "networkCounts" in peermanagerSrc
 
   test "G16 BUG-11 cont: no GetReachableEmptyNetworks → no fixed-seed gating":
     ## net.cpp:2495-2506.  Nimrod's fallbackPeers are an unconditional

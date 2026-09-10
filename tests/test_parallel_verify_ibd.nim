@@ -519,6 +519,10 @@ suite "parallel verify — assumevalid gate":
       # Give best header plenty of work (set high bytes)
       ctx.bestHeaderChainWork[31] = 0xFF
       ctx.bestHeaderChainWork[30] = 0xFF
+      # Condition 6 is GetBlockProofEquivalentTime, not a height delta.
+      # Unset bits => proof 0 => ssrTooRecentForBestHeader (fail-safe).
+      ctx.bestHeaderBits = 0x207fffff'u32
+      ctx.blockChainWork = default(array[32, byte])
 
       let reason = shouldSkipScripts(ctx, params)
       echo "shouldSkipScripts result: ", $reason
@@ -563,6 +567,8 @@ suite "parallel verify — assumevalid gate":
       )
       ctx.bestHeaderChainWork[31] = 0xFF
       ctx.bestHeaderChainWork[30] = 0xFF
+      ctx.bestHeaderBits = 0x207fffff'u32
+      ctx.blockChainWork = default(array[32, byte])
 
       let skipReason = shouldSkipScripts(ctx, params)
       let skipScripts = skipReason == ssrSkip

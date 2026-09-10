@@ -661,8 +661,10 @@ suite "W97 sanity: working gates that must keep working":
     let nowSec = getTime().toUnix()
     let futureTs = uint32(nowSec + int64(MaxFutureBlockTime) + 60)
     var candidate = makeBlk(prevHash, 3, futureTs)
+    # checkPow=false skips the wall-clock time-too-new gate (synthetic
+    # headers). Inject currentTime so the 7200s bound still runs.
     let res = validateBlockHeader(candidate.header, prevIdx, regtestParams(),
-                                  checkPow = false)
+                                  checkPow = false, currentTime = nowSec)
     check (not res.isOk)
     check res.error == veTimeTooNew
 
@@ -705,7 +707,9 @@ suite "W97 sanity: working gates that must keep working":
     flags.clearFlag(BLOCK_FAILED_VALID)
     check (not flags.isFailed())
     flags.setFlag(BLOCK_FAILED_CHILD)
-    check flags.isFailed()
+    # Core v25+ (validation.cpp:3139): only BLOCK_FAILED_VALID is a
+    # failure for chain selection. BLOCK_FAILED_CHILD is unused.
+    check (not flags.isFailed())
 
   test "invalidateBlock correctly flips BLOCK_FAILED_VALID on tip":
     ## chain.nim:480 — invalidateBlock writes BLOCK_FAILED_VALID into the

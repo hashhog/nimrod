@@ -255,11 +255,12 @@ suite "W124 logging + debug (G11-G20)":
     check "handleUptime" in src
 
   test "G20 BUG-7 (P2): logging RPC absent (no runtime category toggle)":
-    ## No method `logging` dispatched in handleMethod.  Operator must
-    ## restart with new --debug=... to change topic state.
+    ## logging is dispatched (handleLogging). The remaining gap is that
+    ## chronicles categories still cannot be toggled at runtime the way
+    ## Core's `logging` RPC does — pin the handler, not the absence.
     let src = readFile("src/rpc/server.nim")
-    check "of \"logging\":" notin src
-    check "handleLogging" notin src
+    check "of \"logging\":" in src
+    check "handleLogging" in src
 
 # ============================================================================
 # G21-G30: datadir, supervision, ops UX

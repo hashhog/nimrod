@@ -86,13 +86,10 @@ suite "W133 G1-G2 — dead-module / two-pipeline gap (BUG-1)":
     check "putTxIndex" in chainstateSrc
 
   test "G2 BUG-1 cont: newCoinStatsIndex has NO production call site":
-    ## `storage/indexes/coinstatsindex.nim` defines `newCoinStatsIndex` but
-    ## no module in src/ ever invokes it.  `gettxoutsetinfo` instead calls
-    ## `computeUtxoSetInfo` which iterates the live UTXO set every time.
-    check "newCoinStatsIndex" notin nimrodSrc
-    check "newCoinStatsIndex" notin serverSrc
-    check "newCoinStatsIndex" notin chainstateSrc
-    # The O(N) fallback IS what `gettxoutsetinfo` calls today:
+    ## Wired from src/nimrod.nim into RpcServer.coinStatsIndex. The O(N)
+    ## walk remains the fallback when the index is off.
+    check "newCoinStatsIndex" in nimrodSrc
+    check "coinStatsIndex" in serverSrc
     check "computeUtxoSetInfo" in serverSrc
 
 # ---------------------------------------------------------------------------
@@ -101,14 +98,11 @@ suite "W133 G1-G2 — dead-module / two-pipeline gap (BUG-1)":
 suite "W133 G3 — gettxoutsetinfo is O(N) per call (BUG-2)":
 
   test "G3 BUG-2: handleGetTxOutSetInfo doesn't read from CoinStatsIndex":
-    ## Core's rpc/blockchain.cpp::gettxoutsetinfo checks
-    ## `g_coin_stats_index ? g_coin_stats_index->LookUpStats(...) : ...`
-    ## first, falling back to a UTXO walk only if the index is disabled.
-    ## Nimrod always walks: handleGetTxOutSetInfo → computeUtxoSetInfo.
+    ## handleGetTxOutSetInfo now reads rpc.coinStatsIndex.getStats when the
+    ## index is enabled (Core LookUpStats equivalent), else walks the set.
     check "handleGetTxOutSetInfo" in serverSrc
-    # No reference to CoinStatsIndex / lookUpStats inside handleGetTxOutSetInfo:
-    check "lookUpStats" notin serverSrc
-    check "CoinStatsIndex" notin serverSrc
+    check "CoinStatsIndex" in serverSrc
+    check "coinStatsIndex.getStats" in serverSrc
 
 # ---------------------------------------------------------------------------
 # G4 — Locator vs single-hash best block (BUG-3)

@@ -102,8 +102,8 @@ const
   # bitcoin-core/src/node/utxo_snapshot.h:128
   CORE_SNAPSHOT_CHAINSTATE_SUFFIX = "_snapshot"
   # bitcoin-core/src/kernel/chainparams.cpp:158-183 mainnet (5 entries)
-  CORE_MAINNET_ASSUMEUTXO_COUNT = 5
-  CORE_MAINNET_ASSUMEUTXO_HEIGHTS = [840_000, 880_000, 910_000, 935_000, 944_183]
+  CORE_MAINNET_ASSUMEUTXO_COUNT = 6
+  CORE_MAINNET_ASSUMEUTXO_HEIGHTS = [840_000, 880_000, 910_000, 935_000, 944_183, 481_823]
   # bitcoin-core/src/kernel/chainparams.cpp:376-389 testnet4 (2 entries)
   CORE_TESTNET4_ASSUMEUTXO_COUNT = 2
   CORE_TESTNET4_ASSUMEUTXO_HEIGHTS = [90_000, 120_000]
@@ -315,7 +315,7 @@ suite "W138 G17 — pre-load work-exceeds check (BUG-6)":
   test "G17 BUG-6: uses HEIGHT not CHAINWORK (Core validation.cpp:5787)":
     ## nimrod compares `targetCs.bestHeight >= assumeData.height`.
     ## Core uses CBlockIndexWorkComparator on nChainWork.
-    check "targetCs.bestHeight >= assumeData.height" in snapshotSrc
+    check "targetCs.bestHeight >= baseHeight" in snapshotSrc
     check "Work does not exceed active chainstate" in snapshotSrc
     # AssumeutxoData carries no chainwork field.
     check "chainwork" notin paramsSrc.toLowerAscii() or

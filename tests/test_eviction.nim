@@ -180,7 +180,8 @@ suite "inbound peer eviction":
     check c2.isLocal == false
 
   test "netgroup is computed for candidate":
-    let c = newEvictionCandidate(1, "192.168.1.1", 0x1234)
+    # Public IPv4: RFC1918 is NetUnroutable (Core GetGroup).
+    let c = newEvictionCandidate(1, "8.8.8.8", 0x1234)
     check c.netGroup.data.len > 0
     check c.netGroup.data[0] == NetIPv4
 

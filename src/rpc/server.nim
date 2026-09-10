@@ -14931,6 +14931,17 @@ proc checkAuth(rpc: RpcServer, authHeader: string): bool =
   except CatchableError:
     return false
 
+proc parseHttpRequestLine*(line: string): tuple[ok: bool, httpMethod: string, path: string] =
+  ## True iff `line` is an HTTP/1.x request line (`METHOD path HTTP/…`).
+  ## Distinguishes a request line from a header whose name happens to start
+  ## with GET/POST (Core's libevent parser does this; a startsWith("GET")
+  ## check does not). JSON-RPC is POST-only (httprpc.cpp HTTPReq_JSONRPC).
+  let parts = line.split(' ')
+  if parts.len >= 3 and parts[2].startsWith("HTTP/"):
+    result.ok = true
+    result.httpMethod = parts[0]
+    result.path = parts[1]
+
 proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
   ## Handle a single client connection with proper HTTP parsing
   var headers: Table[string, string]
@@ -15003,24 +15014,35 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
           authHeader = ""
           reqPath = ""
 
-        elif line.startsWith("POST") or line.startsWith("GET"):
-          # Request line: "<METHOD> <path> HTTP/1.x" — capture the path so the
-          # /wallet/<name> endpoint can route wallet RPCs to a named wallet.
-          let parts = line.split(' ')
-          if parts.len >= 2:
-            reqPath = parts[1]
+        else:
+          let rl = parseHttpRequestLine(line)
+          if rl.ok:
+            # Core httprpc.cpp:107-110 — JSON-RPC is POST-only. A GET (or any
+            # other method) with a body would otherwise execute the RPC; reject
+            # with 405 before reading the body. Request-line detection requires
+            # the HTTP/ token so a header like `Get-User-Time:` is not stolen.
+            if rl.httpMethod != "POST":
+              const body = "JSONRPC server handles only POST requests"
+              let response = "HTTP/1.1 405 Method Not Allowed\r\n" &
+                            "Allow: POST\r\n" &
+                            "Connection: close\r\n" &
+                            "Content-Type: text/plain\r\n" &
+                            "Content-Length: " & $body.len & "\r\n" &
+                            "\r\n" & body
+              discard await transp.write(response)
+              break
+            reqPath = rl.path
+          elif line.contains(":"):
+            let colonIdx = line.find(':')
+            let key = line[0 ..< colonIdx].strip().toLowerAscii()
+            let value = line[colonIdx + 1 .. ^1].strip()
 
-        elif line.contains(":"):
-          let colonIdx = line.find(':')
-          let key = line[0 ..< colonIdx].strip().toLowerAscii()
-          let value = line[colonIdx + 1 .. ^1].strip()
+            headers[key] = value
 
-          headers[key] = value
-
-          if key == "content-length":
-            contentLength = parseInt(value)
-          elif key == "authorization":
-            authHeader = value
+            if key == "content-length":
+              contentLength = parseInt(value)
+            elif key == "authorization":
+              authHeader = value
 
     except CatchableError:
       break

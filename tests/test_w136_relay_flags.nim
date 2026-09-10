@@ -318,7 +318,8 @@ suite "W136 G12 — randomize() reseed-per-call anti-pattern (BUG-10)":
       if f < 0: break
       inc calls
       idx = f + 1
-    check calls >= 3  # At least 3 reseed sites: rounder, poisson, hysteresis.
+    # 16ada01: one thread-local RNG; relay.nim no longer reseeds per call.
+    check calls == 0
 
 # ---------------------------------------------------------------------------
 # G13 — AvgFeefilterBroadcastInterval clamped to 60s (BUG-11)

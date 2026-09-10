@@ -111,8 +111,10 @@ suite "W125 Gate 4: -32602 RPC_INVALID_PARAMS — PARTIAL (over-used)":
     ## application sites (Gate 10) — that's the PARTIAL classification.
     let rpc = minimalRpcServer()
     let r = rpc.rpcMethodErr("getblockhash", %*[])
-    check r.code == -32602
-    check "missing height" in r.msg
+    # Central arity check (checkCoreArity) matches Core's HelpResult path:
+    # RPC_MISC_ERROR (-1) carrying the method's help / "takes N argument(s)".
+    check r.code == -1
+    check "takes 1 argument" in r.msg
 
   test "PRESENT — RpcInvalidParams constant is -32602":
     check RpcInvalidParams == -32602
@@ -297,8 +299,10 @@ suite "W125 Gate 13: -25 RPC_VERIFY_ERROR — PARTIAL":
     ## for invalid blocks, never -25.  No RpcError raised → code=0.
     let rpc = minimalRpcServer()
     let r = rpc.rpcMethodErr("submitblock", %*["00"])
-    check r.code == 0       # no RpcError raised
-    check r.code != -25     # the gap: should be -25 per Core
+    # Core DecodeHexBlk failure is RPC_DESERIALIZATION_ERROR (-22)
+    # "Block decode failed", not a BIP-22 string and not -25 (that's
+    # proposal-mode validation). Bad hex is a decode error.
+    check r.code == -22
 
 # ===========================================================================
 # Gate 14 — RPC_VERIFY_REJECTED (-26) PRESENT

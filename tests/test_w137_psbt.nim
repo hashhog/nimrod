@@ -477,9 +477,8 @@ suite "W137 G27 — utxoupdatepsbt + joinpsbts RPCs (BUG-19)":
     check "handleUtxoUpdatePsbt" notin serverSrc
 
   test "G27 BUG-19 cont: no joinpsbts RPC handler":
-    ## Core rpc/rawtransaction.cpp registers `joinpsbts`.
-    check "joinpsbts" notin serverSrc
-    check "handleJoinPsbts" notin serverSrc
+    check "joinpsbts" in serverSrc
+    check "handleJoinPsbts" in serverSrc
 
 # ---------------------------------------------------------------------------
 # G28 — walletprocesspsbt + converttopsbt + descriptorprocesspsbt RPCs
@@ -488,14 +487,12 @@ suite "W137 G27 — utxoupdatepsbt + joinpsbts RPCs (BUG-19)":
 suite "W137 G28 — walletprocesspsbt / converttopsbt / descriptorprocesspsbt (BUG-20)":
 
   test "G28 BUG-20: no walletprocesspsbt RPC handler":
-    ## Core wallet/rpc/spend.cpp registers `walletprocesspsbt`.
-    check "walletprocesspsbt" notin serverSrc
-    check "handleWalletProcessPsbt" notin serverSrc
+    check "walletprocesspsbt" in serverSrc
+    check "handleWalletProcessPsbt" in serverSrc
 
   test "G28 BUG-20 cont: no converttopsbt RPC handler":
-    ## Core rpc/rawtransaction.cpp registers `converttopsbt`.
-    check "converttopsbt" notin serverSrc
-    check "handleConvertToPsbt" notin serverSrc
+    check "converttopsbt" in serverSrc
+    check "handleConvertToPsbt" in serverSrc
 
   test "G28 BUG-20 cont: no descriptorprocesspsbt RPC handler":
     ## Core rpc/rawtransaction.cpp registers `descriptorprocesspsbt`.

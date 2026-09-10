@@ -34,16 +34,11 @@ than wrong answers (`getblockstats`, `getchaintxstats`); the other 31 are wrong
 answers, wrong error codes or wrong shapes. An earlier draft of this line said
 "several", which softened the score with a count the artifact does not support.
 
-**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
-unit suite is *measured, not fixed* — 17 failing tests across
-`test_misbehavior` (6), `test_netgroup` (5), `test_eviction` (1),
-`test_eclipse` (1), `test_parallel_verify_ibd` (1) and `test_snapshot` (3), each
-recorded as test-bug-vs-node-bug NOT VERIFIED. These sit in modules using the
-stdlib `unittest`, whose failures the "2177/2177 green" `unittest2` summary
-never counted. 112 of the 223 `tests/test_*.nim` files are never imported by
-`tests/test_all.nim`, and 8 of those do not compile. The nightly assumeUTXO
-snapshot-boot gate is a declared carve-out for nimrod
-(`BOOTSMOKE_EXPECTED_FAIL=rustoshi nimrod`,
+**Known gaps in this repo:** the 50 aggregate failures that 2e819ea made
+visible were triaged (see CHANGELOG). Ten `tests/test_*.nim` files remain
+excluded from `tests/test_all.nim` (7 do not compile, one binds reserved
+ports, one has no assertions). The nightly assumeUTXO snapshot-boot gate is
+a declared carve-out for nimrod (`BOOTSMOKE_EXPECTED_FAIL=rustoshi nimrod`,
 `receipts/boot-smoke-4-red-triaged-2026-08-16.md:91-118`), not a passing gate.
 
 **Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the hashhog

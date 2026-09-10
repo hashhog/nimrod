@@ -643,17 +643,14 @@ suite "G33 — recursive descriptor depth":
 
 suite "G34 — older/after bounds":
   test "MISSING / P2 — older(0) accepted (BUG-21)":
-    # BIP-112 / Core type-check: older requires 1 ≤ n ≤ 0x7FFFFFFF.
-    # Nimrod: no range check at parse or computeType.
-    var ok = false
+    # BIP-112 / Core type-check: older requires 1 ≤ n < 2^31.
+    # miniscript.nim now rejects n==0 (MiniscriptError).
+    var rejected = false
     try:
-      let n = parseMiniscript("older(0)", MsP2WSH)
-      check n.kind == MsOlder
-      check n.lockValue == 0'u32
-      ok = true
-    except:
-      ok = false
-    check ok  # currently accepts (BUG-21); should reject when fixed
+      discard parseMiniscript("older(0)", MsP2WSH)
+    except CatchableError:
+      rejected = true
+    check rejected
 
 suite "G35 — Sat/Dissat malleability tracking":
   test "PARTIAL — InputStack has malleable flag but scoring is shallow (BUG-22)":

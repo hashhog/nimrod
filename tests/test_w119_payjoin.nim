@@ -197,8 +197,9 @@ suite "W119 G1-G2 PayJoin HTTP transport":
     ## anything not in its hard-coded prefix list — including any
     ## `payjoin` path — without ever inspecting the request method.
     check compiles(handleRestRequest)
-    check not compiles(handleRestPayJoin)
-    check not compiles(handleRestPayJoinPost)
+    # FIX-65 / handleRestPayJoin*: the BIP-78 receiver route exists.
+    check compiles(handleRestPayJoin)
+    check compiles(handleRestPayJoinPost)
 
 # ---------------------------------------------------------------------------
 # G3  TLS / Tor onion (BIP-78 §Communicating with the receiver)
@@ -225,8 +226,8 @@ suite "W119 G3 PayJoin TLS / Tor":
     ## TLS retrofit landed it would add a `tlsEnabled`/`sslContext`
     ## field and `compiles(RestServer().tlsEnabled)` would flip true.
     check compiles(RestServer)
-    check not compiles(RestServer().tlsEnabled)
-    check not compiles(RestServer().sslContext)
+    # rest.nim RestServer.tlsEnabled was added with the TLS retrofit.
+    check compiles(RestServer().tlsEnabled)
 
 # ---------------------------------------------------------------------------
 # G4  Original PSBT deserialize + sanity (incl. fully-signed sender input)

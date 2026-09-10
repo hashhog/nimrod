@@ -46,6 +46,7 @@
 
 import unittest2
 import std/[strutils, os]
+import ../src/rpc/server
 
 # Read production source files once for source-level pinning.
 let
@@ -98,19 +99,14 @@ suite "W140 G1 — __cookie__ constant + .cookie filename":
 suite "W140 G2 — POST-only method gate":
 
   test "G2 BUG-2 (P0-SEC): GET is silently accepted alongside POST":
-    ## src/rpc/server.nim:8693 — `line.startsWith(\"POST\") or
-    ## line.startsWith(\"GET\")`. Core httprpc.cpp:107-110 explicitly
-    ## refuses non-POST with HTTP_BAD_METHOD.  Flip this assertion when
-    ## the fix wave restricts to POST.
-    check "line.startsWith(\"POST\") or line.startsWith(\"GET\")" in serverSrc
-    # No HTTP_BAD_METHOD / 405 reply path exists today.
-    check "405" notin serverSrc
-    check "Method Not Allowed" notin serverSrc
+    ## JSON-RPC is POST-only (Core httprpc.cpp:107-110 HTTP_BAD_METHOD).
+    check "405 Method Not Allowed" in serverSrc
+    check "JSONRPC server handles only POST requests" in serverSrc
+    check "parseHttpRequestLine" in serverSrc
+    check "rl.httpMethod != \"POST\"" in serverSrc
 
   test "G2 BUG-2 (P0-SEC): no \"only POST\" rejection branch present":
-    ## Source-level: a `if requestMethod != \"POST\"` guard does not exist
-    ## anywhere in server.nim.  Flip when the fix lands.
-    check "!= \"POST\"" notin serverSrc
+    check "rl.httpMethod != \"POST\"" in serverSrc
 
 # ---------------------------------------------------------------------------
 # G3 — IPv6 ::1 binding absent (BUG-3, P1-SEC)
@@ -135,12 +131,16 @@ suite "W140 G4 — -rpcauth hashed credentials":
     check "rpcauth" notin mainSrc.toLowerAscii()
 
   test "G4 BUG-4 (P1-SEC): no HMAC-SHA256 in auth path":
-    ## Core httprpc.cpp:74 CHMAC_SHA256.  Nimrod's checkAuth only does
-    ## plaintext equality.
-    check "CHMAC_SHA256" notin serverSrc
-    check "HMAC" notin serverSrc.toUpperAscii().split("\n").join("\n").
-                          # avoid grabbing unrelated comments — search code only
-                          replace("##", "@@")
+    ## Core httprpc.cpp:74 CHMAC_SHA256 for -rpcauth. Nimrod checkAuth is
+    ## still cookie / rpcuser plaintext (constant-time). A whole-file
+    ## "HMAC" grep hits BIP-32 wallet comments and is not this gate.
+    let idx = serverSrc.find("proc checkAuth(")
+    check idx >= 0
+    let authEnd = serverSrc.find("\nproc ", idx + 1)
+    let authBody = serverSrc[idx ..< authEnd]
+    check "CHMAC_SHA256" notin authBody
+    check "HMAC" notin authBody
+    check "rpcauth" notin mainSrc.toLowerAscii()
     check CORE_RPCAUTH_SALT_BYTES == 16
 
 # ---------------------------------------------------------------------------
@@ -149,16 +149,12 @@ suite "W140 G4 — -rpcauth hashed credentials":
 suite "W140 G5 — constant-time password / cookie comparison":
 
   test "G5 BUG-5 (P0-SEC): checkAuth uses Nim default `==` on cookie / pass":
-    ## src/rpc/server.nim:8618-8623 — `pass == rpc.cookiePassword` /
-    ## `pass == rpc.authPass` / `user == rpc.authUser`.  None are
-    ## constant-time.  Core httprpc.cpp:66,77 wraps both username AND
-    ## hash in TimingResistantEqual.
-    check "pass == rpc.cookiePassword" in serverSrc
-    check "user == rpc.authUser and pass == rpc.authPass" in serverSrc
-    # No constant-time helper imported in this file.
-    check "TimingResistantEqual" notin serverSrc
-    check "constantTimeEqual" notin serverSrc
-    check "ctEqual" notin serverSrc
+    ## checkAuth compares cookie and rpcuser/rpcpassword via constantTimeEq
+    ## (Core TimingResistantEqual).
+    check "proc constantTimeEq" in serverSrc
+    check "constantTimeEq(pass, rpc.cookiePassword)" in serverSrc
+    check "constantTimeEq(user, rpc.authUser)" in serverSrc
+    check "constantTimeEq(pass, rpc.authPass)" in serverSrc
 
 # ---------------------------------------------------------------------------
 # G6 — 250 ms brute-force throttle on auth fail (BUG-6, P1-SEC)
@@ -305,10 +301,11 @@ suite "W140 G13 — JSON-RPC 2.0 notification (no id) semantics":
 
   test "G13 BUG-13 (P1-CORRECTNESS): no IsNotification() check":
     ## Core httprpc.cpp:167-171 emits HTTP_NO_CONTENT (204) for v2
-    ## requests with no `id`.  Nimrod responds normally with id=null.
+    ## requests with no `id`. Nimrod still answers a JSON body with id=null.
+    ## Do not grep "204" in the whole file — it matches timestamps.
     check "IsNotification" notin serverSrc
-    check "204" notin serverSrc
     check "No Content" notin serverSrc
+    check "HTTP_NO_CONTENT" notin serverSrc
 
   test "G13 BUG-13 (P1-CORRECTNESS): id-less request defaults to newJNull()":
     ## src/rpc/server.nim:8492-8497 — `var requestId = newJNull(); if
@@ -408,22 +405,13 @@ suite "W140 G19 — /wallet/<name> URL routing":
     let bodyAfterDecl = serverSrc.find("currentWalletName*: string")
     check bodyAfterDecl >= 0
     let tail = serverSrc[bodyAfterDecl + 30 ..< serverSrc.len]
-    check "rpc.currentWalletName =" notin tail
-    check ".currentWalletName = " notin tail
-    # And the error message at server.nim:5220 ITSELF references the
-    # /wallet/ URL contract that the server doesn't honor — self-confessing.
-    check "/wallet/<walletname>" in serverSrc
+    check "rpc.currentWalletName =" in tail
+    check "/wallet/" in serverSrc
 
   test "G19 BUG-19 (P1-CORRECTNESS): request line is `discard`ed without URL parse":
-    ## src/rpc/server.nim:8693-8695.
-    check "elif line.startsWith(\"POST\") or line.startsWith(\"GET\"):" in serverSrc
-    let idx = serverSrc.find("elif line.startsWith(\"POST\") or line.startsWith(\"GET\"):")
-    check idx >= 0
-    let snippet = serverSrc[idx ..< min(idx + 200, serverSrc.len)]
-    check "# Request line - ignore" in snippet
-    check "discard" in snippet
-    check "URI" notin snippet
-    check "wallet" notin snippet
+    check "parseHttpRequestLine" in serverSrc
+    check "reqPath = rl.path" in serverSrc
+    check "p.startsWith(\"/wallet/\")" in serverSrc
 
 # ---------------------------------------------------------------------------
 # G20 — -rpcthreads (BUG-20, P2-OPS)
@@ -594,17 +582,13 @@ suite "W140 G27 — keep-alive reset path":
 suite "W140 G28 — request-line vs header prefix shadowing":
 
   test "G28 BUG-28 (P3): request-line branch matched by startsWith only":
-    ## src/rpc/server.nim:8693 — `line.startsWith(\"POST\") or
-    ## line.startsWith(\"GET\")` precedes the `line.contains(\":\")`
-    ## header branch.  A literal header `Get-User-Time: x` (or
-    ## `Post-Authorization:`) is silently dropped because
-    ## startsWith(\"GET\") matches before the header branch.
-    let idx = serverSrc.find("elif line.startsWith(\"POST\") or line.startsWith(\"GET\"):")
+    ## Request lines are classified by parseHttpRequestLine, which requires
+    ## the HTTP/ token so a header named Get-User-Time is not stolen.
+    let idx = serverSrc.find("proc parseHttpRequestLine")
     check idx >= 0
-    # The robust shape (which we don't have) would split on whitespace
-    # and assert that token[2] starts with "HTTP/".  That guard is absent.
-    let tail = serverSrc[idx ..< min(idx + 400, serverSrc.len)]
-    check "HTTP/" notin tail.split("\n")[0..min(5, tail.split("\n").high)].join("\n")
+    let tail = serverSrc[idx ..< min(idx + 600, serverSrc.len)]
+    check "startsWith(\"HTTP/\")" in tail
+    check "Get-User-Time" in tail or "header whose name happens to start" in tail
 
 # ---------------------------------------------------------------------------
 # G29 — CSPRNG for cookie (PRESENT)
@@ -651,6 +635,28 @@ suite "W140 G30 — auth-bypass fallback unreachable in default startup":
     check "config.rpcUser" in snippet
     check "config.rpcPassword" in snippet
     check "cookiePass" in snippet
+
+# ---------------------------------------------------------------------------
+# parseHttpRequestLine — POST-only JSON-RPC (node-bug fix)
+# ---------------------------------------------------------------------------
+suite "parseHttpRequestLine (POST-only JSON-RPC)":
+
+  test "POST /wallet/<name> HTTP/1.1 is a request line":
+    let r = parseHttpRequestLine("POST /wallet/main HTTP/1.1")
+    check r.ok
+    check r.httpMethod == "POST"
+    check r.path == "/wallet/main"
+
+  test "GET request line is classified as GET (caller replies 405)":
+    let r = parseHttpRequestLine("GET / HTTP/1.1")
+    check r.ok
+    check r.httpMethod == "GET"
+
+  test "Get-User-Time header is not a request line":
+    # Title-case would not match startsWith("GET"); the stolen-header
+    # case is a header whose name itself starts with GET/POST.
+    let r = parseHttpRequestLine("GET-User-Time: x")
+    check not r.ok
 
 # ---------------------------------------------------------------------------
 # Summary pin

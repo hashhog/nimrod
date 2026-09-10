@@ -11,19 +11,19 @@ import ../src/consensus/params
 
 suite "eclipse attack protections":
   test "netgroup diversity prevents /16 collision":
-    # Simulate tracking outbound netgroups
+    # Simulate tracking outbound netgroups. RFC1918 is a single unroutable
+    # bucket in Core; use public /16s so a collision is actually a /16 hit.
     var outboundNetGroups: HashSet[NetGroup]
 
-    # Add first peer from 192.168.x.x
-    let ng1 = getNetGroup("192.168.1.1")
+    let ng1 = getNetGroup("8.8.8.8")
     outboundNetGroups.incl(ng1)
 
     # Second peer from same /16 should be rejected
-    let ng2 = getNetGroup("192.168.2.2")
+    let ng2 = getNetGroup("8.8.4.4")
     check (ng2 in outboundNetGroups) == true  # Collision!
 
     # Peer from different /16 should be allowed
-    let ng3 = getNetGroup("10.0.0.1")
+    let ng3 = getNetGroup("1.1.1.1")
     check (ng3 in outboundNetGroups) == false  # No collision
 
   test "8 full-relay peers can be diverse":

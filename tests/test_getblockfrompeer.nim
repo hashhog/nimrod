@@ -285,5 +285,7 @@ suite "getblockfrompeer — success path":
       discard rpc.handleMethod("getblockfrompeer", %*[displayHash(h)])
     except RpcError as e:
       raised = true
-      check e.code == -32602
+      # Core rpc/server.cpp IsValidNumArgs → HelpResult → RPC_MISC_ERROR (-1)
+      # with the method's help text. -32602 was the pre-arity-dispatcher pin.
+      check e.code == -1
     check raised

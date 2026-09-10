@@ -18,12 +18,16 @@ proc bytesToHex(data: openArray[byte]): string =
 
 suite "bip155 network id":
   test "network id values match bip155":
-    check ord(netIPv4) == 1
-    check ord(netIPv6) == 2
-    check ord(netTorV2) == 3  # deprecated
-    check ord(netTorV3) == 4
-    check ord(netI2P) == 5
-    check ord(netCJDNS) == 6
+    # Nim case-object enums are 0-based; BIP-155 wire IDs are 1-6.
+    # writeNetAddressV2 uses networkIdToWire (W117 BUG-1), not ord().
+    check networkIdToWire(netIPv4) == 1'u8
+    check networkIdToWire(netIPv6) == 2'u8
+    check networkIdToWire(netTorV2) == 3'u8  # deprecated
+    check networkIdToWire(netTorV3) == 4'u8
+    check networkIdToWire(netI2P) == 5'u8
+    check networkIdToWire(netCJDNS) == 6'u8
+    check wireToNetworkId(1'u8).get() == netIPv4
+    check wireToNetworkId(6'u8).get() == netCJDNS
 
 suite "bip155 address sizes":
   test "address size constants":

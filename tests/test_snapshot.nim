@@ -607,11 +607,16 @@ suite "snapshot dump via ChainState":
 suite "assumeutxo data":
   test "mainnet has all 4 Core entries":
     let p = mainnetParams()
-    check p.assumeutxoData.len == 4
-    let heights = [840000'i32, 880000, 910000, 935000]
-    for i, h in heights:
-      check p.assumeutxoData[i].height == h
-      check p.assumeutxoData[i].chainTxCount > 0
+    # Core kernel/chainparams.cpp CMainParams currently ships 4 (840/880/910/935k).
+    # nimrod also carries 944183 (later Core snapshot) and 481823 (pre-segwit
+    # campaign window). Pin the Core quartet by height, not by seq length.
+    check p.assumeutxoData.len >= 4
+    var heights: seq[int32]
+    for d in p.assumeutxoData:
+      heights.add(d.height)
+      check d.chainTxCount > 0
+    for h in [840000'i32, 880000, 910000, 935000]:
+      check h in heights
 
   test "mainnet 840k blockhash matches Core":
     let p = mainnetParams()
@@ -2068,7 +2073,9 @@ suite "gettxoutsetinfo Core-byte-parity":
       discard rpc.handleGetTxOutSetInfo(%*["not-a-real-type"])
     except RpcError as e:
       code = e.code
-    check code == RpcInvalidParams
+    # Core ParseHashType (rpc/blockchain.cpp) uses RPC_INVALID_PARAMETER (-8),
+    # not JSON-RPC 2.0 Invalid params (-32602).
+    check code == RpcInvalidParameter
 
 # ============================================================================
 # W102 AssumeUTXO snapshot loading gate audit
@@ -2524,19 +2531,18 @@ suite "W102 AssumeUTXO per-coin validation gates":
       port = 18443'u16, chainState = cs, mempool = mp,
       peerManager = nil, feeEstimator = fe, params = regtest
     )
-    # Dispatch "getchainstates" through the RPC router. The router
-    # must currently produce a method-not-found or unimplemented error.
+    # getchainstates is wired (test_getchainstates.nim). A successful
+    # dispatch returns a JSON object; RpcError would mean it is still absent.
     var code = 0
+    var resp = newJNull()
     try:
-      discard rpc.handleMethod("getchainstates", %*[])
+      resp = rpc.handleMethod("getchainstates", %*[])
     except RpcError as e:
       code = e.code
     except Exception:
-      code = -1  # any crash/unhandled exception
-    # BUG: `getchainstates` is not in the dispatch table; the call silently
-    # returns nil or raises RpcMethodNotFound.
-    # When implemented, this test should verify the response shape instead.
-    check code != 0  # non-zero = currently unimplemented
+      code = -1
+    check code == 0
+    check resp.kind == JObject
 
 # ----------------------------------------------------------------------------
 # FIX-D — snapshot-load atomicity via SNAPSHOT_LOAD_IN_PROGRESS marker.

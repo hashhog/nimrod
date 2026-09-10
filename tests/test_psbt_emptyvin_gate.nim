@@ -33,13 +33,13 @@ const
 suite "empty-vin witness-first decode gate (fundraw + psbt)":
 
   test "fixture: witness-first decode is the BUG (drops the output)":
-    # Proves the test is non-vacuous: the un-gated witness-aware decoder
-    # mis-reads the leading 0x00 as a segwit marker and loses the output,
-    # and the result does NOT re-serialize back to the raw bytes.
+    # Used to parse as a 0-in/0-out witness tx (output dropped). Now
+    # deserializeTransaction raises SerializationError ("Superfluous
+    # witness record") instead of silently dropping. Pin the raise; the
+    # next test covers the legacy-forced path that keeps the OP_RETURN.
     let raw = hexToBytes(EMPTY_VIN_TX_HEX)
-    let buggy = deserializeTransaction(raw)
-    check buggy.outputs.len == 0          # output silently dropped
-    check serialize(buggy, includeWitness = true) != raw  # not fully consumed
+    expect SerializationError:
+      discard deserializeTransaction(raw)
 
   test "legacy-forced decoder preserves the OP_RETURN output":
     let raw = hexToBytes(EMPTY_VIN_TX_HEX)
