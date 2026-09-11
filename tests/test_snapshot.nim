@@ -1412,9 +1412,9 @@ suite "dumptxoutset rollback":
 #   1. A non-loadable file (missing / not in the assumeutxo whitelist) is
 #      refused with RpcInternalError (-32603), matching Core's error code when
 #      ActivateSnapshot cannot proceed.
-#   2. The live `chainState` is NEVER mutated by loadtxoutset — the load goes
-#      to an isolated store, so even a refused load has zero chainState side
-#      effects.
+#   2. A REFUSED load does not mutate live chainState (isolated store). A
+#      SUCCESSFUL load activates the live tip (ActivateSnapshot); that is
+#      pinned in tests/test_assumeutxo_dual_chainstate.nim.
 #   3. Malformed params (empty/empty-path) are still rejected with
 #      RpcInvalidParams before any load attempt.
 # ----------------------------------------------------------------------------

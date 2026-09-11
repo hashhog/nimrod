@@ -2392,6 +2392,9 @@ proc startNode*(config: NimrodConfig) {.async.} =
       if not r.success:
         error "snapshot load failed", error = r.error
         quit(1)
+      # loadSnapshot writes coins + cfMeta tip but not the height -> hash
+      # slot, so getblockhash(base) returned empty (boot-smoke cliload FAIL).
+      writeSnapshotActivationIndex(state.chainState)
       info "snapshot loaded",
         coins = r.coinsLoaded,
         height = state.chainState.bestHeight,

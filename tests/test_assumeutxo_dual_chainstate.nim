@@ -311,6 +311,116 @@ suite "AssumeUTXO dual-chainstate — real background second chainstate":
     check gcs["chainstates"][0]["validated"].getBool == false
     cs.close()
 
+  test "loadtxoutset activates the live tip (boot-smoke tip cell)":
+    ## handleLoadTxOutSetImpl used to load into an isolated sibling and never
+    ## reassign rpc.chainState, so getblockcount stayed at genesis. After
+    ## ActivateSnapshot the live tip MUST move to the snapshot base — this is
+    ## the in-repo control for boot-smoke `tip FAIL getblockcount=0`.
+    let root = freshDir("activate")
+    defer:
+      try: removeDir(root) except OSError: discard
+    let regtest = regtestParams()
+
+    var source = newChainState(root / "source", regtest)
+    let (baseHeight, baseHash) = buildChain(source)
+    let snapPath = root / "snap.dat"
+    let dump = createSnapshot(source, snapPath, regtest)
+    let savedIdx = source.db.getBlockIndex(baseHash)
+    check savedIdx.isSome
+    source.close()
+
+    # Fresh genesis-only chainstate — the boot-smoke RPC-path starting point.
+    var live = newChainState(root / "live", regtest)
+    let genesis = makeBlock(BlockHash(default(array[32, byte])), 0,
+                            @[makeCoinbaseTx(0)])
+    doAssert live.connectBlock(genesis, 0).isOk
+    check live.bestHeight == 0
+    # submitheader equivalent: hash-only index for the snapshot base.
+    live.db.putBlockIndexHashOnly(savedIdx.get())
+
+    let rpc = mkRpc(live, regtest)
+    rpc.registerRegtestAssumeutxo(AssumeutxoData(
+      height: baseHeight, hashSerialized: dump.txoutsetHash,
+      chainTxCount: 0'u64, blockhash: baseHash))
+
+    let res = rpc.handleLoadTxOutSetImpl(snapPath)
+    check res.hasKey("coins_loaded")
+    check rpc.chainState.bestHeight == baseHeight
+    check rpc.chainState.bestBlockHash == baseHash
+    check rpc.chainState.getBlockHashByHeight(baseHeight).get() == baseHash
+    let count = rpc.handleMethod("getblockcount", newJArray())
+    check count.getInt == int(baseHeight)
+    live.close()
+
+  test "activated snapshot tip persists across reopen (boot-smoke restart cell)":
+    ## Same as above, then close + newChainState on the SAME dir. The
+    ## in-repo control for boot-smoke `restart FAIL getblockcount=0`.
+    let root = freshDir("restart")
+    defer:
+      try: removeDir(root) except OSError: discard
+    let regtest = regtestParams()
+
+    var source = newChainState(root / "source", regtest)
+    let (baseHeight, baseHash) = buildChain(source)
+    let snapPath = root / "snap.dat"
+    let dump = createSnapshot(source, snapPath, regtest)
+    let savedIdx = source.db.getBlockIndex(baseHash)
+    check savedIdx.isSome
+    source.close()
+
+    var live = newChainState(root / "live", regtest)
+    let genesis = makeBlock(BlockHash(default(array[32, byte])), 0,
+                            @[makeCoinbaseTx(0)])
+    doAssert live.connectBlock(genesis, 0).isOk
+    live.db.putBlockIndexHashOnly(savedIdx.get())
+    let rpc = mkRpc(live, regtest)
+    rpc.registerRegtestAssumeutxo(AssumeutxoData(
+      height: baseHeight, hashSerialized: dump.txoutsetHash,
+      chainTxCount: 0'u64, blockhash: baseHash))
+    discard rpc.handleLoadTxOutSetImpl(snapPath)
+    check live.bestHeight == baseHeight
+    live.close()
+
+    var reopened = newChainState(root / "live", regtest)
+    check reopened.bestHeight == baseHeight
+    check reopened.bestBlockHash == baseHash
+    check reopened.getBlockHashByHeight(baseHeight).get() == baseHash
+    reopened.close()
+
+  test "in-place load writes height index (boot-smoke cliload cell)":
+    ## CLI `--load-snapshot` calls loadSnapshot on the live chainstate, which
+    ## sets bestHeight but historically omitted the height -> hash slot, so
+    ## getblockhash(base) returned empty. writeSnapshotActivationIndex is the
+    ## missing step.
+    let root = freshDir("cliload")
+    defer:
+      try: removeDir(root) except OSError: discard
+    let regtest = regtestParams()
+
+    var source = newChainState(root / "source", regtest)
+    let (baseHeight, baseHash) = buildChain(source)
+    let snapPath = root / "snap.dat"
+    let dump = createSnapshot(source, snapPath, regtest)
+    source.close()
+
+    var live = newChainState(root / "live", regtest)
+    let genesis = makeBlock(BlockHash(default(array[32, byte])), 0,
+                            @[makeCoinbaseTx(0)])
+    doAssert live.connectBlock(genesis, 0).isOk
+    let load = loadSnapshot(snapPath, live, regtest, @[AssumeutxoData(
+      height: baseHeight, hashSerialized: dump.txoutsetHash,
+      chainTxCount: 0'u64, blockhash: baseHash)])
+    check load.success
+    check live.bestHeight == baseHeight
+    writeSnapshotActivationIndex(live)
+    check live.getBlockHashByHeight(baseHeight).get() == baseHash
+    live.close()
+
+    var reopened = newChainState(root / "live", regtest)
+    check reopened.bestHeight == baseHeight
+    check reopened.getBlockHashByHeight(baseHeight).get() == baseHash
+    reopened.close()
+
   test "non-vacuity: the tampered hash truly differs from the real chain hash":
     ## Guards against a vacuous reject test (e.g. if the tampered set happened
     ## to hash identically). The phantom-coin snapshot's hash MUST differ from

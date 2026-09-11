@@ -510,6 +510,14 @@ proc putBlockIndexHashOnly*(cdb: ChainDb, idx: BlockIndex) =
   ## mutates the active chain's height index until ActivateBestChain.
   cdb.db.put(cfBlockIndex, blockKey(array[32, byte](idx.hash)), serializeBlockIndex(idx))
 
+proc putHeightIndex*(cdb: ChainDb, height: int32, hash: BlockHash) =
+  ## Persist the active-chain height -> hash slot without inserting a
+  ## hash -> BlockIndex row. Snapshot activation uses this when the base
+  ## header is not yet in the index (CLI `--load-snapshot` before
+  ## submitheader); a dummy CBlockIndex would make later submitheader
+  ## treat the real header as already-known and never store it.
+  cdb.db.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](hash)))
+
 proc getBlockIndex*(cdb: ChainDb, hash: BlockHash): Option[BlockIndex] =
   ## Get block index by hash.
   ##

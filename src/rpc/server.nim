@@ -8030,10 +8030,14 @@ proc handleLoadTxOutSetImpl*(rpc: RpcServer, path: string): JsonNode =
   ## (validation.cpp:5588/6170/5967), and the camlcoin/blockbrew/hotbuns/lunarblock
   ## pilots. A snapshot is loaded into an ISOLATED store (a sibling
   ## `<chainstate>-snapshot` dir) so a refused/invalid load NEVER pollutes the
-  ## live chainstate. The verdict is surfaced via `getchainstates`
-  ## (validated=false while bg runs / after a mismatch, true after a match) —
-  ## Core's async `AbortNode` model means `loadtxoutset` itself returns Ok and
-  ## a mismatch is reported out-of-band rather than as an RPC error.
+  ## live chainstate. On success the isolated coins are promoted onto the
+  ## LIVE chainstate (`activateSnapshotAsActive`) so `getblockcount` /
+  ## `getbestblockhash` / `getblockhash(base)` serve the snapshot tip and a
+  ## restart reloads it — Core's ActivateSnapshot + AddChainstate. The
+  ## verdict is surfaced via `getchainstates` (validated=false while bg runs
+  ## / after a mismatch, true after a match) — Core's async `AbortNode`
+  ## model means `loadtxoutset` itself returns Ok and a mismatch is reported
+  ## out-of-band rather than as an RPC error.
 
   let assumeData = rpc.effectiveAssumeutxoData()
 
@@ -8074,6 +8078,14 @@ proc handleLoadTxOutSetImpl*(rpc: RpcServer, path: string): JsonNode =
       baseHeight = d.height
       break
   snapshotCs.targetUtxoHash = some(assumedHash)
+
+  # Activate onto the LIVE chainstate. Isolated load is the hash-gate
+  # refuse-safety; without this step handleGetBlockCount keeps returning
+  # genesis (boot-smoke tip/restart FAIL getblockcount=0). Core activates
+  # as soon as the file authenticates, even while genesis->base replay is
+  # still pending — do the same, before background validation.
+  activateSnapshotAsActive(
+    rpc.chainState, snapCs, snapCs.bestBlockHash, baseHeight)
 
   # 2) Build the SECOND background chainstate (own store) + drive genesis->base.
   let activation = activateSnapshotWithBackground(

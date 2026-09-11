@@ -1173,6 +1173,74 @@ proc makeBackgroundChainState*(bgDbPath: string,
   result.db.bestBlockHash = BlockHash(default(array[32, byte]))
   result.db.bestHeight = -1'i32
 
+proc writeSnapshotActivationIndex*(
+    cs: ChainState,
+    baseHash: BlockHash,
+    baseHeight: int32
+) =
+  ## Persist the snapshot base as the active tip's height -> hash slot so
+  ## `getblockhash(base)` survives restart. If the base header is already
+  ## in the index (RPC path after `submitheader`), rewrite it with
+  ## `putBlockIndex` so both the hash row and the height slot agree. If
+  ## it is not (CLI `--load-snapshot` on a fresh datadir), write ONLY the
+  ## height slot — a dummy CBlockIndex would make later `submitheader`
+  ## treat the real header as already-known (idempotent no-op) and
+  ## `getblockheader(base)` would stay unserved.
+  ##
+  ## Also updates the in-memory + cfMeta tip pointer (idempotent if
+  ## `loadSnapshot` already committed it).
+  cs.bestBlockHash = baseHash
+  cs.bestHeight = baseHeight
+  cs.db.bestBlockHash = baseHash
+  cs.db.bestHeight = baseHeight
+  cs.db.updateBestBlock(baseHash, baseHeight)
+  let existing = cs.db.getBlockIndex(baseHash)
+  if existing.isSome:
+    var idx = existing.get()
+    idx.height = baseHeight
+    cs.db.putBlockIndex(idx)
+  else:
+    cs.db.putHeightIndex(baseHeight, baseHash)
+
+proc writeSnapshotActivationIndex*(cs: ChainState) =
+  ## Convenience: use the chainstate's current tip as the snapshot base.
+  writeSnapshotActivationIndex(cs, cs.bestBlockHash, cs.bestHeight)
+
+proc activateSnapshotAsActive*(
+    live, snapshot: ChainState,
+    baseHash: BlockHash,
+    baseHeight: int32
+) =
+  ## Promote an already-authenticated snapshot onto the LIVE chainstate.
+  ##
+  ## `loadtxoutset` loads coins into an isolated sibling store so a refused
+  ## file never mutates live (hash-gate refuse-safety). Core then makes that
+  ## snapshot the active chainstate (`ActivateSnapshot` + `AddChainstate`,
+  ## validation.cpp:6170-6187). Without this step `getblockcount` keeps
+  ## answering genesis — boot-smoke `tip`/`restart` FAIL.
+  ##
+  ## When live is still below the snapshot base (the boot-smoke / CLI
+  ## starting point: genesis only), copy the authenticated coins into live
+  ## and commit tip + coins together via `writeSynced`. When live is already
+  ## at/past the base (dual-chainstate tests that built the chain in-process)
+  ## skip the copy — the coins are already there — and only write the height
+  ## index.
+  var src = snapshot
+  if live.bestHeight < baseHeight:
+    src.flushCache()
+    let batch = live.db.db.newWriteBatch()
+    defer: batch.destroy()
+    for (key, value) in src.db.db.iterCf(cfUtxo):
+      batch.put(cfUtxo, key, value)
+    batch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](baseHash)))
+    var hw = BinaryWriter()
+    hw.writeInt32LE(baseHeight)
+    batch.put(cfMeta, metaKey("height"), hw.data)
+    live.db.db.writeSynced(batch)
+    live.utxoCache.clear()
+    live.cacheSize = 0
+  writeSnapshotActivationIndex(live, baseHash, baseHeight)
+
 proc activateSnapshotWithBackground*(
     snapshotCs: SnapshotChainState,
     bgDbPath: string,
