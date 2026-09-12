@@ -23,3 +23,6 @@ task test, "Run tests":
 
 task build_release, "Build release binary":
   exec "nim c -d:release -o:bin/nimrod src/nimrod.nim"
+
+task build_shim, "Build the Phase B verifyscript shim (untracked ELF)":
+  exec "nim c -d:release -o:tools/phaseb_verifyscript_shim tools/phaseb_verifyscript_shim.nim"

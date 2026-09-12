@@ -17,6 +17,13 @@ tests/*
 !tests/*.*
 !tests/*/
 
+# Phase B verifyscript shim ELF. Source is tools/phaseb_verifyscript_shim.nim;
+# rebuild with `nimble build_shim` or
+#   nim c -d:release -o:tools/phaseb_verifyscript_shim tools/phaseb_verifyscript_shim.nim
+# Previously tracked; every rebuild rewrote ELF bytes (GNU BuildID among
+# them) and left the tree dirty (DIRTY-TREE skip).
+/tools/phaseb_verifyscript_shim
+
 src/mempool/cluster
 src/rpc/rest
 

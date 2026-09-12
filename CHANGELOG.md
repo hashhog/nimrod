@@ -4,6 +4,9 @@
 
 Changes since `v1.0.0`:
 
+- fix: stop tracking `tools/phaseb_verifyscript_shim` (compiled ELF).
+  Every rebuild rewrote the binary so `git status` never stayed clean
+  (DIRTY-TREE skip). Source remains; rebuild with `nimble build_shim`.
 - test: triage the 50 aggregate failures 2e819ea made visible.
   node-bug (1, fixed): JSON-RPC accepted GET as POST — now 405, request
   lines require an HTTP/ token (Core httprpc.cpp). Control: reverting
