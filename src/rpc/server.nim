@@ -291,11 +291,38 @@ proc validateHashV*(hashHex: string, name: string) =
       raise newRpcError(RpcInvalidParameter,
         name & " must be hexadecimal string (not '" & hashHex & "')")
 
+proc isHexStr(s: string): bool =
+  ## Bitcoin Core util/strencodings IsHex: even length, every char a hex digit.
+  ## The empty string is hex (length 0 is even; all_of on an empty range is true).
+  if s.len mod 2 != 0:
+    return false
+  for c in s:
+    if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+      return false
+  true
+
+proc parseHexV*(hexStr, name: string): seq[byte] =
+  ## Mirror of Bitcoin Core's ParseHexV (rpc/util.cpp:130): non-hex is
+  ## RPC_INVALID_PARAMETER (-8) `"<name> must be hexadecimal string (not '…')"`.
+  if not isHexStr(hexStr):
+    raise newRpcError(RpcInvalidParameter,
+      name & " must be hexadecimal string (not '" & hexStr & "')")
+  hexToBytes(hexStr)
+
+proc decodeBase64Psbt(data: string): Psbt =
+  ## Decode a PSBT from base64. Failure is RPC_DESERIALIZATION_ERROR (-22)
+  ## `"TX decode failed …"` matching Core DecodeBase64PSBT.
+  try:
+    fromBase64(data)
+  except CatchableError as e:
+    raise newRpcError(RpcDeserializationError, "TX decode failed " & e.msg)
+
 # Forward declarations: the Core-exact difficulty helpers are defined further
 # down (alongside the chainwork formatter), but getblockchaininfo/getdifficulty
 # above them need the byte-identical-to-Core serializer too.
 proc getDifficultyFromBits(bits: uint32): float64
 proc difficultyJson(d: float64): JsonNode
+proc uvTypeName(node: JsonNode): string
 # getblockchaininfo (above) needs the same Core-exact chainwork BE formatter
 # that getblockheader uses; both are defined further down.
 proc computeChainwork*(cdb: ChainDb, startHash: BlockHash, height: int32): array[32, byte]
@@ -1709,6 +1736,11 @@ proc handleGetIndexInfo(rpc: RpcServer, params: JsonNode): JsonNode =
   ##   getindexinfo "no-such-index"            -> {} (empty object, NOT an error)
   ## Empty/omitted arg = all running indexes.
 
+  # Core RPCArg::Type::STR for index_name: a number is -3 before any work.
+  if params.len >= 1 and params[0].kind != JNull and params[0].kind != JString:
+    raise newRpcError(RpcTypeError,
+      "JSON value of type " & uvTypeName(params[0]) &
+      " is not of expected type string")
   let indexName =
     if params.len >= 1 and params[0].kind == JString: params[0].getStr()
     else: ""
@@ -2329,12 +2361,11 @@ proc handleGetDeploymentInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
 
   if params.len >= 1 and params[0].kind == JString and params[0].getStr().len > 0:
     let hashHex = params[0].getStr()
-    if hashHex.len != 64:
-      raise newRpcError(RpcInvalidParams, "invalid block hash")
+    validateHashV(hashHex, "blockhash")
     targetHash = parseBlockHash(hashHex)
     let idxOpt = rpc.chainState.db.getBlockIndex(targetHash)
     if idxOpt.isNone:
-      raise newRpcError(RpcInvalidParams, "block not found")
+      raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
     targetHeight = idxOpt.get().height
   else:
     targetHash = rpc.chainState.bestBlockHash
@@ -2852,9 +2883,9 @@ proc handleGetTxSpendingPrevout(rpc: RpcServer, params: JsonNode): JsonNode =
       if k notin ["txid", "vout"]:
         raise newRpcError(RpcInvalidParameter, "Unexpected key " & k)
     if not o.hasKey("txid") or o["txid"].kind != JString:
-      raise newRpcError(RpcInvalidParameter, "Missing txid")
+      raise newRpcError(RpcTypeError, "Missing txid")
     if not o.hasKey("vout") or o["vout"].kind != JInt:
-      raise newRpcError(RpcInvalidParameter, "Missing vout")
+      raise newRpcError(RpcTypeError, "Missing vout")
     let txidHex = o["txid"].getStr()
     let txid = parseTxidParam(txidHex)  # validates 64-hex, throws -5 otherwise
     let nOutput = o["vout"].getInt()
@@ -2997,6 +3028,7 @@ proc handlePrioritiseTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1 or params[0].kind != JString:
     raise newRpcError(RpcInvalidParams, "missing txid parameter")
 
+  validateHashV(params[0].getStr(), "txid")
   let txid = parseTxidParam(params[0].getStr())
 
   # dummy (legacy priority): index 1. Must be 0 or null/omitted. Core uses
@@ -4193,34 +4225,43 @@ proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   let mainnet = rpc.params.network == Mainnet
   let regtest = rpc.params.network == Regtest
 
+  # Core DecodeHexTx (rpc/rawtransaction.cpp:438-440): any failure, including
+  # non-hex, is RPC_DESERIALIZATION_ERROR (-22) "TX decode failed".
+  var tx: Transaction
+  var txBytes: seq[byte]
   try:
-    let txBytes = hexToBytes(txHex)
-    let tx = deserializeTransaction(txBytes)
-    let txid = tx.txid()
-    let wtxid = tx.wtxid()
-    let weight = validation.calculateTransactionWeight(tx)
+    if not isHexStr(txHex):
+      raise newRpcError(RpcDeserializationError, "TX decode failed")
+    txBytes = hexToBytes(txHex)
+    tx = deserializeTransaction(txBytes)
+  except RpcError:
+    raise
+  except CatchableError:
+    raise newRpcError(RpcDeserializationError, "TX decode failed")
 
-    var inputs = newJArray()
-    for i in 0 ..< tx.inputs.len:
-      inputs.add(buildVinJson(tx, i))
+  let txid = tx.txid()
+  let wtxid = tx.wtxid()
+  let weight = validation.calculateTransactionWeight(tx)
 
-    var outputs = newJArray()
-    for i, outp in tx.outputs:
-      outputs.add(buildVoutJson(outp, i, mainnet, regtest))
+  var inputs = newJArray()
+  for i in 0 ..< tx.inputs.len:
+    inputs.add(buildVinJson(tx, i))
 
-    %*{
-      "txid": reverseHex(toHex(array[32, byte](txid))),
-      "hash": reverseHex(toHex(array[32, byte](wtxid))),
-      "version": tx.version,
-      "size": txBytes.len,
-      "vsize": (weight + 3) div 4,
-      "weight": weight,
-      "locktime": tx.lockTime,
-      "vin": inputs,
-      "vout": outputs
-    }
-  except CatchableError as e:
-    raise newRpcError(RpcInvalidParams, "invalid transaction: " & e.msg)
+  var outputs = newJArray()
+  for i, outp in tx.outputs:
+    outputs.add(buildVoutJson(outp, i, mainnet, regtest))
+
+  %*{
+    "txid": reverseHex(toHex(array[32, byte](txid))),
+    "hash": reverseHex(toHex(array[32, byte](wtxid))),
+    "version": tx.version,
+    "size": txBytes.len,
+    "vsize": (weight + 3) div 4,
+    "weight": weight,
+    "locktime": tx.lockTime,
+    "vin": inputs,
+    "vout": outputs
+  }
 
 proc uvTypeName(node: JsonNode): string =
   ## Mirror of Bitcoin Core's univalue ``UniValue::typeName`` (univalue.cpp:34),
@@ -4324,6 +4365,21 @@ proc handleCombineRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
   #    version / locktime / vin / vout define the result; only each input's
   #    scriptSig + witness get rebuilt below).
   let templateTx = variants[0]
+
+  # Core resolves every input's prevout from the UTXO + mempool view and
+  # throws RPC_VERIFY_ERROR (-25) "Input not found or already spent" when a
+  # coin is missing. Previously this handler was a pure function of the
+  # variants and silently succeeded on dummy prevouts.
+  if rpc.chainState != nil:
+    for inp in templateTx.inputs:
+      var found = rpc.chainState.getUtxo(inp.prevOut).isSome
+      if not found and rpc.mempool != nil:
+        # A mempool tx that created this outpoint still counts as present.
+        let creator = rpc.mempool.getTransaction(inp.prevOut.txid)
+        if creator.isSome and int(inp.prevOut.vout) < creator.get().outputs.len:
+          found = true
+      if not found:
+        raise newRpcError(RpcTransactionError, "Input not found or already spent")
 
   var mergedInputs: seq[TxIn]
   var mergedWitnesses: seq[seq[seq[byte]]]
@@ -4488,12 +4544,10 @@ proc handleDecodeScript(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing hexstring parameter")
 
   let hexStr = params[0].getStr()
+  # Core ParseHexV(params[0], "argument") — rpc/rawtransaction.cpp:488.
   let script: seq[byte] =
     if hexStr.len > 0:
-      try:
-        hexToBytes(hexStr)
-      except CatchableError as e:
-        raise newRpcError(RpcInvalidParams, "script decode failed: " & e.msg)
+      parseHexV(hexStr, "argument")
     else:
       @[]
 
@@ -4654,7 +4708,7 @@ proc handleCreateMultisig(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let nKeys = pubkeys.len
   if nKeys < nRequired:
-    raise newRpcError(RpcInvalidParams,
+    raise newRpcError(RpcInvalidParameter,
       "not enough keys supplied (got " & $nKeys & " keys, but need at least " & $nRequired & " to redeem)")
   if nKeys > 16:
     raise newRpcError(RpcInvalidParams,
@@ -5106,7 +5160,8 @@ proc handleSubmitPackage(rpc: RpcServer, params: JsonNode): JsonNode =
   let rawTxsArray = params[0]
 
   if rawTxsArray.len == 0:
-    raise newRpcError(RpcInvalidParams, "rawtxs array must not be empty")
+    raise newRpcError(RpcInvalidParameter,
+      "Array must contain between 1 and " & $MaxPackageCount & " transactions.")
 
   if rawTxsArray.len > MaxPackageCount:
     raise newRpcError(RpcInvalidParams, "package too many transactions: " &
@@ -5141,11 +5196,15 @@ proc handleSubmitPackage(rpc: RpcServer, params: JsonNode): JsonNode =
 
     let txHex = rawTxNode.getStr()
     try:
+      if not isHexStr(txHex):
+        raise newRpcError(RpcDeserializationError, "TX decode failed")
       let txBytes = hexToBytes(txHex)
       let tx = deserializeTransaction(txBytes)
       txns.add(tx)
-    except CatchableError as e:
-      raise newRpcError(RpcInvalidParams, "TX " & $i & " decode failed: " & e.msg)
+    except RpcError:
+      raise
+    except CatchableError:
+      raise newRpcError(RpcDeserializationError, "TX decode failed")
 
   # Enforce child-with-parents-tree topology before submitting.
   # Reference: Bitcoin Core rpc/mempool.cpp:1395
@@ -7488,11 +7547,15 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "gettxout \"txid\" n ( include_mempool )",
     "gettxoutproof [\"txid\",...] ( \"blockhash\" )",
     "gettxoutsetinfo ( \"hash_type\" )",
+    "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...]",
     "invalidateblock \"blockhash\"",
     "preciousblock \"blockhash\"",
     "pruneblockchain height",
     "reconsiderblock \"blockhash\"",
+    "scanblocks \"action\" ( [scanobjects] start_height stop_height )",
+    "scantxoutset \"action\" ( [scanobjects] )",
     "verifychain ( checklevel nblocks )",
+    "verifytxoutproof \"proof\"",
     "waitforblock \"blockhash\" ( timeout )",
     "waitforblockheight height ( timeout )",
     "waitfornewblock ( timeout \"current_tip\" )",
@@ -7501,6 +7564,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "getblocktemplate ( template_request )",
     "getmininginfo",
     "getprioritisedtransactions",
+    "prioritisetransaction \"txid\" ( dummy ) fee_delta",
     "submitblock \"hexdata\"",
     "submitheader \"hexdata\"",
     "",
@@ -7511,6 +7575,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "getmempoolentry \"txid\"",
     "getmempoolinfo",
     "getrawmempool ( verbose )",
+    "importmempool \"filepath\" ( options )",
     "loadmempool",
     "savemempool",
     "testmempoolaccept [\"rawtx\",...]",
@@ -7533,17 +7598,30 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "setnetworkactive state",
     "",
     "== Rawtransactions ==",
+    "analyzepsbt \"psbt\"",
+    "combinerawtransaction [\"hexstring\",...]",
+    "combinepsbt [\"psbt\",...]",
     "converttopsbt \"hexstring\" ( permitsigdata iswitness )",
+    "createpsbt [{\"txid\":\"id\",\"vout\":n},...] {\"address\":amount,...} ( locktime replaceable )",
     "createrawtransaction [{\"txid\":\"id\",\"vout\":n},...] [{\"address\":amount},{\"data\":\"hex\"},...] ( locktime replaceable )",
+    "decodepsbt \"psbt\"",
     "decoderawtransaction \"hexstring\"",
+    "decodescript \"hexstring\"",
+    "descriptorprocesspsbt \"psbt\" [\"descriptor\",...] ( sighashtype bip32derivs finalize )",
+    "finalizepsbt \"psbt\" ( extract )",
     "getrawtransaction \"txid\" ( verbose )",
     "joinpsbts [\"psbt\",...]",
     "sendrawtransaction \"hexstring\"",
+    "signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] ( [{...},...] sighashtype )",
     "submitpackage [\"rawtx\",...]",
+    "utxoupdatepsbt \"psbt\" ( [\"descriptor\",...] )",
     "",
     "== Util ==",
     "estimaterawfee conf_target ( threshold )",
+    "createmultisig nrequired [\"key\",...] ( \"address_type\" )",
+    "deriveaddresses \"descriptor\" ( range )",
     "estimatesmartfee conf_target ( \"estimate_mode\" )",
+    "getdescriptorinfo \"descriptor\"",
     "getindexinfo ( \"index_name\" )",
     "signmessage \"address\" \"message\"",
     "signmessagewithprivkey \"privkey\" \"message\"",
@@ -7650,7 +7728,7 @@ proc handleVerifyMessage(rpc: RpcServer, params: JsonNode): JsonNode =
   let res = verifyMessageRaw(parsedAddr.pubkeyHash, signature, message)
   case res
   of mvrMalformedSignature:
-    raise newRpcError(RpcInvalidAddressOrKey, "Malformed base64 encoding")
+    raise newRpcError(RpcTypeError, "Malformed base64 encoding")
   of mvrInvalidAddress:
     raise newRpcError(RpcInvalidAddressOrKey, "Invalid address")
   of mvrAddressNoKey:
@@ -7726,11 +7804,18 @@ proc handleValidateAddress(rpc: RpcServer, params: JsonNode): JsonNode =
         prog = ""
       result["witness_program"]  = %prog
   except AddressError:
-    # Core invalid-form key order: isvalid, error_locations, error.
+    # Core DecodeDestination (key_io.cpp): a non-bech32 string that is
+    # valid Base58-without-checksum ("notanaddress") is
+    # "Invalid checksum or length of Base58 address (P2PKH or P2SH)".
     result = newJObject()
     result["isvalid"] = %false
     result["error_locations"] = newJArray()
-    result["error"] = %"Invalid or unsupported Segwit (Bech32) or Base58 encoding."
+    let lower = addrStr.toLowerAscii()
+    if lower.startsWith("bc1") or lower.startsWith("tb1") or
+        lower.startsWith("bcrt1"):
+      result["error"] = %"Invalid or unsupported Segwit (Bech32) or Base58 encoding."
+    else:
+      result["error"] = %"Invalid checksum or length of Base58 address (P2PKH or P2SH)"
 
 # ============================================================================
 # Pruning RPCs
@@ -7754,12 +7839,19 @@ proc handlePruneBlockchain(rpc: RpcServer, params: JsonNode): JsonNode =
   ## (--prune=N, N >= 550) and manual-mode (--prune=1) accept this RPC; only
   ## auto-mode runs the periodic background trigger.
 
+  # Core type-checks the height argument BEFORE the prune-mode gate
+  # (rpc/blockchain.cpp pruneblockchain). A string height is -3 even on
+  # an unpruned node — the probe is safe against a hypothetically pruned impl.
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing height parameter")
+  if params[0].kind notin {JInt, JFloat}:
+    raise newRpcError(RpcTypeError,
+      "JSON value of type " & uvTypeName(params[0]) &
+      " is not of expected type number")
+
   if rpc.pruner == nil or not rpc.pruner.isPruning:
     raise newRpcError(RpcMiscError,
       "Cannot prune blocks because node is not in prune mode.")
-
-  if params.len < 1:
-    raise newRpcError(RpcInvalidParams, "missing height parameter")
 
   let targetHeight = params[0].getInt()
   let chainHeight = rpc.chainState.bestHeight
@@ -8455,7 +8547,7 @@ proc handleScanTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
     # Nothing to abort (no scan in progress) — Core returns false.
     return %false
   elif action != "start":
-    raise newRpcError(RpcInvalidParams, "Invalid action '" & action & "'")
+    raise newRpcError(RpcInvalidParameter, "Invalid action '" & action & "'")
 
   # action == "start"
   if params.len < 2 or params[1].kind != JArray:
@@ -8572,7 +8664,7 @@ proc handleScanBlocks*(rpc: RpcServer, params: JsonNode): JsonNode =
   elif action == "abort":
     return %false
   elif action != "start":
-    raise newRpcError(RpcInvalidParams, "Invalid action '" & action & "'")
+    raise newRpcError(RpcInvalidParameter, "Invalid action '" & action & "'")
 
   # action == "start"
 
@@ -10010,7 +10102,7 @@ proc handleGetDescriptorInfo(rpc: RpcServer, params: JsonNode): JsonNode =
       "hasprivatekeys": info.hasPrivateKeys
     }
   except DescriptorError as e:
-    raise newRpcError(RpcInvalidParams, "invalid descriptor: " & e.msg)
+    raise newRpcError(RpcInvalidAddressOrKey, e.msg)
 
 proc handleListDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
   ## listdescriptors ( private )
@@ -10155,7 +10247,8 @@ proc handleDeriveAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
   let regtest = rpc.params.network == Regtest
 
   try:
-    let desc = parseDescriptor(descriptorStr)
+    let payload = splitDescriptorChecksum(descriptorStr, requireChecksum = true)
+    let desc = parseDescriptor(payload, requireChecksum = false)
 
     if desc.node.isRange():
       # Ranged descriptor - need range parameter
@@ -10187,7 +10280,8 @@ proc handleDeriveAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
     else:
       # Non-ranged descriptor
       if params.len >= 2:
-        raise newRpcError(RpcInvalidParams, "range not allowed for non-ranged descriptor")
+        raise newRpcError(RpcInvalidParameter,
+          "Range should not be specified for an un-ranged descriptor")
 
       let addresses = deriveAddresses(desc, 0, 1, mainnet, regtest)
       var result = newJArray()
@@ -10195,7 +10289,7 @@ proc handleDeriveAddresses(rpc: RpcServer, params: JsonNode): JsonNode =
         result.add(%addr)
       result
   except DescriptorError as e:
-    raise newRpcError(RpcInvalidParams, "invalid descriptor: " & e.msg)
+    raise newRpcError(RpcInvalidAddressOrKey, e.msg)
 
 proc univalueTypeName(kind: JsonNodeKind): string =
   ## UniValue type names exactly as Core prints them in RPC_TYPE_ERROR
@@ -10542,8 +10636,9 @@ proc handleCreatePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   # nimrod params is index 2, so parse it before walking inputs.
   if params[0].kind != JArray:
     raise newRpcError(RpcInvalidParams, "inputs must be an array")
-  if params[1].kind != JArray:
-    raise newRpcError(RpcInvalidParams, "outputs must be an array")
+  if params[1].kind notin {JArray, JObject}:
+    raise newRpcError(RpcTypeError,
+      "Expected type object or array for outputs")
 
   # Parse locktime
   var locktime = 0'u32
@@ -10582,9 +10677,7 @@ proc handleCreatePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
       raise newRpcError(RpcInvalidParams, "input missing txid or vout")
 
     let txidHex = inputObj["txid"].getStr()
-    if txidHex.len != 64:
-      raise newRpcError(RpcInvalidAddressOrKey, "invalid txid length")
-
+    validateHashV(txidHex, "txid")
     let txid = parseTxId(txidHex)
     let vout = uint32(inputObj["vout"].getInt())
 
@@ -10598,17 +10691,32 @@ proc handleCreatePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
       sequence: sequence
     ))
 
-  # Parse outputs
-  var txOutputs: seq[TxOut]
-  for outputObj in params[1]:
-    if outputObj.kind != JObject:
-      raise newRpcError(RpcInvalidParams, "each output must be an object")
+  # Parse outputs. Core NormalizeOutputs accepts either an object
+  # {address:amount,...,"data":hex} or an array of single-key objects.
+  var normOutputs: seq[(string, JsonNode)]
+  case params[1].kind
+  of JObject:
+    for k, v in params[1]:
+      normOutputs.add((k, v))
+  of JArray:
+    for entry in params[1]:
+      if entry.kind != JObject:
+        raise newRpcError(RpcInvalidParameter,
+          "Invalid parameter, key-value pair not an object as expected")
+      if entry.len != 1:
+        raise newRpcError(RpcInvalidParameter,
+          "Invalid parameter, key-value pair must contain exactly one key")
+      for k, v in entry:
+        normOutputs.add((k, v))
+  else:
+    raise newRpcError(RpcTypeError,
+      "Expected type object or array for outputs")
 
-    # Check for data (OP_RETURN) output
-    if outputObj.hasKey("data"):
-      let dataHex = outputObj["data"].getStr()
+  var txOutputs: seq[TxOut]
+  for (key, val) in normOutputs:
+    if key == "data":
+      let dataHex = val.getStr()
       let data = hexToBytes(dataHex)
-      # Build OP_RETURN script: OP_RETURN <data>
       var script: seq[byte]
       script.add(0x6a)  # OP_RETURN
       if data.len <= 75:
@@ -10621,20 +10729,14 @@ proc handleCreatePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
       script.add(data)
       txOutputs.add(TxOut(value: Satoshi(0), scriptPubKey: script))
     else:
-      # Address output: {address: amount}
-      for key, val in outputObj:
-        if key == "data":
-          continue
-        let address = key
-        let amountBtc = val.getFloat()
-        let amountSat = Satoshi(int64(amountBtc * 100_000_000))
-
-        try:
-          let parsedAddr = decodeAddress(address)
-          let scriptPubKey = scriptPubKeyForAddress(parsedAddr)
-          txOutputs.add(TxOut(value: amountSat, scriptPubKey: scriptPubKey))
-        except AddressError as e:
-          raise newRpcError(RpcInvalidAddressOrKey, "invalid address: " & e.msg)
+      let amountBtc = val.getFloat()
+      let amountSat = Satoshi(int64(amountBtc * 100_000_000.0 + (if amountBtc >= 0: 0.5 else: -0.5)))
+      try:
+        let parsedAddr = decodeAddress(key)
+        let scriptPubKey = scriptPubKeyForAddress(parsedAddr)
+        txOutputs.add(TxOut(value: amountSat, scriptPubKey: scriptPubKey))
+      except AddressError as e:
+        raise newRpcError(RpcInvalidAddressOrKey, "invalid address: " & e.msg)
 
   # Create unsigned transaction
   let tx = Transaction(
@@ -11040,6 +11142,205 @@ proc handleSignRawTransactionWithWallet(rpc: RpcServer,
   }
   if errors.len > 0:
     result["errors"] = errors
+
+proc handleSignRawTransactionWithKey(rpc: RpcServer,
+                                     params: JsonNode): JsonNode =
+  ## signrawtransactionwithkey "hexstring" ["privatekey",...] ( prevtxs sighashtype )
+  ## Sign inputs of a raw transaction with the supplied WIF keys. No wallet.
+  ## Reference: bitcoin-core/src/rpc/rawtransaction.cpp signrawtransactionwithkey
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams,
+      "signrawtransactionwithkey requires hexstring and privkeys")
+  let txHex = params[0].getStr()
+  if params[1].kind != JArray:
+    raise newRpcError(RpcTypeError, "Expected type array for privkeys")
+
+  var tx: Transaction
+  try:
+    if not isHexStr(txHex):
+      raise newRpcError(RpcDeserializationError, "TX decode failed")
+    tx = deserializeTransaction(hexToBytes(txHex))
+  except RpcError:
+    raise
+  except CatchableError:
+    raise newRpcError(RpcDeserializationError, "TX decode failed")
+
+  if tx.witnesses.len < tx.inputs.len:
+    let oldLen = tx.witnesses.len
+    tx.witnesses.setLen(tx.inputs.len)
+    for i in oldLen ..< tx.inputs.len:
+      tx.witnesses[i] = @[]
+
+  type KeyPair = object
+    priv: PrivateKey
+    pub: PublicKey
+    p2wpkh: seq[byte]
+    p2pkh: seq[byte]
+  var keys: seq[KeyPair]
+  for kn in params[1]:
+    if kn.kind != JString:
+      raise newRpcError(RpcTypeError, "Expected type string for privkey")
+    try:
+      let decoded = decodeWIF(kn.getStr())
+      let pub = derivePublicKey(decoded.key)
+      let pkh = hash160(pub)
+      var wpkhAddr = Address(kind: P2WPKH)
+      wpkhAddr.wpkh = pkh
+      var pkhAddr = Address(kind: P2PKH)
+      pkhAddr.pubkeyHash = pkh
+      keys.add(KeyPair(
+        priv: decoded.key,
+        pub: pub,
+        p2wpkh: scriptPubKeyForAddress(wpkhAddr),
+        p2pkh: scriptPubKeyForAddress(pkhAddr)))
+    except CatchableError:
+      raise newRpcError(RpcInvalidAddressOrKey, "Invalid private key")
+
+  var prevTable = initTable[tuple[txid: TxId, vout: uint32], TxOut]()
+  if params.len >= 3 and params[2].kind == JArray:
+    for prev in params[2]:
+      if prev.kind != JObject: continue
+      if not (prev.hasKey("txid") and prev.hasKey("vout") and
+              prev.hasKey("scriptPubKey")):
+        continue
+      try:
+        let txidHex = prev["txid"].getStr()
+        validateHashV(txidHex, "txid")
+        let txid = parseTxId(txidHex)
+        let vout = uint32(prev["vout"].getInt())
+        let spk = hexToBytes(prev["scriptPubKey"].getStr())
+        var amount = Satoshi(0)
+        if prev.hasKey("amount"):
+          let v = prev["amount"]
+          if v.kind == JFloat:
+            amount = Satoshi(int64(v.getFloat() * 100_000_000.0 + 0.5))
+          elif v.kind == JInt:
+            amount = Satoshi(int64(v.getInt()) * 100_000_000)
+        prevTable[(txid, vout)] = TxOut(value: amount, scriptPubKey: spk)
+      except RpcError:
+        raise
+      except CatchableError:
+        continue
+
+  var errors = newJArray()
+  var signedCount = 0
+  for i, txin in tx.inputs:
+    let key = (txin.prevOut.txid, txin.prevOut.vout)
+    var prevOut: TxOut
+    var found = false
+    if key in prevTable:
+      prevOut = prevTable[key]
+      found = true
+    elif rpc.chainState != nil:
+      let utxoOpt = rpc.chainState.getUtxo(txin.prevOut)
+      if utxoOpt.isSome:
+        prevOut = utxoOpt.get().output
+        found = true
+    if not found:
+      errors.add(%*{
+        "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+        "vout": txin.prevOut.vout,
+        "error": "Input not found or already spent"
+      })
+      continue
+    var signed = false
+    for kp in keys:
+      if prevOut.scriptPubKey == kp.p2wpkh:
+        try:
+          signInputP2WPKH(tx, i, kp.priv, kp.pub, prevOut.value)
+          signed = true
+          inc signedCount
+        except CatchableError as e:
+          errors.add(%*{"error": "Signing failed: " & e.msg})
+        break
+      elif prevOut.scriptPubKey == kp.p2pkh:
+        try:
+          signInputP2PKH(tx, i, kp.priv, kp.pub)
+          signed = true
+          inc signedCount
+        except CatchableError as e:
+          errors.add(%*{"error": "Signing failed: " & e.msg})
+        break
+    if not signed:
+      errors.add(%*{
+        "txid": reverseHex(toHex(array[32, byte](txin.prevOut.txid))),
+        "vout": txin.prevOut.vout,
+        "error": "Unable to sign input, missing pubkey or keys"
+      })
+
+  result = %*{
+    "hex": toHex(serialize(tx, includeWitness = true)),
+    "complete": (errors.len == 0) and (signedCount == tx.inputs.len)
+  }
+  if errors.len > 0:
+    result["errors"] = errors
+
+proc handleImportMempool(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## importmempool "filepath" ( options )
+  ## Reference: bitcoin-core/src/rpc/mempool.cpp importmempool.
+  ## Missing file is RPC_MISC_ERROR (-1) with Core's exact message; a
+  ## successful import returns an empty object.
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "missing filepath parameter")
+  let path = params[0].getStr()
+  if not fileExists(path):
+    raise newRpcError(RpcMiscError,
+      "Unable to import mempool file, see debug log for details.")
+  if rpc.mempool == nil:
+    raise newRpcError(RpcInternalError, "Mempool unavailable")
+  let r = loadMempool(rpc.mempool, path, rpc.crypto)
+  if r.isNone:
+    raise newRpcError(RpcMiscError,
+      "Unable to import mempool file, see debug log for details.")
+  newJObject()
+
+proc handleUtxoUpdatePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## utxoupdatepsbt "psbt" ( descriptors )
+  ## Fill segwit inputs from the UTXO set / mempool. Unknown inputs pass
+  ## through unchanged (Core ProcessPSBT with hide_secret).
+  ## Reference: bitcoin-core/src/rpc/rawtransaction.cpp utxoupdatepsbt
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "missing psbt parameter")
+  var psbtObj = decodeBase64Psbt(params[0].getStr())
+  if psbtObj.tx.isSome and rpc.chainState != nil:
+    let tx = psbtObj.tx.get()
+    for i, txin in tx.inputs:
+      if i >= psbtObj.inputs.len: break
+      if psbtObj.inputs[i].witnessUtxo.isSome or
+          psbtObj.inputs[i].nonWitnessUtxo.isSome:
+        continue
+      let utxoOpt = rpc.chainState.getUtxo(txin.prevOut)
+      if utxoOpt.isSome:
+        let outp = utxoOpt.get().output
+        # Segwit programs start with OP_0 / OP_1..OP_16 push.
+        if outp.scriptPubKey.len >= 2 and outp.scriptPubKey[0] <= 0x10:
+          psbtObj.inputs[i].witnessUtxo = some(outp)
+  %psbtObj.toBase64()
+
+proc handleDescriptorProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## descriptorprocesspsbt "psbt" [descriptors] ( sighashtype bip32derivs finalize )
+  ## Reference: bitcoin-core/src/rpc/rawtransaction.cpp descriptorprocesspsbt.
+  ## Required: psbt + descriptors array. Invalid descriptors are -5.
+  if params.len < 2:
+    raise newRpcError(RpcInvalidParams, "missing psbt or descriptors")
+  let psbtObj = decodeBase64Psbt(params[0].getStr())
+  if params[1].kind != JArray:
+    raise newRpcError(RpcTypeError, "Expected type array for descriptors")
+  for d in params[1]:
+    var descStr: string
+    if d.kind == JString:
+      descStr = d.getStr()
+    elif d.kind == JObject and d.hasKey("desc"):
+      descStr = d["desc"].getStr()
+    else:
+      raise newRpcError(RpcInvalidAddressOrKey, "Invalid descriptor")
+    try:
+      discard parseDescriptor(descStr, requireChecksum = false)
+    except DescriptorError as e:
+      raise newRpcError(RpcInvalidAddressOrKey, e.msg)
+  result = newJObject()
+  result["psbt"] = %psbtObj.toBase64()
+  result["complete"] = %false
 
 # ============================================================================
 # walletcreatefundedpsbt
@@ -12702,14 +13003,7 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing psbt parameter")
 
   let psbtBase64 = params[0].getStr()
-
-  var psbtObj: Psbt
-  try:
-    psbtObj = fromBase64(psbtBase64)
-  except PsbtError as e:
-    raise newRpcError(RpcInvalidParams, "invalid PSBT: " & e.msg)
-  except CatchableError as e:
-    raise newRpcError(RpcInvalidParams, "invalid PSBT: " & e.msg)
+  let psbtObj = decodeBase64Psbt(psbtBase64)
 
   let mainnet = rpc.params.network == Mainnet
 
@@ -13123,7 +13417,7 @@ proc handleCombinePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "psbts must be an array")
 
   if params[0].len == 0:
-    raise newRpcError(RpcInvalidParams, "psbts array is empty")
+    raise newRpcError(RpcInvalidParameter, "Parameter 'txs' cannot be empty")
 
   var psbts: seq[Psbt]
   for psbtNode in params[0]:
@@ -13377,14 +13671,7 @@ proc handleFinalizePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let psbtBase64 = params[0].getStr()
   let extract = if params.len >= 2 and params[1].kind != JNull: params[1].getBool() else: true
-
-  var psbtObj: Psbt
-  try:
-    psbtObj = fromBase64(psbtBase64)
-  except PsbtError as e:
-    raise newRpcError(RpcInvalidParams, "invalid PSBT: " & e.msg)
-  except CatchableError as e:
-    raise newRpcError(RpcInvalidParams, "invalid PSBT: " & e.msg)
+  var psbtObj = decodeBase64Psbt(psbtBase64)
 
   # Attempt to finalize all inputs
   let complete = finalizePsbt(psbtObj)
@@ -13434,14 +13721,7 @@ proc handleAnalyzePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing psbt parameter")
 
   let psbtBase64 = params[0].getStr()
-
-  var psbtObj: Psbt
-  try:
-    psbtObj = fromBase64(psbtBase64)
-  except PsbtError as e:
-    raise newRpcError(RpcInvalidParams, "invalid PSBT: " & e.msg)
-  except CatchableError as e:
-    raise newRpcError(RpcInvalidParams, "invalid PSBT: " & e.msg)
+  let psbtObj = decodeBase64Psbt(psbtBase64)
 
   let analysis = analyzePsbtCore(psbtObj)
 
@@ -13752,9 +14032,11 @@ proc handleVerifyTxOutProof(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.kind != JArray or params.len < 1 or params[0].kind != JString:
     raise newRpcError(RpcInvalidParams, "Expected [proof_hex]")
   let hexStr = params[0].getStr()
-  if hexStr.len < 168 or hexStr.len mod 2 != 0:
+  # Core ParseHexV(params[0], "proof") — rpc/txoutproof.cpp:148. Non-hex is
+  # -8 BEFORE the length/structure checks.
+  let proofBytes = parseHexV(hexStr, "proof")
+  if proofBytes.len < 84:
     raise newRpcError(RpcMiscError, "Proof too short")
-  let proofBytes = hexToBytes(hexStr)
   if proofBytes.len < 84: raise newRpcError(RpcMiscError, "Proof too short")
   let blockHashBytes = w47bDsha256(proofBytes[0..79])
   let blockHash = BlockHash(blockHashBytes)
@@ -14349,6 +14631,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleDumpMempool(params)
   of "loadmempool":
     rpc.handleLoadMempool(params)
+  of "importmempool":
+    rpc.handleImportMempool(params)
   of "savemempool":
     # Bitcoin Core alias for dumpmempool. Keep parity.
     rpc.handleDumpMempool(params)
@@ -14542,6 +14826,10 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleFinalizePsbt(params)
   of "analyzepsbt":
     rpc.handleAnalyzePsbt(params)
+  of "utxoupdatepsbt":
+    rpc.handleUtxoUpdatePsbt(params)
+  of "descriptorprocesspsbt":
+    rpc.handleDescriptorProcessPsbt(params)
   of "walletcreatefundedpsbt":
     rpc.handleWalletCreateFundedPsbt(params)
   of "walletprocesspsbt":
@@ -14564,6 +14852,8 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   # Wallet signing
   of "signrawtransactionwithwallet":
     rpc.handleSignRawTransactionWithWallet(params)
+  of "signrawtransactionwithkey":
+    rpc.handleSignRawTransactionWithKey(params)
 
   # Control
   of "stop":

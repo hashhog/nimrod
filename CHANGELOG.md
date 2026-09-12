@@ -4,6 +4,8 @@
 
 Changes since `v1.0.0`:
 
+- fix: T2 R5 probe parity (error codes, PSBT object outputs, missing RPCs).
+  Control: `nim c -r tests/test_t2_r5_parity.nim`.
 - fix: stop tracking `tools/phaseb_verifyscript_shim` (compiled ELF).
   Every rebuild rewrote the binary so `git status` never stayed clean
   (DIRTY-TREE skip). Source remains; rebuild with `nimble build_shim`.

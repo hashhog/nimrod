@@ -471,10 +471,10 @@ suite "W137 G26 — SignPSBTInput PSBTError enum (BUG-18)":
 # ---------------------------------------------------------------------------
 suite "W137 G27 — utxoupdatepsbt + joinpsbts RPCs (BUG-19)":
 
-  test "G27 BUG-19: no utxoupdatepsbt RPC handler":
+  test "G27 BUG-19: utxoupdatepsbt RPC handler is present":
     ## Core rpc/rawtransaction.cpp registers `utxoupdatepsbt`.
-    check "utxoupdatepsbt" notin serverSrc
-    check "handleUtxoUpdatePsbt" notin serverSrc
+    check "utxoupdatepsbt" in serverSrc
+    check "handleUtxoUpdatePsbt" in serverSrc
 
   test "G27 BUG-19 cont: no joinpsbts RPC handler":
     check "joinpsbts" in serverSrc
@@ -494,10 +494,10 @@ suite "W137 G28 — walletprocesspsbt / converttopsbt / descriptorprocesspsbt (B
     check "converttopsbt" in serverSrc
     check "handleConvertToPsbt" in serverSrc
 
-  test "G28 BUG-20 cont: no descriptorprocesspsbt RPC handler":
+  test "G28 BUG-20 cont: descriptorprocesspsbt RPC handler is present":
     ## Core rpc/rawtransaction.cpp registers `descriptorprocesspsbt`.
-    check "descriptorprocesspsbt" notin serverSrc
-    check "handleDescriptorProcessPsbt" notin serverSrc
+    check "descriptorprocesspsbt" in serverSrc
+    check "handleDescriptorProcessPsbt" in serverSrc
 
 # ---------------------------------------------------------------------------
 # G29 — analyzepsbt fee / estimated_vsize / estimated_feerate (BUG-21, P1)

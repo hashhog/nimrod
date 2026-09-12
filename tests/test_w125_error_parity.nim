@@ -227,11 +227,12 @@ suite "W125 Gate 10: -8 RPC_INVALID_PARAMETER — MISSING (xfail)":
     let r = rpc.rpcMethodErr("testmempoolaccept", %*[newJArray()])
     check r.code == -32602
 
-  test "xfail — submitpackage empty rawtxs array currently -32602":
-    ## TODO(W125 Gate 10): expected -8.  See server.nim:3236.
+  test "PRESENT — submitpackage empty rawtxs array is -8":
+    ## Closed by the T2 R5 probe parity fix: Core MAX_PACKAGE_COUNT bound.
     let rpc = minimalRpcServer()
     let r = rpc.rpcMethodErr("submitpackage", %*[newJArray()])
-    check r.code == -32602
+    check r.code == -8
+    check r.msg.startsWith("Array must contain between 1 and")
 
 # ===========================================================================
 # Gate 11 — RPC_DATABASE_ERROR (-20) MISSING
@@ -271,11 +272,12 @@ suite "W125 Gate 12: -22 RPC_DESERIALIZATION_ERROR — MISSING (xfail)":
     check r.code in [-32602, -32603]
     check r.code != -22  # the gap
 
-  test "xfail — decoderawtransaction non-hex bytes":
-    ## TODO(W125 Gate 12): expected -22.
+  test "PRESENT — decoderawtransaction non-hex bytes is -22":
+    ## Closed by the T2 R5 probe parity fix: Core DecodeHexTx → -22.
     let rpc = minimalRpcServer()
     let r = rpc.rpcMethodErr("decoderawtransaction", %*["xx"])
-    check r.code != -22
+    check r.code == -22
+    check r.msg == "TX decode failed"
 
   test "xfail — decodescript non-hex bytes currently -32602":
     ## TODO(W125 Gate 12): expected -22.  See server.nim:2646.
