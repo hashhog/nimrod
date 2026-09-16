@@ -1,6 +1,17 @@
 # Changelog
 
-## v1.0.2 (unreleased)
+## v1.0.2 — 2026-09-16
+
+- 59fee59 fix: getMedianTimePastFromChain median of last min(11,n) times (BIP113)
+- d828ff2 fix: params.nim campaign parser typo 'andentry' -> 'and entry' (compile break)
+- 22a60b8 fix: graft campaign base_tail_headers so snapshot-boot header-sync starts at the base
+- b3b428c fix: T2 R5 probe parity (error codes, PSBT, missing RPCs)
+- 82e48b3 fix: stop tracking the phaseb verifyscript shim ELF
+- 7029b72 fix: activate loadtxoutset onto the live chainstate
+- 263b1af test: triage the 50 failures 2e819ea made visible
+
+
+## v1.0.2 — 2026-09-16
 
 - fix: `getMedianTimePastFromChain` is again the BIP113 median of the last
   min(11, n) timestamps. 22a60b8 routed every lookup through
@@ -9,7 +20,7 @@
   Hash-index lookup is used only when `hashes` covers the height (snapshot
   holes); otherwise `headers[h]` is read directly.
 
-## v1.0.1 (unreleased)
+## v1.0.2 — 2026-09-16
 
 Changes since `v1.0.0`:
 
