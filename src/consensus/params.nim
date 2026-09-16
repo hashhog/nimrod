@@ -717,7 +717,7 @@ proc loadCampaignAssumeutxo*(params: var ConsensusParams) =
             "base_tail_headers entries must be hex strings at height " & $height)
         rawTails.add(n.getStr)
     elif entry.hasKey("base_header") and entry["base_header"].kind ==
-        JString andentry["base_header"].getStr.len > 0:
+        JString and entry["base_header"].getStr.len > 0:
       rawTails.add(entry["base_header"].getStr)
 
     if rawTails.len > 0 and entry.hasKey("base_header") and
