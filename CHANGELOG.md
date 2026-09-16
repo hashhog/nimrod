@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.2 (unreleased)
+
+- fix: `getMedianTimePastFromChain` is again the BIP113 median of the last
+  min(11, n) timestamps. 22a60b8 routed every lookup through
+  `getHeaderByHeight`, which returns none when `hashes`/`byHash` are empty,
+  so an 11-header window of times 100..1100 returned 0 instead of 600.
+  Hash-index lookup is used only when `hashes` covers the height (snapshot
+  holes); otherwise `headers[h]` is read directly.
+
 ## v1.0.1 (unreleased)
 
 Changes since `v1.0.0`:

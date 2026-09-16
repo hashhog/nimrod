@@ -199,7 +199,8 @@ suite "Median Time Past":
     check mtp == genesis.header.timestamp
 
   test "MTP calculation with multiple headers":
-    # Build a chain of headers with known timestamps
+    # Headers-only HeaderChain (no hashes/byHash) — the 22a60b8 regression:
+    # getHeaderByHeight returned none for every height, so MTP was 0.
     var hc = initHeaderChain()
     hc.headers = @[]
 
@@ -220,6 +221,47 @@ suite "Median Time Past":
     # Median (index 5): 600
     let mtp = getMedianTimePastFromChain(hc, 10)
     check mtp == 600
+
+  test "MTP with hashes/byHash populated (production HeaderChain)":
+    var hc = initHeaderChain()
+    let timestamps = [100'u32, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100]
+    for i, ts in timestamps:
+      let header = BlockHeader(
+        version: 1,
+        timestamp: ts,
+        bits: 0x207fffff'u32,
+        nonce: uint32(i + 1)
+      )
+      let h = BlockHash(doubleSha256(serialize(header)))
+      hc.headers.add(header)
+      hc.hashes.add(h)
+      hc.byHash[h] = hc.headers.len - 1
+    hc.tipHeight = int32(hc.headers.len - 1)
+    check getMedianTimePastFromChain(hc, 10) == 600
+
+  test "MTP skips snapshot-graft holes below a contiguous tail":
+    # headers/hashes pre-sized like loadHeaderChainFromDb's suffix graft:
+    # holes at 0..8, eleven timestamps at 9..19. Last-11 window is dense.
+    var hc = initHeaderChain()
+    hc.headers.setLen(20)
+    hc.hashes.setLen(20)
+    let timestamps = [100'u32, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100]
+    for i, ts in timestamps:
+      let height = 9 + i
+      let header = BlockHeader(
+        version: 1,
+        timestamp: ts,
+        bits: 0x207fffff'u32,
+        nonce: uint32(i + 1)
+      )
+      let h = BlockHash(doubleSha256(serialize(header)))
+      hc.headers[height] = header
+      hc.hashes[height] = h
+      hc.byHash[h] = height
+    hc.tipHeight = 19
+    check hc.getHeaderByHeight(8).isNone
+    check hc.getHeaderByHeight(9).isSome
+    check getMedianTimePastFromChain(hc, 19) == 600
 
 suite "SyncManager":
   test "newSyncManager initializes with genesis":

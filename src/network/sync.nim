@@ -658,21 +658,29 @@ proc validateHeaderChainLinkByHash*(header: BlockHeader,
   header.prevBlock == prevHash
 
 proc getMedianTimePastFromChain*(hc: HeaderChain, height: int32): uint32 =
-  ## Calculate MTP from the header chain
-  ## Uses timestamps of the previous 11 blocks
-  var timestamps: seq[uint32]
-
+  ## BIP113 MTP of the header at `height` — Core CBlockIndex::GetMedianTimePast
+  ## (chain.h:233-245): last min(MedianTimeSpan=11, n) timestamps, sorted,
+  ## return index len/2.
+  ##
+  ## Snapshot-grafted chains pre-size `headers`/`hashes` with holes below the
+  ## tail; `getHeaderByHeight` skips those. When `hashes` does not cover `h`
+  ## (a headers-only HeaderChain), read `headers[h]` directly. 22a60b8 routed
+  ## every lookup through getHeaderByHeight, so a dense 11-header window with
+  ## empty hashes returned MTP 0 instead of the median.
+  var window: seq[BlockHeader]
+  if height < 0:
+    return 0
   let startHeight = max(0, height - MedianTimeSpan + 1)
   for h in startHeight .. height:
-    let hdr = hc.getHeaderByHeight(h)
-    if hdr.isSome:
-      timestamps.add(hdr.get().timestamp)
-
-  if timestamps.len == 0:
-    return 0
-
-  timestamps.sort()
-  timestamps[timestamps.len div 2]
+    if h >= int32(hc.headers.len):
+      continue
+    if h < int32(hc.hashes.len):
+      let hdr = hc.getHeaderByHeight(h)
+      if hdr.isSome:
+        window.add(hdr.get())
+    else:
+      window.add(hc.headers[h])
+  getMedianTimePast(window)
 
 proc validateHeaderMTP*(header: BlockHeader, hc: HeaderChain,
     height: int32): bool =
