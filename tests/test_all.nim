@@ -200,6 +200,7 @@ const IncludedTests = [
   "test_signrawtransactionwithwallet",
   "test_sigop",
   "test_snapshot",
+  "test_snapshot_header_boot",
   "test_softforks_bridge",
   "test_stale_peer",
   "test_standard",

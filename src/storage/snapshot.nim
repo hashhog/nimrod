@@ -46,9 +46,9 @@ type
   ## Snapshot validation state — tracks whether a snapshot chainstate has
   ## been fully validated by the background chain.
   Assumeutxo* = enum
-    auValidated    ## Fully validated from genesis (or background validation done)
-    auUnvalidated  ## Loaded from snapshot, background validation pending
-    auInvalid      ## Snapshot validation failed (hash mismatch)
+    auValidated   ## Fully validated from genesis (or background validation done)
+    auUnvalidated ## Loaded from snapshot, background validation pending
+    auInvalid     ## Snapshot validation failed (hash mismatch)
 
   ## Metadata at the head of every snapshot file. Fields match
   ## `bitcoin-core/src/node/utxo_snapshot.h::SnapshotMetadata`.
@@ -84,16 +84,16 @@ type
   ## snapshot-rooted chainstate the node serves from is the SNAPSHOT chainstate.
   ## A node with no active snapshot has a single chainstate with role `csrNormal`.
   ChainstateRole* = enum
-    csrNormal       ## Single fully-validated chainstate (no snapshot active).
-    csrSnapshot     ## Snapshot-rooted active chainstate (Core's m_from_snapshot).
-    csrBackground   ## Genesis-rooted background chainstate re-validating a snapshot.
+    csrNormal   ## Single fully-validated chainstate (no snapshot active).
+    csrSnapshot ## Snapshot-rooted active chainstate (Core's m_from_snapshot).
+    csrBackground ## Genesis-rooted background chainstate re-validating a snapshot.
 
   SnapshotChainState* = ref object
     chainState*: ChainState
     assumeutxo*: Assumeutxo
     snapshotBlockhash*: Option[BlockHash]
     targetUtxoHash*: Option[array[32, byte]]
-    role*: ChainstateRole   ## csrSnapshot once a snapshot is loaded into it.
+    role*: ChainstateRole ## csrSnapshot once a snapshot is loaded into it.
 
   BackgroundValidation* = ref object
     running*: bool
@@ -110,12 +110,12 @@ type
   ## background chainstate targeting the snapshot base, and the work that
   ## independently recomputes the snapshot's HASH_SERIALIZED.
   SnapshotActivation* = ref object
-    snapshot*: SnapshotChainState        ## Active, Unvalidated snapshot chainstate.
-    background*: ChainState              ## Background chainstate — SEPARATE store.
-    bgValidation*: BackgroundValidation  ## Drives the genesis->base re-connect.
-    baseHeight*: int32                   ## Snapshot base height (= au_data.height).
-    assumedHash*: array[32, byte]        ## au_data.hash_serialized to match against.
-    bgDbPath*: string                    ## On-disk dir of the bg coins store.
+    snapshot*: SnapshotChainState       ## Active, Unvalidated snapshot chainstate.
+    background*: ChainState             ## Background chainstate — SEPARATE store.
+    bgValidation*: BackgroundValidation ## Drives the genesis->base re-connect.
+    baseHeight*: int32                  ## Snapshot base height (= au_data.height).
+    assumedHash*: array[32, byte]       ## au_data.hash_serialized to match against.
+    bgDbPath*: string                   ## On-disk dir of the bg coins store.
 
   SnapshotValidationResult* = enum
     svrNotReady
@@ -311,9 +311,10 @@ proc decompressSpecialScript(tag: uint64, payload: openArray[byte]): seq[byte] =
       # error so the snapshot load aborts loudly rather than silently
       # corrupting the UTXO set.
       raise newException(SnapshotError,
-        "ScriptCompression: invalid x-coordinate for uncompressed P2PK (tag " & $tag & ")")
+        "ScriptCompression: invalid x-coordinate for uncompressed P2PK (tag " &
+        $tag & ")")
     result = newSeq[byte](67)
-    result[0] = 0x41'u8  # push 65 bytes
+    result[0] = 0x41'u8 # push 65 bytes
     for i in 0 ..< 65: result[1 + i] = uncompressed[i]
     result[66] = OpChecksig
   else:
@@ -335,7 +336,7 @@ proc readCompressedScript*(r: var BinaryReader): seq[byte] =
     let payload = r.readBytes(payloadLen)
     return decompressSpecialScript(tag, payload)
   let scriptLen = tag - ScriptSpecialScripts
-  if scriptLen > 16505'u64:  # MAX_SCRIPT_SIZE-ish guard, see compressor.h
+  if scriptLen > 16505'u64: # MAX_SCRIPT_SIZE-ish guard, see compressor.h
     raise newException(SnapshotError, "ScriptCompression: script too long: " & $scriptLen)
   return r.readBytes(int(scriptLen))
 
@@ -348,7 +349,8 @@ proc writeCoinBody*(w: var BinaryWriter, coin: SnapshotCoin) =
   ## outer txid (handled by the txid-grouping layer). Layout:
   ##   compactsize(vout) | VARINT(code) | VARINT(CompressAmount(value)) | scriptPubKey
   w.writeCompactSize(uint64(coin.outpoint.vout))
-  let code = uint64(coin.height) * 2'u64 + (if coin.isCoinbase: 1'u64 else: 0'u64)
+  let code = uint64(coin.height) * 2'u64 + (
+      if coin.isCoinbase: 1'u64 else: 0'u64)
   w.writeVarInt(code)
   w.writeVarInt(compressAmount(uint64(int64(coin.output.value))))
   w.writeCompressedScript(coin.output.scriptPubKey)
@@ -384,7 +386,8 @@ proc readSnapshotMetadata*(r: var BinaryReader): SnapshotMetadata =
       raise newException(SnapshotError, "invalid snapshot magic bytes")
   result.version = r.readUint16LE()
   if result.version != SnapshotVersion:
-    raise newException(SnapshotError, "unsupported snapshot version: " & $result.version)
+    raise newException(SnapshotError, "unsupported snapshot version: " &
+        $result.version)
   for i in 0 .. 3:
     result.networkMagic[i] = r.readUint8()
   result.baseBlockhash = r.readBlockHash()
@@ -541,7 +544,8 @@ proc createSnapshot*(
     cs: ChainState,
     path: string,
     params: ConsensusParams
-): tuple[coinsWritten: uint64, baseHash: BlockHash, baseHeight: int32, txoutsetHash: array[32, byte]] =
+): tuple[coinsWritten: uint64, baseHash: BlockHash, baseHeight: int32,
+    txoutsetHash: array[32, byte]] =
   ## Create a UTXO snapshot from the current chainstate UTXO cache.
   ## Mirrors the layout of `WriteUTXOSnapshot` in rpc/blockchain.cpp.
   ##
@@ -913,7 +917,8 @@ proc loadSnapshot*(
   let trailingGot = sf.file.readBytes(trailingBuf, 0, 1)
   if trailingGot > 0:
     return (false, coinsLoaded,
-            "Bad snapshot - coins left over after deserializing " & $coinsLoaded & " coins")
+            "Bad snapshot - coins left over after deserializing " &
+            $coinsLoaded & " coins")
 
   # Strict assumeutxo content-hash check, matching Bitcoin Core verbatim
   # (`bitcoin-core/src/validation.cpp:5912-5914`):
@@ -1106,7 +1111,8 @@ proc validateSnapshot*(
 # ============================================================================
 
 proc newBackgroundValidation*(targetHeight: int32,
-                              snapshotHash: array[32, byte]): BackgroundValidation =
+                              snapshotHash: array[32,
+                                  byte]): BackgroundValidation =
   BackgroundValidation(
     running: false,
     progress: 0,
@@ -1206,6 +1212,95 @@ proc writeSnapshotActivationIndex*(cs: ChainState) =
   ## Convenience: use the chainstate's current tip as the snapshot base.
   writeSnapshotActivationIndex(cs, cs.bestBlockHash, cs.bestHeight)
 
+proc subWork(a, b: array[32, byte]): array[32, byte] =
+  ## 256-bit little-endian subtraction. Caller must ensure a >= b.
+  var borrow: int16 = 0
+  for i in 0 ..< 32:
+    let diff = int16(a[i]) - int16(b[i]) - borrow
+    if diff < 0:
+      result[i] = byte(diff + 256)
+      borrow = 1
+    else:
+      result[i] = byte(diff)
+      borrow = 0
+
+proc workLess(a, b: array[32, byte]): bool =
+  for i in countdown(31, 0):
+    if a[i] < b[i]: return true
+    if a[i] > b[i]: return false
+  false
+
+proc isZeroWorkArr(w: array[32, byte]): bool =
+  for b in w:
+    if b != 0: return false
+  true
+
+proc persistAssumeutxoBaseHeaders*(cdb: ChainDb, data: AssumeutxoData): int =
+  ## Write the campaign `base_tail_headers` band into the block index so
+  ## `loadHeaderChainFromDb` can reconstruct a header chain whose tip is the
+  ## assumeUTXO base, not genesis. Last header is the snapshot base itself.
+  ##
+  ## Cumulative work descends from `data.chainwork` (nChainWork at the base);
+  ## it cannot be derived from the band, whose predecessors are absent.
+  ## Returns the number of headers persisted, or 0 when there is nothing to
+  ## graft (legacy fixture, missing chainwork).
+  let band = data.baseTailHeaders
+  if band.len == 0:
+    return 0
+  if isZeroWorkArr(data.chainwork):
+    warn "assumeutxo base headers present but chainwork is zero; not grafting",
+         height = data.height
+    return 0
+  if data.height < int32(band.len - 1):
+    warn "assumeutxo base tail does not fit below height",
+         height = data.height, band = band.len
+    return 0
+  if campaignHeaderHash(band[^1]) != data.blockhash:
+    warn "assumeutxo base tail last header does not match blockhash",
+         height = data.height
+    return 0
+
+  var works = newSeq[array[32, byte]](band.len)
+  works[^1] = data.chainwork
+  for i in countdown(band.len - 2, 0):
+    let step = calculateBlockWork(band[i + 1].bits)
+    works[i] = subWork(works[i + 1], step)
+    if not isZeroWorkArr(step) and not workLess(works[i], works[i + 1]):
+      warn "assumeutxo chainwork too small for tail band; not grafting",
+           height = data.height, band = band.len
+      return 0
+
+  let startHeight = data.height - int32(band.len - 1)
+  for i, hdr in band:
+    let height = startHeight + int32(i)
+    let h = campaignHeaderHash(hdr)
+    let idx = BlockIndex(
+      hash: h,
+      height: height,
+      status: if i == band.len - 1: bsValidated else: bsHeaderOnly,
+      prevHash: hdr.prevBlock,
+      header: hdr,
+      totalWork: works[i],
+      undoPos: FlatFilePos(fileNum: -1, pos: -1),
+      failureFlags: BLOCK_NO_FAILURE,
+      sequenceId: 0,
+      nTx: if i == band.len - 1: 1 else: 0
+    )
+    cdb.putBlockIndex(idx)
+  info "persisted assumeutxo base-tail headers",
+       count = band.len, firstHeight = startHeight, baseHeight = data.height
+  band.len
+
+proc persistAssumeutxoBaseHeaders*(cs: ChainState,
+                                   table: seq[AssumeutxoData]): int =
+  ## Persist the whitelist entry whose blockhash matches the live tip.
+  if cs.isNil or cs.db.isNil:
+    return 0
+  for d in table:
+    if d.blockhash == cs.bestBlockHash:
+      return persistAssumeutxoBaseHeaders(cs.db, d)
+  0
+
 proc activateSnapshotAsActive*(
     live, snapshot: ChainState,
     baseHash: BlockHash,
@@ -1264,7 +1359,8 @@ proc activateSnapshotWithBackground*(
   ## refuses it.
   snapshotCs.assumeutxo = auUnvalidated
   snapshotCs.role = csrSnapshot
-  let background = makeBackgroundChainState(bgDbPath, snapshotCs.chainState.params)
+  let background = makeBackgroundChainState(bgDbPath,
+      snapshotCs.chainState.params)
   let bgv = newBackgroundValidation(baseHeight, assumedHash)
   SnapshotActivation(
     snapshot: snapshotCs,
@@ -1309,7 +1405,8 @@ proc runSnapshotValidation*(
   activation.bgValidation.running = true
   activation.bgValidation.progress = bg.bestHeight + 1
   while activation.bgValidation.running and
-        activation.bgValidation.progress <= activation.bgValidation.targetHeight:
+        activation.bgValidation.progress <=
+            activation.bgValidation.targetHeight:
     let blockOpt = getNextBlock(activation.bgValidation.progress)
     if blockOpt.isNone:
       inc stalls
@@ -1346,5 +1443,6 @@ proc runSnapshotValidation*(
 proc stopBackgroundValidation*(bgv: BackgroundValidation) =
   bgv.running = false
 
-proc getProgress*(bgv: BackgroundValidation): tuple[current: int32, target: int32] =
+proc getProgress*(bgv: BackgroundValidation): tuple[current: int32,
+    target: int32] =
   (bgv.progress, bgv.targetHeight)

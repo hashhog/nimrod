@@ -103,7 +103,8 @@ const
   CORE_SNAPSHOT_CHAINSTATE_SUFFIX = "_snapshot"
   # bitcoin-core/src/kernel/chainparams.cpp:158-183 mainnet (5 entries)
   CORE_MAINNET_ASSUMEUTXO_COUNT = 6
-  CORE_MAINNET_ASSUMEUTXO_HEIGHTS = [840_000, 880_000, 910_000, 935_000, 944_183, 481_823]
+  CORE_MAINNET_ASSUMEUTXO_HEIGHTS = [840_000, 880_000, 910_000, 935_000,
+      944_183, 481_823]
   # bitcoin-core/src/kernel/chainparams.cpp:376-389 testnet4 (2 entries)
   CORE_TESTNET4_ASSUMEUTXO_COUNT = 2
   CORE_TESTNET4_ASSUMEUTXO_HEIGHTS = [90_000, 120_000]
@@ -118,12 +119,12 @@ const
 
 # Read production source files once for source-level pinning.
 let
-  snapshotSrc:  string = readFile("src/storage/snapshot.nim")
-  paramsSrc:    string = readFile("src/consensus/params.nim")
-  serverSrc:    string = readFile("src/rpc/server.nim")
-  prunerSrc:    string = readFile("src/storage/pruner.nim")
-  chainstSrc:   string = readFile("src/storage/chainstate.nim")
-  nimrodSrc:    string = readFile("src/nimrod.nim")
+  snapshotSrc: string = readFile("src/storage/snapshot.nim")
+  paramsSrc: string = readFile("src/consensus/params.nim")
+  serverSrc: string = readFile("src/rpc/server.nim")
+  prunerSrc: string = readFile("src/storage/pruner.nim")
+  chainstSrc: string = readFile("src/storage/chainstate.nim")
+  nimrodSrc: string = readFile("src/nimrod.nim")
 
 # ---------------------------------------------------------------------------
 # G1 — SNAPSHOT_MAGIC_BYTES (PRESENT)
@@ -251,9 +252,9 @@ suite "W138 G12 — base block headers-chain membership (BUG-1)":
     # `db.getBlockIndex(...)` walk shows up that resolves base hash against
     # the header chain).
 
-# ---------------------------------------------------------------------------
-# G13 — BLOCK_FAILED_VALID check (BUG-2, P1, MISSING)
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # G13 — BLOCK_FAILED_VALID check (BUG-2, P1, MISSING)
+  # ---------------------------------------------------------------------------
 suite "W138 G13 — BLOCK_FAILED_VALID on snapshot base (BUG-2)":
 
   test "G13 BUG-2: snapshot.nim does NOT check base-block failure flags":
@@ -289,9 +290,9 @@ suite "W138 G15 — mempool empty precondition (BUG-4)":
     # gap is contained — but the (currently-refused) RPC path would
     # silently bypass.
 
-# ---------------------------------------------------------------------------
-# G16 — Double-activation guard polarity (BUG-5, P0-CDIV, PARTIAL)
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # G16 — Double-activation guard polarity (BUG-5, P0-CDIV, PARTIAL)
+  # ---------------------------------------------------------------------------
 suite "W138 G16 — double-activation guard polarity (BUG-5)":
 
   test "G16 BUG-5: error string matches Core verbatim":
@@ -307,27 +308,23 @@ suite "W138 G16 — double-activation guard polarity (BUG-5)":
     # commit that adds `or snapshotCs.assumeutxo == auValidated` will
     # flip this `in` to `notin` and the test author must update.
 
-# ---------------------------------------------------------------------------
-# G17 — Work-exceeds-active pre-check (BUG-6, P1, PARTIAL — height not work)
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # G17 — Work-exceeds-active pre-check (BUG-6, P1, PARTIAL — height not work)
+  # ---------------------------------------------------------------------------
 suite "W138 G17 — pre-load work-exceeds check (BUG-6)":
 
   test "G17 BUG-6: uses HEIGHT not CHAINWORK (Core validation.cpp:5787)":
     ## nimrod compares `targetCs.bestHeight >= assumeData.height`.
     ## Core uses CBlockIndexWorkComparator on nChainWork.
+    ## Campaign `chainwork` is stored for snapshot-boot header grafting
+    ## (a different use than the load-time work-exceeds check).
     check "targetCs.bestHeight >= baseHeight" in snapshotSrc
     check "Work does not exceed active chainstate" in snapshotSrc
-    # AssumeutxoData carries no chainwork field.
-    check "chainwork" notin paramsSrc.toLowerAscii() or
-          "AssumeutxoData does not store chainwork" in snapshotSrc
 
-  test "G17 BUG-6: AssumeutxoData has no chainwork field":
+  test "G17: AssumeutxoData carries chainwork for snapshot-boot grafting":
     let m = mainnetParams()
-    when compiles(m.assumeutxoData[0].chainWork):
-      check false # if this compiles after fix, audit must update.
-    # We can statically confirm the field doesn't exist by attempting
-    # field access in a `compiles()` block:
-    check (not compiles(m.assumeutxoData[0].chainWork))
+    check compiles(m.assumeutxoData[0].chainwork)
+    check compiles(m.assumeutxoData[0].baseTailHeaders)
 
 # ---------------------------------------------------------------------------
 # G18 — Work-exceeds post-check (BUG-7, P1, MISSING)
@@ -414,7 +411,7 @@ suite "W138 G21 — chainTxCount written to BlockIndex.nTx (BUG-9)":
       loadSnapshotProcStart
     )
     let body = snapshotSrc[loadSnapshotProcStart .. (if bodyEnd > 0: bodyEnd
-                                                    else: snapshotSrc.len - 1)]
+      else: snapshotSrc.len - 1)]
     check "chainTxCount" notin body
     check "nTx" notin body
     check "updateBlockIndex" notin body
@@ -464,8 +461,8 @@ suite "W138 G23 — dual-chainstate manager (BUG-11)":
     ## FIXED (AssumeUTXO dual-chainstate pilot): the snapshot-chainstate wrapper
     ## is now instantiated in the live loadtxoutset handler to drive the real
     ## background validation.
-    check "newSnapshotChainState" in snapshotSrc  # definition
-    check "newSnapshotChainState" in serverSrc    # now a production call site
+    check "newSnapshotChainState" in snapshotSrc # definition
+    check "newSnapshotChainState" in serverSrc # now a production call site
 
   test "G23 BUG-11 FIXED: background validation wired into loadtxoutset":
     ## FIXED (AssumeUTXO dual-chainstate pilot): the background validation
@@ -474,7 +471,7 @@ suite "W138 G23 — dual-chainstate manager (BUG-11)":
     ## The async `runBackgroundValidation` loop is retained for the
     ## interface but the synchronous `runSnapshotValidation` is the wired path.
     check "runSnapshotValidation" in snapshotSrc
-    check "runSnapshotValidation" in serverSrc          # wired into the RPC
+    check "runSnapshotValidation" in serverSrc # wired into the RPC
     check "activateSnapshotWithBackground" in serverSrc # builds the 2nd store
 
 # ---------------------------------------------------------------------------
@@ -645,14 +642,16 @@ suite "W138 X1 — AssumeutxoData struct shape":
     check d.height == 0'i32
     check d.chainTxCount == 0'u64
 
-  test "X1 BUG-6 cross-ref: AssumeutxoData has NO chainWork field":
+  test "X1: AssumeutxoData carries chainwork + baseTailHeaders for snapshot-boot":
     let d = AssumeutxoData(
       height: 0'i32,
       hashSerialized: default(array[32, byte]),
       chainTxCount: 0'u64,
       blockhash: BlockHash(default(array[32, byte]))
     )
-    check (not compiles(d.chainWork))
+    check compiles(d.chainwork)
+    check compiles(d.baseTailHeaders)
+    check d.baseTailHeaders.len == 0
 
 # ---------------------------------------------------------------------------
 # Cross-cutting: P3 cosmetic / contract

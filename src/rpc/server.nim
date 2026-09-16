@@ -117,6 +117,12 @@ type
                                           ## whose header sync hasn't reached the
                                           ## snapshot base yet — reporting
                                           ## bestHeight for `headers` masked both.
+    headerChainReloader*: proc() {.gcsafe, raises: [].}
+                                          ## Re-seed the live header chain from the
+                                          ## block index. Wired by startNode so
+                                          ## loadtxoutset can graft campaign
+                                          ## base_tail_headers after the sync
+                                          ## manager already exists. nil = no-op.
 
   RpcRequest = object
     jsonrpc: string
@@ -8178,6 +8184,11 @@ proc handleLoadTxOutSetImpl*(rpc: RpcServer, path: string): JsonNode =
   # still pending — do the same, before background validation.
   activateSnapshotAsActive(
     rpc.chainState, snapCs, snapCs.bestBlockHash, baseHeight)
+  # Graft campaign base_tail_headers into the live header index so
+  # getblockchaininfo.headers reports the snapshot base, not genesis.
+  discard persistAssumeutxoBaseHeaders(rpc.chainState, assumeData)
+  if rpc.headerChainReloader != nil:
+    rpc.headerChainReloader()
 
   # 2) Build the SECOND background chainstate (own store) + drive genesis->base.
   let activation = activateSnapshotWithBackground(

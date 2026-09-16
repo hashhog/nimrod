@@ -32,10 +32,10 @@ type
 
 type
   SyncState* = enum
-    ssIdle            ## Not syncing
-    ssSyncingHeaders  ## Downloading and validating headers
-    ssDownloadingBlocks  ## Downloading full block data
-    ssSynced          ## Fully synchronized
+    ssIdle              ## Not syncing
+    ssSyncingHeaders    ## Downloading and validating headers
+    ssDownloadingBlocks ## Downloading full block data
+    ssSynced            ## Fully synchronized
 
   SideHeader* = object
     ## A header that does NOT extend the active header chain — a competing
@@ -54,10 +54,10 @@ type
   HeaderChain* = object
     headers*: seq[BlockHeader]
     hashes*: seq[BlockHash]        ## Index -> hash mapping
-    byHash*: Table[BlockHash, int]  ## Hash -> index mapping
+    byHash*: Table[BlockHash, int] ## Hash -> index mapping
     tip*: BlockHash
     tipHeight*: int32
-    totalWork*: array[32, byte]  ## Cumulative work of the chain
+    totalWork*: array[32, byte]    ## Cumulative work of the chain
     # Competing-fork headers that branch BELOW the active tip.  Keyed by the
     # fork header's own hash.  Populated by handleHeaders' fork arm (does NOT
     # ban the peer); read by requestBlocks to walk the fork's ancestry and
@@ -68,26 +68,26 @@ type
   HeaderBatchRouting* = enum
     ## Outcome of classifying an incoming `headers` batch — mirrors the
     ## branching of Bitcoin Core's ProcessHeadersMessage (net_processing.cpp).
-    hbrUnconnecting   ## headers[0].prevBlock not in our header chain (BIP-130
+    hbrUnconnecting ## headers[0].prevBlock not in our header chain (BIP-130
                       ## announcement / transient reorg) — re-request, count
-    hbrAntiDoS        ## headers connect, but claimed work < anti-DoS
-                      ## threshold — must go through the PRESYNC pipeline
-    hbrDirect         ## headers connect AND already carry enough work
-                      ## (or threshold is zero / regtest) — validate directly
+    hbrAntiDoS ## headers connect, but claimed work < anti-DoS
+                 ## threshold — must go through the PRESYNC pipeline
+    hbrDirect ## headers connect AND already carry enough work
+                ## (or threshold is zero / regtest) — validate directly
 
   ## Statistics for header presync (anti-DoS tracking)
   HeadersPresyncStats* = object
-    work*: UInt256              ## Total verified work accumulated
-    height*: int64              ## Height reached (only valid in PRESYNC)
-    timestamp*: uint32          ## Block timestamp of last header (only valid in PRESYNC)
-    inPresync*: bool            ## True if in PRESYNC phase, false if in REDOWNLOAD
+    work*: UInt256     ## Total verified work accumulated
+    height*: int64     ## Height reached (only valid in PRESYNC)
+    timestamp*: uint32 ## Block timestamp of last header (only valid in PRESYNC)
+    inPresync*: bool   ## True if in PRESYNC phase, false if in REDOWNLOAD
 
   SyncManager* = ref object
     state*: SyncState
     headerChain*: HeaderChain
     peerManager*: PeerManager
     chainDb*: ChainDb
-    chainState*: ChainState  ## Full chain state for block connection
+    chainState*: ChainState ## Full chain state for block connection
     params*: ConsensusParams
     syncPeer*: Peer
     # Block download state
@@ -95,25 +95,25 @@ type
     pendingBlocks*: int
     lastSyncTime*: SyncTime
     # Separate tracking for header tip vs chain tip (CRITICAL pitfall)
-    headerTip*: BlockHash       ## Tip of validated headers
-    headerTipHeight*: int32     ## Height of header tip
-    chainTip*: BlockHash        ## Tip of fully validated blocks
-    chainTipHeight*: int32      ## Height of chain tip
+    headerTip*: BlockHash                                   ## Tip of validated headers
+    headerTipHeight*: int32                                 ## Height of header tip
+    chainTip*: BlockHash                                    ## Tip of fully validated blocks
+    chainTipHeight*: int32                                  ## Height of chain tip
     # Anti-DoS header sync state (per-peer PRESYNC/REDOWNLOAD)
-    peerHeadersSync*: Table[int64, HeadersSyncState]  ## peerId -> sync state
-    headersPresyncStats*: Table[int64, HeadersPresyncStats]  ## Per-peer stats
-    presyncBestPeer*: int64     ## Peer with most work in presync
-    presyncBestWork*: UInt256   ## Best work seen in presync
-    minimumChainWork*: UInt256  ## Anti-DoS work threshold
+    peerHeadersSync*: Table[int64, HeadersSyncState]        ## peerId -> sync state
+    headersPresyncStats*: Table[int64, HeadersPresyncStats] ## Per-peer stats
+    presyncBestPeer*: int64                                 ## Peer with most work in presync
+    presyncBestWork*: UInt256                               ## Best work seen in presync
+    minimumChainWork*: UInt256                              ## Anti-DoS work threshold
     # Block failure tracking
-    failedBlockHeight*: int32   ## Height of last failed block
-    failedBlockRetries*: int    ## Number of retries for the same block
-    maxBlockRetries*: int       ## Max retries before skipping script check (default 3)
+    failedBlockHeight*: int32                               ## Height of last failed block
+    failedBlockRetries*: int ## Number of retries for the same block
+    maxBlockRetries*: int ## Max retries before skipping script check (default 3)
     # Parallel script verification
-    numVerifyWorkers*: int      ## Thread pool size for parallel script verify (0 = auto)
+    numVerifyWorkers*: int ## Thread pool size for parallel script verify (0 = auto)
     # Out-of-order block buffer (blocks received ahead of chainTip)
-    receivedBlocks*: Table[int32, Block]  ## height -> block buffer
-    requestedHashes*: HashSet[BlockHash]  ## hashes currently in-flight
+    receivedBlocks*: Table[int32, Block]                    ## height -> block buffer
+    requestedHashes*: HashSet[BlockHash]                    ## hashes currently in-flight
     # Per-peer counter of consecutive unconnecting-headers messages.
     # Mirrors Bitcoin Core's `nUnconnectingHeaders` accounting in
     # net_processing.cpp::ProcessHeadersMessage.  When the count exceeds
@@ -123,13 +123,13 @@ type
     # Core and discards honest peers caught in transient reorgs.  See
     # CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
     # (Pattern B).
-    unconnectingHeaders*: Table[int64, int]  ## peerId -> count
+    unconnectingHeaders*: Table[int64, int] ## peerId -> count
     # Chain height at which the last header-tip repair was ATTEMPTED.  Guards
     # reconcileHeaderTip from re-running the O(bestHeight) block-index walk on
     # every sync-loop iteration when the persisted index cannot close the gap
     # (a truncated/corrupt index prefix).  A successful repair makes the cheap
     # invariant check short-circuit, so this only bounds the failing case.
-    headerTipRepairAt*: int32   ## chainTipHeight of last repair attempt
+    headerTipRepairAt*: int32 ## chainTipHeight of last repair attempt
     # Optional BIP-157 basic block-filter index — populated alongside each
     # connectBlock/connectBlockIBD when --blockfilterindex is set.  nil
     # when disabled.  Mirrors Core's `g_indexes` BaseIndex hook list:
@@ -172,13 +172,13 @@ const
   MaxNumUnconnectingHeadersMsgs* = 10
 
   # Block download constants
-  DownloadWindow* = 1024            ## Sliding window size for block requests
-  MaxBlocksPerPeer* = 16            ## Per-peer in-flight cap (avoid one slow peer blocking others)
-  BaseRequestTimeout* = 5           ## Base timeout in seconds
-  MaxRequestTimeout* = 64           ## Max timeout after adaptive scaling
-  BatchGetDataSize* = 64            ## Blocks per getdata message (batched for IBD throughput)
-  UtxoFlushInterval* = 500          ## Flush UTXO set every N blocks during IBD
-  InvWitnessBlockType* = 0x40000002'u32  ## Segwit block inv type
+  DownloadWindow* = 1024 ## Sliding window size for block requests
+  MaxBlocksPerPeer* = 16 ## Per-peer in-flight cap (avoid one slow peer blocking others)
+  BaseRequestTimeout* = 5 ## Base timeout in seconds
+  MaxRequestTimeout* = 64 ## Max timeout after adaptive scaling
+  BatchGetDataSize* = 64 ## Blocks per getdata message (batched for IBD throughput)
+  UtxoFlushInterval* = 500 ## Flush UTXO set every N blocks during IBD
+  InvWitnessBlockType* = 0x40000002'u32 ## Segwit block inv type
 
 type
   BlockRequest* = object
@@ -186,27 +186,27 @@ type
     height*: int32
     peer*: Peer
     requestTime*: SyncTime
-    timeout*: SyncDuration        ## Adaptive timeout per request
+    timeout*: SyncDuration ## Adaptive timeout per request
 
   PeerBlockState* = object
-    inFlight*: int                ## Blocks currently in-flight for this peer
-    lastStall*: SyncTime          ## Last time this peer stalled
-    currentTimeout*: int          ## Current timeout in seconds (adaptive)
-    consecutiveSuccess*: int      ## Consecutive successful block receipts
+    inFlight*: int           ## Blocks currently in-flight for this peer
+    lastStall*: SyncTime     ## Last time this peer stalled
+    currentTimeout*: int     ## Current timeout in seconds (adaptive)
+    consecutiveSuccess*: int ## Consecutive successful block receipts
 
   BlockDownloader* = ref object
     syncManager*: SyncManager
     pendingRequests*: Table[BlockHash, BlockRequest]
-    downloadWindow*: int          ## 1024 blocks
-    nextDownloadHeight*: int32    ## Next height to request
-    nextProcessHeight*: int32     ## Next height to process (in-order)
-    receivedBlocks*: Table[int32, Block]  ## Out-of-order buffer
-    requestTimeout*: SyncDuration ## Base timeout (30s default)
-    peerStates*: Table[string, PeerBlockState]  ## Per-peer tracking
-    ibdActive*: bool              ## True during initial block download
-    lastUtxoFlush*: int32         ## Height of last UTXO flush
-    blocksProcessed*: int         ## Total blocks processed
-    startTime*: SyncTime          ## IBD start time for stats
+    downloadWindow*: int                       ## 1024 blocks
+    nextDownloadHeight*: int32                 ## Next height to request
+    nextProcessHeight*: int32                  ## Next height to process (in-order)
+    receivedBlocks*: Table[int32, Block]       ## Out-of-order buffer
+    requestTimeout*: SyncDuration              ## Base timeout (30s default)
+    peerStates*: Table[string, PeerBlockState] ## Per-peer tracking
+    ibdActive*: bool                           ## True during initial block download
+    lastUtxoFlush*: int32                      ## Height of last UTXO flush
+    blocksProcessed*: int                      ## Total blocks processed
+    startTime*: SyncTime                       ## IBD start time for stats
 
 # =============================================================================
 # 256-bit arithmetic for proof of work calculations
@@ -249,7 +249,7 @@ proc calculateWork*(bits: uint32): array[32, byte] =
 
   # Long division algorithm
   var dividend: array[33, byte]
-  dividend[32] = 1  # This represents 2^256
+  dividend[32] = 1 # This represents 2^256
 
   # Result will be 32 bytes
   var remainder: array[33, byte]
@@ -261,7 +261,7 @@ proc calculateWork*(bits: uint32): array[32, byte] =
       remainder[j] = remainder[j - 1]
     remainder[0] = dividend[i]
 
-    if i < 32:  # Result bytes are for indices 0..31
+    if i < 32: # Result bytes are for indices 0..31
       # Find how many times targetPlusOne fits into remainder
       var quotient: byte = 0
       while true:
@@ -294,7 +294,7 @@ proc calculateWork*(bits: uint32): array[32, byte] =
 
         quotient += 1
         if quotient == 255:
-          break  # Prevent infinite loop
+          break # Prevent infinite loop
 
       result[i] = quotient
 
@@ -305,6 +305,18 @@ proc addWork*(a, b: array[32, byte]): array[32, byte] =
     let sum = uint16(a[i]) + uint16(b[i]) + carry
     result[i] = byte(sum and 0xFF)
     carry = sum shr 8
+
+proc subtractWork*(a, b: array[32, byte]): array[32, byte] =
+  ## Subtract two 256-bit work values (a - b). Caller must ensure a >= b.
+  var borrow: int16 = 0
+  for i in 0 ..< 32:
+    let diff = int16(a[i]) - int16(b[i]) - borrow
+    if diff < 0:
+      result[i] = byte(diff + 256)
+      borrow = 1
+    else:
+      result[i] = byte(diff)
+      borrow = 0
 
 proc compareWork*(a, b: array[32, byte]): int =
   ## Compare two 256-bit work values
@@ -336,7 +348,8 @@ proc initHeaderChain*(): HeaderChain =
     sideHeaders: initTable[BlockHash, SideHeader]()
   )
 
-proc initHeaderChain*(genesisHeader: BlockHeader, genesisHash: BlockHash): HeaderChain =
+proc initHeaderChain*(genesisHeader: BlockHeader,
+    genesisHash: BlockHash): HeaderChain =
   ## Initialize header chain with genesis block
   result = initHeaderChain()
   result.headers.add(genesisHeader)
@@ -356,16 +369,25 @@ proc getHeader*(hc: HeaderChain, hash: BlockHash): Option[BlockHeader] =
     none(BlockHeader)
 
 proc getHeaderByHeight*(hc: HeaderChain, height: int32): Option[BlockHeader] =
-  if height >= 0 and height < int32(hc.headers.len):
-    some(hc.headers[height])
-  else:
-    none(BlockHeader)
+  ## Height-index lookup that treats snapshot-graft holes as missing.
+  ## After assumeUTXO boot the seq is pre-sized to tipHeight+1 so index==height
+  ## still holds for the grafted suffix, but the gap below the tail is empty
+  ## and must not be returned as a real header.
+  if height < 0 or height >= int32(hc.headers.len) or
+      height >= int32(hc.hashes.len):
+    return none(BlockHeader)
+  let h = hc.hashes[height]
+  if hc.byHash.getOrDefault(h, -1) != int(height):
+    return none(BlockHeader)
+  some(hc.headers[height])
 
 proc getHashByHeight*(hc: HeaderChain, height: int32): Option[BlockHash] =
-  if height >= 0 and height < int32(hc.hashes.len):
-    some(hc.hashes[height])
-  else:
-    none(BlockHash)
+  if height < 0 or height >= int32(hc.hashes.len):
+    return none(BlockHash)
+  let h = hc.hashes[height]
+  if hc.byHash.getOrDefault(h, -1) != int(height):
+    return none(BlockHash)
+  some(h)
 
 proc getHeight*(hc: HeaderChain, hash: BlockHash): Option[int32] =
   ## Look up the height of a block by its hash
@@ -401,9 +423,21 @@ proc resolveParentWork*(hc: HeaderChain,
   ## the active chain's totalWork (Core nChainWork parity, one work path).
   if prevHash in hc.byHash:
     let idx = hc.byHash[prevHash]
-    var w: array[32, byte]
-    for i in 0 .. idx:
-      w = addWork(w, calculateWork(hc.headers[i].bits))
+    if idx == int(hc.tipHeight):
+      return some((height: int32(idx), totalWork: hc.totalWork))
+    if len(hc.byHash) == hc.headers.len:
+      var w: array[32, byte]
+      for i in 0 .. idx:
+        w = addWork(w, calculateWork(hc.headers[i].bits))
+      return some((height: int32(idx), totalWork: w))
+    # Snapshot-grafted chain: do not sum through the hole. Walk back from
+    # the tip, subtracting filled headers' work.
+    var w = hc.totalWork
+    var i = int(hc.tipHeight)
+    while i > idx:
+      if i < hc.hashes.len and hc.byHash.getOrDefault(hc.hashes[i], -1) == i:
+        w = subtractWork(w, calculateWork(hc.headers[i].bits))
+      dec i
     return some((height: int32(idx), totalWork: w))
   if prevHash in hc.sideHeaders:
     let sh = hc.sideHeaders[prevHash]
@@ -481,14 +515,14 @@ proc heaviestSideTip*(hc: HeaderChain): Option[SideHeader] =
 type
   DiffbitsOutcome* = enum
     ## Verdict of the Core validation.cpp:4088 gate for a single header.
-    dboOk            ## header.nBits == GetNextWorkRequired -> gate passed
-    dboBadDiffbits   ## header.nBits != GetNextWorkRequired -> header is
-                     ## INVALID; rejecting it (and penalising the sender) is
-                     ## fair.  Core token: "bad-diffbits".
-    dboUnevaluable   ## an ancestor the rule needs is not in OUR index, so we
-                     ## cannot compute the required nBits.  The header is NOT
-                     ## known-invalid — drop it, request the bridging headers,
-                     ## and do NOT penalise the peer.
+    dboOk          ## header.nBits == GetNextWorkRequired -> gate passed
+    dboBadDiffbits ## header.nBits != GetNextWorkRequired -> header is
+                   ## INVALID; rejecting it (and penalising the sender) is
+                   ## fair.  Core token: "bad-diffbits".
+    dboUnevaluable ## an ancestor the rule needs is not in OUR index, so we
+                   ## cannot compute the required nBits.  The header is NOT
+                   ## known-invalid — drop it, request the bridging headers,
+                   ## and do NOT penalise the peer.
 
 const HeaderErrCannotEvaluate* = "cannot-evaluate-diffbits"
   ## `validateHeader` error token for dboUnevaluable.  Callers MUST treat this
@@ -611,13 +645,15 @@ proc validateHeaderPoW*(header: BlockHeader): bool =
   let hash = BlockHash(doubleSha256(headerBytes))
   hashMeetsTarget(hash, header.bits)
 
-proc validateHeaderChainLink*(header: BlockHeader, prevHeader: BlockHeader): bool =
+proc validateHeaderChainLink*(header: BlockHeader,
+    prevHeader: BlockHeader): bool =
   ## Check that header links correctly to previous header (recomputes hash)
   let prevBytes = serialize(prevHeader)
   let prevHash = BlockHash(doubleSha256(prevBytes))
   header.prevBlock == prevHash
 
-proc validateHeaderChainLinkByHash*(header: BlockHeader, prevHash: BlockHash): bool =
+proc validateHeaderChainLinkByHash*(header: BlockHeader,
+    prevHash: BlockHash): bool =
   ## Check that header links correctly to previous header using stored hash
   header.prevBlock == prevHash
 
@@ -628,8 +664,9 @@ proc getMedianTimePastFromChain*(hc: HeaderChain, height: int32): uint32 =
 
   let startHeight = max(0, height - MedianTimeSpan + 1)
   for h in startHeight .. height:
-    if h < int32(hc.headers.len):
-      timestamps.add(hc.headers[h].timestamp)
+    let hdr = hc.getHeaderByHeight(h)
+    if hdr.isSome:
+      timestamps.add(hdr.get().timestamp)
 
   if timestamps.len == 0:
     return 0
@@ -637,16 +674,18 @@ proc getMedianTimePastFromChain*(hc: HeaderChain, height: int32): uint32 =
   timestamps.sort()
   timestamps[timestamps.len div 2]
 
-proc validateHeaderMTP*(header: BlockHeader, hc: HeaderChain, height: int32): bool =
+proc validateHeaderMTP*(header: BlockHeader, hc: HeaderChain,
+    height: int32): bool =
   ## Validate that header timestamp is greater than MTP of previous 11 blocks
   if height == 0:
-    return true  # Genesis has no MTP requirement
+    return true # Genesis has no MTP requirement
 
   let mtp = getMedianTimePastFromChain(hc, height - 1)
   header.timestamp > mtp
 
 proc validateDifficultyRetarget*(header: BlockHeader, hc: HeaderChain,
-                                  height: int32, params: ConsensusParams): bool =
+                                  height: int32,
+                                      params: ConsensusParams): bool =
   ## DEPRECATED — kept only so out-of-tree callers keep compiling.
   ##
   ## This used to be the header path's difficulty check, and it was wrong twice
@@ -664,12 +703,13 @@ proc validateDifficultyRetarget*(header: BlockHeader, hc: HeaderChain,
   ## admission path needs to tell "invalid header" apart from "we cannot
   ## evaluate the rule".  Use `checkHeaderDiffbits` instead.
   if height == 0:
-    return true  # Genesis has no parent to measure against.
+    return true # Genesis has no parent to measure against.
   checkHeaderDiffbits(hc, header, params) == dboOk
 
 proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
                      params: ConsensusParams,
-                     minPowChecked: bool = true): tuple[valid: bool, error: string] =
+                     minPowChecked: bool = true): tuple[valid: bool,
+                         error: string] =
   ## Full header validation
   ##
   ## minPowChecked: true if the PRESYNC anti-DoS pipeline has already
@@ -701,10 +741,11 @@ proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
   # used here only to name "our tip"; it plays no part in resolving the
   # candidate's retarget ancestors below.)
   if height > 0:
-    if height - 1 >= int32(hc.hashes.len):
+    let prevHashOpt = hc.getHashByHeight(height - 1)
+    if prevHashOpt.isNone:
       return (false, "previous header not found")
 
-    let prevHash = hc.hashes[height - 1]
+    let prevHash = prevHashOpt.get()
     if not validateHeaderChainLinkByHash(header, prevHash):
       return (false, "header does not link to previous")
 
@@ -779,7 +820,8 @@ proc loadHeaderChainFromDb*(chainDb: ChainDb,
 
   var prevHash = genesisHash
   var loaded: int32 = 0
-  for height in 1'i32 .. bestHeight:
+  var height = 1'i32
+  while height <= bestHeight:
     let hashOpt = chainDb.getBlockHashByHeight(height)
     if hashOpt.isNone:
       warn "header-chain reload: missing height->hash, stopping",
@@ -813,9 +855,78 @@ proc loadHeaderChainFromDb*(chainDb: ChainDb,
     result.totalWork = idx.totalWork
     prevHash = hash
     inc loaded
+    inc height
 
-  info "reloaded header chain from block index",
-       tipHeight = result.tipHeight, bestHeight = bestHeight, loaded = loaded
+  if height > bestHeight:
+    info "reloaded header chain from block index",
+         tipHeight = result.tipHeight, bestHeight = bestHeight, loaded = loaded
+    return
+
+  # Gap in the genesis-rooted prefix. A truncated IBD index (missing a
+  # middle height) keeps the clean prefix — live header sync rebuilds the
+  # rest. The assumeUTXO snapshot case is different: nothing after genesis
+  # (height still 1) but bestHeight has a contiguous suffix of BlockIndex
+  # rows (the persisted base_tail_headers band). Graft that suffix at its
+  # real heights so the header chain presents the snapshot base, not 0.
+  if height > 1:
+    info "reloaded header chain from block index",
+         tipHeight = result.tipHeight, bestHeight = bestHeight, loaded = loaded
+    return
+
+  let tipHashOpt = chainDb.getBlockHashByHeight(bestHeight)
+  if tipHashOpt.isNone:
+    info "reloaded header chain from block index",
+         tipHeight = result.tipHeight, bestHeight = bestHeight, loaded = loaded
+    return
+  let tipIdxOpt = chainDb.getBlockIndex(tipHashOpt.get())
+  if tipIdxOpt.isNone:
+    info "reloaded header chain from block index",
+         tipHeight = result.tipHeight, bestHeight = bestHeight, loaded = loaded
+    return
+
+  var suffix: seq[chainstate.BlockIndex] = @[tipIdxOpt.get()]
+  var cursor = tipIdxOpt.get()
+  while int32(suffix.len) < bestHeight:
+    let parentOpt = chainDb.getBlockIndex(cursor.prevHash)
+    if parentOpt.isNone:
+      break
+    let parent = parentOpt.get()
+    if parent.hash == genesisHash:
+      break
+    suffix.add(parent)
+    cursor = parent
+  suffix.reverse()
+
+  if suffix.len == 0 or suffix[^1].height != bestHeight:
+    info "reloaded header chain from block index",
+         tipHeight = result.tipHeight, bestHeight = bestHeight, loaded = loaded
+    return
+  var linked = true
+  for i in 1 ..< suffix.len:
+    if suffix[i].header.prevBlock != suffix[i - 1].hash or
+        suffix[i].height != suffix[i - 1].height + 1:
+      linked = false
+      break
+  if not linked:
+    warn "header-chain reload: snapshot suffix not contiguous, leaving genesis"
+    return
+
+  result.headers.setLen(int(bestHeight) + 1)
+  result.hashes.setLen(int(bestHeight) + 1)
+  for idx in suffix:
+    let i = int(idx.height)
+    if i <= 0 or i > int(bestHeight):
+      continue
+    result.headers[i] = idx.header
+    result.hashes[i] = idx.hash
+    result.byHash[idx.hash] = i
+  result.tip = suffix[^1].hash
+  result.tipHeight = bestHeight
+  result.totalWork = suffix[^1].totalWork
+  loaded = int32(suffix.len)
+  info "reloaded header chain from snapshot suffix",
+       tipHeight = result.tipHeight, bestHeight = bestHeight,
+       firstHeight = suffix[0].height, loaded = loaded
 
 proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
                      params: ConsensusParams,
@@ -1154,7 +1265,7 @@ proc tryLowWorkHeadersSync*(sm: SyncManager, peer: Peer,
   if headers.len < MaxHeadersPerRequest:
     debug "ignoring low-work headers (incomplete message)",
           peer = $peer, headers = headers.len, work = $totalWork
-    headers = @[]  # Clear headers to prevent normal processing
+    headers = @[] # Clear headers to prevent normal processing
     return true
 
   # Initialize header sync state for this peer
@@ -1364,20 +1475,42 @@ proc classifyHeaderBatch*(sm: SyncManager,
   result.connectBits = sm.headerChain.headers[connectIdx].bits
 
   # Cumulative work up to (and including) the connection point.  Core reads
-  # chain_start_header->nChainWork directly; nimrod's header chain does not
-  # cache per-index chainwork, so it is summed here.
-  var startWork = initUInt256()
-  for i in 0 .. connectIdx:
-    startWork = startWork + headerssync.getBlockProof(sm.headerChain.headers[i])
-  result.connectWork = startWork
+  # chain_start_header->nChainWork directly.  On a dense genesis-rooted chain
+  # nimrod sums per-header proofs; on a snapshot-grafted chain (holes below
+  # the tail) summing would count empty slots, so use the cached tip work
+  # and subtract filled headers above the connect point.
+  if connectIdx == int(sm.headerChain.tipHeight):
+    result.connectWork = initUInt256(sm.headerChain.totalWork)
+  elif len(sm.headerChain.byHash) == sm.headerChain.headers.len:
+    var startWork = initUInt256()
+    for i in 0 .. connectIdx:
+      startWork = startWork + headerssync.getBlockProof(sm.headerChain.headers[i])
+    result.connectWork = startWork
+  else:
+    var w = initUInt256(sm.headerChain.totalWork)
+    var i = int(sm.headerChain.tipHeight)
+    while i > connectIdx:
+      if i < sm.headerChain.hashes.len and
+          sm.headerChain.byHash.getOrDefault(sm.headerChain.hashes[i], -1) == i:
+        w = w - headerssync.getBlockProof(sm.headerChain.headers[i])
+      dec i
+    result.connectWork = w
 
   # Core TryLowWorkHeadersSync: total_work = chain_start.nChainWork +
   # CalculateClaimedHeadersWork(headers); if total_work < GetAntiDoSWorkThreshold()
   # the batch must go through the PRESYNC pipeline.
   let claimedWork = calculateClaimedHeadersWork(headers)
-  let totalWork = startWork + claimedWork
+  let totalWork = result.connectWork + claimedWork
   let threshold = sm.getAntiDoSWorkThreshold()
-  if totalWork < threshold:
+  # Snapshot-grafted chain: the assumeUTXO base is a trusted mid-chain tip
+  # whose nChainWork is below nMinimumChainWork (campaign rungs). Extending
+  # that tip must not enter PRESYNC — the replay peer only serves the window,
+  # and PRESYNC would leave getblockchaininfo.headers frozen at the base.
+  # Dense genesis-rooted chains (byHash.len == headers.len) still PRESYNC.
+  let grafted = len(sm.headerChain.byHash) < sm.headerChain.headers.len
+  if grafted and firstPrev == sm.headerChain.tip:
+    result.routing = hbrDirect
+  elif totalWork < threshold:
     result.routing = hbrAntiDoS
   else:
     # Enough work already (or threshold == 0 on regtest): validate directly.
@@ -1402,7 +1535,7 @@ proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
   discard sm.reconcileHeaderTip()
 
   let locator = sm.buildBlockLocator()
-  let hashStop = default(array[32, byte])  # Get as many as possible
+  let hashStop = default(array[32, byte]) # Get as many as possible
 
   try:
     await peer.sendGetHeaders(
@@ -1422,15 +1555,15 @@ proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
 
 type ForkHeaderOutcome* = enum
   ## Result of trying to accept a header that does NOT extend the active tip.
-  fhoAccepted        ## stored as a competing-fork header (do NOT ban)
-  fhoNotFork         ## parent is unknown — caller treats as a genuine bad header
-  fhoBadPow          ## PoW failed — caller bans (genuine-bad)
-  fhoBadDiffbits     ## nBits != GetNextWorkRequired — the header IS invalid
-                     ## (Core "bad-diffbits", validation.cpp:4088); caller bans
-  fhoCannotEvaluate  ## an ancestor the difficulty rule needs is missing from
-                     ## OUR index.  The header is NOT known-invalid — caller
-                     ## drops it, asks for the bridging headers, and applies
-                     ## NO peer penalty.  Our gap is not peer misbehaviour.
+  fhoAccepted       ## stored as a competing-fork header (do NOT ban)
+  fhoNotFork        ## parent is unknown — caller treats as a genuine bad header
+  fhoBadPow         ## PoW failed — caller bans (genuine-bad)
+  fhoBadDiffbits    ## nBits != GetNextWorkRequired — the header IS invalid
+                    ## (Core "bad-diffbits", validation.cpp:4088); caller bans
+  fhoCannotEvaluate ## an ancestor the difficulty rule needs is missing from
+                    ## OUR index.  The header is NOT known-invalid — caller
+                    ## drops it, asks for the bridging headers, and applies
+                    ## NO peer penalty.  Our gap is not peer misbehaviour.
 
 proc acceptForkHeader*(sm: SyncManager, header: BlockHeader,
                        hash: BlockHash,
@@ -1614,7 +1747,8 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
       # CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
       # (Pattern B).
       let pid = getPeerId(peer)
-      sm.unconnectingHeaders[pid] = sm.unconnectingHeaders.getOrDefault(pid, 0) + 1
+      sm.unconnectingHeaders[pid] = sm.unconnectingHeaders.getOrDefault(pid,
+          0) + 1
       let count = sm.unconnectingHeaders[pid]
       if count > MaxNumUnconnectingHeadersMsgs:
         warn "peer exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS, banning",
@@ -1748,7 +1882,8 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
     # params.minimumChainWork is non-zero.  Raw direct-peer headers arrive
     # with minPowChecked=false; PRESYNC-validated batches arrive with true.
     let (valid, error) = validateHeader(header, sm.headerChain, expectedHeight,
-                                        sm.params, minPowChecked = minPowChecked)
+                                        sm.params,
+                                        minPowChecked = minPowChecked)
     if not valid:
       if isUnevaluableHeaderError(error):
         # W168: "we could not evaluate the rule", NOT "the header is invalid".
@@ -1974,7 +2109,7 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   let candidate = sm.headerChain.heaviestSideTip()
   if candidate.isSome and
      compareWork(candidate.get().totalWork, sm.headerChain.totalWork) > 0:
-    var forkHashes: seq[BlockHash]   # collected tip-down, requested fork-point-up
+    var forkHashes: seq[BlockHash] # collected tip-down, requested fork-point-up
     var cur = candidate.get().header
     var curHash = BlockHash(doubleSha256(serialize(cur)))
     var depth = 0
@@ -2059,7 +2194,8 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     # (`if i == peers.len - 1: inventory.len`), so a large window could
     # dump 50+ blocks on one peer.
     let blocksPerPeer = max(1, min(MaxBlocksPerPeer,
-                                   (inventory.len + peers.len - 1) div peers.len))
+                                   (inventory.len + peers.len -
+                                       1) div peers.len))
     var idx = 0
     var totalSent = 0
     for p in peers:
@@ -2296,7 +2432,8 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
     # OUTSIDE the captureUndo gate — otherwise enabling --txospenderindex alone
     # (with filter/coinstats off) would never populate it.
     try:
-      discard sm.txoSpenderIndex.addBlock(blk, hash, height, chainstate.BlockUndo())
+      discard sm.txoSpenderIndex.addBlock(blk, hash, height,
+          chainstate.BlockUndo())
     except CatchableError:
       discard
     except Exception:
@@ -2323,10 +2460,10 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
       {.gcsafe.}:
         let cryptoOff = newCryptoEngine()
         let resOff = acceptBlock(blk, prevIdxOff, sm.chainDb, sm.params,
-                                 skipScripts = true,   # no UTXO set offline
-                                 checkPow = true,
-                                 getUtxo = noUtxo,
-                                 crypto = cryptoOff)
+                                 skipScripts = true, # no UTXO set offline
+          checkPow = true,
+          getUtxo = noUtxo,
+          crypto = cryptoOff)
         if not resOff.isOk:
           warn "block failed consensus checks (offline applyBlock)",
                height = height, error = $resOff.error
@@ -2354,7 +2491,8 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
 
   true
 
-proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [CatchableError].} =
+proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [
+    CatchableError].} =
   ## LIVENESS FIX (B).  Connect successors of the chain tip whose bodies are
   ## ALREADY persisted, without waiting for them to arrive over the network.
   ##
@@ -2386,7 +2524,7 @@ proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [CatchableErro
       break
     let blkOpt = sm.chainDb.getBlock(hashOpt.get())
     if blkOpt.isNone:
-      break                       # not on disk: the normal download path owns it
+      break # not on disk: the normal download path owns it
     let blk = blkOpt.get()
     # Only connect a DIRECT successor of the current tip.  Guards against
     # connecting across a gap if the header chain and the chain tip ever
@@ -2596,7 +2734,7 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
         sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlock, "mutated block")
       return false
     sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
-    sm.lastSyncTime = getTime()  # Reset timeout on progress
+    sm.lastSyncTime = getTime() # Reset timeout on progress
     # Drain any buffered blocks that now connect
     sm.drainBlockBuffer()
     return true
@@ -2612,7 +2750,7 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
     sm.lastSyncTime = getTime()
     # Don't decrement pendingBlocks here - it will be decremented when
     # the block is actually processed from the buffer in drainBlockBuffer
-    return true  # Successfully received, just not yet applied
+    return true # Successfully received, just not yet applied
   else:
     # Block is behind our chain tip or too far ahead - discard
     sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
@@ -2670,9 +2808,9 @@ proc startHeaderSync*(sm: SyncManager) {.async.} =
 
 proc syncLoop*(sm: SyncManager) {.async.} =
   ## Main sync loop
-  sm.maxBlockRetries = 3  # Skip script verification after 3 failures on same block
+  sm.maxBlockRetries = 3 # Skip script verification after 3 failures on same block
   var consecutiveTimeouts = 0
-  var lastTimeoutHeight = sm.chainTipHeight  # Track height at last timeout to detect progress
+  var lastTimeoutHeight = sm.chainTipHeight # Track height at last timeout to detect progress
 
   while true:
     let peer = sm.selectSyncPeer()
@@ -2688,7 +2826,7 @@ proc syncLoop*(sm: SyncManager) {.async.} =
         await sm.startHeaderSync()
       elif not sm.isSynced():
         sm.state = ssDownloadingBlocks
-        sm.lastSyncTime = getTime()  # Reset timer on state transition
+        sm.lastSyncTime = getTime() # Reset timer on state transition
       else:
         sm.state = ssSynced
       # Always sleep in ssIdle to prevent tight loop when cycling states
@@ -2911,7 +3049,7 @@ proc getPeerState*(dl: BlockDownloader, peer: Peer): var PeerBlockState =
   if key notin dl.peerStates:
     dl.peerStates[key] = PeerBlockState(
       inFlight: 0,
-      lastStall: getTime() - initDuration(hours = 1),  # Far in past
+      lastStall: getTime() - initDuration(hours = 1), # Far in past
       currentTimeout: BaseRequestTimeout,
       consecutiveSuccess: 0
     )
@@ -2995,7 +3133,7 @@ proc requestBlocks*(dl: BlockDownloader) {.async.} =
     # Select peer for this request
     let peer = dl.selectPeerForRequest()
     if peer == nil:
-      break  # No available peers
+      break # No available peers
 
     let key = peerKey(peer)
 
@@ -3070,7 +3208,8 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
     # Validate block structure (cheap checks: merkle root, weight, etc.)
     let checkResult = checkBlock(blk, sm.params)
     if not checkResult.isOk:
-      warn "invalid block during IBD", height = height, error = $checkResult.error
+      warn "invalid block during IBD", height = height,
+          error = $checkResult.error
       dl.receivedBlocks.del(height)
       continue
 
@@ -3139,7 +3278,8 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
       # data, so it is fed OUTSIDE the captureUndo gate (see the linear-connect
       # site above for rationale).
       try:
-        discard sm.txoSpenderIndex.addBlock(blk, hashPRB, height, chainstate.BlockUndo())
+        discard sm.txoSpenderIndex.addBlock(blk, hashPRB, height,
+            chainstate.BlockUndo())
       except CatchableError:
         discard
       except Exception:
@@ -3152,10 +3292,12 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
                             chainstate.BlockIndex(height: -1'i32,
                               hash: BlockHash(default(array[32, byte])))
                           else:
-                            let p = sm.chainDb.getBlockIndex(blk.header.prevBlock)
+                            let p = sm.chainDb.getBlockIndex(
+                                blk.header.prevBlock)
                             if p.isNone:
                               warn "processReceivedBlocks(offline): prev index not found",
-                                   height = height, prevHash = $blk.header.prevBlock
+                                   height = height,
+                                       prevHash = $blk.header.prevBlock
                               dl.receivedBlocks.del(height)
                               continue
                             p.get()
@@ -3273,7 +3415,7 @@ proc handleStaleRequests*(dl: BlockDownloader) {.async.} =
       # Double timeout, capped at max
       peerState.currentTimeout = min(MaxRequestTimeout,
                                       peerState.currentTimeout * 2)
-      peerState.inFlight = 0  # Reset in-flight count (requests will be re-queued)
+      peerState.inFlight = 0 # Reset in-flight count (requests will be re-queued)
       dl.peerStates[key] = peerState
 
       debug "increased peer timeout due to stall", peer = key,
@@ -3283,8 +3425,9 @@ proc handleStaleRequests*(dl: BlockDownloader) {.async.} =
   for hash, request in dl.pendingRequests:
     let pk = peerKey(request.peer)
     if pk in stalePeers:
-      dl.syncManager.peerManager.misbehavingPeer(request.peer, ScoreBlockDownloadStall, "block download stalling")
-      break  # One score per peer is enough
+      dl.syncManager.peerManager.misbehavingPeer(request.peer,
+          ScoreBlockDownloadStall, "block download stalling")
+      break # One score per peer is enough
 
   # Re-queue stale requests for reassignment
   for hash in staleRequests:

@@ -2395,6 +2395,16 @@ proc startNode*(config: NimrodConfig) {.async.} =
       # loadSnapshot writes coins + cfMeta tip but not the height -> hash
       # slot, so getblockhash(base) returned empty (boot-smoke cliload FAIL).
       writeSnapshotActivationIndex(state.chainState)
+      # Persist campaign base_tail_headers so loadHeaderChainFromDb (a few
+      # steps later) reconstructs a header chain whose tip is the snapshot
+      # base, not genesis. Without this, getblockchaininfo.headers stays 0
+      # and the locator is seeded at the base hash the header chain does
+      # not hold — every peer batch is unconnecting.
+      let nTail = persistAssumeutxoBaseHeaders(state.chainState,
+                                               params.assumeutxoData)
+      if nTail > 0:
+        info "snapshot base-tail headers persisted",
+          count = nTail, height = state.chainState.bestHeight
       info "snapshot loaded",
         coins = r.coinsLoaded,
         height = state.chainState.bestHeight,
@@ -2936,6 +2946,17 @@ proc startNode*(config: NimrodConfig) {.async.} =
       if sync != nil:
         state.rpcServer.headerTipProvider = proc(): int32 {.gcsafe, raises: [].} =
           sync.headerChain.tipHeight
+        state.rpcServer.headerChainReloader = proc() {.gcsafe, raises: [].} =
+          try:
+            let rebuilt = loadHeaderChainFromDb(sync.chainDb, sync.params)
+            sync.headerChain = rebuilt
+            sync.headerTip = rebuilt.tip
+            sync.headerTipHeight = rebuilt.tipHeight
+            if sync.chainState != nil and rebuilt.headers.len > 0:
+              sync.chainState.updateBestHeaderInfo(
+                rebuilt.totalWork, rebuilt.tipHeight, rebuilt.headers[^1].bits)
+          except CatchableError:
+            discard
 
     # Wire the BlockFileManager so getblockchaininfo and pruneblockchain
     # answer correctly. The handler also reads `pruner` (when non-nil) for
