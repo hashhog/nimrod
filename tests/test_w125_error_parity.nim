@@ -259,18 +259,12 @@ suite "W125 Gate 11: -20 RPC_DATABASE_ERROR — MISSING":
 # 28 Core raise sites for TX/block/PSBT/script decode failures.
 # ===========================================================================
 suite "W125 Gate 12: -22 RPC_DESERIALIZATION_ERROR — MISSING (xfail)":
-  test "xfail — sendrawtransaction non-hex bytes currently -32602":
-    ## TODO(W125 Gate 12): expected -22 RPC_DESERIALIZATION_ERROR.
-    ## See server.nim:2996 "TX decode failed".
+  test "PRESENT — sendrawtransaction non-hex bytes is -22":
+    ## Closed by the T1 R5 probe parity fix: Core DecodeHexTx → -22.
     let rpc = minimalRpcServer()
-    # Pass odd-length / invalid hex to trigger the decode-failed path.
-    # Note: depending on how parsing fails, the error may surface as
-    # -32602 (caught by the try/except in handleSendRawTransaction) or
-    # -32603 (if it escapes to the dispatcher).
     let r = rpc.rpcMethodErr("sendrawtransaction", %*["xx"])
-    # Both -32602 and -32603 are wrong; Core says -22.
-    check r.code in [-32602, -32603]
-    check r.code != -22  # the gap
+    check r.code == -22
+    check r.msg == "TX decode failed. Make sure the tx has at least one input."
 
   test "PRESENT — decoderawtransaction non-hex bytes is -22":
     ## Closed by the T2 R5 probe parity fix: Core DecodeHexTx → -22.

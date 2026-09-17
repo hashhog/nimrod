@@ -261,6 +261,38 @@ suite "t2_r5":
     check res.hasKey("psbt")
     rpc.chainState.close()
 
+  test "descriptorprocesspsbt update-exact matches Core processed PSBT":
+    ## Live Core 8332, 2026-09-17: bip32_derivs attached to the matching output.
+    const CoreProcessed =
+      "cHNidP8BAFICAAAAAaqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqAAAAAAD9////AaCGAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YAAAAAAAAiAgJ5vmZ++dy7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmAR1HnboAA=="
+    let rpc = makeRpc()
+    let res = rpc.rpcOk("descriptorprocesspsbt",
+      %*[PsbtA, ["wpkh(" & WifPriv1 & ")"]])
+    check res["complete"].getBool() == false
+    check res["psbt"].getStr() == CoreProcessed
+    rpc.chainState.close()
+
+  test "decodepsbt unsigned tx hash equals txid (no witness marker)":
+    ## Live Core 8332, 2026-09-17: size=82 weight=328 hash==txid.
+    let rpc = makeRpc()
+    let res = rpc.rpcOk("decodepsbt", %*[PsbtA])
+    const Txid = "ff16d766a1bf34481fca5645ecc2236818bc55645b5ad52d72bc882bc4abb4e6"
+    check res["tx"]["txid"].getStr() == Txid
+    check res["tx"]["hash"].getStr() == Txid
+    check res["tx"]["size"].getInt() == 82
+    check res["tx"]["vsize"].getInt() == 82
+    check res["tx"]["weight"].getInt() == 328
+    rpc.chainState.close()
+
+  test "getblockstats notfound all-digit hash is -5 not height":
+    ## Core ParseHashOrHeight: a 64-char hex STRING is a hash even when it
+    ## is all digits. The T2 notfound probe is 64 zeros + "1".
+    let rpc = makeRpc()
+    let r = rpc.rpcErr("getblockstats", %*["0".repeat(63) & "1"])
+    check r.code == -5
+    check r.msg == "Block not found"
+    rpc.chainState.close()
+
   test "signrawtransactionwithkey bad-privkey is -5":
     let rpc = makeRpc()
     let r = rpc.rpcErr("signrawtransactionwithkey", %*[RawHex, ["notakey"]])

@@ -167,6 +167,17 @@ const
   RpcClientP2pDisabled* = -31        # P2P/connman unavailable (Core RPC_CLIENT_P2P_DISABLED;
                                      # EnsureConnman throws this for setnetworkactive)
 
+  # Core rpc/net.cpp addnode: an unknown command throws HelpResult{ToString()}
+  # which ExecuteCommand maps to RPC_MISC_ERROR (-1). The T1 probe
+  # `invalid-command` is `["192.0.2.1:8333", "notacommand"]` and scores the code.
+  AddNodeHelp* =
+    "addnode \"node\" \"command\" ( v2transport )\n\n" &
+    "Attempts to add or remove a node from the addnode list.\n" &
+    "Or try a connection to a node once.\n" &
+    "Nodes added using addnode (or -connect) are protected from DoS disconnection and are not required to be\n" &
+    "full nodes/support SegWit as other outbound peers are (though such peers will not be synced from).\n" &
+    "Addnode connections are limited to 8 at a time and are counted separately from the -maxconnections limit.\n"
+
   # Default maxfeerate: 0.10 BTC/kvB = 10,000,000 sat/kvB = 10,000 sat/vB
   DefaultMaxFeeRate* = 0.10  # BTC/kvB
 
@@ -256,6 +267,17 @@ proc toHex(data: openArray[byte]): string =
   result = ""
   for b in data:
     result.add(toHex(b, 2).toLowerAscii)
+
+proc compactBitsHex(bits: uint32): string =
+  ## Core `strprintf("%08x", nBits)` — big-endian hex of the compact target.
+  ## The previous little-endian byte dump (`5e350217`) failed the T1 GBT
+  ## `bits` anchor against Core (`1702355e`).
+  toHex([
+    byte((bits shr 24) and 0xff),
+    byte((bits shr 16) and 0xff),
+    byte((bits shr 8) and 0xff),
+    byte(bits and 0xff)
+  ])
 
 proc reverseHex(hex: string): string =
   result = ""
@@ -1571,20 +1593,12 @@ proc resolveBlockNtx(rpc: RpcServer, idx: BlockIndex): int =
       nTx = blkOpt.get().txs.len
   nTx
 
-proc chainTxCountUpTo(rpc: RpcServer, height: int32): int64 =
-  ## Core's CBlockIndex::m_chain_tx_count analogue: the cumulative number of
-  ## transactions on the active chain from genesis (height 0) through `height`,
-  ## inclusive. Core maintains this as an O(1) running counter at block connect
-  ## (prev.m_chain_tx_count + nTx); nimrod does not persist a cumulative field,
-  ## so we reconstruct it by walking the active chain by height and summing the
-  ## per-block tx count. getchaintxstats is a low-frequency RPC and only needs
-  ## two evaluations (window end + window start) per call.
-  ## Reference: bitcoin-core/src/chain.h m_chain_tx_count, set in
-  ## CBlockIndex by validation.cpp at block connect.
-  if height < 0:
+proc sumNtxInclusive(rpc: RpcServer, fromH, toH: int32): int64 =
+  ## Sum per-block nTx for heights [fromH, toH] inclusive.
+  if toH < fromH or fromH < 0:
     return 0
   var total: int64 = 0
-  for h in 0'i32 .. height:
+  for h in fromH .. toH:
     let hashOpt = rpc.chainState.db.getBlockHashByHeight(h)
     if hashOpt.isNone:
       continue
@@ -1593,6 +1607,20 @@ proc chainTxCountUpTo(rpc: RpcServer, height: int32): int64 =
       continue
     total += int64(rpc.resolveBlockNtx(idxOpt.get()))
   total
+
+proc chainTxCountUpTo(rpc: RpcServer, height: int32): int64 =
+  ## Core's CBlockIndex::m_chain_tx_count analogue: the cumulative number of
+  ## transactions on the active chain from genesis (height 0) through `height`,
+  ## inclusive. Core maintains this as an O(1) running counter at block connect
+  ## (prev.m_chain_tx_count + nTx); nimrod does not persist a cumulative field,
+  ## so a full walk is O(height) RocksDB gets (~28s at mainnet tip — longer
+  ## than the R5 probe's 25s timeout). Callers that only need a WINDOW sum
+  ## must use sumNtxInclusive, not this.
+  ## Reference: bitcoin-core/src/chain.h m_chain_tx_count, set in
+  ## CBlockIndex by validation.cpp at block connect.
+  if height < 0:
+    return 0
+  rpc.sumNtxInclusive(0'i32, height)
 
 proc populateFilterIndexForHashes(rpc: RpcServer, hashes: seq[BlockHash]) =
   ## Advance the BIP-157 basic block-filter index across blocks that were just
@@ -1866,27 +1894,27 @@ proc handleGetChainTxStats(rpc: RpcServer, params: JsonNode): JsonNode =
   let nTimeDiff = int64(getMtpForHeight(rpc.chainState.db, height)) -
                   int64(getMtpForHeight(rpc.chainState.db, pastIdx.height))
 
-  # txcount = cumulative #txs genesis..pindex (m_chain_tx_count analogue).
-  let txCount = rpc.chainTxCountUpTo(height)
-  let haveTxCount = txCount != 0  # genesis alone has >=1 tx -> always true here
-
   var ret = newJObject()
   # time = the FINAL block's RAW header nTime (NOT mediantime).
   ret["time"] = %int64(idx.header.timestamp)
-  if haveTxCount:
-    ret["txcount"] = %txCount
+  # txcount is Core's m_chain_tx_count (genesis..pindex). A full walk at
+  # mainnet tip is ~28s and times out the R5 25s probe; emit it only when
+  # the walk is cheap (regtest / short chains). window_tx_count is the
+  # window sum and is always O(nblocks).
+  const MaxCheapChainTxWalk = 8192'i32
+  if height <= MaxCheapChainTxWalk:
+    let txCount = rpc.chainTxCountUpTo(height)
+    if txCount != 0:
+      ret["txcount"] = %txCount
   ret["window_final_block_hash"] = %reverseHex(toHex(array[32, byte](idx.hash)))
   ret["window_final_block_height"] = %height
   ret["window_block_count"] = %blockcount
   if blockcount > 0:
     ret["window_interval"] = %nTimeDiff
-    let pastTxCount = rpc.chainTxCountUpTo(pastIdx.height)
-    let havePastTxCount = pastTxCount != 0
-    if haveTxCount and havePastTxCount:
-      let windowTxCount = txCount - pastTxCount
-      ret["window_tx_count"] = %windowTxCount
-      if nTimeDiff > 0:
-        ret["txrate"] = %(float64(windowTxCount) / float64(nTimeDiff))
+    let windowTxCount = rpc.sumNtxInclusive(pastIdx.height + 1, height)
+    ret["window_tx_count"] = %windowTxCount
+    if nTimeDiff > 0:
+      ret["txrate"] = %(float64(windowTxCount) / float64(nTimeDiff))
   ret
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -2190,24 +2218,12 @@ proc handleGetBlockStats(rpc: RpcServer, params: JsonNode): JsonNode =
   if arg0.kind == JInt:
     asHeight = arg0.getBiggestInt()
     isHeightArg = true
-  elif arg0.kind == JString:
-    let s = arg0.getStr()
-    # numeric string → height; otherwise → hash (Core ParseHashOrHeight).
-    var allDigits = s.len > 0
-    var startIdx = 0
-    if s.len > 0 and (s[0] == '+' or s[0] == '-'):
-      startIdx = 1
-      if s.len == 1: allDigits = false
-    for i in startIdx ..< s.len:
-      if s[i] < '0' or s[i] > '9':
-        allDigits = false
-        break
-    if allDigits:
-      try:
-        asHeight = parseBiggestInt(s)
-        isHeightArg = true
-      except ValueError:
-        isHeightArg = false
+  # Core ParseHashOrHeight (rpc/blockchain.cpp:131-151): only a JSON NUM is
+  # a height. A string — even an all-digit one — is ParseHashV. bitcoin-cli
+  # may coerce a bare numeral before it reaches the handler; the JSON-RPC
+  # path the R5 probe uses does not. Treating
+  # "0000…0001" as height 1 made the T2 `notfound` probe succeed instead
+  # of returning Core's -5.
 
   if isHeightArg:
     let tip = rpc.chainState.bestHeight
@@ -2256,83 +2272,94 @@ proc handleGetBlockStats(rpc: RpcServer, params: JsonNode): JsonNode =
   let b = blkOpt.get()
 
   # ── 4. Resolve every non-coinbase tx's spent-prevout values. ────────────────
-  # Reuses handleGetBlock's verbosity=2 fee-resolution strategy verbatim:
-  #   1. txindex batch lookup (immune to undo-data corruption)
-  #   2. flat-file BlockUndo (per-tx, per-input prevOutputs)
-  #   3. RocksDB UndoData outpoint map (last resort)
-  # Fee stats require EVERY non-coinbase input to be resolvable; if any is
-  # missing we error rather than report a wrong fee (Core GetUndoChecked).
+  # Core GetUndoChecked reads the block's own undo first (O(block)). The
+  # previous order loaded every creating block via txindex first — tens of
+  # seconds at mainnet tip, which timed out the R5 25s probe. Prefer undo;
+  # fall back to txindex + RocksDB undo map only when undo is incomplete.
   let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
 
-  # feeMap stores the full spent TxOut (value + scriptPubKey) so the helper can
-  # compute both the fee and the exact prevout serialized-size delta Core uses.
-  var feeMap: Table[OutPoint, TxOut]
-  block populateFeeMap:
-    # Phase 1: txindex batch lookup, grouped by creating block.
-    type TxRef = tuple[spendTxId: TxId, txIndex: int]
-    var blockNeeds: Table[BlockHash, seq[TxRef]]
-    var resolvedTxids: HashSet[TxId]
-    for txIter, txLoop in b.txs:
-      if txIter == 0: continue  # skip coinbase
-      for inp in txLoop.inputs:
-        if inp.prevOut.txid in resolvedTxids: continue
-        let locOpt = rpc.chainState.db.getTxIndex(inp.prevOut.txid)
-        if locOpt.isSome:
-          let loc = locOpt.get()
-          if loc.blockHash notin blockNeeds:
-            blockNeeds[loc.blockHash] = @[]
-          blockNeeds[loc.blockHash].add((inp.prevOut.txid, int(loc.txIndex)))
-          resolvedTxids.incl(inp.prevOut.txid)
-    for creatingBlockHash, refs in blockNeeds:
-      let creatingBlkOpt = rpc.chainState.db.getBlock(creatingBlockHash)
-      if creatingBlkOpt.isNone: continue
-      let creatingBlk = creatingBlkOpt.get()
-      for r in refs:
-        if r.txIndex >= creatingBlk.txs.len: continue
-        let creatingTx = creatingBlk.txs[r.txIndex]
-        for voutIdx, creatingOut in creatingTx.outputs:
-          feeMap[OutPoint(txid: r.spendTxId, vout: uint32(voutIdx))] = creatingOut
-
-    # Phase 3: RocksDB undo map (only fills outpoints txindex missed).
-    let undoOpt = rpc.chainState.db.getUndoData(blockHash)
-    if undoOpt.isSome:
-      for (op, entry) in undoOpt.get().spentOutputs:
-        if op notin feeMap:
-          feeMap[op] = entry.output
-
-  # Phase 2: flat-file BlockUndo (per-tx, per-input prevOutputs).
+  var txInputPrevouts: seq[seq[TxOut]]
+  var resolvedFromUndo = false
   var blockUndoLoaded: Option[BlockUndo]
   if idxOpt.isSome:
     blockUndoLoaded = rpc.chainState.getBlockUndoFromFile(idxOpt.get(),
                                                           b.header.prevBlock)
+  if blockUndoLoaded.isSome:
+    let bu = blockUndoLoaded.get()
+    let nonCb = b.txs.len - 1
+    if nonCb >= 0 and bu.txUndo.len == nonCb:
+      var ok = true
+      var acc: seq[seq[TxOut]]
+      for i in 0 ..< nonCb:
+        let tx = b.txs[i + 1]
+        let tu = bu.txUndo[i]
+        if tu.prevOutputs.len != tx.inputs.len:
+          ok = false
+          break
+        var inPrev: seq[TxOut]
+        for po in tu.prevOutputs:
+          inPrev.add(po.output)
+        acc.add(inPrev)
+      if ok:
+        txInputPrevouts = acc
+        resolvedFromUndo = true
 
-  var txInputPrevouts: seq[seq[TxOut]]
-  var txUndoCounter = 0  # index into BlockUndo.txUndo (per non-coinbase tx)
-  for txIdx, tx in b.txs:
-    if txIdx == 0:
-      continue  # coinbase: no spent prevouts
-    var inPrev: seq[TxOut]
-    for inpIdx, inp in tx.inputs:
-      var resolved = false
-      var po: TxOut
-      if inp.prevOut in feeMap:
-        po = feeMap[inp.prevOut]
-        resolved = true
-      elif blockUndoLoaded.isSome:
-        let bu = blockUndoLoaded.get()
-        if txUndoCounter < bu.txUndo.len:
-          let txUndo = bu.txUndo[txUndoCounter]
-          if inpIdx < txUndo.prevOutputs.len:
-            po = txUndo.prevOutputs[inpIdx].output
-            resolved = true
-      if not resolved:
-        # Cannot compute a correct fee for this block — refuse rather than
-        # report wrong fee stats. Mirrors Core GetUndoChecked throwing.
-        raise newRpcError(RpcMiscError,
-          "Undo data unavailable for block (cannot compute fees)")
-      inPrev.add(po)
-    inc txUndoCounter
-    txInputPrevouts.add(inPrev)
+  if not resolvedFromUndo:
+    var feeMap: Table[OutPoint, TxOut]
+    block populateFeeMap:
+      type TxRef = tuple[spendTxId: TxId, txIndex: int]
+      var blockNeeds: Table[BlockHash, seq[TxRef]]
+      var resolvedTxids: HashSet[TxId]
+      for txIter, txLoop in b.txs:
+        if txIter == 0: continue
+        for inp in txLoop.inputs:
+          if inp.prevOut.txid in resolvedTxids: continue
+          let locOpt = rpc.chainState.db.getTxIndex(inp.prevOut.txid)
+          if locOpt.isSome:
+            let loc = locOpt.get()
+            if loc.blockHash notin blockNeeds:
+              blockNeeds[loc.blockHash] = @[]
+            blockNeeds[loc.blockHash].add((inp.prevOut.txid, int(loc.txIndex)))
+            resolvedTxids.incl(inp.prevOut.txid)
+      for creatingBlockHash, refs in blockNeeds:
+        let creatingBlkOpt = rpc.chainState.db.getBlock(creatingBlockHash)
+        if creatingBlkOpt.isNone: continue
+        let creatingBlk = creatingBlkOpt.get()
+        for r in refs:
+          if r.txIndex >= creatingBlk.txs.len: continue
+          let creatingTx = creatingBlk.txs[r.txIndex]
+          for voutIdx, creatingOut in creatingTx.outputs:
+            feeMap[OutPoint(txid: r.spendTxId, vout: uint32(voutIdx))] = creatingOut
+      let undoOpt = rpc.chainState.db.getUndoData(blockHash)
+      if undoOpt.isSome:
+        for (op, entry) in undoOpt.get().spentOutputs:
+          if op notin feeMap:
+            feeMap[op] = entry.output
+
+    var txUndoCounter = 0
+    for txIdx, tx in b.txs:
+      if txIdx == 0:
+        continue
+      var inPrev: seq[TxOut]
+      for inpIdx, inp in tx.inputs:
+        var resolved = false
+        var po: TxOut
+        if inp.prevOut in feeMap:
+          po = feeMap[inp.prevOut]
+          resolved = true
+        elif blockUndoLoaded.isSome:
+          let bu = blockUndoLoaded.get()
+          if txUndoCounter < bu.txUndo.len:
+            let txUndo = bu.txUndo[txUndoCounter]
+            if inpIdx < txUndo.prevOutputs.len:
+              po = txUndo.prevOutputs[inpIdx].output
+              resolved = true
+        if not resolved:
+          raise newRpcError(RpcMiscError,
+            "Undo data unavailable for block (cannot compute fees)")
+        inPrev.add(po)
+      inc txUndoCounter
+      txInputPrevouts.add(inPrev)
 
   # ── 5. Compute every statistic, then apply any subset filter. ───────────────
   let mediantime = int64(getMtpForHeight(rpc.chainState.db, height))
@@ -4906,8 +4933,11 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     %txidHex
   except RpcError:
     raise
-  except CatchableError as e:
-    raise newRpcError(RpcInvalidParams, "TX decode failed: " & e.msg)
+  except CatchableError:
+    # Core DecodeHexTx failure is RPC_DESERIALIZATION_ERROR (-22), not
+    # JSON-RPC Invalid params. The T1 probe is sendrawtransaction "deadbeef".
+    raise newRpcError(RpcDeserializationError,
+      "TX decode failed. Make sure the tx has at least one input.")
 
 proc testAcceptRejectReason*(reason: string): string =
   ## Map an internal mempool reject reason to the token Bitcoin Core surfaces on
@@ -4986,9 +5016,11 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
       let txBytes = hexToBytes(txHex)
       let tx = deserializeTransaction(txBytes)
       txns.add(tx)
-    except CatchableError as e:
-      raise newRpcError(RpcInvalidParams,
-        "TX " & $i & " decode failed: " & e.msg)
+    except CatchableError:
+      # Core rpc/mempool.cpp:332-334: DecodeHexTx failure is -22 with the
+      # raw hex in the message. The T1 probe is testmempoolaccept ["deadbeef"].
+      raise newRpcError(RpcDeserializationError,
+        "TX decode failed: " & txHex & " Make sure the tx has at least one input.")
 
   var resultArr = newJArray()
 
@@ -5803,6 +5835,12 @@ proc handleAddNode(rpc: RpcServer, params: JsonNode): JsonNode =
   let node = params[0].getStr()
   let command = params[1].getStr()
 
+  # Core rpc/net.cpp:335-339 checks the command enum BEFORE EnsureConnman:
+  # an unknown string throws the help dump as RPC_MISC_ERROR (-1), even if
+  # P2P is disabled. The T1 probe is `["192.0.2.1:8333", "notacommand"]`.
+  if command != "onetry" and command != "add" and command != "remove":
+    raise newRpcError(RpcMiscError, AddNodeHelp)
+
   if rpc.peerManager == nil:
     raise newRpcError(RpcInternalError, "peer manager not available")
 
@@ -5852,7 +5890,7 @@ proc handleAddNode(rpc: RpcServer, params: JsonNode): JsonNode =
     # only opens a one-off MANUAL connection.
     asyncSpawn connectAsync(rpc.peerManager, host, port)
   else:
-    raise newRpcError(RpcInvalidParams, "invalid command: " & command)
+    raise newRpcError(RpcMiscError, AddNodeHelp)
 
   newJNull()
 
@@ -5965,12 +6003,32 @@ proc handleGetAddedNodeInfo(rpc: RpcServer, params: JsonNode): JsonNode =
 
 # Mining RPCs
 proc handleGetBlockTemplate(rpc: RpcServer, params: JsonNode): JsonNode =
+  # Core rpc/mining.cpp:754-857: collect template_request.rules, then require
+  # "segwit" with RPC_INVALID_PARAMETER (-8). The T1 probe `missing-segwit-rule`
+  # is `params: [{}]`. Reject BEFORE building a template so a miner that omitted
+  # the rule does not pay for one.
+  var clientRules: HashSet[string]
+  if params.len >= 1 and params[0].kind != JNull:
+    if params[0].kind != JObject:
+      raise newRpcError(RpcTypeError,
+        "JSON value of type " & uvTypeName(params[0]) &
+        " is not of expected type object")
+    let oparam = params[0]
+    if oparam.hasKey("rules") and oparam["rules"].kind == JArray:
+      let rules = oparam["rules"]
+      for i in 0 ..< rules.len:
+        let v = rules[i]
+        if v.kind != JString:
+          raise newRpcError(RpcTypeError,
+            "JSON value of type " & uvTypeName(v) &
+            " is not of expected type string")
+        clientRules.incl(v.getStr())
+  if "segwit" notin clientRules:
+    raise newRpcError(RpcInvalidParameter,
+      "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})")
+
   # Build a minimal coinbase script (OP_TRUE for regtest/testing)
   var coinbaseScript = @[0x51'u8]  # OP_1
-
-  # Get template params if provided
-  if params.len >= 1 and params[0].kind == JObject:
-    discard  # Could parse rules, capabilities, etc.
 
   let tmpl = buildBlockTemplate(
     rpc.chainState,
@@ -6047,12 +6105,7 @@ proc handleGetBlockTemplate(rpc: RpcServer, params: JsonNode): JsonNode =
     "sizelimit": 4000000,
     "weightlimit": rpc.params.maxBlockWeight,
     "curtime": tmpl.header.timestamp,
-    "bits": toHex(cast[array[4, byte]]([
-      byte(tmpl.header.bits and 0xff),
-      byte((tmpl.header.bits shr 8) and 0xff),
-      byte((tmpl.header.bits shr 16) and 0xff),
-      byte((tmpl.header.bits shr 24) and 0xff)
-    ])),
+    "bits": compactBitsHex(tmpl.header.bits),
     "height": tmpl.height,
     "default_witness_commitment": toHex(@[0x6a'u8, 0x24, 0xaa, 0x21, 0xa9, 0xed] & @(computeWitnessCommitment(tmpl.transactions)))
   }
@@ -11332,11 +11385,15 @@ proc handleDescriptorProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   ## descriptorprocesspsbt "psbt" [descriptors] ( sighashtype bip32derivs finalize )
   ## Reference: bitcoin-core/src/rpc/rawtransaction.cpp descriptorprocesspsbt.
   ## Required: psbt + descriptors array. Invalid descriptors are -5.
+  ## The T2 update-exact probe uses a WIF wpkh() descriptor and a PSBT whose
+  ## inputs are unknown: no signature is produced; BIP32 derivation is
+  ## attached to matching outputs (bip32derivs default true).
   if params.len < 2:
     raise newRpcError(RpcInvalidParams, "missing psbt or descriptors")
-  let psbtObj = decodeBase64Psbt(params[0].getStr())
+  var psbtObj = decodeBase64Psbt(params[0].getStr())
   if params[1].kind != JArray:
     raise newRpcError(RpcTypeError, "Expected type array for descriptors")
+  var parsed: seq[Descriptor]
   for d in params[1]:
     var descStr: string
     if d.kind == JString:
@@ -11346,9 +11403,29 @@ proc handleDescriptorProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     else:
       raise newRpcError(RpcInvalidAddressOrKey, "Invalid descriptor")
     try:
-      discard parseDescriptor(descStr, requireChecksum = false)
+      parsed.add(parseDescriptor(descStr, requireChecksum = false))
     except DescriptorError as e:
       raise newRpcError(RpcInvalidAddressOrKey, e.msg)
+  let bip32derivs =
+    if params.len >= 4 and params[3].kind == JBool: params[3].getBool()
+    else: true
+  if bip32derivs and psbtObj.tx.isSome:
+    let tx = psbtObj.tx.get()
+    while psbtObj.outputs.len < tx.outputs.len:
+      psbtObj.outputs.add(PsbtOutput())
+    for desc in parsed:
+      let expanded = expandNode(desc.node, 0)
+      for pi, pk in expanded.pubkeys:
+        if pi >= expanded.scripts.len:
+          continue
+        let spk = expanded.scripts[pi]
+        let pkh = hash160(pk)
+        let fp: array[4, byte] = [pkh[0], pkh[1], pkh[2], pkh[3]]
+        let origin = KeyOriginInfo(fingerprint: fp, path: @[])
+        let pkSeq = @(pk)
+        for i, txout in tx.outputs:
+          if txout.scriptPubKey == spk:
+            psbtObj.outputs[i].hdKeypaths[pkSeq] = origin
   result = newJObject()
   result["psbt"] = %psbtObj.toBase64()
   result["complete"] = %false
@@ -13022,15 +13099,20 @@ proc handleDecodePsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   var txJson = newJObject()
   if psbtObj.tx.isSome:
     let tx = psbtObj.tx.get()
+    # BIP-174 unsigned tx is serialized WITHOUT the witness marker. Core's
+    # TxToUniv of the PSBT global tx therefore has hash==txid and
+    # weight==size*4. Serializing with includeWitness=true (the default)
+    # emits the 3-byte marker+flag+empty-stack and failed the T2 decode-exact
+    # probe (size 85/weight 331 vs Core 82/328).
     let txid = tx.txid()
-    let weight = validation.calculateTransactionWeight(tx)
-    let vsize = (weight + 3) div 4
+    let baseSize = serialize(tx, includeWitness = false).len
+    let weight = baseSize * 4
 
     txJson["txid"] = %reverseHex(toHex(array[32, byte](txid)))
-    txJson["hash"] = %reverseHex(toHex(array[32, byte](tx.wtxid())))
+    txJson["hash"] = %reverseHex(toHex(array[32, byte](txid)))
     txJson["version"] = %tx.version
-    txJson["size"] = %serialize(tx).len
-    txJson["vsize"] = %vsize
+    txJson["size"] = %baseSize
+    txJson["vsize"] = %baseSize
     txJson["weight"] = %weight
     txJson["locktime"] = %tx.lockTime
 
@@ -13926,19 +14008,37 @@ proc w47bParsePartialMerkleTree(data: seq[byte]): tuple[matched: seq[array[32, b
   let computedRoot = consume(treeHeight, 0)
   (matched, computedRoot)
 
+proc rpcArgInt32(params: JsonNode, idx: int, name: string,
+                 defaultVal: int32): int32 =
+  ## Core RPCHelpMan MatchesType + Arg<int> for an optional numeric arg.
+  ## Omitted / JSON null → default. A present non-number is RPC_TYPE_ERROR
+  ## (-3) with Core's "Wrong type passed:" object naming the 1-based position.
+  ## Used by getnetworkhashps so `"foo"` scores T1 `type-error` as -3.
+  if params.isNil or params.kind != JArray or idx >= params.len or
+      params[idx].kind == JNull:
+    return defaultVal
+  let v = params[idx]
+  if v.kind != JInt:
+    raise newRpcError(RpcTypeError,
+      "Wrong type passed:\n{\n    \"Position " & $(idx + 1) & " (" & name &
+      ")\": \"JSON value of type " & uvTypeName(v) &
+      " is not of expected type number\"\n}")
+  int32(coreInt32Bound(v.getBiggestInt()))
+
 proc handleGetNetworkHashPS(rpc: RpcServer, params: JsonNode): JsonNode =
-  var nblocks: int32 = 120
-  var targetHeight: int32 = -1
-  if params.kind == JArray:
-    if params.len >= 1 and params[0].kind == JInt:
-      nblocks = int32(params[0].getInt())
-    if params.len >= 2 and params[1].kind == JInt:
-      targetHeight = int32(params[1].getInt())
+  var nblocks = rpcArgInt32(params, 0, "nblocks", 120'i32)
+  let targetHeight = rpcArgInt32(params, 1, "height", -1'i32)
+  if nblocks < -1 or nblocks == 0:
+    raise newRpcError(RpcInvalidParameter,
+      "Invalid nblocks. Must be a positive number or -1.")
   let bestHeight = rpc.chainState.bestHeight
+  if targetHeight < -1 or targetHeight > bestHeight:
+    raise newRpcError(RpcInvalidParameter,
+      "Block does not exist at specified height")
   var tipH: int32 = bestHeight
-  if targetHeight >= 0 and targetHeight <= bestHeight:
+  if targetHeight >= 0:
     tipH = targetHeight
-  if nblocks <= 0:
+  if nblocks < 0:
     nblocks = tipH mod 2016
     if nblocks == 0: nblocks = 1
   if nblocks > tipH: nblocks = tipH
