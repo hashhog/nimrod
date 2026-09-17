@@ -32,6 +32,12 @@ const
     ## DefaultMaxCacheSize=50000), not bytes, so no byte budget is tracked on the
     ## hot path. This constant is the genuine configured byte budget reported as
     ## Core's m_coinstip_cache_size_bytes (getchainstates' coins_tip_cache_bytes).
+  UnretainedGapThreshold* = 1024'i32
+    ## Consecutive missing bodies, walking tip→genesis, that mark the start of
+    ## the unretained prefix rather than an interior hole. Isolated misses
+    ## (a have on the tip side, then more haves below) are holes. 1024 is well
+    ## above any plausible single-file gap and well below the ~955k-block
+    ## implicit-prune prefix on the live mainnet datadir.
 
 type
   ChainStateError* = object of CatchableError
@@ -161,6 +167,10 @@ type
     ibdBatch*: WriteBatch        ## Persistent write batch for IBD
     ibdBatchBlocks*: int         ## Blocks accumulated in current batch
     ibdMode*: bool               ## True during initial block download
+    # When true, this IBD session is extending a retained body window
+    # (the current tip already has a cfBlocks row) and connectBlockIBD
+    # must persist each new body. Reset by startIBD. See maybeRetainIbdBody.
+    ibdStoreBodies*: bool
     # Pending UTXO deletes tracked during IBD (cache key -> true)
     ibdDeletedUtxos*: Table[string, bool]
     # Disk flush state — tracks blocks since last forced memtable→SST flush.
@@ -502,6 +512,111 @@ proc getBlock*(cdb: ChainDb, hash: BlockHash): Option[Block] =
   if data.isSome:
     return some(deserializeBlock(data.get()))
   none(Block)
+
+proc getBlockHashByHeight*(cdb: ChainDb, height: int32): Option[BlockHash]
+
+proc hasBlockBody*(cdb: ChainDb, hash: BlockHash): bool =
+  ## True iff cfBlocks holds a row for `hash`. Does not deserialize.
+  if cdb == nil or cdb.db == nil:
+    return false
+  cdb.db.hasKey(cfBlocks, blockKey(array[32, byte](hash)))
+
+proc deleteBlockBody*(cdb: ChainDb, hash: BlockHash) =
+  ## Drop the cfBlocks row for `hash`. Height index and UTXO set are
+  ## untouched — this is the test/audit way to punch the 967000-shaped hole.
+  if cdb == nil or cdb.db == nil:
+    return
+  cdb.db.delete(cfBlocks, blockKey(array[32, byte](hash)))
+
+type
+  RetainedBodyAudit* = object
+    ## Result of walking [floor, tip] and asking whether each active-chain
+    ## body's cfBlocks row is actually readable. A hole is a height whose
+    ## height→hash index resolves (the block was connected) but whose body
+    ## is missing — getblockhash succeeds, getblock returns -5.
+    floor*: int32          ## lowest height treated as retained (inclusive)
+    tip*: int32
+    checked*: int          ## heights inspected in [floor, tip]
+    holeCount*: int        ## missing bodies in that range (may exceed holes.len)
+    holes*: seq[int32]     ## sample of hole heights, ascending, capped at maxHoles
+    truncated*: bool       ## true if holeCount > holes.len
+
+proc auditRetainedBodies*(cdb: ChainDb, tip: int32,
+                          pruneHeight: int32 = -1,
+                          maxHoles: int = 64,
+                          unretainedGap: int32 = UnretainedGapThreshold):
+                          RetainedBodyAudit =
+  ## Walk every height between the retained floor and `tip` and record
+  ## connected blocks whose body is unreadable.
+  ##
+  ## Floor is `pruneHeight` when that is >= 0. Otherwise it is inferred:
+  ## walk from the tip down; a run of `unretainedGap` consecutive misses
+  ## is the unretained prefix (IBD skipped those bodies), not a bag of
+  ## holes. Isolated misses inside the have-window ARE holes.
+  ##
+  ## Does not abort the node — callers log. A wallet rescan or a peer
+  ## getdata at a hole height is what actually fails.
+  result.tip = tip
+  result.floor = 0
+  result.checked = 0
+  result.holeCount = 0
+  result.holes = @[]
+  result.truncated = false
+  if cdb == nil or tip < 0:
+    return
+
+  var floor = 0'i32
+  if pruneHeight >= 0:
+    floor = pruneHeight
+  else:
+    var lastHave = -1'i32
+    var consecMiss = 0'i32
+    var h = tip
+    while h >= 0:
+      var have = false
+      try:
+        let hashOpt = cdb.getBlockHashByHeight(h)
+        have = hashOpt.isSome and cdb.hasBlockBody(hashOpt.get())
+      except CatchableError:
+        have = false
+      if have:
+        lastHave = h
+        consecMiss = 0
+      else:
+        inc consecMiss
+        if lastHave >= 0 and consecMiss >= unretainedGap:
+          break
+      dec h
+    floor = if lastHave >= 0: lastHave else: tip
+
+  if floor > tip:
+    result.floor = floor
+    return
+  result.floor = floor
+  result.checked = int(tip - floor + 1)
+
+  var found: seq[int32] = @[]
+  var h = floor
+  while h <= tip:
+    var have = false
+    var indexed = false
+    try:
+      let hashOpt = cdb.getBlockHashByHeight(h)
+      indexed = hashOpt.isSome
+      have = indexed and cdb.hasBlockBody(hashOpt.get())
+    except CatchableError:
+      have = false
+      indexed = true
+    # A height with no index row is not "connected" — that is a snapshot
+    # hole (next queue item), not a retained-range body hole. Count only
+    # connected-but-unreadable.
+    if indexed and not have:
+      inc result.holeCount
+      if found.len < maxHoles:
+        found.add(h)
+    inc h
+  result.holes = found
+  result.truncated = result.holeCount > found.len
 
 # Block index operations (ChainDb)
 
@@ -887,6 +1002,7 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     ibdBatch: nil,
     ibdBatchBlocks: 0,
     ibdMode: false,
+    ibdStoreBodies: false,
     ibdDeletedUtxos: initTable[string, bool](),
     ibdBlocksSinceLastDiskFlush: 0,
     ibdDiskFlushInterval: IbdBatchFlushInterval,  # default: flush to disk every 2000 blocks
@@ -1438,6 +1554,7 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
 proc startIBD*(cs: var ChainState) =
   ## Enter IBD mode: enable write batching for performance
   cs.ibdMode = true
+  cs.ibdStoreBodies = false
   cs.ibdBatch = cs.db.db.newWriteBatch()
   cs.ibdBatchBlocks = 0
   cs.ibdDeletedUtxos = initTable[string, bool]()
@@ -1882,10 +1999,43 @@ proc computeUtxoSetInfo*(cs: var ChainState,
     result.hashSerialized = muh.finalize()
   of cshtNone: discard
 
+proc maybeRetainIbdBody(cs: var ChainState, blk: Block, blockHash: BlockHash) =
+  ## Persist this IBD-connected body when we are extending a retained window.
+  ##
+  ## connectBlockIBD used to skip cfBlocks entirely (throughput for genesis
+  ## IBD). P2P re-enters IBD whenever headerTip-height > 10, so a restart or
+  ## header-sync stall that left the node 11+ blocks behind connected the
+  ## catch-up window WITHOUT bodies — a hole inside the range getblock
+  ## serves (mainnet 967000 missing while 966000 and 967400 were present,
+  ## tip 967473). Bitcoin Core's AcceptBlock writes the body before
+  ## ConnectBlock; the invariant is connected ⇒ readable.
+  ##
+  ## Genesis IBD (bestHeight == 0, only genesis has a body) keeps skipping
+  ## so the datadir does not balloon to the fully-indexed class. Once any
+  ## post-genesis body is already on disk at the current tip — we were
+  ## serving a retained window and are now catching up — store every
+  ## subsequent IBD-connected body. The body goes in the same writeSynced
+  ## batch as the tip pointer so a crash cannot advance the tip past a
+  ## missing body, and also lands in the memtable so getBlock sees it
+  ## before the next flush (WriteBatch is not readable).
+  if cs.ibdBatch == nil:
+    return
+  if not cs.ibdStoreBodies:
+    if cs.bestHeight <= 0 or not cs.db.hasBlockBody(cs.bestBlockHash):
+      return
+    cs.ibdStoreBodies = true
+  let bodyBytes = serialize(blk)
+  cs.ibdBatch.put(cfBlocks, blockKey(array[32, byte](blockHash)), bodyBytes)
+  cs.db.storeBlock(blk)
+
 proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainStateResult[void] =
   ## Fast-path block connection for IBD
-  ## Skips: undo data, tx index, full block storage, per-block RocksDB flush
-  ## Accumulates UTXO changes in memory + write batch, flushes every IbdBatchFlushInterval blocks
+  ## Skips: undo data, tx index, per-block RocksDB flush
+  ## Full block storage is skipped only during genesis IBD (the current tip
+  ## has no post-genesis body). Catch-up that extends a retained window
+  ## stores the body so a stall cannot punch a hole in the range getblock
+  ## serves. Accumulates UTXO changes in memory + write batch, flushes
+  ## every IbdBatchFlushInterval blocks.
 
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
@@ -1948,6 +2098,11 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
         continue
       intraCreated[outpointKey(OutPoint(txid: txId, vout: uint32(voutIdx)))] =
         UtxoEntry(output: output, height: height, isCoinbase: txIdx == 0)
+
+  # Body first, while bestBlockHash is still the parent: a crash after this
+  # write and before the tip batch commits leaves an extra body, never a
+  # connected-without-body hole. Pass 2 cannot fail.
+  maybeRetainIbdBody(cs, blk, blockHash)
 
   # ── PASS 2: apply mutations (guaranteed to succeed by pass 1). ───────────
   for txIdx, tx in blk.txs:

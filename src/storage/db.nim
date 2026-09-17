@@ -165,6 +165,7 @@ proc rocksdb_create_iterator_cf*(db: RocksDbPtr, readOpts: RocksDbReadOptionsPtr
 proc rocksdb_iter_destroy*(it: RocksDbIteratorPtr)
 proc rocksdb_iter_seek_to_first*(it: RocksDbIteratorPtr)
 proc rocksdb_iter_seek_to_last*(it: RocksDbIteratorPtr)
+proc rocksdb_iter_seek*(it: RocksDbIteratorPtr, k: cstring, klen: csize_t)
 proc rocksdb_iter_next*(it: RocksDbIteratorPtr)
 proc rocksdb_iter_valid*(it: RocksDbIteratorPtr): uint8
 proc rocksdb_iter_key*(it: RocksDbIteratorPtr, klen: ptr csize_t): cstring
@@ -543,6 +544,29 @@ proc contains*(db: Database, cf: ColumnFamily, key: openArray[byte]): bool =
 
 proc contains*(db: Database, key: openArray[byte]): bool =
   db.contains(cfDefault, key)
+
+proc hasKey*(db: Database, cf: ColumnFamily, key: openArray[byte]): bool =
+  ## True iff `key` exists in `cf`, without copying the value into userspace.
+  ## Used by the retained-range body audit so a startup walk of ~10k heights
+  ## does not deserialize every block.
+  if db == nil or db.db == nil:
+    return false
+  let it = rocksdb_create_iterator_cf(db.db, db.readOpts, db.cfHandles[cf])
+  if it == nil:
+    return false
+  defer: rocksdb_iter_destroy(it)
+  let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
+  rocksdb_iter_seek(it, keyPtr, csize_t(key.len))
+  if rocksdb_iter_valid(it) == 0:
+    return false
+  var klen: csize_t
+  let kPtr = rocksdb_iter_key(it, addr klen)
+  if kPtr == nil or klen != csize_t(key.len):
+    return false
+  for i in 0 ..< key.len:
+    if byte(cast[ptr UncheckedArray[char]](kPtr)[i]) != key[i]:
+      return false
+  true
 
 # Write batch operations
 

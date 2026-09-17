@@ -2459,6 +2459,29 @@ proc startNode*(config: NimrodConfig) {.async.} =
     state.pruner = nil
     info "prune subsystem disabled (no --prune flag)"
 
+  # Self-check: every height between the retained floor and the tip must
+  # have a readable body. A connected block whose body is missing fails
+  # wallet rescan and peer getdata at exactly that height (mainnet 967000
+  # hole, 2026-09-17). Log; do not refuse to boot — the hole is already
+  # on disk and taking the node down does not fill it.
+  try:
+    let pruneH =
+      if state.pruner != nil: state.pruner.currentPruneHeight()
+      else: -1'i32
+    let audit = auditRetainedBodies(state.chainState.db,
+                                    state.chainState.bestHeight, pruneH)
+    if audit.holeCount > 0:
+      let firstHole = if audit.holes.len > 0: audit.holes[0] else: -1'i32
+      warn "retained-range body hole",
+           floor = audit.floor, tip = audit.tip,
+           checked = audit.checked, holes = audit.holeCount,
+           firstHole = firstHole, truncated = audit.truncated
+    else:
+      info "retained-range bodies contiguous",
+           floor = audit.floor, tip = audit.tip, checked = audit.checked
+  except CatchableError as e:
+    warn "retained-range body audit failed", error = e.msg
+
   # 3. Initialize mempool
   info "initializing mempool"
   state.mempool = newMempool(state.chainState, params)
