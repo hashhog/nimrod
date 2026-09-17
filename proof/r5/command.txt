@@ -1,0 +1,14 @@
+# Re-run R5 (operator RPC subset). Needs the hashhog meta-repo instruments
+# and a running node (live fleet or the regtest harness).
+#
+# Live lane (T1/T2; T3 is SKIP-REGTEST here):
+#   python3 tools/r5_probe.py --impl nimrod -v
+#
+# Regtest lane (T3 wallet + stop/getblockfilter):
+#   REGTEST_SLOTS=1 REGTEST_MEM=8G bash tools/regtest-slot.sh \
+#     bash tools/regtest-harness.sh --r5-lane=nimrod
+#
+# In-repo encoding of the live-lane help-parity FAIL closed in this commit
+# (no live node required):
+#   export PATH="$HOME/.nimble/bin:$PATH"
+#   nim c -r tests/test_t1_r5_parity.nim

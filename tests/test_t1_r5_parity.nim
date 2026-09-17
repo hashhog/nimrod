@@ -104,3 +104,21 @@ suite "t1_r5":
     check r.msg ==
       "TX decode failed: deadbeef Make sure the tx has at least one input."
     rpc.chainState.close()
+
+  test "getnetworkhashps is listed in help (r5 help-parity)":
+    ## Mirrors tools/r5_probe.py help_lists(): the first token of a
+    ## non-section help line, with a trailing "( args )" stripped, must
+    ## equal the method name. Live 2026-09-17T080653Z scored this method
+    ## FAIL solely on help-parity — the handler already answered.
+    let rpc = makeRpc()
+    let h = rpc.rpcOk("help", %*[]).getStr()
+    var listed = false
+    for raw in h.splitLines():
+      let l = raw.strip()
+      if l.len == 0 or l.startsWith("="):
+        continue
+      let token = l.split()[0].split("(")[0]
+      if token == "getnetworkhashps":
+        listed = true
+    check listed
+    rpc.chainState.close()

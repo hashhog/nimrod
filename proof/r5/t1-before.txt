@@ -1,0 +1,12 @@
+# BEFORE the help-parity fix (test added, handleHelp did not list getnetworkhashps)
+
+$ nim c -r tests/test_t1_r5_parity.nim
+t1_r5 .......F (0.08s)
+  Check failed: listed
+  [FAILED] getnetworkhashps is listed in help (r5 help-parity)
+[Summary] 8 tests run (0.08s): 7 OK, 1 FAILED, 0 SKIPPED
+
+$ python3 tools/r5_probe.py --impl nimrod -v
+== nimrod ==  T1 44/46  T2 40/41  T3 0/16  (SKIP-REGTEST 18)
+   FAIL getnetworkhashps: help-parity: not listed in help
+artifact: tools/diff-test-artifacts/r5-probe/20260917T102316Z.json

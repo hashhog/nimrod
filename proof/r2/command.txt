@@ -1,0 +1,10 @@
+# Re-run R2 (validator decision parity) for nimrod. Needs the hashhog meta-repo
+# (tools/diff-test-corpus, tools/corpus-sweep.sh, a live bitcoind as oracle).
+# Hours, not minutes. Do not run against production ports.
+#
+#   SWEEP_IMPLS=nimrod bash tools/corpus-sweep.sh
+#   bash tools/corpus-sweep.sh --report
+#
+# The numbers in results.json are from the nightly sweep report in
+# tools/diff-test-artifacts/corpus-sweep/nightly-history.jsonl around the
+# 2026-09-15T07:30:03Z partial marker (jobs recorded: 440).

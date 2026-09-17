@@ -1,0 +1,33 @@
+{
+  "live": {
+    "artifact": "r5/live-20260917T102316Z.json",
+    "command": "python3 tools/r5_probe.py --impl nimrod -v",
+    "T1": {"pass": 44, "total": 46},
+    "T2": {"pass": 40, "total": 41},
+    "T3": {"pass": 0, "total": 16, "note": "SKIP-REGTEST on the live lane"},
+    "fails": [
+      {
+        "method": "getnetworkhashps",
+        "tier": "T1",
+        "detail": "help-parity: not listed in help"
+      }
+    ],
+    "note": "This live artifact is the pin running on 2026-09-17T10:23Z. The one FAIL is help-parity. This commit lists getnetworkhashps in handleHelp; the in-repo control is r5/t1-after.txt (8 OK / 0 FAILED). Live r5_probe cannot go green without an operator restart, which this run is forbidden to do."
+  },
+  "regtest": {
+    "artifact": "r5/regtest-20260917T080758Z.json",
+    "command": "bash tools/regtest-harness.sh --r5-lane=nimrod",
+    "T1": {"pass": 1, "total": 1},
+    "T2": {"pass": 1, "total": 1},
+    "T3": {"pass": 16, "total": 16},
+    "methods_scored": 18,
+    "fails": []
+  },
+  "in_repo_help_parity": {
+    "command": "nim c -r tests/test_t1_r5_parity.nim",
+    "before": "r5/t1-before.txt",
+    "after": "r5/t1-after.txt",
+    "before_summary": "8 tests run: 7 OK, 1 FAILED",
+    "after_summary": "8 tests run: 8 OK, 0 FAILED"
+  }
+}

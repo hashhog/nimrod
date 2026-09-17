@@ -1,0 +1,6 @@
+# From /home/work/genesis-ibd/logs/capture-watch.log
+# tools/lineage-capture-watch.sh fired against the frozen-at-anchor genesis rig.
+
+2026-08-18T16:12:46-04:00 nimrod: FROZEN ON ANCHOR 958794 (000000000000000000015eaadd989e4f09ff75b643a128dc7bdf6070431d7d0e). Starting UTXO scan.
+2026-08-18T16:15:37-04:00 nimrod: *** MATCH *** 29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0
+2026-08-18T16:15:37-04:00 ALERT: hashhog: nimrod REPRODUCES C(958794)

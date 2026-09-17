@@ -1,0 +1,12 @@
+# Re-run R1 (interpreter) for nimrod. Needs:
+#   - this repo (shim source: tools/phaseb_verifyscript_shim.nim)
+#   - sibling bitcoin-core/src/test/data/{script_tests,tx_valid,tx_invalid,sighash}.json
+#   - sibling tools/phaseb-vectors/phaseb_vectors.py
+#
+# From the hashhog meta-repo:
+export PATH="$HOME/.nimble/bin:$PATH"
+(cd nimrod && nim c -d:release -o:tools/phaseb_verifyscript_shim tools/phaseb_verifyscript_shim.nim)
+cd tools/phaseb-vectors
+python3 phaseb_vectors.py --driver=../../nimrod/tools/phaseb_verifyscript_shim
+python3 phaseb_vectors.py --driver=../../nimrod/tools/phaseb_verifyscript_shim --txvectors
+python3 phaseb_vectors.py --driver=../../nimrod/tools/phaseb_verifyscript_shim --sighash

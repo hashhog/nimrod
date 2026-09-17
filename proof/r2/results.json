@@ -1,0 +1,16 @@
+{
+  "source": "tools/diff-test-artifacts/corpus-sweep/nightly-history.jsonl (jobs recorded: 440, preceding 2026-09-15T07:30:03Z partial marker)",
+  "impl": "nimrod",
+  "pass": 365,
+  "fail": 5,
+  "err": 0,
+  "agreement_pct": 98.6,
+  "consensus_splits_accept_vs_reject": 0,
+  "fails": [
+    {"corpus": "regression", "entry": "script-size-too-large", "core": "reject:bad-txns-inputs-missingorspent", "nimrod": "reject:block-script-verify-flag-failed", "same_accept_reject": true},
+    {"corpus": "_tierb-guards-2026-07-06/B1-scripttests/scripttests", "entry": "opreturn-reject", "core": "reject:bad-txns-inputs-missingorspent", "nimrod": "reject:block-script-verify-flag-failed", "same_accept_reject": true},
+    {"corpus": "_tierb-guards-2026-07-06/B2-bad-diffbits", "entry": "diffbits-easier-highhash", "core": "reject:high-hash", "nimrod": "reject:bad-diffbits", "same_accept_reject": true},
+    {"corpus": "tws", "entry": "weight-one-over-limit", "core": "reject:bad-blk-weight", "nimrod": "reject:rejected", "same_accept_reject": true},
+    {"corpus": "tws-tail", "entry": "weight-one-over-limit", "core": "reject:bad-blk-weight", "nimrod": "reject:rejected", "same_accept_reject": true}
+  ]
+}

@@ -1,0 +1,25 @@
+[Unit]
+Description=HashHog genesis IBD — nimrod (mainnet, from-genesis, AV=0, pruned)
+Documentation=https://github.com/hashhog receipts/IBD-BOTTLENECK-2026-07-30.md
+After=network-online.target
+
+[Service]
+Type=simple
+# Launch command PROVEN BY EXECUTION 2026-07-30 (probe on a throwaway datadir:
+# booted, handshaked with the capped replay feed, connected blocks, AV=0
+# confirmed active). Feed is the capped blk-replay-server on 127.0.0.1:28620
+# (--max-serve-height 958794) so the lineage FREEZES on the T2 anchor and never
+# needs a rollback — the operation that destroyed the blockbrew lineage.
+
+ExecStart=/home/work/hashhog/nimrod/bin/nimrod start --network=mainnet --datadir=/home/work/genesis-ibd/nimrod --port=8479 --rpcport=8379 --metricsport=0 --assumevalid=0 --connect=127.0.0.1:28620 --nodnsseed --prune=10000 --dbcache=8192 --printtoconsole
+WorkingDirectory=/home/work/hashhog/nimrod
+Nice=15
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=300
+LimitNOFILE=524288
+StandardOutput=append:/home/work/genesis-ibd/logs/nimrod-genesis.log
+StandardError=append:/home/work/genesis-ibd/logs/nimrod-genesis.log
+
+[Install]
+WantedBy=default.target

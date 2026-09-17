@@ -7626,6 +7626,7 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "== Mining ==",
     "getblocktemplate ( template_request )",
     "getmininginfo",
+    "getnetworkhashps ( nblocks height )",
     "getprioritisedtransactions",
     "prioritisetransaction \"txid\" ( dummy ) fee_delta",
     "submitblock \"hexdata\"",

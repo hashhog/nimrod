@@ -1,0 +1,65 @@
+## start of lineage log (first 40 lines)
+INF 2026-07-30 16:36:32.580-04:00 starting nimrod                            tid=318098 version=0.1.0 network=mainnet dataDir=/home/work/genesis-ibd/nimrod rpcPort=8379 p2pPort=8479
+nimrod v0.1.0
+Network: mainnet
+Data directory: /home/work/genesis-ibd/nimrod
+P2P port: 8479
+RPC port: 8379
+INF 2026-07-30 16:36:32.580-04:00 initializing crypto engine                 tid=318098
+INF 2026-07-30 16:36:32.580-04:00 initializing parallel script-verify pool   tid=318098 workers=15 requested=0
+INF 2026-07-30 16:36:32.584-04:00 opening database                           tid=318098 path=/home/work/genesis-ibd/nimrod/mainnet/chainstate
+db.nim(264)              checkError
+asyncfutures.nim(665)    waitFor
+Error: unhandled exception: IO error: No such file or directory: While renaming a file to /home/work/genesis-ibd/nimrod/mainnet/chainstate/CURRENT: /home/work/genesis-ibd/nimrod/mainnet/chainstate/000005.dbtmp: No such file or directory [RocksDbError]
+INF 2026-07-30 16:39:05.618-04:00 starting nimrod                            tid=320424 version=0.1.0 network=mainnet dataDir=/home/work/genesis-ibd/nimrod rpcPort=8379 p2pPort=8479
+nimrod v0.1.0
+Network: mainnet
+Data directory: /home/work/genesis-ibd/nimrod
+P2P port: 8479
+RPC port: 8379
+INF 2026-07-30 16:39:05.618-04:00 initializing crypto engine                 tid=320424
+INF 2026-07-30 16:39:05.618-04:00 initializing parallel script-verify pool   tid=320424 workers=15 requested=0
+INF 2026-07-30 16:39:05.618-04:00 opening database                           tid=320424 path=/home/work/genesis-ibd/nimrod/mainnet/chainstate
+INF 2026-07-30 16:39:09.666-04:00 initializing genesis block                 tid=320424
+INF 2026-07-30 16:39:09.674-04:00 chainstate loaded                          tid=320424 height=0 bestBlock=000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+INF 2026-07-30 16:39:09.674-04:00 prune subsystem enabled                    tid=320424 mode=automatic target_bytes=10485760000 prune_height=-1
+INF 2026-07-30 16:39:09.674-04:00 initializing mempool                       tid=320424
+INF 2026-07-30 16:39:09.674-04:00 initializing fee estimator                 tid=320424
+INF 2026-07-30 16:39:09.674-04:00 initializing peer manager                  tid=320424
+INF 2026-07-30 16:39:09.674-04:00 no ban list found, starting fresh          tid=320424 path=/home/work/genesis-ibd/nimrod/mainnet/banlist.json
+INF 2026-07-30 16:39:09.674-04:00 DNS seeding disabled (--nodnsseed / --dnsseed=0) tid=320424
+INF 2026-07-30 16:39:09.674-04:00 connect mode: pinned to fixed peers; DNS + auto-outbound disabled tid=320424 peers=1
+INF 2026-07-30 16:39:09.674-04:00 initializing sync manager                  tid=320424
+INF 2026-07-30 16:39:09.674-04:00 starting RPC server                        tid=320424 port=8379
+INF 2026-07-30 16:39:09.674-04:00 wrote RPC cookie file                      tid=320424 path=/home/work/genesis-ibd/nimrod/mainnet/.cookie
+INF 2026-07-30 16:39:09.674-04:00 starting P2P listener                      tid=320424 port=8479 bindAddr=0.0.0.0
+INF 2026-07-30 16:39:09.674-04:00 listening for connections                  tid=320424 address=0.0.0.0 port=8479
+INF 2026-07-30 16:39:09.674-04:00 starting sync                              tid=320424
+INF 2026-07-30 16:39:09.674-04:00 peer manager main loop started             tid=320424
+INF 2026-07-30 16:39:09.674-04:00 connecting to peers                        tid=320424
+INF 2026-07-30 16:39:09.674-04:00 RPC server started                         tid=320520 port=8379
+INF 2026-07-30 16:39:09.674-04:00 starting outbound connections              tid=320424 maxFullRelay=7 maxBlockRelay=2
+
+## first chainstate at genesis (height=0, Bitcoin genesis hash)
+22:INF 2026-07-30 16:39:09.666-04:00 initializing genesis block                 tid=320424
+23:INF 2026-07-30 16:39:09.674-04:00 chainstate loaded                          tid=320424 height=0 bestBlock=000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+
+## first flush at height=958794 (our tip, not the peer's advertised height)
+101569:INF 2026-08-18 16:13:02.560-04:00 flushed IBD batch                          tid=2232853 height=958794 cacheBefore=19453408 cacheAfter=19453408 cacheMiB=6233 budgetMiB=8192 batchBlocks=2000
+
+## end of lineage log (last 12 lines)
+INF 2026-08-19 09:42:07.005-04:00 connect mode: dialing only pinned peers, DNS + auto-outbound disabled tid=2231913 pinned=1
+WRN 2026-08-19 09:42:07.749-04:00 sync timeout, resetting                    tid=2231913 state=ssDownloadingBlocks chainTipHeight=958794 headerTipHeight=960004 pendingBlocks=512 consecutiveTimeouts=700
+INF 2026-08-19 09:42:37.121-04:00 starting outbound connections              tid=2231913 maxFullRelay=7 maxBlockRelay=2
+INF 2026-08-19 09:42:37.121-04:00 connect mode: dialing only pinned peers, DNS + auto-outbound disabled tid=2231913 pinned=1
+INF 2026-08-19 09:42:37.954-04:00 requesting blocks                          tid=2231913 count=512 fromHeight=958795
+INF 2026-08-19 09:43:07.142-04:00 starting outbound connections              tid=2231913 maxFullRelay=7 maxBlockRelay=2
+INF 2026-08-19 09:43:07.142-04:00 connect mode: dialing only pinned peers, DNS + auto-outbound disabled tid=2231913 pinned=1
+
+Received signal 15, shutting down...
+INF 2026-08-19 09:43:13.218-04:00 flushing IBD batch before shutdown         tid=2231913
+INF 2026-08-19 09:43:17.810-04:00 flushed memtables to SST                   tid=2231913 height=958794 blocksSinceFlush=355
+INF 2026-08-19 09:43:17.922-04:00 flushing UTXO cache                        tid=2231913
+
+## snapshot-boot negative control: loadtxoutset/assumeutxo/snapshot lines
+matches=0 (must be 0 for a from-genesis lineage)

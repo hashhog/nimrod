@@ -1,0 +1,13 @@
+=== Phase B VerifyScript vector run ===
+oracle/impl : external driver
+cases seen  : 1217
+  PASS (decision matches Core) : 1217
+  FAIL (decision diverges)     : 0
+  unsupported (oracle scope)   : 0
+  shim error / skipped         : 0
+  rows w/ unmapped flag token  : 0
+  invalid flag combo (skipped) : 0
+  assemble errors (pre-run)    : 5
+  decision coverage            : 1217/1217 (100.0% of cases produced a verdict)
+  decision accuracy            : 1217/1217 (100.0%)
+  (info) reject-reason token mismatches: 358 (decision still correct)

@@ -1,0 +1,134 @@
+{
+ "ts": "20260917T080758Z",
+ "lane": "regtest",
+ "impls": {
+  "nimrod": {
+   "tiers": {
+    "T1": {
+     "pass": 1,
+     "total": 1
+    },
+    "T2": {
+     "pass": 1,
+     "total": 1
+    },
+    "T3": {
+     "pass": 16,
+     "total": 16
+    }
+   },
+   "rows": [
+    {
+     "method": "getblockfilter",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "createwallet",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getwalletinfo",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getnewaddress",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getaddressinfo",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getbalances",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "listunspent",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "listtransactions",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "walletcreatefundedpsbt",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "walletprocesspsbt",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "sendtoaddress",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "send",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "backupwallet",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "listwallets",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "unloadwallet",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "loadwallet",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "restorewallet",
+     "tier": "T3",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "stop",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    }
+   ],
+   "live_lane_methods_not_in_scope": 85,
+   "lane_notes": []
+  }
+ }
+}

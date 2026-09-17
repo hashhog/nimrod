@@ -1,0 +1,642 @@
+{
+ "ts": "20260917T102316Z",
+ "lane": "live",
+ "impls": {
+  "nimrod": {
+   "tiers": {
+    "T1": {
+     "pass": 44,
+     "total": 46
+    },
+    "T2": {
+     "pass": 40,
+     "total": 41
+    },
+    "T3": {
+     "pass": 0,
+     "total": 16
+    }
+   },
+   "rows": [
+    {
+     "method": "getblockcount",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getbestblockhash",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getblockhash",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getblockheader",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getblockchaininfo",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "decoderawtransaction",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "validateaddress",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getblock",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getchaintips",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getdifficulty",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "gettxout",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "gettxoutsetinfo",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "verifychain",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "preciousblock",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getmempoolentry",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getmempoolinfo",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getrawmempool",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "waitforblock",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "waitforblockheight",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "waitfornewblock",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getblockstats",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getchaintxstats",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getdeploymentinfo",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getblockfilter",
+     "tier": "T2",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "getblockfrompeer",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getmempoolancestors",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getmempooldescendants",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "gettxoutproof",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "verifytxoutproof",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "gettxspendingprevout",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getchainstates",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "importmempool",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "savemempool",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "prioritisetransaction",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getprioritisedtransactions",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "scanblocks",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "scantxoutset",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "pruneblockchain",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getmemoryinfo",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getrpcinfo",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "help",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "logging",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "stop",
+     "tier": "T1",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "uptime",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "addnode",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "clearbanned",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "disconnectnode",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getaddednodeinfo",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getaddrmaninfo",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getconnectioncount",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getnettotals",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getnetworkinfo",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getnodeaddresses",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getpeerinfo",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "listbanned",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "ping",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "setban",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "setnetworkactive",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getmininginfo",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getnetworkhashps",
+     "tier": "T1",
+     "status": "FAIL",
+     "detail": "help-parity: not listed in help"
+    },
+    {
+     "method": "getblocktemplate",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "submitblock",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "submitheader",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "sendrawtransaction",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "testmempoolaccept",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getrawtransaction",
+     "tier": "T1",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "createrawtransaction",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "decodescript",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "combinerawtransaction",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "converttopsbt",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "createpsbt",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "decodepsbt",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "analyzepsbt",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "combinepsbt",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "finalizepsbt",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "joinpsbts",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "utxoupdatepsbt",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "descriptorprocesspsbt",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "signrawtransactionwithkey",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "submitpackage",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "createmultisig",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "deriveaddresses",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "estimatesmartfee",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getdescriptorinfo",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "getindexinfo",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "signmessagewithprivkey",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "verifymessage",
+     "tier": "T2",
+     "status": "PASS",
+     "detail": ""
+    },
+    {
+     "method": "createwallet",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "getwalletinfo",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "getnewaddress",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "getaddressinfo",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "getbalances",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "listunspent",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "listtransactions",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "walletcreatefundedpsbt",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "walletprocesspsbt",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "sendtoaddress",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "send",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "backupwallet",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "listwallets",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "unloadwallet",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "loadwallet",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    },
+    {
+     "method": "restorewallet",
+     "tier": "T3",
+     "status": "SKIP-REGTEST",
+     "detail": ""
+    }
+   ]
+  }
+ }
+}

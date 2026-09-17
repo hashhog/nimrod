@@ -1,0 +1,5 @@
+# AFTER the help-parity fix (handleHelp lists "getnetworkhashps ( nblocks height )")
+
+$ nim c -r tests/test_t1_r5_parity.nim
+t1_r5 ........ (0.07s)
+[Summary] 8 tests run (0.07s): 8 OK, 0 FAILED, 0 SKIPPED

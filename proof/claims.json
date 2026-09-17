@@ -1,0 +1,65 @@
+{
+  "r4": {
+    "files": [
+      "r4/C958794.json",
+      "r4/capture.md",
+      "r4/capture-watch-excerpt.txt",
+      "r4/capture-state-marker.txt",
+      "r4/genesis-unit.service",
+      "r4/lineage.log.gz",
+      "r4/lineage.log.sha256",
+      "r4/lineage-excerpt.txt",
+      "r4/av0-250000-ledger.txt",
+      "r4/av0-250000-ledger.jsonl"
+    ],
+    "height": 958794,
+    "bestblockhash": "000000000000000000015eaadd989e4f09ff75b643a128dc7bdf6070431d7d0e",
+    "hash_serialized_3": "29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0",
+    "coins": 166180925,
+    "lineage_log_sha256": "0ef0a694fd2c122d235732a971f31607d09b76212cd3be5cba820436da9cdb43",
+    "genesis_block_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+    "snapshot_booted": false,
+    "assumevalid": "0"
+  },
+  "r1": {
+    "files": ["r1/results.json", "r1/script.txt", "r1/tx.txt", "r1/sighash.txt", "r1/command.txt"],
+    "script_pass": 1217,
+    "script_fail": 0,
+    "tx_valid_pass": 121,
+    "tx_invalid_pass": 93,
+    "sighash_pass": 500,
+    "divergences": 0,
+    "decided": 1931,
+    "charter_vector_count": 1936
+  },
+  "r2": {
+    "files": ["r2/results.json", "r2/nightly-report-excerpt.txt", "r2/command.txt"],
+    "pass": 365,
+    "fail": 5,
+    "err": 0,
+    "consensus_splits_accept_vs_reject": 0
+  },
+  "r5": {
+    "files": [
+      "r5/scorecard.json",
+      "r5/live-20260917T102316Z.json",
+      "r5/regtest-20260917T080758Z.json",
+      "r5/t1-before.txt",
+      "r5/t1-after.txt",
+      "r5/command.txt"
+    ],
+    "live_t1_pass": 44,
+    "live_t1_total": 46,
+    "live_t2_pass": 40,
+    "live_t2_total": 41,
+    "live_fail_method": "getnetworkhashps",
+    "regtest_t3_pass": 16,
+    "regtest_t3_total": 16
+  },
+  "provenance": {
+    "files": ["provenance.txt"],
+    "binary_sha256": "d9b77fa0c620c5e1ef429218716dad3a69675b21f86ded74b678ee7bc4f4df55",
+    "toolchain": "Nim 2.2.8 / nimble 0.20.1",
+    "parent_commit": "8e58af93c31a337c59ee8668e85a48efddada9ac"
+  }
+}

@@ -1,0 +1,16 @@
+  jobs recorded: 440   corpora x impls
+  IMPL           PASS   FAIL   ERR   AGREEMENT
+  ----------------------------------------------
+  nimrod          365      5     0       98.6%
+
+  DIVERGENCES (nimrod rows only):
+    nimrod       regression                       1 failed  (script-size-too-large: both REJECT, reason differs)
+    nimrod       _tierb-guards-2026-07-06/B1-scripttests/scripttests 1 failed  (opreturn-reject: both REJECT, reason differs)
+    nimrod       _tierb-guards-2026-07-06/B2-bad-diffbits 1 failed  (diffbits-easier-highhash: both REJECT, reason differs)
+    nimrod       tws                              1 failed  (weight-one-over-limit: both REJECT, reason differs)
+    nimrod       tws-tail                         1 failed  (weight-one-over-limit: both REJECT, reason differs)
+
+  CONSENSUS SPLITS (accept vs reject -- chain-split risk): 0
+  (The nightly classifier's split count has an accounting gap on the full
+   10-impl report; the five nimrod FAIL logs were read directly and each is
+   reject-vs-reject. See r2/results.json.)

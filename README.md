@@ -56,8 +56,11 @@ meta-repo, which is **not public** — see the note below.
 > JSON with `python3 tools/r5_probe.py` against a running fleet.
 >
 > **What you can check from this repository alone:** build it, run its own test
-> suite, and reproduce its behaviour against Bitcoin Core yourself. That is the
-> evidence this repo actually ships.
+> suite, and reproduce its behaviour against Bitcoin Core yourself. The per-node
+> proof bundle is `proof/` — `bash proof/verify.sh` re-checks every claim against
+> a file in that directory (from-genesis C(958794) lineage, R1 vectors, R2 corpus
+> parity, R5 live+regtest scorecards, build provenance). That is the evidence
+> this repo actually ships.
 
 ## Quick Start
 
