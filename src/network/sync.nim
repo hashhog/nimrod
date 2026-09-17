@@ -130,6 +130,10 @@ type
     # (a truncated/corrupt index prefix).  A successful repair makes the cheap
     # invariant check short-circuit, so this only bounds the failing case.
     headerTipRepairAt*: int32 ## chainTipHeight of last repair attempt
+    # Peers that just hit a headers-sync timeout. selectSyncPeer skips these
+    # so a mute high-startHeight peer cannot be re-picked every 60s (mainnet
+    # 2026-09-17: same IPv6 peer, 966301, Core loopback never asked).
+    stalledSyncPeerKeys*: HashSet[string]
     # Optional BIP-157 basic block-filter index — populated alongside each
     # connectBlock/connectBlockIBD when --blockfilterindex is set.  nil
     # when disabled.  Mirrors Core's `g_indexes` BaseIndex hook list:
@@ -978,6 +982,7 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     requestedHashes: initHashSet[BlockHash](),
     unconnectingHeaders: initTable[int64, int](),
     headerTipRepairAt: -1'i32,
+    stalledSyncPeerKeys: initHashSet[string](),
     numVerifyWorkers: numVerifyWorkers,
     filterIndex: filterIndex,
     coinStatsIndex: coinStatsIndex,
@@ -1103,9 +1108,56 @@ proc reconcileHeaderTip*(sm: SyncManager): bool =
        sideHeadersDropped = dropped, sideHeadersKept = carried
   true
 
+proc peerSyncKey(peer: Peer): string =
+  peer.address & ":" & $peer.port
+
+proc peerIsNoBan(sm: SyncManager, peer: Peer): bool =
+  ## True for addnode / whitelist peers (Core NetPermissionFlags::NoBan).
+  if sm.peerManager == nil:
+    return false
+  let key = peerSyncKey(peer)
+  if key in sm.peerManager.extendedPeers:
+    let ext = sm.peerManager.extendedPeers[key]
+    return ext.noBan or ext.connType == pctManual
+  false
+
+proc countOtherReadyPeers(sm: SyncManager, exceptPeer: Peer): int =
+  if sm.peerManager == nil:
+    return 0
+  for peer in sm.peerManager.peers.values:
+    if peer == exceptPeer:
+      continue
+    if peer.state == psReady and not peer.shouldDisconnect:
+      inc result
+
 proc selectSyncPeer*(sm: SyncManager): Peer =
-  ## Select the best peer for syncing (highest reported height)
-  sm.peerManager.getBestPeer()
+  ## Best ready peer that is not the one we just timed out of header sync.
+  ## Falls back to a recently-stalled peer only when nobody else is ready
+  ## (sole-peer IBD, or every peer has stalled).
+  if sm.peerManager == nil:
+    return nil
+  var best: Peer = nil
+  var bestHeight: int32 = -1
+  var fallback: Peer = nil
+  var fallbackHeight: int32 = -1
+  for peer in sm.peerManager.peers.values:
+    if peer.state != psReady or peer.shouldDisconnect:
+      continue
+    let key = peerSyncKey(peer)
+    if key in sm.stalledSyncPeerKeys:
+      if peer.startHeight > fallbackHeight:
+        fallback = peer
+        fallbackHeight = peer.startHeight
+      continue
+    if peer.startHeight > bestHeight:
+      best = peer
+      bestHeight = peer.startHeight
+  if best != nil:
+    return best
+  if fallback != nil:
+    sm.stalledSyncPeerKeys.excl(peerSyncKey(fallback))
+    return fallback
+  nil
 
 proc buildLocatorFromHeight*(sm: SyncManager, startHeight: int32):
     seq[array[32, byte]] =
@@ -1689,6 +1741,8 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
   # chain — which is exactly what a restart did for free on 2026-08-23
   # ("first batch accepted=9 tipHeight=963741").
   discard sm.reconcileHeaderTip()
+  # A headers message is a response — this peer is not mute.
+  sm.stalledSyncPeerKeys.excl(peerSyncKey(peer))
 
   if headers.len == 0:
     # No headers = we're at tip (or peer has nothing more)
@@ -2793,6 +2847,37 @@ proc isInitialBlockDownload*(sm: SyncManager): bool =
   ## A node with no headers yet (headerTipHeight < 0) is treated as IBD.
   sm.headerTipHeight < 0 or sm.chainTipHeight < sm.headerTipHeight
 
+proc handleHeadersSyncTimeout*(sm: SyncManager) {.raises: [CatchableError].} =
+  ## Headers/blocks made no progress within SyncTimeoutSeconds.
+  ##
+  ## Bitcoin Core disconnects a stalling headers-download peer when another
+  ## preferred peer exists (net_processing.cpp HEADERS_DOWNLOAD_TIMEOUT).
+  ## Pre-fix, nimrod only nil'd syncPeer and selectSyncPeer immediately
+  ## re-picked getBestPeer() — a mute high-startHeight peer livelocked
+  ## header sync (mainnet 2026-09-17: 966301, same IPv6 peer every 60s,
+  ## Core loopback never asked).
+  if sm.syncPeer != nil:
+    let stalled = sm.syncPeer
+    sm.stalledSyncPeerKeys.incl(peerSyncKey(stalled))
+    let others = sm.countOtherReadyPeers(stalled)
+    if others > 0 and not sm.peerIsNoBan(stalled):
+      stalled.shouldDisconnect = true
+      warn "headers sync timeout, disconnecting stalling peer",
+           peer = $stalled, otherReady = others
+    else:
+      warn "headers sync timeout, rotating peer",
+           peer = $stalled, otherReady = others,
+           noban = sm.peerIsNoBan(stalled)
+    sm.syncPeer = nil
+  sm.pendingBlocks = 0
+  sm.blockQueue.clear()
+  sm.requestedHashes.clear()
+  sm.receivedBlocks.clear()
+  discard sm.reconcileHeaderTip()
+  discard sm.connectStoredBlocks()
+  sm.lastSyncTime = getTime()
+  sm.state = ssIdle
+
 proc startHeaderSync*(sm: SyncManager) {.async.} =
   ## Start header synchronization
   sm.syncPeer = sm.selectSyncPeer()
@@ -2926,28 +3011,7 @@ proc syncLoop*(sm: SyncManager) {.async.} =
            pendingBlocks = sm.pendingBlocks,
            consecutiveTimeouts = consecutiveTimeouts
 
-      # Switch to different peer if available
-      if sm.syncPeer != nil:
-        sm.syncPeer = nil
-
-      # Reset download state so we can re-request blocks from scratch
-      sm.pendingBlocks = 0
-      sm.blockQueue.clear()
-      sm.requestedHashes.clear()
-      sm.receivedBlocks.clear()
-
-      # A "reset" that only CLEARS state cannot break a wedge — the mainnet
-      # stall survived 29 (then a further 5, post-restart) of these.  Re-derive
-      # instead: repair the header pointer if it is behind the validated chain
-      # (A), and connect anything already on disk (B).  Both are guarded no-ops
-      # in the healthy case.
-      discard sm.reconcileHeaderTip()
-      discard sm.connectStoredBlocks()
-
-      # Reset timer so we don't immediately timeout again on next iteration
-      sm.lastSyncTime = getTime()
-
-      sm.state = ssIdle
+      sm.handleHeadersSyncTimeout()
 
       # Exponential backoff: 2s, 4s, 8s, 16s, 30s max
       let backoff = min(30000, 2000 * (1 shl min(consecutiveTimeouts - 1, 4)))
