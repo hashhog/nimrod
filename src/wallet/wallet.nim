@@ -539,6 +539,9 @@ proc newWallet*(mnemonic: string, passphrase: string = "",
   result.mainnet = params.network == Mainnet
   result.lastSyncedHeight = -1
   result.watchedScripts = initTable[seq[byte], WatchedScript]()
+  result.txHistory = initTable[TxId, WalletTxRecord]()
+  result.txOrder = @[]
+  result.labels = initTable[string, string]()
 
 proc newWalletFromSeed*(seed: array[64, byte],
                         params: ConsensusParams = mainnetParams()): Wallet =
@@ -552,6 +555,9 @@ proc newWalletFromSeed*(seed: array[64, byte],
   result.mainnet = params.network == Mainnet
   result.lastSyncedHeight = -1
   result.watchedScripts = initTable[seq[byte], WatchedScript]()
+  result.txHistory = initTable[TxId, WalletTxRecord]()
+  result.txOrder = @[]
+  result.labels = initTable[string, string]()
 
 proc newWallet*(mnemonic: string, params: ConsensusParams,
                 mainnet: bool, chainState: ChainState): Wallet =
@@ -570,6 +576,8 @@ proc newWallet*(mnemonic: string, params: ConsensusParams,
   result.labels = initTable[string, string]()
   result.lastSyncedHeight = -1
   result.watchedScripts = initTable[seq[byte], WatchedScript]()
+  result.txHistory = initTable[TxId, WalletTxRecord]()
+  result.txOrder = @[]
 
   # Create default BIP84 (native segwit) account
   result.addAccount(84, 0, 20)
@@ -587,6 +595,8 @@ proc newWalletFromDb*(db: WalletDb, params: ConsensusParams,
   result.labels = initTable[string, string]()
   result.lastSyncedHeight = -1
   result.watchedScripts = initTable[seq[byte], WatchedScript]()
+  result.txHistory = initTable[TxId, WalletTxRecord]()
+  result.txOrder = @[]
 
   # Load encryption info if present
   let encInfo = db.getEncryption()

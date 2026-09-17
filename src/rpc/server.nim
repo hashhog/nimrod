@@ -149,6 +149,10 @@ const
   RpcInvalidAddressOrKey* = -5     # Invalid address or key
   RpcTypeError* = -3               # Unexpected type was passed as parameter (Core RPC_TYPE_ERROR)
   RpcWalletError* = -4             # Generic wallet RPC error (Core RPC_WALLET_ERROR)
+  RpcWalletInsufficientFunds* = -6 # send-family cannot fund the request (Core RPC_WALLET_INSUFFICIENT_FUNDS)
+  RpcWalletNotFound* = -18         # load/unload of a missing wallet (Core RPC_WALLET_NOT_FOUND)
+  RpcWalletAlreadyLoaded* = -35    # loadwallet of an already-loaded name (Core RPC_WALLET_ALREADY_LOADED)
+  RpcWalletAlreadyExists* = -36    # restorewallet onto an existing name (Core RPC_WALLET_ALREADY_EXISTS)
   RpcDeserializationError* = -22   # Error parsing or validating structure (Core RPC_DESERIALIZATION_ERROR)
   RpcTransactionError* = -25       # Generic transaction error
   RpcTransactionRejected* = -26    # Transaction rejected by mempool
@@ -7688,18 +7692,25 @@ proc handleHelp(rpc: RpcServer, params: JsonNode): JsonNode =
     "verifymessage \"address\" \"signature\" \"message\"",
     "",
     "== Wallet ==",
+    "backupwallet \"destination\"",
     "createwallet \"wallet_name\"",
     "fundrawtransaction \"hexstring\" ( options iswitness )",
+    "getaddressinfo \"address\"",
     "getbalance",
+    "getbalances",
     "getnewaddress",
     "getwalletinfo",
     "listunspent",
     "listtransactions ( count )",
+    "listwallets",
     "loadwallet \"filename\"",
+    "restorewallet \"wallet_name\" \"backup_file\"",
+    "send [{\"address\":amount},...]",
     "sendtoaddress \"address\" amount",
     "signrawtransactionwithwallet \"hexstring\" ( [{...},...] sighashtype )",
     "unloadwallet",
     "walletcreatefundedpsbt [{...}] [{addr:amt},...] ( locktime options bip32derivs )",
+    "walletprocesspsbt \"psbt\" ( sign sighashtype bip32derivs finalize )",
     "",
     "== Control ==",
     "getmemoryinfo ( \"mode\" )",
@@ -8945,6 +8956,66 @@ proc getTargetLoadedWallet(rpc: RpcServer): LoadedWallet {.gcsafe.} =
     return lwOpt.get()
   nil
 
+proc raiseWalletMgrRpc(e: ref WalletManagerError) {.noReturn.} =
+  ## Surface a WalletManagerError with the Core JSON-RPC code it carries.
+  let code = if e.rpcCode != 0: e.rpcCode else: RpcWalletError
+  raise newRpcError(code, e.msg)
+
+proc syncTargetWalletToTip(rpc: RpcServer) {.gcsafe.} =
+  ## Core CWallet::BlockUntilSyncedToCurrentChain: scan the gap
+  ## [lastSyncedHeight+1 .. tip] into the targeted wallet before a read/spend
+  ## RPC answers. Safety net for any connect path that missed the hook.
+  if rpc.walletManager == nil:
+    return
+  let lw = rpc.getTargetLoadedWallet()
+  if lw != nil:
+    try:
+      discard rpc.walletManager.reconcileWalletToTip(lw)
+    except CatchableError:
+      discard
+
+proc lastProcessedBlockJson(rpc: RpcServer, w: Wallet): JsonNode =
+  ## Core AppendLastProcessedBlock: {hash, height} of the wallet locator.
+  result = newJObject()
+  var h = w.lastSyncedHeight
+  var hash = default(BlockHash)
+  if rpc.chainState != nil:
+    if h < 0:
+      h = rpc.chainState.bestHeight
+    if h >= 0:
+      let ho = rpc.chainState.db.getBlockHashByHeight(h)
+      if ho.isSome:
+        hash = ho.get()
+  result["hash"] = %reverseHex(toHex(array[32, byte](hash)))
+  result["height"] = %h
+
+proc solvingDescriptor(key: DerivedKey): string =
+  ## Infer a checksummed descriptor for a key-owned script so getaddressinfo
+  ## / listunspent emit Core's `desc` / `parent_descs` fields.
+  ## Reference: bitcoin-core/src/wallet/rpc/addresses.cpp:459-463.
+  let pubHex = toHex(key.extKey.publicKey)
+  try:
+    case key.address.kind
+    of P2WPKH:
+      addDescriptorChecksum("wpkh(" & pubHex & ")")
+    of P2PKH:
+      addDescriptorChecksum("pkh(" & pubHex & ")")
+    of P2SH:
+      addDescriptorChecksum("sh(wpkh(" & pubHex & "))")
+    of P2TR:
+      addDescriptorChecksum("tr(" & toHex(key.address.taprootKey) & ")")
+    of P2WSH:
+      addDescriptorChecksum("raw(" & toHex(scriptPubKeyForAddress(key.address)) & ")")
+  except CatchableError:
+    "wpkh(" & pubHex & ")"
+
+proc raiseWalletSpendError(msg: string) {.noReturn.} =
+  ## Map coin-selection failures onto Core's spend-family codes.
+  let low = msg.toLowerAscii()
+  if "insufficient" in low or "no spendable" in low:
+    raise newRpcError(RpcWalletInsufficientFunds, msg)
+  raise newRpcError(RpcWalletError, msg)
+
 # ============================================================================
 # Wallet Management RPCs
 # ============================================================================
@@ -9020,9 +9091,9 @@ proc handleCreateWallet(rpc: RpcServer, params: JsonNode): JsonNode =
       for wmsg in warnings:
         warr.add(%wmsg)
       resp["warnings"] = warr
-    resp
+    return resp
   except WalletManagerError as e:
-    raise newRpcError(RpcWalletError, e.msg)
+    raiseWalletMgrRpc(e)
   except CatchableError as e:
     raise newRpcError(RpcWalletError, "Failed to create wallet: " & e.msg)
 
@@ -9056,9 +9127,9 @@ proc handleLoadWallet(rpc: RpcServer, params: JsonNode): JsonNode =
     }
     result
   except WalletManagerError as e:
-    raise newRpcError(RpcMiscError, e.msg)
+    raiseWalletMgrRpc(e)
   except CatchableError as e:
-    raise newRpcError(RpcMiscError, "Failed to load wallet: " & e.msg)
+    raise newRpcError(RpcWalletError, "Failed to load wallet: " & e.msg)
 
 proc handleUnloadWallet(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Unload a wallet from memory
@@ -9100,9 +9171,9 @@ proc handleUnloadWallet(rpc: RpcServer, params: JsonNode): JsonNode =
       "warning": if warnings.len > 0: warnings.join("; ") else: ""
     }
   except WalletManagerError as e:
-    raise newRpcError(RpcMiscError, e.msg)
+    raiseWalletMgrRpc(e)
   except CatchableError as e:
-    raise newRpcError(RpcMiscError, "Failed to unload wallet: " & e.msg)
+    raise newRpcError(RpcWalletError, "Failed to unload wallet: " & e.msg)
 
 proc handleListWallets(rpc: RpcServer, params: JsonNode): JsonNode =
   ## List currently loaded wallets
@@ -9165,11 +9236,20 @@ proc handleGetNewAddress(rpc: RpcServer, params: JsonNode): JsonNode =
 
   try:
     let addrStr = w.getNewAddressByTypeName(addressType)
+    if params.len >= 1 and params[0].kind == JString:
+      let label = params[0].getStr()
+      if label.len > 0:
+        w.labels[addrStr] = label
     # Persist the keypool advance immediately so a crash can't reissue this
     # address (gap-limit safety). DATA-LOSS FIX wa0fq5wtk.
     rpc.persistTargetWallet()
     %addrStr
   except WalletError as e:
+    # Core ParseOutputType miss -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+    # "Unknown address type '%s'" (wallet/rpc/addresses.cpp:57).
+    if "unknown address type" in e.msg.toLowerAscii():
+      raise newRpcError(RpcInvalidAddressOrKey,
+        "Unknown address type '" & addressType & "'")
     raise newRpcError(RpcMiscError, e.msg)
 
 proc handleSetHdSeed(rpc: RpcServer, params: JsonNode): JsonNode =
@@ -9489,10 +9569,27 @@ proc handleListUnspent(rpc: RpcServer, params: JsonNode): JsonNode =
   ##
   ## Returns: Array of UTXOs
 
+  rpc.syncTargetWalletToTip()
   let w = rpc.getTargetWallet()
 
-  let minconf = if params.len >= 1: params[0].getInt() else: 1
-  let maxconf = if params.len >= 2: params[1].getInt() else: 9999999
+  let minconf = if params.len >= 1 and params[0].kind != JNull: params[0].getInt() else: 1
+  let maxconf = if params.len >= 2 and params[1].kind != JNull: params[1].getInt() else: 9999999
+
+  # Address filter: invalid -> -5, duplicate -> -8 (coins.cpp:542/545).
+  var filterAddrs = initHashSet[string]()
+  var haveFilter = false
+  if params.len >= 3 and params[2].kind == JArray:
+    haveFilter = params[2].len > 0
+    for a in params[2]:
+      let s = a.getStr()
+      try:
+        discard decodeAddress(s)
+      except CatchableError:
+        raise newRpcError(RpcInvalidAddressOrKey, "Invalid Bitcoin address: " & s)
+      if s in filterAddrs:
+        raise newRpcError(RpcInvalidParameter,
+          "Invalid parameter, duplicated address: " & s)
+      filterAddrs.incl(s)
 
   let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
   let mainnet = rpc.params.network == Mainnet
@@ -9507,12 +9604,16 @@ proc handleListUnspent(rpc: RpcServer, params: JsonNode): JsonNode =
     let confs = if utxo.height > 0: currentHeight - utxo.height + 1 else: 0
     if confs >= minconf and confs <= maxconf:
       let addrOpt = extractAddressFromScript(utxo.output.scriptPubKey, mainnet, regtest)
+      if haveFilter:
+        if addrOpt.isNone or addrOpt.get() notin filterAddrs:
+          continue
       # Immature coinbase coins are listed but flagged non-spendable/unsafe,
       # matching Core's AvailableCoins semantics (a coinbase at height H is
       # spendable once currentHeight - H >= COINBASE_MATURITY, i.e. it has
       # COINBASE_MATURITY+1 confirmations). isMatureCoinbase returns true for
       # all non-coinbase coins.
       let spendable = utxo.isMatureCoinbase(currentHeight)
+      let addrStr = if addrOpt.isSome: addrOpt.get() else: ""
       var entry = %*{
         "txid": reverseHex(toHex(array[32, byte](utxo.outpoint.txid))),
         "vout": utxo.outpoint.vout,
@@ -9521,10 +9622,22 @@ proc handleListUnspent(rpc: RpcServer, params: JsonNode): JsonNode =
         "scriptPubKey": toHex(utxo.output.scriptPubKey),
         "spendable": spendable,
         "solvable": true,
-        "safe": spendable
+        "safe": spendable,
+        "label": w.labels.getOrDefault(addrStr, "")
       }
       if addrOpt.isSome:
-        entry["address"] = %addrOpt.get()
+        entry["address"] = %addrStr
+      let keyOpt = w.findKeyForScript(utxo.output.scriptPubKey)
+      var parentDescs = newJArray()
+      if keyOpt.isSome:
+        let desc = solvingDescriptor(keyOpt.get())
+        entry["desc"] = %desc
+        parentDescs.add(%desc)
+      elif w.isWatchedScript(utxo.output.scriptPubKey):
+        let d = w.watchedScripts[utxo.output.scriptPubKey].descriptor
+        entry["desc"] = %d
+        parentDescs.add(%d)
+      entry["parent_descs"] = parentDescs
       utxoArray.add(entry)
 
   utxoArray
@@ -9533,6 +9646,7 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Get wallet information
   ## Reference: Bitcoin Core wallet/rpc/wallet.cpp getwalletinfo
 
+  rpc.syncTargetWalletToTip()
   let w = rpc.getTargetWallet()
 
   # Get wallet name from wallet manager if available
@@ -9545,7 +9659,8 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
       walletName = lwOpt.get().name
 
   let balance = w.getBalance()
-  let txCount = w.utxos.len  # Simplified: count UTXOs as proxy for tx count
+  # Core txcount is mapWallet.size (confirmed + mempool wallet txs), not UTXOs.
+  let txCount = if w.txHistory.len > 0: w.txHistory.len else: w.utxos.len
   let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
   let immatureBalance = w.getImmatureBalance(currentHeight)
 
@@ -9557,7 +9672,7 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
   var info = %*{
     "walletname": walletName,
     "walletversion": 1,
-    "format": "nimrod",
+    "format": "sqlite",
     "balance": float64(int64(balance)) / 100_000_000.0,
     "unconfirmed_balance": 0.0,
     "immature_balance": float64(int64(immatureBalance)) / 100_000_000.0,
@@ -9568,7 +9683,7 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
     "private_keys_enabled": not w.privateKeysDisabled,
     "avoid_reuse": false,
     "scanning": false,
-    "descriptors": false,
+    "descriptors": true,
     "external_signer": false,
     "blank": (w.accounts.len == 0 and not w.privateKeysDisabled),
     "unlocked_until": (if w.isEncrypted and not w.isLocked: w.unlockExpiry else: 0)
@@ -9578,7 +9693,28 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
   if w.privateKeysDisabled:
     flags.add(%"disable_private_keys")
   info["flags"] = flags
+  info["lastprocessedblock"] = rpc.lastProcessedBlockJson(w)
   info
+
+proc handleGetBalances(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## getbalances — Core wallet/rpc/coins.cpp.
+  ## Returns {mine: {trusted, untrusted_pending, immature}, lastprocessedblock}.
+  rpc.syncTargetWalletToTip()
+  let w = rpc.getTargetWallet()
+  let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
+  let trusted = w.getSpendableBalance(currentHeight)
+  let immature = w.getImmatureBalance(currentHeight)
+  var pending = Satoshi(0)
+  for _, utxo in w.utxos:
+    if utxo.height <= 0:
+      pending = pending + utxo.output.value
+  var mine = newJObject()
+  mine["trusted"] = %(float64(int64(trusted)) / 100_000_000.0)
+  mine["untrusted_pending"] = %(float64(int64(pending)) / 100_000_000.0)
+  mine["immature"] = %(float64(int64(immature)) / 100_000_000.0)
+  result = newJObject()
+  result["mine"] = mine
+  result["lastprocessedblock"] = rpc.lastProcessedBlockJson(w)
 
 # ============================================================================
 # Wallet Send/Receive RPCs
@@ -9612,6 +9748,7 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 2:
     raise newRpcError(RpcInvalidParams, "missing address and/or amount parameter")
 
+  rpc.syncTargetWalletToTip()
   let addressStr = params[0].getStr()
   var amount: float64
 
@@ -9620,13 +9757,14 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   elif params[1].kind == JInt:
     amount = float64(params[1].getInt())
   else:
-    raise newRpcError(RpcInvalidParams, "amount must be a number")
+    raise newRpcError(RpcTypeError, "Amount is not a number or string")
 
-  # Validate amount
+  # AmountFromValue: negative / out of range is RPC_TYPE_ERROR (-3).
+  # Reference: bitcoin-core/src/rpc/util.cpp AmountFromValue.
   if amount <= 0:
-    raise newRpcError(RpcInvalidParams, "amount must be positive")
+    raise newRpcError(RpcTypeError, "Invalid amount")
   if amount > 21000000.0:
-    raise newRpcError(RpcInvalidParams, "amount exceeds max supply")
+    raise newRpcError(RpcTypeError, "Amount out of range")
 
   # Convert BTC to satoshis
   let satoshis = Satoshi(int64(amount * 100_000_000.0))
@@ -9663,9 +9801,9 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   try:
     tx = w.createTransaction(outputs, feeRate)
   except WalletError as e:
-    raise newRpcError(RpcTransactionError, e.msg)
+    raiseWalletSpendError(e.msg)
   except CoinSelectionError as e:
-    raise newRpcError(RpcTransactionError, e.msg)
+    raiseWalletSpendError(e.msg)
 
   # If subtractfeefromamount, adjust the output
   if subtractFee:
@@ -9682,9 +9820,9 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
     try:
       tx = w.createTransaction(outputs, feeRate)
     except WalletError as e:
-      raise newRpcError(RpcTransactionError, e.msg)
+      raiseWalletSpendError(e.msg)
     except CoinSelectionError as e:
-      raise newRpcError(RpcTransactionError, e.msg)
+      raiseWalletSpendError(e.msg)
 
   # Set RBF-enable sequence if replaceable
   if replaceable:
@@ -9753,6 +9891,168 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
     asyncSpawn rpc.peerManager.broadcastTx(tx)
 
   %txidHex
+
+proc commitWalletSend(rpc: RpcServer, w: var Wallet, tx: var Transaction,
+                      feeRate: float64): string =
+  ## Sign, accept to mempool, record, persist, broadcast. Returns display txid.
+  var utxos: seq[WalletUtxo]
+  for input in tx.inputs:
+    if input.prevOut in w.utxos:
+      utxos.add(w.utxos[input.prevOut])
+    else:
+      raise newRpcError(RpcTransactionError, "input UTXO not found in wallet")
+  try:
+    if not w.signTransaction(tx, utxos):
+      raise newRpcError(RpcTransactionError, "failed to sign transaction")
+  except WalletError as e:
+    raise newRpcError(RpcTransactionError, "signing error: " & e.msg)
+  var mp = rpc.mempool
+  let acceptResult = mp.acceptTransaction(tx, rpc.crypto)
+  if not acceptResult.isOk:
+    raise newRpcError(RpcTransactionRejected, "mempool rejected: " & acceptResult.error)
+  var inputValues: seq[Satoshi]
+  for input in tx.inputs:
+    if input.prevOut in w.utxos:
+      inputValues.add(w.utxos[input.prevOut].output.value)
+  w.recordOutgoingTx(tx, inputValues, getTime().toUnix())
+  for input in tx.inputs:
+    w.removeUtxo(input.prevOut)
+  let txid = tx.txid()
+  for voutIdx, output in tx.outputs:
+    let keyOpt = w.findKeyForScript(output.scriptPubKey)
+    if keyOpt.isSome:
+      let key = keyOpt.get()
+      let outpoint = OutPoint(txid: txid, vout: uint32(voutIdx))
+      let isInternal = key.path.contains("/1/")
+      w.addUtxo(outpoint, output, 0, key.path, isInternal, false)
+  rpc.persistTargetWallet()
+  if rpc.peerManager != nil:
+    asyncSpawn rpc.peerManager.broadcastTx(tx)
+  reverseHex(toHex(array[32, byte](txid)))
+
+proc handleSend(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## send [{"address":amount},...] ( conf_target estimate_mode fee_rate options )
+  ## Reference: bitcoin-core/src/wallet/rpc/spend.cpp send.
+  if params.len < 1:
+    raise newRpcError(RpcInvalidParams, "missing outputs")
+  rpc.syncTargetWalletToTip()
+  var w = rpc.getTargetWallet()
+  if w.privateKeysDisabled:
+    raise newRpcError(RpcWalletError,
+      "Error: Private keys are disabled for this wallet")
+
+  var txOutputs: seq[TxOut]
+  let outs = params[0]
+  if outs.kind == JArray:
+    if outs.len == 0:
+      raise newRpcError(RpcInvalidParameter,
+        "Invalid parameter, outputs are missing")
+    for outputObj in outs:
+      if outputObj.kind != JObject:
+        raise newRpcError(RpcInvalidParameter,
+          "Invalid parameter, key-value pair not an object as expected")
+      for k, v in outputObj:
+        try:
+          let parsedAddr = decodeAddress(k)
+          let amountBtc =
+            if v.kind == JFloat: v.getFloat()
+            elif v.kind == JInt: float64(v.getInt())
+            else: raise newRpcError(RpcTypeError, "Amount is not a number or string")
+          if amountBtc <= 0:
+            raise newRpcError(RpcTypeError, "Invalid amount")
+          let amountSat = Satoshi(int64(amountBtc * 100_000_000.0))
+          txOutputs.add(TxOut(value: amountSat,
+                              scriptPubKey: scriptPubKeyForAddress(parsedAddr)))
+        except AddressError:
+          raise newRpcError(RpcInvalidAddressOrKey,
+            "Invalid Bitcoin address: " & k)
+  elif outs.kind == JObject:
+    if outs.len == 0:
+      raise newRpcError(RpcInvalidParameter,
+        "Invalid parameter, outputs are missing")
+    for k, v in outs:
+      try:
+        let parsedAddr = decodeAddress(k)
+        let amountBtc =
+          if v.kind == JFloat: v.getFloat()
+          elif v.kind == JInt: float64(v.getInt())
+          else: raise newRpcError(RpcTypeError, "Amount is not a number or string")
+        if amountBtc <= 0:
+          raise newRpcError(RpcTypeError, "Invalid amount")
+        txOutputs.add(TxOut(value: Satoshi(int64(amountBtc * 100_000_000.0)),
+                            scriptPubKey: scriptPubKeyForAddress(parsedAddr)))
+      except AddressError:
+        raise newRpcError(RpcInvalidAddressOrKey,
+          "Invalid Bitcoin address: " & k)
+  else:
+    raise newRpcError(RpcInvalidParameter,
+      "Invalid parameter, outputs are missing")
+  if txOutputs.len == 0:
+    raise newRpcError(RpcInvalidParameter,
+      "Invalid parameter, outputs are missing")
+
+  var feeRate = FallbackFeeRate
+  if params.len >= 4 and params[3].kind in {JInt, JFloat}:
+    feeRate = params[3].getFloat()
+    if feeRate <= 0:
+      feeRate = FallbackFeeRate
+  elif rpc.feeEstimator != nil:
+    feeRate = rpc.feeEstimator.estimateFee(6)
+
+  var tx: Transaction
+  try:
+    tx = w.createTransaction(txOutputs, feeRate)
+  except WalletError as e:
+    raiseWalletSpendError(e.msg)
+  except CoinSelectionError as e:
+    raiseWalletSpendError(e.msg)
+  for i in 0 ..< tx.inputs.len:
+    tx.inputs[i].sequence = 0xfffffffd'u32
+  let txidHex = rpc.commitWalletSend(w, tx, feeRate)
+  result = %*{
+    "complete": true,
+    "txid": txidHex
+  }
+
+proc handleBackupWallet(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## backupwallet "destination" — Core wallet/rpc/backup.cpp.
+  if rpc.walletManager == nil:
+    raise newRpcError(RpcMiscError, "wallet functionality not enabled")
+  if params.len < 1 or params[0].kind != JString:
+    raise newRpcError(RpcInvalidParams, "destination required")
+  rpc.syncTargetWalletToTip()
+  let lw = rpc.getTargetLoadedWallet()
+  if lw == nil:
+    raise newRpcError(RpcWalletNotFound,
+      "Requested wallet does not exist or is not loaded")
+  try:
+    rpc.walletManager.backupWalletFile(lw.name, params[0].getStr())
+  except WalletManagerError as e:
+    raiseWalletMgrRpc(e)
+  newJNull()
+
+proc handleRestoreWallet(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## restorewallet "wallet_name" "backup_file" ( load_on_startup )
+  ## Reference: bitcoin-core/src/wallet/rpc/backup.cpp restorewallet.
+  if rpc.walletManager == nil:
+    raise newRpcError(RpcMiscError, "wallet functionality not enabled")
+  if params.len < 2 or params[0].kind != JString or params[1].kind != JString:
+    raise newRpcError(RpcInvalidParams, "wallet_name and backup_file required")
+  var loadOnStartup = none(bool)
+  if params.len >= 3 and params[2].kind == JBool:
+    loadOnStartup = some(params[2].getBool())
+  try:
+    let (lw, warnings) = rpc.walletManager.restoreWalletFromBackup(
+      params[0].getStr(), params[1].getStr(), loadOnStartup)
+    var resp = %*{"name": lw.name}
+    if warnings.len > 0:
+      var warr = newJArray()
+      for wmsg in warnings:
+        warr.add(%wmsg)
+      resp["warnings"] = warr
+    return resp
+  except WalletManagerError as e:
+    raiseWalletMgrRpc(e)
 
 # ============================================================================
 # Wallet transaction-history helpers (listtransactions / gettransaction)
@@ -9874,6 +10174,7 @@ proc handleListTransactions(rpc: RpcServer, params: JsonNode): JsonNode =
   ## the live UTXO set, so a "send" the wallet made is reported even though its
   ## input UTXOs are gone.
 
+  rpc.syncTargetWalletToTip()
   let w = rpc.getTargetWallet()
 
   let labelFilter = if params.len >= 1 and params[0].kind == JString: params[0].getStr() else: "*"
@@ -9881,9 +10182,9 @@ proc handleListTransactions(rpc: RpcServer, params: JsonNode): JsonNode =
   let skip = if params.len >= 3: params[2].getInt() else: 0
 
   if count < 0:
-    raise newRpcError(RpcInvalidParams, "count must be non-negative")
+    raise newRpcError(RpcInvalidParameter, "Negative count")
   if skip < 0:
-    raise newRpcError(RpcInvalidParams, "skip must be non-negative")
+    raise newRpcError(RpcInvalidParameter, "Negative from")
 
   # Flatten every recorded tx into its legs, in scan (first-seen) order. Core
   # appends most-recent last and returns the LAST (count) entries after (skip),
@@ -10608,6 +10909,7 @@ proc handleGetAddressInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   ## an OrderedTable, so insertion order is response order.
   ##
   ## Invalid address -> -5 (addresses.cpp:431-439).
+  rpc.syncTargetWalletToTip()
   let w = rpc.getTargetWallet()
 
   if params.len < 1 or params[0].kind != JString:
@@ -10643,11 +10945,15 @@ proc handleGetAddressInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   result["scriptPubKey"] = %toHex(spk)
   result["ismine"] = %ismine
   result["solvable"] = %solvable
-  if solvable and watched:
-    # The canonical imported descriptor doubles as desc for non-ranged
-    # single-script watches (Core: inferred per-address descriptor).
-    result["desc"] = %watchEntry.descriptor
-  if watched:
+  if solvable:
+    if keyOpt.isSome:
+      let d = solvingDescriptor(keyOpt.get())
+      result["desc"] = %d
+      result["parent_desc"] = %d
+    elif watched:
+      result["desc"] = %watchEntry.descriptor
+      result["parent_desc"] = %watchEntry.descriptor
+  elif watched:
     result["parent_desc"] = %watchEntry.descriptor
   # Deprecated, always false since the legacy-watchonly removal (Core v29+).
   result["iswatchonly"] = %false
@@ -11456,6 +11762,7 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
     raise newRpcError(RpcInvalidParams,
       "missing required parameters: inputs, outputs")
 
+  rpc.syncTargetWalletToTip()
   var w = rpc.getTargetWallet()
 
   if params[0].kind != JArray:
@@ -11544,7 +11851,11 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
           txOutputs.add(TxOut(value: amountSat, scriptPubKey: spk))
         except AddressError as e:
           raise newRpcError(RpcInvalidAddressOrKey,
-            "invalid address: " & e.msg)
+            "Invalid Bitcoin address: " & k)
+
+  if txOutputs.len == 0:
+    raise newRpcError(RpcInvalidParameter,
+      "Invalid parameter, outputs are missing")
 
   # ---- locktime / replaceable (already parsed early for pre-input default
   # sequence; re-bind to the names used by the rest of the body) ----
@@ -11607,9 +11918,9 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
     try:
       fundedTx = w.createTransaction(txOutputs, feeRate)
     except WalletError as e:
-      raise newRpcError(RpcWalletError, e.msg)
+      raiseWalletSpendError(e.msg)
     except CoinSelectionError as e:
-      raise newRpcError(RpcWalletError, e.msg)
+      raiseWalletSpendError(e.msg)
     # Sum totalIn from selected inputs
     for inp in fundedTx.inputs:
       if inp.prevOut in w.utxos:
@@ -11748,6 +12059,7 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing psbt parameter")
 
+  rpc.syncTargetWalletToTip()
   var w = rpc.getTargetWallet()
 
   let sign = if params.len >= 2 and params[1].kind == JBool:
@@ -14877,6 +15189,14 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
     rpc.handleGetWalletInfo(params)
   of "sendtoaddress":
     rpc.handleSendToAddress(params)
+  of "send":
+    rpc.handleSend(params)
+  of "getbalances":
+    rpc.handleGetBalances(params)
+  of "backupwallet":
+    rpc.handleBackupWallet(params)
+  of "restorewallet":
+    rpc.handleRestoreWallet(params)
   of "listtransactions":
     rpc.handleListTransactions(params)
   of "gettransaction":
@@ -14969,6 +15289,7 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   # Control
   of "stop":
     # Return success - actual shutdown handled by caller
+    if params.len >= 1 and params[0].kind notin {JInt, JNull}: raise newRpcError(RpcTypeError, "JSON value of type " & uvTypeName(params[0]) & " is not of expected type number")
     %"nimrod server stopping"
   of "uptime":
     rpc.handleUptime()
@@ -15011,8 +15332,16 @@ proc namedArgPositions(methodName: string): seq[string] =
   of "importdescriptors": @["requests"]
   of "listdescriptors": @["private"]
   of "getaddressinfo": @["address"]
-  of "getwalletinfo", "listwallets", "listwalletdir": @[]
+  of "getwalletinfo", "listwallets", "listwalletdir", "getbalances": @[]
   of "getnewaddress": @["label", "address_type"]
+  of "backupwallet": @["destination"]
+  of "restorewallet": @["wallet_name", "backup_file", "load_on_startup"]
+  of "send":
+    @["outputs", "conf_target", "estimate_mode", "fee_rate", "options"]
+  of "walletprocesspsbt":
+    @["psbt", "sign", "sighashtype", "bip32derivs", "finalize"]
+  of "walletcreatefundedpsbt":
+    @["inputs", "outputs", "locktime", "options", "bip32derivs"]
   of "getbalance": @["dummy", "minconf", "include_watchonly", "avoid_reuse"]
   of "listunspent":
     @["minconf", "maxconf", "addresses", "include_unsafe", "query_options"]

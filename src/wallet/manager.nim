@@ -15,6 +15,7 @@ export wallet_persist.WalletLoadOutcome
 
 type
   WalletManagerError* = object of CatchableError
+    rpcCode*: int  ## Core JSON-RPC code; 0 means the caller should use -4
 
   WalletCreateOptions* = object
     disablePrivateKeys*: bool    ## Create watch-only wallet
@@ -37,6 +38,13 @@ type
     params: ConsensusParams
     chainState: ChainState
     settingsPath: string         ## Path to settings.json
+
+proc raiseWalletMgr*(msg: string, code: int = -4) =
+  ## Raise a WalletManagerError carrying the Core JSON-RPC code the handler
+  ## should surface. Default -4 RPC_WALLET_ERROR.
+  var e = newException(WalletManagerError, msg)
+  e.rpcCode = code
+  raise e
 
 # =============================================================================
 # Wallet Manager Creation
@@ -260,14 +268,14 @@ proc loadWallet*(wm: WalletManager, filename: string,
   withLock wm.walletsLock:
     # Check if already loaded
     if wm.wallets.hasKey(name):
-      raise newException(WalletManagerError, "Wallet \"" & name & "\" is already loaded")
+      raiseWalletMgr("Wallet \"" & name & "\" is already loaded.", -35)
 
   # Check wallet exists
   let walletPath = wm.getWalletPath(name)
   let dbPath = wm.getWalletDbPath(name)
 
   if not fileExists(dbPath):
-    raise newException(WalletManagerError, "Wallet file not found: " & dbPath)
+    raiseWalletMgr("Wallet file not found: " & dbPath, -18)
 
   # Open database
   var db = newWalletDb(dbPath)
@@ -356,7 +364,7 @@ proc unloadWallet*(wm: WalletManager, walletName: string,
 
   withLock wm.walletsLock:
     if not wm.wallets.hasKey(walletName):
-      raise newException(WalletManagerError, "Wallet \"" & walletName & "\" is not loaded")
+      raiseWalletMgr("Requested wallet does not exist or is not loaded", -18)
 
     lw = wm.wallets[walletName]
     wm.wallets.del(walletName)
@@ -434,6 +442,9 @@ proc createWallet*(wm: WalletManager, name: string,
       accounts: @[],
       utxos: initTable[OutPoint, WalletUtxo](),
       labels: initTable[string, string](),
+      txHistory: initTable[TxId, WalletTxRecord](),
+      txOrder: @[],
+      watchedScripts: initTable[seq[byte], WatchedScript](),
       isEncrypted: false,
       isLocked: false,
       lastSyncedHeight: -1,
@@ -455,6 +466,9 @@ proc createWallet*(wm: WalletManager, name: string,
       accounts: @[],
       utxos: initTable[OutPoint, WalletUtxo](),
       labels: initTable[string, string](),
+      txHistory: initTable[TxId, WalletTxRecord](),
+      txOrder: @[],
+      watchedScripts: initTable[seq[byte], WatchedScript](),
       isEncrypted: false,
       isLocked: false,
       lastSyncedHeight: -1
@@ -478,6 +492,12 @@ proc createWallet*(wm: WalletManager, name: string,
       db.saveAccount(acc.purpose, acc.coinType, acc.accountIndex,
                      acc.nextExternal, acc.nextInternal, acc.gap)
 
+  # New wallets attach at the current chain tip (Core CWallet::AttachChain)
+  # so they do not rescan history they could not have participated in.
+  # Subsequent P2P/RPC block-connects credit coins from that height forward.
+  if wm.chainState != nil:
+    wallet.lastSyncedHeight = wm.chainState.bestHeight
+
   let lw = LoadedWallet(
     wallet: wallet,
     db: db,
@@ -487,6 +507,7 @@ proc createWallet*(wm: WalletManager, name: string,
 
   withLock wm.walletsLock:
     wm.wallets[name] = lw
+  discard wm.persistWallet(name)
 
   # Update load_on_startup setting
   if options.loadOnStartup:
@@ -579,3 +600,79 @@ proc reconcileAllWalletsToTip*(wm: WalletManager) =
       discard wm.reconcileWalletToTip(lw)
     except CatchableError:
       discard
+
+proc scanBlockIntoLoadedWallets*(wm: WalletManager, blk: Block,
+                                 height: int32) {.gcsafe, raises: [].} =
+  ## Credit/debit every loaded wallet from a connected block, then persist.
+  ## Called from ChainState.connectHook on every successful connect (P2P,
+  ## mining, reorg). Best-effort: a wallet fault never aborts the block.
+  if wm == nil:
+    return
+  var names: seq[string]
+  try:
+    {.gcsafe.}:
+      withLock wm.walletsLock:
+        for name, lw in wm.wallets:
+          names.add(name)
+          if lw != nil and lw.wallet != nil:
+            try:
+              var w = lw.wallet
+              w.scanBlockForWallet(blk, height)
+            except CatchableError:
+              discard
+  except CatchableError:
+    return
+  except Exception:
+    return
+  for name in names:
+    try:
+      {.gcsafe.}:
+        discard wm.persistWallet(name)
+    except CatchableError:
+      discard
+    except Exception:
+      discard
+
+proc backupWalletFile*(wm: WalletManager, name, dest: string) =
+  ## Copy the loaded wallet's database to `dest`. Parent directory of `dest`
+  ## must already exist (Core backupwallet: missing parent -> -4).
+  ## Reference: bitcoin-core/src/wallet/rpc/backup.cpp backupwallet.
+  let lwOpt = wm.getWallet(name)
+  if lwOpt.isNone:
+    raiseWalletMgr("Requested wallet does not exist or is not loaded", -18)
+  let lw = lwOpt.get()
+  discard wm.persistWallet(name)
+  let destDir = dest.parentDir
+  if destDir.len > 0 and not dirExists(destDir):
+    raiseWalletMgr("Error: Wallet backup failed!", -4)
+  try:
+    copyFile(lw.db.path, dest)
+    let snap = wm.getWalletSnapshotPath(name)
+    if fileExists(snap):
+      copyFile(snap, dest & ".state")
+  except CatchableError:
+    raiseWalletMgr("Error: Wallet backup failed!", -4)
+
+proc restoreWalletFromBackup*(wm: WalletManager, name, backupFile: string,
+                              loadOnStartup: Option[bool] = none(bool)):
+                              tuple[wallet: LoadedWallet, warnings: seq[string]] =
+  ## Restore a wallet from a backupwallet file and load it.
+  ## Missing backup -> -8; destination already exists -> -36.
+  ## Reference: bitcoin-core/src/wallet/wallet.cpp RestoreWallet.
+  if not fileExists(backupFile):
+    raiseWalletMgr("Backup file does not exist", -8)
+  let destDb = wm.getWalletDbPath(name)
+  if fileExists(destDb) or wm.getWallet(name).isSome:
+    raiseWalletMgr("Failed to restore wallet. Database file exists '" &
+                   destDb & "'.", -36)
+  let walletPath = wm.getWalletPath(name)
+  if not dirExists(walletPath):
+    createDir(walletPath)
+  try:
+    copyFile(backupFile, destDb)
+    let stateSidecar = backupFile & ".state"
+    if fileExists(stateSidecar):
+      copyFile(stateSidecar, wm.getWalletSnapshotPath(name))
+  except CatchableError as e:
+    raiseWalletMgr("Error: Wallet restore failed: " & e.msg, -4)
+  wm.loadWallet(name, loadOnStartup)

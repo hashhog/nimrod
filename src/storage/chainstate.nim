@@ -197,6 +197,16 @@ type
     # Reference: bitcoin-core/src/index/base.cpp::BaseIndex::BlockDisconnected.
     disconnectHook*: proc(blockHash: BlockHash, prevHash: BlockHash,
                           height: int32) {.raises: [].}
+    # Optional connect hook fired AFTER a block is successfully connected to
+    # the active tip (connectBlock, connectBlockIBD, adoptAppliedBlock, and
+    # each promoted block of handleReorg). Wired by the daemon to scan every
+    # loaded wallet so outputs paying a wallet address are credited on the
+    # P2P path, not only generatetoaddress/submitblock. Mirrors Bitcoin Core
+    # CValidationInterface::BlockConnected. nil when no wallet is wired.
+    # Best-effort: the hook is raises:[] so a wallet fault never rolls back
+    # a fully-validated block.
+    # Reference: bitcoin-core/src/validationinterface.cpp BlockConnected.
+    connectHook*: proc(blk: Block, height: int32) {.gcsafe, raises: [].}
     # Best-known header tip metadata — updated by SyncManager whenever the
     # header chain advances (see updateBestHeaderInfo).  Used by the
     # assumevalid skip gate (shouldSkipScripts conditions 4-6) so that
@@ -882,6 +892,7 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     ibdDiskFlushInterval: IbdBatchFlushInterval,  # default: flush to disk every 2000 blocks
     reorgDeletedUtxos: nil,
     disconnectHook: nil,
+    connectHook: nil,
     # Best-header info: conservative defaults until SyncManager calls
     # updateBestHeaderInfo.  Zero chainwork → condition 4 fails →
     # scripts verified (fail-safe).
@@ -1419,6 +1430,8 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   # stall block connection.
   if cs.tipChangedHook != nil:
     cs.tipChangedHook()
+  if cs.connectHook != nil:
+    cs.connectHook(blk, height)
 
   ok()
 
@@ -2023,6 +2036,8 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
   # blockTip / WaitTipChanged fires during IBD too). Best-effort.
   if cs.tipChangedHook != nil:
     cs.tipChangedHook()
+  if cs.connectHook != nil:
+    cs.connectHook(blk, height)
 
   ok()
 
@@ -2167,6 +2182,8 @@ proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainSta
   cs.flushToDiskIfNeeded()
   if cs.tipChangedHook != nil:
     cs.tipChangedHook()
+  if cs.connectHook != nil:
+    cs.connectHook(blk, height)
 
   info "rolled forward already-applied block", height = height,
        hash = $blockHash
@@ -3085,6 +3102,13 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   # Best-effort.
   if cs.tipChangedHook != nil:
     cs.tipChangedHook()
+  # Credit wallets for every promoted block (Core BlockConnected per ConnectTip).
+  # Heights run fork+1 .. new tip; newChain is oldest-first.
+  if cs.connectHook != nil and newChain.len > 0:
+    var h = cs.bestHeight - int32(newChain.len) + 1
+    for blk in newChain:
+      cs.connectHook(blk, h)
+      inc h
 
   ok()
 

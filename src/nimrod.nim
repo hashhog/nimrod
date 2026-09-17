@@ -2991,6 +2991,21 @@ proc startNode*(config: NimrodConfig) {.async.} =
     state.rpcServer.walletManager =
       newWalletManager(networkDir, params, state.chainState)
 
+    # Wallet block-connect hook: every chainstate connect (P2P, IBD, reorg,
+    # mining) credits loaded wallets. Without this, coins paid to a
+    # getnewaddress output over P2P never appear in listunspent/getbalances
+    # (the generate/submitblock RPC paths already scanned; the live path did
+    # not). Mirrors Bitcoin Core CValidationInterface::BlockConnected.
+    # Reference: bitcoin-core/src/wallet/wallet.cpp CWallet::blockConnected.
+    let wmForConnect = state.rpcServer.walletManager
+    state.chainState.connectHook = proc(blk: Block, height: int32) {.gcsafe, raises: [].} =
+      try:
+        wmForConnect.scanBlockIntoLoadedWallets(blk, height)
+      except CatchableError:
+        discard
+      except Exception:
+        discard
+
     # Auto-load wallets marked load_on_startup (or the default wallet). This is
     # fast and stays synchronous here because the wallet RPCs need the wallets
     # loaded before the RPC thread starts serving.

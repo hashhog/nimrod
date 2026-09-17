@@ -209,6 +209,7 @@ const IncludedTests = [
   "test_sync",
   "test_t1_r5_parity",
   "test_t2_r5_parity",
+  "test_t3_r5_parity",
   "test_taproot_commitment",
   "test_taproot_op_success",
   "test_taproot_p1_gaps",
