@@ -1,6 +1,7 @@
 ## Peer connection management
 ## Handles peer discovery, DNS resolution, connection limits, banning, and message routing
-## 8 full-relay outbound + 2 block-relay-only outbound + 117 inbound connections
+## 8 full-relay outbound + 2 block-relay-only outbound + inbound =
+## maxconnections - (8+2+1 feeler); Core nMaxInbound.
 ## 24h ban duration, misbehavior scoring: 100 points = ban (Bitcoin Core compatible)
 ##
 ## Eclipse attack protections:
@@ -67,6 +68,8 @@ const
   DefaultMaxOutboundFullRelay* = 8
   DefaultMaxOutboundBlockRelay* = 2
   DefaultMaxInbound* = 117
+  DEFAULT_MAX_CONNECTIONS* = 125
+  DEFAULT_BIND_HOSTS* = ["0.0.0.0", "::"]
   NetgroupKey* = 0x6c0edd8036ef4036'u64  # SHA256("netgroup")[0:8]
   # BIP-324: cap the v1-only address cache.  Mirrors clearbit's
   # V2_FALLBACK_CACHE_MAX = 4096.  Bounded so a churn-y network doesn't
@@ -75,6 +78,12 @@ const
 
 type
   PeerCallback* = proc(peer: Peer, msg: P2PMessage): Future[void] {.async.}
+
+  BindSpec* = object
+    ## One resolved P2P listen endpoint (host + port).
+    ## Core-style -bind: 0.0.0.0, 127.0.0.1:8334, [::], [::1]:18444, or bare ::.
+    host*: string
+    port*: uint16
 
   PeerConnectionType* = enum
     pctFullRelay       # Full-relay outbound (8 slots)
@@ -128,6 +137,11 @@ type
     banManager*: BanManager
     anchorList*: AnchorList
     listener*: StreamServer
+    listeners*: seq[StreamServer]
+    bindSpecs*: seq[string]            ## empty = DEFAULT_BIND_HOSTS
+    listenPort*: uint16
+    listenEnabled*: bool
+    handshakeTimeoutMs*: int           ## copied onto accepted/dialed peers
     onMessage*: PeerCallback
     ourHeight*: int32
     seedNodes*: seq[tuple[host: string, port: uint16]]
@@ -205,6 +219,7 @@ type
 # Forward declarations
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
 proc tryEvictInbound(pm: PeerManager): Option[string]
+proc stopListener*(pm: PeerManager) {.raises: [].}
 proc runStalePeerChecks*(pm: PeerManager) {.async.}
 proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage)
 proc markAddressGood*(pm: PeerManager, address: string, port: uint16) {.raises: [], gcsafe.}
@@ -216,6 +231,84 @@ proc peerKey(host: string, port: uint16): string =
 
 proc peerKey(peer: Peer): string =
   peerKey(peer.address, peer.port)
+
+proc parseBindSpec*(spec: string, defaultPort: uint16): BindSpec =
+  ## Parse a Core-style -bind spec. A spec without an explicit port inherits
+  ## `defaultPort`. Bare IPv6 (e.g. ::, ::1) cannot carry a port; use [addr]:port.
+  let s = spec.strip()
+  if s.len == 0:
+    raise newException(ValueError, "empty bind spec")
+  if s[0] == '[':
+    let closeBr = s.find(']')
+    if closeBr < 0:
+      raise newException(ValueError, "unterminated IPv6 bind spec: " & spec)
+    let host = s[1 ..< closeBr]
+    if host.len == 0:
+      raise newException(ValueError, "empty IPv6 host in bind spec: " & spec)
+    if closeBr == s.high:
+      return BindSpec(host: host, port: defaultPort)
+    if s[closeBr + 1] != ':':
+      raise newException(ValueError, "invalid bind spec: " & spec)
+    let port = parseInt(s[closeBr + 2 .. ^1])
+    if port < 1 or port > 65535:
+      raise newException(ValueError, "invalid port in bind spec: " & spec)
+    return BindSpec(host: host, port: uint16(port))
+  var ncolon = 0
+  for ch in s:
+    if ch == ':':
+      inc ncolon
+  if ncolon >= 2:
+    return BindSpec(host: s, port: defaultPort)
+  let colon = s.find(':')
+  if colon < 0:
+    return BindSpec(host: s, port: defaultPort)
+  if colon == 0 or colon == s.high:
+    raise newException(ValueError, "invalid bind spec: " & spec)
+  let host = s[0 ..< colon]
+  let port = parseInt(s[colon + 1 .. ^1])
+  if port < 1 or port > 65535:
+    raise newException(ValueError, "invalid port in bind spec: " & spec)
+  BindSpec(host: host, port: uint16(port))
+
+proc resolveListenBinds*(specs: seq[string], port: uint16): seq[BindSpec] =
+  ## Empty input means DEFAULT_BIND_HOSTS (0.0.0.0 and ::).
+  if specs.len == 0:
+    for h in DEFAULT_BIND_HOSTS:
+      result.add(BindSpec(host: h, port: port))
+  else:
+    for s in specs:
+      result.add(parseBindSpec(s, port))
+
+proc inboundSlotsFor*(maxConnections, maxOutbound: int): int =
+  ## Core nMaxInbound = nMaxConnections - nMaxOutbound.
+  max(0, maxConnections - maxOutbound)
+
+proc connectionBudget*(maxConnections: int): tuple[fullRelay, blockRelay, inbound: int] =
+  ## Core init.cpp: nMaxOutbound = min(8+2+1, nMaxConnections);
+  ## nMaxInbound = max(0, nMaxConnections - nMaxOutbound).
+  let fullRelay = min(DefaultMaxOutboundFullRelay, max(0, maxConnections))
+  let blockRelay = min(DefaultMaxOutboundBlockRelay, max(0, maxConnections - fullRelay))
+  let feeler = min(MaxFeelerConnections, max(0, maxConnections - fullRelay - blockRelay))
+  let inbound = max(0, maxConnections - fullRelay - blockRelay - feeler)
+  (fullRelay, blockRelay, inbound)
+
+proc hostOf*(ta: TransportAddress): string =
+  case ta.family
+  of AddressFamily.IPv4:
+    $IpAddress(family: IpAddressFamily.IPv4, address_v4: ta.address_v4)
+  of AddressFamily.IPv6:
+    $IpAddress(family: IpAddressFamily.IPv6, address_v6: ta.address_v6)
+  else:
+    ""
+
+proc getBindAddresses*(pm: PeerManager): seq[BindSpec] =
+  let port = if pm.listenPort > 0: pm.listenPort else: pm.params.defaultPort
+  resolveListenBinds(pm.bindSpecs, port)
+
+proc getListeningBinds*(pm: PeerManager): seq[BindSpec] =
+  for s in pm.listeners:
+    let ta = s.localAddress()
+    result.add(BindSpec(host: hostOf(ta), port: uint16(ta.port)))
 
 proc addAddedNode*(pm: PeerManager, node: string): bool =
   ## Record `node` on the `addnode`-managed list. nimrod equivalent of Bitcoin
@@ -383,6 +476,11 @@ proc newPeerManager*(params: ConsensusParams,
     # Core CConnman.fNetworkActive defaults true; the gates are no-ops while true
     # so default behavior is byte-for-byte identical to before this flag existed.
     networkActive: true,
+    listenEnabled: true,
+    listenPort: params.defaultPort,
+    bindSpecs: @[],
+    listeners: @[],
+    handshakeTimeoutMs: HandshakeTimeoutSec * 1000,
     ourHeight: 0,
     inFlightBlocks: initTable[BlockHash, InFlightBlock](),
     running: false,
@@ -539,8 +637,11 @@ proc outboundBlockRelayCount*(pm: PeerManager): int =
       result += 1
 
 proc inboundCount*(pm: PeerManager): int =
+  ## Count inbound peers that occupy a slot, including half-open
+  ## (psConnected / psHandshaking). Core CConnman::GetNodeCount(In) walks
+  ## m_nodes, which includes sockets still in the version handshake.
   for peer in pm.peers.values:
-    if peer.direction == pdInbound and peer.state == psReady:
+    if peer.direction == pdInbound and peer.state != psDisconnected:
       result += 1
 
 proc isBanned*(pm: PeerManager, address: string): bool =
@@ -686,7 +787,8 @@ proc resolveDnsSeeds*(pm: PeerManager): Future[seq[string]] {.async.} =
   return addresses
 
 proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
-                            connType: PeerConnectionType): Future[bool] {.async.} =
+                            connType: PeerConnectionType,
+                            skipReachability = false): Future[bool] {.async.} =
   ## Connect to a peer with specific connection type
   let key = peerKey(address, port)
 
@@ -702,7 +804,9 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
   # operator can always force-dial a specific peer for debugging.
   # Reference: bitcoin-core/src/net.cpp CConnman::ConnectNode early
   # return on !IsReachable(addr.GetNetwork()).
-  if connType in {pctFullRelay, pctBlockRelayOnly}:
+  # skipReachability is the test-only analogue of Core's addnode/connect
+  # bypass so a regtest inbound-flood control can dial 127.0.0.1.
+  if not skipReachability and connType in {pctFullRelay, pctBlockRelayOnly}:
     let onion = isOnionHost(address)
     let i2p   = isI2pHost(address)
     let cjdns = (not onion and not i2p) and isCjdnsHost(address)
@@ -769,6 +873,7 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
              # MAX_FEELER_CONNECTIONS=1 single-FEELER-per-open-loop rule.
 
   let peer = newPeer(address, port, pm.params, pdOutbound)
+  peer.handshakeTimeoutMs = pm.handshakeTimeoutMs
   # BIP-324: if this address has previously failed a v2 probe, skip v2
   # this round — the peer is already known to be v1-only.  Mirrors
   # clearbit's `try_v2 = v2_enabled and !self.isV1Only(address)` gate
@@ -1098,6 +1203,7 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
       return
 
   let peer = newPeer(address, port, pm.params, pdInbound)
+  peer.handshakeTimeoutMs = pm.handshakeTimeoutMs
   peer.transport = transp
   peer.state = psConnected
   pm.peers[key] = peer
@@ -1159,23 +1265,59 @@ proc inboundConnectionCallback(server: StreamServer, transp: StreamTransport) {.
     except CatchableError:
       discard
 
+proc startListeners*(pm: PeerManager, specs: seq[string], port: uint16) {.async.} =
+  ## Bind one StreamServer per resolved spec. Empty `specs` means
+  ## DEFAULT_BIND_HOSTS (0.0.0.0 and ::). IPv6 sockets use DualStackType.Disabled
+  ## (IPV6_V6ONLY) so they do not collide with the IPv4 bind. When `port` is 0
+  ## the first successful bind's assigned port is reused for the rest.
+  pm.bindSpecs = specs
+  pm.listenPort = port
+  let binds = resolveListenBinds(specs, port)
+  var assigned: uint16 = 0
+  var lastErr = ""
+  for spec in binds:
+    let usePort = if spec.port == 0 and assigned != 0: assigned else: spec.port
+    let dual =
+      if ':' in spec.host: DualStackType.Disabled
+      else: DualStackType.Auto
+    try:
+      let ta = initTAddress(spec.host, Port(usePort))
+      let server = createStreamServer(
+        ta,
+        inboundConnectionCallback,
+        {ServerFlags.ReuseAddr},
+        udata = cast[pointer](pm),
+        dualstack = dual)
+      server.start()
+      pm.listeners.add(server)
+      if pm.listener == nil:
+        pm.listener = server
+      let livePort = uint16(server.localAddress.port)
+      if assigned == 0:
+        assigned = livePort
+        if pm.listenPort == 0:
+          pm.listenPort = livePort
+      info "listening for connections", address = spec.host, port = livePort
+    except CatchableError as e:
+      lastErr = e.msg
+      warn "listen bind failed", host = spec.host, port = usePort, error = e.msg
+  if pm.listeners.len == 0:
+    raise newException(IOError, "failed to bind P2P listener: " & lastErr)
+
 proc startListener*(pm: PeerManager, bindAddr: string, port: uint16) {.async.} =
-  let ta = initTAddress(bindAddr, Port(port))
+  await pm.startListeners(@[bindAddr], port)
 
-  pm.listener = createStreamServer(
-    ta,
-    inboundConnectionCallback,
-    {ServerFlags.ReuseAddr},
-    udata = cast[pointer](pm)
-  )
-  pm.listener.start()
-  info "listening for connections", address = bindAddr, port = port
-
-proc stopListener*(pm: PeerManager) =
-  if pm.listener != nil:
-    pm.listener.stop()
-    pm.listener.close()
-    pm.listener = nil
+proc stopListener*(pm: PeerManager) {.raises: [].} =
+  for s in pm.listeners:
+    try:
+      s.stop()
+      s.close()
+    except CatchableError:
+      discard
+    except Exception:
+      discard
+  pm.listeners = @[]
+  pm.listener = nil
 
 proc getReadyPeers*(pm: PeerManager): seq[Peer] =
   for peer in pm.peers.values:

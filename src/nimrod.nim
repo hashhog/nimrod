@@ -46,7 +46,8 @@ type
     rpcEnabled*: bool
     rpcUser*: string
     rpcPassword*: string
-    bindAddr*: string
+    bindSpecs*: seq[string] ## Repeatable --bind. Empty = 0.0.0.0 and ::.
+    listenEnabled*: bool    ## --listen / --nolisten. Default true.
     pruneTarget*: uint64  ## Prune target in MiB (0 = disabled, 1 = manual only)
     importBlocks*: string ## Path to blk*.dat directory, or "-" for framed stdin
     metricsPort*: uint16  ## Prometheus metrics port (0 = disabled)
@@ -280,7 +281,8 @@ proc defaultConfig*(): NimrodConfig =
     rpcEnabled: true,
     rpcUser: "",
     rpcPassword: "",
-    bindAddr: "0.0.0.0",
+    bindSpecs: @[],
+    listenEnabled: true,
     pruneTarget: 0,  # Pruning disabled by default
     metricsPort: 9332,
     ibdFlushInterval: 0,  # 0 = use default (IbdBatchFlushInterval = 2000)
@@ -358,7 +360,12 @@ proc loadConfigFile*(config: var NimrodConfig) =
     of "rpcpassword":
       config.rpcPassword = value
     of "bind":
-      config.bindAddr = value
+      config.bindSpecs.add(value)
+    of "listen":
+      config.listenEnabled = value.toLowerAscii() in ["1", "true", "yes", "on", ""]
+    of "nolisten":
+      if value.len == 0 or value.toLowerAscii() in ["1", "true", "yes", "on"]:
+        config.listenEnabled = false
     of "norpc":
       config.rpcEnabled = value.toLowerAscii() notin ["1", "true", "yes"]
     of "testnet":
@@ -522,7 +529,9 @@ Options:
   --maxconnections=N     Maximum peer connections (default: 125)
   --rpcuser=USER         RPC username
   --rpcpassword=PASS     RPC password
-  --bind=ADDR            P2P bind address (default: 0.0.0.0)
+  --bind=ADDR            P2P bind address, repeatable (default: 0.0.0.0 and ::)
+  --listen               Accept inbound P2P connections (default: 1)
+  --nolisten             Do not accept inbound P2P connections
   --norpc                Disable RPC server
   --prune=SIZE_MB        Enable pruning. SIZE_MB=0 disables; SIZE_MB=1 enables
                          manual mode (only the pruneblockchain RPC prunes;
@@ -605,14 +614,14 @@ Config file: <datadir>/nimrod.conf or path passed via --conf (key=value format)
 SIGHUP: reopens the configured log file (rotation-friendly).
 """
 
-proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] =
+proc parseArgs*(cmdline: seq[string]): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] =
   ## Parse command line arguments
   ## Returns: command, config, and additional args
   result.config = defaultConfig()
   result.cmd = cmdStart  # Default command
   result.args = @[]
 
-  var p = initOptParser()
+  var p = initOptParser(cmdline)
   var cmdParsed = false
 
   while true:
@@ -661,7 +670,12 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
       of "rpcpassword":
         result.config.rpcPassword = p.val
       of "bind":
-        result.config.bindAddr = p.val
+        result.config.bindSpecs.add(p.val)
+      of "listen":
+        result.config.listenEnabled = p.val.len == 0 or
+          p.val.toLowerAscii() in ["1", "true", "yes", "on"]
+      of "nolisten":
+        result.config.listenEnabled = false
       of "norpc":
         result.config.rpcEnabled = false
       of "metricsport":
@@ -951,6 +965,9 @@ proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] 
   # Merge: CLI takes precedence
   # Only use file values if CLI didn't explicitly set them
   # (This is simplified - a proper impl would track which were set)
+
+proc parseArgs*(): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] =
+  parseArgs(commandLineParams())
 
 proc getConsensusParams*(config: NimrodConfig): ConsensusParams =
   result =
@@ -2493,12 +2510,17 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # outbound diversity checks (hasNetGroupCollision) and bucket-group storage
   # use ASN-keyed groups when an asmap file is loaded.
   # Reference: bitcoin-core/src/net.cpp CConnman constructor — m_netgroupman ref.
+  let budget = connectionBudget(config.maxConnections)
   state.peerManager = newPeerManager(
     params,
-    maxOutFullRelay = config.maxConnections div 16,
-    maxIn = config.maxConnections - config.maxConnections div 16,
+    maxOutFullRelay = budget.fullRelay,
+    maxOutBlockRelay = budget.blockRelay,
+    maxIn = budget.inbound,
     dataDir = networkDir,
     netGroupMgr = state.netGroupManager)
+  state.peerManager.bindSpecs = config.bindSpecs
+  state.peerManager.listenPort = config.p2pPort
+  state.peerManager.listenEnabled = config.listenEnabled
   state.peerManager.updateHeight(state.chainState.bestHeight)
   state.peerManager.setMessageCallback(messageCallback(state))
 
@@ -3083,8 +3105,12 @@ proc startNode*(config: NimrodConfig) {.async.} =
     asyncSpawn startMetricsServer(state, config.metricsPort)
 
   # 8. Start P2P listener
-  info "starting P2P listener", port = config.p2pPort, bindAddr = config.bindAddr
-  await state.peerManager.startListener(config.bindAddr, config.p2pPort)
+  if config.listenEnabled:
+    info "starting P2P listener", port = config.p2pPort,
+         binds = (if config.bindSpecs.len == 0: $DEFAULT_BIND_HOSTS else: $config.bindSpecs)
+    await state.peerManager.startListeners(config.bindSpecs, config.p2pPort)
+  else:
+    info "P2P listen disabled (--nolisten)"
 
   # 9. Start the sync loop and peer-manager main loop FIRST, as independent
   #    background tasks.

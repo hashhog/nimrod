@@ -132,6 +132,7 @@ type
     localNonce*: uint64          # Our nonce for self-connection detection
     remoteNonce*: uint64         # Their nonce from version message
     handshakeStartTime*: stdtimes.Time  # When handshake started (for timeout)
+    handshakeTimeoutMs*: int            # 0 = HandshakeTimeoutSec * 1000 (tests override)
     # Misbehavior scoring (Bitcoin Core: 100 = ban threshold)
     misbehaviorScore*: uint32
     shouldDisconnect*: bool
@@ -216,6 +217,7 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     versionSent: false,
     verackReceived: false,
     verackSent: false,
+    handshakeTimeoutMs: HandshakeTimeoutSec * 1000,
     localNonce: uint64(nodeRng().rand(high(int))),  # Generate unique nonce for self-connection detection
     remoteNonce: 0,
     # BIP 152 compact blocks
@@ -236,6 +238,11 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     chainSyncState: ChainSyncState(),
     blocksInFlight: 0
   )
+
+proc handshakeTimeoutDur(peer: Peer): ctimer.Duration =
+  let ms = if peer.handshakeTimeoutMs > 0: peer.handshakeTimeoutMs
+           else: HandshakeTimeoutSec * 1000
+  ctimer.milliseconds(ms)
 
 proc `$`*(peer: Peer): string =
   fmt"{peer.address}:{peer.port}"
@@ -1093,10 +1100,19 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
   peer.handshakeStartTime = stdtimes.getTime()
 
   # Inbound classification: peek 16 bytes, decide v1 vs v2.
+  # Bound the peek with the handshake timeout so a TCP connect that never
+  # sends a version is reaped (Core TIMEOUT_INTERVAL / version wait).
   if peer.direction == pdInbound and peer.transportProto == tpV1:
     try:
-      await peer.fillRecvBuffer(V1PrefixLen)
+      let peekFut = peer.fillRecvBuffer(V1PrefixLen)
+      if not await peekFut.withTimeout(peer.handshakeTimeoutDur()):
+        await peekFut.cancelAndWait()
+        raise newException(PeerError, "handshake timeout waiting for version")
+      if peekFut.failed:
+        raise peekFut.error
     except PeerError as e:
+      if "handshake timeout" in e.msg:
+        raise
       raise newException(PeerError, "v2 classify peek failed: " & e.msg)
     let prefix = peer.recvBuffer[0 ..< V1PrefixLen]
     if not classifyInboundV2(prefix, peer.networkMagic):
@@ -1146,7 +1162,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
 
     # Wait for their version
     let recvVersionFut = peer.readMessage()
-    if not await recvVersionFut.withTimeout(ctimer.seconds(HandshakeTimeoutSec)):
+    if not await recvVersionFut.withTimeout(peer.handshakeTimeoutDur()):
       raise newException(PeerError, "handshake timeout waiting for version")
 
     let versionMsg = recvVersionFut.value()
@@ -1184,7 +1200,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     block waitForVerack:
       for attempt in 0 ..< 20:  # Safety limit to avoid infinite loop
         let recvFut = peer.readMessage()
-        if not await recvFut.withTimeout(ctimer.seconds(HandshakeTimeoutSec)):
+        if not await recvFut.withTimeout(peer.handshakeTimeoutDur()):
           raise newException(PeerError, "handshake timeout waiting for verack")
 
         let msg = recvFut.value()
@@ -1217,7 +1233,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
   else:
     # Inbound: wait for version first
     let recvVersionFut = peer.readMessage()
-    if not await recvVersionFut.withTimeout(ctimer.seconds(HandshakeTimeoutSec)):
+    if not await recvVersionFut.withTimeout(peer.handshakeTimeoutDur()):
       raise newException(PeerError, "handshake timeout waiting for version")
 
     let versionMsg = recvVersionFut.value()
@@ -1262,7 +1278,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     block waitForVerackInbound:
       for attempt in 0 ..< 20:
         let recvFut = peer.readMessage()
-        if not await recvFut.withTimeout(ctimer.seconds(HandshakeTimeoutSec)):
+        if not await recvFut.withTimeout(peer.handshakeTimeoutDur()):
           raise newException(PeerError, "handshake timeout waiting for verack")
 
         let msg = recvFut.value()
@@ -1926,7 +1942,9 @@ proc checkHandshakeTimeout*(peer: Peer): bool =
     return false
 
   let elapsed = stdtimes.getTime() - peer.handshakeStartTime
-  result = elapsed.inSeconds >= HandshakeTimeoutSec
+  let limitMs = if peer.handshakeTimeoutMs > 0: peer.handshakeTimeoutMs
+                else: HandshakeTimeoutSec * 1000
+  result = elapsed.inMilliseconds >= limitMs
 
   if result:
     warn "handshake timeout", peer = $peer, elapsed = elapsed.inSeconds
