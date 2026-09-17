@@ -1323,8 +1323,21 @@ proc tryLowWorkHeadersSync*(sm: SyncManager, peer: Peer,
 
   # Only trigger if message is full (peer has more headers)
   if headers.len < MaxHeadersPerRequest:
-    debug "ignoring low-work headers (incomplete message)",
-          peer = $peer, headers = headers.len, work = $totalWork
+    # Core ignores an incomplete low-work message (net_processing.cpp
+    # TryLowWorkHeadersSync: headers.size() != MAX_HEADERS_RESULTS).
+    # That is correct for a from-genesis / far-below-tip batch. It is
+    # NOT correct for a tip-extend on a node that already has height
+    # H>0: 22a60b8's cached-totalWork classify can mis-route those as
+    # hbrAntiDoS, and clearing them here is the silent drop that
+    # livelocked mainnet at 967057 (301 headers, zero "processed
+    # headers", 60s timeout on every peer). Let the caller process a
+    # tip-extend directly.
+    if headers.len > 0 and headers[0].prevBlock == sm.headerChain.tip and
+        sm.headerChain.tipHeight > 0:
+      return false
+    warn "ignoring low-work headers (incomplete message)",
+         peer = $peer, headers = headers.len, work = $totalWork,
+         tipHeight = sm.headerChain.tipHeight
     headers = @[] # Clear headers to prevent normal processing
     return true
 
@@ -1562,13 +1575,22 @@ proc classifyHeaderBatch*(sm: SyncManager,
   let claimedWork = calculateClaimedHeadersWork(headers)
   let totalWork = result.connectWork + claimedWork
   let threshold = sm.getAntiDoSWorkThreshold()
-  # Snapshot-grafted chain: the assumeUTXO base is a trusted mid-chain tip
-  # whose nChainWork is below nMinimumChainWork (campaign rungs). Extending
-  # that tip must not enter PRESYNC — the replay peer only serves the window,
-  # and PRESYNC would leave getblockchaininfo.headers frozen at the base.
-  # Dense genesis-rooted chains (byHash.len == headers.len) still PRESYNC.
-  let grafted = len(sm.headerChain.byHash) < sm.headerChain.headers.len
-  if grafted and firstPrev == sm.headerChain.tip:
+  # Tip-extending batch (connect point IS our current header tip) on a
+  # chain that already has height H>0: do not enter PRESYNC.
+  # PRESYNC protects a node that does not yet have a minimum-work chain
+  # (from-genesis). A node whose header tip is already above genesis is
+  # not that node — Core reads chain_start->nChainWork from CBlockIndex,
+  # which at the tip is the validated chain's work. nimrod's in-memory
+  # totalWork cache can be 0, quantised, or a different formula
+  # (calculateWork vs getBlockProof), so the comparison above mis-routes
+  # a tip-extend as hbrAntiDoS; tryLowWorkHeadersSync then silently
+  # drops a <2000 batch. Live 2026-09-17: 0675bde at 967057, 301 headers
+  # from public peers, zero "processed headers". b89aba8 summed
+  # getBlockProof and accepted. Grafted snapshot-boot (holes below the
+  # tail, tipHeight > 0) is the same shape. From-genesis (tipHeight==0,
+  # firstPrev==genesis==tip) still goes through the work comparison
+  # (W162).
+  if firstPrev == sm.headerChain.tip and sm.headerChain.tipHeight > 0:
     result.routing = hbrDirect
   elif totalWork < threshold:
     result.routing = hbrAntiDoS
@@ -1610,8 +1632,26 @@ proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
     return
 
   sm.lastSyncTime = getTime()
+  var locatorEntries = newSeqOfCap[string](locator.len)
+  for h in locator:
+    let bh = BlockHash(h)
+    var height = -1'i32
+    let ho = sm.headerChain.getHeight(bh)
+    if ho.isSome:
+      height = ho.get()
+    elif sm.chainDb != nil:
+      let idx = sm.chainDb.getBlockIndex(bh)
+      if idx.isSome:
+        height = idx.get().height
+    locatorEntries.add($height & ":" & $bh)
+  let matchesActive =
+    locator.len > 0 and BlockHash(locator[0]) == sm.chainTip
   info "requested headers", peer = $peer, locatorLen = locator.len,
-       tipHeight = sm.headerChain.tipHeight
+       tipHeight = sm.headerChain.tipHeight,
+       chainTipHeight = sm.chainTipHeight,
+       version = ProtocolVersion, hashStop = $BlockHash(hashStop),
+       locator0MatchesActiveTip = matchesActive,
+       locator = locatorEntries.join(",")
 
 type ForkHeaderOutcome* = enum
   ## Result of trying to accept a header that does NOT extend the active tip.
@@ -1733,6 +1773,17 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
   ## Validate PoW, chain linkage, MTP, difficulty retarget
   ## Implements PRESYNC/REDOWNLOAD anti-DoS protection for low-work headers
   ## Request more if 2000 headers received, tip reached if < 2000
+
+  # Log the inbound batch BEFORE any filtering so a silent drop
+  # (unconnecting / incomplete-low-work / PRESYNC consume) is visible.
+  if headers.len == 0:
+    info "received headers", peer = $peer, count = 0,
+         connectsToTip = false, tipHeight = sm.headerChain.tipHeight
+  else:
+    info "received headers", peer = $peer, count = headers.len,
+         firstPrev = $headers[0].prevBlock,
+         connectsToTip = (headers[0].prevBlock == sm.headerChain.tip),
+         tipHeight = sm.headerChain.tipHeight
 
   # LIVENESS FIX (A): enforce the header-tip invariant on the INBOUND edge as
   # well as the outbound one (requestHeaders).  Without this the wedge only

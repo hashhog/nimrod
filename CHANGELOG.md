@@ -2,6 +2,11 @@
 
 ## v1.0.2 — 2026-09-16
 
+- fix: tip-extending `headers` on a chain at height H>0 skip PRESYNC. 22a60b8
+  classified them with cached `headerChain.totalWork` (not getBlockProof);
+  a <2000 batch was then dropped as incomplete low-work with no log, so
+  mainnet header sync timed out on every peer at 967057. Locator head is
+  the active tip; inbound headers are logged before filtering.
 - 59fee59 fix: getMedianTimePastFromChain median of last min(11,n) times (BIP113)
 - d828ff2 fix: params.nim campaign parser typo 'andentry' -> 'and entry' (compile break)
 - 22a60b8 fix: graft campaign base_tail_headers so snapshot-boot header-sync starts at the base

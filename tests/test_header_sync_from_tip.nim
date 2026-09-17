@@ -12,8 +12,19 @@
 ## pre-rework pin that held tip; the v1.0.2 gate never exercised
 ## public-peer header sync from an existing chainstate.
 ##
+## STILL BROKEN after 0675bde (live 2026-09-17T03:04Z, tip 967057):
+## rotation works, but every answering peer times out 60s after
+## `requested headers locatorLen=30` with zero `processed headers`.
+## Rolled back to b89aba8: `processed headers accepted=N` in ~1s on
+## the same datadir. 0675bde's fake peer answered whatever locator it
+## got and called handleHeaders with a pre-made H+n batch, so it could
+## not see 22a60b8 mis-routing a tip-extend as hbrAntiDoS then dropping
+## a <2000 batch as "incomplete low-work" (no log).
+##
 ## Bitcoin Core: net_processing.cpp HEADERS_DOWNLOAD_TIMEOUT disconnects
 ## a stalling headers-sync peer when another preferred peer exists.
+## TryLowWorkHeadersSync is for from-genesis / low-work chains, not a
+## tip-extend on a node that already has height H>0.
 ##
 ## Command:
 ##   nim c -r tests/test_header_sync_from_tip.nim
@@ -24,9 +35,10 @@ import chronos
 import ../src/network/sync
 import ../src/network/peermanager
 import ../src/network/peer
+import ../src/network/headerssync
 import ../src/consensus/params
 import ../src/storage/chainstate
-import ../src/primitives/[types, serialize]
+import ../src/primitives/[types, serialize, uint256]
 import ../src/crypto/hashing
 
 proc hashOf(h: BlockHeader): BlockHash =
@@ -65,6 +77,41 @@ proc readyPeer(address: string, port: uint16, params: ConsensusParams,
 
 proc peerKeyOf(p: Peer): string =
   p.address & ":" & $p.port
+
+proc peerAnswerHeaders(peerHeaders: seq[BlockHeader], genesisHash: BlockHash,
+                       locator: seq[array[32, byte]],
+                       expectedTip: BlockHash): seq[BlockHeader] =
+  ## Core FindForkInGlobalIndex + Next(). Answers only from the first
+  ## locator hash this peer knows. A locator whose head is not the node's
+  ## active tip is not a tip-extend — the peer walks for a common ancestor
+  ## (typically genesis) and does NOT invent an H+n batch.
+  var known = initTable[array[32, byte], int]()
+  known[array[32, byte](genesisHash)] = -1
+  for i, h in peerHeaders:
+    known[array[32, byte](hashOf(h))] = i
+  var forkIdx = -2
+  var found = false
+  for loc in locator:
+    if loc in known:
+      forkIdx = known[loc]
+      found = true
+      break
+  if not found:
+    return @[]
+  # Locator head must be the node's active tip or this is not a tip-extend.
+  if locator.len == 0 or BlockHash(locator[0]) != expectedTip:
+    let start = forkIdx + 1
+    if start < 0:
+      return peerHeaders[0 ..< min(2000, peerHeaders.len)]
+    if start >= peerHeaders.len:
+      return @[]
+    return peerHeaders[start ..< min(start + 2000, peerHeaders.len)]
+  let start = forkIdx + 1
+  if start < 0:
+    return peerHeaders[0 ..< min(2000, peerHeaders.len)]
+  if start >= peerHeaders.len:
+    return @[]
+  peerHeaders[start ..< min(start + 2000, peerHeaders.len)]
 
 proc buildDenseDb(path: string, params: ConsensusParams,
                   count: int): tuple[cdb: ChainDb, headers: seq[BlockHeader]] =
@@ -206,3 +253,74 @@ suite "header sync from a dense chain at height H":
     sm.handleHeadersSyncTimeout()
     check not only.shouldDisconnect
     check sm.selectSyncPeer() == only
+
+  test "fake peer answers only from the common ancestor; locator head must be the active tip":
+    ## 22a60b8 used cached headerChain.totalWork at the tip instead of
+    ## summing getBlockProof (b89aba8). When that cache is below
+    ## nMinimumChainWork — zero, quantised, or a different work formula —
+    ## a tip-extending batch of <2000 headers is classified hbrAntiDoS
+    ## and tryLowWorkHeadersSync CLEARS it as an incomplete low-work
+    ## message. handleHeaders then returns without "processed headers".
+    ## Live: 301 headers from Satoshi:31.1.0 at 967057, 60s timeout on
+    ## every peer. The previous test fed H+n straight to handleHeaders
+    ## on regtest (threshold 0) so it could not fail.
+    let params = regtestParams()
+    let path = "/tmp/nimrod_hdr_sync_from_tip_locator"
+    let (cdb, headers) = buildDenseDb(path, params, 12)
+    defer:
+      var c = cdb
+      c.close()
+      removeDir(path)
+
+    let pm = newPeerManager(params, 8, 2, 117, path / "pm")
+    let answering = readyPeer("127.0.0.1", 8333, params, 20)
+    pm.peers[peerKeyOf(answering)] = answering
+
+    let sm = newSyncManager(pm, cdb, params)
+    let activeTip = hashOf(headers[^1])
+    check sm.headerChain.tipHeight == 12
+    check cdb.bestBlockHash == activeTip
+    check sm.headerChain.tip == activeTip
+
+    let locator = sm.buildBlockLocator()
+    check locator.len > 0
+    # REAL locator check: head is the ACTIVE chain tip, not a graft row.
+    check locator[0] == array[32, byte](activeTip)
+    check locator[0] == array[32, byte](cdb.bestBlockHash)
+
+    let ahead = mineChain(activeTip, headers[^1].timestamp, 5)
+    var peerChain = headers
+    peerChain.add(ahead)
+
+    # Negative: a locator whose head is not the active tip (campaign /
+    # graft hash, then genesis) must NOT yield the H+n tip-extend.
+    var graftHash: array[32, byte]
+    graftHash[0] = 0xCA
+    graftHash[1] = 0xFE
+    let badLocator = @[graftHash, array[32, byte](params.genesisBlockHash)]
+    let badAnswer = peerAnswerHeaders(peerChain, params.genesisBlockHash,
+                                      badLocator, activeTip)
+    check badAnswer.len > 0
+    check badAnswer[0].prevBlock != activeTip
+
+    let answer = peerAnswerHeaders(peerChain, params.genesisBlockHash,
+                                   locator, activeTip)
+    check answer.len == 5
+    check answer[0].prevBlock == activeTip
+    check answer[^1] == ahead[^1]
+
+    # Reproduce the 22a60b8 mis-route: cached totalWork does not meet
+    # the anti-DoS threshold, but the dense chain's getBlockProof sum
+    # does (b89aba8). 5 new headers alone do not.
+    let oneProof = getBlockProof(headers[0])
+    sm.minimumChainWork = oneProof * 8'u64
+    sm.headerChain.totalWork = default(array[32, byte])
+
+    let cls = sm.classifyHeaderBatch(answer)
+    check cls.routing == hbrDirect
+    check cls.connectHash == activeTip
+    check cls.connectHeight == 12
+
+    waitFor sm.handleHeaders(answering, answer)
+    check sm.headerChain.tipHeight == 17
+    check sm.headerChain.tip == hashOf(ahead[^1])
