@@ -161,6 +161,9 @@ type
     # every processBlock and only the reorg arm fills them.
     pendingReorgDisconnectedTxs*: seq[Transaction]
     pendingReorgConnectedBlocks*: seq[Block]
+    # Last time planRepairInventory was allowed to retry in-flight hole
+    # fetches. A mute peer must not pin a retained-range hole forever.
+    lastRepairRequest*: SyncTime
 
 const
   MaxHeadersPerRequest* = 2000
@@ -183,6 +186,8 @@ const
   BatchGetDataSize* = 64 ## Blocks per getdata message (batched for IBD throughput)
   UtxoFlushInterval* = 500 ## Flush UTXO set every N blocks during IBD
   InvWitnessBlockType* = 0x40000002'u32 ## Segwit block inv type
+  MaxRepairGetData* = 16 ## Hole-repair getdata items per round (Core per-peer cap)
+  RepairRetrySeconds* = 15 ## Re-ask a still-missing hole after this many seconds
 
 type
   BlockRequest* = object
@@ -986,7 +991,8 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     numVerifyWorkers: numVerifyWorkers,
     filterIndex: filterIndex,
     coinStatsIndex: coinStatsIndex,
-    txoSpenderIndex: txoSpenderIndex
+    txoSpenderIndex: txoSpenderIndex,
+    lastRepairRequest: getTime()
   )
 
   # Initialize with genesis if chain is empty
@@ -2355,6 +2361,61 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     info "requesting blocks", count = inventory.len,
          fromHeight = sm.chainTipHeight + 1
 
+proc planRepairInventory*(sm: SyncManager,
+                          maxItems: int = MaxRepairGetData): seq[InvVector] =
+  ## getdata inventory for queued retained-range holes.
+  ##
+  ## Skips already-have (and drops them from the queue), skips in-flight
+  ## hashes, and does not emit the unretained prefix (enqueue already
+  ## refused those). After RepairRetrySeconds, in-flight hashes that
+  ## never arrived are eligible again so a mute peer cannot pin a hole.
+  result = @[]
+  if sm == nil or sm.chainState == nil:
+    return
+  let now = getTime()
+  if now - sm.lastRepairRequest >= initDuration(seconds = RepairRetrySeconds):
+    for h in sm.chainState.pendingBodyRepairs:
+      sm.requestedHashes.excl(h)
+    sm.lastRepairRequest = now
+  var drop: seq[BlockHash] = @[]
+  for h in sm.chainState.pendingBodyRepairs:
+    if sm.chainDb != nil and sm.chainDb.hasBlockBody(h):
+      drop.add(h)
+      continue
+    if h in sm.requestedHashes:
+      continue
+    result.add(InvVector(invType: invWitnessBlock,
+                         hash: array[32, byte](h)))
+    sm.requestedHashes.incl(h)
+    if result.len >= maxItems:
+      break
+  for h in drop:
+    sm.chainState.pendingBodyRepairs.excl(h)
+
+proc requestRepairBodies*(sm: SyncManager) {.async.} =
+  ## Send getdata for queued retained-range holes to a ready peer.
+  ## No-op when the queue is empty or no peer is ready. Does not
+  ## increment pendingBlocks — IBD must not stall behind repair.
+  let inv = sm.planRepairInventory()
+  if inv.len == 0:
+    return
+  if sm.peerManager == nil:
+    for item in inv:
+      sm.requestedHashes.excl(BlockHash(item.hash))
+    return
+  let peers = sm.peerManager.getReadyPeers()
+  if peers.len == 0:
+    for item in inv:
+      sm.requestedHashes.excl(BlockHash(item.hash))
+    return
+  try:
+    await peers[0].sendGetData(inv)
+    info "requesting retained-range body repair", count = inv.len
+  except CatchableError as e:
+    warn "failed to send body-repair getdata", error = e.msg
+    for item in inv:
+      sm.requestedHashes.excl(BlockHash(item.hash))
+
 proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
   ## Validate and apply a single block at the given height.
   ## Returns true if the block was successfully applied.
@@ -2784,6 +2845,44 @@ proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
       sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlock, "invalid side-branch block")
     false
 
+proc tryFillMissingBody(sm: SyncManager, blk: Block): bool =
+  ## Store a behind-tip active-chain body that IBD skipped writing.
+  ##
+  ## getblockfrompeer and the repair getdata land here: the header is
+  ## known, the height is already connected, cfBlocks is empty. Pre-fix,
+  ## processBlock discarded anything below chainTipHeight, so those
+  ## fetches could never heal the 1,470 live holes. Does not reconnect
+  ## UTXO. Witness commitment is checked when present so a stripped
+  ## body cannot replace a segwit block.
+  if sm == nil or sm.chainState == nil:
+    return false
+  try:
+    {.gcsafe.}:
+      let hash = BlockHash(doubleSha256(serialize(blk.header)))
+      if sm.chainState.db.hasBlockBody(hash):
+        return false
+      let idxOpt = sm.chainState.db.getBlockIndex(hash)
+      if idxOpt.isNone:
+        return false
+      let idx = idxOpt.get()
+      if idx.height > sm.chainTipHeight:
+        return false
+      let canon = sm.chainState.db.getBlockHashByHeight(idx.height)
+      if canon.isNone or canon.get() != hash:
+        return false
+      if blk.txs.len > 0:
+        let wit = checkWitnessMalleation(blk, true)
+        if not wit.isOk:
+          return false
+      let res = sm.chainState.fillMissingBody(blk)
+      if res.isOk:
+        info "filled retained-range body hole", height = idx.height, hash = $hash
+      return res.isOk
+  except CatchableError:
+    return false
+  except Exception:
+    return false
+
 proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   ## Process a received block, returns true if valid.
   ## Buffers out-of-order blocks and processes sequentially.
@@ -2802,6 +2901,38 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
 
   # Remove from in-flight tracking
   sm.requestedHashes.excl(hash)
+
+  # Retained-range hole fill. Must run before the behind-tip discard and
+  # before the side-branch arm: the index row exists (the block was
+  # connected) and headerChain.getHeight will find it, so the old
+  # `blockHeight < expectedHeight → discard` path is what punched the
+  # live 967000 hole permanently.
+  if sm.tryFillMissingBody(blk):
+    sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    sm.lastSyncTime = getTime()
+    return true
+
+  # Active-chain behind-tip whose body did not fill (bad merkle / below
+  # floor / already have) must not fall through to the side-branch arm.
+  # acceptSideBranchBlock would storeBlock a mutated body under the
+  # already-connected hash. Live headerChain.getHeight finds these, so
+  # the old discard path also covered them; this guard is the same rule
+  # when the header chain and the index disagree (tests, snapshot graft).
+  if sm.chainState != nil:
+    try:
+      {.gcsafe.}:
+        let idxOpt = sm.chainState.db.getBlockIndex(hash)
+        if idxOpt.isSome:
+          let idx = idxOpt.get()
+          let canon = sm.chainState.db.getBlockHashByHeight(idx.height)
+          if canon.isSome and canon.get() == hash and
+             idx.height <= sm.chainTipHeight:
+            sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+            return false
+    except CatchableError:
+      discard
+    except Exception:
+      discard
 
   # Determine what height this block belongs to by looking up its hash
   # in the header chain
@@ -3026,6 +3157,9 @@ proc syncLoop*(sm: SyncManager) {.async.} =
          (sm.chainTipHeight < sm.headerTipHeight or heavierFork):
         await sm.requestBlocks(peer)
 
+      if sm.chainState != nil and sm.chainState.pendingBodyRepairs.len > 0:
+        await sm.requestRepairBodies()
+
       if sm.chainTipHeight >= sm.headerTipHeight and not heavierFork:
         sm.state = ssSynced
         info "block sync complete", height = sm.chainTipHeight
@@ -3044,7 +3178,14 @@ proc syncLoop*(sm: SyncManager) {.async.} =
       # Check if we need to download blocks.
       if sm.headerTipHeight > sm.chainTipHeight:
         sm.state = ssIdle
-      await sleepAsync(5000)
+        await sleepAsync(200)
+      elif sm.chainState != nil and sm.chainState.pendingBodyRepairs.len > 0:
+        # Interior holes do not self-heal at tip (connectBlockIBD already
+        # ran). Drain the repair queue without waiting the 5s header poll.
+        await sm.requestRepairBodies()
+        await sleepAsync(200)
+      else:
+        await sleepAsync(5000)
 
     # Timeout handling (skip when already synced — no activity expected)
     if sm.state != ssSynced and

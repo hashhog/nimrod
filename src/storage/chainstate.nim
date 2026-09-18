@@ -3,7 +3,7 @@
 ## Uses RocksDB column families for data separation
 ## Undo data stored in flat files (rev*.dat) for efficient reorg handling
 
-import std/[options, tables, os, algorithm, strutils]
+import std/[options, tables, os, algorithm, strutils, sets]
 import ./db
 import ./undo
 import ../primitives/[types, serialize]
@@ -177,6 +177,11 @@ type
     # bodies. An interior hole raises this above discoverFirstBody.
     historyFloor*: int32
     historyFloorProbed*: bool
+    # Interior retained-range bodies to re-fetch (live 1,470 holes after
+    # connectBlockIBD skipped cfBlocks). getblock/getdata enqueue here;
+    # the sync loop drains it. Prefix below discoverFirstBody is never
+    # queued — that is the 600 G archive decision, not this repair.
+    pendingBodyRepairs*: HashSet[BlockHash]
     # Pending UTXO deletes tracked during IBD (cache key -> true)
     ibdDeletedUtxos*: Table[string, bool]
     # Disk flush state — tracks blocks since last forced memtable→SST flush.
@@ -520,6 +525,7 @@ proc getBlock*(cdb: ChainDb, hash: BlockHash): Option[Block] =
   none(Block)
 
 proc getBlockHashByHeight*(cdb: ChainDb, height: int32): Option[BlockHash] {.gcsafe.}
+proc getBlockIndex*(cdb: ChainDb, hash: BlockHash): Option[BlockIndex]
 
 proc hasBlockBody*(cdb: ChainDb, hash: BlockHash): bool {.gcsafe, raises: [].} =
   ## True iff cfBlocks holds a row for `hash`. Does not deserialize.
@@ -678,6 +684,117 @@ proc auditRetainedBodies*(cdb: ChainDb, tip: int32,
     inc h
   result.holes = found
   result.truncated = result.holeCount > found.len
+
+proc planBodyRepairs*(cdb: ChainDb, tip: int32,
+                      maxHoles: int = 4096): seq[BlockHash] {.raises: [].} =
+  ## Hashes of connected active-chain bodies missing in [firstBody, tip].
+  ##
+  ## Interior holes only. The unretained prefix below discoverFirstBody
+  ## is a floor, not a repair list (live genesis→952185; ~600 G). Live
+  ## 2026-09-18: 1,470 hashes between 952411 and pruneheight.
+  result = @[]
+  if cdb == nil or tip < 0:
+    return
+  try:
+    let floor = discoverFirstBody(cdb, tip)
+    var h = floor
+    while h <= tip and result.len < maxHoles:
+      let hashOpt = cdb.getBlockHashByHeight(h)
+      if hashOpt.isSome and not cdb.hasBlockBody(hashOpt.get()):
+        result.add(hashOpt.get())
+      inc h
+  except CatchableError:
+    discard
+  except Exception:
+    discard
+
+proc enqueueBodyRepair*(cs: ChainState, hash: BlockHash): bool {.raises: [].} =
+  ## Queue `hash` for peer getdata iff it is a retained-range hole.
+  ## Returns false for unknown headers, already-have, side-branch, not-
+  ## yet-connected, or the unretained prefix.
+  if cs == nil or cs.db == nil:
+    return false
+  try:
+    if cs.db.hasBlockBody(hash):
+      return false
+    let idxOpt = cs.db.getBlockIndex(hash)
+    if idxOpt.isNone:
+      return false
+    let idx = idxOpt.get()
+    if idx.height > cs.bestHeight:
+      return false
+    let floor = discoverFirstBody(cs.db, cs.bestHeight)
+    if idx.height < floor:
+      return false
+    let canon = cs.db.getBlockHashByHeight(idx.height)
+    if canon.isNone or canon.get() != hash:
+      return false
+    cs.pendingBodyRepairs.incl(hash)
+    return true
+  except CatchableError:
+    return false
+  except Exception:
+    return false
+
+proc enqueueRetainedBodyRepairs*(cs: ChainState,
+                                 maxHoles: int = 4096): int {.raises: [].} =
+  ## Seed pendingBodyRepairs from planBodyRepairs. Returns how many hashes
+  ## were queued. Startup calls this after auditRetainedBodies.
+  if cs == nil:
+    return 0
+  try:
+    let hashes = planBodyRepairs(cs.db, cs.bestHeight, maxHoles)
+    for h in hashes:
+      cs.pendingBodyRepairs.incl(h)
+    return hashes.len
+  except CatchableError:
+    return 0
+  except Exception:
+    return 0
+
+proc fillMissingBody*(cs: ChainState, blk: Block): ChainStateResult[void] =
+  ## Store an already-connected active-chain body that IBD skipped.
+  ##
+  ## Does not reconnect UTXO (the block is already on the active tip's
+  ## ancestry). Header must be in the index, height on the active chain,
+  ## at or above discoverFirstBody, and the txid merkle root must match.
+  ## Already-have is ok (idempotent). Clears the pruneheight cache so a
+  ## filled hole can lower the contiguous suffix.
+  if cs == nil or cs.db == nil:
+    return err("no chainstate")
+  try:
+    let headerBytes = serialize(blk.header)
+    let hash = BlockHash(doubleSha256(headerBytes))
+    let idxOpt = cs.db.getBlockIndex(hash)
+    if idxOpt.isNone:
+      return err("header missing")
+    let idx = idxOpt.get()
+    if cs.db.hasBlockBody(hash):
+      cs.pendingBodyRepairs.excl(hash)
+      return ok()
+    let floor = discoverFirstBody(cs.db, cs.bestHeight)
+    if idx.height < floor:
+      return err("below retained floor")
+    if idx.height > cs.bestHeight:
+      return err("not yet connected")
+    let canon = cs.db.getBlockHashByHeight(idx.height)
+    if canon.isNone or canon.get() != hash:
+      return err("not on active chain")
+    if blk.txs.len == 0:
+      return err("empty block")
+    var txHashes: seq[array[32, byte]]
+    for tx in blk.txs:
+      txHashes.add(array[32, byte](tx.txid()))
+    if merkleRoot(txHashes) != blk.header.merkleRoot:
+      return err("merkle root mismatch")
+    cs.db.storeBlock(blk)
+    cs.historyFloorProbed = false
+    cs.pendingBodyRepairs.excl(hash)
+    return ok()
+  except CatchableError as e:
+    return err(e.msg)
+  except Exception as e:
+    return err(e.msg)
 
 # Block index operations (ChainDb)
 
@@ -1096,6 +1213,9 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     ibdBatchBlocks: 0,
     ibdMode: false,
     ibdStoreBodies: false,
+    historyFloor: 0,
+    historyFloorProbed: false,
+    pendingBodyRepairs: initHashSet[BlockHash](),
     ibdDeletedUtxos: initTable[string, bool](),
     ibdBlocksSinceLastDiskFlush: 0,
     ibdDiskFlushInterval: IbdBatchFlushInterval,  # default: flush to disk every 2000 blocks

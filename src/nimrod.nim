@@ -1285,6 +1285,9 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           except CatchableError as e:
             debug "failed to serve block", peer = $peer, error = e.msg
         else:
+          if state.chainState != nil:
+            {.gcsafe.}:
+              discard state.chainState.enqueueBodyRepair(BlockHash(item.hash))
           notFound.add(item)
       elif item.invType == invCmpctBlock:
         # getdata(MSG_CMPCTBLOCK): serve a compact block if the requested block
@@ -1321,6 +1324,9 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
             except CatchableError as e:
               debug "failed to serve block (cmpct fallback)", peer = $peer, error = e.msg
         else:
+          if state.chainState != nil:
+            {.gcsafe.}:
+              discard state.chainState.enqueueBodyRepair(BlockHash(item.hash))
           notFound.add(item)
       elif item.invType == invTx or item.invType == invWitnessTx:
         let txid = TxId(item.hash)
@@ -2490,6 +2496,9 @@ proc startNode*(config: NimrodConfig) {.async.} =
            checked = audit.checked, holes = audit.holeCount,
            firstHole = firstHole, truncated = audit.truncated,
            pruneheight = advertised
+      let queued = state.chainState.enqueueRetainedBodyRepairs()
+      info "queued retained-range body repair", queued = queued,
+           holes = audit.holeCount
     else:
       info "retained-range bodies contiguous",
            floor = audit.floor, tip = audit.tip, checked = audit.checked,

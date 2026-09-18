@@ -1304,6 +1304,12 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let blkOpt = rpc.chainState.db.getBlock(blockHash)
   if blkOpt.isNone:
+    # On-demand repair: a retained-range hole (header known, body gone)
+    # is queued for peer getdata. Still return -5 immediately — Core
+    # getblock is not a blocking fetch; getblockfrompeer is. The prefix
+    # below discoverFirstBody is not queued (no 600 G archive backfill).
+    if rpc.chainState != nil:
+      discard rpc.chainState.enqueueBodyRepair(blockHash)
     raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
 
   let b = blkOpt.get()

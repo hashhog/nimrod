@@ -99,6 +99,7 @@ const IncludedTests = [
   "test_blockfilter",
   "test_blockstore",
   "test_blockwork_exact",
+  "test_body_hole_backfill",
   "test_chain_management",
   "test_chainstate",
   "test_checkpoint",
