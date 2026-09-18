@@ -561,9 +561,12 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   # IBD / snapshot prefix: bodies start at a floor well above genesis
   # (live mainnet 2026-09-17: miss at 1/500000/900000/940000, HAVE from
   # 960000) while the height→hash index is dense. Core reports pruned
-  # whenever the node does not hold the full chain (rpc/blockchain.cpp).
-  # Until a backfill exists this is an honest limitation, not prune-mode.
-  # Do not invent prune_target_size when -prune is off.
+  # whenever the node does not hold the full chain (rpc/blockchain.cpp)
+  # and pruneheight is the first height of the contiguous run to the
+  # tip (GetFirstBlock). An interior hole (live 966302..967347) raises
+  # that floor; advertising the first stored body over-claims complete
+  # data. Until a backfill exists this is an honest limitation, not
+  # prune-mode. Do not invent prune_target_size when -prune is off.
   if rpc.chainState != nil:
     let bodyFloor = rpc.chainState.discoverBodyFloor()
     if bodyFloor > 0:
@@ -836,10 +839,12 @@ proc handleGetBlockHash(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParameter, "Block height out of range")
   if rpc.chainState != nil and height > rpc.chainState.bestHeight:
     raise newRpcError(RpcInvalidParameter, "Block height out of range")
-  if rpc.chainState != nil:
-    let floor = rpc.chainState.discoverBodyFloor()
-    if height > 0 and floor > 0 and height < floor:
-      raise newRpcError(RpcMiscError, "Block not available (pruned data)")
+  if rpc.chainState != nil and height > 0 and
+      not heightHasBody(rpc.chainState.db, height):
+    # Floor cutoff over-claimed: a hole above discoverFirstBody (live
+    # 966302..967347) still had an index row, so getblockhash handed
+    # out a hash for a body we do not hold. Ask cfBlocks.
+    raise newRpcError(RpcMiscError, "Block not available (pruned data)")
 
   # Use ChainState.getBlockHashByHeight which also checks the IBD in-memory map,
   # covering heights not yet flushed to RocksDB (up to 2000 blocks).

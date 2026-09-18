@@ -226,3 +226,57 @@ suite "retained-range body holes":
     check broken.holeCount == 1
     check 3'i32 in broken.holes
     cs.close()
+
+  test "negative control: large hole above the claimed floor is reported":
+    ## Live 87ac1d8: 1,046 missing bodies (>= UnretainedGapThreshold) sat
+    ## above discoverBodyFloor=952185. auditRetainedBodies(-1) treated that
+    ## run as the unretained prefix, set floor=967348, and logged contiguous.
+    ## Punch a hole wider than unretainedGap above the first body and the
+    ## audit must still report it — passing pruneHeight=-1 is how startup
+    ## calls this, so the default path is the one that has to see the hole.
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    discard connectN(cs, getBlockHash(genesis), 1, 20, ibd = false)
+    # Prefix 1..5 missing, island 6..10, hole 11..13 (width 3), suffix 14..20.
+    for h in [1'i32, 2, 3, 4, 5, 11, 12, 13]:
+      cs.db.deleteBlockBody(cs.db.getBlockHashByHeight(h).get())
+    let claimed = 6'i32
+    check discoverFirstBody(cs.db, cs.bestHeight) == claimed
+    check discoverBodyFloor(cs.db, cs.bestHeight) == 14
+    let audit = auditRetainedBodies(cs.db, cs.bestHeight, pruneHeight = -1,
+                                    maxHoles = 16, unretainedGap = 3)
+    check audit.floor == claimed
+    check audit.tip == 20
+    check audit.checked == 15
+    check audit.holeCount == 3
+    check audit.holes == @[11'i32, 12, 13]
+    check not audit.truncated
+    # Same scan with the floor getblockchaininfo used to advertise.
+    let fromClaimed = auditRetainedBodies(cs.db, cs.bestHeight,
+                                          pruneHeight = claimed, maxHoles = 16,
+                                          unretainedGap = 3)
+    check fromClaimed.holes == @[11'i32, 12, 13]
+    cs.close()
+
+  test "negative control: a large hole in an otherwise complete chain is reported":
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    discard connectN(cs, getBlockHash(genesis), 1, 20, ibd = false)
+    let claimed = auditRetainedBodies(cs.db, cs.bestHeight).floor
+    check claimed == 0
+    for h in 8'i32 .. 12'i32:
+      cs.db.deleteBlockBody(cs.db.getBlockHashByHeight(h).get())
+    # Default path (startup): must not raise the floor over the hole.
+    let broken = auditRetainedBodies(cs.db, cs.bestHeight, pruneHeight = -1,
+                                     maxHoles = 16, unretainedGap = 3)
+    check broken.floor == claimed
+    check broken.holeCount == 5
+    check broken.holes == @[8'i32, 9, 10, 11, 12]
+    # Explicit claimed floor, same result — the two must agree.
+    let explicit = auditRetainedBodies(cs.db, cs.bestHeight,
+                                       pruneHeight = claimed, maxHoles = 16,
+                                       unretainedGap = 3)
+    check explicit.holes == broken.holes
+    cs.close()

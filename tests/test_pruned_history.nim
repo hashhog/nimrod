@@ -8,7 +8,8 @@
 ## receipts/CORRECTION-historical-bodies-fleet-wide-2026-09-17.md).
 ##
 ## Core (rpc/blockchain.cpp): pruned is true whenever the node does not hold
-## the full chain; pruneheight is the first height with complete data.
+## the full chain; pruneheight is the first height of the contiguous run
+## to the tip (GetFirstBlock), not the first stored body.
 ## getblockhash -8 is only for height < 0 or height > tip. An in-range
 ## height whose body we do not retain is -1 "Block not available (pruned
 ## data)" (same string Core's getblock uses for pruned bodies).
@@ -112,6 +113,13 @@ proc rpcErr(rpc: RpcServer, methodName: string,
   except RpcError as e:
     (code: e.code, msg: e.msg)
 
+proc punchHoles(cs: ChainState, lo, hi: int32) =
+  for h in lo .. hi:
+    let hashOpt = cs.db.getBlockHashByHeight(h)
+    check hashOpt.isSome
+    cs.db.deleteBlockBody(hashOpt.get())
+    check not cs.db.hasBlockBody(hashOpt.get())
+
 proc seedPrefixGap(cs: var ChainState, floor, tip: int32): BlockHash =
   ## Genesis body + contiguous bodies at floor..tip. Heights 1..floor-1 keep
   ## their height→hash index but have no body — the live mainnet shape
@@ -120,15 +128,20 @@ proc seedPrefixGap(cs: var ChainState, floor, tip: int32): BlockHash =
   check cs.connectBlock(genesis, 0).isOk
   var prev = getBlockHash(genesis)
   prev = connectN(cs, prev, 1, tip)
-  for h in 1'i32 .. (floor - 1):
-    let hashOpt = cs.db.getBlockHashByHeight(h)
-    check hashOpt.isSome
-    cs.db.deleteBlockBody(hashOpt.get())
-    check not cs.db.hasBlockBody(hashOpt.get())
+  punchHoles(cs, 1, floor - 1)
   check cs.db.hasBlockBody(cs.db.getBlockHashByHeight(floor).get())
   check cs.db.hasBlockBody(cs.db.getBlockHashByHeight(tip).get())
   check cs.bestHeight == tip
   prev
+
+proc seedGappedRetention(cs: var ChainState, firstBody, holeLo, holeHi,
+    tip: int32) =
+  ## Live 87ac1d8 shape, scaled: prefix miss, an island of bodies, a hole,
+  ## then a contiguous suffix to the tip. 2026-09-18 mainnet: first body
+  ## 952185, hole 966302..967347, suffix 967348..tip.
+  discard seedPrefixGap(cs, floor = firstBody, tip = tip)
+  punchHoles(cs, holeLo, holeHi)
+  cs.historyFloorProbed = false
 
 suite "pruned history honesty":
   test "complete chain reports pruned false":
@@ -267,3 +280,75 @@ suite "pruned history honesty":
     check not heightHasBody(cs.db, 9)
     check heightHasBody(cs.db, 10)
     check heightHasBody(cs.db, 20)
+
+  test "interior hole raises pruneheight to the contiguous suffix":
+    ## Binary-search first-body is 6; the contiguous run to the tip
+    ## starts at 14. pruneheight is the latter (Core GetFirstBlock).
+    let dbPath = freshDbPath()
+    var cs = newChainState(dbPath, regtestParams())
+    defer:
+      cs.close()
+      cleanupDb(dbPath)
+    seedGappedRetention(cs, firstBody = 6, holeLo = 11, holeHi = 13, tip = 20)
+    check discoverFirstBody(cs.db, cs.bestHeight) == 6
+    check discoverBodyFloor(cs.db, cs.bestHeight) == 14
+    check cs.discoverBodyFloor() == 14
+    let rpc = rpcWithChainState(cs)
+    let info = rpc.handleMethod("getblockchaininfo", %*[])
+    check info["pruned"].getBool() == true
+    check info.hasKey("pruneheight")
+    if info.hasKey("pruneheight"):
+      check info["pruneheight"].getInt() == 14
+    check not info.hasKey("prune_target_size")
+
+  test "pruneheight bodies exist at floor, floor+1, and gap boundaries":
+    let dbPath = freshDbPath()
+    var cs = newChainState(dbPath, regtestParams())
+    defer:
+      cs.close()
+      cleanupDb(dbPath)
+    seedGappedRetention(cs, firstBody = 6, holeLo = 11, holeHi = 13, tip = 20)
+    let rpc = rpcWithChainState(cs)
+    let floor = rpc.handleMethod("getblockchaininfo", %*[])[
+        "pruneheight"].getInt()
+    check floor == 14
+    # Last present below the gap, first missing, last missing, first present.
+    check heightHasBody(cs.db, 10)
+    check not heightHasBody(cs.db, 11)
+    check not heightHasBody(cs.db, 13)
+    check heightHasBody(cs.db, 14)
+    check heightHasBody(cs.db, int32(floor))
+    check heightHasBody(cs.db, int32(floor + 1))
+    check heightHasBody(cs.db, 20)
+    proc bodyViaGetblock(height: int): bool =
+      try:
+        let hex = rpc.handleMethod("getblockhash", %*[height]).getStr()
+        discard rpc.handleMethod("getblock", %*[hex, 0])
+        true
+      except RpcError:
+        false
+    check bodyViaGetblock(floor)
+    check bodyViaGetblock(floor + 1)
+    check not bodyViaGetblock(11)
+    check not bodyViaGetblock(13)
+    check bodyViaGetblock(10)
+
+  test "getblockhash at an interior hole is -1 not the index hash":
+    let dbPath = freshDbPath()
+    var cs = newChainState(dbPath, regtestParams())
+    defer:
+      cs.close()
+      cleanupDb(dbPath)
+    seedGappedRetention(cs, firstBody = 6, holeLo = 11, holeHi = 13, tip = 20)
+    let rpc = rpcWithChainState(cs)
+    check cs.db.getBlockHashByHeight(11).isSome
+    let hole = rpc.rpcErr("getblockhash", %*[11])
+    check hole.code == -1
+    check hole.msg == "Block not available (pruned data)"
+    let atFloor = rpc.handleMethod("getblockhash", %*[14])
+    check atFloor.kind == JString
+    check atFloor.getStr().len == 64
+    # Island below the hole is still readable by hash — we hold the body.
+    let island = rpc.handleMethod("getblockhash", %*[10])
+    check island.kind == JString
+    check island.getStr().len == 64

@@ -33,11 +33,11 @@ const
     ## hot path. This constant is the genuine configured byte budget reported as
     ## Core's m_coinstip_cache_size_bytes (getchainstates' coins_tip_cache_bytes).
   UnretainedGapThreshold* = 1024'i32
-    ## Consecutive missing bodies, walking tip→genesis, that mark the start of
-    ## the unretained prefix rather than an interior hole. Isolated misses
-    ## (a have on the tip side, then more haves below) are holes. 1024 is well
-    ## above any plausible single-file gap and well below the ~955k-block
-    ## implicit-prune prefix on the live mainnet datadir.
+    ## Kept as the auditRetainedBodies default so call sites compile.
+    ## Do not use it to infer the retained floor: a hole wider than this
+    ## (live mainnet 966302..967347, 1,046 blocks) was treated as the
+    ## unretained prefix, so the audit logged "contiguous" for every
+    ## chainstate. Floor is discoverFirstBody / an explicit pruneHeight.
 
 type
   ChainStateError* = object of CatchableError
@@ -171,10 +171,10 @@ type
     # (the current tip already has a cfBlocks row) and connectBlockIBD
     # must persist each new body. Reset by startIBD. See maybeRetainIbdBody.
     ibdStoreBodies*: bool
-    # Honest-limitation detector for getblockchaininfo.pruned /
-    # getblockhash of an unretained prefix. 0 = complete from genesis
-    # (or unprobed). See discoverBodyFloor. Not a substitute for
-    # genesis→floor backfill; IBD still skips those bodies.
+    # Cached contiguous-suffix floor for getblockchaininfo.pruneheight.
+    # 0 = complete from height 1 (or unprobed). See discoverBodyFloor.
+    # Not a substitute for genesis→floor backfill; IBD still skips those
+    # bodies. An interior hole raises this above discoverFirstBody.
     historyFloor*: int32
     historyFloorProbed*: bool
     # Pending UTXO deletes tracked during IBD (cache key -> true)
@@ -551,23 +551,13 @@ proc heightHasBody*(cdb: ChainDb, height: int32): bool {.gcsafe, raises: [].} =
   except Exception:
     result = false
 
-proc discoverBodyFloor*(cdb: ChainDb, tip: int32): int32 {.gcsafe, raises: [].} =
+proc discoverFirstBody*(cdb: ChainDb, tip: int32): int32 {.gcsafe, raises: [].} =
   ## Lowest height > 0 whose body is stored, if height 1 is missing.
   ##
-  ## 0 means no prefix gap (height 1 has a body, or tip <= 0). Bitcoin
-  ## Core's block index is dense from genesis even on a pruned node —
-  ## getblockhash(1) always resolves, and pruned/pruneheight describe
-  ## missing *bodies*. nimrod's genesis IBD skips cfBlocks for 1..N, so
-  ## the live mainnet datadir has a complete height index and bodies
-  ## only from ~960000 forward (measured 2026-09-17). That is the
-  ## prefix this finds.
-  ##
-  ## Returns:
-  ##   * 0 if tip <= 0 or height 1 has a body (no snapshot/IBD hole).
-  ##   * the first height in 1..=tip with a body, if height 1 is missing.
-  ##   * `tip` itself if even the tip body is missing.
-  ##
-  ## Does not backfill. Binary search, O(log tip) lookups.
+  ## 0 means no prefix gap (height 1 has a body, or tip <= 0). Does not
+  ## notice interior holes — that is discoverBodyFloor. Binary search,
+  ## O(log tip). Used as the default audit floor so a hole above the
+  ## first body is visible.
   if cdb == nil or tip <= 0:
     return 0
   if heightHasBody(cdb, 1):
@@ -584,12 +574,38 @@ proc discoverBodyFloor*(cdb: ChainDb, tip: int32): int32 {.gcsafe, raises: [].} 
       lo = mid + 1
   lo
 
+proc discoverBodyFloor*(cdb: ChainDb, tip: int32): int32 {.gcsafe, raises: [].} =
+  ## First height of the contiguous body run ending at `tip`.
+  ##
+  ## Core BlockManager::GetFirstBlock / getblockchaininfo.pruneheight:
+  ## "the first block unpruned, all previous blocks were pruned". Walk
+  ## tip→genesis until the parent is missing. 0 means height 1..tip are
+  ## all present. Otherwise H such that H..tip all have bodies and H-1
+  ## does not (or `tip` if even the tip is missing).
+  ##
+  ## An interior hole raises this above discoverFirstBody. Live mainnet
+  ## 2026-09-18: first body 952185, hole 966302..967347, suffix 967348
+  ## — pruneheight must be 967348, not 952185. Does not backfill.
+  ## O(contiguous suffix); the implicit-prune prefix is not walked.
+  if cdb == nil or tip <= 0:
+    return 0
+  if not heightHasBody(cdb, tip):
+    return tip
+  var h = tip
+  while h > 0:
+    if not heightHasBody(cdb, h - 1):
+      if h == 1:
+        return 0
+      return h
+    dec h
+  0
+
 type
   RetainedBodyAudit* = object
     ## Result of walking [floor, tip] and asking whether each active-chain
     ## body's cfBlocks row is actually readable. A hole is a height whose
     ## height→hash index resolves (the block was connected) but whose body
-    ## is missing — getblockhash succeeds, getblock returns -5.
+    ## is missing — getblockhash is now -1, getblock still -5.
     floor*: int32          ## lowest height treated as retained (inclusive)
     tip*: int32
     checked*: int          ## heights inspected in [floor, tip]
@@ -605,13 +621,17 @@ proc auditRetainedBodies*(cdb: ChainDb, tip: int32,
   ## Walk every height between the retained floor and `tip` and record
   ## connected blocks whose body is unreadable.
   ##
-  ## Floor is `pruneHeight` when that is >= 0. Otherwise it is inferred:
-  ## walk from the tip down; a run of `unretainedGap` consecutive misses
-  ## is the unretained prefix (IBD skipped those bodies), not a bag of
-  ## holes. Isolated misses inside the have-window ARE holes.
+  ## Floor is `pruneHeight` when that is >= 0. Otherwise it is
+  ## discoverFirstBody — the lowest height getblockchaininfo might have
+  ## claimed — so a hole above that floor is reported. Inferring the
+  ## floor from the contiguous suffix (a run of `unretainedGap` misses
+  ## walking tip→genesis) made the audit structurally unable to fail:
+  ## the hole decided where it started looking (live 87ac1d8: floor
+  ## 967348, checked=145, hole 966302..967347 never visited).
   ##
   ## Does not abort the node — callers log. A wallet rescan or a peer
   ## getdata at a hole height is what actually fails.
+  discard unretainedGap
   result.tip = tip
   result.floor = 0
   result.checked = 0
@@ -625,27 +645,7 @@ proc auditRetainedBodies*(cdb: ChainDb, tip: int32,
   if pruneHeight >= 0:
     floor = pruneHeight
   else:
-    var lastHave = -1'i32
-    var consecMiss = 0'i32
-    var h = tip
-    while h >= 0:
-      var have = false
-      try:
-        let hashOpt = cdb.getBlockHashByHeight(h)
-        have = hashOpt.isSome and cdb.hasBlockBody(hashOpt.get())
-      except CatchableError:
-        have = false
-      except Exception:
-        have = false
-      if have:
-        lastHave = h
-        consecMiss = 0
-      else:
-        inc consecMiss
-        if lastHave >= 0 and consecMiss >= unretainedGap:
-          break
-      dec h
-    floor = if lastHave >= 0: lastHave else: tip
+    floor = discoverFirstBody(cdb, tip)
 
   if floor > tip:
     result.floor = floor
@@ -772,13 +772,13 @@ proc getBlockHashByHeight*(cs: ChainState, height: int32): Option[BlockHash] =
   cs.db.getBlockHashByHeight(height)
 
 proc discoverBodyFloor*(cs: ChainState): int32 {.gcsafe, raises: [].} =
-  ## Cached wrapper around ChainDb.discoverBodyFloor.
+  ## Cached wrapper around ChainDb.discoverBodyFloor (contiguous suffix).
   ##
-  ## A complete chain (floor 0) stays complete. A prefix-gap floor is
-  ## reused while height 1 is still missing and the cached floor still
-  ## has a body — the floor only moves down if we backfill, which we
-  ## do not. Mid-IBD the tip itself has no body, so a cached `tip`
-  ## would go stale; that case re-probes.
+  ## Reused while the cached floor and the tip still have bodies and
+  ## the height below the floor still does not. Mid-IBD the tip itself
+  ## has no body, so a cached `tip` would go stale; that case re-probes.
+  ## A complete chain (floor 0) stays complete — punching a hole in
+  ## tests must clear historyFloorProbed.
   if cs == nil or cs.db == nil:
     return 0
   if cs.historyFloorProbed:
@@ -786,7 +786,8 @@ proc discoverBodyFloor*(cs: ChainState): int32 {.gcsafe, raises: [].} =
       return 0
     if cs.historyFloor <= cs.bestHeight and
        heightHasBody(cs.db, cs.historyFloor) and
-       not heightHasBody(cs.db, 1):
+       heightHasBody(cs.db, cs.bestHeight) and
+       not heightHasBody(cs.db, cs.historyFloor - 1):
       return cs.historyFloor
   cs.historyFloor = discoverBodyFloor(cs.db, cs.bestHeight)
   cs.historyFloorProbed = true

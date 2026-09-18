@@ -2465,20 +2465,35 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # hole, 2026-09-17). Log; do not refuse to boot — the hole is already
   # on disk and taking the node down does not fill it.
   try:
-    let pruneH =
-      if state.pruner != nil: state.pruner.currentPruneHeight()
-      else: -1'i32
+    # Scan from the first stored body (what getblockchaininfo used to
+    # advertise), not from the contiguous suffix. pruneheight itself is
+    # the contiguous floor — they disagree exactly when there is a hole
+    # the operator needs to hear about (live 952185 vs 967348).
+    let advertised = state.chainState.discoverBodyFloor()
+    let firstBody = discoverFirstBody(state.chainState.db,
+                                      state.chainState.bestHeight)
+    var pruneH = firstBody
+    if state.pruner != nil:
+      let ph = state.pruner.currentPruneHeight()
+      if ph > pruneH:
+        pruneH = ph
     let audit = auditRetainedBodies(state.chainState.db,
                                     state.chainState.bestHeight, pruneH)
+    if advertised != audit.floor:
+      warn "pruneheight is the contiguous suffix; first body is lower",
+           pruneheight = advertised, firstBody = audit.floor,
+           tip = audit.tip
     if audit.holeCount > 0:
       let firstHole = if audit.holes.len > 0: audit.holes[0] else: -1'i32
       warn "retained-range body hole",
            floor = audit.floor, tip = audit.tip,
            checked = audit.checked, holes = audit.holeCount,
-           firstHole = firstHole, truncated = audit.truncated
+           firstHole = firstHole, truncated = audit.truncated,
+           pruneheight = advertised
     else:
       info "retained-range bodies contiguous",
-           floor = audit.floor, tip = audit.tip, checked = audit.checked
+           floor = audit.floor, tip = audit.tip, checked = audit.checked,
+           pruneheight = advertised
   except CatchableError as e:
     warn "retained-range body audit failed", error = e.msg
 
