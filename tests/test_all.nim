@@ -180,6 +180,7 @@ const IncludedTests = [
   "test_pre_handshake",
   "test_prioritisetransaction",
   "test_pruner",
+  "test_pruned_history",
   "test_psbt",
   "test_psbt_convert_join",
   "test_psbt_emptyvin_gate",

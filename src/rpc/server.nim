@@ -558,6 +558,21 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
     if pruned:
       pruneHeight = rpc.blockFileManager.getPruneHeight()
 
+  # IBD / snapshot prefix: bodies start at a floor well above genesis
+  # (live mainnet 2026-09-17: miss at 1/500000/900000/940000, HAVE from
+  # 960000) while the height→hash index is dense. Core reports pruned
+  # whenever the node does not hold the full chain (rpc/blockchain.cpp).
+  # Until a backfill exists this is an honest limitation, not prune-mode.
+  # Do not invent prune_target_size when -prune is off.
+  if rpc.chainState != nil:
+    let bodyFloor = rpc.chainState.discoverBodyFloor()
+    if bodyFloor > 0:
+      pruned = true
+      if pruneHeight < 0:
+        pruneHeight = bodyFloor
+      else:
+        pruneHeight = max(pruneHeight, bodyFloor)
+
   # size_on_disk fallback for the RocksDB-backed block/chainstate store.
   # In archive mode the flat-file BlockFileManager tracks no blk*.dat/rev*.dat
   # (block bodies live in the chainstate RocksDB), so calculateCurrentUsage
@@ -809,13 +824,29 @@ proc handleGetBlockHash(rpc: RpcServer, params: JsonNode): JsonNode =
   if height64 < low(int32).int64 or height64 > high(int32).int64:
     raise newRpcError(RpcMiscError, "JSON integer out of range")
   let height = int32(height64)
+  # Core rpc/blockchain.cpp::getblockhash raises RPC_INVALID_PARAMETER (-8)
+  # with this exact message when nHeight < 0 || nHeight > active tip height,
+  # BEFORE any index lookup — not the generic JSON-RPC -32602.
+  # A height inside 0..=tip that we simply do not retain is NOT a bad
+  # parameter — Core would still return the hash because its index is
+  # dense. nimrod's IBD-skip / snapshot prefix is the latter; -8 there
+  # reads as "the caller asked for a height that cannot exist". Use
+  # Core's pruned-data wording instead (same string getblock uses).
+  if height < 0:
+    raise newRpcError(RpcInvalidParameter, "Block height out of range")
+  if rpc.chainState != nil and height > rpc.chainState.bestHeight:
+    raise newRpcError(RpcInvalidParameter, "Block height out of range")
+  if rpc.chainState != nil:
+    let floor = rpc.chainState.discoverBodyFloor()
+    if height > 0 and floor > 0 and height < floor:
+      raise newRpcError(RpcMiscError, "Block not available (pruned data)")
+
   # Use ChainState.getBlockHashByHeight which also checks the IBD in-memory map,
   # covering heights not yet flushed to RocksDB (up to 2000 blocks).
   let hashOpt = rpc.chainState.getBlockHashByHeight(height)
   if hashOpt.isNone:
-    # Core rpc/blockchain.cpp::getblockhash raises RPC_INVALID_PARAMETER (-8)
-    # with this exact message when nHeight < 0 || nHeight > active tip height,
-    # BEFORE any index lookup — not the generic JSON-RPC -32602.
+    if rpc.chainState != nil and height <= rpc.chainState.bestHeight:
+      raise newRpcError(RpcMiscError, "Block not available (pruned data)")
     raise newRpcError(RpcInvalidParameter, "Block height out of range")
 
   %reverseHex(toHex(array[32, byte](hashOpt.get())))

@@ -171,6 +171,12 @@ type
     # (the current tip already has a cfBlocks row) and connectBlockIBD
     # must persist each new body. Reset by startIBD. See maybeRetainIbdBody.
     ibdStoreBodies*: bool
+    # Honest-limitation detector for getblockchaininfo.pruned /
+    # getblockhash of an unretained prefix. 0 = complete from genesis
+    # (or unprobed). See discoverBodyFloor. Not a substitute for
+    # genesis→floor backfill; IBD still skips those bodies.
+    historyFloor*: int32
+    historyFloorProbed*: bool
     # Pending UTXO deletes tracked during IBD (cache key -> true)
     ibdDeletedUtxos*: Table[string, bool]
     # Disk flush state — tracks blocks since last forced memtable→SST flush.
@@ -513,13 +519,18 @@ proc getBlock*(cdb: ChainDb, hash: BlockHash): Option[Block] =
     return some(deserializeBlock(data.get()))
   none(Block)
 
-proc getBlockHashByHeight*(cdb: ChainDb, height: int32): Option[BlockHash]
+proc getBlockHashByHeight*(cdb: ChainDb, height: int32): Option[BlockHash] {.gcsafe.}
 
-proc hasBlockBody*(cdb: ChainDb, hash: BlockHash): bool =
+proc hasBlockBody*(cdb: ChainDb, hash: BlockHash): bool {.gcsafe, raises: [].} =
   ## True iff cfBlocks holds a row for `hash`. Does not deserialize.
   if cdb == nil or cdb.db == nil:
     return false
-  cdb.db.hasKey(cfBlocks, blockKey(array[32, byte](hash)))
+  try:
+    result = cdb.db.hasKey(cfBlocks, blockKey(array[32, byte](hash)))
+  except CatchableError:
+    result = false
+  except Exception:
+    result = false
 
 proc deleteBlockBody*(cdb: ChainDb, hash: BlockHash) =
   ## Drop the cfBlocks row for `hash`. Height index and UTXO set are
@@ -527,6 +538,51 @@ proc deleteBlockBody*(cdb: ChainDb, hash: BlockHash) =
   if cdb == nil or cdb.db == nil:
     return
   cdb.db.delete(cfBlocks, blockKey(array[32, byte](hash)))
+
+proc heightHasBody*(cdb: ChainDb, height: int32): bool {.gcsafe, raises: [].} =
+  ## True iff the height→hash index resolves and cfBlocks holds that body.
+  if cdb == nil:
+    return false
+  try:
+    let hashOpt = cdb.getBlockHashByHeight(height)
+    result = hashOpt.isSome and cdb.hasBlockBody(hashOpt.get())
+  except CatchableError:
+    result = false
+  except Exception:
+    result = false
+
+proc discoverBodyFloor*(cdb: ChainDb, tip: int32): int32 {.gcsafe, raises: [].} =
+  ## Lowest height > 0 whose body is stored, if height 1 is missing.
+  ##
+  ## 0 means no prefix gap (height 1 has a body, or tip <= 0). Bitcoin
+  ## Core's block index is dense from genesis even on a pruned node —
+  ## getblockhash(1) always resolves, and pruned/pruneheight describe
+  ## missing *bodies*. nimrod's genesis IBD skips cfBlocks for 1..N, so
+  ## the live mainnet datadir has a complete height index and bodies
+  ## only from ~960000 forward (measured 2026-09-17). That is the
+  ## prefix this finds.
+  ##
+  ## Returns:
+  ##   * 0 if tip <= 0 or height 1 has a body (no snapshot/IBD hole).
+  ##   * the first height in 1..=tip with a body, if height 1 is missing.
+  ##   * `tip` itself if even the tip body is missing.
+  ##
+  ## Does not backfill. Binary search, O(log tip) lookups.
+  if cdb == nil or tip <= 0:
+    return 0
+  if heightHasBody(cdb, 1):
+    return 0
+  if not heightHasBody(cdb, tip):
+    return tip
+  var lo = 1'i32
+  var hi = tip
+  while lo < hi:
+    let mid = lo + (hi - lo) div 2
+    if heightHasBody(cdb, mid):
+      hi = mid
+    else:
+      lo = mid + 1
+  lo
 
 type
   RetainedBodyAudit* = object
@@ -545,7 +601,7 @@ proc auditRetainedBodies*(cdb: ChainDb, tip: int32,
                           pruneHeight: int32 = -1,
                           maxHoles: int = 64,
                           unretainedGap: int32 = UnretainedGapThreshold):
-                          RetainedBodyAudit =
+                          RetainedBodyAudit {.gcsafe, raises: [].} =
   ## Walk every height between the retained floor and `tip` and record
   ## connected blocks whose body is unreadable.
   ##
@@ -579,6 +635,8 @@ proc auditRetainedBodies*(cdb: ChainDb, tip: int32,
         have = hashOpt.isSome and cdb.hasBlockBody(hashOpt.get())
       except CatchableError:
         have = false
+      except Exception:
+        have = false
       if have:
         lastHave = h
         consecMiss = 0
@@ -605,6 +663,9 @@ proc auditRetainedBodies*(cdb: ChainDb, tip: int32,
       indexed = hashOpt.isSome
       have = indexed and cdb.hasBlockBody(hashOpt.get())
     except CatchableError:
+      have = false
+      indexed = true
+    except Exception:
       have = false
       indexed = true
     # A height with no index row is not "connected" — that is a snapshot
@@ -668,7 +729,7 @@ proc getBlockIndex*(cdb: ChainDb, hash: BlockHash): Option[BlockIndex] =
     return some(deserializeBlockIndex(data.get()))
   none(BlockIndex)
 
-proc getBlockHashByHeight*(cdb: ChainDb, height: int32): Option[BlockHash] =
+proc getBlockHashByHeight*(cdb: ChainDb, height: int32): Option[BlockHash] {.gcsafe.} =
   ## Get block hash at given height.
   ##
   ## Consults the IBD unflushed shadow FIRST (see `getBlockIndex` above and
@@ -709,6 +770,37 @@ proc getBlockHashByHeight*(cs: ChainState, height: int32): Option[BlockHash] =
   ## to RocksDB every 2000 blocks; the shadow ensures getblockhash is never
   ## "out of range" for heights that are already connected.
   cs.db.getBlockHashByHeight(height)
+
+proc discoverBodyFloor*(cs: ChainState): int32 {.gcsafe, raises: [].} =
+  ## Cached wrapper around ChainDb.discoverBodyFloor.
+  ##
+  ## A complete chain (floor 0) stays complete. A prefix-gap floor is
+  ## reused while height 1 is still missing and the cached floor still
+  ## has a body — the floor only moves down if we backfill, which we
+  ## do not. Mid-IBD the tip itself has no body, so a cached `tip`
+  ## would go stale; that case re-probes.
+  if cs == nil or cs.db == nil:
+    return 0
+  if cs.historyFloorProbed:
+    if cs.historyFloor == 0:
+      return 0
+    if cs.historyFloor <= cs.bestHeight and
+       heightHasBody(cs.db, cs.historyFloor) and
+       not heightHasBody(cs.db, 1):
+      return cs.historyFloor
+  cs.historyFloor = discoverBodyFloor(cs.db, cs.bestHeight)
+  cs.historyFloorProbed = true
+  cs.historyFloor
+
+proc holdsIncompleteHistory*(cs: ChainState): bool {.gcsafe, raises: [].} =
+  ## True when the node does not hold the full chain: explicit prune
+  ## mode, or a prefix of bodies is missing (IBD skip / snapshot).
+  ## Core reports getblockchaininfo.pruned from IsPruneMode(); we also
+  ## report it for a missing prefix so an operator is not told the
+  ## chain is complete.
+  if cs == nil:
+    return false
+  cs.pruningEnabled or cs.discoverBodyFloor() > 0
 
 # UTXO operations (ChainDb - low level)
 
