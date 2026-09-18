@@ -151,9 +151,13 @@ python3 - "$PROOF" <<'PY' || fail=1
 import json, sys, pathlib
 proof = pathlib.Path(sys.argv[1])
 c = json.loads((proof / "claims.json").read_text())["r5"]
-live = json.loads((proof / "r5/live-20260917T102316Z.json").read_text())["impls"]["nimrod"]
-reg = json.loads((proof / "r5/regtest-20260917T080758Z.json").read_text())["impls"]["nimrod"]
+live_doc = json.loads((proof / "r5/live-20260917T102316Z.json").read_text())
+reg_doc = json.loads((proof / "r5/regtest-20260917T080758Z.json").read_text())
+live = live_doc["impls"]["nimrod"]
+reg = reg_doc["impls"]["nimrod"]
 sc = json.loads((proof / "r5/scorecard.json").read_text())
+live_ts = live_doc.get("ts", "?")
+reg_ts = reg_doc.get("ts", "?")
 errs = []
 if live["tiers"]["T1"]["pass"] != c["live_t1_pass"] or live["tiers"]["T1"]["total"] != c["live_t1_total"]:
     errs.append("live T1")
@@ -182,8 +186,8 @@ if "0 FAILED" not in after:
 if errs:
     print("FAIL: R5:", "; ".join(errs))
     sys.exit(1)
-print(f"R5 live T1 {c['live_t1_pass']}/{c['live_t1_total']} T2 {c['live_t2_pass']}/{c['live_t2_total']} FAIL={c['live_fail_method']}")
-print(f"R5 regtest T3 {c['regtest_t3_pass']}/{c['regtest_t3_total']}")
+print(f"R5 live (scorecard {live_ts}) T1 {c['live_t1_pass']}/{c['live_t1_total']} T2 {c['live_t2_pass']}/{c['live_t2_total']} FAIL={c['live_fail_method']}")
+print(f"R5 regtest (scorecard {reg_ts}) T3 {c['regtest_t3_pass']}/{c['regtest_t3_total']}")
 PY
 
 # 7. README cites every claims.json file

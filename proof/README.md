@@ -21,8 +21,9 @@ bash proof/verify.sh
 observable, that sha256 is the recorded one. `verify.sh` re-checks
 every claim in `claims.json` against a file here, refuses a
 snapshot-booted lineage, re-runs the in-repo R5 help-parity test, and
-calls `check-pin.sh`. Re-run `bash proof/assemble.sh --pin` after every
-promote so the closure cannot go stale.
+calls `check-pin.sh`. After every promote run `bash proof/on-promote.sh`
+(or `nimble attest_pin`) so the closure cannot go stale. That is a
+release step, not a manual afterthought.
 
 Re-running the heavy instruments (from-genesis IBD, full R2 corpus, live
 R5 probe) needs the commands in `r4/`, `r1/command.txt`, `r2/command.txt`,
@@ -35,10 +36,10 @@ here are the captured results of those commands.
 
 The sha256 of the **promoted pin** (the binary actually running), the
 commit that pin was built from, and the toolchain (Nim 2.2.8 / nimble
-0.20.1). Written by `assemble.sh`. Enforced by `check-pin.sh`. **Does
-not prove** bit-exact reproducible builds across toolchains — see
-`REPRODUCIBLE-BUILD.md`. A local `bin/nimrod` rebuild is not the
-attested binary.
+0.20.1). Written by `assemble.sh` via `on-promote.sh`. Enforced by
+`check-pin.sh`. **Does not prove** bit-exact reproducible builds across
+toolchains — see `REPRODUCIBLE-BUILD.md`. A local `bin/nimrod` rebuild
+is not the attested binary.
 
 ### R4 from-genesis lineage — `r4/`
 

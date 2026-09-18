@@ -631,6 +631,15 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   if pruned and pruneHeight >= 0:
     response["pruneheight"] = %pruneHeight
 
+  # Retained-range body-repair progress. pendingBodyRepairs.len is the
+  # untruncated remaining count (the planner no longer caps). Operators
+  # poll this; a falling remaining is stored bodies, a stuck remaining
+  # with repeating getdata is requests that never arrive. Extra field:
+  # R5 getblockchaininfo is an inclusion check, not an exact key set.
+  if rpc.chainState != nil:
+    response["body_repair_remaining"] = %rpc.chainState.bodyRepairRemaining()
+    response["body_repair_filled"] = %rpc.chainState.bodyRepairFilled
+
   # Add prune_target_size if pruning is enabled. Prefer the Pruner's value
   # because manual mode (--prune=1) reports the AutoPruneFloor as the
   # underlying byte budget while signalling the manual flavor via mode.

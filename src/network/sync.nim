@@ -2410,7 +2410,9 @@ proc requestRepairBodies*(sm: SyncManager) {.async.} =
     return
   try:
     await peers[0].sendGetData(inv)
-    info "requesting retained-range body repair", count = inv.len
+    info "requesting retained-range body repair",
+         count = inv.len,
+         remaining = sm.chainState.bodyRepairRemaining()
   except CatchableError as e:
     warn "failed to send body-repair getdata", error = e.msg
     for item in inv:
@@ -2876,7 +2878,21 @@ proc tryFillMissingBody(sm: SyncManager, blk: Block): bool =
           return false
       let res = sm.chainState.fillMissingBody(blk)
       if res.isOk:
-        info "filled retained-range body hole", height = idx.height, hash = $hash
+        let remaining = sm.chainState.bodyRepairRemaining()
+        info "filled retained-range body hole",
+             height = idx.height, hash = $hash,
+             remaining = remaining,
+             filled = sm.chainState.bodyRepairFilled
+        if remaining == 0:
+          let left = countRetainedBodyHoles(sm.chainState.db,
+              sm.chainState.bestHeight)
+          if left == 0:
+            info "retained-range body repair complete",
+                 filled = sm.chainState.bodyRepairFilled
+          else:
+            let queued = sm.chainState.enqueueRetainedBodyRepairs()
+            warn "repair queue empty but retained-range holes remain",
+                 holeCount = left, requeued = queued
       return res.isOk
   except CatchableError:
     return false

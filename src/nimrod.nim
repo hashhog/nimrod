@@ -2493,12 +2493,17 @@ proc startNode*(config: NimrodConfig) {.async.} =
       let firstHole = if audit.holes.len > 0: audit.holes[0] else: -1'i32
       warn "retained-range body hole",
            floor = audit.floor, tip = audit.tip,
-           checked = audit.checked, holes = audit.holeCount,
-           firstHole = firstHole, truncated = audit.truncated,
+           checked = audit.checked, holeCount = audit.holeCount,
+           firstHole = firstHole, sample = audit.holes.len,
+           truncated = audit.truncated,
            pruneheight = advertised
       let queued = state.chainState.enqueueRetainedBodyRepairs()
       info "queued retained-range body repair", queued = queued,
-           holes = audit.holeCount
+           holeCount = audit.holeCount,
+           remaining = state.chainState.bodyRepairRemaining()
+      if queued < audit.holeCount:
+        warn "repair queue is short of the hole count",
+             queued = queued, holeCount = audit.holeCount
     else:
       info "retained-range bodies contiguous",
            floor = audit.floor, tip = audit.tip, checked = audit.checked,

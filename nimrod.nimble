@@ -28,4 +28,4 @@ task build_shim, "Build the Phase B verifyscript shim (untracked ELF)":
   exec "nim c -d:release -o:tools/phaseb_verifyscript_shim tools/phaseb_verifyscript_shim.nim"
 
 task attest_pin, "Refresh proof provenance from the promoted pin (run after every promote)":
-  exec "bash proof/assemble.sh --pin"
+  exec "bash proof/on-promote.sh"

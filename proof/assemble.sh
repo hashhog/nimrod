@@ -4,6 +4,8 @@
 # The attested binary MUST be the one actually running (the deploy pin),
 # not a local rebuild of bin/nimrod. Run this after every promote:
 #
+#   bash proof/on-promote.sh
+#   bash proof/on-promote.sh /path/to/deploy/nimrod/nimrod
 #   bash proof/assemble.sh --pin
 #   bash proof/assemble.sh --pin /path/to/deploy/nimrod/nimrod
 #
@@ -12,7 +14,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-PROOF="$ROOT/proof"
+PROOF="${PROOF_DIR:-$ROOT/proof}"
 # choosenim / nimble are often not on a non-interactive PATH
 export PATH="${HOME}/.nimble/bin:${PATH}"
 
@@ -165,11 +167,15 @@ import pathlib, sys
 path, sha, pin = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 text = path.read_text()
 import re
-text2, n = re.subn(r'("binary_sha256":\s*")[^"]*"', r'\1' + sha + '"', text, count=1)
+# Function replacement: r'\1'+sha is group 19 when sha starts with 9
+# (live 6393e6c pin 920f0ee2… aborted assemble with invalid group reference).
+text2, n = re.subn(r'("binary_sha256":\s*")[^"]*"',
+                   lambda m: m.group(1) + sha + '"', text, count=1)
 if n != 1:
     sys.exit("assemble: failed to patch claims.json binary_sha256")
 if pin:
-    text2, n = re.subn(r'("parent_commit":\s*")[^"]*"', r'\1' + pin + '"', text2, count=1)
+    text2, n = re.subn(r'("parent_commit":\s*")[^"]*"',
+                       lambda m: m.group(1) + pin + '"', text2, count=1)
     if n != 1:
         sys.exit("assemble: failed to patch claims.json parent_commit")
 path.write_text(text2)

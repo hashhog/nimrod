@@ -22,6 +22,9 @@
 ##   4. processBlock of a behind-tip hole stores the body (was discarded).
 ##   5. getblock of a hole enqueues repair and still returns -5.
 ##   6. After fill, the hole is gone and pruneheight can walk down.
+##   7. After repair completes, a scan from firstBody to tip is ZERO holes.
+##   8. Negative control: punch a fresh hole; repair finds and fills it.
+##   9. bodyRepairRemaining is the untruncated hole count, not the sample cap.
 
 import unittest2
 import std/[os, options, json, sets]
@@ -348,4 +351,121 @@ suite "retained-range body hole backfill":
     let broken = planBodyRepairs(cs.db, cs.bestHeight)
     check broken.len == 1
     check broken[0] == cs.db.getBlockHashByHeight(3).get()
+    cs.close()
+
+  test "after repair completes, firstBody-to-tip scan reports zero holes":
+    ## CONTROL (QUEUES.md 2026-09-18 08:55Z (b)): after the repair
+    ## drains, a scan from firstBody to tip must be empty. Logging
+    ## "requesting count=16" is not completion.
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    var bodies: seq[Block] = @[genesis]
+    discard connectKeeping(cs, getBlockHash(genesis), 1, 20, bodies)
+    # Live shape: unretained prefix, an island, interior holes, suffix.
+    # discoverFirstBody is a prefix binary search, so the holes must sit
+    # above the first stored body (same as planBodyRepairs' own test).
+    for h in [1'i32, 2, 3, 4, 5, 11, 12, 13]:
+      cs.db.deleteBlockBody(cs.db.getBlockHashByHeight(h).get())
+    cs.historyFloorProbed = false
+    let firstBody = discoverFirstBody(cs.db, cs.bestHeight)
+    check firstBody == 6
+    let queued = cs.enqueueRetainedBodyRepairs()
+    check queued == 3
+    check cs.bodyRepairRemaining() == 3
+    let rpc = rpcWithChainState(cs)
+    let before = rpc.handleMethod("getblockchaininfo", %*[])
+    check before["body_repair_remaining"].getInt() == 3
+    check before["body_repair_filled"].getInt() == 0
+
+    let sm = newSyncManager(nil, cs.db, regtestParams(), cs)
+    for h in [11'i32, 12, 13]:
+      check sm.processBlock(nil, bodies[h])
+    check cs.bodyRepairRemaining() == 0
+    check cs.bodyRepairFilled == 3
+    let after = rpc.handleMethod("getblockchaininfo", %*[])
+    check after["body_repair_remaining"].getInt() == 0
+    check after["body_repair_filled"].getInt() == 3
+
+    let scan = auditRetainedBodies(cs.db, cs.bestHeight,
+        pruneHeight = firstBody, maxHoles = 10_000)
+    check scan.floor == firstBody
+    check scan.holeCount == 0
+    check scan.holes.len == 0
+    check not scan.truncated
+    check countRetainedBodyHoles(cs.db, cs.bestHeight) == 0
+    # Prefix below firstBody is still absent — not a repair.
+    check not cs.db.hasBlockBody(cs.db.getBlockHashByHeight(3).get())
+    cs.close()
+
+  test "negative control: punch a fresh hole; repair finds and fills it":
+    ## A backfill that silently stops at the first failure looks exactly
+    ## like one that finished. Punching a hole into a just-repaired
+    ## range must raise remaining, and filling it must clear the scan.
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    var bodies: seq[Block] = @[genesis]
+    discard connectKeeping(cs, getBlockHash(genesis), 1, 12, bodies)
+    for h in 1'i32 .. 4'i32:
+      cs.db.deleteBlockBody(cs.db.getBlockHashByHeight(h).get())
+    cs.historyFloorProbed = false
+    check cs.enqueueRetainedBodyRepairs() == 0
+    check cs.bodyRepairRemaining() == 0
+    check countRetainedBodyHoles(cs.db, cs.bestHeight) == 0
+
+    let holeBlk = bodies[8]
+    let holeHash = getBlockHash(holeBlk)
+    cs.db.deleteBlockBody(holeHash)
+    cs.historyFloorProbed = false
+    check not cs.db.hasBlockBody(holeHash)
+    # Queue was empty; a fresh hole is invisible until we plan again.
+    check cs.bodyRepairRemaining() == 0
+    check countRetainedBodyHoles(cs.db, cs.bestHeight) == 1
+    let found = cs.enqueueRetainedBodyRepairs()
+    check found == 1
+    check holeHash in cs.pendingBodyRepairs
+    check cs.bodyRepairRemaining() == 1
+    let rpc = rpcWithChainState(cs)
+    check rpc.handleMethod("getblockchaininfo", %*[])[
+        "body_repair_remaining"].getInt() == 1
+
+    let sm = newSyncManager(nil, cs.db, regtestParams(), cs)
+    check sm.processBlock(nil, holeBlk)
+    check cs.db.hasBlockBody(holeHash)
+    check cs.bodyRepairRemaining() == 0
+    check rpc.handleMethod("getblockchaininfo", %*[])[
+        "body_repair_remaining"].getInt() == 0
+    let firstBody = discoverFirstBody(cs.db, cs.bestHeight)
+    let scan = auditRetainedBodies(cs.db, cs.bestHeight,
+        pruneHeight = firstBody, maxHoles = 10_000)
+    check scan.holeCount == 0
+    check countRetainedBodyHoles(cs.db, cs.bestHeight) == 0
+    cs.close()
+
+  test "bodyRepairRemaining is the untruncated hole count, not the sample cap":
+    ## Live audits log truncated=true because the sample list is capped
+    ## at 64. Differencing that sample is comparing two ceilings.
+    ## remaining / holeCount must be the real total.
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    var bodies: seq[Block] = @[genesis]
+    discard connectKeeping(cs, getBlockHash(genesis), 1, 90, bodies)
+    for h in 11'i32 .. 90'i32:
+      cs.db.deleteBlockBody(cs.db.getBlockHashByHeight(h).get())
+    cs.historyFloorProbed = false
+    let audit = auditRetainedBodies(cs.db, cs.bestHeight)
+    check audit.holeCount == 80
+    check audit.truncated
+    check audit.holes.len < 80
+    let queued = cs.enqueueRetainedBodyRepairs()
+    check queued == 80
+    check cs.bodyRepairRemaining() == 80
+    check cs.bodyRepairRemaining() == audit.holeCount
+    check cs.bodyRepairRemaining() != audit.holes.len
+    check countRetainedBodyHoles(cs.db, cs.bestHeight) == 80
+    let rpc = rpcWithChainState(cs)
+    let info = rpc.handleMethod("getblockchaininfo", %*[])
+    check info["body_repair_remaining"].getInt() == 80
     cs.close()

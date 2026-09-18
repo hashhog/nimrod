@@ -61,7 +61,8 @@ meta-repo, which is **not public** — see the note below.
 > a file in that directory (from-genesis C(958794) lineage, R1 vectors, R2 corpus
 > parity, R5 live+regtest scorecards, build provenance). `bash proof/check-pin.sh`
 > is the attested-binary closure: the recorded sha256 must be the promoted pin
-> and the live exe. Re-run `bash proof/assemble.sh --pin` after every promote.
+> and the live exe. After every promote run `bash proof/on-promote.sh` (or
+> `nimble attest_pin`) so the bundle attests the pin that was just written.
 > That is the evidence this repo actually ships.
 
 ## Quick Start

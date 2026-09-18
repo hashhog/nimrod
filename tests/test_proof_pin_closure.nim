@@ -31,6 +31,40 @@ suite "proof pin closure":
         break
     check provSha == want
 
+  test "on-promote.sh is the assemble --pin release step":
+    let hook = ProofDir / "on-promote.sh"
+    check fileExists(hook)
+    let body = readFile(hook)
+    check "assemble.sh" in body
+    check "--pin" in body
+
+  test "assemble.sh patches claims when pin sha256 starts with a digit":
+    ## Live pin 920f0ee2… made re.sub r'\1'+sha raise invalid group 19.
+    let tmp = getTempDir() / "nimrod_assemble_" & $getCurrentProcessId()
+    createDir(tmp)
+    defer:
+      if dirExists(tmp):
+        removeDir(tmp)
+    copyFile(ProofDir / "claims.json", tmp / "claims.json")
+    let pin = tmp / "pin.bin"
+    var payload = "digit-leading-sha-probe"
+    var want = ""
+    while true:
+      writeFile(pin, payload)
+      want = execCmdEx("sha256sum " & pin.quoteShell()).output.splitWhitespace()[0]
+      if want.len == 64 and want[0] in {'0'..'9'}:
+        break
+      payload.add('x')
+    let chmodR = execCmdEx("chmod +x " & pin.quoteShell())
+    check chmodR.exitCode == 0
+    let r = execCmdEx(
+      "env PROOF_DIR=" & tmp.quoteShell() &
+      " bash " & (ProofDir / "assemble.sh").quoteShell() &
+      " --pin " & pin.quoteShell())
+    check r.exitCode == 0
+    let claims = parseJson(readFile(tmp / "claims.json"))
+    check claims["provenance"]["binary_sha256"].getStr() == want
+
   test "check-pin.sh rejects a pin whose sha256 is not the attested one":
     let fake = getTempDir() / "nimrod_fake_pin_" & $getCurrentProcessId()
     writeFile(fake, "not-the-attested-binary\n")

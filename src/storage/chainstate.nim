@@ -182,6 +182,9 @@ type
     # the sync loop drains it. Prefix below discoverFirstBody is never
     # queued — that is the 600 G archive decision, not this repair.
     pendingBodyRepairs*: HashSet[BlockHash]
+    # Bodies stored by fillMissingBody this process. Operator progress
+    # (getblockchaininfo.body_repair_filled); not persisted.
+    bodyRepairFilled*: int
     # Pending UTXO deletes tracked during IBD (cache key -> true)
     ibdDeletedUtxos*: Table[string, bool]
     # Disk flush state — tracks blocks since last forced memtable→SST flush.
@@ -685,23 +688,51 @@ proc auditRetainedBodies*(cdb: ChainDb, tip: int32,
   result.holes = found
   result.truncated = result.holeCount > found.len
 
+proc countRetainedBodyHoles*(cdb: ChainDb, tip: int32): int {.raises: [].} =
+  ## Untruncated number of connected bodies missing in [firstBody, tip].
+  ##
+  ## auditRetainedBodies.holes is a capped sample (truncated=true when
+  ## holeCount > maxHoles). Differencing that sample is comparing two
+  ## ceilings. This count is the total an operator can poll against.
+  result = 0
+  if cdb == nil or tip < 0:
+    return
+  try:
+    let floor = discoverFirstBody(cdb, tip)
+    var h = floor
+    while h <= tip:
+      let hashOpt = cdb.getBlockHashByHeight(h)
+      if hashOpt.isSome and not cdb.hasBlockBody(hashOpt.get()):
+        inc result
+      inc h
+  except CatchableError:
+    discard
+  except Exception:
+    discard
+
 proc planBodyRepairs*(cdb: ChainDb, tip: int32,
-                      maxHoles: int = 4096): seq[BlockHash] {.raises: [].} =
+                      maxHoles: int = 0): seq[BlockHash] {.raises: [].} =
   ## Hashes of connected active-chain bodies missing in [firstBody, tip].
   ##
   ## Interior holes only. The unretained prefix below discoverFirstBody
   ## is a floor, not a repair list (live genesis→952185; ~600 G). Live
   ## 2026-09-18: 1,470 hashes between 952411 and pruneheight.
+  ##
+  ## maxHoles <= 0 means no cap — remaining must be the real total, not
+  ## a sample. A 4096 cap would silently drop holes past that point and
+  ## a drained queue would look like completion.
   result = @[]
   if cdb == nil or tip < 0:
     return
   try:
     let floor = discoverFirstBody(cdb, tip)
     var h = floor
-    while h <= tip and result.len < maxHoles:
+    while h <= tip:
       let hashOpt = cdb.getBlockHashByHeight(h)
       if hashOpt.isSome and not cdb.hasBlockBody(hashOpt.get()):
         result.add(hashOpt.get())
+        if maxHoles > 0 and result.len >= maxHoles:
+          break
       inc h
   except CatchableError:
     discard
@@ -736,10 +767,17 @@ proc enqueueBodyRepair*(cs: ChainState, hash: BlockHash): bool {.raises: [].} =
   except Exception:
     return false
 
+proc bodyRepairRemaining*(cs: ChainState): int {.raises: [].} =
+  ## Queued retained-range holes not yet stored. Cheap; pollable.
+  if cs == nil:
+    return 0
+  cs.pendingBodyRepairs.len
+
 proc enqueueRetainedBodyRepairs*(cs: ChainState,
-                                 maxHoles: int = 4096): int {.raises: [].} =
+                                 maxHoles: int = 0): int {.raises: [].} =
   ## Seed pendingBodyRepairs from planBodyRepairs. Returns how many hashes
   ## were queued. Startup calls this after auditRetainedBodies.
+  ## maxHoles <= 0 means no cap (honest remaining).
   if cs == nil:
     return 0
   try:
@@ -788,6 +826,7 @@ proc fillMissingBody*(cs: ChainState, blk: Block): ChainStateResult[void] =
     if merkleRoot(txHashes) != blk.header.merkleRoot:
       return err("merkle root mismatch")
     cs.db.storeBlock(blk)
+    inc cs.bodyRepairFilled
     cs.historyFloorProbed = false
     cs.pendingBodyRepairs.excl(hash)
     return ok()
@@ -1216,6 +1255,7 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     historyFloor: 0,
     historyFloorProbed: false,
     pendingBodyRepairs: initHashSet[BlockHash](),
+    bodyRepairFilled: 0,
     ibdDeletedUtxos: initTable[string, bool](),
     ibdBlocksSinceLastDiskFlush: 0,
     ibdDiskFlushInterval: IbdBatchFlushInterval,  # default: flush to disk every 2000 blocks
