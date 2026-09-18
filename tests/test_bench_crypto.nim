@@ -4,7 +4,7 @@
 ## Run with: nimble test -- bench_crypto
 
 import unittest2
-import std/[monotimes, strformat]
+import std/[monotimes, strformat, times]
 
 import ../src/crypto/cpufeatures
 import ../src/crypto/sha256_accel

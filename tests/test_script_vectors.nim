@@ -10,6 +10,7 @@
 ##
 ## Single-element arrays are comments and are skipped.
 
+import unittest2
 import std/[json, strutils, sequtils, tables, os]
 import ../src/primitives/types
 import ../src/primitives/serialize  # txid computation for crediting/spending tx
@@ -399,7 +400,7 @@ proc makeSpendingTx(creditTx: Transaction, scriptSig: seq[byte],
 # Main test runner
 # ---------------------------------------------------------------------------
 
-proc main() =
+proc runScriptVectors(): tuple[passed, failed, skipped, parseErrors, witnessTests: int] =
   let data = readFile(findVectorFile(vectorName))
   let vectors = parseJson(data)
 
@@ -618,6 +619,14 @@ proc main() =
 
   if failed > 0:
     stderr.writeLine("NOTE: " & $failed & " failures remain")
+  result = (passed, failed, skipped, parseErrors, witnessTests)
 
-when isMainModule:
-  main()
+suite "Bitcoin Core script_tests.json":
+  test "script_tests.json vectors run and report failures":
+    ## Previously this file only printed counts under `when isMainModule`,
+    ## so importing it into test_all registered zero cases and could not
+    ## fail. The harness must be a real unittest2 test.
+    let r = runScriptVectors()
+    check r.passed + r.failed + r.skipped + r.parseErrors > 0
+    check r.failed == 0
+    check r.passed > 0

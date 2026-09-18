@@ -485,7 +485,7 @@ suite "Package mempool acceptance":
     discard cs.connectBlock(genesis, 0)
 
     # Add parent's funding output to UTXO set
-    cs.addUtxo(OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+    cs.putUtxoCache(OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
                UtxoEntry(output: TxOut(value: Satoshi(2000), scriptPubKey: makeP2PKHScript()),
                         isCoinbase: false, height: 0))
 
@@ -530,7 +530,7 @@ suite "Package mempool acceptance":
 
     var fundingTxid: array[32, byte]
     fundingTxid[0] = 0x01
-    cs.addUtxo(OutPoint(txid: TxId(fundingTxid), vout: 0),
+    cs.putUtxoCache(OutPoint(txid: TxId(fundingTxid), vout: 0),
                UtxoEntry(output: TxOut(value: Satoshi(10000), scriptPubKey: makeP2PKHScript()),
                         isCoinbase: false, height: 0))
 
@@ -588,7 +588,7 @@ suite "CPFP scenario tests":
 
     var fundingTxid: array[32, byte]
     fundingTxid[0] = 0x01
-    cs.addUtxo(OutPoint(txid: TxId(fundingTxid), vout: 0),
+    cs.putUtxoCache(OutPoint(txid: TxId(fundingTxid), vout: 0),
                UtxoEntry(output: TxOut(value: Satoshi(100000), scriptPubKey: makeP2PKHScript()),
                         isCoinbase: false, height: 0))
 

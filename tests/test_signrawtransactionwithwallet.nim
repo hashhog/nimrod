@@ -125,7 +125,10 @@ suite "signrawtransactionwithwallet + walletcreatefundedpsbt dispatch (Cat H)":
       caught = e
     check caught != nil
     check caught.code != RpcMethodNotFound
-    check caught.code == RpcInvalidParams
+    # Empty array fails Core's IsValidNumArgs (required=2) in checkCoreArity
+    # with RPC_MISC_ERROR (-1), not the handler's RpcInvalidParams. The
+    # method is in the dispatch table either way; -32601 is the regression.
+    check caught.code == RpcMiscError
 
   test "signrawtransactionwithwallet signs a P2WPKH input from wallet UTXOs":
     let wOpt = wm.getWallet("tw")

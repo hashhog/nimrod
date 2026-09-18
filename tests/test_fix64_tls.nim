@@ -45,12 +45,11 @@ randomize()
 # test runs in isolation and the chance of collision with another local
 # listener in the 1-line gap is vanishing.
 proc pickEphemeralPort(): uint16 =
-  # Use a process-local randomised high port instead of bind(0)/close —
-  # the kernel may keep the close()'d socket in TIME_WAIT for a few
-  # seconds, and the immediate rebind by `rest.start()` then hits
-  # EADDRINUSE even though both sockets set `ReuseAddr`.  Picking a
-  # fresh unbound port avoids the race entirely.
-  uint16(20_000 + rand(40_000))
+  # Stay in 61000-61999. A 20000-60000 draw collides with this box's
+  # reserved testnet4 P2P/RPC range (48333-48352) and other hashhog
+  # listeners; bind(0)/close then rebind also hits TIME_WAIT. A 1k
+  # window above the reserved ranges is enough for isolated tests.
+  uint16(61_000 + rand(999))
 
 proc makeSelfSigned(tmpDir: string): tuple[cert: string, key: string] =
   ## Generate a 2048-bit RSA self-signed cert + PKCS#8 PEM key via

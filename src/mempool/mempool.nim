@@ -1446,6 +1446,14 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # Defer the call until after conflicts are staged so the cluster shape is
   # accurate.
 
+  # Standalone-ephemeral guard (validation.cpp:1375 — CheckEphemeralSpends on
+  # a 1-element package). Runs BEFORE PolicyScriptChecks, matching Core.
+  # Package submissions already ran CheckEphemeralSpends on the whole package
+  # (acceptPackage); skip the 1-tx form when packageFeerates is set.
+  if hasEphemeralDust(tx) and not args.packageFeerates:
+    return err(AtmpAcceptInfo,
+               "ephemeral-dust-must-be-spent: standalone tx has ephemeral dust output but no child spending it; use package relay")
+
   # === PolicyScriptChecks ===================================================
   # Run with STANDARD_SCRIPT_VERIFY_FLAGS.  validation.cpp:1135.
   let consensusFlags = getBlockScriptFlags(mp.chainState.bestHeight, mp.params)
@@ -1535,13 +1543,6 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
 
   let (ancestorFee, ancestorWeight) = mp.calculateAncestorFeesAndWeight(tx, modifiedFee, weight)
   let (ancestorCount, ancestorSize) = mp.calculateAncestorStats(tx, vsizeInt)
-
-  # Standalone-ephemeral guard (validation.cpp:1375 — CheckEphemeralSpends).
-  # A single-tx submission with an ephemeral dust output cannot satisfy the
-  # "must be spent by a child in the same package" invariant, so reject.
-  if hasEphemeralDust(tx):
-    return err(AtmpAcceptInfo,
-               "ephemeral-dust-must-be-spent: standalone tx has ephemeral dust output but no child spending it; use package relay")
 
   let info = AtmpAcceptInfo(
     txid: txid,

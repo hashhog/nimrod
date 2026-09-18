@@ -2,7 +2,7 @@
 ## Unit tests for SOCKS5 protocol, I2P addressing, and proxy manager
 
 import unittest2
-import std/[options, tables]
+import std/[options, strutils, tables]
 import ../src/network/proxy
 
 suite "SOCKS5 protocol":

@@ -106,7 +106,9 @@ suite "walletprocesspsbt: Updater + Signer + Finalizer (Core v31.99)":
       caught = e
     check caught != nil
     check caught.code != RpcMethodNotFound
-    check caught.code == RpcInvalidParams
+    # Empty array fails Core's IsValidNumArgs (required=1) in checkCoreArity
+    # with RPC_MISC_ERROR (-1). -32601 would mean the method is not dispatched.
+    check caught.code == RpcMiscError
 
   test "walletprocesspsbt rejects a malformed base64 PSBT with -22":
     var caught: ref RpcError = nil

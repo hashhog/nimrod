@@ -1,7 +1,7 @@
 ## Tests for BIP330 Erlay transaction reconciliation
 ## Tests salt computation, short ID generation, and reconciliation protocol
 
-import std/[random, tables, sequtils]
+import std/[options, random, strutils, tables, sequtils]
 import unittest2
 import ../src/network/erlay
 import ../src/network/messages

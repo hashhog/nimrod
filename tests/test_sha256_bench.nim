@@ -4,7 +4,7 @@
 ## Verifies correctness and measures throughput.
 
 import unittest2
-import std/[monotimes, strformat]
+import std/[monotimes, strformat, times]
 
 import ../src/crypto/cpufeatures
 import ../src/crypto/sha256_accel

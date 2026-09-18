@@ -15727,6 +15727,18 @@ proc parseHttpRequestLine*(line: string): tuple[ok: bool, httpMethod: string, pa
     result.httpMethod = parts[0]
     result.path = parts[1]
 
+const
+  MaxHeadersSize* = 8192
+    ## Cumulative request-line + header budget, matching Core
+    ## httpserver.cpp:51 MAX_HEADERS_SIZE / evhttp_set_max_headers_size.
+
+func cumulativeHeaderBytes*(soFar: int, line: string): int {.inline.} =
+  ## One HTTP line plus its terminating CRLF.
+  soFar + line.len + 2
+
+func headersExceedCap*(soFar: int, line: string): bool {.inline.} =
+  cumulativeHeaderBytes(soFar, line) > MaxHeadersSize
+
 proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
   ## Handle a single client connection with proper HTTP parsing
   var headers: Table[string, string]
@@ -15737,11 +15749,22 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
   # wallet RPCs to the wallet named in /wallet/<name> (Bitcoin Core's
   # -rpcwallet / multi-wallet endpoint convention). "" means no specific wallet.
   var reqPath = ""
+  var headerBytes = 0
 
   while not transp.closed:
     try:
       if inHeaders:
         let line = await transp.readLine()
+        if headersExceedCap(headerBytes, line):
+          const body = "Bad Request"
+          let response = "HTTP/1.1 400 Bad Request\r\n" &
+                        "Connection: close\r\n" &
+                        "Content-Type: text/plain\r\n" &
+                        "Content-Length: " & $body.len & "\r\n" &
+                        "\r\n" & body
+          discard await transp.write(response)
+          break
+        headerBytes = cumulativeHeaderBytes(headerBytes, line)
 
         if line.len == 0 and transp.atEof():
           # Connection closed by remote — stop processing
@@ -15798,6 +15821,7 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
           contentLength = 0
           authHeader = ""
           reqPath = ""
+          headerBytes = 0
 
         else:
           let rl = parseHttpRequestLine(line)

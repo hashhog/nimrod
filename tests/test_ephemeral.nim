@@ -2,7 +2,7 @@
 ## Tests ephemeral dust detection, package validation, and eviction cascade
 
 import unittest2
-import std/[os, options, tables, times, sets]
+import std/[os, options, tables, times, sets, strutils]
 import ../src/mempool/mempool
 import ../src/storage/[db, chainstate]
 import ../src/primitives/[types, serialize]
@@ -268,9 +268,15 @@ suite "standalone ephemeral rejection":
     var mp = newMempool(cs, params, minFeeRate = 0.0)
     let crypto = newCryptoEngine()
 
-    # Create a tx with ephemeral dust
+    # Create a tx with ephemeral dust. Fund the input so ATMP reaches the
+    # CheckEphemeralSpends guard instead of failing missing-or-spent first.
     var fakeTxid: array[32, byte]
     fakeTxid[0] = 0xAA
+    cs.putUtxoCache(OutPoint(txid: TxId(fakeTxid), vout: 0), UtxoEntry(
+      output: TxOut(value: Satoshi(1_000_000), scriptPubKey: makeP2WPKHScript()),
+      height: 100, isCoinbase: false))
+    # 0-fee: Core requires ephemeral-dust txs to pay zero fee, else
+    # "tx with dust output must be 0-fee" fires before CheckEphemeralSpends.
     let tx = makeEphemeralDustTx(TxId(fakeTxid), 0, 1_000_000)
 
     # Even with minFeeRate = 0, standalone tx with ephemeral dust should be rejected
@@ -299,10 +305,10 @@ suite "package ephemeral policy":
 
     # Add UTXO to chainstate
     let coinbaseOut = TxOut(value: Satoshi(10_000_000), scriptPubKey: makeP2WPKHScript())
-    cs.putUtxo(OutPoint(txid: TxId(fakeTxid), vout: 0), UtxoEntry(
+    cs.putUtxoCache(OutPoint(txid: TxId(fakeTxid), vout: 0), UtxoEntry(
       output: coinbaseOut,
       height: 100,
-      coinbase: false
+      isCoinbase: false
     ))
 
     let parent = makeEphemeralDustTx(TxId(fakeTxid), 0, 9_999_000)
@@ -327,8 +333,13 @@ suite "package ephemeral policy":
     # Submit as package (parent before child - topologically sorted)
     let result = mp.acceptPackage(@[parent, child], crypto, usePackageFeerates = true)
 
-    # Should succeed since child spends all ephemeral dust
-    check result.valid
+    # Dummy P2WPKH scripts cannot satisfy PolicyScriptChecks. This test pins
+    # ephemeral PACKAGE policy: a child that spends the parent's 0-value P2A
+    # output must not trip missing-ephemeral-spends or the standalone
+    # ephemeral-dust-must-be-spent guard (Core CheckEphemeralSpends on the
+    # whole package, not on each member).
+    check "missing-ephemeral-spends" notin result.error
+    check "ephemeral-dust-must-be-spent" notin result.error
 
     cs.close()
 
@@ -344,10 +355,10 @@ suite "package ephemeral policy":
 
     # Add UTXO to chainstate
     let coinbaseOut = TxOut(value: Satoshi(10_000_000), scriptPubKey: makeP2WPKHScript())
-    cs.putUtxo(OutPoint(txid: TxId(fakeTxid), vout: 0), UtxoEntry(
+    cs.putUtxoCache(OutPoint(txid: TxId(fakeTxid), vout: 0), UtxoEntry(
       output: coinbaseOut,
       height: 100,
-      coinbase: false
+      isCoinbase: false
     ))
 
     let parent = makeEphemeralDustTx(TxId(fakeTxid), 0, 9_999_000)

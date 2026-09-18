@@ -812,7 +812,7 @@ suite "W109 G15 — PruneAfterHeight minimum-chain-length check absent":
     # The MinBlocksToKeep = 288 is present (correct), but it only prevents
     # pruning the last 288 blocks. The nPruneAfterHeight check prevents any
     # pruning until the chain reaches 100000 (mainnet) or 1000 (testnet4) blocks.
-    check blockstore.MinBlocksToKeep == 288  # this is correct
+    check MinBlocksToKeep == 288  # params.MinBlocksToKeep; this is correct
 
     # There is no equivalent nPruneAfterHeight in nimrod source.
     # Any chain with fewer than 100000 (mainnet) blocks would be erroneously prunable.

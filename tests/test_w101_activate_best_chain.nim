@@ -108,7 +108,6 @@
 import unittest2
 import std/[os, options, tables]
 import ../src/storage/[db, chainstate]
-import ../src/storage/blockstore as bs
 import ../src/consensus/[params, chain]
 import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing
@@ -741,15 +740,12 @@ suite "W101 G29-30 PruneAndFlush safety floors":
     ## Verify that nimrod's pruner does not prune within the keep window.
     ## (This test is structural — we verify the constant exists and is used.)
     ##
-    ## blockstore.nim should export MinBlocksToKeep = 288
-    ## and pruner.nim should enforce ceiling = min(requested, tip - MinBlocksToKeep).
-    ##
-    ## We verify the constant value matches Core's expectation.
-    check bs.MinBlocksToKeep == 288
+    ## params.MinBlocksToKeep = 288 (Core MIN_BLOCKS_TO_KEEP). blockstore no
+    ## longer re-exports it; pruner.nim enforces
+    ## ceiling = min(requested, tip - MinBlocksToKeep).
+    check params.MinBlocksToKeep == 288
 
   test "auto-prune disabled mode prevents pruning — structural absence of pruner import":
     ## pmDisabled mode must not prune anything.
     ## We verify the constant and that the pruner module guards correctly.
-    ## (Pruner import skipped here due to ambiguous MinBlocksToKeep between
-    ## blockstore and params — a separate naming issue in the codebase.)
-    check bs.MinBlocksToKeep == 288
+    check params.MinBlocksToKeep == 288

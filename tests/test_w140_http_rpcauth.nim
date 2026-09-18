@@ -253,13 +253,15 @@ suite "W140 G10 — -rpccookiefile":
 # ---------------------------------------------------------------------------
 suite "W140 G11 — HTTP status codes for JSON-RPC errors":
 
-  test "G11 BUG-11 (P1-CORRECTNESS): every HTTP reply is 200 OK":
-    ## src/rpc/server.nim:8678 hardcodes \"HTTP/1.1 200 OK\".
+  test "G11 BUG-11 (P1-CORRECTNESS): JSON-RPC replies are HTTP 200 regardless of RPC error":
+    ## JSON-RPC success/error still hardcodes HTTP/1.1 200 OK.
     ## Core httprpc.cpp:41-58 maps RPC_INVALID_REQUEST -> 400,
     ## RPC_METHOD_NOT_FOUND -> 404, else -> 500.
+    ## HTTP 400 for oversized headers (MaxHeadersSize) is a different layer
+    ## (libevent evhttp_set_max_headers_size) and is not this gate.
     check "\"HTTP/1.1 200 OK\\r\\n\"" in serverSrc
-    # No 400 / 404 / 500 status lines are emitted.
-    check "HTTP/1.1 400" notin serverSrc
+    let idx = serverSrc.find("let httpResponse = \"HTTP/1.1 200 OK")
+    check idx >= 0
     check "HTTP/1.1 404" notin serverSrc
     check "HTTP/1.1 500" notin serverSrc
 
@@ -525,12 +527,25 @@ suite "W140 G24 — -rpcservertimeout":
 # ---------------------------------------------------------------------------
 suite "W140 G25 — MAX_HEADERS_SIZE":
 
-  test "G25 BUG-25 (P2-OPS): no cumulative header-bytes cap":
-    ## Core httpserver.cpp:51 + 409 — 8192 byte cumulative header cap.
-    ## Nimrod's processClient reads headers via readLine() with no cap.
-    check "MAX_HEADERS_SIZE" notin serverSrc
-    check "8192" notin serverSrc
+  test "G25: processClient enforces Core's 8192-byte cumulative header cap":
+    ## Core httpserver.cpp:51 + 409 — evhttp_set_max_headers_size(8192).
+    ## Flipped from the BUG-25 absence pin after MaxHeadersSize landed.
+    ## A whole-file `"8192" notin serverSrc` is not this gate: getchaintxstats
+    ## uses MaxCheapChainTxWalk = 8192 for a different budget.
+    check "MaxHeadersSize* = 8192" in serverSrc
     check CORE_MAX_HEADERS_SIZE == 8192
+    check MaxHeadersSize == CORE_MAX_HEADERS_SIZE
+    let idx = serverSrc.find("proc processClient")
+    check idx >= 0
+    let endIdx = serverSrc.find("\nproc ", idx + 1)
+    let body = if endIdx >= 0: serverSrc[idx ..< endIdx] else: serverSrc[idx ..< serverSrc.len]
+    check "headersExceedCap" in body
+    check "headerBytes" in body
+    # Negative control: one more byte past the cap is over; the cap itself is not.
+    check not headersExceedCap(0, "POST / HTTP/1.1")
+    check not headersExceedCap(MaxHeadersSize - 2, "")   # empty line + CRLF == cap
+    check headersExceedCap(MaxHeadersSize - 1, "")       # one byte over
+    check headersExceedCap(0, "X".repeat(MaxHeadersSize))
 
 # ---------------------------------------------------------------------------
 # G26 — POST Content-Length: 0 hang (BUG-26, P2-OPS)
