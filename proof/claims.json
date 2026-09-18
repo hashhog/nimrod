@@ -57,9 +57,9 @@
     "regtest_t3_total": 16
   },
   "provenance": {
-    "files": ["provenance.txt"],
-    "binary_sha256": "d9b77fa0c620c5e1ef429218716dad3a69675b21f86ded74b678ee7bc4f4df55",
+    "files": ["provenance.txt", "assemble.sh", "check-pin.sh"],
+    "binary_sha256": "ed291dd479fab2c82ea87e8eb20a27a0923a30eb5de45506cd3bee35a35138a5",
     "toolchain": "Nim 2.2.8 / nimble 0.20.1",
-    "parent_commit": "8e58af93c31a337c59ee8668e85a48efddada9ac"
+    "parent_commit": "f6da7ed8960d579cbf6ba065897999997ebdb4d5"
   }
 }

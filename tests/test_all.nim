@@ -164,6 +164,7 @@ const IncludedTests = [
   "test_ping_timeout",
   "test_pre_handshake",
   "test_prioritisetransaction",
+  "test_proof_pin_closure",
   "test_proxy",
   "test_pruner",
   "test_pruned_history",

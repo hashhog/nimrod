@@ -12,12 +12,17 @@ It claims **only what the included files show.**
 From the nimrod repository root:
 
 ```
+bash proof/check-pin.sh
 bash proof/verify.sh
 ```
 
-That is the control. It exits 0 only if every claim in `claims.json`
-matches a file here, the lineage log is a from-genesis AV=0 run (not a
-snapshot boot), and the in-repo R5 help-parity test is green.
+`check-pin.sh` is the attested-binary closure: it exits 0 only if
+`claims.json` / `provenance.txt` agree and, when a pin or live unit is
+observable, that sha256 is the recorded one. `verify.sh` re-checks
+every claim in `claims.json` against a file here, refuses a
+snapshot-booted lineage, re-runs the in-repo R5 help-parity test, and
+calls `check-pin.sh`. Re-run `bash proof/assemble.sh --pin` after every
+promote so the closure cannot go stale.
 
 Re-running the heavy instruments (from-genesis IBD, full R2 corpus, live
 R5 probe) needs the commands in `r4/`, `r1/command.txt`, `r2/command.txt`,
@@ -28,10 +33,12 @@ here are the captured results of those commands.
 
 ### Provenance — `provenance.txt`
 
-The parent commit this bundle was assembled on, the sha256 of
-`bin/nimrod` built from this tree (`nimble build -d:release -y`), and
-the toolchain (Nim 2.2.8 / nimble 0.20.1). **Does not prove** bit-exact
-reproducible builds across toolchains — see `REPRODUCIBLE-BUILD.md`.
+The sha256 of the **promoted pin** (the binary actually running), the
+commit that pin was built from, and the toolchain (Nim 2.2.8 / nimble
+0.20.1). Written by `assemble.sh`. Enforced by `check-pin.sh`. **Does
+not prove** bit-exact reproducible builds across toolchains — see
+`REPRODUCIBLE-BUILD.md`. A local `bin/nimrod` rebuild is not the
+attested binary.
 
 ### R4 from-genesis lineage — `r4/`
 

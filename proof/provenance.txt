@@ -1,22 +1,31 @@
 # Provenance — nimrod proof bundle
-assembled_utc: 2026-09-17T10:30:05Z
+assembled_utc: 2026-09-18T07:48:27Z
 repo: https://github.com/hashhog/nimrod
 branch: master
-commit: 8e58af93c31a337c59ee8668e85a48efddada9ac
-commit_short: 8e58af93c31a
-subject: feat: credit wallet outputs on block connect and close T3 0/16
+commit: 785f580953b1533f68c56377da09d2741c618a09
+commit_short: 785f580953b1
+subject: fix: green the aggregate unit suite (3 FAIL + 10 excluded)
 tree_clean: NO
-binary: bin/nimrod
-binary_sha256: d9b77fa0c620c5e1ef429218716dad3a69675b21f86ded74b678ee7bc4f4df55
+binary: /home/work/hashhog/deploy/nimrod/nimrod
+binary_sha256: ed291dd479fab2c82ea87e8eb20a27a0923a30eb5de45506cd3bee35a35138a5
 toolchain: Nim Compiler Version 2.2.8 [Linux: amd64]
 nimble: nimble v0.20.1 compiled at 2026-02-23 03:08:48
 target: Linux amd64
 build: nimble build -d:release -y
+deploy_pin: f6da7ed8960d579cbf6ba065897999997ebdb4d5
+deploy_short: f6da7ed
+deploy_sha256: ed291dd479fab2c82ea87e8eb20a27a0923a30eb5de45506cd3bee35a35138a5
+source: pin
 
 # Honest caveats
-Nim compiles via C. The binary hash is for this toolchain and this tree.
-A different Nim, C compiler, libc, or build path is expected to produce
-different bytes. Behavioural re-runs (R1 shim, in-repo R5 tests) are the
-stronger check. See REPRODUCIBLE-BUILD.md.
+The attested binary is the promoted pin (deploy/nimrod/MANIFEST
+sha256=ed291dd479fab2c82ea87e8eb20a27a0923a30eb5de45506cd3bee35a35138a5, commit f6da7ed), which must be
+byte-identical to the live mainnet unit's /proc/<pid>/exe. Re-run
+this script with --pin after every promote; proof/check-pin.sh and
+proof/verify.sh fail if a pin is present and does not match.
+Nim compiles via C. The binary hash is for this toolchain and this
+tree. A different Nim, C compiler, libc, or build path is expected
+to produce different bytes. Behavioural re-runs (R1 shim, in-repo
+R5 tests) are the stronger check. See REPRODUCIBLE-BUILD.md.
 This script refreshes provenance + MANIFEST only. Frozen evidence in
 r1/ r2/ r4/ r5/ is not regenerated from outside this repository.

@@ -59,8 +59,10 @@ meta-repo, which is **not public** — see the note below.
 > suite, and reproduce its behaviour against Bitcoin Core yourself. The per-node
 > proof bundle is `proof/` — `bash proof/verify.sh` re-checks every claim against
 > a file in that directory (from-genesis C(958794) lineage, R1 vectors, R2 corpus
-> parity, R5 live+regtest scorecards, build provenance). That is the evidence
-> this repo actually ships.
+> parity, R5 live+regtest scorecards, build provenance). `bash proof/check-pin.sh`
+> is the attested-binary closure: the recorded sha256 must be the promoted pin
+> and the live exe. Re-run `bash proof/assemble.sh --pin` after every promote.
+> That is the evidence this repo actually ships.
 
 ## Quick Start
 

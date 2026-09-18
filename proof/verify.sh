@@ -6,6 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 PROOF="$ROOT/proof"
+export PATH="${HOME}/.nimble/bin:${PATH}"
 fail=0
 say() { printf '%s\n' "$*"; }
 die() { printf 'FAIL: %s\n' "$*"; fail=1; }
@@ -209,17 +210,22 @@ else
   say "R5: handleHelp lists getnetworkhashps ( nblocks height )"
 fi
 
-# 9. provenance binary hash (optional if bin/nimrod is present)
+# 9. attested-binary closure — the recorded sha256 MUST be the promoted
+# pin and the live exe when those are observable. Local bin/nimrod is
+# informational (rebuilds are not bit-stable across toolchains).
+if ! bash "$PROOF/check-pin.sh"; then
+  fail=1
+fi
 want_bin="$(python3 -c 'import json,pathlib; print(json.loads(pathlib.Path("proof/claims.json").read_text())["provenance"]["binary_sha256"])')"
 if [ -x "$ROOT/bin/nimrod" ]; then
   got_bin="$(sha256sum "$ROOT/bin/nimrod" | awk '{print $1}')"
   if [ "$got_bin" != "$want_bin" ]; then
-    say "NOTE: bin/nimrod sha256=$got_bin (bundle records $want_bin). Rebuilds are not bit-stable across toolchains; this is informational."
+    say "NOTE: bin/nimrod sha256=$got_bin (bundle records $want_bin). Local rebuilds are not the attested pin."
   else
     say "provenance: bin/nimrod sha256=$want_bin"
   fi
 else
-  say "NOTE: bin/nimrod not present (gitignored). Rebuild with nimble build -d:release -y to check the recorded sha256."
+  say "NOTE: bin/nimrod not present (gitignored)."
 fi
 
 # 10. in-repo help-parity control (the live-lane FAIL this commit closes)
