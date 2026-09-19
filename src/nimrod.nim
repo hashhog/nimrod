@@ -384,11 +384,9 @@ proc loadConfigFile*(config: var NimrodConfig) =
         if pruneMiB > 0:
           config.pruneTarget = uint64(pruneMiB)
       except ValueError: discard
-    of "verifythreads", "verify-threads":
+    of "par", "verifythreads", "verify-threads":
       try:
-        let v = parseInt(value)
-        if v >= 0 and v <= 256:
-          config.numVerifyWorkers = v
+        config.numVerifyWorkers = parseInt(value)
       except ValueError: discard
     of "dbcache":
       try:
@@ -538,7 +536,11 @@ Options:
                          no auto-prune); SIZE_MB>=550 enables auto-prune to
                          the given byte budget (Bitcoin Core parity).
   --ibd-flush-interval=N Force memtables to disk every N blocks during IBD (default: 2000, max: 5000)
-  --verify-threads=N     Script verify thread count for parallel IBD (default: 0 = auto/CPU count)
+  --par=N                Script verification threads (Bitcoin Core -par).
+                         0 = auto (ncores, extra workers capped at 15),
+                         1 = serial, >1 = that many threads including the
+                         master, <0 = leave that many cores free. Default: 0.
+  --verify-threads=N     Alias for --par (legacy name)
   --dbcache=N            UTXO cache budget in MiB, Bitcoin Core units (default: 0 =
                          compiled default ~2 GiB ceiling + 200000 IBD entry target;
                          only raises the cache, never shrinks below the default)
@@ -614,6 +616,17 @@ Config file: <datadir>/nimrod.conf or path passed via --conf (key=value format)
 SIGHUP: reopens the configured log file (rotation-friendly).
 """
 
+proc rewriteCoreParFlags(args: seq[string]): seq[string] =
+  ## Bitcoin Core writes `-par=<n>` with a single dash. Nim parseopt treats
+  ## `-par` as grouped short options and `-p` is already `--port`. Rewrite
+  ## `-par` / `-par=N` / `-par:N` to the long form before parsing.
+  result = newSeqOfCap[string](args.len)
+  for a in args:
+    if a == "-par" or a.startsWith("-par=") or a.startsWith("-par:"):
+      result.add("-" & a)
+    else:
+      result.add(a)
+
 proc parseArgs*(cmdline: seq[string]): tuple[cmd: Command, config: NimrodConfig, args: seq[string]] =
   ## Parse command line arguments
   ## Returns: command, config, and additional args
@@ -621,7 +634,7 @@ proc parseArgs*(cmdline: seq[string]): tuple[cmd: Command, config: NimrodConfig,
   result.cmd = cmdStart  # Default command
   result.args = @[]
 
-  var p = initOptParser(cmdline)
+  var p = initOptParser(rewriteCoreParFlags(cmdline))
   var cmdParsed = false
 
   while true:
@@ -721,15 +734,11 @@ proc parseArgs*(cmdline: seq[string]): tuple[cmd: Command, config: NimrodConfig,
         except ValueError:
           echo "Invalid ibd-flush-interval: " & p.val
           quit(1)
-      of "verify-threads":
+      of "par", "verify-threads":
         try:
-          let v = parseInt(p.val)
-          if v < 0 or v > 256:
-            echo "verify-threads must be 0-256 (0 = auto/CPU count)"
-            quit(1)
-          result.config.numVerifyWorkers = v
+          result.config.numVerifyWorkers = parseInt(p.val)
         except ValueError:
-          echo "Invalid verify-threads: " & p.val
+          echo "Invalid par/verify-threads: " & p.val
           quit(1)
       of "dbcache":
         try:
@@ -2339,15 +2348,16 @@ proc startNode*(config: NimrodConfig) {.async.} =
   state.crypto = newCryptoEngine()
 
   # 1a. Pre-warm the secp256k1 verify context and spin up the static parallel
-  # script-verification worker pool (W167). initVerifyPool() calls
-  # initSecp256k1() on THIS (main) thread before any worker can touch the
-  # global context, closing the lazy-init TOCTOU race, then spawns the bounded
-  # pool sized from --verify-threads (0 = auto = countProcessors()-1, clamped
-  # to Core's MAX_SCRIPTCHECK_THREADS=15). verifyScripts auto-dispatches to the
-  # pool once it is up. Must run before IBD / any acceptBlock call.
-  let verifyWorkers = clampWorkers(config.numVerifyWorkers)
+  # script-verification worker pool. initVerifyPool() calls initSecp256k1()
+  # on THIS (main) thread before any worker can touch the global context,
+  # closing the lazy-init TOCTOU race, then spawns extra workers from `-par`
+  # / `--verify-threads` (Core mapping: 0 = auto, 1 = serial, extra clamped
+  # to MAX_SCRIPTCHECK_THREADS=15). verifyScripts auto-dispatches to the pool
+  # once it is up. Must run before IBD / any acceptBlock call.
+  let extraWorkers = clampWorkers(config.numVerifyWorkers)
+  let totalVerifiers = resolveScriptCheckThreads(config.numVerifyWorkers)
   info "initializing parallel script-verify pool",
-    workers = verifyWorkers, requested = config.numVerifyWorkers
+    extra = extraWorkers, total = totalVerifiers, par = config.numVerifyWorkers
   initVerifyPool(config.numVerifyWorkers)
 
   # 2. Open database and chainstate
