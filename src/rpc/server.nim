@@ -15601,10 +15601,15 @@ proc handleRequestSafe(rpc: RpcServer, body: string, reqPath: string): string {.
   {.gcsafe.}:
     try:
       result = rpc.handleRequest(body, reqPath)
-    except CatchableError:
+    except CatchableError as e:
+      error "RPC handler error", error = e.msg
       result = makeErrorResponse(newJNull(), RpcInternalError, "internal error")
-    except Exception:
-      result = makeErrorResponse(newJNull(), RpcParseError, "parse error")
+    except Exception as e:
+      # Defects used to be labelled JSON-RPC parse error (-32700), so a
+      # concurrent flushCache/startIBD crash on a 50M-coin snapshot looked
+      # like malformed JSON to the campaign harness (utxo_hash="-1").
+      error "RPC handler defect", error = e.msg, name = $e.name
+      result = makeErrorResponse(newJNull(), RpcInternalError, "internal error")
 
 proc asyncHandleRequest(rpc: RpcServer, body: string,
                         reqPath: string = ""): Future[string] {.async.} =
@@ -15810,10 +15815,12 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
             var respResult: string
             try:
               respResult = await rpc.asyncHandleRequest(body, reqPath)
-            except CatchableError:
+            except CatchableError as e:
+              error "RPC client handler error", error = e.msg
               respResult = makeErrorResponse(newJNull(), RpcInternalError, "internal error")
-            except Exception:
-              respResult = makeErrorResponse(newJNull(), RpcParseError, "parse error")
+            except Exception as e:
+              error "RPC client handler defect", error = e.msg, name = $e.name
+              respResult = makeErrorResponse(newJNull(), RpcInternalError, "internal error")
 
             let httpResponse = "HTTP/1.1 200 OK\r\n" &
                               "Content-Type: application/json\r\n" &

@@ -832,8 +832,14 @@ proc loadSnapshot*(
   var hw = initHashWriter()
 
   # Phase 2 — chunked per-coin writes. We collect up to SnapshotLoadChunkSize
-  # coins per WriteBatch (matches ouroboros). The cache mirror (`putUtxoCache`)
-  # is updated in-step so in-process readers see the loaded coins immediately.
+  # coins per WriteBatch (matches ouroboros). Coins go ONLY to cfUtxo, not
+  # into `utxoCache`: mirroring every coin (50M at rung 550000) left a 13 GB
+  # Table that gettxoutsetinfo flushCache()'d on the RPC thread while the
+  # main thread entered IBD and mutated the same cache — Defect, JSON-RPC
+  # -32700 "parse error", harness utxo_hash="-1". Load is synchronous on
+  # the main thread before RPC starts; after each chunk write the coins
+  # are visible via getUtxo → cfUtxo. Core's ActivateSnapshot likewise
+  # does not pin the snapshot in the coins-tip cache.
   var chunkBatch = targetCs.db.db.newWriteBatch()
   var chunkCount = 0
   defer: chunkBatch.destroy()
@@ -884,7 +890,6 @@ proc loadSnapshot*(
         height: coin.height,
         isCoinbase: coin.isCoinbase
       )
-      targetCs.putUtxoCache(coin.outpoint, entry)
       let utxoK = utxoKey(array[32, byte](coin.outpoint.txid),
                           coin.outpoint.vout)
       chunkBatch.put(cfUtxo, utxoK, serializeUtxoEntry(entry))

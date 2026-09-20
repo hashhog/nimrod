@@ -2077,6 +2077,101 @@ suite "gettxoutsetinfo Core-byte-parity":
     # not JSON-RPC 2.0 Invalid params (-32602).
     check code == RpcInvalidParameter
 
+  test "loadSnapshot does not pin every coin in utxoCache":
+    ## Campaign rung 550000 loaded 50,067,846 coins into utxoCache (13 GB RSS).
+    ## gettxoutsetinfo then flushCache()'d that Table on the RPC thread for
+    ## minutes while the main thread entered IBD and mutated the same cache —
+    ## a Defect, caught as JSON-RPC -32700 "parse error". The harness printed
+    ## ` -1` and graded NO-ORACLE-SURFACE with utxo_hash="-1".
+    ## Coins already land in cfUtxo via the WriteBatch; the in-memory cache
+    ## must stay within maxCacheSize so flushCache cannot race a 50M-entry
+    ## Table against startIBD.
+    const nCoins = 120
+    const cacheCap = 32
+    const baseHeight = 100'i32
+    let testDir = getTempDir() / "nimrod_gtxosi_snap_cache"
+    createDir(testDir)
+    defer:
+      try: removeDir(testDir) except OSError: discard
+    let loadDir = testDir / "load"
+    createDir(loadDir)
+
+    let mainnet = mainnetParams()
+    let baseHash = BlockHash(mkHashWith([0x55'u8, 0x00, 0xAA]))
+    let snapPath = testDir / "ncoins.dat"
+    let meta = SnapshotMetadata(
+      version: SnapshotVersion,
+      networkMagic: mainnet.networkMagic,
+      baseBlockhash: baseHash,
+      coinsCount: uint64(nCoins)
+    )
+    let sf = openSnapshotForWrite(snapPath, meta)
+    for i in 0 ..< nCoins:
+      var txidBytes: array[32, byte]
+      txidBytes[0] = byte(i and 0xFF)
+      txidBytes[1] = byte((i shr 8) and 0xFF)
+      txidBytes[2] = 0xC0
+      let coin = SnapshotCoin(
+        outpoint: OutPoint(txid: TxId(txidBytes), vout: 0),
+        output: TxOut(value: Satoshi(50_00000000),
+                      scriptPubKey: @[0x51'u8]),
+        height: baseHeight,
+        isCoinbase: true
+      )
+      sf.writeTxidGroup(coin.outpoint.txid, @[coin])
+    sf.close()
+
+    var cs = newChainState(loadDir, mainnet)
+    defer: cs.close()
+    cs.maxCacheSize = cacheCap
+
+    putEnv("HASHHOG_UNSAFE_SNAPSHOT_HEIGHT", $baseHeight)
+    defer: delEnv("HASHHOG_UNSAFE_SNAPSHOT_HEIGHT")
+
+    let res = loadSnapshot(snapPath, cs, mainnet, mainnet.assumeutxoData)
+    check res.success
+    check res.coinsLoaded == uint64(nCoins)
+    check cs.bestHeight == baseHeight
+    # Negative control: a cache that swallowed every snapshot coin is the bug.
+    check cs.cacheSize <= cs.maxCacheSize
+    check cs.cacheSize <= cacheCap
+
+    # Coins are readable from cfUtxo (not only from the cache).
+    var tx0: array[32, byte]
+    tx0[2] = 0xC0
+    let got = cs.getUtxo(OutPoint(txid: TxId(tx0), vout: 0))
+    check got.isSome
+    check got.get().height == baseHeight
+
+    # Wire-level gettxoutsetinfo must be parseable JSON with a height, not
+    # a Defect caught as -32700 parse error.
+    let info = computeUtxoSetInfo(cs, cshtHashSerialized)
+    check info.height == baseHeight
+    check info.txOuts == uint64(nCoins)
+    check info.hashSerialized != default(array[32, byte])
+
+    let mp = newMempool(cs, mainnet)
+    let fe = newFeeEstimator()
+    let rpc = newRpcServer(
+      port = 18443'u16, chainState = cs, mempool = mp,
+      peerManager = nil, feeEstimator = fe, params = mainnet
+    )
+    let rpcRes = rpc.handleGetTxOutSetInfo(%*["hash_serialized_3"])
+    check rpcRes.hasKey("height")
+    check rpcRes["height"].getInt() == int(baseHeight)
+    check rpcRes.hasKey("hash_serialized_3")
+    check rpcRes["hash_serialized_3"].getStr().len == 64
+    let envelope = $ %*{
+      "jsonrpc": "2.0",
+      "id": "camp",
+      "result": rpcRes,
+      "error": newJNull()
+    }
+    let parsed = parseJson(envelope)
+    check parsed["result"].kind == JObject
+    check parsed["result"]["height"].getInt() == int(baseHeight)
+    check parsed["error"].kind == JNull
+
 # ============================================================================
 # W102 AssumeUTXO snapshot loading gate audit
 #
