@@ -2361,6 +2361,53 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     info "requesting blocks", count = inventory.len,
          fromHeight = sm.chainTipHeight + 1
 
+proc pruneBodyRepairQueue*(sm: SyncManager) {.raises: [].} =
+  ## Drop queued hashes that cannot be filled: already-have, no retained
+  ## window (snapshot/genesis IBD), below floor, or unknown header.
+  ## Remaining must fall; a one-block queue that never decrements is the
+  ## 550001 loop.
+  if sm == nil or sm.chainState == nil or sm.chainState.db == nil:
+    return
+  var drop: seq[BlockHash] = @[]
+  let tip = sm.chainState.bestHeight
+  let window = hasRetainedBodyWindow(sm.chainState.db, tip)
+  let floor =
+    if window: discoverFirstBody(sm.chainState.db, tip)
+    else: tip
+  for h in sm.chainState.pendingBodyRepairs:
+    if not window:
+      drop.add(h)
+      continue
+    try:
+      if sm.chainState.db.hasBlockBody(h):
+        drop.add(h)
+        continue
+      let idxOpt = sm.chainState.db.getBlockIndex(h)
+      if idxOpt.isNone or idxOpt.get().height < floor:
+        drop.add(h)
+    except CatchableError:
+      drop.add(h)
+    except Exception:
+      drop.add(h)
+  for h in drop:
+    sm.chainState.pendingBodyRepairs.excl(h)
+    sm.requestedHashes.excl(h)
+
+proc bodyRepairYieldsToIbd*(sm: SyncManager): bool {.raises: [].} =
+  ## Historical body repair shares getdata with IBD. On a one-peer
+  ## range-runner the repair of a single unfillable hole at 550001
+  ## livelocked 550000→575000 (remaining=1, 102 requests, height stuck).
+  ## clearbit 63450d1 / rustoshi HASHHOG_DISABLE_HISTORICAL_BACKFILL are
+  ## the same class. Yield while more than 10 blocks behind and fewer
+  ## than two ready peers.
+  if sm == nil:
+    return false
+  if sm.headerTipHeight - sm.chainTipHeight <= 10:
+    return false
+  if sm.peerManager == nil:
+    return true
+  sm.peerManager.getReadyPeers().len < 2
+
 proc planRepairInventory*(sm: SyncManager,
                           maxItems: int = MaxRepairGetData): seq[InvVector] =
   ## getdata inventory for queued retained-range holes.
@@ -2372,16 +2419,13 @@ proc planRepairInventory*(sm: SyncManager,
   result = @[]
   if sm == nil or sm.chainState == nil:
     return
+  sm.pruneBodyRepairQueue()
   let now = getTime()
   if now - sm.lastRepairRequest >= initDuration(seconds = RepairRetrySeconds):
     for h in sm.chainState.pendingBodyRepairs:
       sm.requestedHashes.excl(h)
     sm.lastRepairRequest = now
-  var drop: seq[BlockHash] = @[]
   for h in sm.chainState.pendingBodyRepairs:
-    if sm.chainDb != nil and sm.chainDb.hasBlockBody(h):
-      drop.add(h)
-      continue
     if h in sm.requestedHashes:
       continue
     result.add(InvVector(invType: invWitnessBlock,
@@ -2389,13 +2433,26 @@ proc planRepairInventory*(sm: SyncManager,
     sm.requestedHashes.incl(h)
     if result.len >= maxItems:
       break
-  for h in drop:
-    sm.chainState.pendingBodyRepairs.excl(h)
 
 proc requestRepairBodies*(sm: SyncManager) {.async.} =
   ## Send getdata for queued retained-range holes to a ready peer.
   ## No-op when the queue is empty or no peer is ready. Does not
   ## increment pendingBlocks — IBD must not stall behind repair.
+  ## Yields on a one-peer IBD so the slice can drain.
+  if sm.bodyRepairYieldsToIbd():
+    sm.pruneBodyRepairQueue()
+    let now = getTime()
+    if now - sm.lastRepairRequest >= initDuration(seconds = RepairRetrySeconds):
+      sm.lastRepairRequest = now
+      let remaining =
+        if sm.chainState != nil: sm.chainState.bodyRepairRemaining()
+        else: 0
+      info "yielding retained-range body repair to IBD",
+           remaining = remaining,
+           chainTipHeight = sm.chainTipHeight,
+           headerTipHeight = sm.headerTipHeight,
+           gap = sm.headerTipHeight - sm.chainTipHeight
+    return
   let inv = sm.planRepairInventory()
   if inv.len == 0:
     return
@@ -2410,9 +2467,21 @@ proc requestRepairBodies*(sm: SyncManager) {.async.} =
     return
   try:
     await peers[0].sendGetData(inv)
+    var firstHeight = -1'i32
+    let firstHash = BlockHash(inv[0].hash)
+    try:
+      let idxOpt = sm.chainState.db.getBlockIndex(firstHash)
+      if idxOpt.isSome:
+        firstHeight = idxOpt.get().height
+    except CatchableError:
+      discard
+    except Exception:
+      discard
     info "requesting retained-range body repair",
          count = inv.len,
-         remaining = sm.chainState.bodyRepairRemaining()
+         remaining = sm.chainState.bodyRepairRemaining(),
+         height = firstHeight,
+         hash = $firstHash
   except CatchableError as e:
     warn "failed to send body-repair getdata", error = e.msg
     for item in inv:
@@ -2893,7 +2962,10 @@ proc tryFillMissingBody(sm: SyncManager, blk: Block): bool =
             let queued = sm.chainState.enqueueRetainedBodyRepairs()
             warn "repair queue empty but retained-range holes remain",
                  holeCount = left, requeued = queued
-      return res.isOk
+        return true
+      info "body-repair fill rejected",
+           height = idx.height, hash = $hash, reason = res.error
+      return false
   except CatchableError:
     return false
   except Exception:
@@ -2924,7 +2996,10 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   # `blockHeight < expectedHeight → discard` path is what punched the
   # live 967000 hole permanently.
   if sm.tryFillMissingBody(blk):
-    sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    # Repair getdata does not increment pendingBlocks (IBD must not stall
+    # behind a hole fill). Do not decrement it here or a rejected/filled
+    # snapshot-base body drives the IBD window to 0 while its hashes stay
+    # in requestedHashes.
     sm.lastSyncTime = getTime()
     return true
 
@@ -2943,7 +3018,6 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
           let canon = sm.chainState.db.getBlockHashByHeight(idx.height)
           if canon.isSome and canon.get() == hash and
              idx.height <= sm.chainTipHeight:
-            sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
             return false
     except CatchableError:
       discard

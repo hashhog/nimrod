@@ -560,6 +560,17 @@ proc heightHasBody*(cdb: ChainDb, height: int32): bool {.gcsafe, raises: [].} =
   except Exception:
     result = false
 
+proc hasRetainedBodyWindow*(cdb: ChainDb, tip: int32): bool {.gcsafe, raises: [].} =
+  ## True when some post-genesis body is stored, so interior holes are
+  ## worth repairing. False for snapshot boot / genesis IBD: height 1
+  ## and the tip both lack bodies, discoverFirstBody returns the tip,
+  ## and treating that as a one-block hole queued the snapshot base
+  ## (live 550000→575000 at 550001 after 65adc07). A missing tip with
+  ## height 1 present is still a window — the tip is just another hole.
+  if cdb == nil or tip <= 0:
+    return false
+  heightHasBody(cdb, 1) or heightHasBody(cdb, tip)
+
 proc discoverFirstBody*(cdb: ChainDb, tip: int32): int32 {.gcsafe, raises: [].} =
   ## Lowest height > 0 whose body is stored, if height 1 is missing.
   ##
@@ -694,8 +705,12 @@ proc countRetainedBodyHoles*(cdb: ChainDb, tip: int32): int {.raises: [].} =
   ## auditRetainedBodies.holes is a capped sample (truncated=true when
   ## holeCount > maxHoles). Differencing that sample is comparing two
   ## ceilings. This count is the total an operator can poll against.
+  ## No retained window (snapshot/genesis IBD) is zero holes, not a
+  ## one-block repair of the tip.
   result = 0
   if cdb == nil or tip < 0:
+    return
+  if not hasRetainedBodyWindow(cdb, tip):
     return
   try:
     let floor = discoverFirstBody(cdb, tip)
@@ -724,6 +739,8 @@ proc planBodyRepairs*(cdb: ChainDb, tip: int32,
   result = @[]
   if cdb == nil or tip < 0:
     return
+  if not hasRetainedBodyWindow(cdb, tip):
+    return
   try:
     let floor = discoverFirstBody(cdb, tip)
     var h = floor
@@ -746,6 +763,8 @@ proc enqueueBodyRepair*(cs: ChainState, hash: BlockHash): bool {.raises: [].} =
   if cs == nil or cs.db == nil:
     return false
   try:
+    if not hasRetainedBodyWindow(cs.db, cs.bestHeight):
+      return false
     if cs.db.hasBlockBody(hash):
       return false
     let idxOpt = cs.db.getBlockIndex(hash)
@@ -805,13 +824,18 @@ proc fillMissingBody*(cs: ChainState, blk: Block): ChainStateResult[void] =
     let hash = BlockHash(doubleSha256(headerBytes))
     let idxOpt = cs.db.getBlockIndex(hash)
     if idxOpt.isNone:
+      cs.pendingBodyRepairs.excl(hash)
       return err("header missing")
     let idx = idxOpt.get()
     if cs.db.hasBlockBody(hash):
       cs.pendingBodyRepairs.excl(hash)
       return ok()
+    if not hasRetainedBodyWindow(cs.db, cs.bestHeight):
+      cs.pendingBodyRepairs.excl(hash)
+      return err("no retained window")
     let floor = discoverFirstBody(cs.db, cs.bestHeight)
     if idx.height < floor:
+      cs.pendingBodyRepairs.excl(hash)
       return err("below retained floor")
     if idx.height > cs.bestHeight:
       return err("not yet connected")

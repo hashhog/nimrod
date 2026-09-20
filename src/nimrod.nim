@@ -2499,7 +2499,12 @@ proc startNode*(config: NimrodConfig) {.async.} =
       warn "pruneheight is the contiguous suffix; first body is lower",
            pruneheight = advertised, firstBody = audit.floor,
            tip = audit.tip
-    if audit.holeCount > 0:
+    if not hasRetainedBodyWindow(state.chainState.db,
+                                 state.chainState.bestHeight):
+      info "no retained-range body window to repair",
+           tip = state.chainState.bestHeight,
+           firstBody = firstBody, pruneheight = advertised
+    elif audit.holeCount > 0:
       let firstHole = if audit.holes.len > 0: audit.holes[0] else: -1'i32
       warn "retained-range body hole",
            floor = audit.floor, tip = audit.tip,

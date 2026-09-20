@@ -25,6 +25,10 @@
 ##   7. After repair completes, a scan from firstBody to tip is ZERO holes.
 ##   8. Negative control: punch a fresh hole; repair finds and fills it.
 ##   9. bodyRepairRemaining is the untruncated hole count, not the sample cap.
+##  10. Snapshot/genesis IBD (tip has no body) is not a one-block repair.
+##  11. A stale queued snapshot-base hash is dropped after IBD advances,
+##      so remaining cannot stay 1 forever (live 550000→575000 at 550001).
+##  12. Body repair yields to one-peer IBD (clearbit 63450d1 class).
 
 import unittest2
 import std/[os, options, json, sets]
@@ -469,3 +473,89 @@ suite "retained-range body hole backfill":
     let info = rpc.handleMethod("getblockchaininfo", %*[])
     check info["body_repair_remaining"].getInt() == 80
     cs.close()
+
+  test "snapshot/genesis IBD (tip has no body) is not a one-block repair":
+    ## Live 65adc07 on 550000→575000: --load-snapshot left a height-index
+    ## row at the base and no body. discoverFirstBody returned the tip,
+    ## planBodyRepairs queued that one hash, remaining stayed 1, and the
+    ## node looped `requesting retained-range body repair count=1 remaining=1`
+    ## while IBD sat at 550001. Receipt:
+    ## receipts/nimrod-65adc07-verified-rpc-answers-rss-13G-to-4G-2026-09-20.md
+    ##
+    ## A tip with no body is not a retained window. Interior holes in a
+    ## window that getblock can serve are still repaired (tests above).
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    var bodies: seq[Block] = @[genesis]
+    discard connectKeeping(cs, getBlockHash(genesis), 1, 10, bodies)
+    for h in 1'i32 .. 10'i32:
+      cs.db.deleteBlockBody(cs.db.getBlockHashByHeight(h).get())
+    cs.historyFloorProbed = false
+    check not cs.db.hasBlockBody(cs.db.getBlockHashByHeight(10).get())
+    check discoverFirstBody(cs.db, cs.bestHeight) == 10
+    check planBodyRepairs(cs.db, cs.bestHeight).len == 0
+    check cs.enqueueRetainedBodyRepairs() == 0
+    check cs.bodyRepairRemaining() == 0
+    check countRetainedBodyHoles(cs.db, cs.bestHeight) == 0
+    check not cs.enqueueBodyRepair(cs.db.getBlockHashByHeight(10).get())
+    cs.close()
+
+  test "stale snapshot-base repair is dropped after IBD advances, remaining falls":
+    ## Discriminator: remaining stays 1 because the reply is rejected
+    ## (below-floor once IBD moved) and the completion never decrements.
+    ## Seed the queue the way 65adc07 did, connect one IBD block without
+    ## storing a body, feed the old tip's body, and require remaining=0
+    ## with no further getdata. Negative: an interior hole in a real
+    ## retained window is still requested.
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    var bodies: seq[Block] = @[genesis]
+    discard connectKeeping(cs, getBlockHash(genesis), 1, 10, bodies)
+    for h in 1'i32 .. 10'i32:
+      cs.db.deleteBlockBody(cs.db.getBlockHashByHeight(h).get())
+    let oldTip = bodies[10]
+    let oldHash = getBlockHash(oldTip)
+    cs.pendingBodyRepairs.incl(oldHash)
+    check cs.bodyRepairRemaining() == 1
+
+    cs.startIBD()
+    let nextBlk = makeSimpleBlock(cs.bestBlockHash, 11)
+    check cs.connectBlockIBD(nextBlk, 11).isOk
+    check cs.bestHeight == 11
+    check not cs.db.hasBlockBody(cs.bestBlockHash)
+
+    let sm = newSyncManager(nil, cs.db, regtestParams(), cs)
+    # SyncManager's on-disk tip lags the IBD in-memory tip until flush;
+    # the live node tracks chainTipHeight from applyBlock.
+    sm.chainTipHeight = cs.bestHeight
+    sm.chainTip = cs.bestBlockHash
+    check sm.chainTipHeight == 11
+    check not sm.processBlock(nil, oldTip)
+    check not cs.db.hasBlockBody(oldHash)
+    check cs.bodyRepairRemaining() == 0
+    check oldHash notin cs.pendingBodyRepairs
+    check sm.planRepairInventory().len == 0
+    cs.stopIBD()
+    cs.close()
+
+  test "body repair yields to one-peer IBD":
+    ## Same class as clearbit 63450d1 / rustoshi HASHHOG_DISABLE_HISTORICAL_BACKFILL:
+    ## a background historical fetch on the only peer starves the slice.
+    ## Yield while more than 10 blocks behind and fewer than two ready peers.
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    var bodies: seq[Block] = @[genesis]
+    discard connectKeeping(cs, getBlockHash(genesis), 1, 6, bodies)
+    let sm = newSyncManager(nil, cs.db, regtestParams(), cs)
+    sm.chainTipHeight = 6
+    sm.headerTipHeight = 100
+    check sm.bodyRepairYieldsToIbd()
+    sm.headerTipHeight = 12
+    check not sm.bodyRepairYieldsToIbd()
+    sm.headerTipHeight = 6
+    check not sm.bodyRepairYieldsToIbd()
+    cs.close()
+
