@@ -154,11 +154,17 @@ suite "W136 G2 — sendSendHeaders unconditional (BUG-2)":
     ## fix lands (idempotency invariant).
     check "sentSendHeaders" notin peerSrc
 
-  test "G2 BUG-2 cont: SENDHEADERS_VERSION constant not referenced":
-    ## Core gate uses `SENDHEADERS_VERSION = 70012`.  nimrod's call
-    ## site has no protocol-version check at all.
-    check "SENDHEADERS_VERSION" notin peerSrc
-    check "70012" notin peerSrc
+  test "G2 BUG-2 cont: sendheaders IS gated on SENDHEADERS_VERSION (flipped)":
+    ## Core gate uses `SENDHEADERS_VERSION = 70012`.  Flipped by the
+    ## handshake Core-parity fix: now that peers below 70015 are admitted
+    ## (MIN_PEER_PROTO_VERSION 31800), the version gate is load-bearing.
+    check SendHeadersVersion == CORE_SENDHEADERS_VERSION
+    check "if peer.version >= SendHeadersVersion:" in peerSrc
+    check FeeFilterVersion == CORE_FEEFILTER_VERSION
+    check ShortIdsBlocksVersion == CORE_SHORT_IDS_BLOCKS_VERSION
+    check WtxidRelayVersion == CORE_WTXID_RELAY_VERSION
+    check "if peer.version >= ShortIdsBlocksVersion:" in peerSrc
+    check "state.peer.version < FeeFilterVersion" in relaySrc
 
 # ---------------------------------------------------------------------------
 # G3-G5 — MaybeSendFeefilter exemptions (BUG-3)
@@ -358,88 +364,69 @@ suite "W136 G14 — FeefilterHighThreshold rounding (BUG-12)":
     check FeefilterLowThreshold == (3.0 / 4.0)
 
 # ---------------------------------------------------------------------------
-# G15 — Pre-verack feefilter accepted (BUG-13)
+# G15 — Pre-verack feefilter (BUG-13 FIXED)
 # ---------------------------------------------------------------------------
-suite "W136 G15 — Pre-verack mkFeeFilter accepted (BUG-13)":
+suite "W136 G15 — Pre-verack mkFeeFilter ignored (BUG-13 FIXED)":
 
-  test "G15 BUG-13: outbound pre-verack loop accepts mkFeeFilter":
-    ## Core does NOT permit FEEFILTER pre-VERACK; the pre-verack switch
-    ## in net_processing.cpp:3801-3940 only whitelists WTXIDRELAY,
-    ## SENDADDRV2, SENDCMPCT, SENDTXRCNCL.  nimrod's outbound feature
-    ## loop (peer.nim:1142-1144) accepts mkFeeFilter.
-    # Find outbound waitForVerack loop:
-    let outboundLoopStart = peerSrc.find("block waitForVerack:")
-    check outboundLoopStart > 0
-    let inboundLoopStart = peerSrc.find("block waitForVerackInbound:")
-    check inboundLoopStart > outboundLoopStart
-    let outboundLoop = peerSrc[outboundLoopStart ..< inboundLoopStart]
-    # Verify the pre-verack loop accepts mkFeeFilter:
-    check "of mkFeeFilter:" in outboundLoop
-
-  test "G15 BUG-13 cont: inbound pre-verack loop accepts mkFeeFilter":
-    let inboundLoopStart = peerSrc.find("block waitForVerackInbound:")
-    check inboundLoopStart > 0
-    # Take the body until next major proc-level dispatch:
-    let endIdx = peerSrc.find("# Send feature negotiation", inboundLoopStart)
-    check endIdx > inboundLoopStart
-    let inboundLoop = peerSrc[inboundLoopStart ..< endIdx]
-    check "of mkFeeFilter:" in inboundLoop
+  test "G15 BUG-13: pre-verack feefilter is ignored, not applied":
+    ## Core does NOT process FEEFILTER pre-VERACK: it falls through to
+    ## "Unsupported message prior to verack" (net_processing.cpp:4010) and
+    ## is ignored.  Both handshake directions share processPreVerackMessage.
+    let p = newPeer("127.0.0.1", 18444, regtestParams(), pdInbound)
+    p.version = 70016
+    p.versionReceived = true
+    check not p.processPreVerackMessage(newFeeFilter(1234'u64))
+    check p.feeFilterRate == 0'u64
+    # The old per-direction loops with their own feefilter arm are gone.
+    check "block waitForVerack:" notin peerSrc
+    check "block waitForVerackInbound:" notin peerSrc
+    check "await peer.awaitVerack(handshakeDeadline)" in peerSrc
 
 # ---------------------------------------------------------------------------
-# G16 — Pre-verack sendheaders accepted (BUG-14)
+# G16 — Pre-verack sendheaders recorded (Core :3896 — correct behaviour)
 # ---------------------------------------------------------------------------
-suite "W136 G16 — Pre-verack mkSendHeaders accepted (BUG-14)":
+suite "W136 G16 — Pre-verack mkSendHeaders recorded":
 
-  test "G16 BUG-14: outbound pre-verack loop accepts mkSendHeaders":
-    let outboundLoopStart = peerSrc.find("block waitForVerack:")
-    let inboundLoopStart = peerSrc.find("block waitForVerackInbound:")
-    let outboundLoop = peerSrc[outboundLoopStart ..< inboundLoopStart]
-    check "of mkSendHeaders:" in outboundLoop
-
-  test "G16 BUG-14 cont: inbound pre-verack loop accepts mkSendHeaders":
-    let inboundLoopStart = peerSrc.find("block waitForVerackInbound:")
-    let endIdx = peerSrc.find("# Send feature negotiation", inboundLoopStart)
-    let inboundLoop = peerSrc[inboundLoopStart ..< endIdx]
-    check "of mkSendHeaders:" in inboundLoop
+  test "G16: pre-verack sendheaders is recorded (Core processes it pre-verack)":
+    let p = newPeer("127.0.0.1", 18444, regtestParams(), pdInbound)
+    p.version = 70016
+    p.versionReceived = true
+    check not p.processPreVerackMessage(newSendHeaders())
+    check p.sendHeaders
 
 # ---------------------------------------------------------------------------
-# G17 — WTXIDRELAY ordering vs SENDADDRV2 (BUG-15)
+# G17 — WTXIDRELAY ordering vs SENDADDRV2 (BUG-15 FIXED)
 # ---------------------------------------------------------------------------
-suite "W136 G17 — outbound handshake WTXIDRELAY/SENDADDRV2 order (BUG-15)":
+suite "W136 G17 — handshake WTXIDRELAY/SENDADDRV2 order (BUG-15 FIXED)":
 
-  test "G17 BUG-15: nimrod sends SENDADDRV2 BEFORE WTXIDRELAY":
-    ## Core net_processing.cpp:3710-3720 — WTXIDRELAY then SENDADDRV2.
-    ## nimrod peer.nim:1110-1113 reversed.
-    # Find the BIP155 block in performHandshake (outbound):
-    let bip155Idx = peerSrc.find("BIP155: Send sendaddrv2 BEFORE verack")
-    check bip155Idx > 0
-    # The next two lines should be sendSendAddrV2 then sendWtxidRelay:
-    let sendAddrV2Idx = peerSrc.find("sendSendAddrV2()", bip155Idx)
-    let sendWtxidIdx = peerSrc.find("sendWtxidRelay()", bip155Idx)
+  test "G17 BUG-15: nimrod sends WTXIDRELAY before SENDADDRV2 (Core order)":
+    ## Core net_processing.cpp:3703-3720 — WTXIDRELAY then SENDADDRV2.
+    let gateIdx = peerSrc.find("if peer.version >= WtxidRelayVersion:")
+    check gateIdx > 0
+    let sendAddrV2Idx = peerSrc.find("sendSendAddrV2()", gateIdx)
+    let sendWtxidIdx = peerSrc.find("sendWtxidRelay()", gateIdx)
     check sendAddrV2Idx > 0
     check sendWtxidIdx > 0
-    # Reversed: sendaddrv2 first (smaller index) in nimrod.
-    check sendAddrV2Idx < sendWtxidIdx
+    check sendWtxidIdx < sendAddrV2Idx
 
 # ---------------------------------------------------------------------------
-# G18 — validatePreHandshakeMessage permits FeeFilter/SendHeaders (BUG-16)
+# G18 — validatePreHandshakeMessage post-VERSION whitelist (BUG-16 FIXED)
 # ---------------------------------------------------------------------------
-suite "W136 G18 — validatePreHandshakeMessage post-VERSION whitelist (BUG-16)":
+suite "W136 G18 — validatePreHandshakeMessage post-VERSION whitelist (BUG-16 FIXED)":
 
-  test "G18 BUG-16: isMessageAllowedDuringHandshake includes mkFeeFilter and mkSendHeaders":
-    ## peer.nim:1771 — pre-VERACK whitelist includes mkFeeFilter and
-    ## mkSendHeaders.  Core doesn't.
-    let validateIdx = peerSrc.find("# Allowed: VERACK, and some negotiation messages")
-    check validateIdx > 0
-    let endIdx = peerSrc.find("proc validatePreHandshakeMessage*", validateIdx)
-    check endIdx > validateIdx
-    let body = peerSrc[validateIdx ..< endIdx]
-    check "mkSendHeaders" in body
-    check "mkFeeFilter" in body
+  test "G18 BUG-16: pre-verack whitelist is Core's (sendheaders yes, feefilter no)":
+    let p = newPeer("127.0.0.1", 18444, regtestParams(), pdInbound)
+    p.versionReceived = true
+    check isPreHandshakeMessageAllowed(p, mkSendHeaders)
+    check isPreHandshakeMessageAllowed(p, mkSendCmpct)
+    check not isPreHandshakeMessageAllowed(p, mkFeeFilter)
 
-  test "G18 BUG-16 cont: validatePreHandshakeMessage marAccept arm includes mkFeeFilter and mkSendHeaders":
-    ## peer.nim:1816 — `of mkSendHeaders, mkSendCmpct, mkFeeFilter: marAccept`.
-    check "of mkSendHeaders, mkSendCmpct, mkFeeFilter:" in peerSrc
+  test "G18 BUG-16 cont: validatePreHandshakeMessage ignores pre-verack feefilter":
+    var p = newPeer("127.0.0.1", 18444, regtestParams(), pdInbound)
+    p.versionReceived = true
+    check validatePreHandshakeMessage(p, mkSendHeaders) == marAccept
+    check validatePreHandshakeMessage(p, mkFeeFilter) == marDropSilent
+    check p.shouldDisconnect == false
 
 # ---------------------------------------------------------------------------
 # G19 — handleReceivedFeefilter dead helper (BUG-17)
@@ -457,17 +444,13 @@ suite "W136 G19 — handleReceivedFeefilter dead helper (BUG-17)":
 # ---------------------------------------------------------------------------
 # G20 — MinProtocolVersion = 70015 obviates SENDHEADERS/FEEFILTER gates (BUG-18)
 # ---------------------------------------------------------------------------
-suite "W136 G20 — MinProtocolVersion 70015 (BUG-18)":
+suite "W136 G20 — MinProtocolVersion == Core 31800 (BUG-18 FIXED)":
 
-  test "G20 BUG-18: MinProtocolVersion = 70015 (10x higher than Core's 31800)":
-    ## peer.nim:25 — `MinProtocolVersion* = 70015'u32`.  Refuses any
-    ## peer < 70015 in handshake.  Makes BIP-130/133 version gates
-    ## de-facto trivially true, masking the absence of explicit gates
-    ## in BUG-2/3/5.
-    check MinProtocolVersion == 70015'u32
-    # Core's MIN_PEER_PROTO_VERSION is 31800 (in version.h); we are
-    # 2.2x more restrictive.  Witness was introduced at 70015 (BIP-141).
-    check MinProtocolVersion > 31800'u32
+  test "G20 BUG-18: MinProtocolVersion = 31800 (Core MIN_PEER_PROTO_VERSION)":
+    ## Was 70015, which refused every peer < 70015 and made the
+    ## BIP-130/133/152 version gates trivially true.  Now Core's floor,
+    ## with the per-feature gates explicit (see G2).
+    check MinProtocolVersion == 31800'u32
 
 # ---------------------------------------------------------------------------
 # G21-G23 — Codec PRESENT (mkSendHeaders / mkWtxidRelay / mkFeeFilter)
@@ -569,19 +552,20 @@ suite "W136 G29 — BIP-130 selectBlockAnnouncement (PRESENT)":
 # ---------------------------------------------------------------------------
 suite "W136 G30 — Pre-VERACK wtxidrelay sets flag (PRESENT)":
 
-  test "G30 PRESENT: outbound pre-VERACK loop sets peer.wtxidRelay = true":
-    let outboundLoopStart = peerSrc.find("block waitForVerack:")
-    let inboundLoopStart = peerSrc.find("block waitForVerackInbound:")
-    let outboundLoop = peerSrc[outboundLoopStart ..< inboundLoopStart]
-    check "of mkWtxidRelay:" in outboundLoop
-    check "peer.wtxidRelay = true" in outboundLoop
+  test "G30 PRESENT: pre-VERACK wtxidrelay sets peer.wtxidRelay = true (both directions)":
+    ## Outbound and inbound handshakes share processPreVerackMessage.
+    let p = newPeer("127.0.0.1", 18444, regtestParams(), pdOutbound)
+    p.version = 70016
+    p.versionReceived = true
+    check not p.processPreVerackMessage(newWtxidRelay())
+    check p.wtxidRelay
 
-  test "G30 PRESENT cont: inbound pre-VERACK loop sets peer.wtxidRelay = true":
-    let inboundLoopStart = peerSrc.find("block waitForVerackInbound:")
-    let endIdx = peerSrc.find("# Send feature negotiation", inboundLoopStart)
-    let inboundLoop = peerSrc[inboundLoopStart ..< endIdx]
-    check "of mkWtxidRelay:" in inboundLoop
-    check "peer.wtxidRelay = true" in inboundLoop
+  test "G30 PRESENT cont: wtxidrelay from a < 70016 peer is not honoured":
+    let p = newPeer("127.0.0.1", 18444, regtestParams(), pdInbound)
+    p.version = 70015
+    p.versionReceived = true
+    discard p.processPreVerackMessage(newWtxidRelay())
+    check not p.wtxidRelay
 
 # ---------------------------------------------------------------------------
 # Sanity: protocol version constants

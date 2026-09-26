@@ -1214,6 +1214,12 @@ proc resolveGetBlockFromPeer*(rpc: RpcServer, blockHash: BlockHash,
     raise newRpcError(RpcMiscError, "Peer does not exist")
   let peer = readyPeers[peerId]
 
+  # (3b) Ignore pre-SegWit peers. Non-witness inbound peers now complete the
+  #      handshake (Core parity), so this gate is reachable.
+  #      Core: net_processing.cpp:1968-1969 → RPC_MISC_ERROR(-1) "Pre-SegWit peer".
+  if not peer.canServeWitnesses():
+    raise newRpcError(RpcMiscError, "Pre-SegWit peer")
+
   # (4) Build the block getdata. Core's FetchBlock always requests the witness
   #     serialization (CInv(MSG_BLOCK | MSG_WITNESS_FLAG, hash)) after rejecting
   #     pre-segwit peers; invWitnessBlock is exactly that flag combination

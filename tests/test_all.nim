@@ -125,6 +125,7 @@ const IncludedTests = [
   "test_getorphantxs",
   "test_getpeerinfo_fields",
   "test_handshake",
+  "test_handshake_core_parity",
   "test_header_sync_from_tip",
   "test_headerssync",
   "test_ibd_cache_eviction",

@@ -346,11 +346,11 @@ proc readBlockHeader*(r: var BinaryReader): BlockHeader =
   result.bits = r.readUint32LE()
   result.nonce = r.readUint32LE()
 
-proc writeBlock*(w: var BinaryWriter, blk: Block) =
+proc writeBlock*(w: var BinaryWriter, blk: Block, includeWitness: bool = true) =
   w.writeBlockHeader(blk.header)
   w.writeCompactSize(uint64(blk.txs.len))
   for tx in blk.txs:
-    w.writeTransaction(tx)
+    w.writeTransaction(tx, includeWitness)
 
 proc readBlock*(r: var BinaryReader): Block =
   result.header = r.readBlockHeader()

@@ -1060,6 +1060,11 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
   # the Peer so Peer.connect() dispatches based on address type
   # (.onion → Tor SOCKS, .i2p → SAM, IPv4/IPv6 → direct/SOCKS5).
   peer.proxyManager = pm.proxyManager
+  # Core CNode::ExpectServicesFromConn(): outbound full-relay and
+  # block-relay-only connections must offer the desirable services
+  # (NODE_NETWORK|NODE_WITNESS); manual and feeler connections are exempt,
+  # and inbound peers are never held to it.
+  peer.expectServices = connType in {pctFullRelay, pctBlockRelayOnly}
   pm.peers[key] = peer
 
   if await peer.connect():
@@ -1130,8 +1135,10 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
 
       # BIP133: Send initial feefilter after handshake
       # 100 sat/vbyte = 100,000 sat/kvB to discourage tx relay during sync
-      let feeMsg = newFeeFilter(100_000'u64)
-      asyncSpawn spawnSafe(peer.sendMessage(feeMsg))
+      # Core MaybeSendFeefilter: only to peers >= FEEFILTER_VERSION (70013).
+      if peer.version >= FeeFilterVersion:
+        let feeMsg = newFeeFilter(100_000'u64)
+        asyncSpawn spawnSafe(peer.sendMessage(feeMsg))
 
       return true
     except CatchableError as e:
@@ -1430,8 +1437,10 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
     asyncSpawn peer.messageLoop(wrappedCb)
 
     # BIP133: Send initial feefilter after handshake
-    let feeMsg = newFeeFilter(100_000'u64)
-    asyncSpawn spawnSafe(peer.sendMessage(feeMsg))
+    # Core MaybeSendFeefilter: only to peers >= FEEFILTER_VERSION (70013).
+    if peer.version >= FeeFilterVersion:
+      let feeMsg = newFeeFilter(100_000'u64)
+      asyncSpawn spawnSafe(peer.sendMessage(feeMsg))
   except CatchableError as e:
     error "inbound handshake failed", peer = $peer, error = e.msg
     await peer.disconnect()
@@ -1507,6 +1516,14 @@ proc stopListener*(pm: PeerManager) {.raises: [].} =
 proc getReadyPeers*(pm: PeerManager): seq[Peer] =
   for peer in pm.peers.values:
     if peer.state == psReady:
+      result.add(peer)
+
+proc getBlockDownloadPeers*(pm: PeerManager): seq[Peer] =
+  ## Ready peers we may request blocks from: Core CanServeWitnesses
+  ## (NODE_WITNESS).  Inbound peers without witness support are kept
+  ## connected (Core parity) but must never be sent a block getdata.
+  for peer in pm.peers.values:
+    if peer.state == psReady and peer.canServeWitnesses():
       result.add(peer)
 
 proc getBestPeer*(pm: PeerManager): Peer =

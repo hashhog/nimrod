@@ -29,7 +29,20 @@ const
   # peer stalls every subsequent dial for two minutes.  Bitcoin Core uses
   # DEFAULT_CONNECT_TIMEOUT = 5000 ms (src/net.h); match it.
   ConnectTimeoutSec* = 5
-  MinProtocolVersion* = 70015'u32  # Minimum for witness support
+  # Core MIN_PEER_PROTO_VERSION (node/protocol_version.h:18), checked for ALL
+  # peers at net_processing.cpp:3619.  This used to be 70015 ("minimum for
+  # witness support"), which dropped every inbound peer Core keeps (e.g. a
+  # 70002 crawler).  Witness capability is a SERVICES question
+  # (NODE_WITNESS), enforced only where Core enforces it: outbound peers we
+  # pick (ExpectServicesFromConn) and the block-download peer choice
+  # (CanServeWitnesses).  Feature messages are gated per-version below.
+  MinProtocolVersion* = 31800'u32
+  # Core node/protocol_version.h feature thresholds.
+  Bip0031Version* = 60000'u32         # ping carries a nonce / pong exists
+  SendHeadersVersion* = 70012'u32     # sendheaders
+  FeeFilterVersion* = 70013'u32       # feefilter
+  ShortIdsBlocksVersion* = 70014'u32  # sendcmpct / BIP-152
+  WtxidRelayVersion* = 70016'u32      # wtxidrelay (+ sendaddrv2 courtesy gate)
   ScorePreHandshakeMessage* = 10'u32  # Misbehavior for pre-handshake messages
   ScoreDuplicateVersion* = 1'u32      # Misbehavior for duplicate version
 
@@ -133,6 +146,9 @@ type
     remoteNonce*: uint64         # Their nonce from version message
     handshakeStartTime*: stdtimes.Time  # When handshake started (for timeout)
     handshakeTimeoutMs*: int            # 0 = HandshakeTimeoutSec * 1000 (tests override)
+    expectServices*: bool               # Core ExpectServicesFromConn(): outbound
+                                        # full-relay/block-relay only (set by
+                                        # PeerManager); inbound/manual/feeler = false
     # Misbehavior scoring (Bitcoin Core: 100 = ban threshold)
     misbehaviorScore*: uint32
     shouldDisconnect*: bool
@@ -1090,6 +1106,98 @@ proc performV2HandshakeInitiator*(peer: Peer) {.async.} =
   peer.transportProto = tpV2
   info "BIP-324 v2 handshake complete (initiator)", peer = $peer
 
+proc hasAllDesirableServiceFlags*(services: uint64): bool =
+  ## Core PeerManagerImpl::HasAllDesirableServiceFlags (net_processing.cpp:1752):
+  ## a full node that can serve witness blocks.  Core accepts
+  ## NODE_NETWORK_LIMITED in place of NODE_NETWORK only when our tip is
+  ## within NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS of now; nimrod's peer layer
+  ## has no view of tip age, so it accepts a limited peer whenever it
+  ## advertises one (a limited peer is still a witness-serving full
+  ## validator; the block downloader stays gated on canServeWitnesses).
+  ## Applied ONLY to outbound connections that expect services
+  ## (Core ExpectServicesFromConn) — never to inbound peers.
+  (services and NodeWitness) != 0 and
+    (services and (NodeNetwork or NodeNetworkLimited)) != 0
+
+proc canServeWitnesses*(peer: Peer): bool =
+  ## Core CanServeWitnesses (net_processing.cpp:1166): peer advertises
+  ## NODE_WITNESS.  Every block request (getdata MSG_WITNESS_BLOCK,
+  ## getblocktxn, getblockfrompeer) must go only to such a peer, now that
+  ## inbound peers without NODE_WITNESS complete the handshake.
+  (peer.services and NodeWitness) != 0
+
+proc processPreVerackMessage*(peer: Peer, msg: P2PMessage): bool =
+  ## Handle one message received after VERSION and before VERACK, the way
+  ## Core's ProcessMessage does while !fSuccessfullyConnected.  Returns true
+  ## when `msg` is the peer's VERACK.  Never raises: nothing a peer sends
+  ## between VERSION and VERACK is a reason to disconnect here.
+  ##
+  ## Processed (recorded) pre-verack in Core:
+  ##   VERACK, WTXIDRELAY (:3919), SENDADDRV2 (:3944), SENDTXRCNCL (:3958),
+  ##   SENDHEADERS (:3896), SENDCMPCT (:3901).
+  ## Everything else — ping, inv, feefilter, getheaders, a redundant
+  ## version... — is logged and IGNORED ("Unsupported message prior to
+  ## verack", :4010): no disconnect, no misbehaviour, no count limit.
+  ## Note feefilter is NOT applied pre-verack in Core, so it is not here.
+  case msg.kind
+  of mkVerack:
+    peer.verackReceived = true
+    return true
+  of mkWtxidRelay:
+    # Core: only honoured when the common version supports it.
+    if peer.version >= WtxidRelayVersion:
+      peer.wtxidRelay = true
+    trace "peer supports wtxidrelay (pre-verack)", peer = $peer
+  of mkSendAddrV2:
+    peer.wantsAddrV2 = true
+    trace "peer supports addrv2 (pre-verack)", peer = $peer
+  of mkSendHeaders:
+    peer.sendHeaders = true
+    trace "peer prefers headers (pre-verack)", peer = $peer
+  of mkSendCmpct:
+    # Core net_processing.cpp:3901-3915: only CMPCTBLOCKS_VERSION (2) is
+    # recorded; any other version is silently dropped.
+    let v = msg.sendCmpct.version
+    if v == 2:
+      peer.peerCmpctVersion = v
+      peer.peerHighBandwidth = msg.sendCmpct.announce
+      peer.compactBlockState.handleSendCmpct(msg.sendCmpct.announce, v)
+    trace "peer sendcmpct (pre-verack)", peer = $peer, version = v
+  of mkSendTxRcncl:
+    trace "peer supports tx reconciliation (pre-verack)", peer = $peer
+  else:
+    debug "unsupported message prior to verack, ignoring", peer = $peer,
+          kind = $msg.kind
+  false
+
+proc remainingUntil(deadline: Moment): ctimer.Duration =
+  let now = Moment.now()
+  if now >= deadline: ctimer.milliseconds(0) else: deadline - now
+
+proc awaitVersionMessage(peer: Peer, deadline: Moment): Future[P2PMessage] {.async.} =
+  ## Read until the peer's VERSION.  Core ignores (logs) any other message
+  ## before VERSION ("non-version message before version handshake",
+  ## net_processing.cpp:3810) rather than disconnecting.
+  while true:
+    let fut = peer.readMessage()
+    if not await fut.withTimeout(remainingUntil(deadline)):
+      raise newException(PeerError, "handshake timeout waiting for version")
+    let msg = fut.value()
+    if msg.kind == mkVersion:
+      return msg
+    debug "non-version message before version handshake, ignoring",
+          peer = $peer, kind = $msg.kind
+
+proc awaitVerack(peer: Peer, deadline: Moment) {.async.} =
+  ## Read until the peer's VERACK, processing/ignoring everything in between
+  ## per `processPreVerackMessage`.  Bounded only by the handshake deadline.
+  while true:
+    let fut = peer.readMessage()
+    if not await fut.withTimeout(remainingUntil(deadline)):
+      raise newException(PeerError, "handshake timeout waiting for verack")
+    if peer.processPreVerackMessage(fut.value()):
+      return
+
 proc performHandshake*(peer: Peer, ourHeight: int32,
                        checkSelfConnect: SelfConnectChecker = nil) {.async.} =
   ## Perform version handshake with peer
@@ -1098,7 +1206,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
   ## Then send wtxidrelay, sendheaders, sendcmpct
   ##
   ## Enforces:
-  ## - Minimum protocol version (70015 for witness support)
+  ## - Minimum protocol version (Core MIN_PEER_PROTO_VERSION = 31800)
   ## - Self-connection detection via nonce
   ## - 60 second handshake timeout
   ##
@@ -1115,6 +1223,10 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
   ## net.cpp V2Transport state machine, BIP-324.
 
   peer.handshakeStartTime = stdtimes.getTime()
+  # One overall deadline for the whole v1 version/verack exchange (Core's
+  # handshake timeout runs from connect), replacing per-message timeouts
+  # plus a 20-message cap.
+  let handshakeDeadline = Moment.now() + peer.handshakeTimeoutDur()
 
   # Inbound classification: peek 16 bytes, decide v1 vs v2.
   # Bound the peek with the handshake timeout so a TCP connect that never
@@ -1178,16 +1290,16 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     await peer.sendVersion(ourHeight)
 
     # Wait for their version
-    let recvVersionFut = peer.readMessage()
-    if not await recvVersionFut.withTimeout(peer.handshakeTimeoutDur()):
-      raise newException(PeerError, "handshake timeout waiting for version")
-
-    let versionMsg = recvVersionFut.value()
-    if versionMsg.kind != mkVersion:
-      raise newException(PeerError, "expected version message")
+    let versionMsg = await peer.awaitVersionMessage(handshakeDeadline)
 
     # Validate version (protocol version, etc.)
     let versionData = versionMsg.version
+    # Core net_processing.cpp:3609 — ExpectServicesFromConn() (outbound
+    # full-relay / block-relay-only; never inbound, manual or feeler) must
+    # offer the desirable services, checked BEFORE the version floor.
+    if peer.expectServices and not hasAllDesirableServiceFlags(versionData.services):
+      raise newException(PeerError, "peer does not offer the expected services (" &
+                         $versionData.services & " offered)")
     if versionData.version < MinProtocolVersion:
       raise newException(PeerError, "peer using obsolete protocol version: " &
                          $versionData.version & " < " & $MinProtocolVersion)
@@ -1206,61 +1318,30 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
          userAgent = peer.userAgent, height = peer.startHeight
 
     # BIP155: Send sendaddrv2 BEFORE verack (protocol version 70016+)
-    if peer.version >= 70016:
-      await peer.sendSendAddrV2()
+    # Core sends WTXIDRELAY and SENDADDRV2 only when the common version
+    # is >= 70016 (net_processing.cpp:3703-3719).
+    if peer.version >= WtxidRelayVersion:
       await peer.sendWtxidRelay()
+      await peer.sendSendAddrV2()
 
     # Send verack
     await peer.sendVerack()
 
-    # Wait for their verack (consuming pre-verack feature messages)
-    # Remote peer may send wtxidrelay, sendaddrv2, sendcmpct, etc. before verack
-    block waitForVerack:
-      for attempt in 0 ..< 20:  # Safety limit to avoid infinite loop
-        let recvFut = peer.readMessage()
-        if not await recvFut.withTimeout(peer.handshakeTimeoutDur()):
-          raise newException(PeerError, "handshake timeout waiting for verack")
-
-        let msg = recvFut.value()
-        case msg.kind
-        of mkVerack:
-          peer.verackReceived = true
-          break waitForVerack
-        of mkWtxidRelay:
-          peer.wtxidRelay = true
-          trace "peer supports wtxidrelay (pre-verack)", peer = $peer
-        of mkSendAddrV2:
-          peer.wantsAddrV2 = true
-          trace "peer supports addrv2 (pre-verack)", peer = $peer
-        of mkSendCmpct:
-          trace "peer supports compact blocks (pre-verack)", peer = $peer
-        of mkSendHeaders:
-          peer.sendHeaders = true
-          trace "peer prefers headers (pre-verack)", peer = $peer
-        of mkFeeFilter:
-          peer.feeFilterRate = msg.feeRate
-          trace "peer feefilter (pre-verack)", peer = $peer
-        of mkSendTxRcncl:
-          trace "peer supports tx reconciliation (pre-verack)", peer = $peer
-        else:
-          raise newException(PeerError, "unexpected message during handshake: " & $msg.kind)
-
-    if not peer.verackReceived:
-      raise newException(PeerError, "did not receive verack during handshake")
+    # Wait for their verack.  Core has no cap on how many messages may
+    # arrive first; the only bound is the handshake timeout, measured
+    # from connect (net.cpp InactivityCheck: !fSuccessfullyConnected &&
+    # now > m_connected + m_peer_connect_timeout).
+    await peer.awaitVerack(handshakeDeadline)
 
   else:
     # Inbound: wait for version first
-    let recvVersionFut = peer.readMessage()
-    if not await recvVersionFut.withTimeout(peer.handshakeTimeoutDur()):
-      raise newException(PeerError, "handshake timeout waiting for version")
-
-    let versionMsg = recvVersionFut.value()
-    if versionMsg.kind != mkVersion:
-      raise newException(PeerError, "expected version message")
+    let versionMsg = await peer.awaitVersionMessage(handshakeDeadline)
 
     let versionData = versionMsg.version
 
-    # Check minimum protocol version
+    # Check minimum protocol version (Core MIN_PEER_PROTO_VERSION; no
+    # services requirement for inbound — Core ExpectServicesFromConn()
+    # is false for INBOUND)
     if versionData.version < MinProtocolVersion:
       raise newException(PeerError, "peer using obsolete protocol version: " &
                          $versionData.version & " < " & $MinProtocolVersion)
@@ -1286,51 +1367,30 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     await peer.sendVersion(ourHeight)
 
     # BIP155: Send sendaddrv2 BEFORE verack (protocol version 70016+)
-    if peer.version >= 70016:
-      await peer.sendSendAddrV2()
+    # Core sends WTXIDRELAY and SENDADDRV2 only when the common version
+    # is >= 70016 (net_processing.cpp:3703-3719).
+    if peer.version >= WtxidRelayVersion:
       await peer.sendWtxidRelay()
+      await peer.sendSendAddrV2()
 
     # Send verack
     await peer.sendVerack()
 
-    # Wait for their verack (consuming pre-verack feature messages)
-    block waitForVerackInbound:
-      for attempt in 0 ..< 20:
-        let recvFut = peer.readMessage()
-        if not await recvFut.withTimeout(peer.handshakeTimeoutDur()):
-          raise newException(PeerError, "handshake timeout waiting for verack")
+    # Wait for their verack.  Core has no cap on how many messages may
+    # arrive first; the only bound is the handshake timeout, measured
+    # from connect (net.cpp InactivityCheck: !fSuccessfullyConnected &&
+    # now > m_connected + m_peer_connect_timeout).
+    await peer.awaitVerack(handshakeDeadline)
 
-        let msg = recvFut.value()
-        case msg.kind
-        of mkVerack:
-          peer.verackReceived = true
-          break waitForVerackInbound
-        of mkWtxidRelay:
-          peer.wtxidRelay = true
-          trace "peer supports wtxidrelay (pre-verack)", peer = $peer
-        of mkSendAddrV2:
-          peer.wantsAddrV2 = true
-          trace "peer supports addrv2 (pre-verack)", peer = $peer
-        of mkSendCmpct:
-          trace "peer supports compact blocks (pre-verack)", peer = $peer
-        of mkSendHeaders:
-          peer.sendHeaders = true
-          trace "peer prefers headers (pre-verack)", peer = $peer
-        of mkFeeFilter:
-          peer.feeFilterRate = msg.feeRate
-          trace "peer feefilter (pre-verack)", peer = $peer
-        of mkSendTxRcncl:
-          trace "peer supports tx reconciliation (pre-verack)", peer = $peer
-        else:
-          raise newException(PeerError, "unexpected message during handshake: " & $msg.kind)
-
-    if not peer.verackReceived:
-      raise newException(PeerError, "did not receive verack during handshake")
-
-  # Send feature negotiation messages (after verack)
-  # Note: sendaddrv2 and wtxidrelay are already sent before verack
-  await peer.sendSendHeaders()
-  await peer.sendSendCmpct()
+  # Send feature negotiation messages (after verack), gated on the peer's
+  # version exactly as Core does, so an old peer is never sent a message it
+  # cannot parse.  sendaddrv2 and wtxidrelay were already sent pre-verack.
+  #   sendheaders: SENDHEADERS_VERSION (70012), net_processing.cpp:5525
+  #   sendcmpct:   SHORT_IDS_BLOCKS_VERSION (70014), net_processing.cpp:3864
+  if peer.version >= SendHeadersVersion:
+    await peer.sendSendHeaders()
+  if peer.version >= ShortIdsBlocksVersion:
+    await peer.sendSendCmpct()
 
   peer.state = psReady
   peer.handshakeComplete = true
@@ -1511,7 +1571,11 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
           info "requesting missing txns for compact block", peer = $peer,
                hash = $blockHash, missing = missing.len,
                mempoolHits = pdb.mempoolCount
-          # Store partial and send getblocktxn
+          # Store partial and send getblocktxn — a block request, so only
+          # to a peer that can serve witness data (Core CanServeWitnesses).
+          if not peer.canServeWitnesses():
+            peer.compactBlockState.failedReconstructions += 1
+            return
           peer.compactBlockState.pendingPartials[blockHash] = pdb
           await peer.sendMessage(newGetBlockTxnMsg(blockHash, missing))
           peer.compactBlockState.txnsRequested += missing.len
@@ -1844,9 +1908,10 @@ proc disconnectOnBadFilterRequest*(peer: Peer,
 
 # Pre-handshake message validation
 # Reference: Bitcoin Core net_processing.cpp ProcessMessage()
-# - Non-version messages before version: drop and misbehave
-# - Messages before verack (except allowed ones): drop and misbehave
-# - Duplicate version: misbehave
+# - Non-version messages before version: log and ignore (:3810)
+# - Messages before verack (except the negotiation set): log and ignore (:4010)
+# - Duplicate version: log and ignore (:3582)
+# None of these disconnect or score misbehaviour in Core.
 # - Self-connection detection via nonce
 # - Minimum protocol version check
 
@@ -1868,7 +1933,8 @@ proc isPreHandshakeMessageAllowed*(peer: Peer, kind: MessageKind): bool =
   # After VERSION received, before VERACK
   # Allowed: VERACK, and some negotiation messages (wtxidrelay, sendaddrv2, sendheaders)
   case kind
-  of mkVerack, mkWtxidRelay, mkSendAddrV2, mkSendHeaders, mkSendCmpct, mkFeeFilter:
+  # (Core processes exactly these pre-verack; feefilter is NOT one of them.)
+  of mkVerack, mkWtxidRelay, mkSendAddrV2, mkSendHeaders, mkSendCmpct, mkSendTxRcncl:
     true
   else:
     false
@@ -1885,18 +1951,19 @@ proc validatePreHandshakeMessage*(peer: var Peer, kind: MessageKind): MessageAcc
     if kind == mkVersion:
       return marAccept
     else:
-      # Non-version message before version handshake
-      warn "pre-version message rejected", peer = $peer, kind = kind
-      misbehaving(peer, ScorePreHandshakeMessage, "non-version message before version")
-      return marDropMisbehave
+      # Core net_processing.cpp:3810: "non-version message before version
+      # handshake" — logged and ignored, no misbehaviour.
+      debug "non-version message before version handshake, ignoring",
+            peer = $peer, kind = kind
+      return marDropSilent
 
   # VERSION received, check specific messages
   case kind
   of mkVersion:
-    # Duplicate VERSION - misbehave (score 1 per Bitcoin Core)
-    warn "duplicate version message", peer = $peer
-    misbehaving(peer, ScoreDuplicateVersion, "duplicate version")
-    return marDropMisbehave
+    # Core net_processing.cpp:3582: "redundant version message" — logged
+    # and ignored, no misbehaviour.
+    debug "redundant version message, ignoring", peer = $peer
+    return marDropSilent
 
   of mkVerack:
     if peer.verackReceived:
@@ -1913,22 +1980,24 @@ proc validatePreHandshakeMessage*(peer: var Peer, kind: MessageKind): MessageAcc
       return marDisconnect
     return marAccept
 
-  of mkSendHeaders, mkSendCmpct, mkFeeFilter:
-    # These can come any time after VERSION
+  of mkSendHeaders, mkSendCmpct, mkSendTxRcncl:
+    # Processed pre-verack by Core (:3896, :3901, :3958)
     return marAccept
 
   else:
     # Other messages before verack
     if not peer.verackReceived:
-      warn "unsupported message prior to verack", peer = $peer, kind = kind
-      misbehaving(peer, ScorePreHandshakeMessage, "message before verack")
-      return marDropMisbehave
+      # Core net_processing.cpp:4010: "Unsupported message prior to verack"
+      # — logged and ignored.  No disconnect, no misbehaviour (this
+      # includes feefilter, which Core does not apply pre-verack).
+      debug "unsupported message prior to verack, ignoring", peer = $peer, kind = kind
+      return marDropSilent
     return marAccept
 
 proc validateVersionMessage*(peer: var Peer, version: uint32, nonce: uint64,
                              checkSelfConnect: SelfConnectChecker): MessageAcceptResult =
   ## Validate a version message
-  ## - Check minimum protocol version (70015 for witness)
+  ## - Check minimum protocol version (Core MIN_PEER_PROTO_VERSION = 31800)
   ## - Check for self-connection via nonce
   ## - Mark version as received
 

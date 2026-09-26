@@ -13,15 +13,14 @@ suite "pre-handshake message rejection (Bitcoin Core compatible)":
     let params = regtestParams()
     var peer = newPeer("127.0.0.1", 18444, params, pdInbound)
 
-    # All these should fail before VERSION
+    # All these are logged and IGNORED before VERSION — Core returns
+    # without Misbehaving() or a disconnect.
     for kind in [mkPing, mkPong, mkAddr, mkInv, mkGetData, mkGetHeaders,
                  mkHeaders, mkBlock, mkTx, mkGetAddr, mkNotFound]:
       var testPeer = newPeer("127.0.0.1", 18444, params, pdInbound)
       let result = validatePreHandshakeMessage(testPeer, kind)
-      check result == marDropMisbehave
-      # See note in test_handshake.nim: Core PR #25974 removed score
-      # accumulation; the discourage flag is the observable.
-      check testPeer.shouldDisconnect == true
+      check result == marDropSilent
+      check testPeer.shouldDisconnect == false
 
   test "unsupported message prior to verack":
     # Reference: net_processing.cpp line 4016-4018
@@ -33,12 +32,15 @@ suite "pre-handshake message rejection (Bitcoin Core compatible)":
     peer.verackSent = true
     # But verackReceived is false
 
-    # These regular messages should be rejected before verack received
-    for kind in [mkAddr, mkInv, mkGetData, mkGetHeaders, mkHeaders, mkBlock, mkTx]:
+    # These regular messages are logged and IGNORED before verack — Core
+    # "Unsupported message prior to verack" (no disconnect, no misbehaviour).
+    for kind in [mkAddr, mkInv, mkGetData, mkGetHeaders, mkHeaders, mkBlock,
+                 mkTx, mkPing, mkFeeFilter]:
       var testPeer = newPeer("127.0.0.1", 18444, params, pdInbound)
       testPeer.versionReceived = true
       let result = validatePreHandshakeMessage(testPeer, kind)
-      check result == marDropMisbehave
+      check result == marDropSilent
+      check testPeer.shouldDisconnect == false
 
   test "redundant version message":
     # Reference: net_processing.cpp line 3586-3588
@@ -51,10 +53,10 @@ suite "pre-handshake message rejection (Bitcoin Core compatible)":
     check result == marAccept
     peer.versionReceived = true
 
-    # Second version is duplicate
+    # Second version is duplicate — ignored, no misbehaviour
     result = validatePreHandshakeMessage(peer, mkVersion)
-    check result == marDropMisbehave
-    check peer.shouldDisconnect == true
+    check result == marDropSilent
+    check peer.shouldDisconnect == false
 
   test "ignoring redundant verack message":
     # Reference: net_processing.cpp line 3822-3824
@@ -91,23 +93,26 @@ suite "pre-handshake message rejection (Bitcoin Core compatible)":
     check result == marDisconnect
 
 suite "protocol version checks":
-  test "minimum peer protocol version is 70015":
-    # Reference: MIN_PEER_PROTO_VERSION should be at least 70015 for witness
-    check MinProtocolVersion == 70015'u32
+  test "minimum peer protocol version is Core's 31800":
+    # Reference: node/protocol_version.h MIN_PEER_PROTO_VERSION = 31800.
+    # Witness is a services question (NODE_WITNESS), not a version floor.
+    check MinProtocolVersion == 31800'u32
 
   test "reject obsolete protocol versions":
     let params = regtestParams()
     var peer = newPeer("127.0.0.1", 18444, params, pdInbound)
 
-    # Pre-BIP31 versions
-    check validateVersionMessage(peer, 31800'u32, 1'u64, nil) == marDisconnect
+    # Below Core's MIN_PEER_PROTO_VERSION
+    check validateVersionMessage(peer, 31799'u32, 1'u64, nil) == marDisconnect
 
-    # Pre-witness versions
     var peer2 = newPeer("127.0.0.1", 18444, params, pdInbound)
-    check validateVersionMessage(peer2, 70000'u32, 1'u64, nil) == marDisconnect
+    check validateVersionMessage(peer2, 209'u32, 1'u64, nil) == marDisconnect
 
+    # Pre-witness versions at/above the floor are KEPT (Core parity)
     var peer3 = newPeer("127.0.0.1", 18444, params, pdInbound)
-    check validateVersionMessage(peer3, 70014'u32, 1'u64, nil) == marDisconnect
+    check validateVersionMessage(peer3, 31800'u32, 1'u64, nil) == marAccept
+    var peer4 = newPeer("127.0.0.1", 18444, params, pdInbound)
+    check validateVersionMessage(peer4, 70002'u32, 1'u64, nil) == marAccept
 
   test "accept witness-compatible versions":
     let params = regtestParams()
@@ -210,12 +215,15 @@ suite "feature negotiation timing":
     peer2.verackReceived = true
     check validatePreHandshakeMessage(peer2, mkSendHeaders) == marAccept
 
-  test "feefilter allowed any time after version":
+  test "feefilter ignored before verack, accepted after":
     let params = regtestParams()
 
+    # Core does not process feefilter before verack ("Unsupported message
+    # prior to verack", net_processing.cpp:4010) — ignored, no penalty.
     var peer1 = newPeer("127.0.0.1", 18444, params, pdInbound)
     peer1.versionReceived = true
-    check validatePreHandshakeMessage(peer1, mkFeeFilter) == marAccept
+    check validatePreHandshakeMessage(peer1, mkFeeFilter) == marDropSilent
+    check peer1.shouldDisconnect == false
 
     var peer2 = newPeer("127.0.0.1", 18444, params, pdInbound)
     peer2.versionReceived = true

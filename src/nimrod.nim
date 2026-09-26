@@ -1242,8 +1242,13 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
                 state.syncManager.isInitialBlockDownload()
     for item in msg.invItems:
       if item.invType == invBlock or item.invType == invWitnessBlock:
-        # Request as witness block for segwit support
-        blockInvs.add(InvVector(invType: invWitnessBlock, hash: item.hash))
+        # Request as witness block for segwit support — and only from a peer
+        # that can serve one (Core CanServeWitnesses).  A non-witness
+        # inbound peer is kept connected but never asked for a block; its
+        # announcement is still picked up via headers sync from a
+        # witness-capable peer.
+        if peer.canServeWitnesses():
+          blockInvs.add(InvVector(invType: invWitnessBlock, hash: item.hash))
       elif item.invType == invTx or item.invType == invWitnessTx or
            item.invType == invWtx:
         # Skip all tx-announcement handling while still catching up — see
@@ -1278,7 +1283,11 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           # invTx/invWitnessTx → MSG_WITNESS_TX (invWitnessTx).  Requesting a
           # wtxid under invWitnessTx (a TXID request) makes the peer miss for
           # segwit txs and reply notfound — the tx would never be ingested.
-          let reqType = getdataTypeForAnnouncement(item.invType)
+          var reqType = getdataTypeForAnnouncement(item.invType)
+          # Core GetFetchFlags: MSG_WITNESS_FLAG only for a peer that can
+          # serve witnesses; a non-witness peer gets a plain MSG_TX.
+          if reqType == invWitnessTx and not peer.canServeWitnesses():
+            reqType = invTx
           txInvs.add(InvVector(invType: reqType, hash: item.hash))
     if blockInvs.len > 0:
       asyncSpawn spawnSafe(peer.sendGetData(blockInvs))
@@ -1324,7 +1333,11 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
             continue
         let blockOpt = state.chainState.db.getBlock(BlockHash(item.hash))
         if blockOpt.isSome:
-          let blkMsg = newBlockMsg(blockOpt.get())
+          var blkMsg = newBlockMsg(blockOpt.get())
+          # Core ProcessGetBlockData: MSG_BLOCK is served TX_NO_WITNESS,
+          # only MSG_WITNESS_BLOCK carries witnesses.  A pre-segwit peer
+          # (now admitted, Core parity) could not parse a witness block.
+          blkMsg.blkNoWitness = item.invType == invBlock
           try:
             await peer.sendMessage(blkMsg)
             servedBlocks.inc
@@ -1379,7 +1392,10 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
         let entryOpt = if state.mempool != nil: state.mempool.get(txid)
                       else: none(MempoolEntry)
         if entryOpt.isSome:
-          let txMsg = newTxMsg(entryOpt.get().tx)
+          var txMsg = newTxMsg(entryOpt.get().tx)
+          # Core ProcessGetData: MSG_TX is served TX_NO_WITNESS; only
+          # MSG_WITNESS_TX / MSG_WTX carry witnesses.
+          txMsg.txNoWitness = item.invType == invTx
           try:
             await peer.sendMessage(txMsg)
             servedTxs.inc

@@ -29,6 +29,7 @@ import ../src/network/sync
 import ../src/network/headerssync
 import ../src/network/peermanager
 import ../src/network/peer
+import ../src/network/messages
 import ../src/consensus/params
 import ../src/primitives/[types, serialize, uint256]
 import ../src/crypto/hashing
@@ -101,6 +102,7 @@ suite "Part 1: below-tip heavier fork header is ACCEPTED, peer NOT banned":
     let params = regtestParams()
     let pm = newPeerManager(params, 8, 2, 117, "/tmp")
     let peer = newPeer("203.0.113.21", 8333, params, pdInbound)
+    peer.services = NodeNetwork or NodeWitness  # a block source (CanServeWitnesses)
     pm.peers["203.0.113.21:8333"] = peer
 
     let sm = syncManagerAtGenesis(params)
@@ -156,6 +158,7 @@ suite "Part 1: below-tip heavier fork header is ACCEPTED, peer NOT banned":
     let params = regtestParams()
     let pm = newPeerManager(params, 8, 2, 117, "/tmp")
     let peer = newPeer("203.0.113.22", 8333, params, pdInbound)
+    peer.services = NodeNetwork or NodeWitness  # a block source (CanServeWitnesses)
     pm.peers["203.0.113.22:8333"] = peer
     let sm = syncManagerAtGenesis(params)
     sm.peerManager = pm
@@ -185,6 +188,7 @@ suite "Part 1: genuine-bad headers are STILL banned (no weakening)":
     let params = regtestParams()
     let pm = newPeerManager(params, 8, 2, 117, "/tmp")
     let peer = newPeer("203.0.113.23", 8333, params, pdInbound)
+    peer.services = NodeNetwork or NodeWitness  # a block source (CanServeWitnesses)
     pm.peers["203.0.113.23:8333"] = peer
     let sm = syncManagerAtGenesis(params)
     sm.peerManager = pm
@@ -215,6 +219,7 @@ suite "Part 1: genuine-bad headers are STILL banned (no weakening)":
     let params = regtestParams()
     let pm = newPeerManager(params, 8, 2, 117, "/tmp")
     let peer = newPeer("203.0.113.24", 8333, params, pdInbound)
+    peer.services = NodeNetwork or NodeWitness  # a block source (CanServeWitnesses)
     pm.peers["203.0.113.24:8333"] = peer
     let sm = syncManagerAtGenesis(params)
     sm.peerManager = pm
@@ -243,6 +248,7 @@ suite "Part 1: fork-aware download walk requests bridging fork bodies":
     let params = regtestParams()
     let pm = newPeerManager(params, 8, 2, 117, "/tmp")
     let peer = newPeer("203.0.113.25", 8333, params, pdInbound)
+    peer.services = NodeNetwork or NodeWitness  # a block source (CanServeWitnesses)
     pm.peers["203.0.113.25:8333"] = peer
     let sm = syncManagerAtGenesis(params)
     sm.peerManager = pm
@@ -290,12 +296,39 @@ suite "Part 1: fork-aware download walk requests bridging fork bodies":
     check firstIdx >= 0 and lastIdx >= 0
     check firstIdx < lastIdx
 
+  test "non-witness peer is never asked for blocks (Core CanServeWitnesses)":
+    ## Same heavier-fork setup as above, but the only peer lacks NODE_WITNESS
+    ## (an inbound pre-segwit peer Core keeps connected).  Nothing may be
+    ## selected for download and no hash may be left marked requested.
+    let params = regtestParams()
+    let pm = newPeerManager(params, 8, 2, 117, "/tmp")
+    let peer = newPeer("203.0.113.28", 8333, params, pdInbound)
+    peer.services = NodeNetwork
+    peer.state = psReady
+    pm.peers["203.0.113.28:8333"] = peer
+    let sm = syncManagerAtGenesis(params)
+    sm.peerManager = pm
+    let genesis = buildGenesisBlock(params)
+    let chainA = buildHeaderChain(params.genesisBlockHash,
+                                  genesis.header.timestamp, 10)
+    sm.extendActiveChain(chainA)
+    sm.chainTip = hashOf(chainA[^1])
+    sm.chainTipHeight = 10
+    let chainB = buildHeaderChain(params.genesisBlockHash,
+                                  genesis.header.timestamp + 1, 15)
+    waitFor sm.handleHeaders(peer, chainB)
+    check sm.headerChain.sideHeaders.len == 15
+    waitFor sm.requestBlocks(peer)
+    check sm.blockQueue.len == 0
+    check sm.requestedHashes.len == 0
+
   test "no fork → requestBlocks requests nothing extra (steady state unchanged)":
     ## Invariant: with no sideHeaders the fork walk is inert; the active-chain
     ## walk alone runs (and here chainTip == headerTip → nothing to do).
     let params = regtestParams()
     let pm = newPeerManager(params, 8, 2, 117, "/tmp")
     let peer = newPeer("203.0.113.26", 8333, params, pdInbound)
+    peer.services = NodeNetwork or NodeWitness  # a block source (CanServeWitnesses)
     pm.peers["203.0.113.26:8333"] = peer
     let sm = syncManagerAtGenesis(params)
     sm.peerManager = pm
@@ -318,6 +351,7 @@ suite "Part 1: fork-aware download walk requests bridging fork bodies":
     let params = regtestParams()
     let pm = newPeerManager(params, 8, 2, 117, "/tmp")
     let peer = newPeer("203.0.113.27", 8333, params, pdInbound)
+    peer.services = NodeNetwork or NodeWitness  # a block source (CanServeWitnesses)
     pm.peers["203.0.113.27:8333"] = peer
     let sm = syncManagerAtGenesis(params)
     sm.peerManager = pm
@@ -393,6 +427,7 @@ suite "Part 1: deep (>288) below-tip fork download is Core-parity work-based":
     let params = regtestParams()
     let pm = newPeerManager(params, 8, 2, 117, "/tmp")
     let peer = newPeer("203.0.113.40", 8333, params, pdInbound)
+    peer.services = NodeNetwork or NodeWitness  # a block source (CanServeWitnesses)
     pm.peers["203.0.113.40:8333"] = peer
     let sm = syncManagerAtGenesis(params)
     sm.peerManager = pm
@@ -438,6 +473,7 @@ suite "Part 1: deep (>288) below-tip fork download is Core-parity work-based":
     let params = regtestParams()
     let pm = newPeerManager(params, 8, 2, 117, "/tmp")
     let peer = newPeer("203.0.113.41", 8333, params, pdInbound)
+    peer.services = NodeNetwork or NodeWitness  # a block source (CanServeWitnesses)
     pm.peers["203.0.113.41:8333"] = peer
     let sm = syncManagerAtGenesis(params)
     sm.peerManager = pm

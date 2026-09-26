@@ -120,6 +120,9 @@ proc addReadyPeer(rpc: RpcServer, addrStr: string, port: uint16): Peer =
   ## deterministic slot (and therefore in getpeerinfo's id numbering).
   let p = newPeer(addrStr, port, rpc.peerManager.params, pdOutbound)
   p.state = psReady
+  # A segwit peer (NODE_NETWORK|NODE_WITNESS); Core FetchBlock refuses
+  # peers that cannot serve witnesses.
+  p.services = NodeNetwork or NodeWitness
   rpc.peerManager.peers[addrStr & ":" & $port] = p
   p
 
@@ -271,6 +274,26 @@ suite "getblockfrompeer — success path":
       check invs.len == 1
       check invs[0].invType == invWitnessBlock
       check invs[0].hash == array[32, byte](h)
+
+  test "pre-segwit peer -> RPC_MISC_ERROR(-1) 'Pre-SegWit peer'":
+    ## Core net_processing.cpp:1969 FetchBlock: !CanServeWitnesses.
+    ## Reachable now that non-witness inbound peers complete the handshake.
+    cleanupTest()
+    defer: cleanupTest()
+    let rpc = buildRpc()
+    defer: rpc.chainState.close()
+    let p = rpc.addReadyPeer("10.0.0.1", 18444'u16)
+    p.services = NodeNetwork          # no NODE_WITNESS
+    let hdr = makeHeader(9)
+    let h = registerHeaderOnly(rpc.chainState, hdr, 1)
+    var raised = false
+    try:
+      discard rpc.handleMethod("getblockfrompeer", %*[displayHash(h), 0])
+    except RpcError as e:
+      raised = true
+      check e.code == -1
+      check e.msg == "Pre-SegWit peer"
+    check raised
 
   test "missing peer_id param -> invalid params (-32602)":
     cleanupTest()

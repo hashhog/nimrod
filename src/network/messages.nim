@@ -264,8 +264,10 @@ type
       headers*: seq[BlockHeader]
     of mkBlock:
       blk*: Block
+      blkNoWitness*: bool    # serve as TX_NO_WITNESS (getdata MSG_BLOCK)
     of mkTx:
       tx*: Transaction
+      txNoWitness*: bool     # serve as TX_NO_WITNESS (getdata MSG_TX)
     of mkReject:
       reject*: RejectMsg
     of mkSendCmpct:
@@ -541,9 +543,9 @@ proc serializePayload*(msg: P2PMessage): seq[byte] =
   of mkHeaders:
     w.writeHeadersPayload(msg.headers)
   of mkBlock:
-    w.writeBlock(msg.blk)
+    w.writeBlock(msg.blk, includeWitness = not msg.blkNoWitness)
   of mkTx:
-    w.writeTransaction(msg.tx)
+    w.writeTransaction(msg.tx, includeWitness = not msg.txNoWitness)
   of mkReject:
     w.writeRejectMsg(msg.reject)
   of mkSendCmpct:

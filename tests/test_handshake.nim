@@ -33,7 +33,9 @@ suite "pre-handshake message rejection":
     check isPreHandshakeMessageAllowed(peer, mkSendAddrV2) == true
     check isPreHandshakeMessageAllowed(peer, mkSendHeaders) == true
     check isPreHandshakeMessageAllowed(peer, mkSendCmpct) == true
-    check isPreHandshakeMessageAllowed(peer, mkFeeFilter) == true
+    check isPreHandshakeMessageAllowed(peer, mkSendTxRcncl) == true
+    # Core does NOT process feefilter before verack (net_processing.cpp:4010)
+    check isPreHandshakeMessageAllowed(peer, mkFeeFilter) == false
 
     # But not regular messages
     check isPreHandshakeMessageAllowed(peer, mkPing) == false
@@ -53,20 +55,16 @@ suite "pre-handshake message rejection":
     check isPreHandshakeMessageAllowed(peer, mkGetHeaders) == true
     check isPreHandshakeMessageAllowed(peer, mkBlock) == true
 
-  test "validate pre-version messages get misbehavior":
+  test "validate pre-version messages are ignored (no misbehavior)":
     let params = regtestParams()
     var peer = newPeer("127.0.0.1", 18444, params, pdInbound)
 
-    # Send ping before version
+    # Send ping before version.  Core net_processing.cpp:3810 logs
+    # "non-version message before version handshake" and returns — no
+    # Misbehaving(), no disconnect.
     let result = validatePreHandshakeMessage(peer, mkPing)
-    check result == marDropMisbehave
-    # Core 2022 PR #25974 removed misbehaviour SCORE accumulation: Misbehaving()
-    # now sets m_should_discourage unconditionally, whatever the old point value
-    # was.  nimrod matches that (peer.nim misbehaving() -> shouldDisconnect), so
-    # peer.misbehaviorScore never moves and asserting on it tests nothing —
-    # the `== 0` variants below were passing vacuously for the same reason.
-    # Assert the flag that actually carries the decision.
-    check peer.shouldDisconnect == true
+    check result == marDropSilent
+    check peer.shouldDisconnect == false
 
   test "validate version before version returns accept":
     let params = regtestParams()
@@ -76,14 +74,15 @@ suite "pre-handshake message rejection":
     check result == marAccept
     check peer.shouldDisconnect == false   # control: no discourage on the happy path
 
-  test "duplicate version message gets misbehavior":
+  test "duplicate version message is ignored (no misbehavior)":
     let params = regtestParams()
     var peer = newPeer("127.0.0.1", 18444, params, pdInbound)
     peer.versionReceived = true  # First version already received
 
+    # Core net_processing.cpp:3582: "redundant version message" — ignored.
     let result = validatePreHandshakeMessage(peer, mkVersion)
-    check result == marDropMisbehave
-    check peer.shouldDisconnect == true
+    check result == marDropSilent
+    check peer.shouldDisconnect == false
 
   test "redundant verack dropped silently":
     let params = regtestParams()
@@ -118,7 +117,8 @@ suite "protocol version validation":
     let params = regtestParams()
     var peer = newPeer("127.0.0.1", 18444, params, pdInbound)
 
-    let result = validateVersionMessage(peer, 31800'u32, 12345'u64, nil)
+    # Core: nVersion < MIN_PEER_PROTO_VERSION (31800) disconnects.
+    let result = validateVersionMessage(peer, 31799'u32, 12345'u64, nil)
     check result == marDisconnect
 
   test "version at minimum accepted":
@@ -245,7 +245,8 @@ suite "misbehavior score constants":
     check ScoreDuplicateVersion == 1'u32
 
   test "minimum protocol version":
-    check MinProtocolVersion == 70015'u32
+    # Core MIN_PEER_PROTO_VERSION (node/protocol_version.h:18)
+    check MinProtocolVersion == 31800'u32
 
 when isMainModule:
   echo "Running handshake tests..."

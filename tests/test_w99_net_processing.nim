@@ -523,11 +523,12 @@ suite "G18 fork-not-on-best-chain":
 
 suite "G19 version exactly once":
 
-  test "G19: duplicate version returns marDropMisbehave":
+  test "G19: duplicate version is ignored (Core: redundant version, no misbehaviour)":
     var peer = makePeer()
     peer.versionReceived = true
     let result = peer.validatePreHandshakeMessage(mkVersion)
-    check result == marDropMisbehave
+    check result == marDropSilent
+    check peer.shouldDisconnect == false
 
 # ---------------------------------------------------------------------------
 # G20 — verack required before non-handshake
@@ -538,21 +539,23 @@ suite "G19 version exactly once":
 
 suite "G20 verack required before non-handshake":
 
-  test "G20: non-handshake message before verack triggers misbehave":
+  test "G20: non-handshake message before verack is ignored":
     var peer = makePeer()
     peer.versionReceived = true
     peer.verackReceived = false
     peer.handshakeComplete = false
     let result = peer.validatePreHandshakeMessage(mkBlock)
-    check result == marDropMisbehave
+    check result == marDropSilent
+    check peer.shouldDisconnect == false
 
-  test "G20: inv before verack triggers misbehave":
+  test "G20: inv before verack is ignored":
     var peer = makePeer()
     peer.versionReceived = true
     peer.verackReceived = false
     peer.handshakeComplete = false
     let result = peer.validatePreHandshakeMessage(mkInv)
-    check result == marDropMisbehave
+    check result == marDropSilent
+    check peer.shouldDisconnect == false
 
 # ---------------------------------------------------------------------------
 # G21 — Handshake msgs between version and verack only

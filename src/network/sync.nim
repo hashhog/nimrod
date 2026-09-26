@@ -2176,6 +2176,26 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   # A restart does NOT clear this — the bodies are on disk.
   discard sm.connectStoredBlocks()
 
+  # Block requests go only to peers that can serve witness blocks (Core
+  # CanServeWitnesses, net_processing.cpp:1166/2854).  `peer` is the header
+  # sync peer, which may be a non-witness inbound peer that Core keeps
+  # connected; it is used for the single-peer fallback only if it
+  # qualifies.  Decide BEFORE building the inventory so no hash is marked
+  # requested when nobody can serve it.
+  let peers =
+    if sm.peerManager != nil: sm.peerManager.getBlockDownloadPeers()
+    else: @[]
+  let fetchPeer =
+    if peer != nil and peer.canServeWitnesses(): peer
+    elif peers.len > 0: peers[0]
+    else: nil
+  if fetchPeer == nil:
+    if sm.chainTipHeight < sm.headerTipHeight:
+      debug "no witness-capable peer to request blocks from",
+            chainTipHeight = sm.chainTipHeight,
+            headerTipHeight = sm.headerTipHeight
+    return
+
   # Find blocks we need (headers we have but blocks we don't)
   var height = sm.chainTipHeight + 1
   var storedSkipped = 0
@@ -2301,7 +2321,6 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
 
   # During IBD, distribute block requests across all available peers
   # to maximize download throughput (parallel download from multiple peers)
-  let peers = sm.peerManager.getReadyPeers()
   if peers.len > 1 and sm.chainState != nil and sm.chainState.ibdMode:
     # Cap per-peer in-flight requests at MaxBlocksPerPeer (= Bitcoin Core's
     # MAX_BLOCKS_IN_TRANSIT_PER_PEER, 16).  A Core peer that receives a
@@ -2350,9 +2369,9 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   else:
     # Single-peer fallback
     try:
-      await peer.sendGetData(inventory)
+      await fetchPeer.sendGetData(inventory)
     except CatchableError as e:
-      warn "failed to send getdata", peer = $peer, error = e.msg
+      warn "failed to send getdata", peer = $fetchPeer, error = e.msg
       for inv in inventory:
         sm.requestedHashes.excl(BlockHash(inv.hash))
       return
@@ -2406,7 +2425,7 @@ proc bodyRepairYieldsToIbd*(sm: SyncManager): bool {.raises: [].} =
     return false
   if sm.peerManager == nil:
     return true
-  sm.peerManager.getReadyPeers().len < 2
+  sm.peerManager.getBlockDownloadPeers().len < 2
 
 proc planRepairInventory*(sm: SyncManager,
                           maxItems: int = MaxRepairGetData): seq[InvVector] =
@@ -2460,7 +2479,7 @@ proc requestRepairBodies*(sm: SyncManager) {.async.} =
     for item in inv:
       sm.requestedHashes.excl(BlockHash(item.hash))
     return
-  let peers = sm.peerManager.getReadyPeers()
+  let peers = sm.peerManager.getBlockDownloadPeers()
   if peers.len == 0:
     for item in inv:
       sm.requestedHashes.excl(BlockHash(item.hash))
@@ -3411,12 +3430,13 @@ proc getPeerState*(dl: BlockDownloader, peer: Peer): var PeerBlockState =
 
 proc supportsWitness*(peer: Peer): bool =
   ## Check if peer supports segwit (NODE_WITNESS = 8)
-  (peer.services and NodeWitness) != 0
+  peer.canServeWitnesses()
 
 proc selectPeerForRequest*(dl: BlockDownloader): Peer =
-  ## Round-robin selection with per-peer in-flight cap
+  ## Round-robin selection with per-peer in-flight cap, over peers that can
+  ## serve witness blocks (Core CanServeWitnesses).
   ## Returns nil if no suitable peer available
-  let peers = dl.syncManager.peerManager.getReadyPeers()
+  let peers = dl.syncManager.peerManager.getBlockDownloadPeers()
   if peers.len == 0:
     return nil
 
@@ -3495,8 +3515,9 @@ proc requestBlocks*(dl: BlockDownloader) {.async.} =
     if key notin peerRequests:
       peerRequests[key] = (peer: peer, inv: @[])
 
-    # Determine inv type (witness block for segwit peers)
-    let invType = if peer.supportsWitness(): invWitnessBlock else: invBlock
+    # selectPeerForRequest only returns witness-capable peers, so every
+    # request is MSG_WITNESS_BLOCK (Core GetFetchFlags).
+    let invType = invWitnessBlock
 
     # Add to batch
     peerRequests[key].inv.add(InvVector(

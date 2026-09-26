@@ -531,6 +531,10 @@ proc maybeSendFeefilter*(rm: RelayManager, state: PeerRelayState) {.async.} =
   ## 4. After IBD: immediately send current filter
   if not state.peer.isConnected() or not state.peer.handshakeComplete:
     return
+  # Core MaybeSendFeefilter (net_processing.cpp:5543): never send feefilter
+  # to a peer whose version predates it (FEEFILTER_VERSION = 70013).
+  if state.peer.version < FeeFilterVersion:
+    return
 
   let now = Moment.now()
   let currentFilter = rm.getCurrentFeefilterValue()
