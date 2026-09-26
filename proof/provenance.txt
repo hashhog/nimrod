@@ -1,25 +1,25 @@
 # Provenance — nimrod proof bundle
-assembled_utc: 2026-09-18T09:59:00Z
+assembled_utc: 2026-09-26T05:44:25Z
 repo: https://github.com/hashhog/nimrod
 branch: master
-commit: 928f7c2af882ea70d6f1c4d4ad0d36f882278830
-commit_short: 928f7c2af882
-subject: fix: report untruncated body-repair remaining and attest the live pin
+commit: 23e42afc845c6f08144a2bd91ab89ff66453c0dc
+commit_short: 23e42afc845c
+subject: feat: advertise our own address to peers (Core MaybeSendAddr / -externalip / -discover)
 tree_clean: NO
 binary: /home/work/hashhog/deploy/nimrod/nimrod
-binary_sha256: 5b36d8db8e4adfe679aff61e4280cca41579e4bde7a69a1daec62a496200fb81
+binary_sha256: 67be21e9bbbcd61430ba99b4e309de253bc212a5dcc59bb047637776a6c5498a
 toolchain: Nim Compiler Version 2.2.8 [Linux: amd64]
 nimble: nimble v0.20.1 compiled at 2026-02-23 03:08:48
 target: Linux amd64
 build: nimble build -d:release -y
-deploy_pin: 928f7c2af882ea70d6f1c4d4ad0d36f882278830
-deploy_short: 928f7c2
-deploy_sha256: 5b36d8db8e4adfe679aff61e4280cca41579e4bde7a69a1daec62a496200fb81
+deploy_pin: 23e42afc845c6f08144a2bd91ab89ff66453c0dc
+deploy_short: 23e42af
+deploy_sha256: 67be21e9bbbcd61430ba99b4e309de253bc212a5dcc59bb047637776a6c5498a
 source: pin
 
 # Honest caveats
 The attested binary is the promoted pin (deploy/nimrod/MANIFEST
-sha256=5b36d8db8e4adfe679aff61e4280cca41579e4bde7a69a1daec62a496200fb81, commit 928f7c2), which must be
+sha256=67be21e9bbbcd61430ba99b4e309de253bc212a5dcc59bb047637776a6c5498a, commit 23e42af), which must be
 byte-identical to the live mainnet unit's /proc/<pid>/exe. Re-run
 this script with --pin after every promote; proof/check-pin.sh and
 proof/verify.sh fail if a pin is present and does not match.
