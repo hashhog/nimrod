@@ -11,7 +11,7 @@
 ##
 ## Reference: Bitcoin Core net.cpp, node/eviction.cpp
 
-import std/[tables, sets, sequtils, random, times, net, strutils, algorithm, options]
+import std/[tables, sets, sequtils, random, times, net, strutils, algorithm, options, math]
 import ../util/rng
 import chronos
 import chronicles
@@ -23,12 +23,13 @@ import ./eviction
 import ./anchors
 import ./addr
 import ./addrman
+import ./localaddr
 import ./proxy as proxy_mod
 import ../consensus/params
 import ../primitives/[types, serialize]
 import ../crypto/hashing
 
-export banman, netgroup, eviction, anchors
+export banman, netgroup, eviction, anchors, localaddr
 
 const
   BanDuration* = initDuration(hours = 24)
@@ -215,6 +216,17 @@ type
     # health sweeps keep running unconditionally.  Not persisted; resets to
     # enabled on restart.
     networkActive*: bool
+    # Self-address advertisement (Core mapLocalHost / fDiscover / MaybeSendAddr;
+    # see localaddr.nim and the "Self-address advertisement" section below).
+    #  - localAddrs: our own address table (--externalip + discovered).
+    #  - discover: learn our address from what OUTBOUND peers report in VERSION
+    #    addr_recv (Core -discover; default on, off when --externalip is set
+    #    unless --discover is given explicitly — resolved in nimrod.nim).
+    #  - isIbd: initial-block-download predicate; our address is not announced
+    #    during IBD (Core MaybeSendAddr).  nil = never in IBD (test rigs).
+    localAddrs*: LocalAddrTable
+    discover*: bool
+    isIbd*: proc(): bool {.gcsafe, raises: [].}
 
 # Forward declarations
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
@@ -502,8 +514,11 @@ proc newPeerManager*(params: ConsensusParams,
     # caller (src/nimrod.nim startNode) wires them after construction
     # when --proxy / --onion / --i2psam / --cjdnsreachable are set.
     proxyManager: nil,
-    cjdnsReachable: false
+    cjdnsReachable: false,
+    discover: true,
+    isIbd: nil
   )
+  initLocalAddrTable(result.localAddrs)
 
   # AXIS #2: load the Core-bucketed addrman from <dataDir>/peers.dat (or a
   # cold empty table on first run / corrupt file).  Re-bucketed from the
@@ -520,7 +535,9 @@ proc newPeerManager*(params: ConsensusParams,
     services: NodeNetwork or NodeWitness,
     timestamp: getTime().toUnix(),
     addrRecv: NetAddress(services: NodeNetwork, port: params.defaultPort),
-    addrFrom: NetAddress(services: NodeNetwork or NodeWitness, port: params.defaultPort),
+    # addr_from is empty, as Core sends it (see peer.sendVersion); it used to
+    # carry the chain-default port instead of the configured listen port.
+    addrFrom: NetAddress(services: NodeNetwork or NodeWitness),
     nonce: uint64(nodeRng().rand(high(int))),
     userAgent: UserAgent,
     startHeight: 0,
@@ -730,6 +747,164 @@ proc getNetGroupForAddress*(pm: PeerManager, address: string): NetGroup =
   let ip = parseIpAddr(address)
   getNetGroupAsn(pm.netGroupManager, ip)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Self-address advertisement (Bitcoin Core parity).
+#
+# Without this a listening node never tells anyone where it can be reached, so
+# it gets no inbound peers even with the port forwarded.  Mirrors:
+#  - net.cpp AddLocal / SeenLocal / IsPeerAddrLocalGood  -> noteVersionAddrRecv
+#  - net.cpp GetLocalAddrForPeer (240-268)                -> localAddrForPeer
+#  - net_processing.cpp MaybeSendAddr (5445-5479)         -> prepareLocalAddrMsg
+# The table itself is localaddr.nim.
+
+proc listening*(pm: PeerManager): bool =
+  ## Core fListen: we accept inbound connections on a known port.
+  pm.listenEnabled and pm.listenPort != 0
+
+proc addExternalIP*(pm: PeerManager, spec: string): bool =
+  ## --externalip=<ip>[:port] (Core -externalip, LOCAL_MANUAL).  A bare IP is
+  ## stored with port 0 = "our listen port", resolved when advertised, because
+  ## an ephemeral --port=0 listener only learns its port at bind time.
+  ## false when malformed or not publicly routable (Core AddLocal refuses).
+  let parsed = parseExternalIP(spec)
+  if parsed.isNone:
+    return false
+  pm.localAddrs.addManual(parsed.get.ip, parsed.get.port)
+
+proc resolvePort(pm: PeerManager, port: uint16): uint16 {.inline.} =
+  if port == 0: pm.listenPort else: port
+
+proc localAddresses*(pm: PeerManager): seq[LocalAddress] =
+  ## getnetworkinfo.localaddresses rows, ports resolved to the listen port.
+  result = pm.localAddrs.list(getTime().toUnix())
+  for a in result.mitems:
+    a.port = pm.resolvePort(a.port)
+
+proc peerIp16(peer: Peer): Option[array[16, byte]] =
+  ip16FromString(peer.address)
+
+proc noteVersionAddrRecv*(pm: PeerManager, peer: Peer, now: int64) =
+  ## Handle the addr_recv field of a peer's VERSION (stored as peer.addrLocal).
+  ## An OUTBOUND peer's view of us is a discovery (only with --discover, only
+  ## when both ends are routable, Core IsPeerAddrLocalGood); an INBOUND peer's
+  ## view only scores an address we already know (Core SeenLocal).  Discovered
+  ## entries are stored with OUR LISTEN PORT: an outbound peer cannot observe
+  ## it (we dialed from an ephemeral port).  Score = distinct peer netgroups.
+  if not pm.discover or not pm.listening():
+    return
+  let rip = peerIp16(peer)
+  if rip.isNone or not isRoutable16(rip.get):
+    return
+  if not isRoutable16(peer.addrLocal.ip):
+    return
+  let ipObj = parseIpAddr(peer.address)
+  let group = $getNetGroupAsn(pm.netGroupManager, ipObj)
+  discard pm.localAddrs.confirm(peer.addrLocal.ip, pm.listenPort, group,
+                                create = peer.direction == pdOutbound, now)
+
+proc localAddrForPeer*(pm: PeerManager, peer: Peer, now: int64,
+                       coin: proc(bits: int): bool {.gcsafe, raises: [].} = nil):
+                       Option[tuple[ip: array[16, byte], port: uint16]] =
+  ## Core GetLocalAddrForPeer (net.cpp:240-268): our best table entry; but if
+  ## the peer told us a routable address for us (and --discover is on), use
+  ## that instead when the table has nothing routable, and otherwise
+  ## sometimes (1/2, or 1/8 when the best entry scores above LOCAL_MANUAL).
+  ## Inbound: take the peer's view of IP AND port (it dialed our listening
+  ## port).  Outbound: IP only, keep our listen port.  `coin(bits)` returns
+  ## true with probability 1/2^bits (injectable for tests).
+  let rip = peerIp16(peer)
+  let local = pm.localAddrs.best(rip, now)
+  var ip: array[16, byte]
+  var port = pm.listenPort
+  var localScore = 0
+  if local.isSome:
+    ip = local.get.ip
+    port = pm.resolvePort(local.get.port)
+    localScore = local.get.score
+  let peerGood = pm.discover and rip.isSome and isRoutable16(rip.get) and
+                 isRoutable16(peer.addrLocal.ip)
+  if peerGood:
+    let bits = if localScore > LocalManual: 3 else: 1
+    let flip =
+      if local.isNone: true
+      elif coin != nil: coin(bits)
+      else: nodeRng().rand((1 shl bits) - 1) == 0
+    if flip:
+      ip = peer.addrLocal.ip
+      if peer.direction == pdInbound:
+        port = peer.addrLocal.port
+  if not isRoutable16(ip) or port == 0:
+    return none(tuple[ip: array[16, byte], port: uint16])
+  some((ip: ip, port: port))
+
+proc buildLocalAddrMsg*(peer: Peer, ip: array[16, byte], port: uint16,
+                        services: uint64, now: int64): P2PMessage =
+  ## The initial self-announcement: ONE address in its own message (Core
+  ## sends it alone so a peer's addr rate limiter cannot drop it inside a
+  ## bigger batch).  addrv2 when the peer sent sendaddrv2 (BIP-155).
+  let ts = uint32(now)
+  if peer.wantsAddrV2:
+    newAddrV2(@[TimestampedAddrV2(timestamp: ts, services: services,
+                                  address: fromIPv6Mapped(ip), port: port)])
+  else:
+    newAddr(@[TimestampedAddr(timestamp: ts,
+      address: NetAddress(services: services, ip: ip, port: port,
+                          lastSeen: ts))])
+
+proc nextLocalAddrDelaySec*(): int64 =
+  ## Poisson inter-announcement delay, mean 24h (Core rand_exp_duration of
+  ## AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL).
+  let u = nodeRng().rand(1.0)
+  let d = -ln(max(1.0 - u, 1e-12)) * float(AvgLocalAddressBroadcastIntervalSec)
+  max(1'i64, int64(d))
+
+proc prepareLocalAddrMsg*(pm: PeerManager, peer: Peer,
+                          connType: PeerConnectionType, now: int64):
+                          Option[P2PMessage] =
+  ## Core MaybeSendAddr's self-announcement block.  Returns the addr/addrv2 to
+  ## send when this peer is due, updating its Poisson timer; none otherwise.
+  ##  - only when listening and NOT in IBD.  IBD leaves the timer untouched,
+  ##    so the first announcement goes out on the first tick after IBD ends;
+  ##  - never to block-relay-only or feeler connections (Core:
+  ##    m_addr_relay_enabled is false for them);
+  ##  - carries our advertised services (the word sent in VERSION), time now
+  ##    and the LISTEN port.
+  if peer == nil or peer.state != psReady or peer.closing:
+    return none(P2PMessage)
+  if connType in {pctBlockRelayOnly, pctFeeler}:
+    return none(P2PMessage)
+  if not pm.listening():
+    return none(P2PMessage)
+  if pm.isIbd != nil and pm.isIbd():
+    return none(P2PMessage)
+  if peer.nextLocalAddrSend != 0 and now < peer.nextLocalAddrSend:
+    return none(P2PMessage)
+  peer.nextLocalAddrSend = now + nextLocalAddrDelaySec()
+  let chosen = pm.localAddrForPeer(peer, now)
+  if chosen.isNone:
+    return none(P2PMessage)
+  some(buildLocalAddrMsg(peer, chosen.get.ip, chosen.get.port,
+                         advertisedServices(), now))
+
+proc maybeSendLocalAddr*(pm: PeerManager, peer: Peer,
+                         connType: PeerConnectionType): bool =
+  ## Send our address to `peer` if it is due.  true when a message went out.
+  let msg = pm.prepareLocalAddrMsg(peer, connType, getTime().toUnix())
+  if msg.isNone:
+    return false
+  debug "advertising our address", peer = $peer, kind = $msg.get.kind
+  asyncSpawn spawnSafe(peer.sendMessage(msg.get))
+  true
+
+proc sendLocalAddrToDuePeers*(pm: PeerManager) =
+  ## Periodic re-announcement (Core MaybeSendAddr timer), LocalAddrCheckIntervalSec.
+  var due: seq[(Peer, PeerConnectionType)]
+  for ext in pm.extendedPeers.values:
+    if ext.peer != nil and ext.peer.state == psReady:
+      due.add((ext.peer, ext.connType))
+  for (p, ct) in due:
+    discard pm.maybeSendLocalAddr(p, ct)
+
 proc hasNetGroupCollision*(pm: PeerManager, address: string): bool =
   ## Check if connecting to this address would cause a netgroup collision
   ## with existing outbound peers (eclipse protection).
@@ -934,6 +1109,12 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
         return true
 
       info "connected to peer", peer = $peer, height = peer.startHeight, connType = $connType
+
+      # Self-address advertisement: learn our address from the peer's view
+      # of us (addr_recv), then send the initial self-announcement (Core
+      # MaybeSendAddr on the first SendMessages after the handshake).
+      pm.noteVersionAddrRecv(peer, getTime().toUnix())
+      discard pm.maybeSendLocalAddr(peer, connType)
 
       # Start message loop for outbound peer (same as inbound)
       # Wrap callback to handle addr/addrv2/getaddr/feefilter internally
@@ -1232,6 +1413,10 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
     pm.extendedPeers[key] = ext
 
     info "inbound handshake complete", peer = $peer, height = peer.startHeight
+
+    # Self-address advertisement (inbound: SeenLocal only + initial announce).
+    pm.noteVersionAddrRecv(peer, getTime().toUnix())
+    discard pm.maybeSendLocalAddr(peer, pctInbound)
 
     # Wrap callback to handle addr/addrv2/getaddr/feefilter internally
     let wrappedCb = proc(p: Peer, msg: P2PMessage) {.async.} =
@@ -1572,6 +1757,7 @@ proc mainLoop*(pm: PeerManager) {.async.} =
   var lastGetAddr = getTime()
   var lastFeeler = getTime()
   var lastAddrDump = getTime()
+  var lastLocalAddr = getTime()
   var lastStalePeerCheck = chronos.Moment.now()
 
   info "peer manager main loop started"
@@ -1598,6 +1784,13 @@ proc mainLoop*(pm: PeerManager) {.async.} =
     if (now - lastFeeler).inSeconds >= FeelerInterval:
       await pm.tryFeelerConnection()
       lastFeeler = now
+
+    # Self-address re-announcement (Core MaybeSendAddr Poisson timer, mean
+    # 24h per peer).  Also the path that delivers the FIRST announcement to
+    # peers connected during IBD, on the first tick after IBD ends.
+    if (now - lastLocalAddr).inSeconds >= LocalAddrCheckIntervalSec:
+      pm.sendLocalAddrToDuePeers()
+      lastLocalAddr = now
 
     # Periodic addrman flush (Core DumpAddresses / DUMP_PEERS_INTERVAL=900s):
     # persist peers.dat while running so a SIGKILL/OOM does not lose addresses

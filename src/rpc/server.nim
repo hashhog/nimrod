@@ -5527,6 +5527,16 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
   let networkActive =
     if rpc.peerManager != nil: rpc.peerManager.networkActiveState() else: true
 
+  # localaddresses: our own advertised addresses (--externalip + discovered),
+  # Core rpc/net.cpp getnetworkinfo: [{address, port, score}].  Always an
+  # array.  The table is lock-protected (localaddr.nim) because this handler
+  # runs on the RPC thread.
+  var localAddrs = newJArray()
+  if rpc.peerManager != nil:
+    for la in rpc.peerManager.localAddresses():
+      localAddrs.add(%*{"address": ip16ToString(la.ip), "port": int(la.port),
+                        "score": la.score})
+
   %*{
     "version": 210000,
     "subversion": "/nimrod:0.1.0/",
@@ -5547,7 +5557,7 @@ proc handleGetNetworkInfo(rpc: RpcServer): JsonNode =
     # the real admission floor. Emit via btcAmountNode for Core's 8-decimal text.
     "relayfee": btcAmountNode(int64(rpc.mempool.minFeeRate * 1000.0 + 0.5)),
     "incrementalfee": btcAmountNode(int64(rpc.mempool.incrementalRelayFeeRate + 0.5)),
-    "localaddresses": [],
+    "localaddresses": localAddrs,
     # Core v31.99 emits warnings as an array of strings (empty = no warnings).
     "warnings": newJArray()
   }

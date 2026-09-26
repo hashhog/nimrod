@@ -146,6 +146,14 @@ type
     #    spends one token, excess is dropped (Core m_addr_token_bucket;
     #    net_processing.cpp:5646-5670).
     getaddrRecvd*: bool
+    # Self-address advertisement (Core CNode::addrLocal /
+    # Peer::m_next_local_addr_send):
+    #  - addrLocal: the addr_recv field of the peer's VERSION = the address the
+    #    peer sees us at.  Feeds discovery and GetLocalAddrForPeer.
+    #  - nextLocalAddrSend: unix seconds when our own address is next announced
+    #    to this peer; 0 = never announced yet (the first send is still due).
+    addrLocal*: NetAddress
+    nextLocalAddrSend*: int64
     addrTokenBucket*: float64
     addrTokenTimestamp*: int64         # unix seconds of last bucket refill
     # Internal state
@@ -648,21 +656,30 @@ proc advertisedServices*(): uint64 =
     ourServices = ourServices or NodeCompactFilters
   ourServices
 
-proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
-  ## Send version message
+proc buildVersionMsg*(peer: Peer, ourHeight: int32): P2PMessage =
+  ## The VERSION message sendVersion puts on the wire.
   let ourServices = advertisedServices()
-  let msg = newVersionMsg(
+  newVersionMsg(
     version = ProtocolVersion,
     services = ourServices,
     timestamp = stdtimes.getTime().toUnix(),
     addrRecv = NetAddress(services: NodeNetwork, port: peer.port),
-    addrFrom = NetAddress(services: ourServices, port: peer.params.p2pPort),
+    # addr_from: Core sends an empty CService (net_processing.cpp
+    # PushNodeVersion: `CNetAddr::V1(CService{})`) -- our reachable address is
+    # announced by the addr/addrv2 self-advertisement after the handshake, not
+    # here.  This used to carry the chain-default port (params.p2pPort, 8333 on
+    # mainnet) regardless of --port, i.e. a wrong port for any node not on the
+    # default; empty (::, port 0) is what peers expect and ignore.
+    addrFrom = NetAddress(services: ourServices),
     nonce = peer.localNonce,  # Use our unique nonce for self-connection detection
     userAgent = UserAgent,
     startHeight = ourHeight,
     relay = true
   )
 
+proc sendVersion*(peer: Peer, ourHeight: int32) {.async.} =
+  ## Send version message
+  let msg = peer.buildVersionMsg(ourHeight)
   await peer.sendMessage(msg)
   peer.versionSent = true
   peer.state = psHandshaking
@@ -1183,6 +1200,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     peer.timeOffset = versionData.timestamp - getTime().toUnix()
     peer.versionReceived = true
     peer.remoteNonce = versionData.nonce
+    peer.addrLocal = versionData.addrRecv
 
     info "received version", peer = $peer, version = peer.version,
          userAgent = peer.userAgent, height = peer.startHeight
@@ -1259,6 +1277,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     peer.timeOffset = versionData.timestamp - getTime().toUnix()
     peer.versionReceived = true
     peer.remoteNonce = versionData.nonce
+    peer.addrLocal = versionData.addrRecv
 
     info "received version", peer = $peer, version = peer.version,
          userAgent = peer.userAgent, height = peer.startHeight
@@ -1341,6 +1360,7 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     peer.startHeight = msg.version.startHeight
     peer.relay = msg.version.relay
     peer.timeOffset = msg.version.timestamp - getTime().toUnix()
+    peer.addrLocal = msg.version.addrRecv
     info "received version", peer = $peer, version = msg.version.version,
          height = msg.version.startHeight
     await peer.sendVerack()

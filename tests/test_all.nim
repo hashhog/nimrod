@@ -187,6 +187,7 @@ const IncludedTests = [
   "test_script",
   "test_script_flag_exceptions",
   "test_script_vectors",
+  "test_self_advertise",
   "test_sequence_lock",
   "test_serialize",
   "test_serving",

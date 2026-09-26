@@ -151,6 +151,15 @@ type
                             ## Mirrors Bitcoin Core `-connect` (which implies
                             ## `-dnsseed=0`) and clearbit's --connect branch.
                             ## Empty = normal DNS + auto-outbound behavior.
+    externalIPs*: seq[string] ## --externalip=<ip>[:port] (repeatable /
+                            ## comma-separated): our own public address(es) to
+                            ## advertise to peers.  Bare IP = the P2P listen
+                            ## port.  Mirrors Core -externalip.
+    discover*: bool         ## --discover: learn our public address from what
+                            ## outbound peers report (Core -discover).  Default
+                            ## on; off when --externalip is given unless
+                            ## --discover was passed explicitly (discoverSet).
+    discoverSet*: bool
     noDnsSeed*: bool        ## --nodnsseed / --dnsseed=0: suppress DNS-seed
                             ## resolution independently of --connect.  Default
                             ## false (DNS seeding on).  Mirrors Core `-dnsseed`.
@@ -309,6 +318,9 @@ proc defaultConfig*(): NimrodConfig =
     onionProxy: "",
     i2psam: "",
     connectPeers: @[],
+    externalIPs: @[],
+    discover: true,
+    discoverSet: false,
     noDnsSeed: false,
     cjdnsReachable: false,
     # W119 + FIX-64 REST/TLS termination (default off — plaintext)
@@ -483,6 +495,12 @@ proc loadConfigFile*(config: var NimrodConfig) =
         config.connectPeers = @[]
       else:
         config.connectPeers.add(value)
+    of "externalip":
+      for part in value.split(','):
+        if part.strip().len > 0: config.externalIPs.add(part.strip())
+    of "discover":
+      config.discover = value.toLowerAscii() in ["", "1", "true", "yes", "on"]
+      config.discoverSet = true
     of "nodnsseed":
       config.noDnsSeed = value.toLowerAscii() in ["", "1", "true", "yes"]
     of "dnsseed":
@@ -598,6 +616,13 @@ Operational:
                          the pinned peer(s).  Bare IP uses the network default
                          port.  --connect=0 clears the list.  Mirrors Bitcoin
                          Core -connect (which implies -dnsseed=0).
+  --externalip=IP[:PORT] Advertise this public address to peers (repeatable
+                         or comma-separated).  A bare IP uses the P2P listen
+                         port.  Implies --discover=0 unless --discover is
+                         given.  Mirrors Bitcoin Core -externalip.
+  --discover[=0|1]       Learn our public address from what outbound peers
+                         report (default: 1 unless --externalip is set).
+                         Mirrors Bitcoin Core -discover.
   --nodnsseed            Suppress DNS-seed resolution (equivalently
                          --dnsseed=0), independently of --connect.  Mirrors
                          Bitcoin Core -dnsseed=0.
@@ -905,6 +930,18 @@ proc parseArgs*(cmdline: seq[string]): tuple[cmd: Command, config: NimrodConfig,
           result.config.connectPeers = @[]
         else:
           result.config.connectPeers.add(p.val)
+      of "externalip":
+        # Core -externalip=<ip>[:port]: repeatable and/or comma-separated.
+        for part in p.val.split(','):
+          if part.strip().len > 0: result.config.externalIPs.add(part.strip())
+      of "discover":
+        # Core -discover (default 1; soft-off under -externalip).
+        result.config.discover = p.val.len == 0 or
+          p.val.toLowerAscii() in ["1", "true", "yes", "on"]
+        result.config.discoverSet = true
+      of "nodiscover":
+        result.config.discover = false
+        result.config.discoverSet = true
       of "nodnsseed":
         # Core -dnsseed=0 / -nodnsseed: suppress DNS-seed resolution.
         if p.val.len == 0:
@@ -2588,6 +2625,19 @@ proc startNode*(config: NimrodConfig) {.async.} =
   state.peerManager.bindSpecs = config.bindSpecs
   state.peerManager.listenPort = config.p2pPort
   state.peerManager.listenEnabled = config.listenEnabled
+  # Self-address advertisement (Core -externalip / -discover).  init.cpp:815:
+  # -externalip soft-sets -discover=0 unless -discover was given explicitly.
+  state.peerManager.discover =
+    if config.externalIPs.len > 0 and not config.discoverSet: false
+    else: config.discover
+  for spec in config.externalIPs:
+    if state.peerManager.addExternalIP(spec):
+      info "externalip: advertising our address", address = spec
+    else:
+      warn "--externalip value is malformed or not publicly routable; ignored",
+           value = spec
+  if config.externalIPs.len > 0 and not config.listenEnabled:
+    warn "--externalip has no effect with --nolisten (nothing is advertised)"
   state.peerManager.updateHeight(state.chainState.bestHeight)
   state.peerManager.setMessageCallback(messageCallback(state))
 
@@ -2789,6 +2839,37 @@ proc startNode*(config: NimrodConfig) {.async.} =
                                      state.txoSpenderIndex)
   state.syncManager.chainTip = state.chainState.bestBlockHash
   state.syncManager.chainTipHeight = state.chainState.bestHeight
+
+  # IBD predicate for the self-address advertisement gate (Core MaybeSendAddr:
+  # `!m_chainman.IsInitialBlockDownload()`).  Core's IsInitialBlockDownload is
+  # latched: in IBD until the tip is within MAX_TIP_AGE (24h) of now AND the
+  # block chain has caught up with the header chain, then false for the rest
+  # of the process.  syncManager.isInitialBlockDownload() alone is only the
+  # "blocks behind headers" half — a node whose tip is days old but whose
+  # headers are equally stale (e.g. a fresh regtest genesis, or a node just
+  # restarted after a long outage before headers arrive) is still in IBD.
+  block:
+    let sm = state.syncManager
+    let cs = state.chainState
+    var latchedOut = false
+    state.peerManager.isIbd = proc(): bool {.gcsafe, raises: [].} =
+      if latchedOut:
+        return false
+      if sm.isInitialBlockDownload():
+        return true
+      var tipTime = 0'i64
+      try:
+        let idx = cs.db.getBlockIndex(cs.bestBlockHash)
+        if idx.isSome:
+          tipTime = int64(idx.get.header.timestamp)
+      except CatchableError:
+        return true
+      if getTime().toUnix() - tipTime > 24 * 60 * 60:
+        return true
+      latchedOut = true
+      info "leaving initial block download (self-address advertisement enabled)",
+           height = cs.bestHeight
+      false
 
   # 6a. IBD backfill of the block-filter index.  If --blockfilterindex was
   # toggled on AFTER an initial IBD, walk the chain from the index's
