@@ -1174,15 +1174,40 @@ proc remainingUntil(deadline: Moment): ctimer.Duration =
   let now = Moment.now()
   if now >= deadline: ctimer.milliseconds(0) else: deadline - now
 
+proc readHandshakeMessage(peer: Peer, deadline: Moment,
+                          what: string): Future[P2PMessage] {.async.} =
+  ## Read ONE message during the v1 version/verack exchange, bounded by the
+  ## overall handshake deadline.  Any read failure (peer closed the socket,
+  ## bad magic, oversized/garbled message) is RAISED, never turned into a
+  ## message.
+  ##
+  ## Two chronos details make this necessary:
+  ##   * `withTimeout` returns TRUE when `fut` FAILED (it only means "fut
+  ##     finished before the timer"), and
+  ##   * `fut.value()` on a failed future does not raise — it returns
+  ##     default(P2PMessage), whose kind is mkVersion (the first enum value).
+  ## Reading with `value()` therefore turned a closed socket into an endless
+  ## stream of phantom VERSION messages.  With the (Core-parity) unbounded
+  ## pre-verack loop that became a synchronous spin: readMessage fails
+  ## without yielding at EOF, so the event loop never ran again, the
+  ## deadline timer never fired, and memory grew until the cgroup OOM
+  ## killer fired (mainnet, 2026-09-26: 7 OOM kills on a8982ff).  `read()`
+  ## re-raises the stored error instead.
+  if Moment.now() >= deadline:
+    raise newException(PeerError, "handshake timeout waiting for " & what)
+  let fut = peer.readMessage()
+  if not await fut.withTimeout(remainingUntil(deadline)):
+    if not fut.finished():
+      await fut.cancelAndWait()
+    raise newException(PeerError, "handshake timeout waiting for " & what)
+  return fut.read()
+
 proc awaitVersionMessage(peer: Peer, deadline: Moment): Future[P2PMessage] {.async.} =
   ## Read until the peer's VERSION.  Core ignores (logs) any other message
   ## before VERSION ("non-version message before version handshake",
   ## net_processing.cpp:3810) rather than disconnecting.
   while true:
-    let fut = peer.readMessage()
-    if not await fut.withTimeout(remainingUntil(deadline)):
-      raise newException(PeerError, "handshake timeout waiting for version")
-    let msg = fut.value()
+    let msg = await peer.readHandshakeMessage(deadline, "version")
     if msg.kind == mkVersion:
       return msg
     debug "non-version message before version handshake, ignoring",
@@ -1190,12 +1215,12 @@ proc awaitVersionMessage(peer: Peer, deadline: Moment): Future[P2PMessage] {.asy
 
 proc awaitVerack(peer: Peer, deadline: Moment) {.async.} =
   ## Read until the peer's VERACK, processing/ignoring everything in between
-  ## per `processPreVerackMessage`.  Bounded only by the handshake deadline.
+  ## per `processPreVerackMessage`.  Bounded by the handshake deadline (Core
+  ## has no message-count cap here, only the connect timeout); a read
+  ## failure — including the peer closing the socket — ends the handshake.
   while true:
-    let fut = peer.readMessage()
-    if not await fut.withTimeout(remainingUntil(deadline)):
-      raise newException(PeerError, "handshake timeout waiting for verack")
-    if peer.processPreVerackMessage(fut.value()):
+    let msg = await peer.readHandshakeMessage(deadline, "verack")
+    if peer.processPreVerackMessage(msg):
       return
 
 proc performHandshake*(peer: Peer, ourHeight: int32,

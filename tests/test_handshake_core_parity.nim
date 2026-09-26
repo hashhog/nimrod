@@ -18,7 +18,7 @@
 ##   nim c -r tests/test_handshake_core_parity.nim
 
 import unittest2
-import std/[times, monotimes, tempfiles, os, tables]
+import std/[times, monotimes, tempfiles, os, tables, posix]
 import chronos
 import ../src/network/[peer, peermanager, messages]
 import ../src/consensus/params
@@ -137,6 +137,18 @@ proc inboundReady(n: TestNode): bool =
 
 # ── socket tests ────────────────────────────────────────────────────────────
 
+proc onWedge(sig: cint) {.noconv.} =
+  const m = "\nFAIL: event loop wedged (handshake read spin after peer EOF)\n"
+  discard posix.write(2, m.cstring, m.len)
+  exitnow(1)
+
+proc armWedgeWatchdog(secs: cint) =
+  discard signal(SIGALRM, onWedge)
+  discard alarm(secs)
+
+proc disarmWedgeWatchdog() =
+  discard alarm(0)
+
 suite "handshake Core parity (socket)":
 
   test "inbound VERSION(70002) completes the handshake":
@@ -218,6 +230,33 @@ suite "handshake Core parity (socket)":
       check waitUntil(proc(): bool = n.inboundReady(), 3000)
       check not c.closed
     finally:
+      n.cleanup()
+
+  test "peer that closes the socket before VERACK is dropped (no spin)":
+    # Mainnet 2026-09-26: inbound /Satoshi:31.0.0/ probes (fake start
+    # height) send VERSION, a second VERSION, then close without VERACK.
+    # a8982ff read the failed read future with value(), which yields a
+    # default mkVersion message instead of raising; the pre-verack loop
+    # ignored it and re-read the dead socket forever WITHOUT yielding, so
+    # the event loop froze and RSS grew to the 16G cgroup limit.  A wedged
+    # loop would hang this test rather than fail it, so a SIGALRM watchdog
+    # turns the hang into a hard failure.
+    let n = startNode()
+    armWedgeWatchdog(10)
+    try:
+      let c = n.dial()
+      c.send(versionMsg(70016'u32, NodeNetwork or NodeWitness))
+      check waitUntil(proc(): bool = c.has(mkVerack), 3000)
+      check waitUntil(proc(): bool = not n.inboundPeer().isNil, 1000)
+      c.send(versionMsg(70016'u32, NodeNetwork or NodeWitness))  # redundant, ignored
+      settle(100)
+      check not n.inboundPeer().isNil   # redundant VERSION alone: kept (Core)
+      c.close()
+      # Dropped on EOF, well inside the handshake timeout (HandshakeMs):
+      # this measures the closed-socket path, not the deadline.
+      check waitUntil(proc(): bool = n.inboundPeer().isNil, HandshakeMs div 2)
+    finally:
+      disarmWedgeWatchdog()
       n.cleanup()
 
 # ── outbound: services required only for outbound connections we pick ──────
