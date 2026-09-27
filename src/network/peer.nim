@@ -181,6 +181,10 @@ type
     lastTxTime*: chronos.Moment        # When peer last sent us a transaction
     lastBlockAnnouncement*: int64      # Unix time of last block announcement (for eviction)
     bestKnownHeight*: int32            # Best known block height from this peer
+    lastGetHeadersMs*: int64           # Unix ms of our last getheaders to this
+                                       # peer; 0 once its headers reply arrives
+                                       # (Core m_last_getheaders_timestamp)
+    invTriggeredGetHeaders*: bool      # Core m_inv_triggered_getheaders_before_sync
     pingStartTime*: chronos.Moment     # When current ping was sent (for timeout)
     pingPending*: bool                 # Whether we're waiting for a pong
     headersRequested*: bool            # Whether we've requested headers from this peer
@@ -254,6 +258,7 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     lastTxTime: now,
     lastBlockAnnouncement: 0,
     bestKnownHeight: 0,
+    lastGetHeadersMs: 0,
     pingStartTime: now,
     pingPending: false,
     headersRequested: false,
@@ -578,6 +583,26 @@ proc pruneModeAdvertiseEnabled*(): bool =
   ## True when we should advertise NODE_NETWORK_LIMITED in the version handshake.
   pruneModeAdvertise
 
+# NODE_NETWORK honesty gate. Core sets NODE_NETWORK only when it can serve
+# every historical block: not pruned (init.cpp:1947-1950) and no assumeutxo
+# snapshot chainstate whose background sync is unfinished (init.cpp:1952,
+# re-enabled at 1369-1370). nimrod has no background sync, so a datadir whose
+# bodies do not reach down to height 1 (snapshot bootstrap, or a pre-fix
+# genesis IBD that skipped bodies) must advertise NODE_NETWORK_LIMITED only.
+# Latched by nimrod.nim at startup from the on-disk body floor, and cleared
+# by any snapshot load.
+var fullHistoryAdvertise: bool = true
+
+proc setFullHistoryAdvertise*(enabled: bool) =
+  fullHistoryAdvertise = enabled
+
+proc fullHistoryAdvertiseEnabled*(): bool =
+  fullHistoryAdvertise
+
+proc servesFullHistory*(): bool =
+  ## True when NODE_NETWORK is advertised: all bodies from height 1 are kept.
+  fullHistoryAdvertise and not pruneModeAdvertise
+
 # BIP-157 NODE_COMPACT_FILTERS advertisement gate.  W121 G15 / FIX-71.
 # Set from `nimrod.nim` at daemon startup, computed as
 # `config.peerblockfilters and config.blockfilterindex`.  When true,
@@ -649,7 +674,12 @@ proc advertisedServices*(): uint64 =
   # Nimrod has no CBloomFilter implementation (W110 BUG-01), so NODE_BLOOM is
   # intentionally absent from outbound services regardless of any env var.
   # See also: peerBloomFiltersEnabled() above for the mempool-only gate.
-  var ourServices = NodeNetwork or NodeWitness
+  var ourServices = NodeWitness
+  # NODE_NETWORK only when every historical body is served (see
+  # servesFullHistory). Pruned or snapshot-bootstrapped datadirs keep
+  # NODE_NETWORK_LIMITED below and serve only the recent window.
+  if servesFullHistory():
+    ourServices = ourServices or NodeNetwork
   # BIP-159: NODE_NETWORK_LIMITED is advertised UNCONDITIONALLY by every full
   # node — Core sets it in g_local_services regardless of prune mode
   # (init.cpp:863, `NODE_NETWORK_LIMITED | NODE_WITNESS`), because any full
@@ -724,6 +754,7 @@ proc sendGetHeaders*(peer: Peer, locators: seq[BlockHash], hashStop: BlockHash) 
     locatorHashes,
     array[32, byte](hashStop)
   )
+  peer.lastGetHeadersMs = int64(stdtimes.epochTime() * 1000.0)
   await peer.sendMessage(msg)
 
 proc sendGetData*(peer: Peer, inventory: seq[InvVector]) {.async.} =
@@ -2090,6 +2121,30 @@ proc updateBestKnownHeight*(peer: var Peer, height: int32) =
   ## Update the best known block height from this peer
   if height > peer.bestKnownHeight:
     peer.bestKnownHeight = height
+
+proc noteBestKnownHeight*(peer: Peer, height: int32) =
+  ## Core UpdateBlockAvailability: the peer announced (inv / headers) or
+  ## served a block at `height` on our active header chain, so it has every
+  ## block up to it. Peer is a ref type; this is the non-var twin.
+  if peer != nil and height > peer.bestKnownHeight:
+    peer.bestKnownHeight = height
+
+proc availableHeight*(peer: Peer): int32 =
+  ## Highest active-chain height we believe this peer can serve. Core uses
+  ## pindexBestKnownBlock only (learned from inv/headers); nimrod also takes
+  ## the version-message start height so IBD keeps downloading from every
+  ## peer that connected at a higher tip, as it did before availability
+  ## gating existed.
+  max(peer.startHeight, peer.bestKnownHeight)
+
+const HeadersResponseTimeMs* = 2'i64 * 60 * 1000
+  ## Core HEADERS_RESPONSE_TIME (net_processing.cpp).
+
+proc getHeadersRequestAllowed*(lastGetHeadersMs, nowMs: int64): bool =
+  ## Core MaybeSendGetHeaders: at most one getheaders in flight per peer; a
+  ## new one is allowed once the last was answered (timestamp cleared) or
+  ## HEADERS_RESPONSE_TIME has passed.
+  lastGetHeadersMs == 0 or nowMs - lastGetHeadersMs > HeadersResponseTimeMs
 
 proc startPing*(peer: var Peer) =
   ## Record that we're starting a ping

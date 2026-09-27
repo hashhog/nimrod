@@ -8316,6 +8316,9 @@ proc handleLoadTxOutSetImpl*(rpc: RpcServer, path: string): JsonNode =
   # still pending — do the same, before background validation.
   activateSnapshotAsActive(
     rpc.chainState, snapCs, snapCs.bestBlockHash, baseHeight)
+  # Bodies below the base are not on disk: stop advertising NODE_NETWORK
+  # (Core init.cpp:1952 runs NODE_NETWORK_LIMITED while a snapshot is active).
+  setFullHistoryAdvertise(false)
   # Graft campaign base_tail_headers into the live header index so
   # getblockchaininfo.headers reports the snapshot base, not genesis.
   discard persistAssumeutxoBaseHeaders(rpc.chainState, assumeData)

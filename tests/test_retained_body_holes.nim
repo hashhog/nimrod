@@ -16,7 +16,9 @@
 ##   nim c -r tests/test_retained_body_holes.nim
 ##
 ## It pins three things:
-##   1. Genesis IBD still skips bodies (no silent 600 G backfill).
+##   1. Genesis IBD stores every body (2026-09-26: a NODE_NETWORK node must
+##      serve what it validated; the old skip left a genesis-synced node
+##      answering notfound for its whole chain).
 ##   2. Catch-up IBD that extends an already-retained tip stores every body
 ##      so a stall cannot punch a hole.
 ##   3. `auditRetainedBodies` reports an interior miss between floor and tip
@@ -93,7 +95,7 @@ suite "retained-range body holes":
   teardown:
     cleanupTestDb()
 
-  test "genesis IBD does not store bodies (no silent archive backfill)":
+  test "genesis IBD stores every body (NODE_NETWORK serves what it validated)":
     var cs = newChainState(TestDbPath, regtestParams())
     let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
     check cs.connectBlock(genesis, 0).isOk
@@ -102,17 +104,20 @@ suite "retained-range body holes":
 
     cs.startIBD()
     discard connectN(cs, genesisHash, 1, 8, ibd = true)
-    cs.stopIBD()
-
-    check cs.bestHeight == 8
-    check cs.db.getBlockHashByHeight(8).isSome
-    # Index is on the active chain...
+    # Readable BEFORE the IBD batch is flushed: a peer may getdata a block
+    # the moment it is announced.
     for h in 1'i32 .. 8'i32:
       let hashOpt = cs.db.getBlockHashByHeight(h)
       check hashOpt.isSome
-      # ...but the IBD fast path must not have written the body. Writing
-      # every IBD body is a ~600 G operator decision, not this fix.
-      check not cs.db.hasBlockBody(hashOpt.get())
+      check cs.db.getBlock(hashOpt.get()).isSome
+    cs.stopIBD()
+
+    check cs.bestHeight == 8
+    for h in 1'i32 .. 8'i32:
+      let hashOpt = cs.db.getBlockHashByHeight(h)
+      check hashOpt.isSome
+      check cs.db.hasBlockBody(hashOpt.get())
+    check discoverFirstBody(cs.db, cs.bestHeight) == 0
     cs.close()
 
   test "catch-up IBD extending a retained tip stores every body":

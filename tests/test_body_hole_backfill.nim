@@ -504,8 +504,8 @@ suite "retained-range body hole backfill":
   test "stale snapshot-base repair is dropped after IBD advances, remaining falls":
     ## Discriminator: remaining stays 1 because the reply is rejected
     ## (below-floor once IBD moved) and the completion never decrements.
-    ## Seed the queue the way 65adc07 did, connect one IBD block without
-    ## storing a body, feed the old tip's body, and require remaining=0
+    ## Seed the queue the way 65adc07 did, connect one IBD block above the
+    ## deleted range, feed the old tip's body, and require remaining=0
     ## with no further getdata. Negative: an interior hole in a real
     ## retained window is still requested.
     var cs = newChainState(TestDbPath, regtestParams())
@@ -524,7 +524,9 @@ suite "retained-range body hole backfill":
     let nextBlk = makeSimpleBlock(cs.bestBlockHash, 11)
     check cs.connectBlockIBD(nextBlk, 11).isOk
     check cs.bestHeight == 11
-    check not cs.db.hasBlockBody(cs.bestBlockHash)
+    # IBD stores every body since 2026-09-26 (NODE_NETWORK serves what it
+    # validated); the floor is 11 either way, so height 10 is below it.
+    check cs.db.hasBlockBody(cs.bestBlockHash)
 
     let sm = newSyncManager(nil, cs.db, regtestParams(), cs)
     # SyncManager's on-disk tip lags the IBD in-memory tip until flush;

@@ -1242,13 +1242,12 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
                 state.syncManager.isInitialBlockDownload()
     for item in msg.invItems:
       if item.invType == invBlock or item.invType == invWitnessBlock:
-        # Request as witness block for segwit support — and only from a peer
-        # that can serve one (Core CanServeWitnesses).  A non-witness
-        # inbound peer is kept connected but never asked for a block; its
-        # announcement is still picked up via headers sync from a
-        # witness-capable peer.
-        if peer.canServeWitnesses():
-          blockInvs.add(InvVector(invType: invWitnessBlock, hash: item.hash))
+        # Headers-first (Core net_processing.cpp:4051-4122): a block inv
+        # records that this peer has the block and, if the header is
+        # unknown, triggers getheaders to THIS peer. Bodies are fetched by
+        # the downloader from peers known to have them — never requested
+        # straight off the inv, where an unknown-parent body was dropped.
+        blockInvs.add(item)
       elif item.invType == invTx or item.invType == invWitnessTx or
            item.invType == invWtx:
         # Skip all tx-announcement handling while still catching up — see
@@ -1289,8 +1288,11 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           if reqType == invWitnessTx and not peer.canServeWitnesses():
             reqType = invTx
           txInvs.add(InvVector(invType: reqType, hash: item.hash))
-    if blockInvs.len > 0:
-      asyncSpawn spawnSafe(peer.sendGetData(blockInvs))
+    if blockInvs.len > 0 and state.syncManager != nil:
+      var announced = newSeqOfCap[BlockHash](blockInvs.len)
+      for it in blockInvs:
+        announced.add(BlockHash(it.hash))
+      await state.syncManager.handleBlockAnnouncement(peer, announced)
     if txInvs.len > 0:
       # G5: cap outgoing getdata at MAX_GETDATA_SZ=1000 items per message.
       # Core: net_processing.cpp:6207 flushes vGetData when it reaches 1000.
@@ -1316,7 +1318,10 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     # Uses params.MinBlocksToKeep (imported at the top of this module).
     # This was a THIRD function-local copy of the same 288 that nobody
     # updating the pruning margin would have thought to look for.
-    let pruneActive = pruneModeAdvertiseEnabled()
+    # Same gate for a snapshot-bootstrapped datadir: without NODE_NETWORK we
+    # advertised only the recent window (Core net_processing.cpp:2383-2388
+    # applies it to every NODE_NETWORK_LIMITED-only node, pruned or not).
+    let pruneActive = not servesFullHistory()
     var pruneHorizon: int32 = -1
     if pruneActive and state.chainState != nil and
         state.chainState.bestHeight > MinBlocksToKeep:
@@ -2533,6 +2538,20 @@ proc startNode*(config: NimrodConfig) {.async.} =
   else:
     state.pruner = nil
     info "prune subsystem disabled (no --prune flag)"
+
+  # NODE_NETWORK honesty (Core init.cpp:1947-1952): advertise full-history
+  # service only when bodies reach down to height 1. A snapshot-bootstrapped
+  # datadir (mainnet: first body at the snapshot base) or one synced by a
+  # pre-fix genesis IBD that skipped bodies cannot serve old blocks, so it
+  # advertises NODE_NETWORK_LIMITED alone and getdata serves the recent
+  # window only. A fresh datadir (tip 0) stores every body from here on.
+  block:
+    let firstBody = discoverFirstBody(state.chainState.db,
+                                      state.chainState.bestHeight)
+    setFullHistoryAdvertise(firstBody == 0)
+    info "block-serving services",
+      nodeNetwork = servesFullHistory(), firstBody = firstBody,
+      tip = state.chainState.bestHeight, pruned = config.pruneTarget > 0
 
   # Self-check: every height between the retained floor and the tip must
   # have a readable body. A connected block whose body is missing fails

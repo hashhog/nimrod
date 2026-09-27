@@ -90,6 +90,7 @@ type
     chainState*: ChainState ## Full chain state for block connection
     params*: ConsensusParams
     syncPeer*: Peer
+    lastInvHeadersTrigger*: BlockHash ## Core m_last_block_inv_triggering_headers_sync
     # Block download state
     blockQueue*: Deque[BlockHash]
     pendingBlocks*: int
@@ -1659,6 +1660,66 @@ proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
        locator0MatchesActiveTip = matchesActive,
        locator = locatorEntries.join(",")
 
+const MaxTipAgeForHeadersSyncSecs* = 24'i64 * 60 * 60
+  ## Core SendMessages: headers sync starts with EVERY peer once the best
+  ## header is younger than 24h (net_processing.cpp "close to today").
+
+proc headerTipIsRecent*(sm: SyncManager, nowSecs: int64): bool =
+  let tipHdr = sm.headerChain.getHeaderByHeight(sm.headerChain.tipHeight)
+  tipHdr.isSome and
+    int64(tipHdr.get().timestamp) + MaxTipAgeForHeadersSyncSecs > nowSecs
+
+proc invShouldTriggerGetHeaders*(syncingWithPeer, tipRecent,
+                                 peerAlreadyTriggered: bool,
+                                 hash, lastTrigger: BlockHash): bool =
+  ## Core ProcessMessage(INV) net_processing.cpp:4097-4122: a block inv for
+  ## an unknown hash sends getheaders to the ANNOUNCING peer when headers
+  ## sync with it has started (fSyncStarted: our sync peer, or every peer
+  ## once the best header is recent), else at most once per peer and one
+  ## new peer per new block.
+  syncingWithPeer or tipRecent or
+    (not peerAlreadyTriggered and hash != lastTrigger)
+
+proc handleBlockAnnouncement*(sm: SyncManager, peer: Peer,
+                              hashes: seq[BlockHash]) {.async.} =
+  ## Block `inv` from any peer (Core headers-first, net_processing.cpp
+  ## 4051-4122): record what the peer has (UpdateBlockAvailability) and,
+  ## for a hash we have no header for, ask THAT peer for headers. Bodies
+  ## are then fetched by the downloader from peers known to have them.
+  ##
+  ## nimrod used to answer a block inv with getdata for the body. With the
+  ## header unknown, the body could not connect and was dropped, and the
+  ## only header source was the single polled sync peer — so a chain
+  ## announced by any other peer was never synced (regtest relay test,
+  ## 2026-09-26: nimrod stayed at 0 while Core A announced 101 blocks).
+  var unknown: Option[BlockHash]
+  for h in hashes:
+    let ho = sm.headerChain.getHeight(h)
+    if ho.isSome:
+      peer.noteBestKnownHeight(ho.get())
+    elif not sm.headerChain.hasAnyHeader(h):
+      unknown = some(h)   # Core keeps the LAST unknown (best_block)
+  if unknown.isNone:
+    return
+  let nowSecs = getTime().toUnix()
+  # Decide before the await: a failed send clears sm.syncPeer (rotation).
+  let syncingWithPeer = sm.syncPeer == peer
+  let tipRecent = sm.headerTipIsRecent(nowSecs)
+  if not invShouldTriggerGetHeaders(syncingWithPeer, tipRecent,
+                                    peer.invTriggeredGetHeaders,
+                                    unknown.get(), sm.lastInvHeadersTrigger):
+    return
+  if not getHeadersRequestAllowed(peer.lastGetHeadersMs,
+                                  int64(epochTime() * 1000.0)):
+    return
+  info "block inv for unknown header, requesting headers",
+       peer = $peer, hash = $unknown.get(),
+       headerTip = sm.headerChain.tipHeight
+  await sm.requestHeaders(peer)
+  if not syncingWithPeer and not tipRecent:
+    peer.invTriggeredGetHeaders = true
+    sm.lastInvHeadersTrigger = unknown.get()
+
 type ForkHeaderOutcome* = enum
   ## Result of trying to accept a header that does NOT extend the active tip.
   fhoAccepted       ## stored as a competing-fork header (do NOT ban)
@@ -1800,6 +1861,9 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
   discard sm.reconcileHeaderTip()
   # A headers message is a response — this peer is not mute.
   sm.stalledSyncPeerKeys.excl(peerSyncKey(peer))
+  # Core ProcessHeadersMessage: any headers message clears the in-flight
+  # getheaders timestamp, so the next announcement may ask again.
+  peer.lastGetHeadersMs = 0
 
   if headers.len == 0:
     # No headers = we're at tip (or peer has nothing more)
@@ -1938,6 +2002,10 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
 
     # Skip if already have this header (active chain or a stored fork header).
     if sm.headerChain.hasAnyHeader(hash):
+      # The peer has it (Core UpdateBlockAvailability on every header).
+      let knownHeight = sm.headerChain.getHeight(hash)
+      if knownHeight.isSome:
+        peer.noteBestKnownHeight(knownHeight.get())
       continue
 
     # Check that this header connects to our chain
@@ -2085,6 +2153,7 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
 
     lastValidHeight = expectedHeight
     accepted += 1
+    peer.noteBestKnownHeight(expectedHeight)
 
   sm.lastSyncTime = getTime()
 
@@ -2155,6 +2224,42 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
 # below requestBlocks.
 proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [CatchableError].}
 
+proc selectFetchPeer*(syncPeer: Peer, peers: seq[Peer]): Peer =
+  ## Single-peer block fetch target: the witness-capable peer known to have
+  ## the most blocks (Core only asks a peer for blocks up to its
+  ## pindexBestKnownBlock). Ties go to the header-sync peer, then to the
+  ## earlier peer in `peers`, so the pre-availability choice is kept
+  ## whenever it is at least as good.
+  var best: Peer = nil
+  if syncPeer != nil and syncPeer.canServeWitnesses():
+    best = syncPeer
+  for p in peers:
+    if best == nil or p.availableHeight() > best.availableHeight():
+      best = p
+  best
+
+proc assignBlocksToPeers*(heights: seq[int32], peers: seq[Peer],
+                          perPeerCap: int): seq[int] =
+  ## For each block (ascending heights; -1 = fork body, any peer) pick the
+  ## least-loaded peer whose availableHeight covers it, at most `perPeerCap`
+  ## each. Returns peer indices for the assignable PREFIX; the first block
+  ## no peer can take ends the round (heights ascend, so later active blocks
+  ## have no more candidates).
+  var load = newSeq[int](peers.len)
+  for h in heights:
+    var pick = -1
+    for i, p in peers:
+      if load[i] >= perPeerCap:
+        continue
+      if h >= 0 and p.availableHeight() < h:
+        continue
+      if pick < 0 or load[i] < load[pick]:
+        pick = i
+    if pick < 0:
+      break
+    load[pick] += 1
+    result.add(pick)
+
 proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   ## Request blocks for validated headers
   ## During IBD, distributes requests across multiple peers for parallel download
@@ -2182,26 +2287,32 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   # connected; it is used for the single-peer fallback only if it
   # qualifies.  Decide BEFORE building the inventory so no hash is marked
   # requested when nobody can serve it.
+  #
+  # Availability (Core FindNextBlocksToDownload walks only up to the peer's
+  # pindexBestKnownBlock): a block is asked only of a peer known to have it —
+  # it announced it (inv/headers) or connected at a higher start height. The
+  # old code sent every request to the header-sync peer, so with the chain
+  # announced by a DIFFERENT peer the getdata went to a peer that did not
+  # have the block and the download waited for the sync timeout.
   let peers =
     if sm.peerManager != nil: sm.peerManager.getBlockDownloadPeers()
     else: @[]
-  let fetchPeer =
-    if peer != nil and peer.canServeWitnesses(): peer
-    elif peers.len > 0: peers[0]
-    else: nil
+  let fetchPeer = selectFetchPeer(peer, peers)
   if fetchPeer == nil:
     if sm.chainTipHeight < sm.headerTipHeight:
       debug "no witness-capable peer to request blocks from",
             chainTipHeight = sm.chainTipHeight,
             headerTipHeight = sm.headerTipHeight
     return
+  let maxAvail = fetchPeer.availableHeight()
 
   # Find blocks we need (headers we have but blocks we don't)
+  var invHeights: seq[int32]   # parallel to inventory; -1 = fork body (any peer)
   var height = sm.chainTipHeight + 1
   var storedSkipped = 0
   var noHeaderHash = 0
 
-  while height <= sm.headerTipHeight and
+  while height <= sm.headerTipHeight and height <= maxAvail and
         sm.pendingBlocks + inventory.len < MaxBlocksInFlight:
     let hashOpt = sm.headerChain.getHashByHeight(height)
     if hashOpt.isSome:
@@ -2218,6 +2329,7 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
           invType: invWitnessBlock,
           hash: array[32, byte](hash)
         ))
+        invHeights.add(height)
         sm.requestedHashes.incl(hash)
         sm.blockQueue.addLast(hash)
       else:
@@ -2297,6 +2409,7 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
         invType: invWitnessBlock,
         hash: array[32, byte](h)
       ))
+      invHeights.add(-1'i32)
       sm.requestedHashes.incl(h)
       sm.blockQueue.addLast(h)
 
@@ -2331,16 +2444,19 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     # was uncapped and the LAST peer was handed *all* the remaining blocks
     # (`if i == peers.len - 1: inventory.len`), so a large window could
     # dump 50+ blocks on one peer.
-    let blocksPerPeer = max(1, min(MaxBlocksPerPeer,
-                                   (inventory.len + peers.len -
-                                       1) div peers.len))
-    var idx = 0
+    # Each block goes to the least-loaded peer that HAS it (availableHeight
+    # >= its height), at most MaxBlocksPerPeer per peer this round. Heights
+    # ascend, so the set of peers able to serve a block only shrinks: the
+    # first block nobody can take ends the round, and the unrequested tail
+    # is rolled back below exactly as before.
+    let assignment = assignBlocksToPeers(invHeights, peers, MaxBlocksPerPeer)
+    var batches = newSeq[seq[InvVector]](peers.len)
+    for k in 0 ..< assignment.len:
+      batches[assignment[k]].add(inventory[k])
+    let idx = assignment.len
     var totalSent = 0
-    for p in peers:
-      if idx >= inventory.len:
-        break
-      let endIdx = min(idx + blocksPerPeer, inventory.len)
-      let batch = inventory[idx ..< endIdx]
+    for pi, p in peers:
+      let batch = batches[pi]
       if batch.len > 0:
         try:
           await p.sendGetData(batch)
@@ -2349,7 +2465,6 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
           warn "failed to send getdata to peer", peer = $p, error = e.msg
           for inv in batch:
             sm.requestedHashes.excl(BlockHash(inv.hash))
-      idx = endIdx
     # Any blocks beyond peers.len * blocksPerPeer were not requested this
     # round (their hashes were optimistically added to requestedHashes and
     # appended to blockQueue above); drop them from both so the next
@@ -3348,7 +3463,13 @@ proc syncLoop*(sm: SyncManager) {.async.} =
         await sm.requestRepairBodies()
         await sleepAsync(200)
       else:
-        await sleepAsync(5000)
+        # Poll interval, but wake as soon as an announcement from ANY peer
+        # (handleHeaders) moved us out of ssSynced — relaying a new block
+        # should not wait out the sync peer's 5 s poll.
+        for _ in 0 ..< 50:
+          await sleepAsync(100)
+          if sm.state != ssSynced or sm.headerTipHeight > sm.chainTipHeight:
+            break
 
     # Timeout handling (skip when already synced — no activity expected)
     if sm.state != ssSynced and

@@ -2277,30 +2277,24 @@ proc computeUtxoSetInfo*(cs: var ChainState,
   of cshtNone: discard
 
 proc maybeRetainIbdBody(cs: var ChainState, blk: Block, blockHash: BlockHash) =
-  ## Persist this IBD-connected body when we are extending a retained window.
+  ## Persist every IBD-connected body (Core AcceptBlock writes the body
+  ## before ConnectBlock; the invariant is connected => readable).
   ##
-  ## connectBlockIBD used to skip cfBlocks entirely (throughput for genesis
-  ## IBD). P2P re-enters IBD whenever headerTip-height > 10, so a restart or
-  ## header-sync stall that left the node 11+ blocks behind connected the
-  ## catch-up window WITHOUT bodies — a hole inside the range getblock
-  ## serves (mainnet 967000 missing while 966000 and 967400 were present,
-  ## tip 967473). Bitcoin Core's AcceptBlock writes the body before
-  ## ConnectBlock; the invariant is connected ⇒ readable.
+  ## Genesis IBD used to skip cfBlocks for throughput "so the datadir does
+  ## not balloon", while the version message still advertised NODE_NETWORK.
+  ## The node then answered getdata for blocks it had just validated with
+  ## notfound: two Core peers linked only through a genesis-synced nimrod
+  ## never converged (regtest relay test, 2026-09-26: B stayed at 0 while A
+  ## was at 101). A non-pruned full node keeps and serves every body; disk
+  ## is bounded by --prune, which also drops NODE_NETWORK.
   ##
-  ## Genesis IBD (bestHeight == 0, only genesis has a body) keeps skipping
-  ## so the datadir does not balloon to the fully-indexed class. Once any
-  ## post-genesis body is already on disk at the current tip — we were
-  ## serving a retained window and are now catching up — store every
-  ## subsequent IBD-connected body. The body goes in the same writeSynced
-  ## batch as the tip pointer so a crash cannot advance the tip past a
-  ## missing body, and also lands in the memtable so getBlock sees it
-  ## before the next flush (WriteBatch is not readable).
+  ## The body goes in the same writeSynced batch as the tip pointer so a
+  ## crash cannot advance the tip past a missing body, and also lands in
+  ## the memtable so getBlock sees it before the next flush (WriteBatch is
+  ## not readable).
   if cs.ibdBatch == nil:
     return
-  if not cs.ibdStoreBodies:
-    if cs.bestHeight <= 0 or not cs.db.hasBlockBody(cs.bestBlockHash):
-      return
-    cs.ibdStoreBodies = true
+  cs.ibdStoreBodies = true
   let bodyBytes = serialize(blk)
   cs.ibdBatch.put(cfBlocks, blockKey(array[32, byte](blockHash)), bodyBytes)
   cs.db.storeBlock(blk)
