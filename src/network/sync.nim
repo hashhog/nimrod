@@ -2506,6 +2506,59 @@ proc requestRepairBodies*(sm: SyncManager) {.async.} =
     for item in inv:
       sm.requestedHashes.excl(BlockHash(item.hash))
 
+const AnnounceMaxTipAgeSecs* = 24'i64 * 60 * 60
+  ## Core DEFAULT_MAX_TIP_AGE (kernel/chainstatemanager_opts.h:24).
+
+proc shouldAnnounceTip*(tipTime: uint32, nowSecs: int64): bool =
+  ## Core PeerManagerImpl::UpdatedBlockTip (net_processing.cpp:2162) does not
+  ## relay while fInitialDownload; on a synced node the deciding IBD clause is
+  ## the tip age. `ibdMode` here is a batching switch (>10 blocks behind), not
+  ## Core's IBD, so it is deliberately not used.
+  int64(tipTime) + AnnounceMaxTipAgeSecs >= nowSecs
+
+proc connectedServeCeiling*(connectedTipHeight: int32): int32 =
+  ## Highest height a getheaders reply may reach: the connected tip (Core
+  ## serves getheaders from ActiveChain() only), never the header tip.
+  connectedTipHeight
+
+proc announceConnectedTip(sm: SyncManager, blk: Block) =
+  ## Relay a block that just became the active tip via P2P: `headers` to
+  ## sendheaders peers, `inv` otherwise (PeerManager.broadcastBlock, Core
+  ## SendMessages). broadcastBlock used to be reachable only from the mining
+  ## RPCs, so nimrod connected P2P blocks but never announced them: two Core
+  ## peers linked only through nimrod never converged (regtest relay test,
+  ## 2026-09-26).
+  if sm.peerManager == nil:
+    return
+  if not shouldAnnounceTip(blk.header.timestamp, getTime().toUnix()):
+    return
+  # In IBD batch mode the body sits in the unflushed WriteBatch until
+  # flushIBDBatch (every 2000 blocks or stopIBD), and getdata reads RocksDB
+  # only -- a peer asking for an announced block would get notfound and, being
+  # Core, not re-ask that peer until its download timeout. Announce the tip
+  # after the batch is flushed instead (announceTipAfterIBDFlush).
+  if sm.chainState != nil and sm.chainState.ibdMode:
+    return
+  try:
+    asyncSpawn spawnSafe(sm.peerManager.broadcastBlock(blk))
+  except CatchableError:
+    discard
+  except Exception:
+    discard
+
+proc announceTipAfterIBDFlush(sm: SyncManager) =
+  ## After an IBD batch is flushed (stopIBD), relay the now-readable tip.
+  if sm.chainState == nil or sm.chainState.ibdMode:
+    return
+  try:
+    let blkOpt = sm.chainState.db.getBlock(sm.chainState.bestBlockHash)
+    if blkOpt.isSome:
+      sm.announceConnectedTip(blkOpt.get())
+  except CatchableError:
+    discard
+  except Exception:
+    discard
+
 proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
   ## Validate and apply a single block at the given height.
   ## Returns true if the block was successfully applied.
@@ -2741,6 +2794,7 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
   # Update chain tip (NOT header tip - they're tracked separately)
   sm.chainTip = hash
   sm.chainTipHeight = height
+  sm.announceConnectedTip(blk)
 
   if sm.blockQueue.len > 0:
     discard sm.blockQueue.popFirst()
@@ -3704,6 +3758,7 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
     # Update chain tip (hashPRB computed above).
     sm.chainTip = hashPRB
     sm.chainTipHeight = height
+    sm.announceConnectedTip(blk)
 
     # Update stats
     dl.blocksProcessed += 1
@@ -3867,6 +3922,7 @@ proc startIBD*(dl: BlockDownloader) {.async.} =
   dl.ibdActive = false
   if sm.chainState != nil and sm.chainState.ibdMode:
     sm.chainState.stopIBD()
+    sm.announceTipAfterIBDFlush()
 
   let elapsed = getTime() - dl.startTime
   let rate = float(dl.blocksProcessed) / max(1.0, elapsed.inSeconds.float)

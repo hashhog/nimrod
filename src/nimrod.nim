@@ -1478,7 +1478,13 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     var height = startHeight
     let stopHash = req.hashStop
     let stopIsNull = stopHash == zeroHash
-    while headers.len < MaxHeadersPerMsg:
+    # Never serve past the CONNECTED tip. Core answers getheaders from
+    # ActiveChain() only; the in-memory header chain runs ahead of it during
+    # sync, and serving those headers made a peer getdata bodies we did not
+    # have yet, get notfound, and stall on the gap until its block-download
+    # timeout (regtest relay test 2026-09-26: Core B stuck at genesis).
+    let servedCeiling = connectedServeCeiling(state.chainState.bestHeight)
+    while headers.len < MaxHeadersPerMsg and height <= servedCeiling:
       let hdrOpt = activeChainHeaderAtHeight(state, height)
       if hdrOpt.isNone:
         break
