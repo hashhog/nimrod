@@ -2172,6 +2172,86 @@ iterator iterateUtxos*(cs: var ChainState): tuple[outpoint: OutPoint,
                 uint32(key[35])
     yield (OutPoint(txid: TxId(txidBytes), vout: vout), entry)
 
+type
+  UtxoStatsAcc = object
+    hw: HashWriter
+    muh: MuHash3072
+    sawAny: bool
+    prevTxid: array[32, byte]
+
+proc initUtxoStatsAcc(): UtxoStatsAcc =
+  result.hw = initHashWriter()
+  result.muh = newMuHash3072()
+
+proc addUtxoRow(info: var UtxoSetInfo, acc: var UtxoStatsAcc,
+                key, value: seq[byte]) =
+  ## Fold one cfUtxo row into the stats (`ComputeUTXOStats` per-coin step).
+  if key.len != 36:
+    # Defensive: skip malformed entries rather than abort the walk.
+    return
+  var entry: UtxoEntry
+  try:
+    entry = deserializeUtxoEntry(value)
+  except CatchableError:
+    return
+
+  # Skip provably unspendable entries that may persist on legacy
+  # datadirs (pre-94b7755 chainstates carry orphan OP_RETURN coins
+  # from segwit witness-commitment outputs). Core's `AddCoins` filters
+  # these at write time so its UTXO walk never sees them; we mirror
+  # that by filtering at read time too. `scrubUnspendable` is the
+  # idempotent operator tool for permanent removal.
+  if isUnspendable(entry.output.scriptPubKey):
+    return
+
+  # Reconstruct the outpoint from the 36-byte key (txid(32) || vout(4 BE)).
+  var txidBytes: array[32, byte]
+  copyMem(addr txidBytes[0], unsafeAddr key[0], 32)
+
+  let vout = (uint32(key[32]) shl 24) or
+             (uint32(key[33]) shl 16) or
+             (uint32(key[34]) shl 8)  or
+              uint32(key[35])
+  let outpoint = OutPoint(txid: TxId(txidBytes), vout: vout)
+
+  # Distinct-tx count: increment whenever the leading 32 bytes change.
+  if not acc.sawAny or txidBytes != acc.prevTxid:
+    inc info.transactions
+    acc.prevTxid = txidBytes
+    acc.sawAny = true
+
+  inc info.txOuts
+  info.bogosize += bogoSizeFor(entry.output.scriptPubKey.len)
+  info.totalAmount += int64(entry.output.value)
+  # Estimated on-disk chainstate size: the raw key + value bytes for this
+  # cfUtxo entry, as they sit in the column family. This is a deterministic
+  # proxy for Core's `view->EstimateSize()` (RocksDB has no leveldb-style
+  # range estimate bound here). Impl-specific by design — the differential
+  # test only asserts disk_size is PRESENT + integer-typed, never byte-equal.
+  info.diskSize += uint64(key.len + value.len)
+
+  if info.hashType != cshtNone:
+    let coinBytes = serializeCoinForHash(
+      outpoint, int64(entry.output.value), entry.output.scriptPubKey,
+      entry.height, entry.isCoinbase)
+    case info.hashType
+    of cshtHashSerialized:
+      acc.hw.update(coinBytes)
+    of cshtMuHash:
+      acc.muh.insert(coinBytes)
+    of cshtNone: discard
+
+proc finishUtxoStats(info: var UtxoSetInfo, acc: var UtxoStatsAcc) =
+  case info.hashType
+  of cshtHashSerialized:
+    if info.txOuts > 0:
+      info.hashSerialized = acc.hw.finalizeHash()
+    else:
+      info.hashSerialized = default(array[32, byte])
+  of cshtMuHash:
+    info.hashSerialized = acc.muh.finalize()
+  of cshtNone: discard
+
 proc computeUtxoSetInfo*(cs: var ChainState,
                          hashType: CoinStatsHashType): UtxoSetInfo =
   ## Walk the entire UTXO set and return Core-parity stats.
@@ -2195,8 +2275,6 @@ proc computeUtxoSetInfo*(cs: var ChainState,
   result.bestBlock = cs.bestBlockHash
   result.hashType = hashType
 
-  var hw = initHashWriter()
-  var muh = newMuHash3072()
 
   # NOTE: W12 (efdc4bf) had a walk-time genesis-coinbase filter here as a
   # workaround for nimrod adding the genesis coinbase to cfUtxo via
@@ -2206,75 +2284,47 @@ proc computeUtxoSetInfo*(cs: var ChainState,
   # `createSnapshot` keeps its dump-time filter as belt-and-suspenders
   # for legacy datadirs created before W14.
 
-  # Track distinct-tx count by detecting txid transitions in cursor order.
-  var sawAny = false
-  var prevTxidBytes: array[32, byte]
+  var acc = initUtxoStatsAcc()
 
   for (key, value) in cs.db.db.iterCf(cfUtxo):
-    if key.len != 36:
-      # Defensive: skip malformed entries rather than abort the walk.
-      continue
-    var entry: UtxoEntry
-    try:
-      entry = deserializeUtxoEntry(value)
-    except CatchableError:
-      continue
+    addUtxoRow(result, acc, key, value)
+  finishUtxoStats(result, acc)
 
-    # Skip provably unspendable entries that may persist on legacy
-    # datadirs (pre-94b7755 chainstates carry orphan OP_RETURN coins
-    # from segwit witness-commitment outputs). Core's `AddCoins` filters
-    # these at write time so its UTXO walk never sees them; we mirror
-    # that by filtering at read time too. `scrubUnspendable` is the
-    # idempotent operator tool for permanent removal.
-    if isUnspendable(entry.output.scriptPubKey):
-      continue
-
-    # Reconstruct the outpoint from the 36-byte key (txid(32) || vout(4 BE)).
-    var txidBytes: array[32, byte]
-    copyMem(addr txidBytes[0], unsafeAddr key[0], 32)
-
-    let vout = (uint32(key[32]) shl 24) or
-               (uint32(key[33]) shl 16) or
-               (uint32(key[34]) shl 8)  or
-                uint32(key[35])
-    let outpoint = OutPoint(txid: TxId(txidBytes), vout: vout)
-
-    # Distinct-tx count: increment whenever the leading 32 bytes change.
-    if not sawAny or txidBytes != prevTxidBytes:
-      inc result.transactions
-      prevTxidBytes = txidBytes
-      sawAny = true
-
-    inc result.txOuts
-    result.bogosize += bogoSizeFor(entry.output.scriptPubKey.len)
-    result.totalAmount += int64(entry.output.value)
-    # Estimated on-disk chainstate size: the raw key + value bytes for this
-    # cfUtxo entry, as they sit in the column family. This is a deterministic
-    # proxy for Core's `view->EstimateSize()` (RocksDB has no leveldb-style
-    # range estimate bound here). Impl-specific by design — the differential
-    # test only asserts disk_size is PRESENT + integer-typed, never byte-equal.
-    result.diskSize += uint64(key.len + value.len)
-
-    if hashType != cshtNone:
-      let coinBytes = serializeCoinForHash(
-        outpoint, int64(entry.output.value), entry.output.scriptPubKey,
-        entry.height, entry.isCoinbase)
-      case hashType
-      of cshtHashSerialized:
-        hw.update(coinBytes)
-      of cshtMuHash:
-        muh.insert(coinBytes)
-      of cshtNone: discard
-
-  case hashType
-  of cshtHashSerialized:
-    if result.txOuts > 0:
-      result.hashSerialized = hw.finalizeHash()
-    else:
-      result.hashSerialized = default(array[32, byte])
-  of cshtMuHash:
-    result.hashSerialized = muh.finalize()
-  of cshtNone: discard
+proc computeUtxoSetInfoAt*(v: DbSnapshotView, hashType: CoinStatsHashType,
+                           fallbackHeight: int32,
+                           fallbackHash: BlockHash): UtxoSetInfo =
+  ## `computeUtxoSetInfo` over ONE RocksDB snapshot, with no ChainState access
+  ## and no flush, so it can run on its own OS thread while the main thread
+  ## keeps connecting blocks (Core's ComputeUTXOStats walks a cursor snapshot
+  ## without cs_main).
+  ##
+  ## The height/bestblock come from the SAME snapshot as the coins: every
+  ## writer commits `bestblock`/`height` in the WriteBatch that carries the
+  ## coin changes (`connectBlock`, `flushIBDBatch`), so the label always
+  ## describes the hashed set -- Core seeds them from `pcursor->GetBestBlock()`
+  ## (coinstats.cpp:147-157). The old RPC path read `cs.bestHeight` from the
+  ## RPC thread, then opened an iterator later, while the main thread kept
+  ## connecting, so the label and the set could be different blocks.
+  ##
+  ## In IBD mode the snapshot is the last `flushIBDBatch` checkpoint (still
+  ## self-consistent). The fallbacks are used only when the pointer is absent.
+  result.hashType = hashType
+  result.height = fallbackHeight
+  result.bestBlock = fallbackHash
+  let hb = v.get(cfMeta, metaKey("bestblock"))
+  let hh = v.get(cfMeta, metaKey("height"))
+  if hb.isSome and hb.get().len == 32 and hh.isSome and hh.get().len == 4:
+    var h: array[32, byte]
+    let hbv = hb.get()
+    copyMem(addr h[0], unsafeAddr hbv[0], 32)
+    let d = hh.get()
+    result.bestBlock = BlockHash(h)
+    result.height = cast[int32](uint32(d[0]) or (uint32(d[1]) shl 8) or
+                                (uint32(d[2]) shl 16) or (uint32(d[3]) shl 24))
+  var acc = initUtxoStatsAcc()
+  for (key, value) in v.iterCf(cfUtxo):
+    addUtxoRow(result, acc, key, value)
+  finishUtxoStats(result, acc)
 
 proc maybeRetainIbdBody(cs: var ChainState, blk: Block, blockHash: BlockHash) =
   ## Persist every IBD-connected body (Core AcceptBlock writes the body

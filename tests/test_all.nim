@@ -214,6 +214,7 @@ const IncludedTests = [
   "test_template",
   "test_truc",
   "test_txindex",
+  "test_txoutset_snapshot_walk",
   "test_txospenderindex",
   "test_undo",
   "test_utxo_cache",

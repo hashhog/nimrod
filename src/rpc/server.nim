@@ -2,13 +2,14 @@
 ## Bitcoin Core compatible RPC interface with HTTP Basic auth
 ## JSON-RPC 2.0 compliant with proper error codes
 
-import std/[json, strutils, tables, options, base64, parseutils, times, sets, os, algorithm, streams, sysrand]
+import std/[json, strutils, tables, options, base64, parseutils, times, sets, os, algorithm, streams, sysrand, atomics]
 import chronos
 import chronicles
 import jsony
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation, chain, versionbits]
 import ../storage/[chainstate, blockstore, snapshot, pruner]
+from ../storage/db import DbSnapshotView, openSnapshotView, closeSnapshotView
 import ../storage/indexes/blockfilterindex
 import ../storage/indexes/coinstatsindex
 import ../storage/indexes/txospenderindex
@@ -8391,6 +8392,46 @@ proc formatBtcAmount(satoshi: int64): string =
     rStr = "0" & rStr
   (if neg: "-" else: "") & $q & "." & rStr
 
+proc txOutSetInfoJson(info: UtxoSetInfo, coinHashType: CoinStatsHashType): JsonNode =
+  ## gettxoutsetinfo tip-path response (no coinstatsindex).
+  # Core none/tip-path key order (blockchain.cpp:1114-1130):
+  #   height, bestblock, txouts, bogosize, [hash_serialized_3 | muhash],
+  #   total_amount, transactions, disk_size.
+  var response = %*{
+    "height": info.height,
+    "bestblock": reverseHex(toHex(array[32, byte](info.bestBlock))),
+    "txouts": info.txOuts,
+    "bogosize": info.bogosize
+  }
+
+  case coinHashType
+  of cshtHashSerialized:
+    # Emit BOTH `_3` (Core's current key) and `_2` (legacy alias the
+    # cross-impl diff-test prefers). Display byte-order via reverseHex,
+    # mirroring Core's `stats.hashSerialized.GetHex()` (uint256::GetHex
+    # reverses internally).
+    let hexStr = reverseHex(toHex(info.hashSerialized))
+    response["hash_serialized_3"] = %hexStr
+    response["hash_serialized_2"] = %hexStr
+  of cshtMuHash:
+    response["muhash"] = %reverseHex(toHex(info.hashSerialized))
+  of cshtNone: discard
+
+  response["total_amount"] = parseJson(formatBtcAmount(info.totalAmount))
+  response["transactions"] = %info.transactions
+  # `disk_size`: Core emits this (alongside `transactions`) whenever the
+  # coinstatsindex is NOT used — see blockchain.cpp:1127-1129. It is the
+  # estimated chainstate-on-disk size via CCoinsViewDB::EstimateSize(), which
+  # returns 0 while the coins are still in the in-memory cache (unflushed
+  # regtest chainstate). The value is impl-specific / non-load-bearing per the
+  # RPC contract, so the cross-impl agreement (rustoshi, blockbrew, clearbit) is
+  # to emit the literal 0 on the unflushed-regtest non-index path rather than
+  # the live computed cfUtxo byte sum. The coinstatsindex path (above) OMITS
+  # disk_size entirely and must stay that way.
+  response["disk_size"] = %(0'u64)
+
+  response
+
 proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Return statistics about the UTXO set.
   ##
@@ -8560,45 +8601,19 @@ proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
     resp["block_info"] = blockInfo
     return resp
 
-  let info = computeUtxoSetInfo(rpc.chainState, coinHashType)
-
-  # Core none/tip-path key order (blockchain.cpp:1114-1130):
-  #   height, bestblock, txouts, bogosize, [hash_serialized_3 | muhash],
-  #   total_amount, transactions, disk_size.
-  var response = %*{
-    "height": info.height,
-    "bestblock": reverseHex(toHex(array[32, byte](info.bestBlock))),
-    "txouts": info.txOuts,
-    "bogosize": info.bogosize
-  }
-
-  case coinHashType
-  of cshtHashSerialized:
-    # Emit BOTH `_3` (Core's current key) and `_2` (legacy alias the
-    # cross-impl diff-test prefers). Display byte-order via reverseHex,
-    # mirroring Core's `stats.hashSerialized.GetHex()` (uint256::GetHex
-    # reverses internally).
-    let hexStr = reverseHex(toHex(info.hashSerialized))
-    response["hash_serialized_3"] = %hexStr
-    response["hash_serialized_2"] = %hexStr
-  of cshtMuHash:
-    response["muhash"] = %reverseHex(toHex(info.hashSerialized))
-  of cshtNone: discard
-
-  response["total_amount"] = parseJson(formatBtcAmount(info.totalAmount))
-  response["transactions"] = %info.transactions
-  # `disk_size`: Core emits this (alongside `transactions`) whenever the
-  # coinstatsindex is NOT used — see blockchain.cpp:1127-1129. It is the
-  # estimated chainstate-on-disk size via CCoinsViewDB::EstimateSize(), which
-  # returns 0 while the coins are still in the in-memory cache (unflushed
-  # regtest chainstate). The value is impl-specific / non-load-bearing per the
-  # RPC contract, so the cross-impl agreement (rustoshi, blockbrew, clearbit) is
-  # to emit the literal 0 on the unflushed-regtest non-index path rather than
-  # the live computed cfUtxo byte sum. The coinstatsindex path (above) OMITS
-  # disk_size entirely and must stay that way.
-  response["disk_size"] = %(0'u64)
-
-  response
+  # Tip path: walk ONE RocksDB snapshot, labelled from that snapshot, with
+  # no flush -- this runs on the RPC thread, and flushing the main thread's
+  # caches from here raced connectBlock (see computeUtxoSetInfoAt). Single
+  # requests take asyncGetTxOutSetInfo instead, which runs the same walk on
+  # its own thread; this inline form serves batches.
+  var view = openSnapshotView(rpc.chainState.db.db)
+  var info: UtxoSetInfo
+  try:
+    info = computeUtxoSetInfoAt(view, coinHashType, rpc.chainState.bestHeight,
+                                rpc.chainState.bestBlockHash)
+  finally:
+    closeSnapshotView(view)
+  txOutSetInfoJson(info, coinHashType)
 
 proc parseScanObject(rpc: RpcServer, scanobject: JsonNode): seq[byte] =
   ## Translate a single scanobject into the scriptPubKey bytes to match.
@@ -15630,6 +15645,127 @@ proc handleRequestSafe(rpc: RpcServer, body: string, reqPath: string): string {.
       error "RPC handler defect", error = e.msg, name = $e.name
       result = makeErrorResponse(newJNull(), RpcInternalError, "internal error")
 
+# ---------------------------------------------------------------------------
+# gettxoutsetinfo off the RPC thread (release gate 3a)
+# ---------------------------------------------------------------------------
+#
+# The full-set walk used to run synchronously inside the RPC thread's chronos
+# loop. On mainnet that is ~38 minutes during which the loop serves NOTHING:
+# one getblockcount waited 2,306 s (2026-10-01). It also flushed the main
+# thread's UTXO caches from the RPC thread and labelled the result with a
+# height read at a different moment than the iterator's implicit snapshot.
+#
+# Now: the RPC thread opens a RocksDB snapshot, hands it (raw pointers only,
+# no Nim refs) to a dedicated OS thread that walks it, and awaits completion
+# with a short sleepAsync poll, so every other request on the loop keeps being
+# served. The label comes from the same snapshot as the coins.
+
+type
+  TxoWalkJob = object
+    view: DbSnapshotView
+    hashType: CoinStatsHashType
+    fbHeight: int32
+    fbHash: BlockHash
+    info: UtxoSetInfo
+    failed: bool
+    errMsg: array[256, char]
+    done: Atomic[bool]
+    thread: Thread[ptr TxoWalkJob]
+
+proc txoWalkThread(job: ptr TxoWalkJob) {.thread.} =
+  {.gcsafe.}:
+    try:
+      job.info = computeUtxoSetInfoAt(job.view, job.hashType, job.fbHeight,
+                                      job.fbHash)
+    except Exception as e:
+      job.failed = true
+      let n = min(e.msg.len, job.errMsg.len - 1)
+      for i in 0 ..< n:
+        job.errMsg[i] = e.msg[i]
+  job.done.store(true, moRelease)
+
+proc runTxoWalk*(view: DbSnapshotView, hashType: CoinStatsHashType,
+                 fbHeight: int32, fbHash: BlockHash): Future[UtxoSetInfo] {.async.} =
+  ## Walk `view` on a dedicated thread; the caller's event loop stays live.
+  ## Takes ownership of `view` (closed here).
+  let job = createShared(TxoWalkJob)
+  job.view = view
+  job.hashType = hashType
+  job.fbHeight = fbHeight
+  job.fbHash = fbHash
+  var started = false
+  try:
+    createThread(job.thread, txoWalkThread, job)
+    started = true
+    while not job.done.load(moAcquire):
+      await sleepAsync(20)
+    if job.failed:
+      raise newRpcError(RpcInternalError,
+        "gettxoutsetinfo walk failed: " & $cast[cstring](addr job.errMsg[0]))
+    result = job.info
+  finally:
+    # Never free the job under a running walker (e.g. on cancellation).
+    if started:
+      joinThread(job.thread)
+    closeSnapshotView(job.view)
+    freeShared(job)
+
+proc prepTxOutSetInfo(rpc: RpcServer, params: JsonNode,
+                      done: var JsonNode,
+                      hashType: var CoinStatsHashType) {.raises: [CatchableError].} =
+  ## Synchronous front half of `asyncGetTxOutSetInfo`: arity, hash_type, and
+  ## the coinstatsindex (specific-height) path, which needs no walk. Sets
+  ## `done` when the answer is complete. Defects from the sync handlers are
+  ## mapped to RPC internal errors (the async machinery accepts only
+  ## CatchableError).
+  try:
+    let isTip = not (params.kind == JArray and params.len >= 2 and
+                     params[1].kind != JNull)
+    if not isTip:
+      done = rpc.handleMethod("gettxoutsetinfo", params)
+      return
+    checkCoreArity("gettxoutsetinfo", params)
+    let hashTypeStr = if params.kind == JArray and params.len >= 1 and
+                         params[0].kind == JString:
+                        params[0].getStr()
+                      else:
+                        "hash_serialized_3"
+    hashType = case hashTypeStr
+      of "hash_serialized_3", "hash_serialized_2", "hash_serialized":
+        cshtHashSerialized
+      of "muhash":
+        cshtMuHash
+      of "none":
+        cshtNone
+      else:
+        raise newRpcError(RpcInvalidParameter,
+                          "'" & hashTypeStr & "' is not a valid hash_type")
+  except CatchableError as e:
+    raise e
+  except Exception as e:
+    raise newRpcError(RpcInternalError, "internal error: " & e.msg)
+
+proc asyncGetTxOutSetInfo(rpc: RpcServer, params: JsonNode): Future[JsonNode] {.async.} =
+  ## Single-request gettxoutsetinfo. Same arity / hash_type / coinstatsindex
+  ## handling as the synchronous handler; only the tip-path walk moves to its
+  ## own thread.
+  var done: JsonNode = nil
+  var coinHashType = cshtHashSerialized
+  {.gcsafe.}:
+    rpc.prepTxOutSetInfo(params, done, coinHashType)
+  if done != nil:
+    return done
+  let view = openSnapshotView(rpc.chainState.db.db)
+  let info = await runTxoWalk(view, coinHashType, rpc.chainState.bestHeight,
+                              rpc.chainState.bestBlockHash)
+  try:
+    {.gcsafe.}:
+      return txOutSetInfoJson(info, coinHashType)
+  except CatchableError as e:
+    raise e
+  except Exception as e:
+    raise newRpcError(RpcInternalError, "internal error: " & e.msg)
+
 proc asyncHandleRequest(rpc: RpcServer, body: string,
                         reqPath: string = ""): Future[string] {.async.} =
   ## Async front door for the request path. The three wait-family RPCs must
@@ -15650,7 +15786,8 @@ proc asyncHandleRequest(rpc: RpcServer, body: string,
   # Only single-object requests to a wait method take the async path.
   if parsed.kind != JObject or not parsed.hasKey("method") or
      parsed["method"].kind != JString or
-     not isWaitMethod(parsed["method"].getStr()):
+     not (isWaitMethod(parsed["method"].getStr()) or
+          parsed["method"].getStr() == "gettxoutsetinfo"):
     return rpc.handleRequestSafe(body, reqPath)
 
   # Set the per-request wallet context exactly as the sync path does (harmless
@@ -15686,7 +15823,8 @@ proc asyncHandleRequest(rpc: RpcServer, body: string,
       of "waitfornewblock":    await rpc.rpcWaitForNewBlock(params)
       of "waitforblock":       await rpc.rpcWaitForBlock(params)
       of "waitforblockheight": await rpc.rpcWaitForBlockHeight(params)
-      else:                    newJNull()  # unreachable (isWaitMethod gate)
+      of "gettxoutsetinfo":    await rpc.asyncGetTxOutSetInfo(params)
+      else:                    newJNull()  # unreachable (method gate)
     return $ %*{
       "jsonrpc": "2.0",
       "id": requestId,

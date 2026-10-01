@@ -98,6 +98,9 @@ proc rocksdb_readoptions_create*(): RocksDbReadOptionsPtr
 proc rocksdb_readoptions_destroy*(opts: RocksDbReadOptionsPtr)
 proc rocksdb_readoptions_set_verify_checksums*(opts: RocksDbReadOptionsPtr, v: uint8)
 proc rocksdb_readoptions_set_fill_cache*(opts: RocksDbReadOptionsPtr, v: uint8)
+proc rocksdb_readoptions_set_snapshot*(opts: RocksDbReadOptionsPtr, snap: pointer)
+proc rocksdb_create_snapshot*(db: RocksDbPtr): pointer
+proc rocksdb_release_snapshot*(db: RocksDbPtr, snap: pointer)
 
 # Database operations
 proc rocksdb_open*(opts: RocksDbOptionsPtr, name: cstring, errptr: ptr cstring): RocksDbPtr
@@ -685,6 +688,85 @@ iterator iterCf*(db: Database, cf: ColumnFamily): tuple[key: seq[byte], value: s
         copyMem(addr val[0], vPtr, vlen)
       # NOTE: we do NOT free kPtr/vPtr — RocksDB owns those buffers and
       # invalidates them on the next iter_next/destroy.
+      yield (key, val)
+      rocksdb_iter_next(it)
+    var err: cstring = nil
+    rocksdb_iter_get_error(it, addr err)
+    checkError(err)
+  finally:
+    rocksdb_iter_destroy(it)
+
+# ============================================================================
+# Point-in-time snapshot view (gettxoutsetinfo off the RPC thread)
+# ============================================================================
+
+type
+  DbSnapshotView* = object
+    ## A RocksDB snapshot plus the raw handles needed to read it. Holds NO
+    ## Nim refs, so it can be handed by value to another OS thread: the
+    ## gettxoutsetinfo walk runs on its own thread over one of these while
+    ## blocks keep connecting on the main thread. Every read through it sees
+    ## the database exactly as it was when `openSnapshotView` ran, across all
+    ## column families -- so the best-block pointer read from it labels
+    ## exactly the coin set iterated from it (the tip and the coins are
+    ## committed in one WriteBatch). Close it with `closeSnapshotView`.
+    raw: RocksDbPtr
+    snap: pointer
+    ro: RocksDbReadOptionsPtr
+    cfs: array[ColumnFamily, RocksDbColumnFamilyHandle]
+
+proc openSnapshotView*(db: Database): DbSnapshotView =
+  result.raw = db.db
+  result.cfs = db.cfHandles
+  result.snap = rocksdb_create_snapshot(db.db)
+  result.ro = rocksdb_readoptions_create()
+  rocksdb_readoptions_set_snapshot(result.ro, result.snap)
+  # A full-set walk must not evict the working set validation reads.
+  rocksdb_readoptions_set_fill_cache(result.ro, 0)
+
+proc closeSnapshotView*(v: var DbSnapshotView) =
+  if v.snap != nil:
+    rocksdb_readoptions_destroy(v.ro)
+    rocksdb_release_snapshot(v.raw, v.snap)
+    v.snap = nil
+    v.ro = nil
+
+proc get*(v: DbSnapshotView, cf: ColumnFamily,
+          key: openArray[byte]): Option[seq[byte]] =
+  var
+    err: cstring = nil
+    vallen: csize_t
+  let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
+  let data = rocksdb_get_cf(v.raw, v.ro, v.cfs[cf], keyPtr, csize_t(key.len),
+                            addr vallen, addr err)
+  checkError(err)
+  if data != nil and vallen > 0:
+    var res = newSeq[byte](vallen)
+    copyMem(addr res[0], data, vallen)
+    rocksdb_free(data)
+    return some(res)
+  elif data != nil:
+    rocksdb_free(data)
+  none(seq[byte])
+
+iterator iterCf*(v: DbSnapshotView, cf: ColumnFamily): tuple[key: seq[byte], value: seq[byte]] =
+  ## `iterCf` over the snapshot.
+  let it = rocksdb_create_iterator_cf(v.raw, v.ro, v.cfs[cf])
+  if it == nil:
+    raise newException(RocksDbError, "failed to create snapshot iterator for cf " & $cf)
+  try:
+    rocksdb_iter_seek_to_first(it)
+    while rocksdb_iter_valid(it) != 0:
+      var klen: csize_t = 0
+      var vlen: csize_t = 0
+      let kPtr = rocksdb_iter_key(it, addr klen)
+      let vPtr = rocksdb_iter_value(it, addr vlen)
+      var key = newSeq[byte](klen)
+      var val = newSeq[byte](vlen)
+      if klen > 0:
+        copyMem(addr key[0], kPtr, klen)
+      if vlen > 0:
+        copyMem(addr val[0], vPtr, vlen)
       yield (key, val)
       rocksdb_iter_next(it)
     var err: cstring = nil
