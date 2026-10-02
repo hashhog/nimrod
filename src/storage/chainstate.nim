@@ -2969,7 +2969,17 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
   #   always carry per-output metadata so this path is dormant on
   #   chains synced with modern code, but is required for correctness on
   #   legacy datadirs and crash-recovery from old undo files.
+  # Intra-block chains: an input whose prevout was CREATED by an earlier tx of
+  # this same block is in the undo (with this block's height) but did not exist
+  # before the block. Core's per-tx reverse unwind restores it and then removes
+  # it again when it reaches the creating tx (validation.cpp:2205-2240), so the
+  # net effect is "absent". Restoring it after the whole-block output removal
+  # above would resurrect a coin that never existed at the parent.
+  var blockTxids = initHashSet[TxId]()
+  for t in blk.txs: blockTxids.incl(t.txid())
   for (outpoint, entry) in undo.spentOutputs:
+    if outpoint.txid in blockTxids:
+      continue
     var restoreEntry = entry
 
     # DISCONNECT_UNCLEAN (b): ApplyTxInUndo HaveCoin overwrite check
@@ -3286,8 +3296,14 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
         cs.reorgDeletedUtxos[][outpointKey(outpoint)] = true
       batch.delete(cfTxIndex, txIndexKey(array[32, byte](txId)))
 
-    # Restore spent outputs from undo data.
+    # Restore spent outputs from undo data, skipping intra-block-created
+    # prevouts (created and spent inside this block: absent at the parent,
+    # Core validation.cpp:2205-2240 per-tx unwind order).
+    var blockTxids = initHashSet[TxId]()
+    for t in blk.txs: blockTxids.incl(t.txid())
     for (outpoint, entry) in undo.spentOutputs:
+      if outpoint.txid in blockTxids:
+        continue
       let key = utxoKey(array[32, byte](outpoint.txid), outpoint.vout)
       batch.put(cfUtxo, key, serializeUtxoEntry(entry))
       cs.putUtxoCache(outpoint, entry)
