@@ -628,7 +628,19 @@ proc campaignAssumeutxoFatal(path, msg: string) {.noreturn.} =
   echo "[CAMPAIGN-ASSUMEUTXO] " & path & ": " & msg
   quit(1)
 
-proc loadCampaignAssumeutxo*(params: var ConsensusParams) =
+type CampaignAssumeutxoError* = object of CatchableError
+  ## Raised by applyCampaignAssumeutxoFile on any refusal (malformed file,
+  ## collision with a built-in entry, in-file duplicate).
+
+proc campaignAssumeutxoRefuse(path, msg: string) {.noreturn.} =
+  raise newException(CampaignAssumeutxoError, msg)
+
+proc isZeroChainwork(w: array[32, byte]): bool =
+  for b in w:
+    if b != 0: return false
+  true
+
+proc applyCampaignAssumeutxoFile*(params: var ConsensusParams, path: string) =
   ## `HASHHOG_CAMPAIGN_ASSUMEUTXO=<abs-path.json>` — read ONCE at startup,
   ## after network-params selection. When set, parses the file and appends
   ## its entries to the *running network's* assumeutxo allowlist
@@ -649,53 +661,51 @@ proc loadCampaignAssumeutxo*(params: var ConsensusParams) =
   ## On collision with a built-in (or already-loaded) entry, by height OR
   ## blockhash: refuses to start. Campaign data may never override a
   ## production hash. See receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md.
-  let path = getEnv(CampaignAssumeutxoEnvVar, "")
-  if path.len == 0:
-    return
-
   let raw =
     try:
       readFile(path)
     except IOError as e:
-      campaignAssumeutxoFatal(path, "failed to read: " & e.msg)
+      campaignAssumeutxoRefuse(path, "failed to read: " & e.msg)
   let root =
     try:
       parseJson(raw)
     except CatchableError as e:
-      campaignAssumeutxoFatal(path, "failed to parse JSON: " & e.msg)
+      campaignAssumeutxoRefuse(path, "failed to parse JSON: " & e.msg)
 
   if root.kind != JArray:
-    campaignAssumeutxoFatal(path, "expected a top-level JSON array")
+    campaignAssumeutxoRefuse(path, "expected a top-level JSON array")
 
   var loaded: seq[AssumeutxoData] = @[]
   var heights: seq[string] = @[]
+  var confirms: seq[int] = @[]           # built-in rows confirmed by the file
+  var confirmData: seq[AssumeutxoData] = @[]
 
   for entry in root.elems:
     if entry.kind != JObject:
-      campaignAssumeutxoFatal(path, "each entry must be a JSON object")
+      campaignAssumeutxoRefuse(path, "each entry must be a JSON object")
 
     for key in ["height", "blockhash", "hash_serialized", "m_chain_tx_count"]:
       if not entry.hasKey(key):
-        campaignAssumeutxoFatal(path, "entry missing required key \"" & key & "\"")
+        campaignAssumeutxoRefuse(path, "entry missing required key \"" & key & "\"")
 
     let heightNode = entry["height"]
     if heightNode.kind != JInt or heightNode.getBiggestInt() <= 0:
-      campaignAssumeutxoFatal(path, "\"height\" must be a positive integer")
+      campaignAssumeutxoRefuse(path, "\"height\" must be a positive integer")
     let height = int32(heightNode.getBiggestInt())
 
     let blockhashHex = entry["blockhash"].getStr("")
     if blockhashHex.len != 64 or not blockhashHex.allCharsInSet(HexDigits):
-      campaignAssumeutxoFatal(path,
+      campaignAssumeutxoRefuse(path,
         "\"blockhash\" at height " & $height & " must be 64 hex characters")
 
     let hashSerializedHex = entry["hash_serialized"].getStr("")
     if hashSerializedHex.len != 64 or not hashSerializedHex.allCharsInSet(HexDigits):
-      campaignAssumeutxoFatal(path,
+      campaignAssumeutxoRefuse(path,
         "\"hash_serialized\" at height " & $height & " must be 64 hex characters")
 
     let chainTxCountNode = entry["m_chain_tx_count"]
     if chainTxCountNode.kind != JInt or chainTxCountNode.getBiggestInt() < 0:
-      campaignAssumeutxoFatal(path,
+      campaignAssumeutxoRefuse(path,
         "\"m_chain_tx_count\" at height " & $height & " must be a non-negative integer")
     let chainTxCount = uint64(chainTxCountNode.getBiggestInt())
 
@@ -713,7 +723,7 @@ proc loadCampaignAssumeutxo*(params: var ConsensusParams) =
         entry["base_tail_headers"].elems.len > 0:
       for n in entry["base_tail_headers"].elems:
         if n.kind != JString:
-          campaignAssumeutxoFatal(path,
+          campaignAssumeutxoRefuse(path,
             "base_tail_headers entries must be hex strings at height " & $height)
         rawTails.add(n.getStr)
     elif entry.hasKey("base_header") and entry["base_header"].kind ==
@@ -724,33 +734,33 @@ proc loadCampaignAssumeutxo*(params: var ConsensusParams) =
         entry["base_header"].kind == JString and entry[
             "base_header"].getStr.len > 0:
       if rawTails[^1].toLowerAscii != entry["base_header"].getStr.toLowerAscii:
-        campaignAssumeutxoFatal(path,
+        campaignAssumeutxoRefuse(path,
           "base_header does not match the last base_tail_headers entry at height " &
           $height)
 
     if rawTails.len > 0:
       if int64(rawTails.len) - 1 > int64(height):
-        campaignAssumeutxoFatal(path,
+        campaignAssumeutxoRefuse(path,
           "base_tail_headers has " & $rawTails.len &
           " entries but base height is only " & $height)
       for i, hx in rawTails:
         if hx.len != 160 or not hx.allCharsInSet(HexDigits):
-          campaignAssumeutxoFatal(path,
+          campaignAssumeutxoRefuse(path,
             "base_tail_headers[" & $i & "] at height " & $height &
             " must be 160 hex characters")
         let hdr =
           try:
             parseCampaignHeaderHex(hx)
           except ValueError as e:
-            campaignAssumeutxoFatal(path,
+            campaignAssumeutxoRefuse(path,
               "base_tail_headers[" & $i & "] at height " & $height & ": " & e.msg)
         if i > 0 and hdr.prevBlock != campaignHeaderHash(tailHeaders[i - 1]):
-          campaignAssumeutxoFatal(path,
+          campaignAssumeutxoRefuse(path,
             "base_tail_headers[" & $i & "] prev-hash does not link to [" &
             $(i - 1) & "] at height " & $height)
         tailHeaders.add(hdr)
       if campaignHeaderHash(tailHeaders[^1]) != blockhash:
-        campaignAssumeutxoFatal(path,
+        campaignAssumeutxoRefuse(path,
           "last base_tail_headers entry does not hash to the entry blockhash at height " &
           $height)
 
@@ -760,7 +770,7 @@ proc loadCampaignAssumeutxo*(params: var ConsensusParams) =
       if cw.startsWith("0x") or cw.startsWith("0X"):
         cw = cw[2 .. ^1]
       if cw.len != 64 or not cw.allCharsInSet(HexDigits):
-        campaignAssumeutxoFatal(path,
+        campaignAssumeutxoRefuse(path,
           "\"chainwork\" at height " & $height & " must be 64 hex characters")
       chainwork = hexToBytes32(cw)
 
@@ -773,29 +783,106 @@ proc loadCampaignAssumeutxo*(params: var ConsensusParams) =
       baseTailHeaders: tailHeaders
     )
 
-    # Collision refusal: never let campaign data override/duplicate a
-    # built-in entry, or a different entry already merged from this same
-    # campaign file, by height OR blockhash.
-    for existing in params.assumeutxoData:
-      if existing.height == data.height or existing.blockhash == data.blockhash:
-        campaignAssumeutxoFatal(path,
-          "entry at height " & $height &
-          " collides with a built-in assumeutxo entry — refusing to start")
+    # Refuse a duplicate inside the campaign file itself (by height OR
+    # blockhash) before any comparison with the built-in table.
     for existing in loaded:
       if existing.height == data.height or existing.blockhash == data.blockhash:
-        campaignAssumeutxoFatal(path,
+        campaignAssumeutxoRefuse(path,
           "duplicate entry at height " & $height & " within campaign file")
+    for c in confirms:
+      if params.assumeutxoData[c].height == data.height or
+          params.assumeutxoData[c].blockhash == data.blockhash:
+        campaignAssumeutxoRefuse(path,
+          "duplicate entry at height " & $height & " within campaign file")
+
+    # Collision refusal: campaign data may never override a built-in
+    # (production) entry, by height OR blockhash.
+    #
+    # The ONE non-refusal: an entry whose whole commitment -- height,
+    # blockhash, hash_serialized AND m_chain_tx_count -- is IDENTICAL to the
+    # built-in row is not an override but a second source agreeing with the
+    # first (Core keys an m_assumeutxo_data row by height+blockhash and checks
+    # the snapshot against its hash_serialized; a byte-identical row adds no
+    # trust). The R4 rung at 910,000 was minted by dumping a Core clone there
+    # and equals Core's own hardcoded anchor; refusing it BLOCKED the slice.
+    # Such an entry CONFIRMS the built-in row: the commitment is kept, and
+    # only the supplemental ancestry the built-in row lacks (chainwork,
+    # base_tail_headers -- both needed by persistAssumeutxoBaseHeaders to
+    # boot the header chain at the base) is filled in. A value contradicting
+    # one the row already pins is refused. Hex is compared as decoded bytes,
+    # so case cannot matter.
+    var confirmIdx = -1
+    for i, existing in params.assumeutxoData:
+      if existing.height == data.height or existing.blockhash == data.blockhash:
+        let identical = existing.height == data.height and
+          existing.blockhash == data.blockhash and
+          existing.hashSerialized == data.hashSerialized and
+          existing.chainTxCount == data.chainTxCount
+        if not identical:
+          campaignAssumeutxoRefuse(path,
+            "entry at height " & $height &
+            " collides with a built-in assumeutxo entry (blockhash/" &
+            "hash_serialized/m_chain_tx_count differ) — refusing to start")
+        confirmIdx = i
+        break
+
+    if confirmIdx >= 0:
+      let existing = params.assumeutxoData[confirmIdx]
+      if not isZeroChainwork(existing.chainwork) and
+          not isZeroChainwork(data.chainwork) and
+          existing.chainwork != data.chainwork:
+        campaignAssumeutxoRefuse(path,
+          "entry at height " & $height &
+          " matches the built-in commitment but its chainwork contradicts" &
+          " the built-in row — refusing to start")
+      if existing.baseTailHeaders.len > 0 and data.baseTailHeaders.len > 0 and
+          existing.baseTailHeaders != data.baseTailHeaders:
+        campaignAssumeutxoRefuse(path,
+          "entry at height " & $height &
+          " matches the built-in commitment but its base_tail_headers" &
+          " contradict the built-in row — refusing to start")
+      confirms.add(confirmIdx)
+      confirmData.add(data)
+      heights.add($height & "(confirms built-in)")
+      continue
 
     loaded.add(data)
     heights.add($height)
 
+  # Every entry validated: only now mutate the table (a refusal above leaves
+  # params untouched).
+  for k, c in confirms:
+    var filled: seq[string] = @[]
+    if isZeroChainwork(params.assumeutxoData[c].chainwork) and
+        not isZeroChainwork(confirmData[k].chainwork):
+      params.assumeutxoData[c].chainwork = confirmData[k].chainwork
+      filled.add("chainwork")
+    if params.assumeutxoData[c].baseTailHeaders.len == 0 and
+        confirmData[k].baseTailHeaders.len > 0:
+      params.assumeutxoData[c].baseTailHeaders = confirmData[k].baseTailHeaders
+      filled.add("base_tail_headers")
+    echo "[CAMPAIGN-ASSUMEUTXO] entry height " & $confirmData[k].height &
+      " is IDENTICAL to the built-in assumeutxo commitment (blockhash," &
+      " hash_serialized, m_chain_tx_count) -- accepted as a confirmation;" &
+      " commitment kept, filled: [" & filled.join(",") & "]"
   params.assumeutxoData.add(loaded)
 
   # Loud, greppable startup banner (tools/fleet-monitor.sh alerts if this
   # ever appears in a production log — the flag must only be used for the
   # M2 boundary campaign, never on a launcher-started production node).
-  echo "[CAMPAIGN-ASSUMEUTXO] loaded " & $loaded.len & " entries from " &
+  echo "[CAMPAIGN-ASSUMEUTXO] loaded " & $(loaded.len + confirms.len) & " entries from " &
     path & " heights=[" & heights.join(", ") & "]"
+
+proc loadCampaignAssumeutxo*(params: var ConsensusParams) =
+  ## Startup entrypoint: reads `HASHHOG_CAMPAIGN_ASSUMEUTXO` once; unset/empty
+  ## => no-op. Any refusal from applyCampaignAssumeutxoFile is startup-fatal.
+  let path = getEnv(CampaignAssumeutxoEnvVar, "")
+  if path.len == 0:
+    return
+  try:
+    applyCampaignAssumeutxoFile(params, path)
+  except CampaignAssumeutxoError as e:
+    campaignAssumeutxoFatal(path, e.msg)
 
 proc getBlockSubsidy*(height: int, params: ConsensusParams): Satoshi =
   ## Calculate block subsidy at given height
