@@ -3,6 +3,7 @@
 ## JSON-RPC 2.0 compliant with proper error codes
 
 import std/[json, strutils, tables, options, base64, parseutils, times, sets, os, algorithm, streams, sysrand, atomics]
+from std/posix import nil
 import chronos
 import chronicles
 import jsony
@@ -45,6 +46,11 @@ type
     authPass*: string
     cookiePassword*: string              ## Password for __cookie__ auth (auto-generated)
     running*: bool
+    shutdownRequested*: bool             ## RPC `stop` was accepted. processClient
+                                         ## raises SIGTERM once the reply is
+                                         ## written (requestNodeShutdown), so
+                                         ## `stop` and SIGTERM share one path.
+    shutdownSignalled: bool
     crypto*: CryptoEngine
     blockFileManager*: BlockFileManager  ## Optional: for pruning support
     pruner*: Pruner                      ## Optional: production prune driver
@@ -15374,8 +15380,13 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
 
   # Control
   of "stop":
-    # Return success - actual shutdown handled by caller
+    # Core rpc/server.cpp stop: type-check `wait`, then StartShutdown() and
+    # answer. The shutdown itself is raised by processClient AFTER this reply
+    # is on the wire (requestNodeShutdown -> SIGTERM -> the same sigHandler a
+    # `kill -TERM` runs). Before gate 5 this branch only answered, so `stop`
+    # was a no-op and the node kept running.
     if params.len >= 1 and params[0].kind notin {JInt, JNull}: raise newRpcError(RpcTypeError, "JSON value of type " & uvTypeName(params[0]) & " is not of expected type number")
+    rpc.shutdownRequested = true
     %"nimrod server stopping"
   of "uptime":
     rpc.handleUptime()
@@ -15910,6 +15921,17 @@ func cumulativeHeaderBytes*(soFar: int, line: string): int {.inline.} =
 func headersExceedCap*(soFar: int, line: string): bool {.inline.} =
   cumulativeHeaderBytes(soFar, line) > MaxHeadersSize
 
+proc requestNodeShutdown(rpc: RpcServer) =
+  ## Deliver SIGTERM to our own process: the kernel routes a process-directed
+  ## signal to the main thread, which runs setupSignalHandlers' sigHandler —
+  ## the exact path an operator's `kill -TERM` takes (flush, close, quit 0).
+  ## Called once, after the `stop` reply has been written.
+  if rpc.shutdownSignalled:
+    return
+  rpc.shutdownSignalled = true
+  info "RPC stop: requesting shutdown (SIGTERM to self)"
+  discard posix.kill(posix.getpid(), posix.SIGTERM)
+
 proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
   ## Handle a single client connection with proper HTTP parsing
   var headers: Table[string, string]
@@ -15985,6 +16007,8 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
                               "Content-Length: " & $respResult.len & "\r\n" &
                               "\r\n" & respResult
             discard await transp.write(httpResponse)
+            if rpc.shutdownRequested:
+              rpc.requestNodeShutdown()
             # Connection: close — finish after each request
             break
 

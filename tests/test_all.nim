@@ -186,6 +186,7 @@ const IncludedTests = [
   "test_rpc",
   "test_rpc_conversion_before_lookup",
   "test_rpc_int_arg_bounds",
+  "test_rpc_stop_shutdown",
   "test_rpc_thread_lifetime",
   "test_script",
   "test_script_flag_exceptions",
