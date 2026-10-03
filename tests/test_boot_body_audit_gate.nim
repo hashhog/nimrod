@@ -15,7 +15,7 @@
 ## in `startNode` before either exists.
 
 import unittest2
-import std/[os, strutils, sets, options]
+import std/[os, strutils, sets, options, atomics]
 import ../src/storage/chainstate
 import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing
@@ -179,3 +179,52 @@ suite "startup body audit does not walk on the caller":
     check cs.drainStagedBodyRepairs() == 0
     check cs.bodyRepairRemaining() == 0
     cs.close()
+
+suite "SIGTERM during the startup body audit":
+  ## The audit thread reads cfBlocks for 10-20 min after a mainnet boot.
+  ## The SIGTERM handler closes RocksDB; closing it under a thread that is
+  ## still iterating is a use-after-close. The handler must stop the audit
+  ## (or leave the DB open) first.
+  setup:
+    cleanupTestDb()
+
+  teardown:
+    cleanupTestDb()
+
+  test "a cancelled audit publishes nothing, stages nothing, and reports stopped":
+    var cs = newChainState(TestDbPath, regtestParams())
+    discard connectChain(cs, 12)
+    cs.db.deleteBlockBody(cs.db.getBlockHashByHeight(8).get())
+    cs.deferStartupBodyAudit()
+    cs.markStartupBodyAuditRunning()
+    check cs.bodyAuditRunning.load(moAcquire) == 1
+    cs.bodyAuditCancel.store(true, moRelease)
+    cs.startupRetainedBodyAudit()
+    check cs.bodyAuditRunning.load(moAcquire) == 0
+    check not cs.historyFloorProbed
+    check cs.drainStagedBodyRepairs() == 0
+    check cs.stopStartupBodyAudit(100)
+    cs.close()
+
+  test "stop waits for a running audit and gives up after its timeout":
+    var cs = newChainState(TestDbPath, regtestParams())
+    cs.markStartupBodyAuditRunning()
+    check not cs.stopStartupBodyAudit(50)
+    check cs.bodyAuditCancel.load(moAcquire)
+    cs.bodyAuditRunning.store(0, moRelease)
+    check cs.stopStartupBodyAudit(50)
+    cs.close()
+
+  test "the SIGTERM handler stops the audit before closing the database":
+    let src = stripLineComments(nimrodSrc())
+    let i = src.find("proc sigHandler(")
+    check i >= 0
+    let body = src[i .. ^1]
+    let stopAt = body.find("stopStartupBodyAudit(")
+    let closeAt = body.find("chainState.close()")
+    check stopAt >= 0
+    check closeAt > stopAt
+    let markAt = src.find("markStartupBodyAuditRunning()")
+    let threadAt = src.find("createThread(state.retainedBodyAuditThread")
+    check markAt >= 0
+    check markAt < threadAt

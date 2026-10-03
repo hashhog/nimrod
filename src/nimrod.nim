@@ -1927,10 +1927,18 @@ proc setupSignalHandlers*() =
         info "disconnecting peers"
         globalNodeState.peerManager.stop()
 
-      # Close database
+      # Close database. The startup body audit reads RocksDB from its own
+      # thread for the first 10-20 min after boot; closing the DB under it
+      # is a use-after-close. Stop it first. If it does not stop in time,
+      # leave the DB open: every write above went through the WAL (stopIBD
+      # already flushed the IBD batch), and process exit reclaims the handle.
       if globalNodeState.chainState != nil:
-        info "closing database"
-        globalNodeState.chainState.close()
+        if globalNodeState.chainState.stopStartupBodyAudit(5000):
+          info "closing database"
+          globalNodeState.chainState.close()
+        else:
+          warn "retained-range body audit did not stop; leaving the database open"
+
 
       info "shutdown complete"
 
@@ -3336,11 +3344,13 @@ proc startNode*(config: NimrodConfig) {.async.} =
       state.chainState.startupAuditPrunerHeight =
         state.pruner.currentPruneHeight()
     info "starting background retained-range body audit"
+    state.chainState.markStartupBodyAuditRunning()
     try:
       createThread(state.retainedBodyAuditThread, retainedBodyAuditThreadMain,
                    state.chainState)
     except CatchableError as e:
       warn "retained-range body audit thread failed to start", error = e.msg
+      state.chainState.markStartupBodyAuditStopped()
       state.chainState.releaseDeferredBodyAudit()
 
   # 11a. Startup ASMapHealthCheck (G16/G28 FIX-52).

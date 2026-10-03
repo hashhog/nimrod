@@ -200,6 +200,13 @@ type
     stagedBodyRepairs: seq[BlockHash]
     stagedBodyRepairsReady: bool
     bodyRepairStageLock: Lock
+    # Shutdown handshake with the startup audit thread. The SIGTERM handler
+    # closes RocksDB; doing that under a thread that is still iterating
+    # cfBlocks is a use-after-close. bodyAuditRunning is 1 from just before
+    # the thread is created until startupRetainedBodyAudit returns;
+    # bodyAuditCancel makes its walks stop at the next height.
+    bodyAuditRunning*: Atomic[int32]
+    bodyAuditCancel*: Atomic[bool]
     # Pending UTXO deletes tracked during IBD (cache key -> true)
     ibdDeletedUtxos*: Table[string, bool]
     # Disk flush state — tracks blocks since last forced memtable→SST flush.
@@ -609,7 +616,8 @@ proc discoverFirstBody*(cdb: ChainDb, tip: int32): int32 {.gcsafe, raises: [].} 
       lo = mid + 1
   lo
 
-proc discoverBodyFloor*(cdb: ChainDb, tip: int32): int32 {.gcsafe, raises: [].} =
+proc discoverBodyFloor*(cdb: ChainDb, tip: int32,
+                        cancel: ptr Atomic[bool] = nil): int32 {.gcsafe, raises: [].} =
   ## First height of the contiguous body run ending at `tip`.
   ##
   ## Core BlockManager::GetFirstBlock / getblockchaininfo.pruneheight:
@@ -628,6 +636,8 @@ proc discoverBodyFloor*(cdb: ChainDb, tip: int32): int32 {.gcsafe, raises: [].} 
     return tip
   var h = tip
   while h > 0:
+    if cancel != nil and cancel[].load(moRelaxed):
+      return h   # caller checks the flag; a cancelled walk is never published
     if not heightHasBody(cdb, h - 1):
       if h == 1:
         return 0
@@ -651,7 +661,8 @@ type
 proc auditRetainedBodies*(cdb: ChainDb, tip: int32,
                           pruneHeight: int32 = -1,
                           maxHoles: int = 64,
-                          unretainedGap: int32 = UnretainedGapThreshold):
+                          unretainedGap: int32 = UnretainedGapThreshold,
+                          cancel: ptr Atomic[bool] = nil):
                           RetainedBodyAudit {.gcsafe, raises: [].} =
   ## Walk every height between the retained floor and `tip` and record
   ## connected blocks whose body is unreadable.
@@ -691,6 +702,8 @@ proc auditRetainedBodies*(cdb: ChainDb, tip: int32,
   var found: seq[int32] = @[]
   var h = floor
   while h <= tip:
+    if cancel != nil and cancel[].load(moRelaxed):
+      break
     var have = false
     var indexed = false
     try:
@@ -741,7 +754,8 @@ proc countRetainedBodyHoles*(cdb: ChainDb, tip: int32): int {.raises: [].} =
     discard
 
 proc planBodyRepairs*(cdb: ChainDb, tip: int32,
-                      maxHoles: int = 0): seq[BlockHash] {.raises: [].} =
+                      maxHoles: int = 0,
+                      cancel: ptr Atomic[bool] = nil): seq[BlockHash] {.raises: [].} =
   ## Hashes of connected active-chain bodies missing in [firstBody, tip].
   ##
   ## Interior holes only. The unretained prefix below discoverFirstBody
@@ -760,6 +774,8 @@ proc planBodyRepairs*(cdb: ChainDb, tip: int32,
     let floor = discoverFirstBody(cdb, tip)
     var h = floor
     while h <= tip:
+      if cancel != nil and cancel[].load(moRelaxed):
+        break
       let hashOpt = cdb.getBlockHashByHeight(h)
       if hashOpt.isSome and not cdb.hasBlockBody(hashOpt.get()):
         result.add(hashOpt.get())
@@ -842,6 +858,35 @@ proc releaseDeferredBodyAudit*(cs: ChainState) {.gcsafe, raises: [].} =
     return
   cs.bodyAuditDeferred.store(0, moRelease)
 
+proc markStartupBodyAuditRunning*(cs: ChainState) {.gcsafe, raises: [].} =
+  ## Main thread, immediately before createThread, so a SIGTERM that lands
+  ## between thread creation and the first walk still waits for it.
+  if cs == nil:
+    return
+  cs.bodyAuditCancel.store(false, moRelease)
+  cs.bodyAuditRunning.store(1, moRelease)
+
+proc markStartupBodyAuditStopped*(cs: ChainState) {.gcsafe, raises: [].} =
+  ## The audit thread failed to start: nothing to wait for at shutdown.
+  if cs == nil:
+    return
+  cs.bodyAuditRunning.store(0, moRelease)
+
+proc stopStartupBodyAudit*(cs: ChainState, timeoutMs: int = 5000): bool {.gcsafe, raises: [].} =
+  ## Ask the startup audit thread to stop and wait up to `timeoutMs` for it
+  ## to leave RocksDB. true = it is not running (safe to close the DB).
+  ## Its walks check the flag once per height, so the wait is one body read.
+  if cs == nil:
+    return true
+  cs.bodyAuditCancel.store(true, moRelease)
+  var waited = 0
+  while cs.bodyAuditRunning.load(moAcquire) != 0:
+    if waited >= timeoutMs:
+      return false
+    sleep(10)
+    waited += 10
+  true
+
 proc stageBodyRepairs*(cs: ChainState, hashes: seq[BlockHash]): int {.gcsafe, raises: [].} =
   ## Publish repair hashes from the audit thread. Does not touch
   ## pendingBodyRepairs. Returns how many hashes were staged.
@@ -878,19 +923,27 @@ proc startupRetainedBodyAudit*(cs: ChainState) {.gcsafe, raises: [].} =
   ## before clearing bodyAuditDeferred.
   if cs == nil:
     return
+  # Cleared on every return so the SIGTERM handler's wait ends.
+  defer: cs.bodyAuditRunning.store(0, moRelease)
   if cs.db == nil:
     cs.releaseDeferredBodyAudit()
     return
+  let cancel = addr cs.bodyAuditCancel
+  template cancelled(): bool = cancel[].load(moAcquire)
   var suffix = 0'i32
   var haveSuffix = false
   try:
-    suffix = discoverBodyFloor(cs.db, cs.bestHeight)
+    suffix = discoverBodyFloor(cs.db, cs.bestHeight, cancel)
+    if cancelled():
+      return
     haveSuffix = true
     let firstBody = discoverFirstBody(cs.db, cs.bestHeight)
     var pruneH = firstBody
     if cs.startupAuditPrunerHeight > pruneH:
       pruneH = cs.startupAuditPrunerHeight
-    let audit = auditRetainedBodies(cs.db, cs.bestHeight, pruneH)
+    let audit = auditRetainedBodies(cs.db, cs.bestHeight, pruneH, cancel = cancel)
+    if cancelled():
+      return
     if suffix != audit.floor:
       warn "pruneheight is the contiguous suffix; first body is lower",
            pruneheight = suffix, firstBody = audit.floor,
@@ -906,7 +959,10 @@ proc startupRetainedBodyAudit*(cs: ChainState) {.gcsafe, raises: [].} =
            firstHole = firstHole, sample = audit.holes.len,
            truncated = audit.truncated,
            pruneheight = suffix
-      let hashes = planBodyRepairs(cs.db, cs.bestHeight, maxHoles = 0)
+      let hashes = planBodyRepairs(cs.db, cs.bestHeight, maxHoles = 0,
+                                   cancel = cancel)
+      if cancelled():
+        return
       let staged = cs.stageBodyRepairs(hashes)
       info "staged retained-range body repair",
            staged = staged, holeCount = audit.holeCount
@@ -1427,6 +1483,8 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
   )
   initLock(result.bodyRepairStageLock)
   result.bodyAuditDeferred.store(0, moRelaxed)
+  result.bodyAuditRunning.store(0, moRelaxed)
+  result.bodyAuditCancel.store(false, moRelaxed)
 
   # Load total work from DB if available
   let workData = cdb.db.get(cfMeta, metaKey("totalwork"))
