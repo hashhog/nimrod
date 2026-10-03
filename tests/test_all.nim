@@ -81,6 +81,7 @@ const IncludedTests = [
   "test_blockstore",
   "test_blockwork_exact",
   "test_body_hole_backfill",
+  "test_boot_body_audit_gate",
   "test_chain_management",
   "test_chainstate",
   "test_checkpoint",

@@ -3,7 +3,7 @@
 ## Uses RocksDB column families for data separation
 ## Undo data stored in flat files (rev*.dat) for efficient reorg handling
 
-import std/[options, tables, os, algorithm, strutils, sets]
+import std/[options, tables, os, algorithm, strutils, sets, atomics, locks]
 import ./db
 import ./undo
 import ../primitives/[types, serialize]
@@ -185,6 +185,21 @@ type
     # Bodies stored by fillMissingBody this process. Operator progress
     # (getblockchaininfo.body_repair_filled); not persisted.
     bodyRepairFilled*: int
+    # 1 while the startup body-audit thread owns the linear floor walk.
+    # discoverBodyFloor then returns discoverFirstBody and does not cache
+    # it, so getblockchaininfo on the RPC thread cannot repeat the
+    # 10–20 min scan that used to run before RPC existed (2026-10-02).
+    # Cleared with moRelease after historyFloor is published.
+    bodyAuditDeferred*: Atomic[int32]
+    # --prune height snapshotted on the main thread before the audit
+    # thread starts. -1 = no pruner. Not consensus.
+    startupAuditPrunerHeight*: int32
+    # Repair hashes from the audit thread. The sync loop drains them
+    # onto pendingBodyRepairs on the main thread. The HashSet is not
+    # written from the audit thread.
+    stagedBodyRepairs: seq[BlockHash]
+    stagedBodyRepairsReady: bool
+    bodyRepairStageLock: Lock
     # Pending UTXO deletes tracked during IBD (cache key -> true)
     ibdDeletedUtxos*: Table[string, bool]
     # Disk flush state — tracks blocks since last forced memtable→SST flush.
@@ -795,7 +810,9 @@ proc bodyRepairRemaining*(cs: ChainState): int {.raises: [].} =
 proc enqueueRetainedBodyRepairs*(cs: ChainState,
                                  maxHoles: int = 0): int {.raises: [].} =
   ## Seed pendingBodyRepairs from planBodyRepairs. Returns how many hashes
-  ## were queued. Startup calls this after auditRetainedBodies.
+  ## were queued. Main-thread callers only (the sync loop's requeue when
+  ## the set drains but holes remain). The startup audit stages instead
+  ## of writing this HashSet from its own thread.
   ## maxHoles <= 0 means no cap (honest remaining).
   if cs == nil:
     return 0
@@ -808,6 +825,109 @@ proc enqueueRetainedBodyRepairs*(cs: ChainState,
     return 0
   except Exception:
     return 0
+
+proc deferStartupBodyAudit*(cs: ChainState) {.gcsafe, raises: [].} =
+  ## The startup audit thread owns the linear retained-range walk.
+  ## Call before the RPC thread starts. discoverBodyFloor stays on the
+  ## cheap discoverFirstBody path until startupRetainedBodyAudit publishes.
+  if cs == nil:
+    return
+  cs.bodyAuditDeferred.store(1, moRelease)
+
+proc releaseDeferredBodyAudit*(cs: ChainState) {.gcsafe, raises: [].} =
+  ## Drop the deferred-audit flag without publishing a floor. Used when
+  ## the audit thread fails to start, so a later getblockchaininfo can
+  ## walk itself instead of staying provisional forever.
+  if cs == nil:
+    return
+  cs.bodyAuditDeferred.store(0, moRelease)
+
+proc stageBodyRepairs*(cs: ChainState, hashes: seq[BlockHash]): int {.gcsafe, raises: [].} =
+  ## Publish repair hashes from the audit thread. Does not touch
+  ## pendingBodyRepairs. Returns how many hashes were staged.
+  if cs == nil:
+    return 0
+  withLock cs.bodyRepairStageLock:
+    cs.stagedBodyRepairs = hashes
+    cs.stagedBodyRepairsReady = true
+    result = hashes.len
+
+proc drainStagedBodyRepairs*(cs: ChainState): int {.gcsafe, raises: [].} =
+  ## Main thread (sync loop). Move a staged repair list onto
+  ## pendingBodyRepairs. Returns 0 when nothing is staged, including
+  ## a second call after a successful drain.
+  if cs == nil:
+    return 0
+  var staged: seq[BlockHash]
+  withLock cs.bodyRepairStageLock:
+    if not cs.stagedBodyRepairsReady:
+      return 0
+    staged = cs.stagedBodyRepairs
+    cs.stagedBodyRepairs = @[]
+    cs.stagedBodyRepairsReady = false
+  for h in staged:
+    cs.pendingBodyRepairs.incl(h)
+  staged.len
+
+proc startupRetainedBodyAudit*(cs: ChainState) {.gcsafe, raises: [].} =
+  ## Walk the retained range, log holes, and stage repairs.
+  ##
+  ## Same checks the boot path used to run inline before RPC existed.
+  ## Runs on retainedBodyAuditThreadMain so the walk cannot hold
+  ## getblockcount. Publishes the contiguous-suffix floor (historyFloor)
+  ## before clearing bodyAuditDeferred.
+  if cs == nil:
+    return
+  if cs.db == nil:
+    cs.releaseDeferredBodyAudit()
+    return
+  var suffix = 0'i32
+  var haveSuffix = false
+  try:
+    suffix = discoverBodyFloor(cs.db, cs.bestHeight)
+    haveSuffix = true
+    let firstBody = discoverFirstBody(cs.db, cs.bestHeight)
+    var pruneH = firstBody
+    if cs.startupAuditPrunerHeight > pruneH:
+      pruneH = cs.startupAuditPrunerHeight
+    let audit = auditRetainedBodies(cs.db, cs.bestHeight, pruneH)
+    if suffix != audit.floor:
+      warn "pruneheight is the contiguous suffix; first body is lower",
+           pruneheight = suffix, firstBody = audit.floor,
+           tip = audit.tip
+    if not hasRetainedBodyWindow(cs.db, cs.bestHeight):
+      info "no retained-range body window to repair",
+           tip = cs.bestHeight, firstBody = firstBody, pruneheight = suffix
+    elif audit.holeCount > 0:
+      let firstHole = if audit.holes.len > 0: audit.holes[0] else: -1'i32
+      warn "retained-range body hole",
+           floor = audit.floor, tip = audit.tip,
+           checked = audit.checked, holeCount = audit.holeCount,
+           firstHole = firstHole, sample = audit.holes.len,
+           truncated = audit.truncated,
+           pruneheight = suffix
+      let hashes = planBodyRepairs(cs.db, cs.bestHeight, maxHoles = 0)
+      let staged = cs.stageBodyRepairs(hashes)
+      info "staged retained-range body repair",
+           staged = staged, holeCount = audit.holeCount
+      if staged < audit.holeCount:
+        warn "repair queue is short of the hole count",
+             queued = staged, holeCount = audit.holeCount
+    else:
+      info "retained-range bodies contiguous",
+           floor = audit.floor, tip = audit.tip, checked = audit.checked,
+           pruneheight = suffix
+  except CatchableError as e:
+    warn "retained-range body audit failed", error = e.msg
+  except Exception as e:
+    warn "retained-range body audit failed", error = e.msg
+  # Publish the suffix even if staging failed: the walk already paid
+  # for it, and clearing the flag without a floor sends the next
+  # getblockchaininfo down the same linear path.
+  if haveSuffix:
+    cs.historyFloor = suffix
+    cs.historyFloorProbed = true
+  cs.bodyAuditDeferred.store(0, moRelease)
 
 proc fillMissingBody*(cs: ChainState, blk: Block): ChainStateResult[void] =
   ## Store an already-connected active-chain body that IBD skipped.
@@ -959,8 +1079,17 @@ proc discoverBodyFloor*(cs: ChainState): int32 {.gcsafe, raises: [].} =
   ## has no body, so a cached `tip` would go stale; that case re-probes.
   ## A complete chain (floor 0) stays complete — punching a hole in
   ## tests must clear historyFloorProbed.
+  ##
+  ## While the startup audit owns the linear walk (`bodyAuditDeferred`),
+  ## return discoverFirstBody and do not cache it. That answer matches
+  ## the contiguous suffix when there is no interior hole; an interior
+  ## hole is published by the audit when the walk finishes. Doing the
+  ## walk here blocked the RPC thread for the same 10–20 min the boot
+  ## path used to spend before the socket was bound.
   if cs == nil or cs.db == nil:
     return 0
+  if cs.bodyAuditDeferred.load(moAcquire) != 0:
+    return discoverFirstBody(cs.db, cs.bestHeight)
   if cs.historyFloorProbed:
     if cs.historyFloor == 0:
       return 0
@@ -1280,6 +1409,9 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     historyFloorProbed: false,
     pendingBodyRepairs: initHashSet[BlockHash](),
     bodyRepairFilled: 0,
+    startupAuditPrunerHeight: -1,
+    stagedBodyRepairs: @[],
+    stagedBodyRepairsReady: false,
     ibdDeletedUtxos: initTable[string, bool](),
     ibdBlocksSinceLastDiskFlush: 0,
     ibdDiskFlushInterval: IbdBatchFlushInterval,  # default: flush to disk every 2000 blocks
@@ -1293,6 +1425,8 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     bestHeaderBits: 0'u32,
     bestHeaderHeight: cdb.bestHeight    # fallback: chain-tip height
   )
+  initLock(result.bodyRepairStageLock)
+  result.bodyAuditDeferred.store(0, moRelaxed)
 
   # Load total work from DB if available
   let workData = cdb.db.get(cfMeta, metaKey("totalwork"))
@@ -1302,6 +1436,7 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
 proc close*(cs: var ChainState) =
   cs.undoMgr.close()
   cs.db.close()
+  deinitLock(cs.bodyRepairStageLock)
 
 proc updateBestHeaderInfo*(cs: ChainState, chainWork: array[32, byte],
                            headerHeight: int32, bits: uint32) =

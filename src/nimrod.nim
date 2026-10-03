@@ -266,6 +266,14 @@ type
                                           ## held by NodeState for process
                                           ## lifetime — same `addr(t)` SIGSEGV
                                           ## trap the RPC/REST threads document.
+    retainedBodyAuditThread*: Thread[ChainState]
+                                          ## Background retained-range body
+                                          ## scan. Started after RPC and the
+                                          ## P2P listener so a walk of every
+                                          ## body from the retained floor to
+                                          ## the tip cannot hold boot. Held
+                                          ## for process lifetime — same
+                                          ## `addr(t)` SIGSEGV as rpcThread.
     netGroupManager*: NetGroupManager     ## ASMap-aware network group manager.
                                           ## Loaded from config.asmapFile at
                                           ## startup; nil-replaced with an empty
@@ -2351,6 +2359,24 @@ proc walletReconcileThreadMain(wm: WalletManager) {.thread.} =
     except Exception as e:
       warn "background wallet reconcile failed", error = e.msg
 
+proc retainedBodyAuditThreadMain(cs: ChainState) {.thread.} =
+  ## Retained-range body-contiguity scan, off the boot path.
+  ##
+  ## The walk reads every body from the first stored height to the tip
+  ## (mainnet ~17.3k, 10–20 min on 2026-10-02; 9.6 min on 2026-09-27). It
+  ## used to run synchronously in startNode before startRpcThread, so
+  ## stop_mainnet.sh's 300s getblockcount verify reported failure while
+  ## the node was healthy and still scanning. RPC and the P2P listener
+  ## are already up when this thread is created. The scan still logs
+  ## holes and stages repairs; the sync loop drains the stage onto
+  ## pendingBodyRepairs. A DB-bound walk is a plain OS thread, not an
+  ## asyncSpawn: on the main chronos loop it would stall the heartbeat
+  ## the same way the wallet rescan did. `{.gcsafe.}:` mirrors
+  ## rpcThreadMain. The ChainState ref stays alive because NodeState
+  ## holds it for the process lifetime.
+  {.gcsafe.}:
+    cs.startupRetainedBodyAudit()
+
 proc startNode*(config: NimrodConfig) {.async.} =
   ## Start the node
   ## Init order: db -> chainstate -> mempool -> peermanager -> sync -> fee estimator -> RPC -> P2P
@@ -2553,56 +2579,15 @@ proc startNode*(config: NimrodConfig) {.async.} =
       nodeNetwork = servesFullHistory(), firstBody = firstBody,
       tip = state.chainState.bestHeight, pruned = config.pruneTarget > 0
 
-  # Self-check: every height between the retained floor and the tip must
-  # have a readable body. A connected block whose body is missing fails
-  # wallet rescan and peer getdata at exactly that height (mainnet 967000
-  # hole, 2026-09-17). Log; do not refuse to boot — the hole is already
-  # on disk and taking the node down does not fill it.
-  try:
-    # Scan from the first stored body (what getblockchaininfo used to
-    # advertise), not from the contiguous suffix. pruneheight itself is
-    # the contiguous floor — they disagree exactly when there is a hole
-    # the operator needs to hear about (live 952185 vs 967348).
-    let advertised = state.chainState.discoverBodyFloor()
-    let firstBody = discoverFirstBody(state.chainState.db,
-                                      state.chainState.bestHeight)
-    var pruneH = firstBody
-    if state.pruner != nil:
-      let ph = state.pruner.currentPruneHeight()
-      if ph > pruneH:
-        pruneH = ph
-    let audit = auditRetainedBodies(state.chainState.db,
-                                    state.chainState.bestHeight, pruneH)
-    if advertised != audit.floor:
-      warn "pruneheight is the contiguous suffix; first body is lower",
-           pruneheight = advertised, firstBody = audit.floor,
-           tip = audit.tip
-    if not hasRetainedBodyWindow(state.chainState.db,
-                                 state.chainState.bestHeight):
-      info "no retained-range body window to repair",
-           tip = state.chainState.bestHeight,
-           firstBody = firstBody, pruneheight = advertised
-    elif audit.holeCount > 0:
-      let firstHole = if audit.holes.len > 0: audit.holes[0] else: -1'i32
-      warn "retained-range body hole",
-           floor = audit.floor, tip = audit.tip,
-           checked = audit.checked, holeCount = audit.holeCount,
-           firstHole = firstHole, sample = audit.holes.len,
-           truncated = audit.truncated,
-           pruneheight = advertised
-      let queued = state.chainState.enqueueRetainedBodyRepairs()
-      info "queued retained-range body repair", queued = queued,
-           holeCount = audit.holeCount,
-           remaining = state.chainState.bodyRepairRemaining()
-      if queued < audit.holeCount:
-        warn "repair queue is short of the hole count",
-             queued = queued, holeCount = audit.holeCount
-    else:
-      info "retained-range bodies contiguous",
-           floor = audit.floor, tip = audit.tip, checked = audit.checked,
-           pruneheight = advertised
-  except CatchableError as e:
-    warn "retained-range body audit failed", error = e.msg
+  # The retained-range body scan reads every body from the first stored
+  # height to the tip (mainnet ~17.3k, 10–20 min). Running it here, before
+  # startRpcThread, held getblockcount for the whole walk (2026-10-02;
+  # stop_mainnet.sh's 300s verify reported failure on a healthy node).
+  # The walk runs on retainedBodyAuditThreadMain after RPC and P2P are
+  # up. Until it publishes historyFloor, discoverBodyFloor answers with
+  # discoverFirstBody and does not cache that provisional value. A hole
+  # already on disk is not a reason to refuse to boot.
+  state.chainState.deferStartupBodyAudit()
 
   # 3. Initialize mempool
   info "initializing mempool"
@@ -3341,6 +3326,22 @@ proc startNode*(config: NimrodConfig) {.async.} =
     info "starting background wallet reconcile"
     createThread(state.walletReconcileThread, walletReconcileThreadMain,
                  state.rpcServer.walletManager)
+
+  # Retained-range body audit. RPC, the P2P listener and the sync loop
+  # are already up (steps 7–9). The thread scans and stages repairs; the
+  # sync loop drains them onto pendingBodyRepairs. See
+  # retainedBodyAuditThreadMain.
+  if state.chainState != nil:
+    if state.pruner != nil:
+      state.chainState.startupAuditPrunerHeight =
+        state.pruner.currentPruneHeight()
+    info "starting background retained-range body audit"
+    try:
+      createThread(state.retainedBodyAuditThread, retainedBodyAuditThreadMain,
+                   state.chainState)
+    except CatchableError as e:
+      warn "retained-range body audit thread failed to start", error = e.msg
+      state.chainState.releaseDeferredBodyAudit()
 
   # 11a. Startup ASMapHealthCheck (G16/G28 FIX-52).
   # Logs unique ASNs / mapped / unmapped across the initial known-address pool.

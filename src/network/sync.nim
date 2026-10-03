@@ -3366,6 +3366,15 @@ proc syncLoop*(sm: SyncManager) {.async.} =
   var lastTimeoutHeight = sm.chainTipHeight # Track height at last timeout to detect progress
 
   while true:
+    # Startup body audit stages hole hashes on its own thread. Drain
+    # them here, on the main thread, before any repair getdata. A no-op
+    # once the stage is empty (the common contiguous-range boot).
+    if sm.chainState != nil:
+      let staged = sm.chainState.drainStagedBodyRepairs()
+      if staged > 0:
+        info "queued retained-range body repair",
+             queued = staged,
+             remaining = sm.chainState.bodyRepairRemaining()
     let peer = sm.selectSyncPeer()
 
     if peer == nil:
