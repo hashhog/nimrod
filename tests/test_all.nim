@@ -85,6 +85,7 @@ const IncludedTests = [
   "test_campaign_builtin_confirmation",
   "test_chain_management",
   "test_chainstate",
+  "test_chainwork_memo",
   "test_checkpoint",
   "test_cltv",
   "test_cluster",

@@ -2,7 +2,7 @@
 ## Bitcoin Core compatible RPC interface with HTTP Basic auth
 ## JSON-RPC 2.0 compliant with proper error codes
 
-import std/[json, strutils, tables, options, base64, parseutils, times, sets, os, algorithm, streams, sysrand, atomics]
+import std/[json, strutils, tables, options, base64, parseutils, times, sets, os, algorithm, streams, sysrand, atomics, locks]
 from std/posix import nil
 import chronos
 import chronicles
@@ -974,21 +974,92 @@ proc getBitsProof(bits: uint32): array[32, byte] =
   let divided   = u256Div(notTarget, targetP1)
   u256Add1(divided)
 
+proc u256SubBE(a, b: array[32, byte]): array[32, byte] =
+  ## a - b, big-endian. Callers guarantee a >= b.
+  var borrow = 0'i32
+  for i in countdown(31, 0):
+    var d = int32(a[i]) - int32(b[i]) - borrow
+    if d < 0:
+      d += 256
+      borrow = 1
+    else:
+      borrow = 0
+    result[i] = byte(d)
+
+# Chainwork memo for computeChainwork.
+#
+# getblockchaininfo recomputed the tip's chainwork by reading every block index
+# row from the tip to genesis (~970k RocksDB reads on mainnet) on every call.
+# The RPC thread dispatches requests one at a time, so every other RPC queued
+# behind it: live 2026-10-03, getblockchaininfo 12.7 s and a getblockcount sent
+# 1 s later answered in 11.7 s. Under the gettxoutsetinfo walk's I/O the same
+# call reached 28.6 s (gate 3a, 2026-10-02 12:58Z). fleet-snapshot's FLOOR check
+# calls getblockchaininfo on nimrod every 5 min because nimrod cannot serve
+# block 1.
+#
+# The work of a hash is a pure function of the headers below it, and a header
+# row for a given hash never changes, so a walk that reached genesis is exact
+# for that hash forever. A walk records the tip and every height that is a
+# multiple of ChainworkMemoStride; a later walk stops at the first recorded
+# ancestor. A new tip costs one step; any active-chain block at most
+# ChainworkMemoStride steps. A walk that stopped short of genesis (missing
+# header row) is returned as before and is not recorded.
+const
+  ChainworkMemoStride = 2016'i32
+  ChainworkMemoMax = 16384
+
+var chainworkMemoLock: Lock
+var chainworkMemo: Table[BlockHash, array[32, byte]]
+initLock(chainworkMemoLock)
+
+proc chainworkMemoGet(h: BlockHash, work: var array[32, byte]): bool =
+  {.cast(gcsafe).}:
+    withLock chainworkMemoLock:
+      chainworkMemo.withValue(h, v):
+        work = v[]
+        return true
+  false
+
+proc chainworkMemoPut(entries: openArray[(BlockHash, array[32, byte])]) =
+  {.cast(gcsafe).}:
+    withLock chainworkMemoLock:
+      if chainworkMemo.len + entries.len > ChainworkMemoMax:
+        chainworkMemo.clear()
+      for (h, w) in entries:
+        chainworkMemo[h] = w
+
+proc resetChainworkMemo*() =
+  ## Tests only: forget every memoized chainwork.
+  {.cast(gcsafe).}:
+    withLock chainworkMemoLock:
+      chainworkMemo.clear()
+
 proc computeChainwork*(cdb: ChainDb, startHash: BlockHash, height: int32): array[32, byte] =
   ## Walk backwards from startHash to genesis, summing getBitsProof(bits) for
   ## each block.  Returns the correct 256-bit cumulative chainwork (big-endian),
   ## matching Bitcoin Core's nChainWork.
   ##
-  ## O(height) RocksDB reads.  getBitsProof results are memoized by bits value
+  ## Stops early at the first ancestor whose chainwork is memoized (see
+  ## chainworkMemo above). getBitsProof results are memoized by bits value
   ## since all blocks in a 2016-block epoch share the same bits (≈400 unique
   ## values for mainnet), keeping the computational cost negligible vs. I/O.
   var proofCache: Table[uint32, array[32, byte]]
   var acc = default(array[32, byte])
   var h   = startHash
+  # (hash, acc before that block's proof). work(hash) = total - before.
+  var marks: seq[(BlockHash, array[32, byte])]
+  var complete = false
   for _ in 0 .. height:
+    var memo: array[32, byte]
+    if chainworkMemoGet(h, memo):
+      u256AddBE(acc, memo)
+      complete = true
+      break
     let idxOpt = cdb.getBlockIndex(h)
     if idxOpt.isNone: break
     let idx = idxOpt.get()
+    if h == startHash or idx.height mod ChainworkMemoStride == 0:
+      marks.add((h, acc))
     let bits = idx.header.bits
     let proof =
       if bits in proofCache: proofCache[bits]
@@ -997,8 +1068,15 @@ proc computeChainwork*(cdb: ChainDb, startHash: BlockHash, height: int32): array
         proofCache[bits] = p
         p
     u256AddBE(acc, proof)
-    if idx.height == 0: break  # reached genesis
+    if idx.height == 0:  # reached genesis
+      complete = true
+      break
     h = idx.prevHash
+  if complete and marks.len > 0:
+    var entries = newSeqOfCap[(BlockHash, array[32, byte])](marks.len)
+    for (mh, before) in marks:
+      entries.add((mh, u256SubBE(acc, before)))
+    chainworkMemoPut(entries)
   acc
 
 proc chainworkHexBE*(w: array[32, byte]): string =
