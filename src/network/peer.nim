@@ -181,6 +181,14 @@ type
     lastTxTime*: chronos.Moment        # When peer last sent us a transaction
     lastBlockAnnouncement*: int64      # Unix time of last block announcement (for eviction)
     bestKnownHeight*: int32            # Best known block height from this peer
+    hasHeadersTipCeiling*: bool        # headersTipCeiling is valid
+    headersTipCeiling*: int32          # Height of the LAST header
+                                       # this peer sent in a SHORT (<2000)
+                                       # headers message — i.e. what the peer
+                                       # itself just told us is its tip. Caps
+                                       # the credit given to its version-
+                                       # message start height (see
+                                       # availableHeight).
     onInvalidChain*: bool              # announced/served a block we hold as
                                        # BLOCK_FAILED_VALID: its version-message
                                        # start height (and its claimed tip) is
@@ -2152,9 +2160,26 @@ proc availableHeight*(peer: Peer): int32 =
   ## attacker that just served the invalid block, redialling with a higher
   ## start height, was picked to serve the honest replacement it does not
   ## have, and the download waited out the 60 s sync timeout.
+  ##
+  ## The start height is a CLAIM, never verified (Core never uses it to fetch).
+  ## Once the peer answers a getheaders with a short batch it has told us
+  ## where its chain ends, and that caps the claim: mainnet 2026-10-04 a peer
+  ## advertising height 975538 (real tip 969894) whose chain stopped near
+  ## 955k was picked over every honest announcer for 35+ min and never
+  ## delivered one block.
   if peer.onInvalidChain:
     return peer.bestKnownHeight
-  max(peer.startHeight, peer.bestKnownHeight)
+  let claimed =
+    if peer.hasHeadersTipCeiling: min(peer.startHeight, peer.headersTipCeiling)
+    else: peer.startHeight
+  max(claimed, peer.bestKnownHeight)
+
+proc noteHeadersTip*(peer: Peer, height: int32) =
+  ## The peer ended a headers message (fewer than MAX_HEADERS_RESULTS) at
+  ## `height`: that is its tip as far as it is telling us.
+  if peer != nil:
+    peer.hasHeadersTipCeiling = true
+    peer.headersTipCeiling = height
 
 const HeadersResponseTimeMs* = 2'i64 * 60 * 1000
   ## Core HEADERS_RESPONSE_TIME (net_processing.cpp).

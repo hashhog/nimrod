@@ -6,6 +6,7 @@
 
 import std/[options, deques, tables, algorithm, sequtils, sets, strutils, cpuinfo]
 import std/[times, threadpool]
+from std/os import getEnv
 import chronos
 import chronicles
 import ./peer
@@ -81,6 +82,12 @@ type
     height*: int64     ## Height reached (only valid in PRESYNC)
     timestamp*: uint32 ## Block timestamp of last header (only valid in PRESYNC)
     inPresync*: bool   ## True if in PRESYNC phase, false if in REDOWNLOAD
+
+  InFlightRequest* = object
+    ## One block body in flight: who we asked and since when.  Core's
+    ## mapBlocksInFlight entry (QueuedBlock) + the peer's m_downloading_since.
+    peer*: Peer
+    since*: SyncTime
 
   SyncManager* = ref object
     state*: SyncState
@@ -180,6 +187,17 @@ type
     # classified by processBlock to tell a consensus verdict from a mutated
     # body or a local / cannot-decide failure.
     lastApplyError*: string
+    # Per-block in-flight accounting (Core mapBlocksInFlight). requestedHashes
+    # alone has no owner and no age, so a getdata to a peer that never answers
+    # (or disconnects) left the hash "in flight" until some unrelated global
+    # reset — mainnet 2026-10-04: 969889..969894 asked of one peer, never
+    # delivered, never re-asked, 35+ min. Entries whose hash has left
+    # requestedHashes are stale and dropped lazily by expireBlockRequests.
+    blocksInFlight*: Table[BlockHash, InFlightRequest]
+    # Peers that timed out a block delivery (peerSyncKey). Never picked to
+    # fetch again while connected; cleared when one delivers a block.
+    stalledBlockPeers*: HashSet[string]
+    lastInFlightCheck*: SyncTime
 
 const
   MaxHeadersPerRequest* = 2000
@@ -1004,6 +1022,9 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     unconnectingHeaders: initTable[int64, int](),
     headerTipRepairAt: -1'i32,
     stalledSyncPeerKeys: initHashSet[string](),
+    blocksInFlight: initTable[BlockHash, InFlightRequest](),
+    stalledBlockPeers: initHashSet[string](),
+    lastInFlightCheck: getTime(),
     numVerifyWorkers: numVerifyWorkers,
     filterIndex: filterIndex,
     coinStatsIndex: coinStatsIndex,
@@ -1152,6 +1173,126 @@ proc countOtherReadyPeers(sm: SyncManager, exceptPeer: Peer): int =
     if peer.state == psReady and not peer.shouldDisconnect:
       inc result
 
+# =============================================================================
+# Per-block in-flight accounting + download timeout (Core mapBlocksInFlight)
+# =============================================================================
+
+const
+  BlockDownloadTimeoutBase* = 1.0
+    ## Core BLOCK_DOWNLOAD_TIMEOUT_BASE (net_processing.cpp:148), in units of
+    ## nPowTargetSpacing: 10 min on every network, regtest included.
+  BlockDownloadTimeoutPerPeer* = 0.5
+    ## Core BLOCK_DOWNLOAD_TIMEOUT_PER_PEER (net_processing.cpp:150).
+
+proc blockDownloadTimeoutSecs*(sm: SyncManager, otherPeersDownloading: int): int =
+  ## Core SendMessages (net_processing.cpp:6110-6120): a block in flight from
+  ## a peer for nPowTargetSpacing * (BASE + PER_PEER * N) — N = the OTHER
+  ## peers we are downloading from — disconnects that peer. Regtest only:
+  ## NIMROD_BLOCK_DOWNLOAD_TIMEOUT_SECS overrides it so a P2P harness can see
+  ## the timeout fire without waiting 10 minutes (ignored on every other
+  ## network).
+  if sm.params.network == Regtest:
+    let ov = getEnv("NIMROD_BLOCK_DOWNLOAD_TIMEOUT_SECS")
+    if ov.len > 0:
+      try:
+        return max(1, parseInt(ov))
+      except ValueError:
+        discard
+  let spacing =
+    if sm.params.powTargetSpacing > 0: sm.params.powTargetSpacing else: 600
+  int(float(spacing) * (BlockDownloadTimeoutBase +
+      BlockDownloadTimeoutPerPeer * float(max(0, otherPeersDownloading))))
+
+proc peerCanFetch*(sm: SyncManager, peer: Peer): bool =
+  ## A peer we may send a block getdata to right now: not being dropped, and
+  ## not one that already timed out a block delivery to us.
+  peer != nil and not peer.shouldDisconnect and
+    peerSyncKey(peer) notin sm.stalledBlockPeers
+
+proc noteBlockRequested*(sm: SyncManager, hash: BlockHash, peer: Peer,
+                         now: SyncTime = getTime()) =
+  ## Core BlockRequested: the hash is in flight from `peer` since `now`.
+  sm.blocksInFlight[hash] = InFlightRequest(peer: peer, since: now)
+
+proc releaseBlockRequest*(sm: SyncManager, hash: BlockHash) =
+  ## Forget a request so the next requestBlocks pass asks again (Core
+  ## RemoveBlockRequest on timeout / FinalizeNode).
+  sm.blocksInFlight.del(hash)
+  if hash in sm.requestedHashes:
+    sm.requestedHashes.excl(hash)
+    sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+
+proc noteBlockDelivered*(sm: SyncManager, hash: BlockHash, peer: Peer,
+                         now: SyncTime = getTime()) =
+  ## Core RemoveBlockRequest: when the peer's OLDEST in-flight block arrives
+  ## its download clock restarts (m_downloading_since = max(.., now)); a peer
+  ## that serves later blocks but never the front one still times out.
+  if hash notin sm.blocksInFlight:
+    return
+  let req = sm.blocksInFlight[hash]
+  sm.blocksInFlight.del(hash)
+  var wasFront = true
+  for h2, r2 in sm.blocksInFlight:
+    if r2.peer == req.peer and r2.since < req.since:
+      wasFront = false
+      break
+  if wasFront:
+    for h2, r2 in sm.blocksInFlight.mpairs:
+      if r2.peer == req.peer and r2.since < now:
+        r2.since = now
+  if peer != nil and peer == req.peer:
+    sm.stalledBlockPeers.excl(peerSyncKey(peer))
+
+proc expireBlockRequests*(sm: SyncManager, now: SyncTime = getTime()): int =
+  ## Release every in-flight block whose peer is gone (Core FinalizeNode) or
+  ## whose peer has had its oldest block outstanding longer than the
+  ## BLOCK_DOWNLOAD_TIMEOUT window (Core: disconnect it). Released hashes are
+  ## re-requested — from another peer — on the next requestBlocks pass.
+  ## Returns how many requests were released.
+  var stale: seq[BlockHash]
+  var gone: seq[BlockHash]
+  var oldest = initTable[string, SyncTime]()
+  var owner = initTable[string, Peer]()
+  for h, r in sm.blocksInFlight:
+    if h notin sm.requestedHashes:
+      stale.add(h)
+    elif r.peer == nil or r.peer.state != psReady:
+      gone.add(h)
+    else:
+      let k = peerSyncKey(r.peer)
+      owner[k] = r.peer
+      if k notin oldest or r.since < oldest[k]:
+        oldest[k] = r.since
+  for h in stale:
+    sm.blocksInFlight.del(h)
+  for h in gone:
+    sm.releaseBlockRequest(h)
+  result = gone.len
+  if oldest.len == 0:
+    return
+  let timeout = initDuration(seconds = sm.blockDownloadTimeoutSecs(oldest.len - 1))
+  for k, since in oldest:
+    if now - since <= timeout:
+      continue
+    let p = owner[k]
+    var mine: seq[BlockHash]
+    for h, r in sm.blocksInFlight:
+      if r.peer == p:
+        mine.add(h)
+    let noban = sm.peerIsNoBan(p)
+    warn "Timeout downloading block, releasing its requests",
+         peer = $p, blocks = mine.len, first = $mine[0],
+         waitedSecs = (now - since).inSeconds, timeoutSecs = timeout.inSeconds,
+         disconnect = not noban
+    if not noban:
+      p.shouldDisconnect = true
+    sm.stalledBlockPeers.incl(k)
+    if sm.syncPeer == p:
+      sm.syncPeer = nil
+    for h in mine:
+      sm.releaseBlockRequest(h)
+    result += mine.len
+
 proc selectSyncPeer*(sm: SyncManager): Peer =
   ## Best ready peer that is not the one we just timed out of header sync.
   ## Falls back to a recently-stalled peer only when nobody else is ready
@@ -1169,14 +1310,18 @@ proc selectSyncPeer*(sm: SyncManager): Peer =
     # A peer on an invalid chain is only a last-resort sync peer: its start
     # height is the tip of a chain we rejected, and picking it would re-sync
     # headers from it every loop (each answer is BLOCK_CACHED_INVALID).
+    # availableHeight, not the raw version start height: a peer whose own
+    # headers have shown its chain ends below its claim (headersTipCeiling)
+    # must not keep winning header sync on the strength of that claim.
+    let h = peer.availableHeight()
     if key in sm.stalledSyncPeerKeys or peer.onInvalidChain:
-      if peer.startHeight > fallbackHeight:
+      if h > fallbackHeight:
         fallback = peer
-        fallbackHeight = peer.startHeight
+        fallbackHeight = h
       continue
-    if peer.startHeight > bestHeight:
+    if h > bestHeight:
       best = peer
-      bestHeight = peer.startHeight
+      bestHeight = h
   if best != nil:
     return best
   if fallback != nil:
@@ -1572,6 +1717,17 @@ proc classifyHeaderBatch*(sm: SyncManager,
   result.connectHash = firstPrev
   result.connectBits = sm.headerChain.headers[connectIdx].bits
 
+  # Core ProcessHeadersMessage (net_processing.cpp:3043-3052): when the LAST
+  # header of the message is already in our index as an ancestor of the best
+  # header, skip the anti-DoS checks — those headers cost no memory. Without
+  # this a peer re-sending headers we already hold was routed into PRESYNC
+  # on a dense chain but straight to the direct path on a snapshot-grafted
+  # one (the cached-work branch below), so the same peer behaved differently
+  # on regtest and mainnet.
+  if BlockHash(doubleSha256(serialize(headers[^1]))) in sm.headerChain.byHash:
+    result.routing = hbrDirect
+    return
+
   # Cumulative work up to (and including) the connection point.  Core reads
   # chain_start_header->nChainWork directly.  On a dense genesis-rooted chain
   # nimrod sums per-header proofs; on a snapshot-grafted chain (holes below
@@ -1623,7 +1779,25 @@ proc classifyHeaderBatch*(sm: SyncManager,
     # Enough work already (or threshold == 0 on regtest): validate directly.
     result.routing = hbrDirect
 
-proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
+proc continuationLocator*(sm: SyncManager, lastHash: BlockHash):
+    seq[array[32, byte]] =
+  ## Locator for the getheaders that follows a FULL headers message: Core
+  ## sends GetLocator(pindexLast) — the LAST header the peer just sent —
+  ## (net_processing.cpp:3104-3109), so a peer whose answer started below
+  ## our tip walks forward through its chain. Re-sending our own best-header
+  ## locator instead makes such a peer repeat the identical 2000 headers
+  ## forever: mainnet 2026-10-04, ~1,500 identical batches from 953496 in
+  ## 47 min, every one accepted=0, each refreshing the 60 s sync timeout.
+  let ho = sm.headerChain.getHeight(lastHash)
+  if ho.isSome and ho.get() >= 0:
+    return sm.buildLocatorFromHeight(ho.get())
+  result = @[array[32, byte](lastHash)]
+  for h in sm.buildBlockLocator():
+    if h != array[32, byte](lastHash):
+      result.add(h)
+
+proc requestHeaders*(sm: SyncManager, peer: Peer,
+                     locatorOverride: seq[array[32, byte]] = @[]) {.async.} =
   ## Request headers from peer using getheaders message.
   ##
   ## Catches PeerError + CatchableError so transport-level send failures
@@ -1641,7 +1815,9 @@ proc requestHeaders*(sm: SyncManager, peer: Peer) {.async.} =
   # m_best_header >= ActiveChain().Tip() — validation.cpp:6256-6264).
   discard sm.reconcileHeaderTip()
 
-  let locator = sm.buildBlockLocator()
+  let locator =
+    if locatorOverride.len > 0: locatorOverride
+    else: sm.buildBlockLocator()
   let hashStop = default(array[32, byte]) # Get as many as possible
 
   try:
@@ -2133,6 +2309,9 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
               peer = $peer, state = $syncState.getState()
         sm.cleanupPeerHeadersSync(getPeerId(peer))
 
+    # Nothing after the fork point of our locator: the peer's chain ends at
+    # or below our best header. Cap its version-message claim accordingly.
+    peer.noteHeadersTip(sm.locatorStartHeight())
     info "header sync complete", tipHeight = sm.headerChain.tipHeight
     sm.state = ssDownloadingBlocks
     return
@@ -2493,9 +2672,18 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
       else:
         await sm.requestHeaders(peer)
     else:
-      await sm.requestHeaders(peer)
+      let lastHash = BlockHash(doubleSha256(serialize(headers[^1])))
+      await sm.requestHeaders(peer, sm.continuationLocator(lastHash))
   else:
-    # Received less than 2000 = reached peer's tip
+    # Received less than 2000 = reached peer's tip. Record where that tip is
+    # (its last header), which caps the peer's version-message start height
+    # in availableHeight / selectSyncPeer.
+    let lastHash = BlockHash(doubleSha256(serialize(headers[^1])))
+    let lastH = sm.headerChain.getHeight(lastHash)
+    if lastH.isSome:
+      peer.noteHeadersTip(lastH.get())
+    elif lastHash in sm.headerChain.sideHeaders:
+      peer.noteHeadersTip(sm.headerChain.sideHeaders[lastHash].height)
     info "reached header tip", height = sm.headerChain.tipHeight
     sm.state = ssDownloadingBlocks
 
@@ -2503,12 +2691,33 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
 # below requestBlocks.
 proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [CatchableError].}
 
-proc selectFetchPeer*(syncPeer: Peer, peers: seq[Peer]): Peer =
+proc selectFetchPeer*(syncPeer: Peer, peers: seq[Peer],
+                      needHeight: int32 = -1): Peer =
   ## Single-peer block fetch target: the witness-capable peer known to have
   ## the most blocks (Core only asks a peer for blocks up to its
   ## pindexBestKnownBlock). Ties go to the header-sync peer, then to the
   ## earlier peer in `peers`, so the pre-availability choice is kept
   ## whenever it is at least as good.
+  ##
+  ## needHeight >= 0: first prefer a peer that ANNOUNCED or SERVED a header
+  ## at that height (bestKnownHeight — Core's pindexBestKnownBlock, learned
+  ## from inv/headers, net_processing.cpp:1406/1456). The version-message
+  ## start height is an unverified claim; it is only the fallback when no
+  ## peer has announced the block (IBD bootstrap). Pre-fix a peer claiming
+  ## 975538 beat every honest announcer of 969889 and was asked for six
+  ## blocks it did not have (mainnet 2026-10-04).
+  if needHeight >= 0:
+    var announced: Peer = nil
+    if syncPeer != nil and syncPeer.canServeWitnesses() and
+       syncPeer.bestKnownHeight >= needHeight:
+      announced = syncPeer
+    for p in peers:
+      if p.bestKnownHeight < needHeight:
+        continue
+      if announced == nil or p.bestKnownHeight > announced.bestKnownHeight:
+        announced = p
+    if announced != nil:
+      return announced
   var best: Peer = nil
   if syncPeer != nil and syncPeer.canServeWitnesses():
     best = syncPeer
@@ -2573,10 +2782,16 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   # old code sent every request to the header-sync peer, so with the chain
   # announced by a DIFFERENT peer the getdata went to a peer that did not
   # have the block and the download waited for the sync timeout.
-  let peers =
-    if sm.peerManager != nil: sm.peerManager.getBlockDownloadPeers()
-    else: @[]
-  let fetchPeer = selectFetchPeer(peer, peers)
+  #
+  # Peers being dropped or that already timed out a block delivery to us are
+  # never asked again (Core disconnects them; their requests are re-assigned).
+  var peers: seq[Peer]
+  if sm.peerManager != nil:
+    for p in sm.peerManager.getBlockDownloadPeers():
+      if sm.peerCanFetch(p):
+        peers.add(p)
+  let syncCand = if sm.peerCanFetch(peer): peer else: nil
+  let fetchPeer = selectFetchPeer(syncCand, peers, sm.chainTipHeight + 1)
   if fetchPeer == nil:
     if sm.chainTipHeight < sm.headerTipHeight:
       debug "no witness-capable peer to request blocks from",
@@ -2734,6 +2949,9 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     invHeights.setLen(forkInvStart)
     try:
       await forkPeer.sendGetData(forkInv)
+      let now = getTime()
+      for inv in forkInv:
+        sm.noteBlockRequested(BlockHash(inv.hash), forkPeer, now)
       sm.pendingBlocks += forkInv.len
       sm.lastSyncTime = getTime()
       info "requesting fork blocks from announcing peer", count = forkInv.len,
@@ -2773,6 +2991,9 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
       if batch.len > 0:
         try:
           await p.sendGetData(batch)
+          let now = getTime()
+          for inv in batch:
+            sm.noteBlockRequested(BlockHash(inv.hash), p, now)
           totalSent += batch.len
         except CatchableError as e:
           warn "failed to send getdata to peer", peer = $p, error = e.msg
@@ -2803,10 +3024,13 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
       for inv in inventory:
         sm.requestedHashes.excl(BlockHash(inv.hash))
       return
+    let now = getTime()
+    for inv in inventory:
+      sm.noteBlockRequested(BlockHash(inv.hash), fetchPeer, now)
     sm.pendingBlocks += inventory.len
-    sm.lastSyncTime = getTime()
+    sm.lastSyncTime = now
     info "requesting blocks", count = inventory.len,
-         fromHeight = sm.chainTipHeight + 1
+         fromHeight = sm.chainTipHeight + 1, peer = $fetchPeer
 
 proc pruneBodyRepairQueue*(sm: SyncManager) {.raises: [].} =
   ## Drop queued hashes that cannot be filled: already-have, no retained
@@ -3549,6 +3773,7 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   # Remove from in-flight tracking
   let wasRequested = hash in sm.requestedHashes
   sm.requestedHashes.excl(hash)
+  sm.noteBlockDelivered(hash, peer)
 
   # BLOCK_CACHED_INVALID: a body for a block already marked failed is not
   # validated again (Core AcceptBlockHeader "duplicate-invalid" ->
@@ -3725,6 +3950,7 @@ proc handleHeadersSyncTimeout*(sm: SyncManager) {.raises: [CatchableError].} =
   sm.pendingBlocks = 0
   sm.blockQueue.clear()
   sm.requestedHashes.clear()
+  sm.blocksInFlight.clear()
   sm.receivedBlocks.clear()
   discard sm.reconcileHeaderTip()
   discard sm.connectStoredBlocks()
@@ -3768,6 +3994,18 @@ proc syncLoop*(sm: SyncManager) {.async.} =
         info "queued retained-range body repair",
              queued = staged,
              remaining = sm.chainState.bodyRepairRemaining()
+    # Block download timeout (Core SendMessages, net_processing.cpp:6110-6120)
+    # and FinalizeNode release, once a second. Independent of lastSyncTime:
+    # any header traffic resets the 60s sync timeout below, so it cannot be
+    # what frees a block a peer will never deliver.
+    block:
+      let now = getTime()
+      if now - sm.lastInFlightCheck >= initDuration(seconds = 1):
+        sm.lastInFlightCheck = now
+        if sm.blocksInFlight.len > 0:
+          let released = sm.expireBlockRequests(now)
+          if released > 0 and sm.state == ssSynced:
+            sm.state = ssDownloadingBlocks
     let peer = sm.selectSyncPeer()
 
     if peer == nil:

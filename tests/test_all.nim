@@ -121,6 +121,7 @@ const IncludedTests = [
   "test_fix70_wallet_nsequence",
   "test_fix80_getblockheader_ntx",
   "test_fixedseed_fallback",
+  "test_fork_download_stall",
   "test_fundrawtransaction",
   "test_gcs",
   "test_genesis_sync_relay",
