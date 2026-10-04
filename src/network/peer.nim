@@ -181,6 +181,16 @@ type
     lastTxTime*: chronos.Moment        # When peer last sent us a transaction
     lastBlockAnnouncement*: int64      # Unix time of last block announcement (for eviction)
     bestKnownHeight*: int32            # Best known block height from this peer
+    onInvalidChain*: bool              # announced/served a block we hold as
+                                       # BLOCK_FAILED_VALID: its version-message
+                                       # start height (and its claimed tip) is
+                                       # an INVALID chain, so it must not be
+                                       # treated as having our valid blocks
+                                       # (Core: pindexBestKnownBlock is failed)
+    lastSideAnnounce*: BlockHash       # last competing-fork header this peer
+                                       # sent (Core UpdateBlockAvailability for
+                                       # a non-active header): fork bodies are
+                                       # asked of a peer that announced them
     lastGetHeadersMs*: int64           # Unix ms of our last getheaders to this
                                        # peer; 0 once its headers reply arrives
                                        # (Core m_last_getheaders_timestamp)
@@ -2135,6 +2145,15 @@ proc availableHeight*(peer: Peer): int32 =
   ## the version-message start height so IBD keeps downloading from every
   ## peer that connected at a higher tip, as it did before availability
   ## gating existed.
+  ##
+  ## A peer on an INVALID chain gets no credit for its start height: that
+  ## height is the tip of a chain we rejected (Core never fetches from a peer
+  ## whose pindexBestKnownBlock does not lead to the block). Without this the
+  ## attacker that just served the invalid block, redialling with a higher
+  ## start height, was picked to serve the honest replacement it does not
+  ## have, and the download waited out the 60 s sync timeout.
+  if peer.onInvalidChain:
+    return peer.bestKnownHeight
   max(peer.startHeight, peer.bestKnownHeight)
 
 const HeadersResponseTimeMs* = 2'i64 * 60 * 1000

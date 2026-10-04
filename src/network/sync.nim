@@ -165,6 +165,21 @@ type
     # Last time planRepairInventory was allowed to retry in-flight hole
     # fetches. A mute peer must not pin a retained-range hole forever.
     lastRepairRequest*: SyncTime
+    # Blocks known to be consensus-invalid (BLOCK_FAILED_VALID) and their
+    # descendants — Core InvalidBlockFound / InvalidChainFound. Mirrors the
+    # persisted BlockIndex.failureFlags (the authority; see isKnownInvalid) so
+    # a failed block is never fetched again and an announcement of it is
+    # BLOCK_CACHED_INVALID instead of a fresh download.
+    failedBlocks*: HashSet[BlockHash]
+    # Peer that delivered a body we STORED without connecting (side branch or
+    # out-of-order buffer) — Core mapBlockSource, so a later connect failure
+    # (BlockChecked) punishes the peer that actually sent the bad block, not
+    # whoever delivered the block that triggered the reorg attempt.
+    blockSource*: Table[BlockHash, Peer]
+    # Error string of the last failed applyBlock (acceptAndConnectBlock),
+    # classified by processBlock to tell a consensus verdict from a mutated
+    # body or a local / cannot-decide failure.
+    lastApplyError*: string
 
 const
   MaxHeadersPerRequest* = 2000
@@ -1151,7 +1166,10 @@ proc selectSyncPeer*(sm: SyncManager): Peer =
     if peer.state != psReady or peer.shouldDisconnect:
       continue
     let key = peerSyncKey(peer)
-    if key in sm.stalledSyncPeerKeys:
+    # A peer on an invalid chain is only a last-resort sync peer: its start
+    # height is the tip of a chain we rejected, and picking it would re-sync
+    # headers from it every loop (each answer is BLOCK_CACHED_INVALID).
+    if key in sm.stalledSyncPeerKeys or peer.onInvalidChain:
       if peer.startHeight > fallbackHeight:
         fallback = peer
         fallbackHeight = peer.startHeight
@@ -1680,6 +1698,240 @@ proc invShouldTriggerGetHeaders*(syncingWithPeer, tipRecent,
   syncingWithPeer or tipRecent or
     (not peerAlreadyTriggered and hash != lastTrigger)
 
+# =============================================================================
+# Invalid blocks delivered over P2P (Core InvalidBlockFound / InvalidChainFound
+# / MaybePunishNodeForBlock).
+#
+# A block that fails CONSENSUS validation is a statement about its HASH: Core
+# sets BLOCK_FAILED_VALID on it (validation.cpp InvalidBlockFound), every
+# descendant is failed with it (InvalidChainFound -> SetBlockFailureFlags), the
+# best header is recalculated off it (RecalculateBestHeader), the delivering
+# peer is punished (BlockChecked -> MaybePunishNodeForBlock BLOCK_CONSENSUS),
+# and the block is never requested again: a later header/inv for it is
+# BLOCK_CACHED_INVALID (AcceptBlockHeader "duplicate-invalid"), which
+# discourages an OUTBOUND announcer but not an inbound one.
+#
+# Before this, nimrod remembered nothing. The failed block stayed the tip of
+# the active header chain, so every peer that (re)announced it caused another
+# getdata, the punished peer's redial re-fetched it, and the valid sibling at
+# the same height was never fetched until a heavier header arrived — and then
+# only after the 60 s sync timeout.
+#
+# Non-verdicts stay unmarked (Core BLOCK_MUTATED, missing parent, future time,
+# local errors): see BlockFailureKind in consensus/validation.nim.
+# =============================================================================
+
+proc isKnownInvalid*(sm: SyncManager, hash: BlockHash): bool =
+  ## BLOCK_FAILED_VALID check. The persisted BlockIndex.failureFlags is the
+  ## authority (invalidateblock / reconsiderblock write it, and it survives a
+  ## restart); `failedBlocks` is the in-memory mirror.
+  if hash in sm.failedBlocks:
+    if sm.chainDb != nil:
+      let idx = sm.chainDb.getBlockIndex(hash)
+      if idx.isSome and not idx.get().failureFlags.isFailed():
+        sm.failedBlocks.excl(hash)   # reconsiderblock cleared it
+        return false
+    return true
+  if sm.chainDb != nil:
+    let idx = sm.chainDb.getBlockIndex(hash)
+    if idx.isSome and idx.get().failureFlags.isFailed():
+      sm.failedBlocks.incl(hash)
+      return true
+  false
+
+proc markBlockFailed(sm: SyncManager, hash: BlockHash) =
+  ## Set BLOCK_FAILED_VALID on `hash` (memory + its persisted index row).
+  ## Core marks descendants BLOCK_FAILED_VALID too (BLOCK_FAILED_CHILD is
+  ## unused since v25, chain.h), as nimrod's own setBlockFailureFlags does.
+  sm.failedBlocks.incl(hash)
+  if sm.chainDb == nil:
+    return
+  let idxOpt = sm.chainDb.getBlockIndex(hash)
+  if idxOpt.isSome:
+    var idx = idxOpt.get()
+    if not idx.failureFlags.isFailed():
+      idx.failureFlags.setFlag(BLOCK_FAILED_VALID)
+      sm.chainDb.putBlockIndexHashOnly(idx)
+
+proc truncateActiveHeaders(sm: SyncManager, toHeight: int32) =
+  ## Cut the active header chain back to `toHeight` (never below the
+  ## validated tip — callers guarantee it). Height slots written ahead of the
+  ## validated chain for the removed headers are dropped.
+  var hc = addr sm.headerChain
+  if toHeight < 0 or toHeight >= hc.tipHeight:
+    return
+  var w = hc.totalWork
+  var i = hc.tipHeight
+  while i > toHeight:
+    if i < int32(hc.hashes.len):
+      let h = hc.hashes[i]
+      if hc.byHash.getOrDefault(h, -1) == int(i):
+        w = subtractWork(w, calculateWork(hc.headers[i].bits))
+        hc.byHash.del(h)
+        if sm.chainDb != nil and i > sm.chainTipHeight:
+          sm.chainDb.deleteHeightIndexIf(i, h)
+    dec i
+  hc.headers.setLen(int(toHeight) + 1)
+  hc.hashes.setLen(int(toHeight) + 1)
+  hc.tip = hc.hashes[toHeight]
+  hc.tipHeight = toHeight
+  hc.totalWork = w
+  sm.headerTip = hc.tip
+  sm.headerTipHeight = toHeight
+
+proc promoteBestValidSideBranch(sm: SyncManager) =
+  ## Core RecalculateBestHeader after InvalidChainFound: once the failed
+  ## branch is gone, the most-work VALID header becomes the download target.
+  ## Only branches forking at or above the validated tip are switched here
+  ## (their bodies then download as plain active-chain extensions, e.g. the
+  ## valid sibling at the failed block's height); a fork below the validated
+  ## tip stays in sideHeaders, where the fork-body walk + acceptSideBranchBlock
+  ## reorg path already owns it.
+  let candOpt = sm.headerChain.heaviestSideTip()
+  if candOpt.isNone:
+    return
+  let cand = candOpt.get()
+  if compareWork(cand.totalWork, sm.headerChain.totalWork) <= 0:
+    return
+  var branch: seq[tuple[hash: BlockHash, sh: SideHeader]]
+  var curHash = BlockHash(doubleSha256(serialize(cand.header)))
+  var cur = cand
+  while true:
+    branch.add((hash: curHash, sh: cur))
+    let prev = cur.header.prevBlock
+    if prev in sm.headerChain.sideHeaders:
+      curHash = prev
+      cur = sm.headerChain.sideHeaders[prev]
+    else:
+      break
+  let forkOpt = sm.headerChain.getHeight(branch[^1].sh.header.prevBlock)
+  if forkOpt.isNone:
+    return
+  let f = forkOpt.get()
+  if f < sm.chainTipHeight or branch[^1].sh.height != f + 1:
+    return
+  # Demote the (valid, unconnected) active headers above the fork point.
+  if f < sm.headerChain.tipHeight:
+    let base = sm.headerChain.resolveParentWork(sm.headerChain.hashes[f])
+    if base.isNone:
+      return
+    var w = base.get().totalWork
+    for i in (f + 1) .. sm.headerChain.tipHeight:
+      w = addWork(w, calculateWork(sm.headerChain.headers[i].bits))
+      sm.headerChain.sideHeaders[sm.headerChain.hashes[i]] = SideHeader(
+        header: sm.headerChain.headers[i], height: i, totalWork: w)
+    sm.truncateActiveHeaders(f)
+  for j in countdown(branch.high, 0):
+    let (h, sh) = branch[j]
+    sm.headerChain.sideHeaders.del(h)
+    let idx = sm.headerChain.headers.len
+    sm.headerChain.headers.add(sh.header)
+    sm.headerChain.hashes.add(h)
+    sm.headerChain.byHash[h] = idx
+  sm.headerChain.totalWork = cand.totalWork
+  sm.headerChain.tip = branch[0].hash
+  sm.headerChain.tipHeight = cand.height
+  sm.headerTip = branch[0].hash
+  sm.headerTipHeight = cand.height
+  info "best header moved to the most-work valid branch",
+       tip = $branch[0].hash, height = cand.height, forkHeight = f
+
+proc invalidChainFound*(sm: SyncManager, hash: BlockHash) =
+  ## Mark `hash` and every known descendant failed, drop them from the header
+  ## chain / side headers / download state, and move the best header to the
+  ## most-work valid branch (Core InvalidBlockFound + InvalidChainFound +
+  ## RecalculateBestHeader). Never touches the validated chain.
+  var dead = initHashSet[BlockHash]()
+  dead.incl(hash)
+  var truncateTo = -1'i32
+  let hOpt = sm.headerChain.getHeight(hash)
+  if hOpt.isSome and hOpt.get() > sm.chainTipHeight:
+    let h = hOpt.get()
+    for i in h .. sm.headerChain.tipHeight:
+      let hh = sm.headerChain.getHashByHeight(i)
+      if hh.isSome:
+        dead.incl(hh.get())
+    truncateTo = h - 1
+  var changed = true
+  while changed:
+    changed = false
+    for k, sh in sm.headerChain.sideHeaders:
+      if k notin dead and sh.header.prevBlock in dead:
+        dead.incl(k)
+        changed = true
+  for d in dead:
+    sm.markBlockFailed(d)
+    sm.headerChain.sideHeaders.del(d)
+    if d in sm.requestedHashes:
+      sm.requestedHashes.excl(d)
+      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    sm.blockSource.del(d)
+  var drop: seq[int32]
+  for ht, b in sm.receivedBlocks:
+    if BlockHash(doubleSha256(serialize(b.header))) in dead:
+      drop.add(ht)
+  for ht in drop:
+    sm.receivedBlocks.del(ht)
+    sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+  if truncateTo >= 0:
+    sm.truncateActiveHeaders(max(truncateTo, sm.chainTipHeight))
+  sm.promoteBestValidSideBranch()
+  if sm.chainState != nil and sm.headerChain.headers.len > 0:
+    sm.chainState.updateBestHeaderInfo(
+      sm.headerChain.totalWork, sm.headerChain.tipHeight,
+      sm.headerChain.headers[^1].bits)
+  warn "InvalidChainFound: block marked BLOCK_FAILED_VALID",
+       hash = $hash, failed = dead.len,
+       headerTipHeight = sm.headerChain.tipHeight,
+       chainTipHeight = sm.chainTipHeight
+
+proc segwitActiveAt(sm: SyncManager, height: int32): bool =
+  height >= int32(sm.params.segwitHeight)
+
+proc confirmVerdict(sm: SyncManager, kind: BlockFailureKind, blk: Block,
+                    height: int32): BlockFailureKind =
+  ## A consensus failure only condemns the HASH if this body is the one the
+  ## header commits to; otherwise it is a mutated copy (Core BLOCK_MUTATED).
+  if kind == bfkInvalid and
+     not bodyMatchesCommitments(blk, sm.segwitActiveAt(height)):
+    return bfkMutated
+  kind
+
+proc punishForBlock(sm: SyncManager, peer: Peer, kind: BlockFailureKind,
+                    reason: string) =
+  ## MaybePunishNodeForBlock: BLOCK_CONSENSUS / BLOCK_MUTATED -> Misbehaving
+  ## (disconnect; a local address is not discouraged — misbehavingPeer).
+  if peer == nil or sm.peerManager == nil or kind == bfkUndecided:
+    return
+  if peer.state != psReady and peer.state != psConnected:
+    return
+  sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlock, reason)
+
+proc noteBlockSource(sm: SyncManager, hash: BlockHash, peer: Peer) =
+  if peer == nil:
+    return
+  if sm.blockSource.len >= 4096:
+    sm.blockSource.clear()
+  sm.blockSource[hash] = peer
+
+proc cachedInvalidAnnouncement(sm: SyncManager, peer: Peer, hash: BlockHash) =
+  ## BLOCK_CACHED_INVALID (AcceptBlockHeader "duplicate-invalid"):
+  ## MaybePunishNodeForBlock discourages an OUTBOUND peer on an invalid chain,
+  ## never an inbound one. Either way the block is not fetched, and the peer's
+  ## claimed height no longer counts as having our blocks.
+  if peer == nil:
+    return
+  peer.onInvalidChain = true
+  if sm.syncPeer == peer:
+    sm.syncPeer = nil
+    sm.state = ssIdle
+  if peer.direction == pdOutbound and sm.peerManager != nil:
+    sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlock,
+        "duplicate-invalid: " & $hash)
+  else:
+    debug "announcement of a cached-invalid block (inbound, not punished)",
+          peer = $peer, hash = $hash
+
 proc handleBlockAnnouncement*(sm: SyncManager, peer: Peer,
                               hashes: seq[BlockHash]) {.async.} =
   ## Block `inv` from any peer (Core headers-first, net_processing.cpp
@@ -1698,6 +1950,11 @@ proc handleBlockAnnouncement*(sm: SyncManager, peer: Peer,
     if ho.isSome:
       peer.noteBestKnownHeight(ho.get())
     elif not sm.headerChain.hasAnyHeader(h):
+      # A failed block is still a KNOWN block (Core AlreadyHaveBlock: it is in
+      # m_block_index): never ask for its header or body again.
+      if sm.isKnownInvalid(h):
+        peer.onInvalidChain = true
+        continue
       unknown = some(h)   # Core keeps the LAST unknown (best_block)
   if unknown.isNone:
     return
@@ -2006,7 +2263,28 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
       let knownHeight = sm.headerChain.getHeight(hash)
       if knownHeight.isSome:
         peer.noteBestKnownHeight(knownHeight.get())
+      elif hash in sm.headerChain.sideHeaders:
+        peer.lastSideAnnounce = hash
       continue
+
+    # BLOCK_CACHED_INVALID: Core AcceptBlockHeader returns "duplicate-invalid"
+    # for a header already marked BLOCK_FAILED_VALID and ProcessNewBlockHeaders
+    # stops at the first failing header — the block is never fetched again.
+    if sm.isKnownInvalid(hash):
+      sm.cachedInvalidAnnouncement(peer, hash)
+      return
+    # BLOCK_INVALID_PREV: a new header building on a failed block
+    # (AcceptBlockHeader "bad-prevblk") — Misbehaving for every peer.
+    if header.prevBlock in sm.failedBlocks:
+      sm.markBlockFailed(hash)
+      peer.onInvalidChain = true
+      if sm.syncPeer == peer:
+        sm.syncPeer = nil
+        sm.state = ssIdle
+      if sm.peerManager != nil:
+        sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlock,
+                                       "bad-prevblk: " & $hash)
+      return
 
     # Check that this header connects to our chain
     let expectedHeight = sm.headerChain.tipHeight + 1
@@ -2038,6 +2316,7 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
           # Stored as a competing fork.  Do NOT touch the active chain tip,
           # do NOT ban, just move to the next header in the batch.
           accepted += 1
+          peer.lastSideAnnounce = hash
           continue
         of fhoCannotEvaluate:
           # OUR index is missing an ancestor the difficulty rule needs (a fork
@@ -2357,6 +2636,8 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
   # active chain, requesting every missing body along the way — NO height floor
   # (Core FindNextBlocksToDownload / blockbrew part 1).  Bounded by
   # MAX_REORG_DEPTH so a deep fork announcement cannot cost unbounded getdata.
+  var forkPeer: Peer = nil
+  var forkInvStart = -1
   let candidate = sm.headerChain.heaviestSideTip()
   if candidate.isSome and
      compareWork(candidate.get().totalWork, sm.headerChain.totalWork) > 0:
@@ -2402,7 +2683,21 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
         # Parent is the fork point (active chain) or not yet known — stop.
         break
       depth += 1
+    # Ask the fork bodies of a peer that ANNOUNCED this branch (Core
+    # FindNextBlocksToDownload only walks a peer's own pindexBestKnownBlock
+    # chain). Pre-fix they went to whichever peer had the highest start
+    # height — with two peers on different branches, routinely the one that
+    # does not have them, and the download then waited out the sync timeout.
+    var forkAnnouncers = initHashSet[BlockHash]()
+    forkAnnouncers.incl(BlockHash(doubleSha256(serialize(candidate.get().header))))
+    for h in forkHashes:
+      forkAnnouncers.incl(h)
+    for p in peers:
+      if p.lastSideAnnounce in forkAnnouncers and not p.onInvalidChain:
+        forkPeer = p
+        break
     # Emit fork-point-up so bodies download in connect order.
+    forkInvStart = inventory.len
     for i in countdown(forkHashes.len - 1, 0):
       let h = forkHashes[i]
       inventory.add(InvVector(
@@ -2431,6 +2726,24 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
            inFlight = sm.requestedHashes.len,
            buffered = sm.receivedBlocks.len
     return
+
+  # Fork bodies go to the peer that announced the fork, when we know one.
+  if forkPeer != nil and forkInvStart >= 0 and forkInvStart < inventory.len:
+    let forkInv = inventory[forkInvStart .. ^1]
+    inventory.setLen(forkInvStart)
+    invHeights.setLen(forkInvStart)
+    try:
+      await forkPeer.sendGetData(forkInv)
+      sm.pendingBlocks += forkInv.len
+      sm.lastSyncTime = getTime()
+      info "requesting fork blocks from announcing peer", count = forkInv.len,
+           peer = $forkPeer
+    except CatchableError as e:
+      warn "failed to send fork getdata", peer = $forkPeer, error = e.msg
+      for inv in forkInv:
+        sm.requestedHashes.excl(BlockHash(inv.hash))
+    if inventory.len == 0:
+      return
 
   # During IBD, distribute block requests across all available peers
   # to maximize download throughput (parallel download from multiple peers)
@@ -2680,6 +2993,7 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
   ## Exported so the IBD block-acceptance path (incl. the contextual
   ## difficulty check) can be exercised directly by the test suite —
   ## see tests/test_w164_apply_block_diffbits.nim.
+  sm.lastApplyError = ""
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
 
@@ -2825,6 +3139,7 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
             info "adoption probe negative — genuine reject stands",
                  height = height, probeResult = adoptErr
     if not acceptOk:
+      sm.lastApplyError = acceptErr
       warn "block failed consensus checks (IBD applyBlock)", height = height,
            error = acceptErr
       # Script-verify failure retry tracking (unchanged behaviour): a script
@@ -2897,6 +3212,7 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
           getUtxo = noUtxo,
           crypto = cryptoOff)
         if not resOff.isOk:
+          sm.lastApplyError = "acceptBlock rejected: " & $resOff.error
           warn "block failed consensus checks (offline applyBlock)",
                height = height, error = $resOff.error
           return false
@@ -2983,8 +3299,16 @@ proc drainBlockBuffer(sm: SyncManager) =
     let blk = sm.receivedBlocks[nextHeight]
     sm.receivedBlocks.del(nextHeight)
     sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    let bhash = BlockHash(doubleSha256(serialize(blk.header)))
+    let src = sm.blockSource.getOrDefault(bhash, nil)
+    sm.blockSource.del(bhash)
     if not sm.applyBlock(blk, nextHeight):
       warn "failed to apply buffered block", height = nextHeight
+      let kind = sm.confirmVerdict(
+        blockFailureKindOfApplyError(sm.lastApplyError), blk, nextHeight)
+      if kind == bfkInvalid:
+        sm.invalidChainFound(bhash)
+      sm.punishForBlock(src, kind, "invalid block: " & sm.lastApplyError)
       break
 
 proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
@@ -3082,6 +3406,8 @@ proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
   of sboReorged:
     # The heavier fork is now the active tip.  Re-sync the SyncManager cursor to
     # the new tip and surface the refresh payload for the P2P caller to drain.
+    for cb in connectedBlocks:
+      sm.blockSource.del(BlockHash(doubleSha256(serialize(cb.header))))
     sm.chainTip = sm.chainState.bestBlockHash
     sm.chainTipHeight = sm.chainState.bestHeight
     sm.pendingReorgDisconnectedTxs = disconnectedTxs
@@ -3093,15 +3419,44 @@ proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
     true
   of sboSideBranch:
     # Stored on disk as a competing branch (work <= active, or reorg deferred).
-    # Active tip unchanged — NOT a P2P-refresh event.
+    # Active tip unchanged — NOT a P2P-refresh event. Remember who sent it
+    # (Core mapBlockSource): if a later reorg attempt fails ON this block, it
+    # is this peer that gets punished.
+    sm.noteBlockSource(hash, peer)
     trace "stored competing-fork body as side branch", hash = $hash
     false
   of sboRejected:
-    # Genuine-bad body (validate-for-storage failed) or unknown parent — punish
-    # the peer exactly like the direct-extension arm (BLOCK_CONSENSUS).
-    warn "rejected competing-fork body", hash = $hash, token = sideResult.token
-    if peer != nil:
-      sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlock, "invalid side-branch block")
+    # The failing block is `hash` itself (validate-for-storage) or, when the
+    # heavier-branch reorg failed, the promoted block whose connect failed —
+    # possibly an ancestor stored earlier from another peer
+    # (ChainState.lastRejectedBlock). Core: InvalidBlockFound(that block) and
+    # BlockChecked -> MaybePunishNodeForBlock(mapBlockSource[that block]).
+    let failed = sm.chainState.lastRejectedBlock
+    var kind = blockFailureKindOfToken(sideResult.token)
+    var src: Peer = nil
+    if failed == BlockHash(default(array[32, byte])):
+      kind = bfkUndecided            # unknown parent / no block named
+    elif failed == hash:
+      src = peer
+      let h = block:
+        let ho = sm.headerChain.lookupHeaderByHash(hash)
+        if ho.isSome: ho.get().height else: sm.chainTipHeight + 1
+      kind = sm.confirmVerdict(kind, blk, h)
+    else:
+      src = sm.blockSource.getOrDefault(failed, nil)
+      let fb = (if sm.chainDb != nil: sm.chainDb.getBlock(failed) else: none(Block))
+      let fi = (if sm.chainDb != nil: sm.chainDb.getBlockIndex(failed)
+                else: none(chainstate.BlockIndex))
+      if fb.isNone or fi.isNone:
+        kind = bfkUndecided
+      else:
+        kind = sm.confirmVerdict(kind, fb.get(), fi.get().height)
+    warn "rejected competing-fork body", hash = $hash, token = sideResult.token,
+         failedBlock = $failed, kind = $kind
+    if kind == bfkInvalid:
+      sm.invalidChainFound(failed)
+    sm.blockSource.del(failed)
+    sm.punishForBlock(src, kind, "invalid side-branch block: " & sideResult.token)
     false
 
 proc tryFillMissingBody(sm: SyncManager, blk: Block): bool =
@@ -3176,7 +3531,17 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   sm.pendingReorgConnectedBlocks.setLen(0)
 
   # Remove from in-flight tracking
+  let wasRequested = hash in sm.requestedHashes
   sm.requestedHashes.excl(hash)
+
+  # BLOCK_CACHED_INVALID: a body for a block already marked failed is not
+  # validated again (Core AcceptBlockHeader "duplicate-invalid" ->
+  # MaybePunishNodeForBlock: outbound discouraged, inbound not).
+  if sm.isKnownInvalid(hash):
+    if wasRequested:
+      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    sm.cachedInvalidAnnouncement(peer, hash)
+    return false
 
   # Retained-range hole fill. Must run before the behind-tip discard and
   # before the side-branch arm: the index row exists (the block was
@@ -3249,11 +3614,22 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
     if not sm.applyBlock(blk, expectedHeight):
       sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
       # G16 (W99): MaybePunishNodeForBlock — BLOCK_MUTATED/BLOCK_CONSENSUS.
-      # Bitcoin Core: Misbehaving(peer, "mutated block") on BLOCK_MUTATED.
       # Use the Misbehaving framework (not raw banPeer) so noBan/manual/local
       # guards are respected.
-      if peer != nil:
-        sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlock, "mutated block")
+      #
+      # A consensus verdict on a body that matches its header commitments
+      # condemns the HASH: Core InvalidBlockFound marks it BLOCK_FAILED_VALID
+      # (+ descendants) so it is never fetched again and the valid sibling
+      # becomes the best header. A mutated body is punished but NOT marked
+      # (the hash may be a valid block); a local / cannot-decide failure is
+      # neither marked nor punished — it is retried.
+      let kind = sm.confirmVerdict(
+        blockFailureKindOfApplyError(sm.lastApplyError), blk, expectedHeight)
+      if kind == bfkInvalid:
+        sm.invalidChainFound(hash)
+      sm.punishForBlock(peer, kind,
+        (if kind == bfkMutated: "mutated block" else: "invalid block") &
+        ": " & sm.lastApplyError)
       return false
     sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
     sm.lastSyncTime = getTime() # Reset timeout on progress
@@ -3263,6 +3639,7 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   elif blockHeight > expectedHeight and blockHeight <= sm.headerTipHeight:
     # Out-of-order block - buffer it for later processing
     sm.receivedBlocks[int32(blockHeight)] = blk
+    sm.noteBlockSource(hash, peer)
     trace "buffered out-of-order block", height = blockHeight,
           expectedHeight = expectedHeight, buffered = sm.receivedBlocks.len
     # Reset sync timer: a valid block arrived, so we ARE making progress even if
@@ -3384,7 +3761,7 @@ proc syncLoop*(sm: SyncManager) {.async.} =
     case sm.state
     of ssIdle:
       # Check if we need to sync
-      if peer.startHeight > sm.headerChain.tipHeight:
+      if peer.availableHeight() > sm.headerChain.tipHeight:
         await sm.startHeaderSync()
       elif not sm.isSynced():
         sm.state = ssDownloadingBlocks

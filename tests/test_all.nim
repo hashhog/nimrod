@@ -138,6 +138,7 @@ const IncludedTests = [
   "test_ibd_durability",
   "test_inbound_p2p",
   "test_interpreter_glassbox_fixes",
+  "test_invalid_block_p2p",
   "test_isfinaltx",
   "test_label",
   "test_listdescriptors",

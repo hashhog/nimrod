@@ -324,6 +324,15 @@ type
     # behaves as before — but the production reorg path MUST wire it.
     reorgConnectChecksHook*: proc(blk: Block, height: int32): tuple[ok: bool, err: string]
                           {.gcsafe, raises: [].}
+    # Hash of the block a side-branch acceptance was REJECTED for — the block
+    # itself when validate-for-storage failed, or the promoted block whose
+    # connect failed inside handleReorg (which may be an ANCESTOR stored
+    # earlier, delivered by a different peer). Zero when the rejection names no
+    # block (unknown parent, internal/disconnect failure). Read by the P2P
+    # caller right after an sboRejected outcome to mark the right block failed
+    # and punish the right peer — Core InvalidBlockFound(pindex) +
+    # BlockChecked/mapBlockSource. Only meaningful immediately after a call.
+    lastRejectedBlock*: BlockHash
     # Optional tip-advance hook fired AFTER the active-chain tip pointer is
     # durably advanced — on post-IBD connect (`connectBlock`), IBD connect
     # (`connectBlockIBD`), and reorg (`handleReorg`, which atomically advances
@@ -1059,6 +1068,20 @@ proc putHeightIndex*(cdb: ChainDb, height: int32, hash: BlockHash) =
   ## submitheader); a dummy CBlockIndex would make later submitheader
   ## treat the real header as already-known and never store it.
   cdb.db.put(cfBlockIndex, blockIndexKey(height), @(array[32, byte](hash)))
+
+proc deleteHeightIndexIf*(cdb: ChainDb, height: int32, hash: BlockHash) =
+  ## Drop the height -> hash slot iff it currently names `hash`. Used when a
+  ## header written ahead of the validated chain (handleHeaders claims empty
+  ## height slots for header-only rows) turns out to be a failed block, so the
+  ## slot does not keep naming it once a valid sibling takes that height.
+  if cdb.db == nil:
+    return
+  let data = cdb.db.get(cfBlockIndex, blockIndexKey(height))
+  if data.isSome and data.get().len >= 32:
+    var h: array[32, byte]
+    copyMem(addr h[0], addr data.get()[0], 32)
+    if BlockHash(h) == hash:
+      cdb.db.delete(cfBlockIndex, blockIndexKey(height))
 
 proc getBlockIndex*(cdb: ChainDb, hash: BlockHash): Option[BlockIndex] =
   ## Get block index by hash.
@@ -3366,6 +3389,7 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   ## CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md.
 
   disconnectedTxs.setLen(0)
+  cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
 
   # Guard against re-entrant or nested reorg attempts. The single shared
   # WriteBatch + reorgDeletedUtxos override only handles one reorg at a time.
@@ -3545,6 +3569,9 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   for blk in newChain:
     let headerBytes = serialize(blk.header)
     let blockHash = BlockHash(doubleSha256(headerBytes))
+    # Every error returned from here on names THIS block (Core ConnectTip ->
+    # InvalidBlockFound(pindexNew)); see ChainState.lastRejectedBlock.
+    cs.lastRejectedBlock = blockHash
 
     # Generate undo data BEFORE mutating UTXO state.
     let undo = cs.generateUndoData(blk)
@@ -3887,6 +3914,7 @@ proc acceptSideBranchBlock*(
   ## fee-estimator / wallet refresh.  Empty for every non-reorg outcome.
   disconnectedTxs.setLen(0)
   connectedBlocks.setLen(0)
+  cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
 
   # Mirrors Bitcoin Core's BlockManager::AcceptBlock (validation.cpp): every
   # accepted block, active-chain or side-branch, gets a CBlockIndex entry with
@@ -3909,6 +3937,7 @@ proc acceptSideBranchBlock*(
   # returning the bip22-mapped error token on failure.
   let sideValidation = validateFn(blk, prevIdx)
   if not sideValidation.ok:
+    cs.lastRejectedBlock = blockHash
     return (sboRejected, sideValidation.err)
 
   # Work for this block from its nBits target, on the canonical chainstate work
@@ -4006,8 +4035,11 @@ proc acceptSideBranchBlock*(
     # reorg-in-progress — none of which carry a BIP-22 token) stays inconclusive.
     let tok = bip22RejectToken(reorgRes.error)
     if tok.len > 0:
+      # cs.lastRejectedBlock was set by handleReorg to the promoted block whose
+      # connect failed (zero if the failure was in the disconnect phase).
       return (sboRejected, tok)
     else:
+      cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
       return (sboSideBranch, "inconclusive")
 
   # Reorg succeeded — this branch is now the active tip.  Surface the connected

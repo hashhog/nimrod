@@ -1,7 +1,7 @@
 ## Block and transaction validation
 ## Full consensus rules implementation per Bitcoin protocol
 
-import std/[times, options, algorithm, tables]
+import std/[times, options, algorithm, tables, strutils]
 import ../primitives/[types, serialize]
 import ../crypto/[hashing, secp256k1]
 import ../storage/chainstate
@@ -245,6 +245,66 @@ proc bip22String*(e: ValidationError, blockVersion: int32 = 0'i32): string =
   of veInsufficientChainWork: "too-little-chainwork"
   of veOk: ""
   else: "rejected"
+
+type
+  BlockFailureKind* = enum
+    ## What a block-acceptance failure says about the BLOCK HASH (not just this
+    ## copy of the body). Bitcoin Core: InvalidBlockFound marks
+    ## BLOCK_FAILED_VALID for every result except BLOCK_MUTATED, and only real
+    ## verdicts reach it — a missing parent, a future timestamp, low-work
+    ## headers and local errors never mark anything (validation.cpp
+    ## InvalidBlockFound / AcceptBlock / ConnectTip; net_processing.cpp
+    ## MaybePunishNodeForBlock).
+    bfkInvalid   ## consensus verdict: mark failed (+descendants), punish sender
+    bfkMutated   ## BLOCK_MUTATED: this body does not match the header's
+                 ## commitments; punish the sender, do NOT mark the hash
+    bfkUndecided ## not a verdict about the block: no mark, no punishment
+
+proc blockFailureKind*(e: ValidationError): BlockFailureKind =
+  ## Classify a block-acceptance ValidationError (see BlockFailureKind).
+  ## Callers must ALSO confirm the body matches its header commitments
+  ## (`bodyMatchesCommitments`) before acting on bfkInvalid: nimrod's
+  ## validateBlock checks weight and sigop cost BEFORE the witness commitment,
+  ## so a witness-stuffed copy of a valid block can surface as
+  ## veBlockOverweight / veSigopExceeded (Core orders CheckWitnessMalleation
+  ## first for exactly this reason, validation.cpp ContextualCheckBlock).
+  case e
+  of veBadMerkleRoot, veMutatedMerkleTree, veBadWitnessCommitment,
+     veWitnessNonceSize, veUnexpectedWitness:
+    bfkMutated
+  of veOk, vePrevBlockMissing, veTooFarAhead, veTimeTooNew,
+     veInsufficientChainWork, veCheckpointMismatch, veForkBelowCheckpoint,
+     veFeeTooLow:
+    bfkUndecided
+  else:
+    bfkInvalid
+
+proc blockFailureKindOfToken*(tok: string): BlockFailureKind =
+  ## Same classification for a BIP-22 reject token (the side-branch /
+  ## reorg path only carries bip22String / bip22RejectToken output).
+  case tok
+  of "bad-txnmrklroot", "bad-txns-duplicate", "bad-witness-merkle-match",
+     "bad-witness-nonce-size", "unexpected-witness":
+    bfkMutated
+  of "", "rejected", "inconclusive", "duplicate", "time-too-new",
+     "too-little-chainwork", "prev-blk-not-found", "bad-prevblk":
+    bfkUndecided
+  else:
+    bfkInvalid
+
+proc blockFailureKindOfApplyError*(err: string): BlockFailureKind =
+  ## Classify the string acceptAndConnectBlock returns. Only its
+  ## "acceptBlock rejected: <ValidationError>" form is a statement about the
+  ## block; every other failure (missing prev index, connect / I/O errors,
+  ## exceptions) is local and undecided.
+  const prefix = "acceptBlock rejected: "
+  if not err.startsWith(prefix):
+    return bfkUndecided
+  let rest = err[prefix.len .. ^1]
+  for e in ValidationError:
+    if rest == $e:
+      return blockFailureKind(e)
+  bfkUndecided
 
 proc mempoolCheckTxToken*(e: ValidationError): string =
   ## Map a CheckTransaction (consensus/tx_check.cpp) ValidationError to the
@@ -576,6 +636,22 @@ proc checkWitnessMalleation*(blk: Block, segwitActive: bool): ValidationResult[v
         return voidErr(veUnexpectedWitness)
 
   ok()
+
+proc bodyMatchesCommitments*(blk: Block, segwitActive: bool): bool =
+  ## True when this body is the one the header commits to: merkle root matches
+  ## and is not CVE-2012-2459-mutated, and the witness data matches the
+  ## coinbase commitment (or there is none and no witness). Only then can a
+  ## validation failure be pinned on the block HASH rather than on this copy.
+  if blk.txs.len == 0:
+    return false
+  var txHashes: seq[array[32, byte]]
+  for tx in blk.txs:
+    txHashes.add(array[32, byte](tx.txid()))
+  var mutated = false
+  let root = computeMerkleRootMutated(txHashes, mutated)
+  if mutated or root != blk.header.merkleRoot:
+    return false
+  checkWitnessMalleation(blk, segwitActive).isOk
 
 # Median Time Past (MTP) calculation
 proc getMedianTimePast*(prevHeaders: seq[BlockHeader]): uint32 =
