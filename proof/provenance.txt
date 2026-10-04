@@ -1,25 +1,25 @@
 # Provenance — nimrod proof bundle
-assembled_utc: 2026-09-26T11:38:44Z
+assembled_utc: 2026-10-03T14:14:45Z
 repo: https://github.com/hashhog/nimrod
 branch: master
-commit: 0cc859a43a2034ef43df839dfebaa4b7dbf96e87
-commit_short: 0cc859a43a20
-subject: chore(proof): re-attest bundle to the promoted pin 23e42af
+commit: a6a5cc2ec21cbcc36f437aeb598a21af032cee91
+commit_short: a6a5cc2ec21c
+subject: fix: getblockchaininfo no longer walks the header chain to genesis on every call
 tree_clean: NO
 binary: /home/work/hashhog/deploy/nimrod/nimrod
-binary_sha256: ebc4a3d80fdf319c4d6f4a9b67a29a2c362a368084e5f3696b661640d49cd9b0
+binary_sha256: 2af1074fae1e5d2a1438a5b475f6c6f3e9cf184ea31de75d7c8fa78b377c83ca
 toolchain: Nim Compiler Version 2.2.8 [Linux: amd64]
 nimble: nimble v0.20.1 compiled at 2026-02-23 03:08:48
 target: Linux amd64
 build: nimble build -d:release -y
-deploy_pin: 0cc859a43a2034ef43df839dfebaa4b7dbf96e87
-deploy_short: 0cc859a
-deploy_sha256: ebc4a3d80fdf319c4d6f4a9b67a29a2c362a368084e5f3696b661640d49cd9b0
+deploy_pin: a6a5cc2ec21cbcc36f437aeb598a21af032cee91
+deploy_short: a6a5cc2
+deploy_sha256: 2af1074fae1e5d2a1438a5b475f6c6f3e9cf184ea31de75d7c8fa78b377c83ca
 source: pin
 
 # Honest caveats
 The attested binary is the promoted pin (deploy/nimrod/MANIFEST
-sha256=ebc4a3d80fdf319c4d6f4a9b67a29a2c362a368084e5f3696b661640d49cd9b0, commit 0cc859a), which must be
+sha256=2af1074fae1e5d2a1438a5b475f6c6f3e9cf184ea31de75d7c8fa78b377c83ca, commit a6a5cc2), which must be
 byte-identical to the live mainnet unit's /proc/<pid>/exe. Re-run
 this script with --pin after every promote; proof/check-pin.sh and
 proof/verify.sh fail if a pin is present and does not match.
