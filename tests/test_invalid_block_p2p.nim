@@ -21,7 +21,7 @@
 ## the suite is a real fail-before / pass-after regression test.
 
 import unittest2
-import std/[options, os, tables, sets]
+import std/[options, os, tables, sets, strutils]
 import chronos
 import ../src/network/sync
 import ../src/network/peer
@@ -29,6 +29,7 @@ import ../src/network/peermanager
 import ../src/network/messages
 import ../src/consensus/[params, validation, chain]
 import ../src/storage/chainstate
+import ../src/storage/db
 import ../src/primitives/[types, serialize, uint256]
 import ../src/crypto/hashing
 
@@ -305,3 +306,138 @@ suite "non-verdicts are NOT marked failed":
     check blockFailureKindOfToken("rejected") == bfkUndecided
     check blockFailureKindOfToken("bad-txnmrklroot") == bfkMutated
     check blockFailureKindOfToken("bad-cb-amount") == bfkInvalid
+
+# ===========================================================================
+# A UTXO READ FAILURE is a local fault, not a verdict.
+#
+# Core: CCoinsViewErrorCatcher::GetCoin turns a coins-DB read failure into
+# "Error reading from database, shutting down." + abort — the block is never
+# marked BLOCK_FAILED_VALID and no peer is punished. A coin that is genuinely
+# absent IS a verdict (bad-txns-inputs-missingorspent).
+#
+# The fault is real, not mocked: the spent coin's on-disk record is replaced
+# by a 1-byte value, so ChainDb.getUtxo raises SerializationError exactly as
+# it would for a damaged record. Before this fix the lookup adapters caught
+# the raise and returned none(UtxoEntry), so the coin read as MISSING and the
+# block was persistently marked failed (nimrod writes failureFlags to disk —
+# sticky until reconsiderblock) and its sender punished.
+
+proc ghostOutpoint(tag: byte): OutPoint =
+  ## The outpoint missingInputBlock(.., tag) spends.
+  var ghost: array[32, byte]
+  ghost[0] = 0xAB
+  ghost[1] = tag
+  OutPoint(txid: TxId(ghost), vout: 0)
+
+proc corruptCoin(cs: ChainState, op: OutPoint) =
+  cs.db.db.put(cfUtxo, utxoKey(array[32, byte](op.txid), op.vout), @[0x01'u8])
+
+proc dropCoin(cs: ChainState, op: OutPoint) =
+  cs.db.db.delete(cfUtxo, utxoKey(array[32, byte](op.txid), op.vout))
+
+suite "a UTXO read failure is not a verdict":
+
+  test "tip extension: unreadable coin -> not marked, sender not punished; once the coin is truly missing -> marked":
+    let p = regtestParams()
+    let path = "/tmp/nimrod_ibp2p_readerr_before"
+    let (cs, blks) = buildDatadir(path, p, 20)
+    defer:
+      var c = cs
+      c.close()
+      removeDir(path)
+      removeDir(path & "_pm")
+    var csv = cs
+    let pm = freshPeerManager(p, path & "_pm")
+    let x = pm.readyPeer("198.51.100.142", p, pdInbound, 21)
+    let x2 = pm.readyPeer("198.51.100.143", p, pdInbound, 21)
+    let sm = newSyncManager(pm, csv.db, p, csv)
+
+    let b1 = missingInputBlock(blks[20], 21, 0xE1)
+    let hB1 = hashOf(b1.header)
+    let ghost = ghostOutpoint(0xE1)
+    csv.corruptCoin(ghost)
+    # Instrument check: the fault is live — the raw read raises.
+    expect(CatchableError):
+      discard csv.getUtxo(ghost)
+
+    waitFor sm.handleHeaders(x, @[b1.header])
+    check not sm.processBlock(x, b1)
+    # PRE-FIX: marked BLOCK_FAILED_VALID on disk, header dropped, x punished.
+    check not csv.isFailedOnDisk(hB1)
+    check not x.shouldDisconnect
+    check sm.headerChain.getHashByHeight(21) == some(hB1)   # still wanted (retried)
+    check sm.lastApplyError.startsWith("utxo-read-error")
+    check sm.chainTipHeight == 20
+
+    # Positive control on the same block: the record is now genuinely absent,
+    # which IS a consensus verdict — marked, and the deliverer punished.
+    csv.dropCoin(ghost)
+    check csv.getUtxo(ghost).isNone
+    check not sm.processBlock(x2, b1)
+    check csv.isFailedOnDisk(hB1)
+    check x2.shouldDisconnect
+    check sm.headerChain.getHashByHeight(21) != some(hB1)
+
+  test "reorg attempt: unreadable coin in the promoted block -> nothing marked or punished, tip and chainstate intact":
+    let p = regtestParams()
+    let path = "/tmp/nimrod_ibp2p_readerr_after"
+    let (cs, blks) = buildDatadir(path, p, 20)
+    defer:
+      var c = cs
+      c.close()
+      removeDir(path)
+      removeDir(path & "_pm")
+    var csv = cs
+    let b1v = validBlock(blks[20], 21, 0xC1)
+    check csv.connectBlock(b1v, 21).isOk
+    let pm = freshPeerManager(p, path & "_pm")
+    let x = pm.readyPeer("198.51.100.152", p, pdInbound, 21)
+    let y = pm.readyPeer("198.51.100.153", p, pdInbound, 22)
+    let h = pm.readyPeer("198.51.100.154", p, pdInbound, 21)
+    let sm = newSyncManager(pm, csv.db, p, csv)
+
+    let b1 = missingInputBlock(blks[20], 21, 0xE2)
+    let b2x = validBlock(b1, 22, 0xE3)
+    let b2v = validBlock(b1v, 22, 0xC2)
+    csv.corruptCoin(ghostOutpoint(0xE2))
+
+    waitFor sm.handleHeaders(x, @[b1.header, b2x.header])
+    check not sm.processBlock(x, b1)        # stored as a side branch
+    check not sm.processBlock(y, b2x)       # reorg attempt hits the read fault
+
+    check not csv.isFailedOnDisk(hashOf(b1.header))
+    check not csv.isFailedOnDisk(hashOf(b2x.header))
+    check not x.shouldDisconnect
+    check not y.shouldDisconnect
+    # PRE-FIX: the raise escaped handleReorg with the in-memory tip rolled back
+    # to the fork point and reorgDeletedUtxos left set.
+    check sm.chainTip == hashOf(b1v.header)
+    check csv.bestBlockHash == hashOf(b1v.header)
+    check csv.bestHeight == 21
+    check csv.reorgDeletedUtxos == nil
+
+    waitFor sm.handleHeaders(h, @[b2v.header])
+    check sm.processBlock(h, b2v)
+    check sm.chainTip == hashOf(b2v.header)
+
+  test "lookup adapter: a raise is recorded, a clean miss is not":
+    let g = newUtxoReadGuard()
+    let raising = guardedUtxoLookup(
+      proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} =
+        raise newException(IOError, "injected read fault"), g)
+    check raising(ghostOutpoint(1)).isNone
+    check g.failed
+    let g2 = newUtxoReadGuard()
+    let missing = guardedUtxoLookup(
+      proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} = none(UtxoEntry), g2)
+    check missing(ghostOutpoint(1)).isNone
+    check not g2.failed
+
+  test "classifier: a read failure / hook exception is undecided":
+    check blockFailureKind(veUtxoReadError) == bfkUndecided
+    check blockFailureKind(veInputsMissing) == bfkInvalid
+    check blockFailureKindOfToken("utxo-read-error: x") == bfkUndecided
+    check blockFailureKindOfToken("local-error: boom") == bfkUndecided
+    check blockFailureKindOfToken("bad-txns-inputs-missingorspent") == bfkInvalid
+    check blockFailureKindOfApplyError("utxo-read-error: x") == bfkUndecided
+    check blockFailureKindOfApplyError("acceptBlock rejected: " & $veUtxoReadError) == bfkUndecided

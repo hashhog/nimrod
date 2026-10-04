@@ -3140,6 +3140,14 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
                  height = height, probeResult = adoptErr
     if not acceptOk:
       sm.lastApplyError = acceptErr
+      if acceptErr.startsWith(bip22String(veUtxoReadError)):
+        # Local fault, not a verdict: the block is neither marked nor its
+        # sender punished, and it is retried. Loud, because a persistent
+        # read failure means the UTXO database is damaged (Core aborts here).
+        error "UTXO DATABASE READ FAILED while validating block — NOT marking " &
+              "it invalid; check the disk / chainstate", height = height,
+              hash = $hash, error = acceptErr
+        return false
       warn "block failed consensus checks (IBD applyBlock)", height = height,
            error = acceptErr
       # Script-verify failure retry tracking (unchanged behaviour): a script
@@ -3342,9 +3350,11 @@ proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
         let cryptoSide = newCryptoEngine()
         vr = validateForStorage(sm.chainState, b, prevIdx, cryptoSide)
     except CatchableError as e:
-      return (ok: false, err: e.msg)
+      # An exception is not a statement about the block: without the
+      # local-error prefix blockFailureKindOfToken read e.msg as a verdict.
+      return (ok: false, err: localErrorToken & ": " & e.msg)
     except Exception as e:
-      return (ok: false, err: e.msg)
+      return (ok: false, err: localErrorToken & ": " & e.msg)
     if vr.isOk: (ok: true, err: "")
     else: (ok: false, err: bip22String(vr.error))
 
@@ -3352,18 +3362,21 @@ proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
   let reorgParams = sm.params
   let reorgVerify = proc(b: Block, height: int32): tuple[ok: bool, err: string]
                          {.gcsafe, raises: [].} =
-    let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
-      try: csCapture.getUtxo(op)
-      except: none(UtxoEntry)
+    # A UTXO read failure is recorded, not read as a missing input
+    # (which would be a bad-txns-inputs-missingorspent verdict).
+    let readGuard = newUtxoReadGuard()
+    let utxoLookup = guardedUtxoLookup(csCapture, readGuard)
     var res: ValidationResult[void]
     try:
       {.gcsafe.}:
         let cryptoVerify = newCryptoEngine()
         res = verifyScripts(b, utxoLookup, height, cryptoVerify, reorgParams)
     except CatchableError as e:
-      return (ok: false, err: e.msg)
+      return (ok: false, err: localErrorToken & ": " & e.msg)
     except Exception as e:
-      return (ok: false, err: e.msg)
+      return (ok: false, err: localErrorToken & ": " & e.msg)
+    if readGuard.failed:
+      return (ok: false, err: bip22String(veUtxoReadError) & ": " & readGuard.msg)
     if res.isOk: (ok: true, err: "")
     else: (ok: false, err: bip22String(res.error))
 
@@ -3373,17 +3386,20 @@ proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
   # gates only scripts). Closes nimrod#4 on the P2P body path too.
   let reorgConnectChecksFn = proc(b: Block, height: int32): tuple[ok: bool, err: string]
                                   {.gcsafe, raises: [].} =
-    let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
-      try: csCapture.getUtxo(op)
-      except: none(UtxoEntry)
+    # A UTXO read failure is recorded, not read as a missing input
+    # (which would be a bad-txns-inputs-missingorspent verdict).
+    let readGuard = newUtxoReadGuard()
+    let utxoLookup = guardedUtxoLookup(csCapture, readGuard)
     var res: ValidationResult[void]
     try:
       {.gcsafe.}:
         res = reorgConnectChecks(b, height, utxoLookup, csCapture.db, reorgParams)
     except CatchableError as e:
-      return (ok: false, err: e.msg)
+      return (ok: false, err: localErrorToken & ": " & e.msg)
     except Exception as e:
-      return (ok: false, err: e.msg)
+      return (ok: false, err: localErrorToken & ": " & e.msg)
+    if readGuard.failed:
+      return (ok: false, err: bip22String(veUtxoReadError) & ": " & readGuard.msg)
     if res.isOk: (ok: true, err: "")
     else: (ok: false, err: bip22String(res.error))
 

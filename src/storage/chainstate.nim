@@ -3471,6 +3471,18 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     cs.reorgDeletedUtxos = nil
     disconnectedTxs.setLen(0)
 
+  # An EXCEPTION while staging (a UTXO / undo read that raises — e.g. a corrupt
+  # coin record in generateUndoData or the input-spend loop below) used to
+  # escape with the in-memory tip rolled back to the fork point, the cache
+  # half-mutated and reorgDeletedUtxos left non-nil (every later reorg then
+  # failed "another reorg is already in progress"). Restore the snapshot on
+  # any exit before the commit; the exception still propagates, and
+  # acceptSideBranchBlock reports it as a local (non-verdict) failure.
+  var committed = false
+  defer:
+    if not committed:
+      rollbackInMemory()
+
   # ---- Stage all disconnects onto the shared batch ----
   # Capture per-disconnect hash/prevHash/height tuples so the index
   # disconnect hook (BIP-157 filter-index rollback) can fire AFTER the
@@ -3787,6 +3799,7 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
 
   # ---- Single atomic commit ----
   cs.db.db.write(batch)
+  committed = true
 
   # Clear the tentative-delete override; from here on getUtxo can read
   # straight from RocksDB and see the post-reorg state.
@@ -4018,6 +4031,13 @@ proc acceptSideBranchBlock*(
   var reorgRes: ChainStateResult[void]
   try:
     reorgRes = cs.handleReorg(forkPoint, newChainBlocks, disconnectedTxs)
+  except CatchableError as e:
+    # A raise inside the reorg (UTXO / undo / block read failure) is a LOCAL
+    # error, not a verdict on the branch: no BIP-22 token, so it lands in the
+    # "inconclusive" arm below (no mark, no punishment). handleReorg has
+    # already restored its in-memory snapshot. Core: a coins-DB read failure
+    # aborts the node; it never marks the block.
+    reorgRes = err("local error during reorg (not a block verdict): " & e.msg)
   finally:
     cs.reorgVerifyHook = nil
     cs.reorgConnectChecksHook = nil

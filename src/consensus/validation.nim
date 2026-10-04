@@ -85,6 +85,14 @@ type
     # enum here made two-coinbase blocks report bad-cb-height (corpus
     # bwmc/A5-two-coinbases, A6-coinbase-at-index2).
     veMultipleCoinbase = "more than one coinbase (bad-cb-multiple)"
+    # NOT a consensus result: a UTXO / chain-DB READ FAILED while the block was
+    # being checked (I/O error, corrupt coin record). Core's
+    # CCoinsViewErrorCatcher::GetCoin turns a coins-DB read failure into
+    # "Error reading from database, shutting down." + abort — never into a
+    # block-validity verdict. A lookup adapter that cannot raise records the
+    # failure in a UtxoReadGuard and the caller reports THIS instead of the
+    # "missing input" the adapter had to return. blockFailureKind -> undecided.
+    veUtxoReadError = "UTXO database read failed (local error, not a block verdict)"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -243,6 +251,7 @@ proc bip22String*(e: ValidationError, blockVersion: int32 = 0'i32): string =
   # too-little-chainwork: header accepted before PRESYNC verified chain meets
   # nMinimumChainWork (validation.cpp:4229, BLOCK_HEADER_LOW_WORK).
   of veInsufficientChainWork: "too-little-chainwork"
+  of veUtxoReadError: "utxo-read-error"
   of veOk: ""
   else: "rejected"
 
@@ -274,14 +283,23 @@ proc blockFailureKind*(e: ValidationError): BlockFailureKind =
     bfkMutated
   of veOk, vePrevBlockMissing, veTooFarAhead, veTimeTooNew,
      veInsufficientChainWork, veCheckpointMismatch, veForkBelowCheckpoint,
-     veFeeTooLow:
+     veFeeTooLow, veUtxoReadError:
     bfkUndecided
   else:
     bfkInvalid
 
+const localErrorToken* = "local-error"
+  ## Prefix for a side-branch / reorg hook failure that is not a statement
+  ## about the block (an exception inside the hook). Never a verdict.
+
 proc blockFailureKindOfToken*(tok: string): BlockFailureKind =
   ## Same classification for a BIP-22 reject token (the side-branch /
   ## reorg path only carries bip22String / bip22RejectToken output).
+  ## A UTXO read failure ("utxo-read-error...") or a hook exception
+  ## ("local-error...") is local, never a verdict.
+  if tok.startsWith(bip22String(veUtxoReadError)) or
+     tok.startsWith(localErrorToken):
+    return bfkUndecided
   case tok
   of "bad-txnmrklroot", "bad-txns-duplicate", "bad-witness-merkle-match",
      "bad-witness-nonce-size", "unexpected-witness":
@@ -305,6 +323,45 @@ proc blockFailureKindOfApplyError*(err: string): BlockFailureKind =
     if rest == $e:
       return blockFailureKind(e)
   bfkUndecided
+
+type
+  UtxoReadGuard* = ref object
+    ## Records a READ FAILURE seen by a UTXO / chain-DB lookup adapter whose
+    ## signature cannot raise (`proc(op): Option[UtxoEntry] {.raises: [].}`).
+    ## Such an adapter must return SOMETHING, and "none" is read downstream as
+    ## a missing coin — bad-txns-inputs-missingorspent, a consensus verdict that
+    ## nimrod persists as BLOCK_FAILED_VALID. So the adapter returns none AND
+    ## sets `failed`; the caller then discards whatever verdict the check
+    ## produced and reports veUtxoReadError (a local error) instead. A coin
+    ## that is genuinely absent reads cleanly as none and leaves `failed`
+    ## false, so it stays a verdict.
+    failed*: bool
+    msg*: string
+
+proc newUtxoReadGuard*(): UtxoReadGuard = UtxoReadGuard()
+
+proc noteReadFailure*(g: UtxoReadGuard, what: string) {.gcsafe, raises: [].} =
+  if not g.failed:
+    g.failed = true
+    g.msg = what
+
+proc guardedUtxoLookup*(
+    lookup: proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.},
+    g: UtxoReadGuard): proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+  ## Wrap a raising UTXO lookup (normally `ChainState.getUtxo`) for an API that
+  ## needs a non-raising one; a raise is recorded in `g`, not swallowed.
+  result = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+    try:
+      lookup(op)
+    except Exception as e:
+      g.noteReadFailure("UTXO read " & $op.txid & ":" & $op.vout & ": " & e.msg)
+      none(UtxoEntry)
+
+proc guardedUtxoLookup*(cs: ChainState, g: UtxoReadGuard):
+    proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+  let csRef = cs
+  guardedUtxoLookup(proc(op: OutPoint): Option[UtxoEntry] {.gcsafe.} =
+                      csRef.getUtxo(op), g)
 
 proc mempoolCheckTxToken*(e: ValidationError): string =
   ## Map a CheckTransaction (consensus/tx_check.cpp) ValidationError to the
@@ -1893,22 +1950,29 @@ proc validateBlock*(
     # the connect path use.
     block:
       let blkHashArr = array[32, byte](doubleSha256(serialize(blk.header)))
+      # A read failure in either callback is a LOCAL error (veUtxoReadError),
+      # not "no collision" / "not the canonical BIP34 ancestor".
+      let bip30Guard = newUtxoReadGuard()
       let bip30HasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
         try:
           if getUtxoOverride != nil: getUtxoOverride(op).isSome
           else: utxos.getUtxo(op).isSome
-        except CatchableError: false
-        except Exception: false
+        except Exception as e:
+          bip30Guard.noteReadFailure("BIP30 UTXO read: " & e.msg)
+          false
       let dbRef = utxos
       let bip30AncestorHash = proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} =
         try:
           let hashOpt = dbRef.getBlockHashByHeight(h)
           if hashOpt.isSome: some(array[32, byte](hashOpt.get()))
           else: none(array[32, byte])
-        except CatchableError: none(array[32, byte])
-        except Exception: none(array[32, byte])
+        except Exception as e:
+          bip30Guard.noteReadFailure("BIP34 ancestor read: " & e.msg)
+          none(array[32, byte])
       let bip30Result = checkBip30(blk, height, blkHashArr, params,
                                    bip30HasUtxo, bip30AncestorHash)
+      if bip30Guard.failed:
+        return voidErr(veUtxoReadError)
       if not bip30Result.isOk:
         return bip30Result
 
@@ -2542,16 +2606,26 @@ proc reorgConnectChecks*(
   # checkBip30's raises:[] callback signatures (belt-and-suspenders try/except).
   let blkHeaderBytes = serialize(blk.header)
   let blkHashArr = array[32, byte](doubleSha256(blkHeaderBytes))
+  # The ancestor lookup guards Gate 2 (BIP34 canonical-chain exemption): a
+  # read failure there used to read as "not canonical" and silently force the
+  # BIP30 scan. Either callback failing is now veUtxoReadError (local).
+  let bip30Guard = newUtxoReadGuard()
   let bip30HasUtxo = proc(op: OutPoint): bool {.gcsafe, raises: [].} =
     try: utxos(op).isSome
-    except: false
+    except Exception as e:
+      bip30Guard.noteReadFailure("BIP30 UTXO read: " & e.msg)
+      false
   let bip30AncestorHash = proc(h: int32): Option[array[32, byte]] {.gcsafe, raises: [].} =
     try:
       let hashOpt = db.getBlockHashByHeight(h)
       if hashOpt.isSome: some(array[32, byte](hashOpt.get()))
       else: none(array[32, byte])
-    except: none(array[32, byte])
+    except Exception as e:
+      bip30Guard.noteReadFailure("BIP34 ancestor read: " & e.msg)
+      none(array[32, byte])
   let bip30Result = checkBip30(blk, height, blkHashArr, params, bip30HasUtxo, bip30AncestorHash)
+  if bip30Guard.failed:
+    return voidErr(veUtxoReadError)
   if not bip30Result.isOk:
     return bip30Result
 
@@ -2931,11 +3005,10 @@ proc acceptAndConnectBlock*(
   let blockHash = BlockHash(doubleSha256(blockHashBytes))
   let skipScripts = cs.computeSkipScripts(blockHash, height)
 
-  # UTXO lookup adapter for acceptBlock (BIP-30 + verifyScripts).
-  let csRef = cs
-  let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
-    try: csRef.getUtxo(op)
-    except: none(UtxoEntry)
+  # UTXO lookup adapter for acceptBlock (BIP-30 + verifyScripts). A read
+  # failure is recorded in `readGuard`, not turned into a missing input.
+  let readGuard = newUtxoReadGuard()
+  let utxoLookup = guardedUtxoLookup(cs, readGuard)
 
   # Full consensus envelope (Core AcceptBlock parity):
   #   step 1 checkBlock              (PoW + merkle + tx sanity)
@@ -2950,6 +3023,17 @@ proc acceptAndConnectBlock*(
                                  checkPow = true,
                                  getUtxo = utxoLookup,
                                  crypto = crypto)
+  # A UTXO read failure voids whatever acceptBlock concluded (a coin it could
+  # not read looked missing, or a BIP30 collision looked absent). Report it
+  # WITHOUT the "acceptBlock rejected: " prefix: blockFailureKindOfApplyError
+  # then classifies it undecided (no BLOCK_FAILED_VALID mark, no punishment),
+  # and it does not contain "missing input", so the marker-lag adoption probe
+  # in sync.applyBlock does not fire either. Core: CCoinsViewErrorCatcher ->
+  # AbortNode, never a block verdict.
+  if readGuard.failed or
+     (not acceptResult.isOk and acceptResult.error == veUtxoReadError):
+    return err("utxo-read-error: " & $veUtxoReadError & ": " &
+               (if readGuard.failed: readGuard.msg else: "BIP30/BIP34 lookup"))
   if not acceptResult.isOk:
     return err("acceptBlock rejected: " & $acceptResult.error)
 
@@ -2995,11 +3079,9 @@ proc validateForStorage*(
   ## are re-verified when handleReorg later calls connectBlock on the
   ## side-branch chain (where the disconnect-then-reconnect rebuilds the
   ## UTXO state to the fork point).
-  let csRef = cs
-  let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
-    try: csRef.getUtxo(op)
-    except: none(UtxoEntry)
-  acceptBlock(blk, prevIdx, cs.db, cs.params,
+  let readGuard = newUtxoReadGuard()
+  let utxoLookup = guardedUtxoLookup(cs, readGuard)
+  result = acceptBlock(blk, prevIdx, cs.db, cs.params,
               skipScripts = true,          # scripts re-verify on reorg
               checkPow = true,
               getUtxo = utxoLookup,
@@ -3013,4 +3095,6 @@ proc validateForStorage*(
                                            # here → false bad-txns-inputs-missingorspent.
                                            # ConnectBlock runs at handleReorg time
                                            # against the fork-point UTXO view.
+  if readGuard.failed:
+    result = voidErr(veUtxoReadError)
 

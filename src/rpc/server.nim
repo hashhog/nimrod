@@ -6378,14 +6378,19 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # Reference: bitcoin-core/src/validation.cpp::Chainstate::ProcessNewBlock.
       let skipScripts = cs.params.assumeValidHeight > 0 and
                         height <= cs.params.assumeValidHeight
-      let utxoForAccept = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
-        try: cs.getUtxo(op)
-        except: none(UtxoEntry)
+      # A UTXO read failure is a local error, not bad-txns-inputs-missingorspent.
+      let utxoReadGuard = newUtxoReadGuard()
+      let utxoForAccept = guardedUtxoLookup(cs, utxoReadGuard)
       let acceptResult = acceptBlock(blk, prevIdx, cs.db, cs.params,
                                      skipScripts = skipScripts,
                                      checkPow = false,  # PoW already checked by checkBlock above
                                      getUtxo = utxoForAccept,
                                      crypto = rpc.crypto)
+      if utxoReadGuard.failed:
+        # Not a verdict on the block (Core would abort on a coins-DB read
+        # failure); report it as a local error instead of a reject reason.
+        warn "submitblock: UTXO database read failed", error = utxoReadGuard.msg
+        return %bip22String(veUtxoReadError)
       if not acceptResult.isOk:
         return %bip22String(acceptResult.error, blk.header.version)
 
@@ -6504,17 +6509,19 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       let reorgParams = cs.params
       let reorgVerify = proc(b: Block, height: int32): tuple[ok: bool, err: string]
                              {.gcsafe, raises: [].} =
-        let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
-          try: csCapture.getUtxo(op)
-          except: none(UtxoEntry)
+        # A UTXO read failure is recorded, not read as a missing input.
+        let readGuard = newUtxoReadGuard()
+        let utxoLookup = guardedUtxoLookup(csCapture, readGuard)
         var res: ValidationResult[void]
         try:
           {.gcsafe.}:
             res = verifyScripts(b, utxoLookup, height, reorgCrypto, reorgParams)
         except CatchableError as e:
-          return (ok: false, err: e.msg)
+          return (ok: false, err: localErrorToken & ": " & e.msg)
         except Exception as e:
-          return (ok: false, err: e.msg)
+          return (ok: false, err: localErrorToken & ": " & e.msg)
+        if readGuard.failed:
+          return (ok: false, err: bip22String(veUtxoReadError) & ": " & readGuard.msg)
         if res.isOk: (ok: true, err: "")
         else: (ok: false, err: bip22String(res.error))
 
@@ -6527,17 +6534,19 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # "bad-txns-nonfinal".
       let reorgConnectChecksFn = proc(b: Block, height: int32): tuple[ok: bool, err: string]
                                       {.gcsafe, raises: [].} =
-        let utxoLookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
-          try: csCapture.getUtxo(op)
-          except: none(UtxoEntry)
+        # A UTXO read failure is recorded, not read as a missing input.
+        let readGuard = newUtxoReadGuard()
+        let utxoLookup = guardedUtxoLookup(csCapture, readGuard)
         var res: ValidationResult[void]
         try:
           {.gcsafe.}:
             res = reorgConnectChecks(b, height, utxoLookup, csCapture.db, reorgParams)
         except CatchableError as e:
-          return (ok: false, err: e.msg)
+          return (ok: false, err: localErrorToken & ": " & e.msg)
         except Exception as e:
-          return (ok: false, err: e.msg)
+          return (ok: false, err: localErrorToken & ": " & e.msg)
+        if readGuard.failed:
+          return (ok: false, err: bip22String(veUtxoReadError) & ": " & readGuard.msg)
         if res.isOk: (ok: true, err: "")
         else: (ok: false, err: bip22String(res.error))
 
