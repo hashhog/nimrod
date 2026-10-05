@@ -2901,6 +2901,22 @@ proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainSta
     if txIdx > 0:
       for input in tx.inputs:
         intraSpentProbe[outpointKey(input.prevOut)] = true
+  #
+  # EVIDENCE MUST BE THIS BLOCK'S OWN COIN, NOT JUST ITS OUTPOINT. An outpoint
+  # is NOT unique to one block: a block may re-include a transaction that is
+  # already confirmed (same txid ⇒ same outpoints). Its outputs then sit on
+  # disk from the ORIGINAL block, its inputs are spent, so the block fails
+  # "missing input" — and a bare presence probe used to read those coins as
+  # proof that THIS block was applied, adopt it, and roll forward every tx in
+  # it (incl. spends of coins that never existed). Core never infers "already
+  # applied" from the coin set (ReplayBlocks rolls forward only the blocks
+  # named by the durable HEAD_BLOCKS marker) and rejects such a block
+  # bad-txns-inputs-missingorspent (BIP30's HaveCoin scan is skipped between
+  # BIP34 activation and 1,983,702, validation.cpp:2430-2467). So a durable
+  # coin counts as evidence only if it is byte-identical to what THIS block
+  # creates at THIS height (output, height, coinbase flag); any of the
+  # block's outpoints present with a DIFFERENT coin proves a txid collision
+  # with an earlier block and refuses adoption outright.
   var evidence = 0
   var probed = 0
   for txIdx, tx in blk.txs:
@@ -2912,7 +2928,15 @@ proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainSta
       if outpointKey(op) in intraSpentProbe:
         continue
       inc probed
-      if cs.db.getUtxo(op).isSome:
+      let onDisk = cs.db.getUtxo(op)
+      if onDisk.isSome:
+        let coin = onDisk.get()
+        if coin.height != height or coin.isCoinbase != (txIdx == 0) or
+           coin.output != output:
+          return err("adoption refused: output " & $txId & ":" & $voutIdx &
+                     " is durable from height " & $coin.height &
+                     " — created by an earlier block, not this one at height " &
+                     $height & " (re-included/duplicate txid)")
         inc evidence
   if evidence == 0:
     return err("no adoption evidence: 0/" & $probed &
