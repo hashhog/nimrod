@@ -11,6 +11,7 @@ import ../crypto/hashing
 import ../crypto/muhash
 import ../consensus/params
 import ../consensus/assumevalid
+import ../util/fatal
 import chronicles
 
 export db.ColumnFamily
@@ -1573,6 +1574,14 @@ proc deleteUtxoCache*(cs: var ChainState, op: OutPoint) =
 
 proc flushCache*(cs: var ChainState) =
   ## Flush cached UTXOs to database
+  ##
+  ## Gate 6: never after AbortNode. In IBD the cache holds coins whose batch
+  ## could not be committed; writing them one by one here would persist a
+  ## UTXO set that no tip pointer describes. The cache is cleared only after
+  ## every put has returned (a raise leaves it intact).
+  if isFatal():
+    warn "fatal error latched: NOT flushing the UTXO cache", entries = cs.cacheSize
+    return
   for op, entry in cs.utxoCache:
     cs.db.putUtxo(op, entry)
   cs.utxoCache.clear()
@@ -1853,6 +1862,35 @@ proc computeSkipScripts*(cs: ChainState, blockHash: BlockHash, height: int32): b
   let ctx = buildAssumeValidContext(cs, blockHash, height)
   shouldSkipScripts(ctx, cs.params) == ssrSkip
 
+proc runTipHooks(cs: ChainState, blk: Block, height: int32) =
+  ## Wake the wait-family RPCs (Core KernelNotifications blockTip /
+  ## WaitTipChanged) and the wallet/index connect hook. Best-effort: they run
+  ## after the chainstate commit, so a raise here must never surface as a
+  ## failure to connect a block that is already the durable tip.
+  try:
+    if cs.tipChangedHook != nil:
+      cs.tipChangedHook()
+  except Exception as e:
+    warn "tip-changed hook failed (block stays connected)", error = e.msg
+  try:
+    if cs.connectHook != nil:
+      cs.connectHook(blk, height)
+  except Exception as e:
+    warn "connect hook failed (block stays connected)", height = height,
+         error = e.msg
+
+proc postCommitFlushAndNotify(cs: var ChainState, blk: Block, height: int32) =
+  ## Per-block tail shared by connectBlock: periodic cache flush (retry once,
+  ## then AbortNode — never an error to the caller), then the tip hooks.
+  if cs.shouldFlush():
+    let csRef = cs
+    discard retryOnceOrAbort("UTXO cache flush",
+                             proc() {.gcsafe.} =
+                               {.cast(gcsafe).}:
+                                 var c = csRef
+                                 c.flushCache())
+  cs.runTipHooks(blk, height)
+
 proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateResult[void] =
   ## Connect a block: spend inputs, create outputs, update state
   ## Returns error if any input is missing or immature coinbase
@@ -1874,6 +1912,10 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
                $cs.bestBlockHash & " != block.prevBlock " &
                $blk.header.prevBlock & " (height " & $height & ")")
 
+  # Gate 6: after AbortNode nothing advances the chain.
+  if isFatal():
+    return err(fatalRefusal())
+
   # Generate undo data before making changes (both formats for compatibility).
   # Pass `height` so intra-block-spent outputs get the correct creation height
   # in their SpentOutput entries (matches Core's UpdateCoins per-tx AddCoins).
@@ -1883,10 +1925,28 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   # Write undo data to flat file
   var undoPos = FlatFilePos(fileNum: -1, pos: -1)
   if blk.txs.len > 1:  # Only write undo if there are non-coinbase transactions
-    let (pos, ok) = cs.undoMgr.writeBlockUndo(blockUndo, blk.header.prevBlock, cs.params)
+    var (pos, ok) = cs.undoMgr.writeBlockUndo(blockUndo, blk.header.prevBlock, cs.params)
     if not ok:
-      return err("failed to write undo data for block " & $blockHash)
+      # Core WriteUndoDataForBlock failure -> FatalError (AbortNode). Retry
+      # once (an unreferenced rev*.dat record is inert), then halt. Nothing
+      # in memory has been touched yet.
+      (pos, ok) = cs.undoMgr.writeBlockUndo(blockUndo, blk.header.prevBlock, cs.params)
+      if not ok:
+        abortNode("failed to write undo data for block " & $blockHash)
+        return err(fatalErrorToken & ": failed to write undo data for block " &
+                   $blockHash)
     undoPos = pos
+
+  # Write-before-forget (gate 6, Core CCoinsViewCache discipline): this proc
+  # stages EVERY UTXO-cache, totalWork and tip change and applies them only
+  # after `write(batch)` has returned. A connect that fails part-way (a
+  # missing input, a raise from a coin read) or a write that fails therefore
+  # leaves memory exactly as it was. Before this, outputs created by the
+  # block's earlier txs were already in the cache (phantom coins a later
+  # block could spend, and that a later flushCache persisted) and totalWork
+  # was already incremented (double-counted on the retry).
+  var cacheOps: seq[tuple[isPut: bool, op: OutPoint, entry: UtxoEntry]]
+  var createdThisBlock = initTable[OutPoint, UtxoEntry]()
 
   # Create a write batch for atomic updates
   let batch = cs.db.db.newWriteBatch()
@@ -1944,7 +2004,13 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
             return err("bad-txns-inputs-missingorspent: double-spend within block at " &
                        $input.prevOut.txid & ":" & $input.prevOut.vout)
 
-          let utxoOpt = cs.getUtxo(input.prevOut)
+          # Outputs created by an earlier tx of THIS block live only in the
+          # staged overlay until the commit.
+          let utxoOpt =
+            if input.prevOut in createdThisBlock:
+              some(createdThisBlock[input.prevOut])
+            else:
+              cs.getUtxo(input.prevOut)
           if utxoOpt.isNone:
             return err("missing input: " & $input.prevOut.txid)
 
@@ -1961,10 +2027,10 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
                         ", coinbase height " & $entry.height &
                         ", age " & $age & " < " & $cs.params.coinbaseMaturity)
 
-          # Delete from DB and cache
+          # Delete from DB (staged) and cache (after the commit)
           let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
           batch.delete(cfUtxo, key)
-          cs.deleteUtxoCache(input.prevOut)
+          cacheOps.add((isPut: false, op: input.prevOut, entry: UtxoEntry()))
           # Mark this outpoint as spent within the current block so later txs
           # in the same block cannot re-spend it before the batch commits.
           spentThisBlock[ckSpent] = true
@@ -1987,15 +2053,17 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
         let outpoint = OutPoint(txid: txId, vout: uint32(voutIdx))
         let key = utxoKey(array[32, byte](txId), uint32(voutIdx))
         batch.put(cfUtxo, key, serializeUtxoEntry(entry))
-        cs.putUtxoCache(outpoint, entry)
+        createdThisBlock[outpoint] = entry
+        cacheOps.add((isPut: true, op: outpoint, entry: entry))
 
       # Index transaction
       let loc = TxLocation(blockHash: blockHash, txIndex: uint32(txIdx))
       batch.put(cfTxIndex, txIndexKey(array[32, byte](txId)), serializeTxLocation(loc))
 
-  # Calculate and add work
+  # Calculate the new total work (applied to cs only after the commit)
   let blockWork = calculateBlockWork(blk.header.bits)
-  addWork(cs.totalWork, blockWork)
+  var newTotalWork = cs.totalWork
+  addWork(newTotalWork, blockWork)
 
   # Create block index entry with undo position
   let idx = BlockIndex(
@@ -2004,7 +2072,7 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
     status: bsValidated,
     prevHash: blk.header.prevBlock,
     header: blk.header,
-    totalWork: cs.totalWork,
+    totalWork: newTotalWork,
     undoPos: undoPos,
     nTx: int32(blk.txs.len)
   )
@@ -2019,28 +2087,32 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   var w = BinaryWriter()
   w.writeInt32LE(height)
   batch.put(cfMeta, metaKey("height"), w.data)
-  batch.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
+  batch.put(cfMeta, metaKey("totalwork"), @newTotalWork)
 
-  # Commit atomically
-  cs.db.db.write(batch)
+  # Commit atomically. A failed write is retried once; a second failure is
+  # AbortNode (Core FlushStateToDisk / ConnectTip FatalError). Memory has not
+  # been touched, so the block is not connected, and the latch stops anyone
+  # from deciding anything about it.
+  let rawDb = cs.db.db
+  if not retryOnceOrAbort("connectBlock chainstate write",
+                          proc() {.gcsafe.} = rawDb.write(batch)):
+    return err(fatalErrorToken & ": chainstate write failed for block " &
+               $blockHash & " (" & fatalMessage() & ")")
 
-  # Update in-memory state
+  # Committed: now (and only now) update in-memory state.
+  for c in cacheOps:
+    if c.isPut: cs.putUtxoCache(c.op, c.entry)
+    else: cs.deleteUtxoCache(c.op)
+  cs.totalWork = newTotalWork
   cs.bestBlockHash = blockHash
   cs.bestHeight = height
   cs.db.bestBlockHash = blockHash
   cs.db.bestHeight = height
 
-  # Flush cache if needed
-  if cs.shouldFlush():
-    cs.flushCache()
-
-  # Wake the wait-family RPCs on this tip advance (Core KernelNotifications
-  # blockTip / WaitTipChanged). Best-effort — a notifier fault must never
-  # stall block connection.
-  if cs.tipChangedHook != nil:
-    cs.tipChangedHook()
-  if cs.connectHook != nil:
-    cs.connectHook(blk, height)
+  # The block is connected and durable from here on: nothing below may turn
+  # into a connect failure (the caller would then retry a block that IS the
+  # tip and read its own spends as missing inputs).
+  cs.postCommitFlushAndNotify(blk, height)
 
   ok()
 
@@ -2189,12 +2261,42 @@ proc flushToDiskIfNeeded*(cs: var ChainState, force: bool = false) =
          blocksSinceFlush = cs.ibdBlocksSinceLastDiskFlush
     cs.ibdBlocksSinceLastDiskFlush = 0
 
+proc guardedIbdFlush*(cs: var ChainState, flushBatch: bool, forceDisk: bool = false): bool =
+  ## The IBD durability steps (the periodic writeSynced batch and the memtable
+  ## flush), each retried once, then AbortNode. In IBD the in-memory tip and
+  ## cache run ahead of disk by design (Core's dbcache); a checkpoint that
+  ## cannot be written leaves that state consistent in memory and NOT on disk,
+  ## so the node must stop here and must not flush it at shutdown — the
+  ## restart replays from the last checkpoint that committed. Returns false
+  ## once the node is latched.
+  let csRef = cs
+  if flushBatch:
+    if not retryOnceOrAbort("IBD checkpoint batch write",
+                            proc() {.gcsafe.} =
+                              {.cast(gcsafe).}:
+                                var c = csRef
+                                c.flushIBDBatch()):
+      return false
+  retryOnceOrAbort("IBD memtable flush",
+                   proc() {.gcsafe.} =
+                     {.cast(gcsafe).}:
+                       var c = csRef
+                       c.flushToDiskIfNeeded(force = forceDisk))
+
 proc stopIBD*(cs: var ChainState) =
   ## Exit IBD mode: flush remaining batch and switch to per-block writes
+  ##
+  ## Gate 6: after AbortNode the unflushed batch is exactly the state that
+  ## could not be made durable — it is NOT written (Core skips the shutdown
+  ## flush after a fatal error). A flush that fails here latches the node
+  ## (retry once inside guardedIbdFlush) and leaves the batch in place.
   if cs.ibdBatch != nil:
-    cs.flushIBDBatch()
+    if isFatal():
+      warn "fatal error latched: NOT flushing the IBD batch", height = cs.bestHeight
+      return
     # Force memtables to SST so all data is durable before leaving IBD
-    cs.flushToDiskIfNeeded(force = true)
+    if not cs.guardedIbdFlush(flushBatch = true, forceDisk = true):
+      return
     cs.ibdBatch.destroy()
     cs.ibdBatch = nil
   cs.ibdMode = false
@@ -2586,6 +2688,10 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
                $cs.bestBlockHash & " != block.prevBlock " &
                $blk.header.prevBlock & " (height " & $height & ")")
 
+  # Gate 6: after AbortNode nothing advances the chain.
+  if isFatal():
+    return err(fatalRefusal())
+
   # ── PASS 1: validate EVERY input resolves BEFORE mutating anything. ──────
   #
   # The old single-pass loop deleted inputs / created outputs as it walked and
@@ -2717,19 +2823,21 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
   cs.ibdBatchBlocks += 1
   cs.ibdBlocksSinceLastDiskFlush += 1
 
-  # Flush batch every N blocks (write batch → memtable, fast)
-  if cs.ibdBatchBlocks >= IbdBatchFlushInterval:
-    cs.flushIBDBatch()
-
-  # Periodically force memtables to SST (memtable → disk, slower but durable)
-  cs.flushToDiskIfNeeded()
+  # Flush batch every N blocks (write batch → memtable, fast), and
+  # periodically force memtables to SST (memtable → disk, slower but durable).
+  #
+  # Gate 6: the block above is connected IN MEMORY (tip, cache, batch) —
+  # that is IBD's dbcache design. A checkpoint that fails is retried once and
+  # then latches AbortNode: the in-memory state stays consistent, nothing is
+  # forgotten, and it is never reported as a failure to connect THIS block.
+  # (It used to raise out of here after the tip had advanced; the caller then
+  # retried the block, read its own spends as missing inputs and persisted a
+  # BLOCK_FAILED_VALID mark + punished the peer for a valid block.)
+  discard cs.guardedIbdFlush(flushBatch = cs.ibdBatchBlocks >= IbdBatchFlushInterval)
 
   # Wake the wait-family RPCs on this IBD tip advance (Core KernelNotifications
   # blockTip / WaitTipChanged fires during IBD too). Best-effort.
-  if cs.tipChangedHook != nil:
-    cs.tipChangedHook()
-  if cs.connectHook != nil:
-    cs.connectHook(blk, height)
+  cs.runTipHooks(blk, height)
 
   ok()
 
@@ -2768,6 +2876,8 @@ proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainSta
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
+  if isFatal():
+    return err(fatalRefusal())
   if cs.ibdBatch == nil:
     return err("adoption requires IBD mode (no ibdBatch)")
   if height != cs.bestHeight + 1 or cs.bestBlockHash != blk.header.prevBlock:
@@ -2870,12 +2980,9 @@ proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainSta
   # step. Committing the converged block + tip pointer as one atomic
   # writeSynced batch NOW closes the window where another crash would
   # re-poison the same frontier. One extra batch per adoption is noise.
-  cs.flushIBDBatch()
-  cs.flushToDiskIfNeeded()
-  if cs.tipChangedHook != nil:
-    cs.tipChangedHook()
-  if cs.connectHook != nil:
-    cs.connectHook(blk, height)
+  # Gate 6: retry once, then AbortNode — never an error for this block.
+  discard cs.guardedIbdFlush(flushBatch = true)
+  cs.runTipHooks(blk, height)
 
   info "rolled forward already-applied block", height = height,
        hash = $blockHash
@@ -3115,6 +3222,35 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
   # Reference: validation.cpp:2201-2202, 2209-2221.
   let fEnforceBip30 = not isBip30UnspendableForDisconnect(height, blockHash)
 
+  # Gate 6: after AbortNode nothing changes the active chain.
+  if isFatal():
+    return err(fatalRefusal())
+
+  # Write-before-forget: the cache, work and tip below are mutated while the
+  # batch is staged; any exit before the commit (a missing-metadata return, a
+  # raise from a coin read, a write that fails twice) restores this snapshot.
+  # Disconnects are rare (invalidateblock, rewind) and the non-IBD cache is
+  # bounded (DefaultMaxCacheSize), so the copy is cheap.
+  let savedCache = cs.utxoCache
+  let savedCacheSize = cs.cacheSize
+  let savedTotalWork = cs.totalWork
+  let savedBestHash = cs.bestBlockHash
+  let savedBestHeight = cs.bestHeight
+  let savedIbdByHash = cs.db.ibdIndexByHash
+  let savedIbdByHeight = cs.db.ibdIndexByHeight
+  var committed = false
+  defer:
+    if not committed:
+      cs.utxoCache = savedCache
+      cs.cacheSize = savedCacheSize
+      cs.totalWork = savedTotalWork
+      cs.bestBlockHash = savedBestHash
+      cs.bestHeight = savedBestHeight
+      cs.db.bestBlockHash = savedBestHash
+      cs.db.bestHeight = savedBestHeight
+      cs.db.ibdIndexByHash = savedIbdByHash
+      cs.db.ibdIndexByHeight = savedIbdByHeight
+
   let batch = cs.db.db.newWriteBatch()
   defer: batch.destroy()
 
@@ -3289,15 +3425,22 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
   cs.db.bestBlockHash = blk.header.prevBlock
   cs.db.bestHeight = newBestHeight
 
-  cs.db.db.write(batch)
+  let rawDb = cs.db.db
+  if not retryOnceOrAbort("disconnectBlock chainstate write",
+                          proc() {.gcsafe.} = rawDb.write(batch)):
+    return err(fatalErrorToken & ": chainstate write failed disconnecting " &
+               $blockHash & " (" & fatalMessage() & ")")
+  committed = true
 
   # Fire the disconnect hook (BIP-157 filter-index rollback).  Runs AFTER
   # the chainstate batch commits so the filter index never observes a
-  # state the chainstate has not yet committed.  Hook errors are swallowed
-  # by the index implementation (see blockfilterindex.removeBlock) so a
-  # failed filter rollback does not corrupt the chainstate disconnect.
-  if cs.disconnectHook != nil:
-    cs.disconnectHook(blockHash, blk.header.prevBlock, height)
+  # state the chainstate has not yet committed.  Best-effort: the
+  # disconnect has happened, so a hook raise is logged, not returned.
+  try:
+    if cs.disconnectHook != nil:
+      cs.disconnectHook(blockHash, blk.header.prevBlock, height)
+  except Exception as e:
+    warn "disconnect hook failed (block stays disconnected)", error = e.msg
 
   ok()
 
@@ -3390,6 +3533,10 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
 
   disconnectedTxs.setLen(0)
   cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
+
+  # Gate 6: after AbortNode nothing changes the active chain.
+  if isFatal():
+    return err(fatalRefusal())
 
   # Guard against re-entrant or nested reorg attempts. The single shared
   # WriteBatch + reorgDeletedUtxos override only handles one reorg at a time.
@@ -3661,10 +3808,17 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     # block index points to them) and are inert until reclaimed.
     var undoPos = FlatFilePos(fileNum: -1, pos: -1)
     if blk.txs.len > 1:
-      let (pos, ok) = cs.undoMgr.writeBlockUndo(blockUndo, blk.header.prevBlock, cs.params)
+      var (pos, ok) = cs.undoMgr.writeBlockUndo(blockUndo, blk.header.prevBlock, cs.params)
       if not ok:
+        (pos, ok) = cs.undoMgr.writeBlockUndo(blockUndo, blk.header.prevBlock, cs.params)
+      if not ok:
+        # Core WriteUndoDataForBlock failure -> FatalError (AbortNode). Not a
+        # statement about the block: the reorg is abandoned and the node halts.
         rollbackInMemory()
-        return err("failed to write undo data for block " & $blockHash)
+        cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
+        abortNode("failed to write undo data for block " & $blockHash & " (reorg)")
+        return err(fatalErrorToken & ": failed to write undo data for block " &
+                   $blockHash)
       undoPos = pos
 
     # Store full block data.
@@ -3798,7 +3952,16 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   batch.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
 
   # ---- Single atomic commit ----
-  cs.db.db.write(batch)
+  # Retry once, then AbortNode. On failure the deferred rollbackInMemory()
+  # restores the pre-reorg tip/cache/work (nothing was forgotten), and the
+  # fatal-error token is local in every classifier: the branch is neither
+  # marked nor is its sender punished.
+  let rawDb = cs.db.db
+  if not retryOnceOrAbort("reorg chainstate write",
+                          proc() {.gcsafe.} = rawDb.write(batch)):
+    cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
+    return err(fatalErrorToken & ": reorg chainstate write failed (" &
+               fatalMessage() & ")")
   committed = true
 
   # Clear the tentative-delete override; from here on getUtxo can read
@@ -3812,27 +3975,45 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   # BaseIndex::BlockDisconnected fan-out from validation.cpp::DisconnectTip.
   # Runs AFTER the chainstate batch commits — the index never observes
   # a state the chainstate has not yet committed.
-  if cs.disconnectHook != nil:
-    for (bh, ph, h) in disconnectedForHook:
-      cs.disconnectHook(bh, ph, h)
+  # Everything below runs after the commit: the reorg HAS happened, so a
+  # raise here must not be reported as a failed reorg (the caller would
+  # leave its own cursor on the old chain). Hooks are best-effort; the cache
+  # flush is retry-once-then-AbortNode.
+  try:
+    if cs.disconnectHook != nil:
+      for (bh, ph, h) in disconnectedForHook:
+        cs.disconnectHook(bh, ph, h)
+  except Exception as e:
+    warn "disconnect hook failed after reorg commit", error = e.msg
 
   # Flush cache if it grew above threshold during the reorg.
   if cs.shouldFlush():
-    cs.flushCache()
+    let csRef = cs
+    discard retryOnceOrAbort("UTXO cache flush (reorg)",
+                             proc() {.gcsafe.} =
+                               {.cast(gcsafe).}:
+                                 var c = csRef
+                                 c.flushCache())
 
   # Wake the wait-family RPCs on this reorg tip advance. A reorg is a tip
   # change (Core KernelNotifications blockTip / WaitTipChanged fires on reorg
   # too); this single atomic commit advanced the tip across BOTH halves
   # (disconnect-to-fork then connect-new-branch), so one fire covers it.
   # Best-effort.
-  if cs.tipChangedHook != nil:
-    cs.tipChangedHook()
+  try:
+    if cs.tipChangedHook != nil:
+      cs.tipChangedHook()
+  except Exception as e:
+    warn "tip-changed hook failed after reorg commit", error = e.msg
   # Credit wallets for every promoted block (Core BlockConnected per ConnectTip).
   # Heights run fork+1 .. new tip; newChain is oldest-first.
   if cs.connectHook != nil and newChain.len > 0:
     var h = cs.bestHeight - int32(newChain.len) + 1
     for blk in newChain:
-      cs.connectHook(blk, h)
+      try:
+        cs.connectHook(blk, h)
+      except Exception as e:
+        warn "connect hook failed after reorg commit", height = h, error = e.msg
       inc h
 
   ok()

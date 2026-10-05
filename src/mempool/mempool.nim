@@ -11,6 +11,7 @@ import ./package
 import ./standard
 import ./cluster
 import ../mining/fees
+import ../util/fatal
 export package, standard
 
 type
@@ -1075,6 +1076,12 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   ## another lookup.
 
   # === PreChecks ===========================================================
+
+  # Gate 6: after AbortNode the mempool accepts nothing (Core: shutdown in
+  # progress). The fatal-error token is not a rejection reason — callers
+  # must not record it in recentlyRejected or score the peer.
+  if isFatal():
+    return err(AtmpAcceptInfo, fatalRefusal())
 
   # Compute txid + wtxid.
   let txid = tx.txid()

@@ -60,6 +60,15 @@ type
 
   Secp256k1Error* = object of CatchableError
 
+  Secp256k1ContextError* = object of CatchableError
+    ## Gate 6: the verify context is unavailable (creation or blinding
+    ## failed). Deliberately NOT a Secp256k1Error: the script interpreter
+    ## catches Secp256k1Error from tweakXonlyPubkey as "this pubkey does not
+    ## parse" -> false / WITNESS_PROGRAM_MISMATCH, a consensus verdict. A
+    ## missing context is a fault of this node, not of the script, so it
+    ## must propagate to the check queue as an internal error. Core creates
+    ## the context at init (ECC_Start) and aborts if it cannot.
+
   # ElligatorSwift types for BIP-324
   EllSwiftPubKey* = array[64, byte]
 
@@ -302,19 +311,35 @@ when defined(useSystemSecp256k1):
 
   var globalContext: Secp256k1Context
 
+  # Gate-6 fault injection (tests only; nil in production). When the hook
+  # returns true, getContext behaves as if the verify context could not be
+  # created — the same failure initSecp256k1 reports when urandom fails.
+  var secpContextFaultHook*: proc(): bool {.gcsafe, raises: [].}
+
+  proc contextUnavailable(msg: string) =
+    raise newException(Secp256k1ContextError, msg)
+
   proc initSecp256k1*() =
     if pointer(globalContext) == nil:
       globalContext = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN or SECP256K1_CONTEXT_VERIFY
       )
+      if pointer(globalContext) == nil:
+        contextUnavailable("secp256k1_context_create failed (out of memory)")
       # Side-channel blinding (W159 BUG-4). Mirrors Core's ECC_Start.
       var seed: array[32, byte]
       if not urandom(seed):
-        raise newException(Secp256k1Error,
-          "secp256k1 blinding seed unavailable (urandom failed)")
+        # Do not keep an unblinded context for later callers.
+        secp256k1_context_destroy(globalContext)
+        globalContext = Secp256k1Context(nil)
+        contextUnavailable("secp256k1 blinding seed unavailable (urandom failed)")
       discard secp256k1_context_randomize(globalContext, addr seed[0])
 
   proc getContext(): Secp256k1Context =
+    {.cast(gcsafe).}:
+      let h = secpContextFaultHook
+      if h != nil and h():
+        contextUnavailable("secp256k1 context unavailable (injected fault)")
     if pointer(globalContext) == nil:
       initSecp256k1()
     globalContext

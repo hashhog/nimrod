@@ -144,7 +144,7 @@ method customInit*(idx: BaseIndex): bool {.base.} =
   ## Initialize index-specific state
   true
 
-method customAppend*(idx: BaseIndex, blockInfo: BlockInfo): bool {.base.} =
+method customAppend*(idx: BaseIndex, blockInfo: BlockInfo): bool {.base, gcsafe.} =
   ## Process a new block (called during forward sync)
   raise newException(BlockIndexError, "customAppend not implemented")
 

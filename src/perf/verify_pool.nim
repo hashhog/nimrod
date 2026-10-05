@@ -126,9 +126,23 @@ type
     ## returned seOk. On failure, `err` / `failIndex` identify the LOWEST
     ## index that failed, so 1 worker and N workers report the same reason
     ## even when several checks would fail.
+    ##
+    ## Gate 6 — THREE outcomes, not two: `internal` is set when any check did
+    ## not produce a script result at all (it raised: OOM, an FFI / secp
+    ## context fault, an interpreter bug). That is NOT a script failure and
+    ## must never become one: `ok` is false (nothing was proven valid) but the
+    ## caller re-runs / halts instead of rejecting the block. `internal`
+    ## dominates any script failure seen in the same run.
     ok*: bool
     err*: ScriptError
     failIndex*: int
+    internal*: bool
+    internalMsg*: string
+
+  ScriptCheckInternalError* = object of CatchableError
+    ## Raised by the legacy bool `runChecks*` wrappers when a run was
+    ## internal: a bool cannot carry the third outcome, and `false` would be
+    ## a script-failure verdict.
 
   VerifyPool = object
     threads: seq[Thread[pointer]]
@@ -141,6 +155,8 @@ type
     bad: Atomic[bool]            ## first-failure short-circuit of unclaimed work
     failIndex: Atomic[int]       ## lowest failing index, -1 if none
     failErr: ScriptError         ## ScriptError at failIndex (written under lock)
+    internal: bool               ## a check raised (written under lock)
+    internalMsg: string          ## first internal error message (under lock)
     shutdown: bool
     numWorkers: int              ## spawned worker threads (master adds itself)
     started: bool
@@ -169,10 +185,20 @@ proc clampWorkers*(requested: int): int {.gcsafe.} =
 ## by collectChecks before any worker runs, never mutated again), (c) the
 ## lock-protected globalSigCache, and (d) the read-only secp verify context.
 ## Mirrors Core's CScriptCheck::operator() running on a worker thread.
+# Gate-6 fault injection (tests only; nil in production). When the hook
+# returns true for a check, that check dies with a resource-exhaustion
+# exception instead of producing a script result — the shape of an OOM, an
+# FFI fault or an interpreter bug inside one script check.
+var scriptCheckFaultHook*: proc(inputIndex: int): bool {.gcsafe, raises: [].}
+
 proc runOne(chk: ScriptCheck): ScriptError {.gcsafe.} =
   {.cast(gcsafe).}:
     if gInstrument:
       recordThread()
+    let fh = scriptCheckFaultHook
+    if fh != nil and fh(chk.inputIndex):
+      raise newException(ResourceExhaustedError,
+        "injected script-check internal error (input " & $chk.inputIndex & ")")
     # Deref the shared per-tx TxPrevouts. The ptr is guaranteed live: the
     # block-level seq[TxPrevouts] lives in verifyScripts (on the master stack)
     # and runChecks blocks until all workers finish before returning.
@@ -191,6 +217,18 @@ proc runOne(chk: ScriptCheck): ScriptError {.gcsafe.} =
       amounts,
       scriptPKs
     )
+
+proc runOneSafe(chk: ScriptCheck): tuple[err: ScriptError, internal: bool,
+                                         msg: string] {.gcsafe.} =
+  ## runOne with the third outcome made explicit. A check that raises —
+  ## including a Defect from an interpreter bug, and on a WORKER thread, where
+  ## an escaping exception used to kill the process mid-batch — is recorded as
+  ## internal. It is never turned into a ScriptError.
+  try:
+    result = (err: runOne(chk), internal: false, msg: "")
+  except Exception as e:
+    result = (err: seOk, internal: true,
+              msg: "input " & $chk.inputIndex & ": " & $e.name & ": " & e.msg)
 
 proc recordFailure(q: ptr VerifyPool, idx: int, err: ScriptError) {.inline.} =
   ## Lowest-index failure wins so the reported reason is independent of which
@@ -222,15 +260,23 @@ proc runClaimed(q: ptr VerifyPool, start, n: int) {.gcsafe.} =
   ## failure is known.
   var localFailIdx = -1
   var localFailErr = seOk
+  var localInternal = false
+  var localInternalMsg = ""
   for i in 0 ..< n:
     let idx = start + i
     let known = q.failIndex.load(moRelaxed)
     if q.bad.load(moRelaxed) and known >= 0 and idx > known:
       break
-    let err = runOne(q.checks[][idx])
-    if err != seOk:
+    let r = runOneSafe(q.checks[][idx])
+    if r.internal:
+      # No result for this check: stop, short-circuit the rest of the run
+      # (its outcome is internal whatever else fails), report it.
+      localInternal = true
+      localInternalMsg = r.msg
+      break
+    if r.err != seOk:
       localFailIdx = idx
-      localFailErr = err
+      localFailErr = r.err
       # Indices in a claimed slice increase, so this is the lowest in-slice
       # failure. Stop the rest of the slice; lower indices were already
       # claimed by someone else (or already ran in this slice).
@@ -238,6 +284,11 @@ proc runClaimed(q: ptr VerifyPool, start, n: int) {.gcsafe.} =
   acquire(q.lock)
   if localFailIdx >= 0:
     recordFailure(q, localFailIdx, localFailErr)
+  if localInternal:
+    if not q.internal:
+      q.internal = true
+      q.internalMsg = localInternalMsg
+    q.bad.store(true, moRelaxed)
   q.inFlight -= n
   let noMoreWork = (q.checks == nil) or
                    (q.nextIdx >= q.checks[].len) or
@@ -280,6 +331,8 @@ proc startPool(q: var VerifyPool, numWorkers: int) =
   q.inFlight = 0
   q.failIndex.store(-1, moRelaxed)
   q.failErr = seOk
+  q.internal = false
+  q.internalMsg = ""
   q.bad.store(false, moRelaxed)
   q.shutdown = false
   q.numWorkers = numWorkers
@@ -321,6 +374,8 @@ proc completeOn(q: ptr VerifyPool, checks: var seq[
   q.bad.store(false, moRelaxed)
   q.failIndex.store(-1, moRelaxed)
   q.failErr = seOk
+  q.internal = false
+  q.internalMsg = ""
   broadcast(q.workCond)
   release(q.lock)
 
@@ -339,9 +394,14 @@ proc completeOn(q: ptr VerifyPool, checks: var seq[
   q.checks = nil
   let fi = q.failIndex.load(moRelaxed)
   let err = q.failErr
+  let internal = q.internal
+  let internalMsg = q.internalMsg
   release(q.lock)
 
-  if fi >= 0:
+  if internal:
+    ScriptCheckResult(ok: false, err: seOk, failIndex: -1, internal: true,
+                      internalMsg: internalMsg)
+  elif fi >= 0:
     ScriptCheckResult(ok: false, err: err, failIndex: fi)
   else:
     ScriptCheckResult(ok: true, err: seOk, failIndex: -1)
@@ -380,19 +440,28 @@ proc runChecksSerialDetailed*(checks: openArray[
   ## reported reason — identical to the parallel lowest-index rule because
   ## claiming is sequential from 0.
   for i, chk in checks:
-    let err = runOne(chk)
-    if err != seOk:
-      return ScriptCheckResult(ok: false, err: err, failIndex: i)
+    let r = runOneSafe(chk)
+    if r.internal:
+      return ScriptCheckResult(ok: false, err: seOk, failIndex: -1,
+                               internal: true, internalMsg: r.msg)
+    if r.err != seOk:
+      return ScriptCheckResult(ok: false, err: r.err, failIndex: i)
   ScriptCheckResult(ok: true, err: seOk, failIndex: -1)
 
+proc boolOrRaise(r: ScriptCheckResult): bool =
+  if r.internal:
+    raise newException(ScriptCheckInternalError,
+                       "script check internal error: " & r.internalMsg)
+  r.ok
+
 proc runChecksSerial*(checks: seq[ScriptCheck]): bool {.gcsafe.} =
-  runChecksSerialDetailed(checks).ok
+  boolOrRaise(runChecksSerialDetailed(checks))
 
 proc runChecksParallel*(checks: var seq[ScriptCheck]): bool {.gcsafe.} =
   ## gcsafe wrapper around the process-global pool. Caller must have started
   ## the pool via initVerifyPool (extra workers > 0).
   {.cast(gcsafe).}:
-    result = completeOn(addr gPool, checks).ok
+    result = boolOrRaise(completeOn(addr gPool, checks))
 
 proc initVerifyPool*(numVerifyWorkers: int) {.gcsafe.} =
   ## Node-startup hook: pre-warm secp and spawn the static pool when `-par`
@@ -408,7 +477,7 @@ proc initVerifyPool*(numVerifyWorkers: int) {.gcsafe.} =
     # not race a lazy context_create.
     initSecp256k1()
 
-proc runChecks*(checks: var seq[ScriptCheck]): bool {.gcsafe.} =
+proc runChecksDetailed*(checks: var seq[ScriptCheck]): ScriptCheckResult {.gcsafe.} =
   ## Dispatch: parallel if the static pool is up AND there is work, else serial.
   ## The pool MUST be started by `initVerifyPool` at boot for the parallel path
   ## to engage; if it was never started (`-par=1`, or a unit test calling
@@ -416,9 +485,14 @@ proc runChecks*(checks: var seq[ScriptCheck]): bool {.gcsafe.} =
   ## verdict-identical.
   {.cast(gcsafe).}:
     if gPool.started and gPool.numWorkers > 0 and checks.len > 0:
-      result = completeOn(addr gPool, checks).ok
+      result = completeOn(addr gPool, checks)
     else:
-      result = runChecksSerialDetailed(checks).ok
+      result = runChecksSerialDetailed(checks)
+
+proc runChecks*(checks: var seq[ScriptCheck]): bool {.gcsafe.} =
+  ## Legacy bool form. An internal run RAISES ScriptCheckInternalError — it is
+  ## never reported as `false` (which every caller reads as a script failure).
+  boolOrRaise(runChecksDetailed(checks))
 
 proc runChecksWithN*(nTotal: int, checks: var seq[
     ScriptCheck]): ScriptCheckResult {.gcsafe.} =

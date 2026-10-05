@@ -37,6 +37,7 @@ import ../crypto/secp256k1 as snapshot_secp
 import ../consensus/params
 import ./db
 import ./chainstate
+import ../util/fatal
 
 export chainstate
 
@@ -1142,7 +1143,10 @@ proc runBackgroundValidation*(
     let r = backgroundCs.connectBlock(blockOpt.get(), bgv.progress)
     if not r.isOk:
       bgv.running = false
-      snapshotCs.assumeutxo = auInvalid
+      # Gate 6: a system fault (the AbortNode latch) says nothing about the
+      # snapshot; it stays pending and is re-validated after the restart.
+      if not isFatalFailure(r.error):
+        snapshotCs.assumeutxo = auInvalid
       return
     inc bgv.progress
     if bgv.progress > bgv.targetHeight:
@@ -1425,7 +1429,9 @@ proc runSnapshotValidation*(
     let r = bg.connectBlock(blockOpt.get(), activation.bgValidation.progress)
     if not r.isOk:
       activation.bgValidation.running = false
-      activation.snapshot.assumeutxo = auInvalid
+      # Gate 6: a system fault is not a verdict on the snapshot.
+      if not isFatalFailure(r.error):
+        activation.snapshot.assumeutxo = auInvalid
       return (false, "background connect failed at height " &
               $activation.bgValidation.progress & ": " & r.error)
     inc activation.bgValidation.progress
