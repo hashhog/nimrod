@@ -1,25 +1,25 @@
 # Provenance — nimrod proof bundle
-assembled_utc: 2026-10-05T05:38:20Z
+assembled_utc: 2026-10-05T13:12:05Z
 repo: https://github.com/hashhog/nimrod
 branch: master
-commit: 8c55feaf104dcdda4e460355c2980465e1eee219
-commit_short: 8c55feaf104d
-subject: Merge branch 'gate6-p0'
+commit: 786abb3432237acf5dd80e1c6f853fd237a415f6
+commit_short: 786abb343223
+subject: fix: a peer that stops reading can no longer wedge the PM or sync loops
 tree_clean: NO
 binary: /home/work/hashhog/deploy/nimrod/nimrod
-binary_sha256: 1dff67e7ff1fbedbeb7131274e8b93916b5131a026cbd272dd12ae98759f0fcd
+binary_sha256: b8d2e461c5cb6bac01a7ca2766364c178a428c7634dda4c1afcfd13f60b63833
 toolchain: Nim Compiler Version 2.2.8 [Linux: amd64]
 nimble: nimble v0.20.1 compiled at 2026-02-23 03:08:48
 target: Linux amd64
 build: nimble build -d:release -y
-deploy_pin: 8c55feaf104dcdda4e460355c2980465e1eee219
-deploy_short: 8c55fea
-deploy_sha256: 1dff67e7ff1fbedbeb7131274e8b93916b5131a026cbd272dd12ae98759f0fcd
+deploy_pin: 786abb3432237acf5dd80e1c6f853fd237a415f6
+deploy_short: 786abb3
+deploy_sha256: b8d2e461c5cb6bac01a7ca2766364c178a428c7634dda4c1afcfd13f60b63833
 source: pin
 
 # Honest caveats
 The attested binary is the promoted pin (deploy/nimrod/MANIFEST
-sha256=1dff67e7ff1fbedbeb7131274e8b93916b5131a026cbd272dd12ae98759f0fcd, commit 8c55fea), which must be
+sha256=b8d2e461c5cb6bac01a7ca2766364c178a428c7634dda4c1afcfd13f60b63833, commit 786abb3), which must be
 byte-identical to the live mainnet unit's /proc/<pid>/exe. Re-run
 this script with --pin after every promote; proof/check-pin.sh and
 proof/verify.sh fail if a pin is present and does not match.
