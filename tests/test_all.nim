@@ -61,6 +61,7 @@ const IncludedTests = [
   "test_addrman_axis2",
   "test_addrv2",
   "test_adopt_applied_block",
+  "test_adopt_forged_block",
   "test_anchor",
   "test_assumeutxo_dual_chainstate",
   "test_assumevalid",
