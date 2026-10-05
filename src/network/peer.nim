@@ -124,6 +124,14 @@ type
     # Per-peer I/O counters (for getpeerinfo)
     bytesSent*: uint64
     bytesRecv*: uint64
+    # Bounded-send state (see sendBytes). sendPending counts chunk writes
+    # queued in the transport that have not drained to the kernel yet;
+    # lastSendProgress is when one last did (or when the queue last went
+    # from empty to non-empty). No progress for sendStallTimeout -> the
+    # peer is not reading and is disconnected.
+    sendPending*: int
+    lastSendProgress*: chronos.Moment
+    sendStalled*: bool
     relay*: bool                 # Relay flag from version message
     timeOffset*: int64           # peer_version_timestamp - our_time_at_receipt (seconds)
     # Network params
@@ -377,19 +385,121 @@ proc takeFromRecvBuffer(peer: Peer, n: int): seq[byte] =
   result = peer.recvBuffer[0 ..< n]
   peer.recvBuffer = peer.recvBuffer[n .. ^1]
 
-proc sendMessageV1(peer: Peer, msg: P2PMessage) {.async.} =
-  ## Internal: send a message via v1 (legacy unencrypted) transport.
-  let data = serializeMessage(peer.networkMagic, msg)
+const
+  DefaultSendStallTimeoutMs* = 30_000
+    ## No send progress for this long -> the peer is not reading; drop it.
+    ## Core's analogue is InactivityCheck (net.cpp ~2013), which drops a
+    ## peer whose sends stop progressing; Core never blocks on the socket
+    ## (SocketSendData ~1640-1680 keeps the unsent tail in the per-peer
+    ## queue and pauses sending past the buffer limit).
+  SendChunkSize = 16 * 1024
+    ## Messages are queued to the transport in chunks of this size so that
+    ## a partially drained large message (a block) still registers progress.
 
-  var written: int
+var sendStallTimeoutMs = -1
+
+proc sendStallTimeout*(): chronos.Duration =
+  ## The no-progress bound. NIMROD_SEND_STALL_TIMEOUT_MS overrides it (tests
+  ## shorten it to keep the stall suite fast); read once.
+  if sendStallTimeoutMs < 0:
+    sendStallTimeoutMs = DefaultSendStallTimeoutMs
+    let ov = getEnv("NIMROD_SEND_STALL_TIMEOUT_MS")
+    if ov.len > 0:
+      try:
+        sendStallTimeoutMs = max(1, parseInt(ov))
+      except ValueError:
+        discard
+  chronos.milliseconds(sendStallTimeoutMs)
+
+proc setSendStallTimeoutMs*(ms: int) =
+  ## Test hook: override the no-progress bound regardless of when the
+  ## environment variable was first read.
+  sendStallTimeoutMs = max(1, ms)
+
+proc noteSendDrained(peer: Peer) =
+  dec peer.sendPending
+  peer.lastSendProgress = chronos.Moment.now()
+
+proc sendBytes(peer: Peer, data: seq[byte]) {.async.} =
+  ## Write `data` to the peer, bounded by PROGRESS rather than by time.
+  ##
+  ## chronos' StreamTransport.write completes only once every byte has been
+  ## handed to the kernel, so for a peer that has stopped reading it never
+  ## completes, and before this bound every caller awaiting a send parked
+  ## forever — including the shared PeerManager / SyncManager loops.
+  ##
+  ##  * Fast path, no timer: when the socket has room chronos writes the
+  ##    whole chunk synchronously and returns a finished future, so a
+  ##    healthy peer (and every message below the kernel buffer high-water
+  ##    mark) costs no timer at all.
+  ##  * All chunks of one message are queued synchronously, without an
+  ##    await in between, so concurrent senders cannot interleave bytes
+  ##    inside a message.
+  ##  * While waiting, progress is per PEER: any of this peer's queued
+  ##    chunks draining counts, including other senders' chunks queued ahead
+  ##    of ours. A slow-but-draining peer keeps waiting indefinitely.
+  ##  * No progress for sendStallTimeout(): the peer is disconnected and
+  ##    every waiting sender gets PeerError. (chronos does not fail queued
+  ##    writes when a socket is closed, so waiters also give up as soon as
+  ##    the transport is closed by anyone.)
+  let transp = peer.transport
+  if transp == nil or transp.closed:
+    raise newException(PeerError, "not connected")
+  var futs: seq[Future[int]]
+  var sizes: seq[int]
+  var off = 0
   try:
-    written = await peer.transport.write(data)
+    while off < data.len:
+      let n = min(SendChunkSize, data.len - off)
+      let f =
+        if off == 0 and n == data.len: transp.write(data)
+        else: transp.write(data[off ..< off + n])
+      if not f.finished:
+        if peer.sendPending == 0:
+          peer.lastSendProgress = chronos.Moment.now()
+        inc peer.sendPending
+        f.addCallback(proc(udata: pointer) {.gcsafe, raises: [].} =
+          peer.noteSendDrained())
+      futs.add(f)
+      sizes.add(n)
+      off += n
   except CatchableError as e:
     raise newException(PeerError, "transport write failed: " & e.msg)
 
-  if written != data.len:
-    raise newException(PeerError, "failed to send complete message")
+  let stall = sendStallTimeout()
+  for i, f in futs:
+    while not f.finished:
+      if transp.closed or peer.state == psDisconnected:
+        raise newException(PeerError, "connection closed while sending")
+      let idle = chronos.Moment.now() - peer.lastSendProgress
+      if idle >= stall:
+        if not peer.sendStalled:
+          peer.sendStalled = true
+          warn "send stalled: peer is not reading, disconnecting",
+               peer = $peer, pendingChunks = peer.sendPending,
+               noProgressMs = idle.milliseconds
+          peer.shouldDisconnect = true
+          asyncSpawn peer.disconnect("send stalled (no progress in " &
+                                     $stall.milliseconds & " ms)")
+        raise newException(PeerError, "send stalled: peer not reading")
+      let timer = sleepAsync(stall - idle)
+      try:
+        discard await race(FutureBase(f), FutureBase(timer))
+      finally:
+        if not timer.finished:
+          timer.cancelSoon()
+    var written: int
+    try:
+      written = f.read()
+    except CatchableError as e:
+      raise newException(PeerError, "transport write failed: " & e.msg)
+    if written != sizes[i]:
+      raise newException(PeerError, "failed to send complete message")
 
+proc sendMessageV1(peer: Peer, msg: P2PMessage) {.async.} =
+  ## Internal: send a message via v1 (legacy unencrypted) transport.
+  let data = serializeMessage(peer.networkMagic, msg)
+  await peer.sendBytes(data)
   peer.bytesSent += uint64(data.len)
   trace "sent message (v1)", peer = $peer, kind = msg.kind, size = data.len - 24
 
@@ -412,15 +522,7 @@ proc sendMessageV2(peer: Peer, msg: P2PMessage) {.async.} =
   except BIP324Error as e:
     raise newException(PeerError, "v2 encrypt failed: " & e.msg)
 
-  var written: int
-  try:
-    written = await peer.transport.write(packet)
-  except CatchableError as e:
-    raise newException(PeerError, "transport write failed: " & e.msg)
-
-  if written != packet.len:
-    raise newException(PeerError, "failed to send complete v2 packet")
-
+  await peer.sendBytes(packet)
   peer.bytesSent += uint64(packet.len)
   trace "sent message (v2)", peer = $peer, kind = msg.kind,
         size = contents.len, packetSize = packet.len

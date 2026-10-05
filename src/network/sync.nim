@@ -1223,6 +1223,27 @@ proc releaseBlockRequest*(sm: SyncManager, hash: BlockHash) =
     sm.requestedHashes.excl(hash)
     sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
 
+proc sendBlockGetData(sm: SyncManager, p: Peer,
+                      inv: seq[InvVector]) {.async.} =
+  ## Send a block getdata WITHOUT making the caller wait on the socket.
+  ## Spawned (asyncSpawn) by requestBlocks after the requests are already
+  ## recorded in flight, so syncLoop never parks behind one peer's send
+  ## (Core: PushMessage only queues; the socket thread sends). If the send
+  ## fails — including the send-stall bound dropping a peer that stopped
+  ## reading — the requests still owned by `p` are released at once so the
+  ## next pass re-requests them elsewhere. Never raises.
+  try:
+    await p.sendGetData(inv)
+  except CatchableError as e:
+    warn "failed to send getdata to peer", peer = $p, error = e.msg
+    for item in inv:
+      let h = BlockHash(item.hash)
+      if h in sm.blocksInFlight and sm.blocksInFlight[h].peer == p:
+        sm.releaseBlockRequest(h)
+      elif h notin sm.blocksInFlight and h in sm.requestedHashes:
+        sm.requestedHashes.excl(h)
+        sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+
 proc noteBlockDelivered*(sm: SyncManager, hash: BlockHash, peer: Peer,
                          now: SyncTime = getTime()) =
   ## Core RemoveBlockRequest: when the peer's OLDEST in-flight block arrives
@@ -2948,19 +2969,14 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     let forkInv = inventory[forkInvStart .. ^1]
     inventory.setLen(forkInvStart)
     invHeights.setLen(forkInvStart)
-    try:
-      await forkPeer.sendGetData(forkInv)
-      let now = getTime()
-      for inv in forkInv:
-        sm.noteBlockRequested(BlockHash(inv.hash), forkPeer, now)
-      sm.pendingBlocks += forkInv.len
-      sm.lastSyncTime = getTime()
-      info "requesting fork blocks from announcing peer", count = forkInv.len,
-           peer = $forkPeer
-    except CatchableError as e:
-      warn "failed to send fork getdata", peer = $forkPeer, error = e.msg
-      for inv in forkInv:
-        sm.requestedHashes.excl(BlockHash(inv.hash))
+    let now = getTime()
+    for inv in forkInv:
+      sm.noteBlockRequested(BlockHash(inv.hash), forkPeer, now)
+    sm.pendingBlocks += forkInv.len
+    sm.lastSyncTime = now
+    info "requesting fork blocks from announcing peer", count = forkInv.len,
+         peer = $forkPeer
+    asyncSpawn sm.sendBlockGetData(forkPeer, forkInv)
     if inventory.len == 0:
       return
 
@@ -2987,19 +3003,13 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
       batches[assignment[k]].add(inventory[k])
     let idx = assignment.len
     var totalSent = 0
+    let now = getTime()
     for pi, p in peers:
       let batch = batches[pi]
       if batch.len > 0:
-        try:
-          await p.sendGetData(batch)
-          let now = getTime()
-          for inv in batch:
-            sm.noteBlockRequested(BlockHash(inv.hash), p, now)
-          totalSent += batch.len
-        except CatchableError as e:
-          warn "failed to send getdata to peer", peer = $p, error = e.msg
-          for inv in batch:
-            sm.requestedHashes.excl(BlockHash(inv.hash))
+        for inv in batch:
+          sm.noteBlockRequested(BlockHash(inv.hash), p, now)
+        totalSent += batch.len
     # Any blocks beyond peers.len * blocksPerPeer were not requested this
     # round (their hashes were optimistically added to requestedHashes and
     # appended to blockQueue above); drop them from both so the next
@@ -3016,15 +3026,14 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     sm.lastSyncTime = getTime()
     info "requesting blocks", count = totalSent, peers = peers.len,
          fromHeight = sm.chainTipHeight + 1
+    # Sends go out per peer, concurrently, AFTER the bookkeeping: syncLoop
+    # must never wait on one peer's socket (a peer that stopped reading
+    # parked it here indefinitely before the send bound existed).
+    for pi, p in peers:
+      if batches[pi].len > 0:
+        asyncSpawn sm.sendBlockGetData(p, batches[pi])
   else:
     # Single-peer fallback
-    try:
-      await fetchPeer.sendGetData(inventory)
-    except CatchableError as e:
-      warn "failed to send getdata", peer = $fetchPeer, error = e.msg
-      for inv in inventory:
-        sm.requestedHashes.excl(BlockHash(inv.hash))
-      return
     let now = getTime()
     for inv in inventory:
       sm.noteBlockRequested(BlockHash(inv.hash), fetchPeer, now)
@@ -3032,6 +3041,7 @@ proc requestBlocks*(sm: SyncManager, peer: Peer) {.async.} =
     sm.lastSyncTime = now
     info "requesting blocks", count = inventory.len,
          fromHeight = sm.chainTipHeight + 1, peer = $fetchPeer
+    asyncSpawn sm.sendBlockGetData(fetchPeer, inventory)
 
 proc pruneBodyRepairQueue*(sm: SyncManager) {.raises: [].} =
   ## Drop queued hashes that cannot be filled: already-have, no retained

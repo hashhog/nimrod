@@ -1570,10 +1570,9 @@ proc broadcastTx*(pm: PeerManager, tx: Transaction) {.async.} =
         (invTx, txidHash)
     let inv = @[InvVector(invType: itemType, hash: itemHash)]
     let msg = newInv(inv)
-    try:
-      await peer.sendMessage(msg)
-    except CatchableError as e:
-      debug "failed to broadcast tx inv", peer = $peer, error = e.msg
+    # Per-peer and concurrent: one peer that stopped reading must not delay
+    # every other peer's relay (the send itself is bounded, Peer.sendBytes).
+    asyncSpawn spawnSafe(peer.sendMessage(msg))
 
 proc selectBlockAnnouncement*(
   header: BlockHeader,
@@ -1601,21 +1600,15 @@ proc broadcastBlock*(pm: PeerManager, blk: Block) {.async.} =
   let headerBytes = serialize(blk.header)
   let blockHash = doubleSha256(headerBytes)
 
+  # Per-peer and concurrent (see broadcastTx).
   for peer in pm.getReadyPeers():
-    try:
-      let msg = selectBlockAnnouncement(blk.header, blockHash, peer.sendHeaders)
-      await peer.sendMessage(msg)
-    except CatchableError as e:
-      debug "failed to broadcast block announcement",
-            peer = $peer, sendHeaders = peer.sendHeaders, error = e.msg
+    let msg = selectBlockAnnouncement(blk.header, blockHash, peer.sendHeaders)
+    asyncSpawn spawnSafe(peer.sendMessage(msg))
 
 proc broadcastInventory*(pm: PeerManager, inventory: seq[InvVector]) {.async.} =
   let msg = newInv(inventory)
   for peer in pm.getReadyPeers():
-    try:
-      await peer.sendMessage(msg)
-    except CatchableError as e:
-      debug "failed to broadcast inv", peer = $peer, error = e.msg
+    asyncSpawn spawnSafe(peer.sendMessage(msg))
 
 # NOTE(2026-08-27, meta #72): a `buildBlockLocator*(pm, tip)` helper used to
 # live here returning the 2-hash [tip, genesis] shape — the degenerate-locator
@@ -1716,11 +1709,15 @@ proc sendPingsNow*(pm: PeerManager) {.async.} =
   ## the separate `sendPings` proc below. Fire-and-forget: a per-peer error is
   ## swallowed so one dropped transport never aborts the fan-out (Core loops over
   ## the whole map and returns). With zero ready peers this is a successful no-op.
+  ##
+  ## Each peer's ping is SPAWNED, never awaited here: the keepalive tick runs
+  ## inside the PeerManager main loop, and awaiting a peer that has stopped
+  ## reading parked that loop — and with it ping-timeout eviction, reconnects
+  ## and stale-tip eviction (Core's message handler never waits on a socket;
+  ## PushMessage only queues). A failed or stalled send is bounded and drops
+  ## that peer inside Peer.sendBytes.
   for peer in pm.getReadyPeers():
-    try:
-      await peer.sendPing()
-    except CatchableError as e:
-      debug "failed to ping peer", peer = $peer, error = e.msg
+    asyncSpawn spawnSafe(peer.sendPing())
 
 proc pingPeers(pm: PeerManager) {.async.} =
   ## Background keepalive tick (mainLoop). Forces a ping to every ready peer on
@@ -1730,11 +1727,9 @@ proc pingPeers(pm: PeerManager) {.async.} =
 
 proc requestAddresses(pm: PeerManager) {.async.} =
   let msg = newGetAddr()
+  # Spawned per peer: runs in the PM main loop (see sendPingsNow).
   for peer in pm.getReadyPeers():
-    try:
-      await peer.sendMessage(msg)
-    except CatchableError as e:
-      debug "failed to request addresses", peer = $peer, error = e.msg
+    asyncSpawn spawnSafe(peer.sendMessage(msg))
 
 proc tryFeelerConnection*(pm: PeerManager) {.async.} =
   ## Open ONE short-lived feeler connection to an address selected from the
@@ -2631,11 +2626,8 @@ proc sendPings*(pm: PeerManager) {.async.} =
       continue
 
     if peer.shouldSendPing():
-      try:
-        peer.startPing()
-        await peer.sendPing()
-      except CatchableError as e:
-        debug "failed to send ping", peer = $peer, error = e.msg
+      peer.startPing()
+      asyncSpawn spawnSafe(peer.sendPing())
 
 proc checkHeadersTimeouts*(pm: PeerManager) {.async.} =
   ## Check for headers request timeouts
