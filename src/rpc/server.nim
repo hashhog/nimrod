@@ -10,6 +10,7 @@ import jsony
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation, chain, versionbits]
 import ../storage/[chainstate, blockstore, snapshot, pruner]
+from ../storage/db import RocksDbError
 from ../storage/db import DbSnapshotView, openSnapshotView, closeSnapshotView
 import ../storage/indexes/blockfilterindex
 import ../storage/indexes/coinstatsindex
@@ -21,6 +22,7 @@ import ../network/[peer, peermanager, banman, messages, asmap, netgroup]
 import ../mining/[fees, blocktemplate]
 import ../util/ops as opsMod
 import ../util/tip_notifier
+import ../util/fatal
 import ../wallet/wallet
 import ../wallet/descriptor
 import ../wallet/manager
@@ -6290,7 +6292,17 @@ proc bip22ChainError(errMsg: string): string =
     return "bad-txns-duplicate"
   return "rejected"
 
+proc raiseFatalVerifyError() {.noreturn.} =
+  ## Gate 6: a system fault is never a BIP-22 reject reason. Core's
+  ## submitblock answers a state.IsError() with
+  ## JSONRPCError(RPC_VERIFY_ERROR = -25, ...) (rpc/mining.cpp
+  ## BIP22ValidationResult), and after AbortNode the node is shutting down.
+  raise newRpcError(RpcTransactionError, fatalRefusal())
+
 proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
+  # Gate 6: after AbortNode no block is accepted (RPC_VERIFY_ERROR, -25).
+  if isFatal():
+    raiseFatalVerifyError()
   # NetworkDisable gate. Refuse submissions while a `dumptxoutset
   # rollback` dance is in progress. Mirrors Bitcoin Core's NetworkDisable
   # RAII around TemporaryRollback in rpc/blockchain.cpp::dumptxoutset.
@@ -6379,18 +6391,31 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       let skipScripts = cs.params.assumeValidHeight > 0 and
                         height <= cs.params.assumeValidHeight
       # A UTXO read failure is a local error, not bad-txns-inputs-missingorspent.
-      let utxoReadGuard = newUtxoReadGuard()
-      let utxoForAccept = guardedUtxoLookup(cs, utxoReadGuard)
-      let acceptResult = acceptBlock(blk, prevIdx, cs.db, cs.params,
-                                     skipScripts = skipScripts,
-                                     checkPow = false,  # PoW already checked by checkBlock above
-                                     getUtxo = utxoForAccept,
-                                     crypto = rpc.crypto)
-      if utxoReadGuard.failed:
-        # Not a verdict on the block (Core would abort on a coins-DB read
-        # failure); report it as a local error instead of a reject reason.
-        warn "submitblock: UTXO database read failed", error = utxoReadGuard.msg
-        return %bip22String(veUtxoReadError)
+      # Gate 6: retried once, then AbortNode + RPC_VERIFY_ERROR (-25) — never
+      # a BIP-22 token. A script check with no result twice has latched inside
+      # verifyScripts (veScriptInternalError) and answers the same way.
+      var acceptResult: ValidationResult[void]
+      for attempt in 0 .. 1:
+        let utxoReadGuard = newUtxoReadGuard()
+        let utxoForAccept = guardedUtxoLookup(cs, utxoReadGuard)
+        acceptResult = acceptBlock(blk, prevIdx, cs.db, cs.params,
+                                   skipScripts = skipScripts,
+                                   checkPow = false,  # PoW already checked by checkBlock above
+                                   getUtxo = utxoForAccept,
+                                   crypto = rpc.crypto)
+        if isFatal() or (not acceptResult.isOk and
+                         acceptResult.error == veScriptInternalError):
+          raiseFatalVerifyError()
+        let readFailed = utxoReadGuard.failed or
+          (not acceptResult.isOk and acceptResult.error == veUtxoReadError)
+        if not readFailed:
+          break
+        warn "submitblock: UTXO database read failed", error = utxoReadGuard.msg,
+             attempt = attempt + 1
+        if attempt == 1:
+          abortNode("submitblock: UTXO database read failed twice: " &
+                    utxoReadGuard.msg)
+          raiseFatalVerifyError()
       if not acceptResult.isOk:
         return %bip22String(acceptResult.error, blk.header.version)
 
@@ -6418,6 +6443,8 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
                             cs.connectBlock(blk, height)
 
       if not connectResult.isOk:
+        if isFatal() or connectResult.error.startsWith(fatalErrorToken):
+          raiseFatalVerifyError()
         # Map chainstate error string to BIP-22 token
         return %bip22ChainError(connectResult.error)
 
@@ -6560,6 +6587,8 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       #   sboRejected  -> the carried token ("rejected" or bip22String(error))
       #   sboSideBranch -> "inconclusive" (stored, not best — or reorg deferred)
       #   sboReorged   -> success (JSON null) after the post-reorg refresh below.
+      if isFatal():
+        raiseFatalVerifyError()
       if sideResult.outcome == sboRejected or
          sideResult.outcome == sboSideBranch:
         return %sideResult.token
@@ -6598,7 +6627,17 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
       newJNull()  # null = success per BIP-22 (reorg activated this tip)
 
+  except RpcError as e:
+    # Our own RPC errors (gate 6: -25 for a system fault) pass through; the
+    # catch-all below would otherwise turn them into a BIP-22 "rejected".
+    raise e
+  except RocksDbError as e:
+    # A chainstate / block-index read or write that raised is a system
+    # error, not a reject reason (Core: RPC_VERIFY_ERROR).
+    raise newRpcError(RpcTransactionError, "database error: " & e.msg)
   except CatchableError as e:
+    if isFatal():
+      raiseFatalVerifyError()
     # Unexpected exception — use "rejected" catch-all per BIP-22.
     %"rejected"
 

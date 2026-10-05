@@ -20,6 +20,7 @@ import ./crypto/[secp256k1, hashing]
 import ./perf/verify_pool
 import ./util/ops
 import ./util/tip_notifier
+import ./util/fatal
 
 const NimrodVersion* = "0.1.0"
 
@@ -1167,22 +1168,37 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     var missingInputs = false
     let txid = msg.tx.txid()
     let orphanPeer: OrphanPeerId = (peer.address, peer.port)
+    # Gate 6: a system fault while evaluating the tx (a coins-DB read error,
+    # a script check that raised, the fatal latch) is not a statement about
+    # the tx — it must not land in recentlyRejected (which suppresses every
+    # later re-request of a possibly valid tx) and must not count against
+    # the peer. Only a returned rejection reason does.
+    var systemFault = isFatal()
     {.gcsafe.}:
-      try:
-        let txResult = state.mempool.acceptTransaction(msg.tx, state.crypto)
-        accepted = txResult.isOk
-        if not accepted:
-          # acceptTransaction returns "input not found: ..." when at least
-          # one input has no UTXO and no mempool parent.  Treat that as a
-          # missing-parent (orphan) signal — every other rejection reason
-          # is a hard fail (consensus, policy, RBF, ...) and the tx should
-          # NOT enter the orphan pool.
-          missingInputs = txResult.error.startsWith("input not found")
-      except CatchableError:
-        discard
-      except Exception:
-        discard
-    if accepted:
+      if not systemFault:
+        try:
+          let txResult = state.mempool.acceptTransaction(msg.tx, state.crypto)
+          accepted = txResult.isOk
+          if not accepted:
+            # acceptTransaction returns "input not found: ..." when at least
+            # one input has no UTXO and no mempool parent.  Treat that as a
+            # missing-parent (orphan) signal — every other rejection reason
+            # is a hard fail (consensus, policy, RBF, ...) and the tx should
+            # NOT enter the orphan pool.
+            missingInputs = txResult.error.startsWith("input not found")
+            if txResult.error.startsWith(fatalErrorToken):
+              systemFault = true
+        except CatchableError as e:
+          systemFault = true
+          warn "mempool: system fault evaluating tx (not a rejection)",
+               txid = $txid, error = e.msg
+        except Exception as e:
+          systemFault = true
+          warn "mempool: system fault evaluating tx (not a rejection)",
+               txid = $txid, error = e.msg
+    if systemFault:
+      discard
+    elif accepted:
       # Relay to peers
       asyncSpawn state.peerManager.broadcastTx(msg.tx)
       # Re-feed any orphans that were waiting on this tx as a parent.
@@ -1198,15 +1214,21 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           let pending = state.orphanPool.takeChildrenOf(parent)
           for child in pending:
             var childOk = false
+            var childFault = isFatal()
             {.gcsafe.}:
-              try:
-                let r = state.mempool.acceptTransaction(child.tx, state.crypto)
-                childOk = r.isOk
-              except CatchableError:
-                discard
-              except Exception:
-                discard
-            if childOk:
+              if not childFault:
+                try:
+                  let r = state.mempool.acceptTransaction(child.tx, state.crypto)
+                  childOk = r.isOk
+                  if not childOk and r.error.startsWith(fatalErrorToken):
+                    childFault = true
+                except CatchableError:
+                  childFault = true
+                except Exception:
+                  childFault = true
+            if childFault:
+              discard  # gate 6: a system fault is not a rejection
+            elif childOk:
               asyncSpawn state.peerManager.broadcastTx(child.tx)
               work.add(child.txid)
             else:
@@ -1868,17 +1890,28 @@ proc setupSignalHandlers*() =
     # is nil (early-startup crash path).
     removePidFile()
 
+    # Gate 6 (Core AbortNode): after a fatal system fault the in-memory
+    # chainstate is exactly what could NOT be made durable. Do not write it:
+    # skip the IBD-batch flush and the UTXO-cache flush, leave the database
+    # handle to process exit, and exit 1 so systemd (Restart=on-failure)
+    # restarts the node, which replays from the last state that committed.
+    let fatalShutdown = isFatal()
+    if fatalShutdown:
+      error "shutting down after a FATAL system fault — skipping the " &
+            "chainstate flush; exit status 1", reason = fatalMessage()
+
     if globalNodeState != nil:
       globalNodeState.running = false
 
       # If in IBD mode, flush the write batch before closing (WAL is disabled
       # during IBD so unflushed blocks are not durable until stopIBD is called)
-      if globalNodeState.chainState != nil and globalNodeState.chainState.ibdMode:
+      if not fatalShutdown and globalNodeState.chainState != nil and
+         globalNodeState.chainState.ibdMode:
         info "flushing IBD batch before shutdown"
         globalNodeState.chainState.stopIBD()
 
       # Flush UTXO cache
-      if globalNodeState.chainState != nil:
+      if not fatalShutdown and globalNodeState.chainState != nil:
         info "flushing UTXO cache"
         globalNodeState.chainState.flushCache()
 
@@ -1933,7 +1966,9 @@ proc setupSignalHandlers*() =
       # leave the DB open: every write above went through the WAL (stopIBD
       # already flushed the IBD batch), and process exit reclaims the handle.
       if globalNodeState.chainState != nil:
-        if globalNodeState.chainState.stopStartupBodyAudit(5000):
+        if fatalShutdown:
+          warn "fatal shutdown: leaving the database to process exit (no close-time flush)"
+        elif globalNodeState.chainState.stopStartupBodyAudit(5000):
           info "closing database"
           globalNodeState.chainState.close()
         else:
@@ -1942,7 +1977,15 @@ proc setupSignalHandlers*() =
 
       info "shutdown complete"
 
+    if fatalShutdown or isFatal():
+      quit(1)
     quit(0)
+
+  # AbortNode -> shutdown: the latch (util/fatal) requests the SAME shutdown a
+  # `kill -TERM` / RPC `stop` runs; the handler above sees the latch and skips
+  # every chainstate flush, then exits 1.
+  setAbortAction(proc() {.gcsafe, raises: [].} =
+    discard posix.kill(posix.getpid(), posix.SIGTERM))
 
   signal(SIGINT, sigHandler)
   signal(SIGTERM, sigHandler)
@@ -2259,7 +2302,14 @@ proc runBlockImport*(config: NimrodConfig) =
            $(int(bps)) & " blocks/sec, " &
            $(int(bps * 60.0)) & " blocks/min)"
 
+  # Gate 6: stopIBD skips the final flush after AbortNode (the import stopped
+  # on a system fault); exit non-zero so the caller knows the import did not
+  # complete, instead of a clean "finished".
   cs.stopIBD()
+  if isFatal():
+    echo "Import aborted on a fatal system fault (" & fatalMessage() &
+         "); chainstate left at its last durable checkpoint"
+    quit(1)
   echo "Import finished. Tip at height " & $cs.bestHeight
 
 proc metricsHandler(state: NodeState, transp: StreamTransport) {.async.} =

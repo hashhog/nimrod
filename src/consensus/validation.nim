@@ -8,6 +8,7 @@ import ../storage/chainstate
 import ../script/interpreter
 import ../perf/sig_cache
 import ../perf/verify_pool
+import ../util/fatal
 import ./params
 from ./pow import nil
 
@@ -93,6 +94,12 @@ type
     # failure in a UtxoReadGuard and the caller reports THIS instead of the
     # "missing input" the adapter had to return. blockFailureKind -> undecided.
     veUtxoReadError = "UTXO database read failed (local error, not a block verdict)"
+    # NOT a consensus result either (gate 6): a script check produced no
+    # result at all — it raised (OOM, an FFI / secp context fault, an
+    # interpreter bug) on the re-run too, so verifyScripts latched AbortNode.
+    # Core: a CCheckQueue job never reports anything but a ScriptError;
+    # bad_alloc terminates the process. blockFailureKind -> undecided.
+    veScriptInternalError = "script check internal error (local error, not a block verdict)"
 
   ValidationResult*[T] = object
     case isOk*: bool
@@ -252,6 +259,7 @@ proc bip22String*(e: ValidationError, blockVersion: int32 = 0'i32): string =
   # nMinimumChainWork (validation.cpp:4229, BLOCK_HEADER_LOW_WORK).
   of veInsufficientChainWork: "too-little-chainwork"
   of veUtxoReadError: "utxo-read-error"
+  of veScriptInternalError: "script-check-internal-error"
   of veOk: ""
   else: "rejected"
 
@@ -277,15 +285,27 @@ proc blockFailureKind*(e: ValidationError): BlockFailureKind =
   ## so a witness-stuffed copy of a valid block can surface as
   ## veBlockOverweight / veSigopExceeded (Core orders CheckWitnessMalleation
   ## first for exactly this reason, validation.cpp ContextualCheckBlock).
+  ##
+  ## Gate 6: EXHAUSTIVE — no `else`. A new ValidationError that nobody
+  ## classified is a compile error here, never a silent verdict.
   case e
   of veBadMerkleRoot, veMutatedMerkleTree, veBadWitnessCommitment,
      veWitnessNonceSize, veUnexpectedWitness:
     bfkMutated
   of veOk, vePrevBlockMissing, veTooFarAhead, veTimeTooNew,
      veInsufficientChainWork, veCheckpointMismatch, veForkBelowCheckpoint,
-     veFeeTooLow, veUtxoReadError:
+     veFeeTooLow, veUtxoReadError, veScriptInternalError:
     bfkUndecided
-  else:
+  of veDuplicateTx, veBadPow, veExceedsTarget, veBadTimestamp,
+     veBadCoinbaseSize, veBlockOverweight, veSigopExceeded, veInputsMissing,
+     veDoubleSpend, veBadAmount, veImmatureCoinbase, veScriptVerifyFailed,
+     veBadCoinbase, veNoCoinbase, veBadTxVersion, veDuplicateInput,
+     veBadOutputValue, veVinEmpty, veVoutEmpty, veNegativeOutput,
+     veOutputTooLarge, veBadBlockVersion, veSequenceLockNotSatisfied,
+     veNonFinalTx, veBip30DuplicateOutput, veOutputsBelowInputs, veTxOversize,
+     veTxOutTotalTooLarge, veNullPrevout, veFeesOutOfRange,
+     veIncorrectProofOfWork, veTimeWarpAttack, veBadBlockLength,
+     veMultipleCoinbase:
     bfkInvalid
 
 const localErrorToken* = "local-error"
@@ -295,20 +315,46 @@ const localErrorToken* = "local-error"
 proc blockFailureKindOfToken*(tok: string): BlockFailureKind =
   ## Same classification for a BIP-22 reject token (the side-branch /
   ## reorg path only carries bip22String / bip22RejectToken output).
-  ## A UTXO read failure ("utxo-read-error...") or a hook exception
-  ## ("local-error...") is local, never a verdict.
+  ## A UTXO read failure ("utxo-read-error..."), a hook exception
+  ## ("local-error...") or a fatal system fault ("fatal-error...") is local,
+  ## never a verdict.
+  ##
+  ## Gate 6: STRICT ALLOW-LIST. A token is a verdict only if it is the exact
+  ## bip22String of a ValidationError that blockFailureKind calls a verdict
+  ## (or one of the two script-verify tokens the reorg hook can lead with);
+  ## anything else — an unknown token, a free-form exception message — is
+  ## undecided. (It used to be `else: bfkInvalid`, so any string a fault
+  ## produced was a verdict by default.)
   if tok.startsWith(bip22String(veUtxoReadError)) or
-     tok.startsWith(localErrorToken):
+     tok.startsWith(bip22String(veScriptInternalError)) or
+     tok.startsWith(localErrorToken) or
+     tok.startsWith(fatalErrorToken):
     return bfkUndecided
   case tok
-  of "bad-txnmrklroot", "bad-txns-duplicate", "bad-witness-merkle-match",
-     "bad-witness-nonce-size", "unexpected-witness":
-    bfkMutated
-  of "", "rejected", "inconclusive", "duplicate", "time-too-new",
-     "too-little-chainwork", "prev-blk-not-found", "bad-prevblk":
-    bfkUndecided
-  else:
-    bfkInvalid
+  of "", "rejected", "inconclusive", "duplicate", "prev-blk-not-found",
+     "bad-prevblk":
+    return bfkUndecided
+  of "block-script-verify-flag-failed", "mandatory-script-verify-flag-failed":
+    return bfkInvalid
+  else: discard
+  if tok.startsWith("bad-version(0x") and tok.endsWith(")"):
+    return blockFailureKind(veBadBlockVersion)
+  var kind = bfkUndecided
+  var seen = false
+  for e in ValidationError:
+    if e == veBadBlockVersion or e == veOk:
+      continue
+    let t = bip22String(e)
+    if t == "rejected" or t != tok:
+      continue
+    let k = blockFailureKind(e)
+    if not seen:
+      kind = k
+      seen = true
+    elif k != kind:
+      # Two errors share this token but disagree: not a verdict.
+      return bfkUndecided
+  kind
 
 proc blockFailureKindOfApplyError*(err: string): BlockFailureKind =
   ## Classify the string acceptAndConnectBlock returns. Only its
@@ -2259,13 +2305,29 @@ proc verifyScripts*(
   ## `txPrevoutsStore` is declared HERE (not inside collectChecks) so that its
   ## lifetime encloses the runChecks call: workers deref prevoutsPtr while running
   ## and `runChecks` blocks until they all finish before this proc returns.
+  ##
+  ## Gate 6 — three outcomes. A run in which some check produced NO result
+  ## (it raised) is re-run once, serially (beamchain 30fdcfb / Core: the
+  ## fault is ours, not the block's). If the re-run is internal too, the node
+  ## latches AbortNode and the block gets veScriptInternalError, which no
+  ## classifier treats as a verdict. Only a run where every check produced a
+  ## result can reject (veScriptVerifyFailed) or accept.
   var checks: seq[ScriptCheck] = @[]
   var txPrevoutsStore: seq[TxPrevouts] = @[]
   let collectRes = collectChecks(blk, utxos, height, params, checks, txPrevoutsStore)
   if not collectRes.isOk:
     return collectRes
 
-  if not runChecks(checks):
+  var run = runChecksDetailed(checks)
+  if run.internal:
+    noteFault("script check internal error at height " & $height &
+              " — re-running the block's checks once: " & run.internalMsg)
+    run = runChecksSerialDetailed(checks)
+    if run.internal:
+      abortNode("script check internal error twice at height " & $height &
+                ": " & run.internalMsg)
+      return voidErr(veScriptInternalError)
+  if not run.ok:
     return voidErr(veScriptVerifyFailed)
 
   ok()
@@ -2978,6 +3040,11 @@ proc acceptAndConnectBlock*(
   ## (used by the --import paths which run their own IBD batching wrapper).
   let prevHash = blk.header.prevBlock
 
+  # Gate 6: after AbortNode nothing advances the chain, from any entry point
+  # (P2P, --import, mining, submitblock-tip). Not a verdict (fatal-error).
+  if isFatal():
+    return err(fatalRefusal())
+
   # Look up prevIndex. Genesis (height=0) gets a synthetic sentinel because
   # the genesis block's prevBlock is the zero hash, which is not in the DB.
   let prevIdx = if height <= 0:
@@ -3007,9 +3074,6 @@ proc acceptAndConnectBlock*(
 
   # UTXO lookup adapter for acceptBlock (BIP-30 + verifyScripts). A read
   # failure is recorded in `readGuard`, not turned into a missing input.
-  let readGuard = newUtxoReadGuard()
-  let utxoLookup = guardedUtxoLookup(cs, readGuard)
-
   # Full consensus envelope (Core AcceptBlock parity):
   #   step 1 checkBlock              (PoW + merkle + tx sanity)
   #   step 2 validateBlock           (contextual header + BIP-34 height
@@ -3018,22 +3082,42 @@ proc acceptAndConnectBlock*(
   #   step 3 checkBip30              (CVE-2012-1909 dup-UTXO)
   #   step 4 verifyScripts           (per-input script execution, gated
   #                                   by skipScripts under assumevalid)
-  let acceptResult = acceptBlock(blk, prevIdx, cs.db, cs.params,
-                                 skipScripts = skipScripts,
-                                 checkPow = true,
-                                 getUtxo = utxoLookup,
-                                 crypto = crypto)
+  #
   # A UTXO read failure voids whatever acceptBlock concluded (a coin it could
-  # not read looked missing, or a BIP30 collision looked absent). Report it
-  # WITHOUT the "acceptBlock rejected: " prefix: blockFailureKindOfApplyError
-  # then classifies it undecided (no BLOCK_FAILED_VALID mark, no punishment),
-  # and it does not contain "missing input", so the marker-lag adoption probe
-  # in sync.applyBlock does not fire either. Core: CCoinsViewErrorCatcher ->
-  # AbortNode, never a block verdict.
-  if readGuard.failed or
-     (not acceptResult.isOk and acceptResult.error == veUtxoReadError):
-    return err("utxo-read-error: " & $veUtxoReadError & ": " &
-               (if readGuard.failed: readGuard.msg else: "BIP30/BIP34 lookup"))
+  # not read looked missing, or a BIP30 collision looked absent). It is
+  # retried ONCE; a second failure is AbortNode (Core:
+  # CCoinsViewErrorCatcher -> "Error reading from database, shutting down").
+  # Either way it is reported WITHOUT the "acceptBlock rejected: " prefix:
+  # blockFailureKindOfApplyError classifies it undecided (no
+  # BLOCK_FAILED_VALID mark, no punishment), and it does not contain
+  # "missing input", so the marker-lag adoption probe in sync.applyBlock
+  # does not fire either. A script check that produced no result twice has
+  # already latched inside verifyScripts (veScriptInternalError).
+  var acceptResult: ValidationResult[void]
+  for attempt in 0 .. 1:
+    let readGuard = newUtxoReadGuard()
+    let utxoLookup = guardedUtxoLookup(cs, readGuard)
+    acceptResult = acceptBlock(blk, prevIdx, cs.db, cs.params,
+                               skipScripts = skipScripts,
+                               checkPow = true,
+                               getUtxo = utxoLookup,
+                               crypto = crypto)
+    if not acceptResult.isOk and acceptResult.error == veScriptInternalError:
+      return err(fatalErrorToken & ": " & $veScriptInternalError & " (" &
+                 fatalMessage() & ")")
+    let readFailed = readGuard.failed or
+      (not acceptResult.isOk and acceptResult.error == veUtxoReadError)
+    if not readFailed:
+      break
+    let what = (if readGuard.failed: readGuard.msg else: "BIP30/BIP34 lookup")
+    if attempt == 0:
+      noteFault("UTXO read failed validating block at height " & $height &
+                " — retrying once: " & what)
+      continue
+    abortNode("UTXO database read failed twice validating block at height " &
+              $height & ": " & what)
+    return err(fatalErrorToken & ": utxo-read-error: " & $veUtxoReadError &
+               ": " & what)
   if not acceptResult.isOk:
     return err("acceptBlock rejected: " & $acceptResult.error)
 

@@ -123,6 +123,7 @@ const IncludedTests = [
   "test_fixedseed_fallback",
   "test_fork_download_stall",
   "test_fundrawtransaction",
+  "test_gate6_resource_limits",
   "test_gcs",
   "test_genesis_sync_relay",
   "test_getblockfrompeer",

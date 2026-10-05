@@ -25,6 +25,7 @@ import ../storage/indexes/coinstatsindex
 import ../storage/indexes/txospenderindex
 import ../crypto/[hashing, secp256k1]
 import ../perf/parallel_verify
+import ../util/fatal
 
 # Use std/times for Time and Duration (not chronos/timer)
 type
@@ -3218,6 +3219,12 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
   ## difficulty check) can be exercised directly by the test suite —
   ## see tests/test_w164_apply_block_diffbits.nim.
   sm.lastApplyError = ""
+  # Gate 6: after AbortNode no block is validated or connected. The refusal
+  # carries the fatal-error token, which no classifier treats as a verdict
+  # (no mark, no punishment).
+  if isFatal():
+    sm.lastApplyError = fatalRefusal()
+    return false
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
 
@@ -3364,6 +3371,17 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
                  height = height, probeResult = adoptErr
     if not acceptOk:
       sm.lastApplyError = acceptErr
+      if acceptErr.startsWith(fatalErrorToken) or isFatal():
+        # A system fault (a chainstate write / flush that failed twice, a
+        # coins read that failed twice, a script check with no result twice):
+        # the node has latched AbortNode. Not a verdict: no mark, no
+        # punishment, no retry bookkeeping.
+        error "FATAL system fault while connecting block — NOT marking it " &
+              "invalid; the node is halting", height = height, hash = $hash,
+              error = acceptErr
+        if not acceptErr.startsWith(fatalErrorToken):
+          sm.lastApplyError = fatalRefusal()
+        return false
       if acceptErr.startsWith(bip22String(veUtxoReadError)):
         # Local fault, not a verdict: the block is neither marked nor its
         # sender punished, and it is retried. Loud, because a persistent

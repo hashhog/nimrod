@@ -32,6 +32,7 @@ import ../src/storage/chainstate
 import ../src/storage/db
 import ../src/primitives/[types, serialize, uint256]
 import ../src/crypto/hashing
+import ../src/util/fatal
 
 const EASY_BITS = 0x207fffff'u32
 const BaseTs = 1_700_000_000'u32
@@ -366,8 +367,13 @@ suite "a UTXO read failure is not a verdict":
     check not csv.isFailedOnDisk(hB1)
     check not x.shouldDisconnect
     check sm.headerChain.getHashByHeight(21) == some(hB1)   # still wanted (retried)
-    check sm.lastApplyError.startsWith("utxo-read-error")
+    check "utxo-read-error" in sm.lastApplyError
     check sm.chainTipHeight == 20
+    # Gate 6: the read failed on the retry too -> AbortNode (Core
+    # CCoinsViewErrorCatcher: "Error reading from database, shutting down").
+    check isFatal()
+    check sm.lastApplyError.startsWith(fatalErrorToken)
+    resetFatalForTest()   # the restart: the latch is per process
 
     # Positive control on the same block: the record is now genuinely absent,
     # which IS a consensus verdict — marked, and the deliverer punished.
