@@ -169,10 +169,20 @@ proc clampWorkers*(requested: int): int {.gcsafe.} =
 ## by collectChecks before any worker runs, never mutated again), (c) the
 ## lock-protected globalSigCache, and (d) the read-only secp verify context.
 ## Mirrors Core's CScriptCheck::operator() running on a worker thread.
+# Gate-6 fault injection (tests only; nil in production). When the hook
+# returns true for a check, that check dies with a resource-exhaustion
+# exception instead of producing a script result — the shape of an OOM, an
+# FFI fault or an interpreter bug inside one script check.
+var scriptCheckFaultHook*: proc(inputIndex: int): bool {.gcsafe, raises: [].}
+
 proc runOne(chk: ScriptCheck): ScriptError {.gcsafe.} =
   {.cast(gcsafe).}:
     if gInstrument:
       recordThread()
+    let fh = scriptCheckFaultHook
+    if fh != nil and fh(chk.inputIndex):
+      raise newException(ResourceExhaustedError,
+        "injected script-check internal error (input " & $chk.inputIndex & ")")
     # Deref the shared per-tx TxPrevouts. The ptr is guaranteed live: the
     # block-level seq[TxPrevouts] lives in verifyScripts (on the master stack)
     # and runChecks blocks until all workers finish before returning.

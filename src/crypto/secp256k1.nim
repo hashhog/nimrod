@@ -302,6 +302,14 @@ when defined(useSystemSecp256k1):
 
   var globalContext: Secp256k1Context
 
+  # Gate-6 fault injection (tests only; nil in production). When the hook
+  # returns true, getContext behaves as if the verify context could not be
+  # created — the same failure initSecp256k1 reports when urandom fails.
+  var secpContextFaultHook*: proc(): bool {.gcsafe, raises: [].}
+
+  proc contextUnavailable(msg: string) =
+    raise newException(Secp256k1Error, msg)
+
   proc initSecp256k1*() =
     if pointer(globalContext) == nil:
       globalContext = secp256k1_context_create(
@@ -310,11 +318,14 @@ when defined(useSystemSecp256k1):
       # Side-channel blinding (W159 BUG-4). Mirrors Core's ECC_Start.
       var seed: array[32, byte]
       if not urandom(seed):
-        raise newException(Secp256k1Error,
-          "secp256k1 blinding seed unavailable (urandom failed)")
+        contextUnavailable("secp256k1 blinding seed unavailable (urandom failed)")
       discard secp256k1_context_randomize(globalContext, addr seed[0])
 
   proc getContext(): Secp256k1Context =
+    {.cast(gcsafe).}:
+      let h = secpContextFaultHook
+      if h != nil and h():
+        contextUnavailable("secp256k1 context unavailable (injected fault)")
     if pointer(globalContext) == nil:
       initSecp256k1()
     globalContext

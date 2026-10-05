@@ -267,6 +267,31 @@ proc checkError(err: cstring) =
     rocksdb_free(err)
     raise newException(RocksDbError, msg)
 
+# ---------------------------------------------------------------------------
+# Gate-6 fault injection (tests only). nil in production: one pointer compare
+# per call. A test installs a hook that returns true to make the next matching
+# operation fail exactly as RocksDB reports ENOSPC / EIO: checkError raises
+# RocksDbError. `cf` is meaningful for get/put/delete; a batch write or flush
+# spans every column family and passes cfDefault.
+# ---------------------------------------------------------------------------
+type
+  DbFaultOp* = enum
+    dfoGet        ## Database.get (every point read, incl. coin lookups)
+    dfoPut        ## Database.put (a single-key write outside a batch)
+    dfoDelete     ## Database.delete
+    dfoWrite      ## Database.write (a WriteBatch commit)
+    dfoWriteSync  ## Database.writeSynced (the IBD checkpoint batch)
+    dfoFlush      ## Database.flushAllColumnFamilies
+
+var dbFaultHook*: proc(op: DbFaultOp, cf: ColumnFamily): bool {.gcsafe, raises: [].}
+
+proc injectFault(op: DbFaultOp, cf: ColumnFamily) {.inline, gcsafe.} =
+  {.cast(gcsafe).}:
+    let h = dbFaultHook
+    if h != nil and h(op, cf):
+      raise newException(RocksDbError,
+        "IO error: No space left on device (injected " & $op & " fault)")
+
 proc cfNames(): array[ColumnFamily, string] =
   for cf in ColumnFamily:
     result[cf] = $cf
@@ -486,6 +511,7 @@ proc close*(db: Database) =
   # Note: bloomFilter is owned by cfTableOpts after set_filter_policy; do NOT destroy separately
 
 proc get*(db: Database, cf: ColumnFamily, key: openArray[byte]): Option[seq[byte]] =
+  injectFault(dfoGet, cf)
   var
     err: cstring = nil
     vallen: csize_t
@@ -513,6 +539,7 @@ proc get*(db: Database, key: openArray[byte]): Option[seq[byte]] =
   db.get(cfDefault, key)
 
 proc put*(db: Database, cf: ColumnFamily, key, value: openArray[byte]) =
+  injectFault(dfoPut, cf)
   var err: cstring = nil
   let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
   let valPtr = if value.len > 0: cast[cstring](unsafeAddr value[0]) else: cast[cstring](nil)
@@ -529,6 +556,7 @@ proc put*(db: Database, key, value: openArray[byte]) =
   db.put(cfDefault, key, value)
 
 proc delete*(db: Database, cf: ColumnFamily, key: openArray[byte]) =
+  injectFault(dfoDelete, cf)
   var err: cstring = nil
   let keyPtr = if key.len > 0: cast[cstring](unsafeAddr key[0]) else: cast[cstring](nil)
   rocksdb_delete_cf(
@@ -611,6 +639,7 @@ proc delete*(batch: WriteBatch, key: openArray[byte]) =
   )
 
 proc write*(db: Database, batch: WriteBatch) =
+  injectFault(dfoWrite, cfDefault)
   var err: cstring = nil
   rocksdb_write(db.db, db.writeOpts, batch.batch, addr err)
   checkError(err)
@@ -625,6 +654,7 @@ proc writeSynced*(db: Database, batch: WriteBatch) =
   ## batch survives a crash as a unit. This is the durability primitive the
   ## periodic IBD chainstate checkpoint needs so the chain-tip pointer and the
   ## UTXO-set mutations can never be persisted out of step with each other.
+  injectFault(dfoWriteSync, cfDefault)
   var err: cstring = nil
   rocksdb_write(db.db, db.syncWriteOpts, batch.batch, addr err)
   checkError(err)
@@ -651,6 +681,7 @@ proc flushAllColumnFamilies*(db: Database) =
   ## Force all column-family memtables to SST files on disk.
   ## Must be called after IBD batch writes (where WAL is disabled) to
   ## ensure durability — without this, a crash loses all memtable data.
+  injectFault(dfoFlush, cfDefault)
   let flushOpts = rocksdb_flushoptions_create()
   rocksdb_flushoptions_set_wait(flushOpts, 1)  # block until flush completes
   defer: rocksdb_flushoptions_destroy(flushOpts)
