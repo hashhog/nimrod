@@ -162,6 +162,7 @@ const IncludedTests = [
   "test_nil_db_height_index",
   "test_notification",
   "test_ops",
+  "test_orphan_child_before_parent",
   "test_orphan_pool",
   "test_p2a",
   "test_p2a_witness",

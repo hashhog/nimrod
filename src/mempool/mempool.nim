@@ -177,12 +177,26 @@ type
       value*: T
     of false:
       error*: string
+      missingInputs*: bool  ## Core TxValidationResult::TX_MISSING_INPUTS:
+                            ## a prevout is in neither the UTXO set nor the
+                            ## mempool. The P2P layer routes exactly these
+                            ## to the orphan pool (Core MempoolRejectedTx,
+                            ## node/txdownloadman_impl.cpp:361) — a typed
+                            ## flag, so a reworded reason string can never
+                            ## again silently turn orphans into rejects.
 
 proc ok*[T](val: T): MempoolResult[T] =
   MempoolResult[T](isOk: true, value: val)
 
 proc err*(T: typedesc, msg: string): MempoolResult[T] =
   MempoolResult[T](isOk: false, error: msg)
+
+const MissingInputsToken* = "bad-txns-inputs-missingorspent"
+
+proc errMissingInputs*(T: typedesc, detail: string): MempoolResult[T] =
+  ## TX_MISSING_INPUTS rejection: Core's reason token plus the typed flag.
+  MempoolResult[T](isOk: false, missingInputs: true,
+                   error: MissingInputsToken & ": " & detail)
 
 proc defaultAtmpArgs*(): AtmpArgs =
   ## Default ATMP args mirroring Bitcoin Core's normal sendrawtransaction path:
@@ -1173,10 +1187,10 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
             break
         if alreadyKnown:
           return err(AtmpAcceptInfo, "txn-already-known")
-        return err(AtmpAcceptInfo, "bad-txns-inputs-missingorspent: " & $input.prevOut.txid)
+        return errMissingInputs(AtmpAcceptInfo, $input.prevOut.txid)
       let parentEntry = mp.entries[input.prevOut.txid]
       if int(input.prevOut.vout) >= parentEntry.tx.outputs.len:
-        return err(AtmpAcceptInfo, "bad-txns-inputs-missingorspent: bad vout " &
+        return errMissingInputs(AtmpAcceptInfo, "bad vout " &
                    $input.prevOut.vout & " for mempool parent")
     else:
       let entry = utxo.get()
@@ -1629,7 +1643,8 @@ proc acceptTransaction*(mp: Mempool, tx: Transaction,
   let res = acceptTransactionWithArgs(mp, tx, crypto, args)
   if res.isOk:
     return ok[TxId](res.value.txid)
-  return err(TxId, res.error)
+  MempoolResult[TxId](isOk: false, error: res.error,
+                      missingInputs: res.missingInputs)
 
 # Remove a transaction from the mempool
 proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true) =

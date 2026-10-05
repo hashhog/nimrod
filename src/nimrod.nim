@@ -1180,12 +1180,16 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           let txResult = state.mempool.acceptTransaction(msg.tx, state.crypto)
           accepted = txResult.isOk
           if not accepted:
-            # acceptTransaction returns "input not found: ..." when at least
-            # one input has no UTXO and no mempool parent.  Treat that as a
-            # missing-parent (orphan) signal — every other rejection reason
-            # is a hard fail (consensus, policy, RBF, ...) and the tx should
-            # NOT enter the orphan pool.
-            missingInputs = txResult.error.startsWith("input not found")
+            # Core TX_MISSING_INPUTS (MemPoolAccept::PreChecks,
+            # "bad-txns-inputs-missingorspent"): an input has no UTXO and no
+            # mempool parent. Those go to the orphan pool (Core
+            # MempoolRejectedTx, node/txdownloadman_impl.cpp:361); every
+            # other rejection is a hard fail and must NOT be orphaned.
+            # Typed flag, not a string match: this used to test
+            # startsWith("input not found"), a token the single-tx path no
+            # longer returned, so every child-before-parent tx was dropped
+            # and cached as rejected.
+            missingInputs = txResult.missingInputs
             if txResult.error.startsWith(fatalErrorToken):
               systemFault = true
         except CatchableError as e:
@@ -1214,14 +1218,17 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           let pending = state.orphanPool.takeChildrenOf(parent)
           for child in pending:
             var childOk = false
+            var childMissing = false
             var childFault = isFatal()
             {.gcsafe.}:
               if not childFault:
                 try:
                   let r = state.mempool.acceptTransaction(child.tx, state.crypto)
                   childOk = r.isOk
-                  if not childOk and r.error.startsWith(fatalErrorToken):
-                    childFault = true
+                  if not childOk:
+                    childMissing = r.missingInputs
+                    if r.error.startsWith(fatalErrorToken):
+                      childFault = true
                 except CatchableError:
                   childFault = true
                 except Exception:
@@ -1231,6 +1238,12 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
             elif childOk:
               asyncSpawn state.peerManager.broadcastTx(child.tx)
               work.add(child.txid)
+            elif childMissing:
+              # Still waiting on ANOTHER parent: Core ProcessOrphanTx leaves
+              # a TX_MISSING_INPUTS orphan in the orphanage (only a
+              # non-missing-inputs result erases it). takeChildrenOf removed
+              # it, so put it back under its original announcer.
+              discard state.orphanPool.addOrphan(child.tx, child.fromPeer)
             else:
               # G27: store both txid and wtxid so the rejection filter works
               # regardless of whether a peer re-announces via invTx or invWtx.
