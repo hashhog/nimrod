@@ -40,6 +40,21 @@ const
     ## unretained prefix, so the audit logged "contiguous" for every
     ## chainstate. Floor is discoverFirstBody / an explicit pruneHeight.
 
+
+# ---------------------------------------------------------------------------
+# Test-only interleaving points (compiled out unless -d:nimrodRaceHooks).
+# A test installs `raceHook` to park one thread at a named point inside a
+# chainstate mutation so another thread's work can be interleaved there
+# deterministically (tests/test_chain_lock_race.nim). Production builds do
+# not define the symbol, so `racePoint` expands to nothing.
+when defined(nimrodRaceHooks):
+  var raceHook*: proc(point: string, hash: BlockHash) {.nimcall, gcsafe, raises: [].}
+  template racePoint(point: string, hash: BlockHash) =
+    {.cast(gcsafe).}:
+      if raceHook != nil: raceHook(point, hash)
+else:
+  template racePoint(point: string, hash: BlockHash) = discard
+
 type
   ChainStateError* = object of CatchableError
 
@@ -2093,6 +2108,7 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   # AbortNode (Core FlushStateToDisk / ConnectTip FatalError). Memory has not
   # been touched, so the block is not connected, and the latch stops anyone
   # from deciding anything about it.
+  racePoint("connect.precommit", blockHash)
   let rawDb = cs.db.db
   if not retryOnceOrAbort("connectBlock chainstate write",
                           proc() {.gcsafe.} = rawDb.write(batch)):
@@ -2103,6 +2119,7 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   for c in cacheOps:
     if c.isPut: cs.putUtxoCache(c.op, c.entry)
     else: cs.deleteUtxoCache(c.op)
+  racePoint("connect.postcache", blockHash)
   cs.totalWork = newTotalWork
   cs.bestBlockHash = blockHash
   cs.bestHeight = height
