@@ -217,6 +217,7 @@ const IncludedTests = [
   "test_standard",
   "test_storage",
   "test_sync",
+  "test_sync_tip_single_source",
   "test_t1_r5_parity",
   "test_t2_r5_parity",
   "test_t3_r5_parity",
