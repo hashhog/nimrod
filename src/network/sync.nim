@@ -3795,7 +3795,10 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   ## framework is invoked so noBan/manual guards are respected.
   ## Reference: bitcoin-core/src/net_processing.cpp MaybePunishNodeForBlock +
   ## the ProcessMessage("block") Misbehaving("mutated block") path.
-  lockChainScopeOpt(sm.chainState)  # cs_main: storage/chain_lock.nim
+  # No scope here: applyBlock / processSideBranchBody / tryFillMissingBody each
+  # hold the chain lock for their block, and drainBlockBuffer hands it over
+  # between blocks. A scope across the drain kept RPC out for whole batches
+  # (p50 9 ms during sync). The main thread's base hold covers the rest.
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
 
