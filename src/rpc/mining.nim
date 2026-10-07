@@ -113,6 +113,11 @@ proc generateBlocks*(
   let crypto = newCryptoEngine()
 
   for i in 0 ..< nblocks:
+    # Between blocks, hand the chain lock back to block connection (Core's
+    # generateBlocks takes cs_main per block, not across the batch). Each
+    # block's template, connect and mempool update stay one critical section.
+    if i > 0:
+      discard chainState.chainLock.yieldHeld()
     let blockOpt = mineBlock(chainState, mempool, params, coinbaseScript, maxTries)
     if blockOpt.isNone:
       break
