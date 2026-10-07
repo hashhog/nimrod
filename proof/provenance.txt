@@ -1,25 +1,25 @@
 # Provenance — nimrod proof bundle
-assembled_utc: 2026-10-07T14:32:01Z
+assembled_utc: 2026-10-07T16:16:03Z
 repo: https://github.com/hashhog/nimrod
 branch: master
-commit: a43ef738875f2ee44778b4421abeb23b89147ed9
-commit_short: a43ef738875f
-subject: perf: processBlock no longer holds the chain lock across its buffer drain
+commit: 52154919565bb281cc4f48624edcce5b1da02803
+commit_short: 52154919565b
+subject: fix: one active-chain source of truth — sync reads ChainState's tip; the tip moves only by connect/disconnect
 tree_clean: NO
 binary: /home/work/hashhog/deploy/nimrod/nimrod
-binary_sha256: 5162eaee7fa9e1eb85a7434957652064536eb78d27a7b514aa33660625b3b4a1
+binary_sha256: a687bcd090b3820f1023a4f7ffd6aecf6af6caa729479222ea902a95e02ea743
 toolchain: Nim Compiler Version 2.2.8 [Linux: amd64]
 nimble: nimble v0.20.1 compiled at 2026-02-23 03:08:48
 target: Linux amd64
 build: nimble build -d:release -y
-deploy_pin: a43ef738875f2ee44778b4421abeb23b89147ed9
-deploy_short: a43ef73
-deploy_sha256: 5162eaee7fa9e1eb85a7434957652064536eb78d27a7b514aa33660625b3b4a1
+deploy_pin: 52154919565bb281cc4f48624edcce5b1da02803
+deploy_short: 5215491
+deploy_sha256: a687bcd090b3820f1023a4f7ffd6aecf6af6caa729479222ea902a95e02ea743
 source: pin
 
 # Honest caveats
 The attested binary is the promoted pin (deploy/nimrod/MANIFEST
-sha256=5162eaee7fa9e1eb85a7434957652064536eb78d27a7b514aa33660625b3b4a1, commit a43ef73), which must be
+sha256=a687bcd090b3820f1023a4f7ffd6aecf6af6caa729479222ea902a95e02ea743, commit 5215491), which must be
 byte-identical to the live mainnet unit's /proc/<pid>/exe. Re-run
 this script with --pin after every promote; proof/check-pin.sh and
 proof/verify.sh fail if a pin is present and does not match.
