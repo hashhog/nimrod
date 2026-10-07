@@ -3038,6 +3038,7 @@ proc acceptAndConnectBlock*(
   ##
   ## `forceIbdConnect=true` selects `connectBlockIBD` regardless of cs.ibdMode
   ## (used by the --import paths which run their own IBD batching wrapper).
+  lockChainScope(cs)  # cs_main: check-then-connect is one critical section
   let prevHash = blk.header.prevBlock
 
   # Gate 6: after AbortNode nothing advances the chain, from any entry point

@@ -1190,7 +1190,13 @@ proc processStream(rest: RestServer,
           if meth == "GET" and path.len > 0:
             {.gcsafe.}:
               try:
-                resp = rest.handleRestRequest(path)
+                # Chain lock for the whole (synchronous) handler: REST reads
+                # blocks, coins and the mempool shared with the main thread.
+                if rest.chainState != nil:
+                  withChainLock(rest.chainState):
+                    resp = rest.handleRestRequest(path)
+                else:
+                  resp = rest.handleRestRequest(path)
               except CatchableError as e:
                 resp = restError(Http500, "Internal error: " & e.msg)
             let httpResponse = formatHttpResponse(resp)
@@ -1229,7 +1235,11 @@ proc processStream(rest: RestServer,
             {.gcsafe.}:
               try:
                 if postPath == "/payjoin" or postPath == "/rest/payjoin":
-                  resp = rest.handleRestPayJoin(postQuery, contentType, body)
+                  if rest.chainState != nil:
+                    withChainLock(rest.chainState):
+                      resp = rest.handleRestPayJoin(postQuery, contentType, body)
+                  else:
+                    resp = rest.handleRestPayJoin(postQuery, contentType, body)
                 else:
                   resp = restError(Http404,
                     "POST " & postPath & " not found")

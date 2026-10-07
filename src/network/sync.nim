@@ -3228,6 +3228,7 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
   ## Exported so the IBD block-acceptance path (incl. the contextual
   ## difficulty check) can be exercised directly by the test suite —
   ## see tests/test_w164_apply_block_diffbits.nim.
+  lockChainScopeOpt(sm.chainState)  # cs_main: storage/chain_lock.nim
   sm.lastApplyError = ""
   # Gate 6: after AbortNode no block is validated or connected. The refusal
   # carries the fatal-error token, which no classifier treats as a verdict
@@ -3527,6 +3528,8 @@ proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [
     return 0
   while result < MaxStoredConnectPerCall and
         sm.chainTipHeight < sm.headerTipHeight:
+    # Between blocks: let a waiting RPC/REST thread in (no-op inside a scope).
+    discard sm.chainState.yieldChainToWaiters()
     let nextHeight = sm.chainTipHeight + 1
     let hashOpt = sm.headerChain.getHashByHeight(nextHeight)
     if hashOpt.isNone:
@@ -3553,6 +3556,7 @@ proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [
 proc drainBlockBuffer(sm: SyncManager) =
   ## Process buffered out-of-order blocks sequentially starting from chainTip+1
   while true:
+    discard sm.chainState.yieldChainToWaiters()  # between blocks
     let nextHeight = sm.chainTipHeight + 1
     if nextHeight notin sm.receivedBlocks:
       break
@@ -3591,6 +3595,7 @@ proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
   ##   * validate-for-storage (full CheckBlock + ContextualCheckBlock, scripts
   ##     deferred), bip22-mapped on failure, and
   ##   * the per-promoted-block script-verify hook handleReorg fires.
+  lockChainScopeOpt(sm.chainState)  # cs_main: storage/chain_lock.nim
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
 
@@ -3736,6 +3741,7 @@ proc tryFillMissingBody(sm: SyncManager, blk: Block): bool =
   ## fetches could never heal the 1,470 live holes. Does not reconnect
   ## UTXO. Witness commitment is checked when present so a stripped
   ## body cannot replace a segwit block.
+  lockChainScopeOpt(sm.chainState)  # cs_main: storage/chain_lock.nim
   if sm == nil or sm.chainState == nil:
     return false
   try:
@@ -3789,6 +3795,7 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   ## framework is invoked so noBan/manual guards are respected.
   ## Reference: bitcoin-core/src/net_processing.cpp MaybePunishNodeForBlock +
   ## the ProcessMessage("block") Misbehaving("mutated block") path.
+  lockChainScopeOpt(sm.chainState)  # cs_main: storage/chain_lock.nim
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
 
@@ -4420,6 +4427,7 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
     sm.chainState.startIBD()
 
   while dl.nextProcessHeight in dl.receivedBlocks:
+    discard sm.chainState.yieldChainToWaiters()  # between blocks
     let blk = dl.receivedBlocks[dl.nextProcessHeight]
     let height = dl.nextProcessHeight
 

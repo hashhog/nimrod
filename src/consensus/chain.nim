@@ -442,6 +442,7 @@ proc invalidateBlock*(
   ## - Block not found
   ## - Undo data missing for active chain blocks
 
+  lockChainScope(cs)  # cs_main: storage/chain_lock.nim
   # Look up the block index
   let idxOpt = cs.db.getBlockIndex(blockHash)
   if idxOpt.isNone:
@@ -503,6 +504,7 @@ proc reconsiderBlock*(
   ## Use activateBestChain or similar after reconsiderBlock to potentially
   ## switch to the reconsidered chain if it has more work.
 
+  lockChainScope(cs)  # cs_main: storage/chain_lock.nim
   # Look up the block index
   let idxOpt = cs.db.getBlockIndex(blockHash)
   if idxOpt.isNone:
@@ -528,6 +530,7 @@ proc preciousBlock*(
   ## This is used when a node operator wants to manually prefer one chain
   ## over another without invalidating the competing chain.
 
+  lockChainScope(cs)  # cs_main: storage/chain_lock.nim
   # Look up the block index
   let idxOpt = cs.db.getBlockIndex(blockHash)
   if idxOpt.isNone:

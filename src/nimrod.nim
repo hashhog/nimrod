@@ -20,6 +20,7 @@ import ./crypto/[secp256k1, hashing]
 import ./perf/verify_pool
 import ./util/ops
 import ./util/tip_notifier
+import ./util/chain_lock_home
 import ./util/fatal
 
 const NimrodVersion* = "0.1.0"
@@ -1916,6 +1917,13 @@ proc setupSignalHandlers*() =
     if globalNodeState != nil:
       globalNodeState.running = false
 
+      # cs_main for the rest of shutdown. A signal can land on any thread; on
+      # the main thread this is a recursive acquire of its own base hold, on a
+      # foreign thread it waits for the main thread's next hand-over. Never
+      # released: quit() follows.
+      if globalNodeState.chainState != nil:
+        globalNodeState.chainState.chainLock.acquireChain()
+
       # If in IBD mode, flush the write batch before closing (WAL is disabled
       # during IBD so unflushed blocks are not durable until stopIBD is called)
       if not fatalShutdown and globalNodeState.chainState != nil and
@@ -2524,6 +2532,10 @@ proc startNode*(config: NimrodConfig) {.async.} =
   # 2. Open database and chainstate
   info "opening database", path = networkDir / "chainstate"
   state.chainState = newChainState(networkDir / "chainstate", params)
+  # cs_main: from here on the main thread holds the chain lock and hands it to
+  # the RPC/REST/rescan/audit threads at callback boundaries
+  # (util/chain_lock_home.nim; the hand-over task keeps the handle alive).
+  discard installChainLockHome(state.chainState)
 
   # scripts-on evidence banner (--noassumevalid / --assumevalid=0).
   # Read off the EFFECTIVE params now owned by the ChainState the connect path

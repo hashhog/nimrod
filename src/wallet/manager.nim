@@ -568,20 +568,32 @@ proc reconcileWalletToTip*(wm: WalletManager, lw: LoadedWallet): int32 =
   if wm.chainState == nil or lw == nil or lw.wallet == nil:
     return 0
   var w = lw.wallet
-  let tip = wm.chainState.bestHeight
+  var tip: int32
+  withChainLock(wm.chainState):
+    tip = wm.chainState.bestHeight
   # lastSyncedHeight defaults to -1 (fresh / corrupt-recovered wallet) so the
   # first scanned height is 0 (genesis), a full rebuild.
   var h = w.lastSyncedHeight + 1
   if h < 0: h = 0
   var scanned: int32 = 0
   while h <= tip:
-    let blkOpt = wm.chainState.db.getBlockByHeight(h)
-    if blkOpt.isSome:
-      try:
-        w.scanBlockForWallet(blkOpt.get(), h)
-        inc scanned
-      except CatchableError:
-        discard  # never let one bad block abort the reconcile
+    # Called from the RPC thread (loadwallet) the dispatcher already holds the
+    # lock: hand it back to block connection between blocks. A no-op on the
+    # reconcile thread, which holds nothing here.
+    discard wm.chainState.chainLock.yieldHeld()
+    # One chain-lock hold per block (this runs on its own thread): the
+    # height->hash read consults the main thread's unflushed-IBD shadow
+    # tables, and the scan mutates the same wallet the main thread's
+    # block-connect hook and the RPC wallet calls mutate under the lock.
+    # Lock order: ChainLock before walletsLock (storage/chain_lock.nim).
+    withChainLock(wm.chainState):
+      let blkOpt = wm.chainState.db.getBlockByHeight(h)
+      if blkOpt.isSome:
+        try:
+          w.scanBlockForWallet(blkOpt.get(), h)
+          inc scanned
+        except CatchableError:
+          discard  # never let one bad block abort the reconcile
     inc h
   if scanned > 0:
     discard wm.persistWallet(lw.name)

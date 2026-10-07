@@ -8854,16 +8854,26 @@ proc handleScanTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let isMainnet = rpc.params.network == Mainnet
 
-  # Snapshot tip BEFORE the walk; iterateUtxos flushes state to disk so the
-  # cursor sees the authoritative set (mirrors Core's ForceFlushStateToDisk).
-  let tipHeight = rpc.chainState.bestHeight
-  let tipHash = rpc.chainState.bestBlockHash
+  # Chain lock only for the flush + snapshot (Core scantxoutset: LOCK(cs_main)
+  # around ForceFlushStateToDisk and the cursor). The walk below reads ONLY the
+  # snapshot, with the lock released, so a mainnet-size scan does not stall
+  # block connection, and the label, the coins and each coin's block hash all
+  # come from the same snapshot. (This method is in ChainLockFreeMethods.)
+  var view: DbSnapshotView
+  var fbHeight: int32
+  var fbHash: BlockHash
+  withChainLock(rpc.chainState):
+    fbHeight = rpc.chainState.bestHeight
+    fbHash = rpc.chainState.bestBlockHash
+    view = rpc.chainState.openFlushedSnapshot()
+  defer: closeSnapshotView(view)
+  let (tipHeight, tipHash) = snapshotTip(view, fbHeight, fbHash)
 
   var count: int64 = 0
   var totalIn: int64 = 0
   let unspents = newJArray()
 
-  for (outpoint, entry) in rpc.chainState.iterateUtxos():
+  for (outpoint, entry) in iterateUtxosAt(view):
     inc count  # total UTXOs scanned, matched or not
 
     if entry.output.scriptPubKey notin needles:
@@ -8874,7 +8884,7 @@ proc handleScanTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
 
     # Canonical hash of the active-chain block at the coin's height
     # (Core: tip->GetAncestor(coin.nHeight)->GetBlockHash().GetHex()).
-    let blockHashOpt = rpc.chainState.getBlockHashByHeight(entry.height)
+    let blockHashOpt = snapshotHashAtHeight(view, entry.height)
     let blockHashHex =
       if blockHashOpt.isSome:
         reverseHex(toHex(array[32, byte](blockHashOpt.get())))
@@ -9036,6 +9046,11 @@ proc handleScanBlocks*(rpc: RpcServer, params: JsonNode): JsonNode =
   let relevant = newJArray()
   if needles.len > 0:
     for h in startHeight .. stopHeight:
+      # Let block connection run between blocks (Core's scanblocks does not
+      # hold cs_main across the scan); every read below is re-taken under
+      # the lock this RPC holds.
+      if (h - startHeight) mod 64 == 63:
+        discard rpc.chainState.chainLock.yieldHeld()
       let blockHashOpt = rpc.chainState.getBlockHashByHeight(int32(h))
       if blockHashOpt.isNone:
         raise newRpcError(RpcMiscError,
@@ -9575,6 +9590,12 @@ proc rescanWalletRange(rpc: RpcServer, w: Wallet,
   var wv = w
   var h = startHeight
   while h <= stopHeight:
+    # Between blocks, hand the chain lock back to block connection (Core's
+    # ScanForWalletTransactions does not hold cs_main across the scan). The
+    # read + scan of each block still run under the lock, so a block connect's
+    # wallet hook never interleaves with this scan.
+    if h > startHeight:
+      discard rpc.chainState.chainLock.yieldHeld()
     let hashOpt = rpc.chainState.db.getBlockHashByHeight(h)
     if hashOpt.isSome:
       let blkOpt = rpc.chainState.db.getBlock(hashOpt.get())
@@ -13427,6 +13448,16 @@ proc handleSendPayJoinRequest*(rpc: RpcServer, params: JsonNode): JsonNode =
   ##     "psbt": "...", "error_kind": "...", "error_msg": "..." }
   ##
   ## Reference: BIP-78 §"Sender".
+  # Chain lock for the wallet / fee-estimator / mempool work (shared with the
+  # main thread's block-connect hooks), released around step 5 only: the
+  # HTTP round trip to the payjoin receiver must never run under it.
+  # (This method is in ChainLockFreeMethods so the dispatcher does not hold it.)
+  var chainHeld = false
+  if rpc.chainState != nil:
+    rpc.chainState.chainLock.acquireChain()
+    chainHeld = true
+  defer:
+    if chainHeld: rpc.chainState.chainLock.releaseChain()
   var w = rpc.getTargetWallet()
   if w.isEncrypted and w.isLocked:
     raise newRpcError(RpcMiscError,
@@ -13557,7 +13588,10 @@ proc handleSendPayJoinRequest*(rpc: RpcServer, params: JsonNode): JsonNode =
   if allowNoTls:
     tlsCfg.policy = ptsNoVerify
 
-  # 5. Drive the sender pipeline.
+  # 5. Drive the sender pipeline (network I/O: chain lock released).
+  if chainHeld:
+    rpc.chainState.chainLock.releaseChain()
+    chainHeld = false
   let senderResult =
     try:
       payjoinSenderRun(w, originalPsbt, endpoint, opts,
@@ -13566,6 +13600,9 @@ proc handleSendPayJoinRequest*(rpc: RpcServer, params: JsonNode): JsonNode =
     except PayJoinSendError as e:
       raise newRpcError(RpcMiscError,
         "PayJoin sender pipeline failure: " & e.msg)
+  if rpc.chainState != nil:
+    rpc.chainState.chainLock.acquireChain()
+    chainHeld = true
 
   # 6. Broadcast (either the proposal or the Original fallback).
   let finalTx = senderResult.signedTx
@@ -14718,8 +14755,15 @@ proc currentTipDisplay(rpc: RpcServer): tuple[hash: string, height: int32] =
   ## Authoritative active-chain tip, display (big-endian hex) form. Re-read on
   ## every wait wake so a coalesced / missed notify can never yield a wrong
   ## answer (Core reads ActiveChain().Tip() each loop iteration).
-  let h = reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash)))
-  (h, rpc.chainState.bestHeight)
+  ## Hash and height are read under ONE chain-lock hold so they describe the
+  ## same tip (a sync connect between the two reads used to pair the old hash
+  ## with the new height).
+  var tipHash: BlockHash
+  var tipHeight: int32
+  withChainLock(rpc.chainState):
+    tipHash = rpc.chainState.bestBlockHash
+    tipHeight = rpc.chainState.bestHeight
+  (reverseHex(toHex(array[32, byte](tipHash))), tipHeight)
 
 proc parseWaitTimeoutMs(params: JsonNode, idx: int): int =
   ## Read the `timeout` arg (Core getInt<int>(): non-integral -> RPC_TYPE_ERROR
@@ -15158,7 +15202,7 @@ proc checkCoreArity*(methodName: string, params: JsonNode) =
        else: $a.required & " to " & $a.declared) &
       " argument(s), got " & $n)
 
-proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
+proc handleMethodUnlocked(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
   checkCoreArity(methodName, params)
   case methodName
   # Blockchain
@@ -15536,6 +15580,27 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   else:
     raise newRpcError(RpcMethodNotFound, "method not found: " & methodName)
 
+
+const ChainLockFreeMethods* = [
+  # Touch no chain, coin, mempool or peer state.
+  "uptime", "logging", "getrpcinfo", "stop",
+  # Take the chain lock themselves, only around the parts that need it:
+  "scantxoutset",        # lock: flush + snapshot; walk the snapshot unlocked
+  "sendpayjoinrequest",  # network I/O to the receiver must not run under it
+]
+
+proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNode =
+  ## Every JSON-RPC method runs under the chain lock (Core: the RPC handlers
+  ## take LOCK(cs_main) for their chain/coin/mempool reads and writes), except
+  ## the few listed in ChainLockFreeMethods. On the RPC thread this blocks
+  ## until the main thread reaches a callback boundary and hands the lock
+  ## over (storage/chain_lock.nim), so a handler never observes a
+  ## half-applied block and never connects one concurrently with sync.
+  if rpc.chainState == nil or methodName in ChainLockFreeMethods:
+    return rpc.handleMethodUnlocked(methodName, params)
+  withChainLock(rpc.chainState):
+    result = rpc.handleMethodUnlocked(methodName, params)
+
 proc namedArgPositions(methodName: string): seq[string] =
   ## Positional argument-name tables for object-form ("named") params.
   ## Bitcoin Core accepts named params for EVERY RPC via a table-driven
@@ -15892,9 +15957,17 @@ proc asyncGetTxOutSetInfo(rpc: RpcServer, params: JsonNode): Future[JsonNode] {.
     rpc.prepTxOutSetInfo(params, done, coinHashType)
   if done != nil:
     return done
-  let view = openSnapshotView(rpc.chainState.db.db)
-  let info = await runTxoWalk(view, coinHashType, rpc.chainState.bestHeight,
-                              rpc.chainState.bestBlockHash)
+  # Open the snapshot and read the fallback label under one chain-lock hold
+  # (Core gettxoutsetinfo: LOCK(cs_main) around the cursor + best block), then
+  # walk the snapshot with the lock released.
+  var view: DbSnapshotView
+  var fbHeight: int32
+  var fbHash: BlockHash
+  withChainLock(rpc.chainState):
+    view = openSnapshotView(rpc.chainState.db.db)
+    fbHeight = rpc.chainState.bestHeight
+    fbHash = rpc.chainState.bestBlockHash
+  let info = await runTxoWalk(view, coinHashType, fbHeight, fbHash)
   try:
     {.gcsafe.}:
       return txOutSetInfoJson(info, coinHashType)

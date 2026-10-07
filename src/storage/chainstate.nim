@@ -12,7 +12,10 @@ import ../crypto/muhash
 import ../consensus/params
 import ../consensus/assumevalid
 import ../util/fatal
+import ./chain_lock
 import chronicles
+
+export chain_lock
 
 export db.ColumnFamily
 export undo.BlockUndo, undo.TxUndo, undo.SpentOutput, undo.FlatFilePos
@@ -151,6 +154,12 @@ type
   ## ChainState wraps ChainDb with cache management and consensus params
   ChainState* = ref object
     db*: ChainDb
+    # cs_main analogue. Held across every connect / disconnect / reorg /
+    # flush below, and by every non-main thread for any read of chain, coin
+    # or mempool state. The running node's main thread holds it by default
+    # and hands it over at callback boundaries. See storage/chain_lock.nim
+    # for the design and the lock order.
+    chainLock*: ChainLock
     bestBlockHash*: BlockHash
     bestHeight*: int32
     totalWork*: array[32, byte]
@@ -385,6 +394,31 @@ proc err*(msg: string): ChainStateResult[void] =
 
 # Key helpers
 
+template lockChainScope*(cs: ChainState) =
+  ## Hold the chain lock (recursively) until the end of the enclosing scope.
+  ## The enclosing scope must be synchronous (no `await`).
+  acquireChain(cs.chainLock)
+  defer: releaseChain(cs.chainLock)
+
+template lockChainScopeOpt*(csOrNil: ChainState) =
+  ## lockChainScope for a ChainState that may be nil (offline replay paths).
+  let lockedCsOpt = csOrNil
+  if lockedCsOpt != nil: acquireChain(lockedCsOpt.chainLock)
+  defer:
+    if lockedCsOpt != nil: releaseChain(lockedCsOpt.chainLock)
+
+proc yieldChainToWaiters*(cs: ChainState): bool {.inline, gcsafe, raises: [].} =
+  ## Main-thread hand-over point between units of work in a long synchronous
+  ## loop (between blocks). A no-op unless a foreign thread is waiting AND
+  ## the caller is at its base hold (inside no lockChainScope).
+  if cs == nil: return false
+  cs.chainLock.yieldToWaiters()
+
+template withChainLock*(cs: ChainState, body: untyped) =
+  ## Hold the chain lock (recursively) for `body`. Synchronous bodies only.
+  withChainLock(cs.chainLock):
+    body
+
 proc outpointKey(txid: TxId, vout: uint32): string =
   ## Cache key for outpoints
   result = newString(36)
@@ -559,6 +593,23 @@ proc close*(cdb: var ChainDb) =
   cdb.db.close()
 
 # Block storage (ChainDb)
+
+var shadowReadLock {.threadvar.}: ptr ChainLock
+  ## Set ONLY on a background thread that reads the ChainDb height/hash index
+  ## without otherwise holding the chain lock (the retained-body audit). The
+  ## unflushed-IBD shadow tables below are mutated by the main thread; with
+  ## this set, each read of them takes the chain lock. Nil on every other
+  ## thread: the main thread is the writer, and RPC/REST/rescan readers
+  ## already hold the lock for their whole operation. Not used by the
+  ## script-verify workers (they never touch ChainDb and run while the main
+  ## thread holds the lock and waits on them — acquiring it there would
+  ## deadlock).
+
+template shadowReadScope() =
+  let srl = shadowReadLock
+  if srl != nil: acquireChain(srl[])
+  defer:
+    if srl != nil: releaseChain(srl[])
 
 proc storeBlock*(cdb: ChainDb, blk: Block) =
   ## Store full block data
@@ -816,6 +867,7 @@ proc enqueueBodyRepair*(cs: ChainState, hash: BlockHash): bool {.raises: [].} =
   ## Queue `hash` for peer getdata iff it is a retained-range hole.
   ## Returns false for unknown headers, already-have, side-branch, not-
   ## yet-connected, or the unretained prefix.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   if cs == nil or cs.db == nil:
     return false
   try:
@@ -908,6 +960,9 @@ proc stopStartupBodyAudit*(cs: ChainState, timeoutMs: int = 5000): bool {.gcsafe
   while cs.bodyAuditRunning.load(moAcquire) != 0:
     if waited >= timeoutMs:
       return false
+    # The audit thread may be blocked on the chain lock this (shutdown)
+    # thread holds; let it through so it can see the cancel flag and exit.
+    discard cs.chainLock.yieldForShutdown()
     sleep(10)
     waited += 10
   true
@@ -926,6 +981,7 @@ proc drainStagedBodyRepairs*(cs: ChainState): int {.gcsafe, raises: [].} =
   ## Main thread (sync loop). Move a staged repair list onto
   ## pendingBodyRepairs. Returns 0 when nothing is staged, including
   ## a second call after a successful drain.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   if cs == nil:
     return 0
   var staged: seq[BlockHash]
@@ -955,27 +1011,35 @@ proc startupRetainedBodyAudit*(cs: ChainState) {.gcsafe, raises: [].} =
     return
   let cancel = addr cs.bodyAuditCancel
   template cancelled(): bool = cancel[].load(moAcquire)
+  # This thread reads the height index the main thread's IBD batch shadows:
+  # take the chain lock for each such read (see shadowReadLock), and read the
+  # tip once, under the lock, instead of racing the main thread for it.
+  shadowReadLock = addr cs.chainLock
+  defer: shadowReadLock = nil
+  var auditTip: int32
+  withChainLock(cs.chainLock):
+    auditTip = cs.bestHeight
   var suffix = 0'i32
   var haveSuffix = false
   try:
-    suffix = discoverBodyFloor(cs.db, cs.bestHeight, cancel)
+    suffix = discoverBodyFloor(cs.db, auditTip, cancel)
     if cancelled():
       return
     haveSuffix = true
-    let firstBody = discoverFirstBody(cs.db, cs.bestHeight)
+    let firstBody = discoverFirstBody(cs.db, auditTip)
     var pruneH = firstBody
     if cs.startupAuditPrunerHeight > pruneH:
       pruneH = cs.startupAuditPrunerHeight
-    let audit = auditRetainedBodies(cs.db, cs.bestHeight, pruneH, cancel = cancel)
+    let audit = auditRetainedBodies(cs.db, auditTip, pruneH, cancel = cancel)
     if cancelled():
       return
     if suffix != audit.floor:
       warn "pruneheight is the contiguous suffix; first body is lower",
            pruneheight = suffix, firstBody = audit.floor,
            tip = audit.tip
-    if not hasRetainedBodyWindow(cs.db, cs.bestHeight):
+    if not hasRetainedBodyWindow(cs.db, auditTip):
       info "no retained-range body window to repair",
-           tip = cs.bestHeight, firstBody = firstBody, pruneheight = suffix
+           tip = auditTip, firstBody = firstBody, pruneheight = suffix
     elif audit.holeCount > 0:
       let firstHole = if audit.holes.len > 0: audit.holes[0] else: -1'i32
       warn "retained-range body hole",
@@ -984,7 +1048,7 @@ proc startupRetainedBodyAudit*(cs: ChainState) {.gcsafe, raises: [].} =
            firstHole = firstHole, sample = audit.holes.len,
            truncated = audit.truncated,
            pruneheight = suffix
-      let hashes = planBodyRepairs(cs.db, cs.bestHeight, maxHoles = 0,
+      let hashes = planBodyRepairs(cs.db, auditTip, maxHoles = 0,
                                    cancel = cancel)
       if cancelled():
         return
@@ -1006,8 +1070,9 @@ proc startupRetainedBodyAudit*(cs: ChainState) {.gcsafe, raises: [].} =
   # for it, and clearing the flag without a floor sends the next
   # getblockchaininfo down the same linear path.
   if haveSuffix:
-    cs.historyFloor = suffix
-    cs.historyFloorProbed = true
+    withChainLock(cs.chainLock):
+      cs.historyFloor = suffix
+      cs.historyFloorProbed = true
   cs.bodyAuditDeferred.store(0, moRelease)
 
 proc fillMissingBody*(cs: ChainState, blk: Block): ChainStateResult[void] =
@@ -1018,6 +1083,7 @@ proc fillMissingBody*(cs: ChainState, blk: Block): ChainStateResult[void] =
   ## at or above discoverFirstBody, and the txid merkle root must match.
   ## Already-have is ok (idempotent). Clears the pruneheight cache so a
   ## filled hole can lower the contiguous suffix.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   if cs == nil or cs.db == nil:
     return err("no chainstate")
   try:
@@ -1108,6 +1174,7 @@ proc getBlockIndex*(cdb: ChainDb, hash: BlockHash): Option[BlockIndex] =
   ## consensus check that walks recent blocks (getMtpForHeight finality
   ## cutoff, the diffbits getAncestor retarget walk) would read stale data
   ## for the whole unflushed window. See the `ibdIndexByHash` field comment.
+  shadowReadScope()
   if cdb.ibdIndexByHash.len > 0:
     let shadow = cdb.ibdIndexByHash.getOrDefault(hash, BlockIndex(height: -1))
     if shadow.height >= 0:
@@ -1133,6 +1200,7 @@ proc getBlockHashByHeight*(cdb: ChainDb, height: int32): Option[BlockHash] {.gcs
   ## RocksDB. getMtpForHeight walks this proc for the previous 11 blocks; a
   ## stale miss there silently truncated the MTP window and rejected valid
   ## blocks with "bad-txns-nonfinal".
+  shadowReadScope()
   if cdb.ibdIndexByHeight.len > 0 and height in cdb.ibdIndexByHeight:
     return some(cdb.ibdIndexByHeight[height])
   # A nil db handle means no persisted index exists (harness/offline contexts;
@@ -1520,6 +1588,7 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     bestHeaderBits: 0'u32,
     bestHeaderHeight: cdb.bestHeight    # fallback: chain-tip height
   )
+  initChainLock(result.chainLock)
   initLock(result.bodyRepairStageLock)
   result.bodyAuditDeferred.store(0, moRelaxed)
   result.bodyAuditRunning.store(0, moRelaxed)
@@ -1594,6 +1663,7 @@ proc flushCache*(cs: var ChainState) =
   ## could not be committed; writing them one by one here would persist a
   ## UTXO set that no tip pointer describes. The cache is cleared only after
   ## every put has returned (a raise leaves it intact).
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   if isFatal():
     warn "fatal error latched: NOT flushing the UTXO cache", entries = cs.cacheSize
     return
@@ -1911,6 +1981,7 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   ## Returns error if any input is missing or immature coinbase
   ## Undo data is written to flat files (rev*.dat) for efficient reorg handling
 
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
@@ -2135,6 +2206,7 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
 
 proc startIBD*(cs: var ChainState) =
   ## Enter IBD mode: enable write batching for performance
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   cs.ibdMode = true
   cs.ibdStoreBodies = false
   cs.ibdBatch = cs.db.db.newWriteBatch()
@@ -2154,6 +2226,7 @@ proc evictCleanEntries*(cs: var ChainState) =
   ## exceeds MaxCacheBytes. Evicts down to EvictTargetBytes.
   ## During IBD the cache grows unbounded because flushIBDBatch writes entries
   ## to RocksDB but never removes them from memory. This bounds RSS.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   let cacheBytes = cs.cacheSize * EstimatedEntryBytes
   # Per-instance ceiling (default MaxCacheBytes = 2 GiB; raised by --dbcache
   # via setDbCache). Evict target is half the ceiling, matching the original
@@ -2197,6 +2270,7 @@ proc flushIBDBatch*(cs: var ChainState) =
   ## whole multi-CF batch as a unit, so a crash either loses the entire
   ## checkpoint (chainstate stays consistent at the previous flush; IBD just
   ## redownloads) or keeps all of it. There is no partial-checkpoint window.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   if cs.ibdBatch != nil and cs.ibdBatchBlocks > 0:
     # Write best block pointer into the batch so it's atomic
     cs.ibdBatch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](cs.bestBlockHash)))
@@ -2272,6 +2346,7 @@ proc flushToDiskIfNeeded*(cs: var ChainState, force: bool = false) =
   ## since the last disk flush, or unconditionally if force=true.
   ## WAL is disabled during IBD, so memtable data is volatile. This call
   ## is the ONLY mechanism that makes chainstate durable during IBD.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   if force or cs.ibdBlocksSinceLastDiskFlush >= cs.ibdDiskFlushInterval:
     cs.db.db.flushAllColumnFamilies()
     info "flushed memtables to SST", height = cs.bestHeight,
@@ -2286,6 +2361,7 @@ proc guardedIbdFlush*(cs: var ChainState, flushBatch: bool, forceDisk: bool = fa
   ## so the node must stop here and must not flush it at shutdown — the
   ## restart replays from the last checkpoint that committed. Returns false
   ## once the node is latched.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   let csRef = cs
   if flushBatch:
     if not retryOnceOrAbort("IBD checkpoint batch write",
@@ -2307,6 +2383,7 @@ proc stopIBD*(cs: var ChainState) =
   ## could not be made durable — it is NOT written (Core skips the shutdown
   ## flush after a fatal error). A flush that fails here latches the node
   ## (retry once inside guardedIbdFlush) and leaves the batch in place.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   if cs.ibdBatch != nil:
     if isFatal():
       warn "fatal error latched: NOT flushing the IBD batch", height = cs.bestHeight
@@ -2338,6 +2415,7 @@ proc setDbCache*(cs: var ChainState, dbcacheMiB: int) =
   ##     than staying pinned at 200_000.
   ## Both are floored at their defaults so --dbcache can only ever raise the
   ## cache, never shrink it below the proven-good baseline.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   if dbcacheMiB <= 0:
     return
   let budgetBytes = dbcacheMiB * 1024 * 1024
@@ -2368,6 +2446,7 @@ proc scrubUnspendable*(cs: var ChainState):
   ## Returns (removed_count, bytes_freed) where bytes_freed sums
   ## (key_len + value_len) for every deleted entry (an estimate of LSM
   ## payload reclaimed once compaction sweeps the tombstones).
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   result.removed = 0
   result.bytesFreed = 0
 
@@ -2499,6 +2578,67 @@ iterator iterateUtxos*(cs: var ChainState): tuple[outpoint: OutPoint,
     if isUnspendable(entry.output.scriptPubKey):
       continue
 
+    var txidBytes: array[32, byte]
+    copyMem(addr txidBytes[0], unsafeAddr key[0], 32)
+    let vout = (uint32(key[32]) shl 24) or
+               (uint32(key[33]) shl 16) or
+               (uint32(key[34]) shl 8)  or
+                uint32(key[35])
+    yield (OutPoint(txid: TxId(txidBytes), vout: vout), entry)
+
+proc openFlushedSnapshot*(cs: var ChainState): DbSnapshotView =
+  ## Under the chain lock: make the database authoritative (the same pre-walk
+  ## flush `iterateUtxos` does — Core ForceFlushStateToDisk) and open ONE
+  ## RocksDB snapshot of it. The caller walks the snapshot with the lock
+  ## released (Core scantxoutset / gettxoutsetinfo hold cs_main only for the
+  ## flush + cursor) and closes it with `closeSnapshotView`.
+  lockChainScope(cs)
+  if cs.ibdMode:
+    cs.flushIBDBatch()
+  else:
+    cs.flushCache()
+  openSnapshotView(cs.db.db)
+
+proc snapshotTip*(v: DbSnapshotView, fallbackHeight: int32,
+                  fallbackHash: BlockHash): tuple[height: int32, hash: BlockHash] =
+  ## The best-block pointer stored IN the snapshot (committed in the same
+  ## WriteBatch as the coins it describes), else the fallback.
+  result = (fallbackHeight, fallbackHash)
+  let hb = v.get(cfMeta, metaKey("bestblock"))
+  let hh = v.get(cfMeta, metaKey("height"))
+  if hb.isSome and hb.get().len == 32 and hh.isSome and hh.get().len == 4:
+    var h: array[32, byte]
+    let hbv = hb.get()
+    copyMem(addr h[0], unsafeAddr hbv[0], 32)
+    let d = hh.get()
+    result.hash = BlockHash(h)
+    result.height = cast[int32](uint32(d[0]) or (uint32(d[1]) shl 8) or
+                                (uint32(d[2]) shl 16) or (uint32(d[3]) shl 24))
+
+proc snapshotHashAtHeight*(v: DbSnapshotView, height: int32): Option[BlockHash] =
+  ## Active-chain hash at `height` as of the snapshot (height-index row).
+  let data = v.get(cfBlockIndex, blockIndexKey(height))
+  if data.isSome and data.get().len >= 32:
+    var hash: array[32, byte]
+    let d = data.get()
+    copyMem(addr hash[0], unsafeAddr d[0], 32)
+    return some(BlockHash(hash))
+  none(BlockHash)
+
+iterator iterateUtxosAt*(v: DbSnapshotView): tuple[outpoint: OutPoint,
+                                                   entry: UtxoEntry] =
+  ## `iterateUtxos` over a snapshot: same unspendable filter and key decode,
+  ## no flush, no ChainState access — safe without the chain lock.
+  for (key, value) in v.iterCf(cfUtxo):
+    if key.len != 36:
+      continue
+    var entry: UtxoEntry
+    try:
+      entry = deserializeUtxoEntry(value)
+    except CatchableError:
+      continue
+    if isUnspendable(entry.output.scriptPubKey):
+      continue
     var txidBytes: array[32, byte]
     copyMem(addr txidBytes[0], unsafeAddr key[0], 32)
     let vout = (uint32(key[32]) shl 24) or
@@ -2693,6 +2833,7 @@ proc connectBlockIBD*(cs: var ChainState, blk: Block, height: int32): ChainState
   ## serves. Accumulates UTXO changes in memory + write batch, flushes
   ## every IbdBatchFlushInterval blocks.
 
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
@@ -2890,6 +3031,7 @@ proc adoptAppliedBlock*(cs: var ChainState, blk: Block, height: int32): ChainSta
   ## connectBlockIBD's bookkeeping tail with an IMMEDIATE atomic flush.
   ## IBD-mode only: the disease arises on the WAL-less IBD path, and the
   ## mutations below stage into `ibdBatch`.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
@@ -3254,6 +3396,7 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
   ## ok/unclean distinction Core's caller (DisconnectTip) observes, without
   ## altering the default (nil) call path used everywhere in production.
 
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
@@ -3489,6 +3632,7 @@ proc disconnectBlock*(cs: var ChainState, blk: Block): ChainStateResult[void] =
   ## Disconnect a block by reading undo data from flat files
   ## This is the preferred method for disconnection as it reads from rev*.dat
 
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   let headerBytes = serialize(blk.header)
   let blockHash = BlockHash(doubleSha256(headerBytes))
 
@@ -3572,6 +3716,7 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
   ## Pattern D closure: see
   ## CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md.
 
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   disconnectedTxs.setLen(0)
   cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
 
@@ -4065,6 +4210,7 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash,
   ## New code paths that need mempool refill on reorg should call the
   ## three-arg overload above and feed the result to
   ## `mempool.blockDisconnected`.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   var disconnectedTxs: seq[Transaction] = @[]
   cs.handleReorg(forkPoint, newChain, disconnectedTxs)
 
@@ -4147,6 +4293,7 @@ proc acceptSideBranchBlock*(
   ## (in connect order) and `disconnectedTxs` the non-coinbase txs from the
   ## disconnected old-chain blocks — both for the caller's post-reorg mempool /
   ## fee-estimator / wallet refresh.  Empty for every non-reorg outcome.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
   disconnectedTxs.setLen(0)
   connectedBlocks.setLen(0)
   cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
