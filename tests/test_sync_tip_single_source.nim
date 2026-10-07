@@ -307,3 +307,62 @@ suite "the tip moves only by connect / disconnect (item 2: sync.nim:4067)":
     check final == referenceStats(path & "_ref2", p, a)
     check cs.bestBlockHash == hashOf(a[5])
     check cs.bestHeight == 5
+
+suite "RPC tip moves that are not extensions":
+
+  test "invalidateblock(T) then reconsiderblock(T): sync neither re-fetches nor re-applies T, then follows the reconsider":
+    var f = buildFix("/tmp/nimrod_synctip_5")
+    defer:
+      f.cs.close()
+      removeDir(f.path)
+    let t3 = f.chain[3]
+    let t3h = hashOf(t3)
+    # A peer has announced block 4 (header only) so sync has work above T3.
+    let b4 = mineBlock(t3h, 4, t3.header.timestamp + 600, 0x04)
+    waitFor f.sm.handleHeaders(f.peer, @[b4.header])
+    check f.sm.headerChain.tipHeight == 4
+    var hexT3: array[32, byte]
+    for i in 0 ..< 32: hexT3[i] = array[32, byte](t3h)[31 - i]
+    let inv = f.rpc.handleMethod("invalidateblock", %*[hexOf(hexT3)])
+    checkpoint "invalidateblock -> " & $inv & " tip=" & $f.cs.bestHeight
+    check f.cs.bestHeight == 2
+    check f.sm.chainTipHeight == 2
+    f.sm.blockQueue.clear()
+    runSyncLoopBriefly(f.sm, 300)
+    var queued = initHashSet[BlockHash]()
+    for h in f.sm.blockQueue.items: queued.incl(h)
+    checkpoint "after syncLoop: tip=" & $f.cs.bestHeight & " queued T3=" & $(t3h in queued) &
+               " queued B4=" & $(hashOf(b4) in queued) & " headerTip=" & $f.sm.headerChain.tipHeight
+    check t3h notin queued
+    check hashOf(b4) notin queued
+    # A peer delivering T3 anyway must not reconnect it.
+    discard f.sm.processBlock(f.peer, t3)
+    check f.cs.bestHeight == 2
+    let rec = f.rpc.handleMethod("reconsiderblock", %*[hexOf(hexT3)])
+    checkpoint "reconsiderblock -> " & $rec & " tip=" & $f.cs.bestHeight
+    # nimrod's reconsiderblock clears the flags but does not itself reconnect
+    # (Core's runs ActivateBestChain) — an RPC gap noted separately. Sync must
+    # now accept T3 and B4 again: the header re-announce is not "bad-prevblk",
+    # and the bodies connect from the active tip.
+    waitFor f.sm.handleHeaders(f.peer, @[t3.header, b4.header])
+    check not f.peer.shouldDisconnect
+    check f.sm.headerChain.tipHeight == 4
+    discard f.sm.processBlock(f.peer, t3)
+    check f.sm.processBlock(f.peer, b4)
+    check f.cs.bestHeight == 4
+    check f.sm.chainTip == hashOf(b4)
+
+  test "generatetoaddress on the RPC side, then sync extends it":
+    var f = buildFix("/tmp/nimrod_synctip_6")
+    defer:
+      f.cs.close()
+      removeDir(f.path)
+    let g = f.rpc.handleMethod("generatetodescriptor", %*[2, "raw(51)"])
+    checkpoint "generatetodescriptor -> " & $g & " tip=" & $f.cs.bestHeight
+    check f.cs.bestHeight == 5
+    check f.sm.chainTipHeight == 5
+    let tip = f.cs.db.getBlock(f.cs.bestBlockHash).get()
+    let z = mineBlock(f.cs.bestBlockHash, 6, tip.header.timestamp + 600, 0x06)
+    waitFor f.sm.handleHeaders(f.peer, @[z.header])
+    check f.sm.processBlock(f.peer, z)
+    check f.cs.bestHeight == 6

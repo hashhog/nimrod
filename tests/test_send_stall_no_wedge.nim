@@ -190,7 +190,7 @@ suite "send stall: a non-reading peer is dropped, never waited on forever":
       state: ssDownloadingBlocks,
       headerChain: initHeaderChain(genesis.header, gh),
       params: params, headerTip: gh, headerTipHeight: 0,
-      chainTip: gh, chainTipHeight: 0,
+      chainTipNoState: gh, chainTipHeightNoState: 0,
       peerHeadersSync: initTable[int64, HeadersSyncState](),
       headersPresyncStats: initTable[int64, HeadersPresyncStats](),
       presyncBestPeer: -1, presyncBestWork: initUInt256(),

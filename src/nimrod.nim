@@ -2946,8 +2946,8 @@ proc startNode*(config: NimrodConfig) {.async.} =
                                      state.chainState, config.numVerifyWorkers,
                                      state.blockFilterIndex, state.coinStatsIndex,
                                      state.txoSpenderIndex)
-  state.syncManager.chainTip = state.chainState.bestBlockHash
-  state.syncManager.chainTipHeight = state.chainState.bestHeight
+  # No tip copy to seed: syncManager.chainTip / chainTipHeight read
+  # state.chainState's tip (sync.nim, "The active chain tip — ONE source").
 
   # IBD predicate for the self-address advertisement gate (Core MaybeSendAddr:
   # `!m_chainman.IsInitialBlockDownload()`).  Core's IsInitialBlockDownload is

@@ -106,8 +106,12 @@ type
     # Separate tracking for header tip vs chain tip (CRITICAL pitfall)
     headerTip*: BlockHash                                   ## Tip of validated headers
     headerTipHeight*: int32                                 ## Height of header tip
-    chainTip*: BlockHash                                    ## Tip of fully validated blocks
-    chainTipHeight*: int32                                  ## Height of chain tip
+    # The validated (active) chain tip is NOT stored here when a ChainState
+    # is attached: `chainTip` / `chainTipHeight` below read ChainState's tip
+    # (Core m_chain.Tip()). These two fields are the tip only for a
+    # SyncManager without a ChainState (offline replay, header-only tests).
+    chainTipNoState*: BlockHash   ## validated tip when chainState == nil
+    chainTipHeightNoState*: int32 ## its height when chainState == nil
     # Anti-DoS header sync state (per-peer PRESYNC/REDOWNLOAD)
     peerHeadersSync*: Table[int64, HeadersSyncState]        ## peerId -> sync state
     headersPresyncStats*: Table[int64, HeadersPresyncStats] ## Per-peer stats
@@ -251,6 +255,37 @@ type
     lastUtxoFlush*: int32                      ## Height of last UTXO flush
     blocksProcessed*: int                      ## Total blocks processed
     startTime*: SyncTime                       ## IBD start time for stats
+
+# =============================================================================
+# The active chain tip — ONE source of truth
+# =============================================================================
+#
+# Bitcoin Core keeps the active chain in exactly one place (`m_chain`), moves it
+# only by ConnectTip / DisconnectTip under cs_main, and net_processing reads it
+# from chainman on every message (`m_chainman.ActiveChain().Tip()`); nothing
+# caches it. nimrod's SyncManager used to keep its own copy, written only by
+# sync's own connects, so an RPC connect (submitblock / generate*) left it stale
+# (the next P2P block "did not connect"), and the syncLoop "tip mismatch" arm
+# wrote that stale view BACK into ChainState without disconnecting anything.
+# With a ChainState attached the tip is now read from it, under the chain lock
+# (the main thread holds it outside chronos hand-offs). The setters only apply
+# to a SyncManager without one; with one, the tip moves by connect/disconnect.
+
+proc chainTip*(sm: SyncManager): BlockHash {.inline.} =
+  if sm.chainState != nil: sm.chainState.bestBlockHash
+  else: sm.chainTipNoState
+
+proc chainTipHeight*(sm: SyncManager): int32 {.inline.} =
+  if sm.chainState != nil: sm.chainState.bestHeight
+  else: sm.chainTipHeightNoState
+
+proc `chainTip=`*(sm: SyncManager, h: BlockHash) {.inline.} =
+  if sm.chainState == nil: sm.chainTipNoState = h
+
+proc `chainTipHeight=`*(sm: SyncManager, h: int32) {.inline.} =
+  if sm.chainState == nil: sm.chainTipHeightNoState = h
+
+proc reconcileActiveChain*(sm: SyncManager): bool {.gcsafe, raises: [].}
 
 # =============================================================================
 # 256-bit arithmetic for proof of work calculations
@@ -1000,8 +1035,8 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     lastSyncTime: getTime(),
     headerTip: BlockHash(default(array[32, byte])),
     headerTipHeight: -1,
-    chainTip: BlockHash(default(array[32, byte])),
-    chainTipHeight: -1,
+    chainTipNoState: BlockHash(default(array[32, byte])),
+    chainTipHeightNoState: -1,
     # Anti-DoS header sync state
     peerHeadersSync: initTable[int64, HeadersSyncState](),
     headersPresyncStats: initTable[int64, HeadersPresyncStats](),
@@ -1835,6 +1870,7 @@ proc requestHeaders*(sm: SyncManager, peer: Peer,
   # passes through, so the invariant is enforced here rather than sprinkled
   # over the call sites (Core enforces it at the source instead, by keeping
   # m_best_header >= ActiveChain().Tip() — validation.cpp:6256-6264).
+  discard sm.reconcileActiveChain()
   discard sm.reconcileHeaderTip()
 
   let locator =
@@ -1977,6 +2013,150 @@ proc truncateActiveHeaders(sm: SyncManager, toHeight: int32) =
   sm.headerTip = hc.tip
   sm.headerTipHeight = toHeight
 
+const MaxActiveChainReconcileDepth = 4032
+  ## Longest active-chain suffix reconcileActiveChain grafts block by block
+  ## (two retarget periods; MAX_REORG_DEPTH is 288). A longer divergence falls
+  ## back to the full block-index re-seed reconcileHeaderTip / boot use.
+
+proc reconcileActiveChain*(sm: SyncManager): bool {.gcsafe, raises: [].} =
+  ## Make the active header chain contain the active (validated) chain.
+  ##
+  ## Core keeps one block index: the best-header chain and `m_chain` share
+  ## CBlockIndex objects, and FindNextBlocksToDownload works from
+  ## LastCommonAncestor(m_chain.Tip(), pindexBestKnownBlock). nimrod keeps a
+  ## separate in-memory header chain that only sync extends, so a connect
+  ## that sync did not make — submitblock / generate* on the RPC thread, or a
+  ## side-branch reorg onto a fork whose headers sit in sideHeaders — leaves
+  ## the header chain on a different branch from ChainState's tip.
+  ##
+  ## The pre-fix syncLoop "chain tip mismatch" arm resolved that by moving
+  ## ChainState's tip POINTER to an ancestor without disconnecting a block, so
+  ## the UTXO set and the tip diverged. Here the CHAINSTATE is authoritative
+  ## and only the header chain moves: the header-chain branch above the fork
+  ## point is demoted to sideHeaders (with its own cumulative work) and the
+  ## active blocks are grafted on. If the demoted branch has more work, the
+  ## fork-body walk fetches its bodies and acceptSideBranchBlock -> handleReorg
+  ## switches to it the Core way: disconnect to the fork point, then connect.
+  ##
+  ## Returns true if the header chain changed. Cheap when consistent (one
+  ## height lookup).
+  if sm.chainState == nil or sm.chainDb == nil:
+    return false
+  try:
+    {.gcsafe.}:
+      lockChainScope(sm.chainState)  # cs_main: storage/chain_lock.nim
+      let tipH = sm.chainTipHeight
+      let tip = sm.chainTip
+      if tipH < 0:
+        return false
+      let atTip = sm.headerChain.getHashByHeight(tipH)
+      if atTip.isSome and atTip.get() == tip:
+        return false
+
+      # Walk the active chain back from the tip to the first block that is on
+      # the header chain at its own height: the fork point.
+      var path: seq[chainstate.BlockIndex]   # tip first
+      var cur = tip
+      var curH = tipH
+      var walked = true
+      while true:
+        let onHc = sm.headerChain.getHashByHeight(curH)
+        if onHc.isSome and onHc.get() == cur:
+          break
+        if curH <= 0 or path.len >= MaxActiveChainReconcileDepth:
+          walked = false
+          break
+        let idxOpt = sm.chainDb.getBlockIndex(cur)
+        if idxOpt.isNone or idxOpt.get().height != curH:
+          walked = false
+          break
+        path.add idxOpt.get()
+        cur = idxOpt.get().header.prevBlock
+        dec curH
+      if not walked:
+        warn "active chain not on the header chain and not graftable — " &
+             "re-seeding the header chain from the block index",
+             chainTipHeight = tipH, headerTipHeight = sm.headerChain.tipHeight,
+             walked = path.len
+        sm.headerTipRepairAt = -1
+        let rebuilt = loadHeaderChainFromDb(sm.chainDb, sm.params)
+        var hc = rebuilt
+        # Old active headers off the rebuilt chain are dropped (as boot does);
+        # peers re-announce them. Genuine side branches are carried.
+        for hash, sh in sm.headerChain.sideHeaders:
+          if hash notin hc.byHash:
+            hc.sideHeaders[hash] = sh
+        sm.headerChain = hc
+        sm.headerTip = hc.tip
+        sm.headerTipHeight = hc.tipHeight
+        return true
+
+      let f = curH
+      let oldTipHeight = sm.headerChain.tipHeight
+      if sm.headerChain.headers.len != int(oldTipHeight) + 1 or
+         sm.headerChain.hashes.len != int(oldTipHeight) + 1:
+        warn "reconcileActiveChain: header chain arrays inconsistent, skipped",
+             headerTipHeight = oldTipHeight, headers = sm.headerChain.headers.len
+        return false
+      # Demote the header-chain branch above the fork point. Work at f is the
+      # header chain's total minus the headers above it (no genesis walk).
+      var baseWork = sm.headerChain.totalWork
+      var i = oldTipHeight
+      while i > f:
+        if i < int32(sm.headerChain.hashes.len) and
+           sm.headerChain.byHash.getOrDefault(sm.headerChain.hashes[i], -1) == int(i):
+          baseWork = subtractWork(baseWork,
+                                  calculateWork(sm.headerChain.headers[i].bits))
+        dec i
+      var demoted = 0
+      if f < oldTipHeight:
+        var w = baseWork
+        for j in (f + 1) .. oldTipHeight:
+          w = addWork(w, calculateWork(sm.headerChain.headers[j].bits))
+          sm.headerChain.sideHeaders[sm.headerChain.hashes[j]] = SideHeader(
+            header: sm.headerChain.headers[j], height: j, totalWork: w)
+          inc demoted
+        sm.truncateActiveHeaders(f)
+      # Graft the active blocks f+1 .. tip.
+      var w = baseWork
+      for k in countdown(path.high, 0):
+        let idx = path[k]
+        sm.headerChain.sideHeaders.del(idx.hash)
+        let pos = sm.headerChain.headers.len
+        sm.headerChain.headers.add(idx.header)
+        sm.headerChain.hashes.add(idx.hash)
+        sm.headerChain.byHash[idx.hash] = pos
+        w = addWork(w, calculateWork(idx.header.bits))
+      if path.len > 0:
+        sm.headerChain.tip = path[0].hash
+        sm.headerChain.tipHeight = tipH
+        sm.headerChain.totalWork = w
+      sm.headerTip = sm.headerChain.tip
+      sm.headerTipHeight = sm.headerChain.tipHeight
+      # Buffered bodies were keyed by the OLD header heights above the fork.
+      var drop: seq[int32]
+      for ht in sm.receivedBlocks.keys:
+        if ht > f:
+          drop.add(ht)
+      for ht in drop:
+        sm.receivedBlocks.del(ht)
+        sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+      if sm.headerChain.headers.len > 0:
+        sm.chainState.updateBestHeaderInfo(
+          sm.headerChain.totalWork, sm.headerChain.tipHeight,
+          sm.headerChain.headers[^1].bits)
+      warn "header chain moved onto the active chain (tip changed outside sync)",
+           forkHeight = f, chainTipHeight = tipH, tip = $tip,
+           grafted = path.len, demotedToSide = demoted,
+           droppedBuffered = drop.len
+      return true
+  except CatchableError as e:
+    warn "reconcileActiveChain failed", error = e.msg
+    return false
+  except Exception as e:
+    warn "reconcileActiveChain failed", error = e.msg
+    return false
+
 proc promoteBestValidSideBranch(sm: SyncManager) =
   ## Core RecalculateBestHeader after InvalidChainFound: once the failed
   ## branch is gone, the most-work VALID header becomes the download target.
@@ -2082,6 +2262,23 @@ proc invalidChainFound*(sm: SyncManager, hash: BlockHash) =
        hash = $hash, failed = dead.len,
        headerTipHeight = sm.headerChain.tipHeight,
        chainTipHeight = sm.chainTipHeight
+
+proc dropInvalidHeaderSuccessor*(sm: SyncManager): bool =
+  ## invalidateblock (RPC) disconnects the tip and marks it BLOCK_FAILED_VALID
+  ## in the block index, but the header chain sync downloads along still runs
+  ## through it. Core's InvalidChainFound recalculates the best header so
+  ## the failed branch is never fetched or connected again; do the same when
+  ## the header chain's successor of the active tip is known-invalid.
+  if sm.chainState == nil:
+    return false
+  let tipH = sm.chainTipHeight
+  if sm.headerChain.tipHeight <= tipH:
+    return false
+  let nextOpt = sm.headerChain.getHashByHeight(tipH + 1)
+  if nextOpt.isNone or not sm.isKnownInvalid(nextOpt.get()):
+    return false
+  sm.invalidChainFound(nextOpt.get())
+  true
 
 proc segwitActiveAt(sm: SyncManager, height: int32): bool =
   height >= int32(sm.params.segwitHeight)
@@ -2313,6 +2510,7 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
   # the pointer is behind heals it and is then processed against the repaired
   # chain — which is exactly what a restart did for free on 2026-08-23
   # ("first batch accepted=9 tipHeight=963741").
+  discard sm.reconcileActiveChain()
   discard sm.reconcileHeaderTip()
   # A headers message is a response — this peer is not mute.
   sm.stalledSyncPeerKeys.excl(peerSyncKey(peer))
@@ -2476,7 +2674,10 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
       return
     # BLOCK_INVALID_PREV: a new header building on a failed block
     # (AcceptBlockHeader "bad-prevblk") — Misbehaving for every peer.
-    if header.prevBlock in sm.failedBlocks:
+    # In-memory first (no DB read per header), then the persisted flag:
+    # reconsiderblock clears it, and isKnownInvalid drops the stale mirror.
+    if header.prevBlock in sm.failedBlocks and
+       sm.isKnownInvalid(header.prevBlock):
       sm.markBlockFailed(hash)
       peer.onInvalidChain = true
       if sm.syncPeer == peer:
@@ -3239,12 +3440,23 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
 
-  # Check this block connects to our chain
+  # A block marked BLOCK_FAILED_VALID is never connected (Core: a failed
+  # index entry is never an ActivateBestChain candidate). Not a new verdict.
+  if sm.chainDb != nil and sm.isKnownInvalid(hash):
+    warn "refusing to connect a block marked invalid", height = height,
+         hash = $hash
+    return false
+
+  # Check this block extends the ACTIVE tip (ChainState's, read under the
+  # chain lock held above) at the next height — Core ConnectTip:
+  # pindexNew->pprev == m_chain.Tip(). Not a verdict on the block.
   if height > 0:
     let expectedPrev = if height == 1: sm.params.genesisBlockHash
                        else: sm.chainTip
-    if blk.header.prevBlock != expectedPrev:
+    if blk.header.prevBlock != expectedPrev or
+       height != sm.chainTipHeight + 1:
       warn "block does not connect", height = height,
+           chainTipHeight = sm.chainTipHeight,
            expected = $expectedPrev, got = $blk.header.prevBlock
       return false
 
@@ -3483,7 +3695,9 @@ proc applyBlock*(sm: SyncManager, blk: Block, height: int32): bool =
       return false
     sm.chainDb.applyBlock(blk, height)
 
-  # Update chain tip (NOT header tip - they're tracked separately)
+  # Chain tip (NOT header tip - they're tracked separately). With a
+  # ChainState the connect above already moved it; this only records the
+  # offline-replay tip.
   sm.chainTip = hash
   sm.chainTipHeight = height
   sm.announceConnectedTip(blk)
@@ -3526,6 +3740,7 @@ proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [
   result = 0
   if sm.chainDb == nil:
     return 0
+  discard sm.reconcileActiveChain()
   while result < MaxStoredConnectPerCall and
         sm.chainTipHeight < sm.headerTipHeight:
     # Between blocks: let a waiting RPC/REST thread in (no-op inside a scope).
@@ -3538,6 +3753,10 @@ proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [
     if blkOpt.isNone:
       break # not on disk: the normal download path owns it
     let blk = blkOpt.get()
+    # Never connect a block marked BLOCK_FAILED_VALID (invalidateblock or a
+    # past verdict) — Core never makes a failed index entry a candidate.
+    if sm.isKnownInvalid(hashOpt.get()):
+      break
     # Only connect a DIRECT successor of the current tip.  Guards against
     # connecting across a gap if the header chain and the chain tip ever
     # disagree (the syncLoop rollback arm handles that case).
@@ -3561,6 +3780,11 @@ proc drainBlockBuffer(sm: SyncManager) =
     if nextHeight notin sm.receivedBlocks:
       break
     let blk = sm.receivedBlocks[nextHeight]
+    # The tip can move during the hand-over above (an RPC connect). A body
+    # that no longer extends it is not a verdict: leave it for the
+    # reconcile to drop or the side-branch arm to take on re-delivery.
+    if blk.header.prevBlock != sm.chainTip:
+      break
     sm.receivedBlocks.del(nextHeight)
     sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
     let bhash = BlockHash(doubleSha256(serialize(blk.header)))
@@ -3681,8 +3905,9 @@ proc processSideBranchBody*(sm: SyncManager, peer: Peer, blk: Block): bool =
     # the new tip and surface the refresh payload for the P2P caller to drain.
     for cb in connectedBlocks:
       sm.blockSource.del(BlockHash(doubleSha256(serialize(cb.header))))
-    sm.chainTip = sm.chainState.bestBlockHash
-    sm.chainTipHeight = sm.chainState.bestHeight
+    # The tip is ChainState's (handleReorg moved it). Point the header chain
+    # at the new active branch now so later bodies route against it.
+    discard sm.reconcileActiveChain()
     sm.pendingReorgDisconnectedTxs = disconnectedTxs
     sm.pendingReorgConnectedBlocks = connectedBlocks
     sm.lastSyncTime = getTime()
@@ -3801,6 +4026,10 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   # (p50 9 ms during sync). The main thread's base hold covers the rest.
   let headerBytes = serialize(blk.header)
   let hash = BlockHash(doubleSha256(headerBytes))
+
+  # Route against the ACTIVE chain: if the tip moved outside sync since the
+  # last message (RPC connect), the header chain follows it first.
+  discard sm.reconcileActiveChain()
 
   # Reorg-drop fix (Part 2): clear any stale reorg-refresh payload from a prior
   # call.  Only the side-branch arm below fills these; the P2P caller drains
@@ -3990,6 +4219,7 @@ proc handleHeadersSyncTimeout*(sm: SyncManager) {.raises: [CatchableError].} =
   sm.requestedHashes.clear()
   sm.blocksInFlight.clear()
   sm.receivedBlocks.clear()
+  discard sm.reconcileActiveChain()
   discard sm.reconcileHeaderTip()
   discard sm.connectStoredBlocks()
   sm.lastSyncTime = getTime()
@@ -4007,6 +4237,7 @@ proc startHeaderSync*(sm: SyncManager) {.async.} =
   # Reconcile BEFORE the log line so `currentHeight` is honest (the mainnet
   # incident logged "currentHeight=962722 peerHeight=963740" for a week while
   # the node's real chain was at 963732).
+  discard sm.reconcileActiveChain()
   discard sm.reconcileHeaderTip()
 
   info "starting header sync", peer = $sm.syncPeer,
@@ -4068,33 +4299,16 @@ proc syncLoop*(sm: SyncManager) {.async.} =
       await sleepAsync(100)
 
     of ssDownloadingBlocks:
-      # Verify chain tip matches header chain before requesting blocks.
-      # If there was a reorg, our stored chain tip may be on a stale fork.
-      block chainTipCheck:
-        let headerHashOpt = sm.headerChain.getHashByHeight(sm.chainTipHeight)
-        if headerHashOpt.isSome and headerHashOpt.get() != sm.chainTip:
-          # Chain tip mismatch - roll back to common ancestor
-          while sm.chainTipHeight > 0:
-            let hashOpt = sm.headerChain.getHashByHeight(sm.chainTipHeight)
-            if hashOpt.isSome and hashOpt.get() == sm.chainTip:
-              break
-            if hashOpt.isNone:
-              break
-            warn "chain tip mismatch, rolling back",
-                 height = sm.chainTipHeight,
-                 storedTip = $sm.chainTip,
-                 headerChainHash = $hashOpt.get()
-            sm.chainTipHeight -= 1
-            let prevHashOpt = sm.headerChain.getHashByHeight(sm.chainTipHeight)
-            if prevHashOpt.isSome:
-              sm.chainTip = prevHashOpt.get()
-            else:
-              break
-          info "rolled back to common ancestor",
-               height = sm.chainTipHeight, tip = $sm.chainTip
-          if sm.chainState != nil:
-            sm.chainState.bestHeight = sm.chainTipHeight
-            sm.chainState.bestBlockHash = sm.chainTip
+      # The header chain must contain the active chain (Core: one block
+      # index; downloads start from LastCommonAncestor(tip, best header)).
+      # When a connect happened outside sync (submitblock / generate*) or a
+      # side-branch reorg moved the tip, re-point the HEADER chain at the
+      # active chain. ChainState's tip is never rewritten here: it moves only
+      # by connect/disconnect (pre-fix this arm set chainState.bestHeight /
+      # bestBlockHash to an ancestor without disconnecting a block, leaving
+      # the UTXO set and the tip on different chains).
+      discard sm.reconcileActiveChain()
+      discard sm.dropInvalidHeaderSuccessor()
 
       # Reorg-drop fix (part 3): also drive block download when a heavier
       # competing fork exists in sideHeaders. Its bridging bodies live BELOW
