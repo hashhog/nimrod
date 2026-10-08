@@ -23,6 +23,8 @@ import ./util/tip_notifier
 import ./util/chain_lock_home
 import ./util/fatal
 import ./util/test_park_hook
+import ./util/shutdown
+export shutdown
 
 const NimrodVersion* = "0.1.0"
 
@@ -1890,13 +1892,11 @@ proc messageCallback(state: NodeState): peer.PeerCallback =
     await handleMessage(state, peer, msg)
   return callback
 
-var shutdownFlag: Atomic[bool]
-  ## Set by the SIGINT/SIGTERM handler (and therefore by RPC `stop` and
-  ## AbortNode, which raise SIGTERM). Read by `shutdownWatcher` on the main
-  ## loop. Core: StartShutdown() only signals; WaitForShutdown() in the main
-  ## thread then runs Interrupt() + Shutdown().
-
-proc shutdownRequested*(): bool = shutdownFlag.load(moAcquire)
+# The shutdown flag lives in util/shutdown (requestShutdown/shutdownRequested):
+# set by the SIGINT/SIGTERM handler (and therefore by RPC `stop` and AbortNode,
+# which raise SIGTERM); read by `shutdownWatcher` on the main loop and by the
+# sync loops between blocks. Core: StartShutdown() only signals;
+# WaitForShutdown() in the main thread then runs Interrupt() + Shutdown().
 
 const ShutdownBanner = "\nReceived shutdown signal, shutting down...\n"
 
@@ -2029,7 +2029,7 @@ proc setupSignalHandlers*() =
     reopenLog()
 
   proc sigHandler(sig: cint) {.noconv.} =
-    shutdownFlag.store(true, moRelease)
+    requestShutdown()
     discard posix.write(2, ShutdownBanner.cstring, ShutdownBanner.len)
 
   # AbortNode -> shutdown: the latch (util/fatal) requests the SAME shutdown a

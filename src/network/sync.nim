@@ -26,6 +26,7 @@ import ../storage/indexes/txospenderindex
 import ../crypto/[hashing, secp256k1]
 import ../perf/parallel_verify
 import ../util/fatal
+import ../util/shutdown
 
 # Use std/times for Time and Duration (not chronos/timer)
 type
@@ -3745,6 +3746,7 @@ proc connectStoredBlocks*(sm: SyncManager): int {.gcsafe, raises: [
         sm.chainTipHeight < sm.headerTipHeight:
     # Between blocks: let a waiting RPC/REST thread in (no-op inside a scope).
     discard sm.chainState.yieldChainToWaiters()
+    if shutdownRequested(): break  # Core ActivateBestChain: m_interrupt between blocks
     let nextHeight = sm.chainTipHeight + 1
     let hashOpt = sm.headerChain.getHashByHeight(nextHeight)
     if hashOpt.isNone:
@@ -3776,6 +3778,7 @@ proc drainBlockBuffer(sm: SyncManager) =
   ## Process buffered out-of-order blocks sequentially starting from chainTip+1
   while true:
     discard sm.chainState.yieldChainToWaiters()  # between blocks
+    if shutdownRequested(): break  # Core ActivateBestChain: m_interrupt between blocks
     let nextHeight = sm.chainTipHeight + 1
     if nextHeight notin sm.receivedBlocks:
       break
@@ -4645,6 +4648,7 @@ proc processReceivedBlocks*(dl: BlockDownloader) =
 
   while dl.nextProcessHeight in dl.receivedBlocks:
     discard sm.chainState.yieldChainToWaiters()  # between blocks
+    if shutdownRequested(): break  # Core ActivateBestChain: m_interrupt between blocks
     let blk = dl.receivedBlocks[dl.nextProcessHeight]
     let height = dl.nextProcessHeight
 
