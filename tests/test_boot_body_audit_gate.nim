@@ -216,12 +216,15 @@ suite "SIGTERM during the startup body audit":
     cs.close()
 
   test "the SIGTERM handler stops the audit before closing the database":
+    # NI-4: the shutdown body moved out of the signal handler into
+    # performShutdown (run on the main loop); the ordering pinned here is
+    # unchanged.
     let src = stripLineComments(nimrodSrc())
-    let i = src.find("proc sigHandler(")
+    let i = src.find("proc performShutdown(")
     check i >= 0
     let body = src[i .. ^1]
     let stopAt = body.find("stopStartupBodyAudit(")
-    let closeAt = body.find("chainState.close()")
+    let closeAt = body.find("cs.close()")
     check stopAt >= 0
     check closeAt > stopAt
     let markAt = src.find("markStartupBodyAuditRunning()")
