@@ -105,8 +105,22 @@ type
     ## applies if the tx re-enters via ApplyDelta in PreChecks.  An entry whose
     ## net delta returns to 0 is erased.  Survives restart via mempool.dat.
     feeDeltas*: Table[TxId, int64]
+    ## Core DisconnectedBlockTransactions (kernel/disconnected_transactions.h):
+    ## non-coinbase txs of blocks disconnected from the active chain and not
+    ## yet re-confirmed, EARLIEST-CONFIRMED FIRST (the order
+    ## MaybeUpdateMempoolForReorg re-accepts them in). Filled by the chainstate
+    ## disconnect hook, pruned by removeForBlock, drained by
+    ## maybeUpdateMempoolForReorg.
+    disconnectPool*: seq[Transaction]
+    disconnectPoolBytes*: int
+    ## Verifier context for the reorg re-accept (the hooks run on whichever
+    ## thread holds the chain lock, so the pool owns its own context).
+    reorgCrypto: CryptoEngine
+    reorgCryptoReady: bool
 
 const
+  ## Core MAX_DISCONNECTED_TX_POOL_BYTES (kernel/disconnected_transactions.h).
+  MaxDisconnectedTxPoolBytes* = 20_000_000
   DefaultMaxMempoolSize* = 300_000_000  ## 300 MB
   DefaultMinFeeRate* = 0.1              ## 0.1 sat/vB = 100 sat/kvB minimum
                                         ## (Core DEFAULT_MIN_RELAY_TX_FEE = 100
@@ -226,6 +240,8 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
                     conflicts: HashSet[TxId], incrementalRelayFee: float64 = DefaultIncrementalRelayFee): MempoolResult[HashSet[TxId]]
 proc removeConflicts*(mp: Mempool, conflicts: HashSet[TxId])
 proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true)
+proc attachToChainState*(mp: Mempool) {.gcsafe, raises: [].}
+proc expire*(mp: Mempool, maxAgeOverride: int = -1)
 
 # Constructor
 proc newMempool*(chainState: ChainState, params: ConsensusParams,
@@ -240,7 +256,7 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
                  clusterSizeLimit: int = DefaultClusterSizeLimit,
                  incrementalRelayFeeRate: float64 = DefaultIncrementalRelayFeeSatKvB,
                  expiryHours: int = DefaultMempoolExpiryHours): Mempool =
-  Mempool(
+  result = Mempool(
     entries: initTable[TxId, MempoolEntry](),
     byWtxid: initTable[TxId, TxId](),
     spentBy: initTable[OutPoint, TxId](),
@@ -263,6 +279,10 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
     expiryHours: expiryHours,
     feeDeltas: initTable[TxId, int64]()
   )
+  # Keep the pool consistent with the chain from inside every connect /
+  # disconnect / reorg (Core ConnectTip / DisconnectTip /
+  # MaybeUpdateMempoolForReorg under cs_main).
+  result.attachToChainState()
 
 # Basic accessors
 proc size*(mp: Mempool): int =
@@ -1699,40 +1719,249 @@ proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true) =
         # No child spends this parent's ephemeral dust, evict it too
         mp.removeTransaction(parentTxid, evictEphemeral = false)  # Prevent infinite recursion
 
+# ----------------------------------------------------------------------------
+# Mempool <-> active chain (Core txmempool.cpp removeForBlock / removeRecursive
+# / removeForReorg, validation.cpp MaybeUpdateMempoolForReorg,
+# kernel/disconnected_transactions.cpp)
+# ----------------------------------------------------------------------------
+
+proc descendantsBySpend(mp: Mempool, txid: TxId, nOutputs: int): seq[TxId] =
+  ## In-mempool descendants of `txid` (not including it), found through the
+  ## spentBy index — O(descendants), unlike calculateDescendants which scans
+  ## every entry per step. `txid` itself need not be in the pool (a tx that
+  ## was confirmed, or that failed to re-enter after a reorg).
+  var seen = initHashSet[TxId]()
+  var queue: seq[(TxId, int)] = @[(txid, nOutputs)]
+  while queue.len > 0:
+    let (t, n) = queue.pop()
+    for v in 0 ..< n:
+      let op = OutPoint(txid: t, vout: uint32(v))
+      if op in mp.spentBy:
+        let child = mp.spentBy[op]
+        if child notin seen and child in mp.entries:
+          seen.incl(child)
+          result.add(child)
+          queue.add((child, mp.entries[child].tx.outputs.len))
+
+proc refreshAncestorState(mp: Mempool, txid: TxId) =
+  ## Recompute an entry's cached ancestor aggregates after a parent entered or
+  ## left the pool (Core UpdateTransactionsFromBlock / UpdateForRemoveFromMempool).
+  if txid notin mp.entries:
+    return
+  var e = mp.entries[txid]
+  let selfFee = Satoshi(int64(e.fee) + mp.getFeeDelta(txid))
+  let (aFee, aWeight) = mp.calculateAncestorFeesAndWeight(e.tx, selfFee, e.weight)
+  let (aCount, aSize) = mp.calculateAncestorStats(e.tx, (e.weight + 3) div 4)
+  e.ancestorFee = aFee
+  e.ancestorWeight = aWeight
+  e.ancestorCount = aCount
+  e.ancestorSize = aSize
+  mp.entries[txid] = e
+
+proc removeRecursive*(mp: Mempool, txid: TxId, nOutputs: int) =
+  ## Core CTxMemPool::removeRecursive: `txid` (if present) and every in-mempool
+  ## descendant. `nOutputs` is the tx's output count (the tx may not be in the
+  ## pool any more, so it cannot be looked up).
+  let desc = mp.descendantsBySpend(txid, nOutputs)
+  if txid in mp.entries:
+    mp.removeTransaction(txid)
+  for d in desc:
+    if d in mp.entries:
+      mp.removeTransaction(d)
+
+proc removeRecursive*(mp: Mempool, tx: Transaction) =
+  mp.removeRecursive(tx.txid(), tx.outputs.len)
+
 # Remove transactions confirmed in a block
 proc removeForBlock*(mp: Mempool, blk: Block) =
-  ## Remove transactions that were included in a block.
-  ## Also removes any transactions that spend outputs created by block txs
-  ## (double-spend conflicts).
+  ## Core CTxMemPool::removeForBlock (txmempool.cpp:405) + the
+  ## DisconnectedBlockTransactions::removeForBlock ConnectTip pairs with it.
+  ## Called for EVERY connected block from inside the chainstate connect (the
+  ## mempoolConnectHook), under the chain lock:
+  ##   * each block tx leaves the pool (its in-mempool children stay — they
+  ##     now spend a confirmed output — with their ancestor state refreshed),
+  ##   * every pool tx that spends an input a block tx spends is a CONFLICT
+  ##     and leaves WITH ALL ITS DESCENDANTS (removeConflicts ->
+  ##     removeRecursive; it used to drop only the direct conflict),
+  ##   * each block tx leaves the disconnect pool.
   ## Sets blockSinceLastRollingFeeBump = true so GetMinFee decays the rolling
-  ## floor after the next update interval.
-  ## Core reference: txmempool.cpp:426-427 (lastRollingFeeUpdate + blockSinceLastRollingFeeBump
-  ## reset happens at the end of CTxMemPool::removeForBlock).
+  ## floor after the next update interval (txmempool.cpp:426-427).
+  mp.lastRollingFeeUpdate = getTime().toUnix()
+  mp.blockSinceLastRollingFeeBump = true
+  # Nothing to do for an empty pool (IBD): skip hashing every tx.
+  if mp.entries.len == 0 and mp.disconnectPool.len == 0:
+    return
 
-  # Collect txids to remove
-  var toRemove: seq[TxId]
-
+  var confirmed = initHashSet[TxId]()
+  var childrenToRefresh: seq[TxId]
   for tx in blk.txs:
     let txid = tx.txid()
+    confirmed.incl(txid)
     if txid in mp.entries:
-      toRemove.add(txid)
-
-    # Check for conflicting mempool transactions
-    # (transactions that spend outputs now used by this block tx)
+      childrenToRefresh.add(mp.descendantsBySpend(txid, tx.outputs.len))
+      mp.removeTransaction(txid)
+    # Conflicts: pool txs spending an outpoint this block tx spends.
     for input in tx.inputs:
       if input.prevOut in mp.spentBy:
         let conflictTxid = mp.spentBy[input.prevOut]
-        if conflictTxid notin toRemove:
-          toRemove.add(conflictTxid)
+        if conflictTxid != txid and conflictTxid in mp.entries:
+          mp.removeRecursive(conflictTxid,
+                             mp.entries[conflictTxid].tx.outputs.len)
 
-  # Remove all collected transactions
-  for txid in toRemove:
-    mp.removeTransaction(txid)
+  for c in childrenToRefresh:
+    mp.refreshAncestorState(c)
 
-  # After block removal: reset rolling fee decay timer so fee floor can decay.
-  # Core sets these at the end of removeForBlock (txmempool.cpp:426-427).
-  mp.lastRollingFeeUpdate = getTime().toUnix()
-  mp.blockSinceLastRollingFeeBump = true
+  if mp.disconnectPool.len > 0:
+    var kept: seq[Transaction]
+    var keptBytes = 0
+    for tx in mp.disconnectPool:
+      if tx.txid() notin confirmed:
+        kept.add(tx)
+        keptBytes += serialize(tx).len
+    mp.disconnectPool = kept
+    mp.disconnectPoolBytes = keptBytes
+
+proc addDisconnectedBlock*(mp: Mempool, blk: Block) =
+  ## Core DisconnectTip -> DisconnectedBlockTransactions::AddTransactionsFromBlock.
+  ## Blocks are disconnected tip-first, so each one's txs go IN FRONT of what is
+  ## already queued: the pool stays earliest-confirmed first. Over
+  ## MaxDisconnectedTxPoolBytes, the most recently confirmed txs are dropped
+  ## (Core LimitMemoryUsage evicts the first-added, i.e. tip-most, entries).
+  var txs: seq[Transaction]
+  var bytes = 0
+  for i, tx in blk.txs:
+    if i == 0:
+      continue  # coinbase never re-enters the pool
+    txs.add(tx)
+    bytes += serialize(tx).len
+  if txs.len == 0:
+    return
+  mp.disconnectPool = txs & mp.disconnectPool
+  mp.disconnectPoolBytes += bytes
+  while mp.disconnectPoolBytes > MaxDisconnectedTxPoolBytes and
+        mp.disconnectPool.len > 0:
+    let dropped = mp.disconnectPool.pop()
+    mp.disconnectPoolBytes -= serialize(dropped).len
+    # Core removeRecursive's whatever spends a tx it gives up on.
+    mp.removeRecursive(dropped)
+
+proc isFinalAndMatureAtTip(mp: Mempool, tx: Transaction): bool =
+  ## The removeForReorg filter Core builds in MaybeUpdateMempoolForReorg
+  ## (validation.cpp:345-381): a pool tx survives only if, at tip+1, it is
+  ## final (CheckFinalTxAtTip, BIP113), its BIP68 sequence locks are met
+  ## (CheckSequenceLocksAtTip; in-pool parents count as height tip+1) and no
+  ## confirmed coinbase it spends is immature.
+  let tipHeight = mp.chainState.bestHeight
+  let mtp = getMtpForHeight(mp.chainState.db, tipHeight)
+  if not isFinalTx(tx, uint32(tipHeight + 1), mtp):
+    return false
+  for input in tx.inputs:
+    if input.prevOut.txid in mp.entries:
+      continue
+    let utxo = mp.chainState.getUtxo(input.prevOut)
+    if utxo.isNone:
+      return false  # input gone: cannot stay (Core asserts this never happens)
+    let coin = utxo.get()
+    if coin.isCoinbase and
+       (tipHeight + 1) - coin.height < int32(mp.params.coinbaseMaturity):
+      return false
+  proc lookupForSeqLock(op: OutPoint): Option[UtxoEntry] =
+    let confirmed = mp.chainState.getUtxo(op)
+    if confirmed.isSome:
+      return confirmed
+    if op.txid in mp.entries:
+      return some(UtxoEntry(output: TxOut(), height: int32(tipHeight + 1),
+                            isCoinbase: false))
+    none(UtxoEntry)
+  proc getMtpAt(h: int32): uint32 = getMtpForHeight(mp.chainState.db, h)
+  checkSequenceLocksForTx(tx, lookupForSeqLock, tipHeight + 1, mtp, getMtpAt,
+                          mp.params).isOk
+
+proc removeForReorg*(mp: Mempool) =
+  ## Core CTxMemPool::removeForReorg (txmempool.cpp:360) with the
+  ## filter_final_and_mature predicate: every entry that is no longer valid at
+  ## the new tip+1 leaves the pool with all its descendants.
+  var drop: seq[TxId]
+  for txid, entry in mp.entries:
+    if not mp.isFinalAndMatureAtTip(entry.tx):
+      drop.add(txid)
+  for txid in drop:
+    if txid in mp.entries:
+      mp.removeRecursive(txid, mp.entries[txid].tx.outputs.len)
+
+proc limitMempoolSize*(mp: Mempool) =
+  ## Core LimitMempoolSize (validation.cpp:268): expire, then trim to size.
+  mp.expire()
+  while mp.currentSize > mp.maxSize and mp.entries.len > 0:
+    mp.evictLowestFee()
+
+proc maybeUpdateMempoolForReorg*(mp: Mempool, addToMempool: bool = true) =
+  ## Core MaybeUpdateMempoolForReorg (validation.cpp:294-386), run under the
+  ## chain lock after InvalidateBlock's each DisconnectTip and once at the end
+  ## of a reorg:
+  ##   1. re-accept the disconnect pool EARLIEST FIRST with bypass_limits
+  ##      (no fee floor / size limit, every other check); a tx that fails is
+  ##      removeRecursive'd so its in-pool descendants (e.g. a child of a tx
+  ##      the new branch double-spent) go too; a re-added tx's in-pool
+  ##      descendants are kept and their ancestor state refreshed
+  ##      (UpdateTransactionsFromBlock);
+  ##   2. removeForReorg: drop non-final / BIP68-locked / immature-coinbase
+  ##      spends at the new tip+1, with descendants;
+  ##   3. LimitMempoolSize.
+  let queued = mp.disconnectPool
+  mp.disconnectPool.setLen(0)
+  mp.disconnectPoolBytes = 0
+  if addToMempool and queued.len > 0 and not mp.reorgCryptoReady:
+    try:
+      mp.reorgCrypto = newCryptoEngine()
+      mp.reorgCryptoReady = true
+    except CatchableError:
+      discard
+  for tx in queued:
+    let txid = tx.txid()
+    var accepted = txid in mp.entries
+    if not accepted and addToMempool and mp.reorgCryptoReady:
+      var args = defaultAtmpArgs()
+      args.bypassLimits = true
+      var r: MempoolResult[TxId]
+      try:
+        r = mp.acceptTransaction(tx, mp.reorgCrypto, args)
+        accepted = r.isOk
+      except CatchableError:
+        accepted = false
+      if accepted:
+        for d in mp.descendantsBySpend(txid, tx.outputs.len):
+          mp.refreshAncestorState(d)
+    if not accepted:
+      mp.removeRecursive(txid, tx.outputs.len)
+  mp.removeForReorg()
+  mp.limitMempoolSize()
+
+proc attachToChainState*(mp: Mempool) {.gcsafe, raises: [].} =
+  ## Install the chainstate hooks that keep this pool consistent with the
+  ## active chain from inside every connect / disconnect / reorg, under the
+  ## chain lock (see ChainState.mempoolConnectHook).
+  if mp.chainState == nil:
+    return
+  let pool = mp
+  mp.chainState.mempoolConnectHook = proc(blk: Block) {.gcsafe, raises: [].} =
+    try:
+      {.cast(gcsafe).}:
+        pool.removeForBlock(blk)
+    except Exception:
+      discard
+  mp.chainState.mempoolDisconnectHook = proc(blk: Block) {.gcsafe, raises: [].} =
+    try:
+      {.cast(gcsafe).}:
+        pool.addDisconnectedBlock(blk)
+    except Exception:
+      discard
+  mp.chainState.mempoolUpdateHook = proc() {.gcsafe, raises: [].} =
+    try:
+      {.cast(gcsafe).}:
+        pool.maybeUpdateMempoolForReorg(true)
+    except Exception:
+      discard
 
 # Re-admit transactions that came back from a disconnected block during a reorg.
 # Mirrors Bitcoin Core's `MaybeUpdateMempoolForReorg`

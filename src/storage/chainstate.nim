@@ -370,6 +370,26 @@ type
     # through a callback so chainstate.nim does not import the RPC layer. nil
     # when no notifier is wired (tests / degraded boot) — fire is then a no-op.
     tipChangedHook*: proc() {.gcsafe, raises: [].}
+    # Mempool hooks: keep the mempool consistent with the active chain INSIDE
+    # the connect / disconnect / reorg, under the chain lock, before any
+    # hand-off to a waiting RPC thread and before tipChangedHook wakes one.
+    # Bitcoin Core does this in the validation layer under cs_main:
+    #   ConnectTip -> m_mempool->removeForBlock(blockConnected.vtx) +
+    #                 disconnectpool->removeForBlock (every connected block:
+    #                 net, disk, reorg, reconsider, submitblock, generate)
+    #   DisconnectTip -> disconnectpool->AddTransactionsFromBlock(block.vtx)
+    #   InvalidateBlock (per disconnected block) / ActivateBestChainStep (once,
+    #                 at the end) -> MaybeUpdateMempoolForReorg
+    # nimrod used to do the mempool update in the P2P caller after
+    # processBlock returned (nimrod.nim mkBlock arm), so drainBlockBuffer's
+    # between-block yield let RPC see confirmed txs in the pool, blocks
+    # connected from disk (connectStoredBlocks) never reached removeForBlock,
+    # and invalidateblock returned nothing to the pool (NI-7, T4).
+    # Wired by mempool.newMempool (the Mempool owns the logic; chainstate
+    # cannot import mempool). nil = no mempool attached (tests, tools).
+    mempoolConnectHook*: proc(blk: Block) {.gcsafe, raises: [].}
+    mempoolDisconnectHook*: proc(blk: Block) {.gcsafe, raises: [].}
+    mempoolUpdateHook*: proc() {.gcsafe, raises: [].}
 
   ## Result type for chainstate operations
   ChainStateResult*[T] = object
@@ -1952,6 +1972,10 @@ proc runTipHooks(cs: ChainState, blk: Block, height: int32) =
   ## WaitTipChanged) and the wallet/index connect hook. Best-effort: they run
   ## after the chainstate commit, so a raise here must never surface as a
   ## failure to connect a block that is already the durable tip.
+  # Mempool first (Core ConnectTip -> removeForBlock, under cs_main): the
+  # tip-changed notification below wakes waiters that may read the pool.
+  if cs.mempoolConnectHook != nil:
+    cs.mempoolConnectHook(blk)
   try:
     if cs.tipChangedHook != nil:
       cs.tipChangedHook()
@@ -3670,6 +3694,11 @@ proc disconnectBlock*(cs: var ChainState, blk: Block, height: int32, undo: UndoD
                $blockHash & " (" & fatalMessage() & ")")
   committed = true
 
+  # Core DisconnectTip -> disconnectpool->AddTransactionsFromBlock. The
+  # caller (invalidateBlock) runs the mempool update after each disconnect.
+  if cs.mempoolDisconnectHook != nil:
+    cs.mempoolDisconnectHook(blk)
+
   # Fire the disconnect hook (BIP-157 filter-index rollback).  Runs AFTER
   # the chainstate batch commits so the filter index never observes a
   # state the chainstate has not yet committed.  Best-effort: the
@@ -4234,6 +4263,19 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
                                {.cast(gcsafe).}:
                                  var c = csRef
                                  c.flushCache())
+
+  # Mempool (Core ActivateBestChainStep): every disconnected block's txs go
+  # to the disconnect pool (tip -> fork), every connected block runs
+  # removeForBlock (fork+1 -> new tip), then MaybeUpdateMempoolForReorg once.
+  # Under the chain lock, before the tip-changed wake-up below.
+  if cs.mempoolDisconnectHook != nil:
+    for (dblk, _, _) in disconnectedBlocks:
+      cs.mempoolDisconnectHook(dblk)
+  if cs.mempoolConnectHook != nil:
+    for cblk in newChain:
+      cs.mempoolConnectHook(cblk)
+  if cs.mempoolUpdateHook != nil:
+    cs.mempoolUpdateHook()
 
   # Wake the wait-family RPCs on this reorg tip advance. A reorg is a tip
   # change (Core KernelNotifications blockTip / WaitTipChanged fires on reorg
