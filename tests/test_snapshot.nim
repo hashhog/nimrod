@@ -1223,6 +1223,10 @@ suite "dumptxoutset rollback":
     let outPath = testDir / "out.dat"
     let res = rpc.handleDumpTxOutSet(%*[outPath])
     check res["base_height"].getInt() == 3
+    # Core WriteUTXOSnapshot: nchaintx = base->m_chain_tx_count, always
+    # emitted (genesis + 3 coinbase-only blocks = 4).
+    check res.hasKey("nchaintx")
+    check res{"nchaintx"}.getInt() == 4
     check fileExists(outPath)
     # Tip is unchanged.
     check cs.bestHeight == 3
@@ -1270,6 +1274,8 @@ suite "dumptxoutset rollback":
       %*[outPath, "", {"rollback": %2}]
     )
     check res["base_height"].getInt() == 2
+    # nchaintx describes the BASE (genesis + 2 blocks), not the tip.
+    check res{"nchaintx"}.getInt() == 3
     # Snapshot's base_hash should be the height-2 block hash (display order).
     let want2 = block:
       var s = ""

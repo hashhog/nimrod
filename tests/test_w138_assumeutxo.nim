@@ -574,11 +574,12 @@ suite "W138 G29 — dumptxoutset RPC parity (BUG-17)":
     check "is_fifo" notin serverSrc
     check "isFifo" notin serverSrc
 
-  test "G29 BUG-17b: nchaintx emitted only when matching hardcoded entry":
+  test "G29 BUG-17b FIXED: nchaintx always emitted (base m_chain_tx_count)":
     ## Core rpc/blockchain.cpp:3346 ALWAYS emits nchaintx = tip->m_chain_tx_count.
-    ## nimrod emits only when target matches assumeutxoData
-    ## (server.nim:5023-5028 — `haveNChainTx` gate).
-    check "haveNChainTx" in serverSrc
+    ## The `haveNChainTx` gate (emit only on an assumeutxo base) is gone;
+    ## behaviour pinned in test_snapshot.nim "dumptxoutset rollback".
+    check "haveNChainTx" notin serverSrc
+    check "dumpBaseChainTxCount" in serverSrc
 
   test "G29 BUG-17c: dump iterates cs.utxoCache directly (not a cursor snapshot)":
     ## snapshot.nim:522 — `for op, entry in cs.utxoCache`.
