@@ -58,8 +58,8 @@
   },
   "provenance": {
     "files": ["provenance.txt", "assemble.sh", "check-pin.sh", "on-promote.sh"],
-    "binary_sha256": "b72367abd4ce1899c733fbd48c8c65855ca83aef68b9ce3e75d768e5316caa8a",
+    "binary_sha256": "e8d452b0d70a44f72df461d628c6f90a83f725eda069aebc43426c272ea2698a",
     "toolchain": "Nim 2.2.8 / nimble 0.20.1",
-    "parent_commit": "2ca3c317fd586b19d4066acd4db81074aa73a83a"
+    "parent_commit": "0c6c660b7a0051ec483103bbf01a1cb65c515255"
   }
 }
