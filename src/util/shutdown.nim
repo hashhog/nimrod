@@ -15,3 +15,9 @@ proc requestShutdown*() {.inline.} =
 
 proc shutdownRequested*(): bool {.inline.} =
   shutdownFlag.load(moAcquire)
+
+proc clearShutdownRequestForTests*() =
+  ## Tests only: a test that raised SIGTERM must not leave the process-wide
+  ## flag set for the suites that run after it in the same binary (the
+  ## connect loops stop between blocks while it is set).
+  shutdownFlag.store(false, moRelease)

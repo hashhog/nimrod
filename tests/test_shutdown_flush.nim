@@ -28,6 +28,7 @@ import ../src/storage/chainstate
 import ../src/mempool/mempool
 import ../src/mining/fees
 import ../src/rpc/server as rpc_server
+import ../src/util/fatal
 
 const TestDb = "/tmp/nimrod_test_shutdown_flush"
 
@@ -35,6 +36,15 @@ suite "NI-4 shutdown runs on the main loop, not in the signal handler":
 
   test "SIGTERM only requests a shutdown; the process keeps running":
     setupSignalHandlers()
+    defer:
+      # Do not leak into the suites that run after this one in test_all:
+      # the flag (connect loops stop between blocks while it is set), the
+      # handlers, and the AbortNode action (tests keep it nil, util/fatal).
+      clearShutdownRequestForTests()
+      setAbortAction(nil)
+      discard posix.signal(posix.SIGTERM, posix.SIG_DFL)
+      discard posix.signal(posix.SIGINT, posix.SIG_DFL)
+      discard posix.signal(posix.SIGHUP, posix.SIG_DFL)
     check not shutdownRequested()
     check posix.kill(posix.getpid(), posix.SIGTERM) == 0
     # A process-directed signal to ourselves is delivered before kill returns
