@@ -2187,9 +2187,18 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
                $blockHash & " (" & fatalMessage() & ")")
 
   # Committed: now (and only now) update in-memory state.
+  when defined(nimrodRaceHooks):
+    var parkedMid = false
   for c in cacheOps:
     if c.isPut: cs.putUtxoCache(c.op, c.entry)
-    else: cs.deleteUtxoCache(c.op)
+    else:
+      when defined(nimrodRaceHooks):
+        # Inside the cache-apply loop, before its first spend: the batch has
+        # already deleted the spent coins on disk, the cache still holds them.
+        if not parkedMid:
+          parkedMid = true
+          racePoint("connect.midcache", blockHash)
+      cs.deleteUtxoCache(c.op)
   racePoint("connect.postcache", blockHash)
   cs.totalWork = newTotalWork
   cs.bestBlockHash = blockHash

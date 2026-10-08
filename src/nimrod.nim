@@ -22,6 +22,7 @@ import ./util/ops
 import ./util/tip_notifier
 import ./util/chain_lock_home
 import ./util/fatal
+import ./util/test_park_hook
 
 const NimrodVersion* = "0.1.0"
 
@@ -3717,6 +3718,7 @@ proc main() =
   of cmdStart:
     operationalSetup(config)
     setupSignalHandlers()
+    installTestParkHook()  # no-op unless -d:nimrodRaceHooks + env
     # Signal readiness AFTER the initial setup but BEFORE the long-lived
     # event loop.  We can't easily wait for "first connect" without a
     # bigger refactor, so this is "the daemon is past startup and about to
