@@ -1791,6 +1791,26 @@ proc chainTxCountUpTo(rpc: RpcServer, height: int32): int64 =
     return 0
   rpc.sumNtxInclusive(0'i32, height)
 
+proc dumpBaseChainTxCount(rpc: RpcServer, baseHeight: int32,
+                          baseHash: BlockHash): uint64 =
+  ## m_chain_tx_count of the dumptxoutset base (see handleDumpTxOutSet).
+  var anchorH: int32 = -1
+  var anchorCount: uint64 = 0
+  for entry in rpc.chainState.params.assumeutxoData:
+    if entry.height > baseHeight or entry.height <= anchorH or
+       entry.chainTxCount == 0:
+      continue
+    let onChain =
+      if entry.height == baseHeight: some(baseHash)
+      else: rpc.chainState.db.getBlockHashByHeight(entry.height)
+    if onChain.isSome and onChain.get() == entry.blockhash:
+      anchorH = entry.height
+      anchorCount = entry.chainTxCount
+  if anchorH >= 0:
+    anchorCount + uint64(rpc.sumNtxInclusive(anchorH + 1, baseHeight))
+  else:
+    uint64(rpc.chainTxCountUpTo(baseHeight))
+
 proc populateFilterIndexForHashes(rpc: RpcServer, hashes: seq[BlockHash]) =
   ## Advance the BIP-157 basic block-filter index across blocks that were just
   ## connected by a generate* RPC.  Mirrors Bitcoin Core's BaseIndex: the index
@@ -8384,26 +8404,23 @@ proc handleDumpTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
       " but failed to re-apply rolled-back blocks; chainstate at height " &
       $rpc.chainState.bestHeight & " (was " & $originalTipHeight & ")")
 
-  # If the dump base height matches a known assumeutxo entry, surface
-  # nchaintx (Core does the same).
-  var nchaintx: uint64 = 0
-  var haveNChainTx = false
-  for entry in rpc.chainState.params.assumeutxoData:
-    if entry.height == dumpRes.baseHeight and
-       entry.blockhash == dumpRes.baseHash:
-      nchaintx = entry.chainTxCount
-      haveNChainTx = true
-      break
+  # nchaintx: Core WriteUTXOSnapshot emits tip->m_chain_tx_count of the
+  # BASE unconditionally (cumulative txs genesis..base, genesis included).
+  # It was emitted only when the base was an assumeutxo entry.  Anchor at
+  # the highest assumeutxo entry on the active chain at or below the base
+  # (its chainparams count includes that block, as Core seeds
+  # base->m_chain_tx_count from au_data), else at genesis, and add each
+  # block's nTx above it.
+  let nchaintx = rpc.dumpBaseChainTxCount(dumpRes.baseHeight, dumpRes.baseHash)
 
   result = %*{
     "coins_written": dumpRes.coinsWritten,
     "base_hash": reverseHex(toHex(array[32, byte](dumpRes.baseHash))),
     "base_height": dumpRes.baseHeight,
     "path": path,
-    "txoutset_hash": reverseHex(toHex(dumpRes.txoutsetHash))
+    "txoutset_hash": reverseHex(toHex(dumpRes.txoutsetHash)),
+    "nchaintx": nchaintx
   }
-  if haveNChainTx:
-    result["nchaintx"] = %nchaintx
 
 proc handleLoadTxOutSetImpl*(rpc: RpcServer, path: string): JsonNode =
   ## REAL loadtxoutset: after the load-time content-hash gate (which
