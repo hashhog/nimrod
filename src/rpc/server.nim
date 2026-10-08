@@ -53,6 +53,10 @@ type
                                          ## written (requestNodeShutdown), so
                                          ## `stop` and SIGTERM share one path.
     shutdownSignalled: bool
+    stopping: Atomic[bool]               ## set by stop() (main thread, shutdown
+                                         ## step 1); handlers let in afterwards
+                                         ## answer "Shutting down" (Core
+                                         ## CRPCTable::execute, IsRPCRunning).
     crypto*: CryptoEngine
     blockFileManager*: BlockFileManager  ## Optional: for pruning support
     pruner*: Pruner                      ## Optional: production prune driver
@@ -175,6 +179,7 @@ const
   # disconnectnode). Non-consensus — RPC-layer error returns only.
   RpcClientNodeAlreadyAdded* = -23   # addnode "add" of an already-added node
   RpcClientNodeNotAdded* = -24       # addnode "remove" of a never-added node
+  RpcClientNotConnected* = -9        # "Shutting down" (Core RPC_CLIENT_NOT_CONNECTED)
   RpcClientNodeNotConnected* = -29   # disconnectnode for a peer not connected
   RpcClientInvalidIpOrSubnet* = -30  # setban with an invalid IP/subnet string
   RpcClientP2pDisabled* = -31        # P2P/connman unavailable (Core RPC_CLIENT_P2P_DISABLED;
@@ -15599,6 +15604,11 @@ proc handleMethod*(rpc: RpcServer, methodName: string, params: JsonNode): JsonNo
   if rpc.chainState == nil or methodName in ChainLockFreeMethods:
     return rpc.handleMethodUnlocked(methodName, params)
   withChainLock(rpc.chainState):
+    # Core CRPCTable::execute: `if (!IsRPCRunning()) throw "Shutting down"`.
+    # Checked AFTER the lock is taken: a handler that waited through the start
+    # of shutdown must not mutate chain state behind the shutdown flush.
+    if rpc.stopping.load(moAcquire):
+      raise newRpcError(RpcClientNotConnected, "Shutting down")
     result = rpc.handleMethodUnlocked(methodName, params)
 
 proc namedArgPositions(methodName: string): seq[string] =
@@ -16273,6 +16283,7 @@ proc start*(rpc: RpcServer) {.async.} =
   server.close()
 
 proc stop*(rpc: RpcServer) =
+  rpc.stopping.store(true, moRelease)
   rpc.running = false
 
 # Convenience function for backward compatibility

@@ -208,6 +208,7 @@ const IncludedTests = [
   "test_serialize",
   "test_serving",
   "test_sha256_bench",
+  "test_shutdown_flush",
   "test_signrawtransactionwithwallet",
   "test_sigop",
   "test_snapshot",

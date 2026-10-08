@@ -2407,6 +2407,51 @@ proc stopIBD*(cs: var ChainState) =
   # Re-enable WAL for normal operation
   cs.db.db.enableWAL()
 
+proc flushStateForShutdown*(cs: var ChainState) =
+  ## The ONE chainstate flush of a clean shutdown (Core init.cpp Shutdown:
+  ## `LOCK(cs_main); chainstate->ForceFlushStateToDisk()`), run by the main
+  ## thread at a callback boundary after RPC and P2P have been stopped — never
+  ## from a signal handler and never from inside a connect/disconnect/reorg.
+  ##
+  ## Coins before the best-block marker, atomically: in IBD the staged batch
+  ## (coins + tip marker) is committed by stopIBD; then every resident cache
+  ## entry and the marker that describes them go to disk in a single synced
+  ## WriteBatch (Core CCoinsViewDB::BatchWrite: coins, then DB_BEST_BLOCK).
+  ## At a callback boundary every cached coin is already on disk, so this
+  ## rewrites identical values; what matters is that it can no longer run
+  ## while the cache and the disk disagree (NI-4).
+  ##
+  ## Gate 6: never after AbortNode (the in-memory state is exactly what could
+  ## not be made durable).
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
+  if isFatal():
+    warn "fatal error latched: NOT flushing the chainstate at shutdown"
+    return
+  if cs.ibdMode:
+    info "flushing IBD batch before shutdown", height = cs.bestHeight
+    cs.stopIBD()
+    if isFatal():
+      return
+  let batch = cs.db.db.newWriteBatch()
+  defer: batch.destroy()
+  var n = 0
+  for op, entry in cs.utxoCache:
+    batch.put(cfUtxo, utxoKey(array[32, byte](op.txid), op.vout),
+              serializeUtxoEntry(entry))
+    inc n
+  batch.put(cfMeta, metaKey("bestblock"), @(array[32, byte](cs.bestBlockHash)))
+  var w = BinaryWriter()
+  w.writeInt32LE(cs.bestHeight)
+  batch.put(cfMeta, metaKey("height"), w.data)
+  batch.put(cfMeta, metaKey("totalwork"), @(cs.totalWork))
+  cs.db.db.writeSynced(batch)
+  cs.db.bestBlockHash = cs.bestBlockHash
+  cs.db.bestHeight = cs.bestHeight
+  cs.utxoCache.clear()
+  cs.cacheSize = 0
+  info "chainstate flushed for shutdown", height = cs.bestHeight,
+       hash = $cs.bestBlockHash, coins = n
+
 proc setDbCache*(cs: var ChainState, dbcacheMiB: int) =
   ## Apply an operator --dbcache=<MiB> override to this ChainState's UTXO
   ## cache sizing. PERF-ONLY / CONSENSUS-NEUTRAL: cache sizing never changes

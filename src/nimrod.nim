@@ -1,7 +1,7 @@
 ## nimrod - Bitcoin full node in Nim
 ## Unified CLI with subcommands for node operation, RPC interaction, and wallet management
 
-import std/[parseopt, os, strutils, json, posix, net, base64, sysrand, tables, monotimes, times, sets, options, algorithm]
+import std/[parseopt, os, strutils, json, posix, net, base64, sysrand, tables, monotimes, times, sets, options, algorithm, atomics]
 import chronos
 import chronicles
 
@@ -1889,122 +1889,150 @@ proc messageCallback(state: NodeState): peer.PeerCallback =
     await handleMessage(state, peer, msg)
   return callback
 
+var shutdownFlag: Atomic[bool]
+  ## Set by the SIGINT/SIGTERM handler (and therefore by RPC `stop` and
+  ## AbortNode, which raise SIGTERM). Read by `shutdownWatcher` on the main
+  ## loop. Core: StartShutdown() only signals; WaitForShutdown() in the main
+  ## thread then runs Interrupt() + Shutdown().
+
+proc shutdownRequested*(): bool = shutdownFlag.load(moAcquire)
+
+const ShutdownBanner = "\nReceived shutdown signal, shutting down...\n"
+
+proc performShutdown(state: NodeState) =
+  ## The whole clean shutdown, on the MAIN thread at a chronos callback
+  ## boundary (see shutdownWatcher). Order follows Core init.cpp Shutdown():
+  ##   1. StopHTTPRPC / StopREST / StopRPC  -> no RPC can mutate any more
+  ##   2. connman->Stop()                   -> P2P stopped, peers dropped
+  ##   3. DumpMempool, fee_estimator Flush
+  ##   4. LOCK(cs_main); ForceFlushStateToDisk()  -> coins, then best block
+  ##   5. wallets flushed, chainstate closed, pid file removed
+  ##
+  ## NI-4: this used to run INSIDE the signal handler. A process-directed
+  ## SIGTERM lands on the main thread wherever it is; inside connectBlock's
+  ## cache-apply loop the batch has already deleted the block's spent coins
+  ## on disk while the cache still holds some of them, and the handler's
+  ## flushCache (a recursive acquire of the main thread's own lock, which
+  ## succeeds instantly) wrote them back: spent coins resurrected on disk
+  ## (tools/repro_shutdown_flush.py). A callback boundary is never inside a
+  ## connect, a disconnect, a reorg or an IBD pass (all synchronous, no
+  ## await), so the cache and the disk agree whenever this runs.
+  let fatalShutdown = isFatal()
+  if fatalShutdown:
+    error "shutting down after a FATAL system fault — skipping the " &
+          "chainstate flush; exit status 1", reason = fatalMessage()
+
+  if state != nil:
+    state.running = false
+    var cs = state.chainState
+
+    # cs_main for the rest of shutdown. On the main thread at a callback
+    # boundary this nests on the base hold (depth 1 -> 2); a depth other than
+    # 1 here would mean we are inside a critical section, which the boundary
+    # rules out — say so loudly if it ever happens. Never released: quit()
+    # follows.
+    if cs != nil:
+      let depth = cs.chainLock.depthHeld
+      if cs.chainLock.isHomeThread and depth != 1:
+        error "shutdown entered inside a chain-lock section", depth = depth
+      cs.chainLock.acquireChain()
+
+    # 1. RPC + REST first (Core StopHTTPRPC/StopREST/StopRPC). A handler that
+    #    is waiting for the lock and is let in later (stopStartupBodyAudit
+    #    yields) is refused with "Shutting down" instead of running.
+    if state.rpcServer != nil:
+      info "stopping RPC server"
+      state.rpcServer.stop()
+      let cookiePath = state.config.dataDir / state.config.network / ".cookie"
+      if fileExists(cookiePath):
+        try:
+          removeFile(cookiePath)
+          info "removed RPC cookie file", path = cookiePath
+        except OSError: discard
+    if state.restServer != nil:
+      info "stopping REST server"
+      state.restServer.stop()
+
+    # 2. P2P (Core connman->Stop()).
+    if state.peerManager != nil:
+      info "disconnecting peers"
+      state.peerManager.stop()
+
+    # 3. Mempool + fee estimates (Core: before the chainstate flush).
+    if state.mempool != nil:
+      let mempoolPath = state.config.dataDir / state.config.network /
+                        CurrentMempoolDumpFile
+      info "saving mempool", path = mempoolPath
+      discard dumpMempool(state.mempool, mempoolPath)
+    if state.feeEstimator != nil:
+      let feePath = state.config.dataDir / state.config.network /
+                    "fee_estimates.json"
+      info "saving fee estimates", path = feePath
+      state.feeEstimator.saveFeeEstimates(feePath)
+
+    # The startup body audit reads RocksDB from its own thread for the first
+    # 10-20 min after boot; closing the DB under it is a use-after-close. Stop
+    # it before the flush (it may let lock waiters through while it waits).
+    var auditStopped = true
+    if cs != nil and not fatalShutdown:
+      auditStopped = cs.stopStartupBodyAudit(5000)
+
+    # 4. The one chainstate flush: coins, then the best-block marker.
+    if cs != nil and not fatalShutdown:
+      cs.flushStateForShutdown()
+
+    # 5. Wallets (save-on-mutation keeps them current; belt and braces).
+    if state.rpcServer != nil and state.rpcServer.walletManager != nil:
+      info "flushing wallets"
+      try: state.rpcServer.walletManager.persistAllWallets()
+      except CatchableError: discard
+
+    if cs != nil:
+      if fatalShutdown:
+        warn "fatal shutdown: leaving the database to process exit (no close-time flush)"
+      elif auditStopped:
+        info "closing database"
+        cs.close()
+      else:
+        warn "retained-range body audit did not stop; leaving the database open"
+
+  removePidFile()
+  info "shutdown complete"
+  if fatalShutdown or isFatal():
+    quit(1)
+  quit(0)
+
+proc shutdownWatcher(state: NodeState) {.async.} =
+  ## Main-loop half of the shutdown (Core WaitForShutdown). Each wake is a
+  ## chronos callback boundary: no synchronous main-thread section is in
+  ## progress, so the flush below never sees a half-applied block.
+  while not shutdownRequested():
+    await sleepAsync(chronos.milliseconds(50))
+  try:
+    {.cast(gcsafe).}:
+      performShutdown(state)
+  except Exception as e:
+    # Never return into the loop half shut down: the flush either ran or the
+    # restart replays from the last committed block.
+    error "shutdown failed", error = e.msg
+    quit(1)
+
 proc setupSignalHandlers*() =
-  ## Setup SIGINT/SIGTERM handlers for graceful shutdown, plus SIGHUP for
-  ## log-file reopen (rotation-friendly; matches Bitcoin Core's
-  ## `OpenDebugLog` reopen-on-rotate behaviour).
+  ## SIGINT/SIGTERM only REQUEST a shutdown (async-signal-safe: an atomic
+  ## store and a write(2)); the shutdown itself runs on the main loop
+  ## (shutdownWatcher -> performShutdown). SIGHUP reopens the log file
+  ## (rotation-friendly; Core `OpenDebugLog` reopen-on-rotate).
   proc sigHupHandler(sig: cint) {.noconv.} =
     # Best-effort log reopen; never modifies node state. Safe for signal
     # context because reopenLog uses only POSIX open/dup2/close.
     reopenLog()
 
   proc sigHandler(sig: cint) {.noconv.} =
-    echo "\nReceived signal " & $sig & ", shutting down..."
-
-    # Always remove the PID file we wrote on launch — even if globalNodeState
-    # is nil (early-startup crash path).
-    removePidFile()
-
-    # Gate 6 (Core AbortNode): after a fatal system fault the in-memory
-    # chainstate is exactly what could NOT be made durable. Do not write it:
-    # skip the IBD-batch flush and the UTXO-cache flush, leave the database
-    # handle to process exit, and exit 1 so systemd (Restart=on-failure)
-    # restarts the node, which replays from the last state that committed.
-    let fatalShutdown = isFatal()
-    if fatalShutdown:
-      error "shutting down after a FATAL system fault — skipping the " &
-            "chainstate flush; exit status 1", reason = fatalMessage()
-
-    if globalNodeState != nil:
-      globalNodeState.running = false
-
-      # cs_main for the rest of shutdown. A signal can land on any thread; on
-      # the main thread this is a recursive acquire of its own base hold, on a
-      # foreign thread it waits for the main thread's next hand-over. Never
-      # released: quit() follows.
-      if globalNodeState.chainState != nil:
-        globalNodeState.chainState.chainLock.acquireChain()
-
-      # If in IBD mode, flush the write batch before closing (WAL is disabled
-      # during IBD so unflushed blocks are not durable until stopIBD is called)
-      if not fatalShutdown and globalNodeState.chainState != nil and
-         globalNodeState.chainState.ibdMode:
-        info "flushing IBD batch before shutdown"
-        globalNodeState.chainState.stopIBD()
-
-      # Flush UTXO cache
-      if not fatalShutdown and globalNodeState.chainState != nil:
-        info "flushing UTXO cache"
-        globalNodeState.chainState.flushCache()
-
-      # Stop REST server (best-effort: just flips the running flag; the
-      # listener exits the next accept(). The thread storage on
-      # NodeState.restThread is freed when the NodeState ref drops).
-      if globalNodeState.restServer != nil:
-        info "stopping REST server"
-        globalNodeState.restServer.stop()
-
-      # Stop RPC server and remove cookie file
-      if globalNodeState.rpcServer != nil:
-        info "stopping RPC server"
-        globalNodeState.rpcServer.stop()
-        let cookiePath = globalNodeState.config.dataDir /
-                         globalNodeState.config.network / ".cookie"
-        if fileExists(cookiePath):
-          removeFile(cookiePath)
-          info "removed RPC cookie file", path = cookiePath
-
-      # Save fee estimates
-      if globalNodeState.feeEstimator != nil:
-        let feePath = globalNodeState.config.dataDir /
-                      globalNodeState.config.network / "fee_estimates.json"
-        info "saving fee estimates", path = feePath
-        globalNodeState.feeEstimator.saveFeeEstimates(feePath)
-
-      # Dump mempool to mempool.dat (Bitcoin Core compatible).
-      if globalNodeState.mempool != nil:
-        let mempoolPath = globalNodeState.config.dataDir /
-                          globalNodeState.config.network / CurrentMempoolDumpFile
-        info "saving mempool", path = mempoolPath
-        discard dumpMempool(globalNodeState.mempool, mempoolPath)
-
-      # Final wallet flush. Save-on-mutation already keeps every loaded
-      # wallet's snapshot current; this is the belt-and-suspenders pass so a
-      # clean shutdown is guaranteed durable too. DATA-LOSS FIX wa0fq5wtk.
-      if globalNodeState.rpcServer != nil and
-         globalNodeState.rpcServer.walletManager != nil:
-        info "flushing wallets"
-        try: globalNodeState.rpcServer.walletManager.persistAllWallets()
-        except CatchableError: discard
-
-      # Disconnect peers
-      if globalNodeState.peerManager != nil:
-        info "disconnecting peers"
-        globalNodeState.peerManager.stop()
-
-      # Close database. The startup body audit reads RocksDB from its own
-      # thread for the first 10-20 min after boot; closing the DB under it
-      # is a use-after-close. Stop it first. If it does not stop in time,
-      # leave the DB open: every write above went through the WAL (stopIBD
-      # already flushed the IBD batch), and process exit reclaims the handle.
-      if globalNodeState.chainState != nil:
-        if fatalShutdown:
-          warn "fatal shutdown: leaving the database to process exit (no close-time flush)"
-        elif globalNodeState.chainState.stopStartupBodyAudit(5000):
-          info "closing database"
-          globalNodeState.chainState.close()
-        else:
-          warn "retained-range body audit did not stop; leaving the database open"
-
-
-      info "shutdown complete"
-
-    if fatalShutdown or isFatal():
-      quit(1)
-    quit(0)
+    shutdownFlag.store(true, moRelease)
+    discard posix.write(2, ShutdownBanner.cstring, ShutdownBanner.len)
 
   # AbortNode -> shutdown: the latch (util/fatal) requests the SAME shutdown a
-  # `kill -TERM` / RPC `stop` runs; the handler above sees the latch and skips
+  # `kill -TERM` / RPC `stop` runs; performShutdown sees the latch and skips
   # every chainstate flush, then exits 1.
   setAbortAction(proc() {.gcsafe, raises: [].} =
     discard posix.kill(posix.getpid(), posix.SIGTERM))
@@ -2512,6 +2540,10 @@ proc startNode*(config: NimrodConfig) {.async.} =
   )
   {.gcsafe.}:
     globalNodeState = state
+  # Shutdown runs on this loop, at a callback boundary (NI-4). A signal that
+  # arrived during the synchronous parts of startup is served at the first
+  # await below.
+  asyncSpawn shutdownWatcher(state)
 
   # 1. Initialize crypto engine
   info "initializing crypto engine"
