@@ -18,7 +18,7 @@ import ../storage/indexes/txospenderindex
 import ../storage/indexes/gcs as gcsMod
 import ../mempool/[mempool, package, persist, orphan]
 import ../crypto/[hashing, secp256k1, address, signmessage]
-import ../network/[peer, peermanager, banman, messages, asmap, netgroup]
+import ../network/[peer, peermanager, banman, messages, asmap, netgroup, p2p_cmd_queue]
 import ../mining/[fees, blocktemplate]
 import ../util/ops as opsMod
 import ../util/tip_notifier
@@ -53,6 +53,9 @@ type
                                          ## written (requestNodeShutdown), so
                                          ## `stop` and SIGTERM share one path.
     shutdownSignalled: bool
+    p2pQueue*: P2PCmdQueue               ## RPC -> main-loop P2P commands (NI-6).
+                                         ## nil outside the node (unit tests):
+                                         ## postP2P then runs on this thread.
     stopping: Atomic[bool]               ## set by stop() (main thread, shutdown
                                          ## step 1); handlers let in afterwards
                                          ## answer "Shutting down" (Core
@@ -205,6 +208,19 @@ const
 proc newRpcError(code: int, msg: string): ref RpcError =
   result = newException(RpcError, msg)
   result.code = code
+
+
+proc postP2P(rpc: RpcServer, cmd: sink P2PCmd) =
+  ## Every P2P side effect of an RPC goes through here (NI-6): peers and their
+  ## chronos transports belong to the main loop, so the command is queued for
+  ## it (PeerManager.p2pCommandLoop). Without a node main loop (unit tests)
+  ## the calling thread's loop owns the peers and the command runs here.
+  if rpc.peerManager == nil:
+    return
+  if rpc.p2pQueue != nil:
+    rpc.p2pQueue.post(cmd)
+  else:
+    rpc.peerManager.runP2PCommand(cmd)
 
 proc coreInt32Bound*(v: int64): int =
   ## Core reads numeric RPC arguments with `UniValue::getInt<int>()`, which
@@ -1343,7 +1359,7 @@ proc handleGetBlockFromPeer(rpc: RpcServer, params: JsonNode): JsonNode =
   # handlers in this file (broadcastTx / broadcastBlock) the write is fired via
   # asyncSpawn+spawnSafe so a torn-down transport can't promote a transport
   # race into a process-killing FutureDefect.
-  asyncSpawn spawnSafe(peer.sendGetData(invs))
+  rpc.postP2P(P2PCmd(kind: pcGetData, host: peer.address, port: peer.port, invs: invs))
 
   # Core returns UniValue::VOBJ — an empty object.
   newJObject()
@@ -5042,7 +5058,7 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
       # Already in mempool, just return the txid (idempotent)
       # Re-broadcast to peers to help propagation
       if rpc.peerManager != nil:
-        asyncSpawn rpc.peerManager.broadcastTx(tx)
+        rpc.postP2P(P2PCmd(kind: pcBroadcastTx, tx: tx))
       return %txidHex
 
     # Calculate transaction weight and fee rate
@@ -5081,7 +5097,7 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
     # Broadcast inv to peers (let them request the full tx)
     if rpc.peerManager != nil:
-      asyncSpawn rpc.peerManager.broadcastTx(tx)
+      rpc.postP2P(P2PCmd(kind: pcBroadcastTx, tx: tx))
 
     %txidHex
   except RpcError:
@@ -5458,7 +5474,7 @@ proc handleSubmitPackage(rpc: RpcServer, params: JsonNode): JsonNode =
     # Broadcast all transactions
     if rpc.peerManager != nil:
       for tx in txns:
-        asyncSpawn rpc.peerManager.broadcastTx(tx)
+        rpc.postP2P(P2PCmd(kind: pcBroadcastTx, tx: tx))
 
   response
 
@@ -5509,7 +5525,7 @@ proc handlePing(rpc: RpcServer, params: JsonNode): JsonNode =
   # per-peer send error is swallowed inside sendPings and can never fail the RPC
   # (peerless / dropped peers tolerated). On a peerless node this spawns a
   # no-op loop over an empty peer set and still returns null.
-  asyncSpawn rpc.peerManager.sendPingsNow()
+  rpc.postP2P(P2PCmd(kind: pcPingAll))
 
   # Core returns UniValue::VNULL -> JSON null.
   newJNull()
@@ -6019,14 +6035,12 @@ proc handleAddNode(rpc: RpcServer, params: JsonNode): JsonNode =
     except ValueError:
       raise newRpcError(RpcInvalidParams, "invalid port number")
 
-  proc connectAsync(pm: PeerManager, h: string, p: uint16) {.async.} =
-    # addnode peers are MANUAL connections (Core CConnman::ConnectNode with
-    # ConnectionType::MANUAL): they bypass the automatic-outbound routability
-    # gate (RFC1918/loopback skip) and slot limits, so an operator can force-dial
-    # a specific peer — including a loopback peer for testing. Using the
-    # full-relay path here silently dropped loopback addnode dials at the
-    # isRoutable() gate.
-    discard await pm.connectManualPeer(h, p)
+  # addnode peers are MANUAL connections (Core CConnman::ConnectNode with
+  # ConnectionType::MANUAL): they bypass the automatic-outbound routability
+  # gate (RFC1918/loopback skip) and slot limits, so an operator can force-dial
+  # a specific peer — including a loopback peer for testing. The dial and the
+  # peer's whole message loop run on the MAIN loop (pcConnectManual): dialled
+  # from here they lived on the RPC thread's dispatcher (NI-5).
 
   case command
   of "add":
@@ -6037,7 +6051,7 @@ proc handleAddNode(rpc: RpcServer, params: JsonNode): JsonNode =
     # success-path side effect.
     if not rpc.peerManager.addAddedNode(node):
       raise newRpcError(RpcClientNodeAlreadyAdded, "Error: Node already added")
-    asyncSpawn connectAsync(rpc.peerManager, host, port)
+    rpc.postP2P(P2PCmd(kind: pcConnectManual, host: host, port: port))
   of "remove":
     # Core rpc/net.cpp::addnode "remove" raises RPC_CLIENT_NODE_NOT_ADDED (-24)
     # when the node was never added (CConnman::RemoveAddedNode returns false).
@@ -6046,12 +6060,12 @@ proc handleAddNode(rpc: RpcServer, params: JsonNode): JsonNode =
         "Error: Node could not be removed. It has not been added previously.")
     for peer in rpc.peerManager.getReadyPeers():
       if peer.address == host and peer.port == port:
-        asyncSpawn rpc.peerManager.removePeer(peer)
+        rpc.postP2P(P2PCmd(kind: pcDisconnect, host: peer.address, port: peer.port))
         break
   of "onetry":
     # Core's "onetry" does NOT touch the added-node list (net.cpp:352-357); it
     # only opens a one-off MANUAL connection.
-    asyncSpawn connectAsync(rpc.peerManager, host, port)
+    rpc.postP2P(P2PCmd(kind: pcConnectManual, host: host, port: port))
   else:
     raise newRpcError(RpcMiscError, AddNodeHelp)
 
@@ -6490,7 +6504,7 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
         # Broadcast to peers
         if rpc.peerManager != nil:
-          asyncSpawn rpc.peerManager.broadcastBlock(blk)
+          rpc.postP2P(P2PCmd(kind: pcBroadcastBlock, blk: blk))
 
       newJNull()  # null = success per BIP-22
 
@@ -6628,7 +6642,7 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
           inc hAt
 
       if rpc.peerManager != nil:
-        asyncSpawn rpc.peerManager.broadcastBlock(blk)
+        rpc.postP2P(P2PCmd(kind: pcBroadcastBlock, blk: blk))
 
       newJNull()  # null = success per BIP-22 (reorg activated this tip)
 
@@ -6958,7 +6972,7 @@ proc handleGenerateToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
     for hash in hashes:
       let blkOpt = rpc.chainState.db.getBlock(hash)
       if blkOpt.isSome:
-        asyncSpawn rpc.peerManager.broadcastBlock(blkOpt.get())
+        rpc.postP2P(P2PCmd(kind: pcBroadcastBlock, blk: blkOpt.get()))
 
   result
 
@@ -7006,7 +7020,7 @@ proc handleGenerateToDescriptor(rpc: RpcServer, params: JsonNode): JsonNode =
     for hash in hashes:
       let blkOpt = rpc.chainState.db.getBlock(hash)
       if blkOpt.isSome:
-        asyncSpawn rpc.peerManager.broadcastBlock(blkOpt.get())
+        rpc.postP2P(P2PCmd(kind: pcBroadcastBlock, blk: blkOpt.get()))
 
   # Convert to JSON array of hex strings
   var result = newJArray()
@@ -7096,7 +7110,7 @@ proc handleGenerateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   if rpc.peerManager != nil:
     let blkOpt = rpc.chainState.db.getBlock(hash)
     if blkOpt.isSome:
-      asyncSpawn rpc.peerManager.broadcastBlock(blkOpt.get())
+      rpc.postP2P(P2PCmd(kind: pcBroadcastBlock, blk: blkOpt.get()))
 
   %*{
     "hash": reverseHex(toHex(array[32, byte](hash)))
@@ -7394,7 +7408,10 @@ proc handleSetBan(rpc: RpcServer, params: JsonNode): JsonNode =
     else:
       # bantime is relative duration in seconds
       let duration = initDuration(seconds = bantime)
-      rpc.peerManager.banPeer(address, duration, brManuallyAdded)
+      rpc.peerManager.banManager.ban(address, duration, brManuallyAdded)
+    # Core rpc/net.cpp setban: Ban(), then connman.DisconnectNode(subnet) —
+    # for an absolute ban too. The disconnect touches transports: main loop.
+    rpc.postP2P(P2PCmd(kind: pcDisconnectAddress, host: address, reason: "banned"))
 
   of "remove":
     if not rpc.peerManager.unbanPeer(address):
@@ -7435,7 +7452,8 @@ proc handleDisconnectNode(rpc: RpcServer, params: JsonNode): JsonNode =
     let ready = rpc.peerManager.getReadyPeers()
     if nodeid < 0 or nodeid >= ready.len:
       raise newRpcError(RpcClientNodeNotConnected, "Node not found in connected nodes")
-    asyncSpawn rpc.peerManager.removePeer(ready[int(nodeid)])
+    let target = ready[int(nodeid)]
+    rpc.postP2P(P2PCmd(kind: pcDisconnect, host: target.address, port: target.port))
     return newJNull()
 
   if haveAddress and haveNodeid:
@@ -7460,7 +7478,7 @@ proc handleDisconnectNode(rpc: RpcServer, params: JsonNode): JsonNode =
   var found = false
   for peer in rpc.peerManager.getReadyPeers():
     if peer.address == host and peer.port == port:
-      asyncSpawn rpc.peerManager.removePeer(peer)
+      rpc.postP2P(P2PCmd(kind: pcDisconnect, host: peer.address, port: peer.port))
       found = true
       break
 
@@ -10132,7 +10150,7 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
 
   # Broadcast to peers
   if rpc.peerManager != nil:
-    asyncSpawn rpc.peerManager.broadcastTx(tx)
+    rpc.postP2P(P2PCmd(kind: pcBroadcastTx, tx: tx))
 
   %txidHex
 
@@ -10171,7 +10189,7 @@ proc commitWalletSend(rpc: RpcServer, w: var Wallet, tx: var Transaction,
       w.addUtxo(outpoint, output, 0, key.path, isInternal, false)
   rpc.persistTargetWallet()
   if rpc.peerManager != nil:
-    asyncSpawn rpc.peerManager.broadcastTx(tx)
+    rpc.postP2P(P2PCmd(kind: pcBroadcastTx, tx: tx))
   reverseHex(toHex(array[32, byte](txid)))
 
 proc handleSend(rpc: RpcServer, params: JsonNode): JsonNode =
@@ -13291,7 +13309,7 @@ proc handleBumpFee(rpc: RpcServer, params: JsonNode): JsonNode =
 
   # Broadcast to peers (best-effort; matches handleSendToAddress).
   if rpc.peerManager != nil:
-    asyncSpawn rpc.peerManager.broadcastTx(newTx)
+    rpc.postP2P(P2PCmd(kind: pcBroadcastTx, tx: newTx))
 
   let txidHex = reverseHex(toHex(array[32, byte](newTxid)))
   %*{
@@ -13634,7 +13652,7 @@ proc handleSendPayJoinRequest*(rpc: RpcServer, params: JsonNode): JsonNode =
       w.addUtxo(op, output, 0, key.path, isInternal, false)
 
   if rpc.peerManager != nil:
-    asyncSpawn rpc.peerManager.broadcastTx(finalTx)
+    rpc.postP2P(P2PCmd(kind: pcBroadcastTx, tx: finalTx))
 
   result = %*{
     "txid": txidHex,

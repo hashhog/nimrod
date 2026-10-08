@@ -9,7 +9,7 @@ import ./primitives/[types, serialize]
 import ./consensus/[params, validation]
 import ./storage/[db, chainstate, snapshot, blockstore, pruner, undo]
 import ./storage/indexes/[blockfilterindex, gcs, coinstatsindex, txospenderindex]
-import ./network/[peer, peermanager, sync, messages, compact_blocks, asmap, netgroup]
+import ./network/[peer, peermanager, sync, messages, compact_blocks, asmap, netgroup, p2p_cmd_queue]
 import ./mempool/[mempool, persist, orphan]
 import ./mining/fees
 import ./wallet/manager
@@ -283,6 +283,7 @@ type
                                           ## (non-asmap) manager when no file is
                                           ## given.  Wired into peerManager and
                                           ## the getpeerinfo RPC handler.
+    p2pQueue*: P2PCmdQueue                ## RPC -> main-loop P2P commands (NI-6)
     lastAsmapHealthCheck*: int64          ## Unix timestamp of last ASMapHealthCheck.
                                           ## 0 = never run.  Checked every heartbeat;
                                           ## re-runs every 3600 s.
@@ -2782,6 +2783,12 @@ proc startNode*(config: NimrodConfig) {.async.} =
     warn "--externalip has no effect with --nolisten (nothing is advertised)"
   state.peerManager.updateHeight(state.chainState.bestHeight)
   state.peerManager.setMessageCallback(messageCallback(state))
+  # NI-6: peers and their transports belong to THIS (main) loop. RPC handlers
+  # post their P2P side effects here instead of driving transports from the
+  # RPC thread; Peer.sendBytes/disconnect refuse a foreign thread.
+  setP2PLoopThread()
+  state.p2pQueue = newP2PCmdQueue()
+  asyncSpawn state.peerManager.p2pCommandLoop(state.p2pQueue)
 
   # 5c. W117 BUG-3 FIX (FIX-56): wire the dead-helper src/network/proxy.nim
   # subsystems (SOCKS5 / Tor control / I2P SAM / ProxyManager) into the
@@ -3231,6 +3238,7 @@ proc startNode*(config: NimrodConfig) {.async.} =
       config.rpcPassword,
       cookiePass
     )
+    state.rpcServer.p2pQueue = state.p2pQueue  # before the RPC thread starts
     # Wire the wait-family tip notifier (Core KernelNotifications blockTip /
     # WaitTipChanged). Created once here; the chainstate fires its
     # tipChangedHook on every tip advance (post-IBD connect, IBD connect, and

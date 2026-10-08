@@ -2,7 +2,7 @@
 ## TCP connection with message framing, version handshake, and ping/pong
 ## Uses chronos for async networking
 
-import std/[strformat, random, hashes, tables, os, strutils, options]
+import std/[strformat, random, hashes, tables, os, strutils, options, atomics]
 import ../util/rng
 import std/times as stdtimes
 import chronos
@@ -345,8 +345,39 @@ proc connect*(peer: Peer): Future[bool] {.async.} =
     peer.state = psDisconnected
     return false
 
+var p2pLoopThread: Atomic[int]
+  ## getThreadId() of the thread whose chronos loop owns every peer transport
+  ## (the main thread in the running node; 0 = unset: unit tests, CLI).
+var offLoopUses: Atomic[int]
+
+proc setP2PLoopThread*() =
+  ## Called once by the main thread before any other thread can see a peer.
+  p2pLoopThread.store(getThreadId(), moRelease)
+
+proc p2pOffLoopCount*(): int = offLoopUses.load(moRelaxed)
+
+proc clearP2PLoopThread*() =
+  ## Tests only: forget the owning loop (0 = no check).
+  p2pLoopThread.store(0, moRelease)
+
+proc onP2PLoop*(op: string): bool =
+  ## NI-6 guard: a peer transport may only be driven from its own loop.
+  ## Another thread doing it wedges the transport (chronos registers the fd
+  ## with the CALLING thread's selector) or resumes futures on the wrong
+  ## thread. Refuse, loudly; RPC handlers post to p2p_cmd_queue instead.
+  let t = p2pLoopThread.load(moAcquire)
+  if t == 0 or t == getThreadId():
+    return true
+  let n = offLoopUses.fetchAdd(1, moRelaxed) + 1
+  if n <= 20:
+    error "P2P transport used off its loop; refused", op = op,
+          thread = getThreadId(), loopThread = t, count = n
+  false
+
 proc disconnect*(peer: Peer, reason: string = "") {.async.} =
   ## Disconnect from the peer gracefully
+  if not onP2PLoop("disconnect"):
+    return
   if peer.closing:
     return
 
@@ -442,6 +473,8 @@ proc sendBytes(peer: Peer, data: seq[byte]) {.async.} =
   ##    every waiting sender gets PeerError. (chronos does not fail queued
   ##    writes when a socket is closed, so waiters also give up as soon as
   ##    the transport is closed by anyone.)
+  if not onP2PLoop("send"):
+    raise newException(PeerError, "P2P send refused off the main loop")
   let transp = peer.transport
   if transp == nil or transp.closed:
     raise newException(PeerError, "not connected")

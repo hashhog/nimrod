@@ -25,6 +25,7 @@ import ./addr
 import ./addrman
 import ./localaddr
 import ./proxy as proxy_mod
+import ./p2p_cmd_queue
 import ../consensus/params
 import ../primitives/[types, serialize]
 import ../crypto/hashing
@@ -664,10 +665,9 @@ proc inboundCount*(pm: PeerManager): int =
 proc isBanned*(pm: PeerManager, address: string): bool =
   pm.banManager.isBanned(address)
 
-proc banPeer*(pm: PeerManager, address: string, duration: times.Duration = BanDuration,
-              reason: BanReason = brMisbehaving) =
-  pm.banManager.ban(address, duration, reason)
-
+proc disconnectMatching*(pm: PeerManager, address: string, reason = "banned") =
+  ## Drop every connected peer whose address matches `address` (Core
+  ## CConnman::DisconnectNode(subnet/addr), used by setban). Main loop only.
   let normalizedAddr = normalizeAddress(address)
   var toRemove: seq[string]
   for key, peer in pm.peers:
@@ -682,8 +682,13 @@ proc banPeer*(pm: PeerManager, address: string, duration: times.Duration = BanDu
       if ext.connType in {pctFullRelay, pctBlockRelayOnly}:
         pm.outboundNetGroups.excl(ext.netGroup)
       pm.extendedPeers.del(key)
-    asyncSpawn peer.disconnect("banned")
+    asyncSpawn peer.disconnect(reason)
     pm.peers.del(key)
+
+proc banPeer*(pm: PeerManager, address: string, duration: times.Duration = BanDuration,
+              reason: BanReason = brMisbehaving) =
+  pm.banManager.ban(address, duration, reason)
+  pm.disconnectMatching(address)
 
 proc unbanPeer*(pm: PeerManager, address: string): bool =
   pm.banManager.unban(address)
@@ -1718,6 +1723,54 @@ proc sendPingsNow*(pm: PeerManager) {.async.} =
   ## that peer inside Peer.sendBytes.
   for peer in pm.getReadyPeers():
     asyncSpawn spawnSafe(peer.sendPing())
+
+proc findPeer*(pm: PeerManager, host: string, port: uint16): Peer =
+  pm.peers.getOrDefault(peerKey(host, port), nil)
+
+proc dialManual(pm: PeerManager, host: string, port: uint16) {.async.} =
+  # addnode peers are MANUAL connections (Core CConnman::ConnectNode with
+  # ConnectionType::MANUAL): they bypass the automatic-outbound routability
+  # gate and slot limits.
+  try:
+    discard await pm.connectManualPeer(host, port)
+  except CatchableError as e:
+    debug "manual connect failed", host = host, port = port, error = e.msg
+
+proc runP2PCommand*(pm: PeerManager, cmd: P2PCmd) =
+  ## Execute one RPC-posted P2P command on the CURRENT thread's loop — in the
+  ## node that is always the main loop (p2pCommandLoop). Peers are re-resolved
+  ## by host:port here: the one the RPC saw may be gone, which is a no-op.
+  case cmd.kind
+  of pcBroadcastTx:
+    asyncSpawn pm.broadcastTx(cmd.tx)
+  of pcBroadcastBlock:
+    asyncSpawn pm.broadcastBlock(cmd.blk)
+  of pcPingAll:
+    asyncSpawn pm.sendPingsNow()
+  of pcGetData:
+    let p = pm.findPeer(cmd.host, cmd.port)
+    if p != nil:
+      asyncSpawn spawnSafe(p.sendGetData(cmd.invs))
+  of pcDisconnect:
+    let p = pm.findPeer(cmd.host, cmd.port)
+    if p != nil:
+      asyncSpawn pm.removePeer(p)
+  of pcDisconnectAddress:
+    pm.disconnectMatching(cmd.host, if cmd.reason.len > 0: cmd.reason else: "banned")
+  of pcConnectManual:
+    asyncSpawn pm.dialManual(cmd.host, cmd.port)
+
+proc p2pCommandLoop*(pm: PeerManager, q: P2PCmdQueue) {.async.} =
+  ## Main loop: run what RPC handlers posted (NI-6). Runs at callback
+  ## boundaries like every other main-loop task, under the main thread's base
+  ## chain-lock hold.
+  while true:
+    await q.waitForCommands()
+    for cmd in q.takeAll():
+      try:
+        pm.runP2PCommand(cmd)
+      except CatchableError as e:
+        warn "RPC-posted P2P command failed", kind = $cmd.kind, error = e.msg
 
 proc pingPeers(pm: PeerManager) {.async.} =
   ## Background keepalive tick (mainLoop). Forces a ping to every ready peer on
