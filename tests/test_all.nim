@@ -152,6 +152,7 @@ const IncludedTests = [
   "test_mempool",
   "test_mempool_eviction_w86",
   "test_mempool_persist",
+  "test_mempool_reorg",
   "test_messages",
   "test_minimalif",
   "test_miniscript",
