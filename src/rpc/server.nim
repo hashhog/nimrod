@@ -2673,6 +2673,8 @@ proc handleInvalidateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
   newJNull()
 
+proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode
+
 proc handleReconsiderBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Removes invalidity status of a block and its descendants
   ## Reference: Bitcoin Core rpc/blockchain.cpp reconsiderblock
@@ -2682,9 +2684,7 @@ proc handleReconsiderBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   ##
   ## Returns: null on success, error on failure
   ##
-  ## Note: This does not automatically reconnect the block to the active chain.
-  ## You may need to restart the node or wait for a new block to trigger
-  ## chain selection.
+  ## Like Core, it then activates the most-work stored chain (see below).
 
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing blockhash parameter")
@@ -2710,6 +2710,23 @@ proc handleReconsiderBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
     else:
       raise newRpcError(RpcMiscError, $result.error)
+
+  # Core ReconsiderBlock -> ActivateBestChain (rpc/blockchain.cpp
+  # reconsiderblock; validation.cpp ResetBlockFailureFlags re-adds the cleared
+  # entries to setBlockIndexCandidates): the chain moves back onto the
+  # most-work stored branch before the RPC returns, instead of waiting for a
+  # peer to re-announce it. The connect goes through submitblock's own
+  # extend / side-branch-reorg machinery (full validation, mempool, indexes),
+  # still under the chain lock this RPC holds. A missing body on the branch
+  # leaves the tip where it is; sync fills it later (Core: no
+  # HaveNumChainTxs, not a candidate).
+  let cand = rpc.chainState.bestStoredCandidate()
+  if cand.isSome:
+    let blkOpt = rpc.chainState.db.getBlock(cand.get())
+    if blkOpt.isSome:
+      let r = rpc.handleSubmitBlock(%*[toHex(serialize(blkOpt.get()))])
+      debug "reconsiderblock: activated best stored chain", answer = $r,
+            tip = rpc.chainState.bestHeight
 
   newJNull()
 
@@ -6394,6 +6411,34 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     # Reference: Bitcoin Core AcceptBlockHeader -> check prev block exists
     var cs = rpc.chainState
     let prevHash = blk.header.prevBlock
+
+    # Core AcceptBlockHeader / AcceptBlock on a block the index already knows
+    # (validation.cpp:4186-4223, 4318-4335; rpc/mining.cpp:1094-1103). Runs
+    # under the chain lock every RPC holds (I1), so it cannot race a connect.
+    #   * the block is BLOCK_FAILED_VALID (invalidateblock, or a validation
+    #     failure) -> "duplicate-invalid"; it is NEVER reconnected. Before this
+    #     check, a failed block whose parent was the tip fell into the
+    #     extend-the-tip arm below and was connected again (fleet-conformance
+    #     INV-SUBMIT: tip 294 -> 295 where Core holds 294).
+    #   * its parent is failed -> "bad-prevblk" (BLOCK_INVALID_PREV).
+    #   * already on the active chain, or stored with no more work than the
+    #     tip -> "duplicate" (fAlreadyHave: accepted, not a new block).
+    let submittedHash = BlockHash(doubleSha256(serialize(blk.header)))
+    let selfIdxOpt = cs.db.getBlockIndex(submittedHash)
+    if selfIdxOpt.isSome:
+      let selfIdx = selfIdxOpt.get()
+      if selfIdx.failureFlags.isFailed():
+        return %"duplicate-invalid"
+      let activeAt = cs.db.getBlockHashByHeight(selfIdx.height)
+      if selfIdx.height <= cs.bestHeight and activeAt.isSome and
+         activeAt.get() == submittedHash:
+        return %"duplicate"
+      if cs.db.hasBlockBody(submittedHash) and
+         compareWork256(selfIdx.totalWork, cs.totalWork) <= 0:
+        return %"duplicate"
+    let prevIdxForFail = cs.db.getBlockIndex(prevHash)
+    if prevIdxForFail.isSome and prevIdxForFail.get().failureFlags.isFailed():
+      return %"bad-prevblk"
 
     if prevHash == cs.bestBlockHash:
       # Block extends the current best chain — connect it

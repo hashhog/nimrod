@@ -4417,8 +4417,12 @@ proc acceptSideBranchBlock*(
   var forkPoint: BlockHash = BlockHash(default(array[32, byte]))
   var foundFork = false
   while walkHeight >= 0:
+    # Only slots at or below the validated tip are the active chain: sync
+    # writes header slots ahead of it, and a fork point above the tip would
+    # send handleReorg looking for a block it can never walk back to.
     let activeAtHeight = cs.db.getBlockHashByHeight(walkHeight)
-    if activeAtHeight.isSome and activeAtHeight.get() == walkHash:
+    if walkHeight <= cs.bestHeight and activeAtHeight.isSome and
+       activeAtHeight.get() == walkHash:
       forkPoint = walkHash
       foundFork = true
       break

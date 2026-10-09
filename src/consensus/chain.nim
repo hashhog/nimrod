@@ -474,15 +474,21 @@ proc invalidateBlock*(
       if not disconnectResult.isOk:
         return chainMgmtErr(cmeDisconnectFailed)
 
-      # Mark disconnected block as BLOCK_FAILED_VALID
+      # Mark disconnected block as BLOCK_FAILED_VALID. Hash row ONLY:
+      # putBlockIndex would also re-write the height -> hash slot that
+      # disconnectBlock just deleted, so the active-chain index went on
+      # claiming the invalidated block (getblockhash past the tip, and the
+      # side-branch fork walk then found a "fork point" above the tip, so
+      # reconsiderblock could never reorg back).
       var tipIdx = cs.db.getBlockIndex(tipHashOpt.get()).get()
       tipIdx.failureFlags.setFlag(BLOCK_FAILED_VALID)
-      cs.db.putBlockIndex(tipIdx)
+      cs.db.putBlockIndexHashOnly(tipIdx)
 
   else:
-    # Block is not on active chain, just mark it as invalid
+    # Block is not on active chain, just mark it as invalid. Hash row only:
+    # the height slot belongs to the active chain's block at that height.
     idx.failureFlags.setFlag(BLOCK_FAILED_VALID)
-    cs.db.putBlockIndex(idx)
+    cs.db.putBlockIndexHashOnly(idx)
 
   # Mark all descendants as BLOCK_FAILED_CHILD
   # Re-fetch the index in case it was updated during disconnection
@@ -516,6 +522,30 @@ proc reconsiderBlock*(
   cs.resetBlockFailureFlags(idx)
 
   chainMgmtOk()
+
+proc bestStoredCandidate*(cs: var ChainState): Option[BlockHash] =
+  ## The most-work block whose body is stored, that is not BLOCK_FAILED_VALID
+  ## and that has strictly more work than the active tip -- the head of Core's
+  ## setBlockIndexCandidates as ActivateBestChain sees it after
+  ## ReconsiderBlock / ResetBlockFailureFlags re-adds the cleared entries
+  ## (validation.cpp ResetBlockFailureFlags + FindMostWorkChain). Whether the
+  ## whole branch down to the active chain has bodies is checked by the
+  ## connect / reorg that follows (a gap leaves the tip where it is).
+  var bestWork = cs.totalWork
+  var best = none(BlockHash)
+  for (key, value) in chaindb.iterCf(cs.db.db, chaindb.cfBlockIndex):
+    if key.len != 32 or value.len == 0:
+      continue
+    let c = deserializeBlockIndex(value)
+    if c.failureFlags.isFailed():
+      continue
+    if compareWork256(c.totalWork, bestWork) <= 0:
+      continue
+    if not cs.db.hasBlockBody(c.hash):
+      continue
+    bestWork = c.totalWork
+    best = some(c.hash)
+  best
 
 proc preciousBlock*(
   cs: var ChainState,
