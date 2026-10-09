@@ -162,6 +162,7 @@ const IncludedTests = [
   "test_muhash_vectors",
   "test_netgroup",
   "test_networkdisable",
+  "test_ni8_walk_off_lock",
   "test_nil_db_height_index",
   "test_notification",
   "test_ops",

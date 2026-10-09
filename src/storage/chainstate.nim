@@ -58,6 +58,12 @@ when defined(nimrodRaceHooks):
 else:
   template racePoint(point: string, hash: BlockHash) = discard
 
+proc noteUtxoWalkCoin*(txid: TxId) {.inline, gcsafe, raises: [].} =
+  ## Long UTXO walks (gettxoutsetinfo, dumptxoutset) call this once per coin.
+  ## A test installs `raceHook` for point "utxo.walk" to park the walk.
+  when defined(nimrodRaceHooks):
+    racePoint("utxo.walk", BlockHash(array[32, byte](txid)))
+
 type
   ChainStateError* = object of CatchableError
 
@@ -2742,6 +2748,7 @@ proc addUtxoRow(info: var UtxoSetInfo, acc: var UtxoStatsAcc,
              (uint32(key[34]) shl 8)  or
               uint32(key[35])
   let outpoint = OutPoint(txid: TxId(txidBytes), vout: vout)
+  noteUtxoWalkCoin(outpoint.txid)
 
   # Distinct-tx count: increment whenever the leading 32 bytes change.
   if not acc.sawAny or txidBytes != acc.prevTxid:

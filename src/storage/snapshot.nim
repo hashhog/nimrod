@@ -589,6 +589,7 @@ proc createSnapshot*(
     # provenance.
     if isUnspendable(entry.output.scriptPubKey):
       continue
+    noteUtxoWalkCoin(op.txid)
     coins.add(SnapshotCoin(
       outpoint: op,
       output: entry.output,
