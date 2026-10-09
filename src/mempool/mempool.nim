@@ -2212,7 +2212,8 @@ proc evictLowestFee*(mp: Mempool) =
 
 # Select transactions for a new block
 proc selectTransactionsForBlock*(mp: Mempool, maxWeight: int = MaxBlockWeight): seq[Transaction] =
-  ## Select transactions for block template (greedy by ancestor fee rate)
+  ## Ancestor-feerate list, capped by maxWeight. Not used for block templates:
+  ## buildBlockTemplate packages by ancestor feerate and emits parents first.
   let entries = mp.getTransactionsByFeeRate(maxWeight)
   for entry in entries:
     result.add(entry.tx)
