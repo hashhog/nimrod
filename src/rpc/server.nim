@@ -6235,21 +6235,32 @@ proc handleGetBlockTemplate(rpc: RpcServer, params: JsonNode): JsonNode =
   )
 
   var txs = newJArray()
-  # Skip coinbase (index 0), add remaining transactions
-  for i in 1 ..< tmpl.transactions.len:
-    let tx = tmpl.transactions[i]
+  # Core rpc/mining.cpp: setTxIndex[txHash] = i over block.vtx, coinbase at 0.
+  # "depends" is the 1-based indexes of in-template parents this tx spends
+  # (BIP-22). Coinbase is not part of the transactions array, so the first
+  # real tx is index 1.
+  var setTxIndex = initTable[TxId, int]()
+  for i, tx in tmpl.transactions:
     let txid = tx.txid()
+    setTxIndex[txid] = i
+    if i == 0:
+      continue
     let entry = rpc.mempool.get(txid)
     let fee = if entry.isSome: int64(entry.get().fee) else: 0'i64
-
-    txs.add(%*{
-      "data": toHex(serialize(tx)),
-      "txid": reverseHex(toHex(array[32, byte](txid))),
-      "hash": reverseHex(toHex(array[32, byte](tx.wtxid()))),
-      "fee": fee,
-      "sigops": estimateTxSigops(tx),
-      "weight": validation.calculateTransactionWeight(tx)
-    })
+    var deps = newJArray()
+    for inp in tx.inputs:
+      let prev = inp.prevOut.txid
+      if setTxIndex.hasKey(prev):
+        deps.add(%setTxIndex[prev])
+    var item = newJObject()
+    item["data"] = %toHex(serialize(tx))
+    item["txid"] = %reverseHex(toHex(array[32, byte](txid)))
+    item["hash"] = %reverseHex(toHex(array[32, byte](tx.wtxid())))
+    item["depends"] = deps
+    item["fee"] = %fee
+    item["sigops"] = %estimateTxSigops(tx)
+    item["weight"] = %validation.calculateTransactionWeight(tx)
+    txs.add(item)
 
   # BUG-22 fix: compute rules array dynamically.
   # Bitcoin Core mining.cpp:950-958: always "csv"; if segwit active add "!segwit"
