@@ -557,11 +557,9 @@ proc createSnapshot*(
   ## never sees a torn file, and a SIGKILL during dump leaves only the
   ## .incomplete artifact (cleaned up here on any error path).
   ##
-  ## NOTE: a production-grade implementation would iterate the on-disk
-  ## leveldb-equivalent (rocksdb cfUtxo) using a cursor; nimrod's db.nim
-  ## doesn't expose iteration FFI yet, so we currently dump the in-memory
-  ## utxoCache. This still produces a Core-byte-compatible file for any
-  ## coins that *are* in the cache, which is sufficient for round-trip tests.
+  ## Walks the in-memory UTXO cache. `dumptxoutset` uses `writeUtxoSnapshot`
+  ## (a RocksDB snapshot) so the scan does not hold the chain lock. This proc
+  ## stays cache-based: callers stage coins with `putUtxoCache` only.
   ##
   ## Genesis coinbase is intentionally excluded: Bitcoin Core treats the
   ## genesis block's coinbase output as un-spendable and never adds it to
@@ -675,6 +673,82 @@ proc createSnapshot*(
             baseHash: cs.bestBlockHash,
             baseHeight: cs.bestHeight,
             txoutsetHash: txoutsetHash)
+
+proc writeUtxoSnapshot*(
+    v: DbSnapshotView,
+    path: string,
+    params: ConsensusParams,
+    baseHash: BlockHash,
+    baseHeight: int32
+): tuple[coinsWritten: uint64, baseHash: BlockHash, baseHeight: int32,
+    txoutsetHash: array[32, byte]] =
+  ## Write one already-open UTXO snapshot to `path`. The caller holds the
+  ## chain lock only while opening `v` (Core: cursor under cs_main, then
+  ## WriteUTXOSnapshot walks it unlocked). Two passes: the header needs
+  ## coins_count before the body, and both passes read the same snapshot.
+  let genesisCoinbaseTxid = buildGenesisBlock(params).txs[0].txid()
+
+  var hw = initHashWriter()
+  var coinsCount: uint64 = 0
+  raiseIfUtxoWalkShutdown()
+  for (op, entry) in v.iterateUtxosAt():
+    if entry.height == 0 and entry.isCoinbase and op.txid == genesisCoinbaseTxid:
+      continue
+    noteUtxoWalkCoin(op.txid)
+    raiseIfUtxoWalkShutdown()
+    inc coinsCount
+    hw.update(serializeCoinForHash(
+      op, int64(entry.output.value), entry.output.scriptPubKey,
+      entry.height, entry.isCoinbase))
+
+  let txoutsetHash = if coinsCount > 0: hw.finalizeHash()
+                     else: default(array[32, byte])
+  let meta = SnapshotMetadata(
+    version: SnapshotVersion,
+    networkMagic: params.networkMagic,
+    baseBlockhash: baseHash,
+    coinsCount: coinsCount
+  )
+  let tmpPath = path & ".incomplete"
+  let sf = openSnapshotForWrite(tmpPath, meta)
+  var renamed = false
+  defer:
+    sf.close()
+    if not renamed and fileExists(tmpPath):
+      try: removeFile(tmpPath) except CatchableError: discard
+
+  var written: uint64 = 0
+  var group: seq[SnapshotCoin] = @[]
+  var groupTxid: TxId
+  var haveGroup = false
+  for (op, entry) in v.iterateUtxosAt():
+    if entry.height == 0 and entry.isCoinbase and op.txid == genesisCoinbaseTxid:
+      continue
+    raiseIfUtxoWalkShutdown()
+    if haveGroup and op.txid != groupTxid:
+      sf.writeTxidGroup(groupTxid, group)
+      written += uint64(group.len)
+      group.setLen(0)
+    groupTxid = op.txid
+    haveGroup = true
+    group.add(SnapshotCoin(
+      outpoint: op,
+      output: entry.output,
+      height: entry.height,
+      isCoinbase: entry.isCoinbase))
+  if group.len > 0:
+    sf.writeTxidGroup(groupTxid, group)
+    written += uint64(group.len)
+  if written != coinsCount:
+    raise newException(SnapshotError,
+      "snapshot coin count changed between passes")
+
+  sf.syncSnapshotFile()
+  sf.close()
+  moveFile(tmpPath, path)
+  renamed = true
+  (coinsWritten: coinsCount, baseHash: baseHash, baseHeight: baseHeight,
+   txoutsetHash: txoutsetHash)
 
 # ============================================================================
 # Snapshot loading (loadtxoutset)

@@ -1978,6 +1978,16 @@ proc performShutdown(state: NodeState) =
     if cs != nil and not fatalShutdown:
       auditStopped = cs.stopStartupBodyAudit(5000)
 
+    # A dumptxoutset / gettxoutsetinfo walk has released the chain lock. Wait
+    # for it (and for a rollback reapply, which needs the lock back) before
+    # the flush, so the flush sees the restored tip and close is not under
+    # a live snapshot.
+    var walksDone = true
+    if state.rpcServer != nil and not fatalShutdown:
+      walksDone = state.rpcServer.waitForSnapshotWalks(5000)
+      if not walksDone:
+        warn "in-flight UTXO snapshot walk did not finish; leaving the database open"
+
     # 4. The one chainstate flush: coins, then the best-block marker.
     if cs != nil and not fatalShutdown:
       cs.flushStateForShutdown()
@@ -1991,11 +2001,13 @@ proc performShutdown(state: NodeState) =
     if cs != nil:
       if fatalShutdown:
         warn "fatal shutdown: leaving the database to process exit (no close-time flush)"
-      elif auditStopped:
+      elif auditStopped and walksDone:
         info "closing database"
         cs.close()
-      else:
+      elif not auditStopped:
         warn "retained-range body audit did not stop; leaving the database open"
+      else:
+        discard
 
   removePidFile()
   info "shutdown complete"
