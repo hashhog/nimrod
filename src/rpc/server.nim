@@ -60,6 +60,11 @@ type
                                          ## step 1); handlers let in afterwards
                                          ## answer "Shutting down" (Core
                                          ## CRPCTable::execute, IsRPCRunning).
+    snapshotWalks: Atomic[int]           ## In-flight UTXO snapshot walks
+                                         ## (dumptxoutset / gettxoutsetinfo)
+                                         ## that have released the chain lock.
+                                         ## Shutdown waits for this before
+                                         ## closing the database.
     crypto*: CryptoEngine
     blockFileManager*: BlockFileManager  ## Optional: for pruning support
     pruner*: Pruner                      ## Optional: production prune driver
@@ -270,6 +275,31 @@ proc newRpcServer*(
     blockSubmissionPaused: false,
     startedAt: getTime().toUnix()
   )
+
+proc beginSnapshotWalk(rpc: RpcServer) =
+  ## Count one walk that is about to release the chain lock. Call under the lock,
+  ## after the shutdown check, so shutdown cannot observe zero and close the DB
+  ## in the gap.
+  discard rpc.snapshotWalks.fetchAdd(1, moAcquireRelease)
+
+proc endSnapshotWalk(rpc: RpcServer) =
+  discard rpc.snapshotWalks.fetchSub(1, moAcquireRelease)
+
+proc waitForSnapshotWalks*(rpc: RpcServer, timeoutMs: int): bool =
+  ## Shutdown holds the chain lock. A walk blocked on it (dumptxoutset's
+  ## reapply) is let through; a walk in the scan drops the count when it
+  ## notices shutdown. true = none left.
+  if rpc == nil:
+    return true
+  var waited = 0
+  while rpc.snapshotWalks.load(moAcquire) > 0:
+    if waited >= timeoutMs:
+      return false
+    if rpc.chainState != nil:
+      discard rpc.chainState.chainLock.yieldForShutdown()
+    sleep(10)
+    waited += 10
+  true
 
 proc isBlockSubmissionPaused*(rpc: RpcServer): bool =
   ## Whether inbound block acceptance is currently gated by an active
@@ -8269,86 +8299,15 @@ proc handleDumpTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
     if params.len >= 3 and params[2].kind == JObject: params[2]
     else: newJObject()
 
-  let originalTipHeight = rpc.chainState.bestHeight
-  var targetHeight: int32 = originalTipHeight
-
-  if optionsObj.hasKey("rollback"):
-    if snapshotType.len > 0 and snapshotType != "rollback":
-      raise newRpcError(RpcInvalidParams,
-        "Invalid snapshot type \"" & snapshotType &
-        "\" specified with rollback option")
-    targetHeight = resolveRollbackTargetHeight(rpc, optionsObj["rollback"])
-  elif snapshotType == "rollback":
-    # Pick the highest assumeutxo entry <= current tip.
-    var best: int32 = -1
-    for entry in rpc.chainState.params.assumeutxoData:
-      if entry.height <= originalTipHeight and entry.height > best:
-        best = entry.height
-    if best < 0:
-      raise newRpcError(RpcMiscError,
-        "No assumeutxo snapshot entry available at or below current tip " &
-        $originalTipHeight)
-    targetHeight = best
-  elif snapshotType == "latest" or snapshotType == "":
-    targetHeight = originalTipHeight
-  else:
-    raise newRpcError(RpcInvalidParams,
-      "Invalid snapshot type \"" & snapshotType &
-      "\" specified. Please specify \"rollback\" or \"latest\"")
-
-  if targetHeight > originalTipHeight:
-    raise newRpcError(RpcInvalidParams,
-      "Target height above current tip")
-
-  # Pruned-mode pre-check. Mirrors Bitcoin Core
-  # rpc/blockchain.cpp:dumptxoutset:
-  #     if (IsPruneMode() &&
-  #         target_index->nHeight < node.chainman->m_blockman.GetFirstBlock()->nHeight)
-  #         throw "Block height N not available (pruned data). Use a height after M.";
-  # We fail fast here so a pruned datadir does not begin a rewind that is
-  # guaranteed to fail when disconnectBlock reads pruned undo data.
-  if rpc.blockFileManager != nil and rpc.blockFileManager.isPruneMode():
-    let firstAvailable = rpc.blockFileManager.getPruneHeight()
-    if firstAvailable >= 0 and targetHeight < firstAvailable:
-      raise newRpcError(RpcMiscError,
-        "Block height " & $targetHeight &
-        " not available (pruned data). Use a height after " &
-        $(firstAvailable - 1) & ".")
-
-  # NetworkDisable RAII (Nim try/finally). Mirrors Bitcoin Core's
-  # NetworkDisable wrapper around TemporaryRollback in
-  # rpc/blockchain.cpp::dumptxoutset. Pause inbound block acceptance for
-  # the duration of the rewind→dump→replay dance; restore on every exit
-  # path (success, error, exception) so peers can resume submitting once
-  # the original tip is back. Only active when there's actual rewind work.
-  let networkPauseActive = targetHeight < originalTipHeight
-  if networkPauseActive:
-    rpc.blockSubmissionPaused = true
+  # NetworkDisable stays set across the unlocked write (Core's guard around
+  # TemporaryRollback). `defer` is procedure-scoped, so it also covers a raise
+  # from the first lock section.
+  var networkPauseActive = false
   defer:
     if networkPauseActive:
-      rpc.blockSubmissionPaused = false
+      withChainLock(rpc.chainState):
+        rpc.blockSubmissionPaused = false
 
-  # Walk the active chain from the current tip down to (but not including)
-  # targetHeight, collecting full Block payloads in disconnect order. We need
-  # to capture these BEFORE disconnect since disconnectBlock removes the
-  # height->hash mapping (chainstate.nim:949).
-  var disconnectOrder: seq[(BlockHash, int32, Block)] = @[]
-  if targetHeight < originalTipHeight:
-    var h = originalTipHeight
-    while h > targetHeight:
-      let hashOpt = rpc.chainState.db.getBlockHashByHeight(h)
-      if hashOpt.isNone:
-        raise newRpcError(RpcInternalError,
-          "no block at height " & $h & " during rollback collection")
-      let blkOpt = rpc.chainState.db.getBlock(hashOpt.get())
-      if blkOpt.isNone:
-        raise newRpcError(RpcInternalError,
-          "missing block data for " & $hashOpt.get() &
-          " — pruned datadir cannot rollback")
-      disconnectOrder.add((hashOpt.get(), h, blkOpt.get()))
-      dec h
-
-  # Re-apply order is reverse of disconnect order (low height first).
   proc reapplyAll(rpc: RpcServer,
                   ordered: seq[(BlockHash, int32, Block)]): bool =
     for i in countdown(ordered.high, 0):
@@ -8360,63 +8319,146 @@ proc handleDumpTxOutSet*(rpc: RpcServer, params: JsonNode): JsonNode =
         return false
     true
 
-  # Disconnect down to targetHeight. Track how far we got so partial failure
-  # can be reverted.
-  var disconnectedCount = 0
-  for i in 0 ..< disconnectOrder.len:
-    let (_, h, blk) = disconnectOrder[i]
-    let dr = rpc.chainState.disconnectBlock(blk)
-    if not dr.isOk:
-      # Best-effort: re-apply what we already disconnected.
-      let already = disconnectOrder[0 ..< disconnectedCount]
-      discard reapplyAll(rpc, already)
-      raise newRpcError(RpcMiscError,
-        "rollback disconnect failed at height " & $h & ": " & dr.error)
-    inc disconnectedCount
-
-  if rpc.chainState.bestHeight != targetHeight:
-    # Try to recover before bailing out.
-    discard reapplyAll(rpc, disconnectOrder)
-    raise newRpcError(RpcMiscError,
-      "Could not roll back to requested height: ended at " &
-      $rpc.chainState.bestHeight & ", wanted " & $targetHeight)
-
-  # Write the snapshot at the rolled-back state.
+  var disconnectOrder: seq[(BlockHash, int32, Block)] = @[]
+  var view: DbSnapshotView
+  var started = false
+  var baseHash: BlockHash
+  var baseHeight: int32
+  var originalTipHeight: int32
   var dumpRes: tuple[coinsWritten: uint64, baseHash: BlockHash,
                      baseHeight: int32, txoutsetHash: array[32, byte]]
   var dumpErr = ""
+  var shuttingDown = false
+  var reapplyOk = true
   try:
-    dumpRes = createSnapshot(rpc.chainState, path, rpc.chainState.params)
-  except SnapshotError as e:
-    dumpErr = "snapshot write failed: " & e.msg
-  except IOError as e:
-    dumpErr = "snapshot I/O error: " & e.msg
+    withChainLock(rpc.chainState):
+      if rpc.stopping.load(moAcquire):
+        raise newRpcError(RpcClientNotConnected, "Shutting down")
+      originalTipHeight = rpc.chainState.bestHeight
+      var targetHeight: int32 = originalTipHeight
 
-  # Always attempt to re-apply blocks back to the original tip.
-  let reapplyOk = reapplyAll(rpc, disconnectOrder)
+      if optionsObj.hasKey("rollback"):
+        if snapshotType.len > 0 and snapshotType != "rollback":
+          raise newRpcError(RpcInvalidParams,
+            "Invalid snapshot type \"" & snapshotType &
+            "\" specified with rollback option")
+        targetHeight = resolveRollbackTargetHeight(rpc, optionsObj["rollback"])
+      elif snapshotType == "rollback":
+        var best: int32 = -1
+        for entry in rpc.chainState.params.assumeutxoData:
+          if entry.height <= originalTipHeight and entry.height > best:
+            best = entry.height
+        if best < 0:
+          raise newRpcError(RpcMiscError,
+            "No assumeutxo snapshot entry available at or below current tip " &
+            $originalTipHeight)
+        targetHeight = best
+      elif snapshotType == "latest" or snapshotType == "":
+        targetHeight = originalTipHeight
+      else:
+        raise newRpcError(RpcInvalidParams,
+          "Invalid snapshot type \"" & snapshotType &
+          "\" specified. Please specify \"rollback\" or \"latest\"")
 
+      if targetHeight > originalTipHeight:
+        raise newRpcError(RpcInvalidParams, "Target height above current tip")
+
+      if rpc.blockFileManager != nil and rpc.blockFileManager.isPruneMode():
+        let firstAvailable = rpc.blockFileManager.getPruneHeight()
+        if firstAvailable >= 0 and targetHeight < firstAvailable:
+          raise newRpcError(RpcMiscError,
+            "Block height " & $targetHeight &
+            " not available (pruned data). Use a height after " &
+            $(firstAvailable - 1) & ".")
+
+      # Count the walk before releasing the lock so shutdown cannot close the
+      # DB between this section and the scan.
+      rpc.beginSnapshotWalk()
+      started = true
+      networkPauseActive = targetHeight < originalTipHeight
+      if networkPauseActive:
+        rpc.blockSubmissionPaused = true
+
+      if targetHeight < originalTipHeight:
+        var h = originalTipHeight
+        while h > targetHeight:
+          let hashOpt = rpc.chainState.db.getBlockHashByHeight(h)
+          if hashOpt.isNone:
+            raise newRpcError(RpcInternalError,
+              "no block at height " & $h & " during rollback collection")
+          let blkOpt = rpc.chainState.db.getBlock(hashOpt.get())
+          if blkOpt.isNone:
+            raise newRpcError(RpcInternalError,
+              "missing block data for " & $hashOpt.get() &
+              " — pruned datadir cannot rollback")
+          disconnectOrder.add((hashOpt.get(), h, blkOpt.get()))
+          dec h
+
+      var disconnectedCount = 0
+      for i in 0 ..< disconnectOrder.len:
+        let (_, h, blk) = disconnectOrder[i]
+        let dr = rpc.chainState.disconnectBlock(blk)
+        if not dr.isOk:
+          let already = disconnectOrder[0 ..< disconnectedCount]
+          discard reapplyAll(rpc, already)
+          raise newRpcError(RpcMiscError,
+            "rollback disconnect failed at height " & $h & ": " & dr.error)
+        inc disconnectedCount
+
+      if rpc.chainState.bestHeight != targetHeight:
+        discard reapplyAll(rpc, disconnectOrder)
+        raise newRpcError(RpcMiscError,
+          "Could not roll back to requested height: ended at " &
+          $rpc.chainState.bestHeight & ", wanted " & $targetHeight)
+
+      view = rpc.chainState.openConsistentSnapshot()
+      let tip = snapshotTip(view, rpc.chainState.bestHeight,
+                            rpc.chainState.bestBlockHash)
+      baseHash = tip.hash
+      baseHeight = tip.height
+
+    # Lock released. The snapshot is the pre-release tip; connects that land
+    # now are not part of the dump.
+    try:
+      dumpRes = writeUtxoSnapshot(view, path, rpc.chainState.params,
+                                  baseHash, baseHeight)
+    except UtxoWalkInterrupted:
+      shuttingDown = true
+    except SnapshotError as e:
+      dumpErr = "snapshot write failed: " & e.msg
+    except IOError as e:
+      dumpErr = "snapshot I/O error: " & e.msg
+
+    withChainLock(rpc.chainState):
+      reapplyOk = reapplyAll(rpc, disconnectOrder)
+      if networkPauseActive:
+        rpc.blockSubmissionPaused = false
+        networkPauseActive = false
+  finally:
+    if started:
+      closeSnapshotView(view)
+      rpc.endSnapshotWalk()
+
+  if shuttingDown:
+    raise newRpcError(RpcClientNotConnected, "Shutting down")
   if dumpErr.len > 0:
     raise newRpcError(RpcInternalError, dumpErr)
   if not reapplyOk:
-    # Snapshot was written but we couldn't restore the chain. Surface that.
     raise newRpcError(RpcInternalError,
       "snapshot written to " & path &
       " but failed to re-apply rolled-back blocks; chainstate at height " &
       $rpc.chainState.bestHeight & " (was " & $originalTipHeight & ")")
 
-  # nchaintx: Core WriteUTXOSnapshot emits tip->m_chain_tx_count of the
-  # BASE unconditionally (cumulative txs genesis..base, genesis included).
-  # It was emitted only when the base was an assumeutxo entry.  Anchor at
-  # the highest assumeutxo entry on the active chain at or below the base
-  # (its chainparams count includes that block, as Core seeds
-  # base->m_chain_tx_count from au_data), else at genesis, and add each
-  # block's nTx above it.
-  let nchaintx = rpc.dumpBaseChainTxCount(dumpRes.baseHeight, dumpRes.baseHash)
+  # nchaintx is the base block's chain-tx count (O(height)). It stays under
+  # the lock; it is not the UTXO walk.
+  var nchaintx: uint64
+  withChainLock(rpc.chainState):
+    nchaintx = rpc.dumpBaseChainTxCount(baseHeight, baseHash)
 
   result = %*{
     "coins_written": dumpRes.coinsWritten,
-    "base_hash": reverseHex(toHex(array[32, byte](dumpRes.baseHash))),
-    "base_height": dumpRes.baseHeight,
+    "base_hash": reverseHex(toHex(array[32, byte](baseHash))),
+    "base_height": baseHeight,
     "path": path,
     "txoutset_hash": reverseHex(toHex(dumpRes.txoutsetHash)),
     "nchaintx": nchaintx
@@ -8659,132 +8701,148 @@ proc handleGetTxOutSetInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   #                   "hash_serialized_3 hash type cannot be queried for a
   #                   specific block") — the index serves muhash only.
   if params.len >= 2 and params[1].kind != JNull:
-    if rpc.coinStatsIndex == nil or not rpc.coinStatsIndex.enabled:
-      raise newRpcError(RpcInvalidParameter,
-                        "Querying specific block heights requires coinstatsindex")
-
-    # hash_serialized_3 cannot be recomputed from the index at an arbitrary
-    # height (it is a chainstate-only hash, valid only at the tip).
-    if coinHashType == cshtHashSerialized:
-      raise newRpcError(RpcInvalidParameter,
-        "hash_serialized_3 hash type cannot be queried for a specific block")
-
-    # Resolve hash_or_height -> a block height present in the active chain.
-    var targetHeight: int32
-    case params[1].kind
-    of JInt:
-      let hOrH = params[1].getInt()
-      # Core's ParseHashOrHeight treats a small integer as a height and a
-      # 64-hex string as a block hash.  Bounds-check the height.
-      if hOrH < 0 or hOrH > int(rpc.chainState.bestHeight):
+    withChainLock(rpc.chainState):
+      if rpc.stopping.load(moAcquire):
+        raise newRpcError(RpcClientNotConnected, "Shutting down")
+      if rpc.coinStatsIndex == nil or not rpc.coinStatsIndex.enabled:
         raise newRpcError(RpcInvalidParameter,
-                          "Target block height " & $hOrH & " after current tip " &
-                          $rpc.chainState.bestHeight)
-      targetHeight = int32(hOrH)
-    of JString:
-      let blockHash = parseBlockHash(params[1].getStr())
-      let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
-      if idxOpt.isNone:
-        raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
-      let bidx = idxOpt.get()
-      # Must be on the active chain (Core resolves via the active ChainstateManager).
-      let atHeight = rpc.chainState.db.getBlockHashByHeight(bidx.height)
-      if atHeight.isNone or atHeight.get() != bidx.hash:
-        raise newRpcError(RpcInvalidParameter, "Block is not in main chain")
-      targetHeight = bidx.height
-    else:
-      raise newRpcError(RpcInvalidParameter,
-                        "hash_or_height must be a height (int) or block hash (string)")
+                          "Querying specific block heights requires coinstatsindex")
 
-    # Pull the per-height snapshot the index folded forward on connect.
-    let statsOpt = rpc.coinStatsIndex.getStats(targetHeight)
-    if statsOpt.isNone:
-      # The index is enabled but has not (yet) indexed this height.  Mirror
-      # Core's "still syncing" path with an internal error rather than a -8.
-      raise newRpcError(RpcInternalError,
-        "Unable to get data because coinstatsindex is still syncing. " &
-        "Current height: " & $rpc.coinStatsIndex.bestIndexedHeight())
-    let stats = statsOpt.get()
+      # hash_serialized_3 cannot be recomputed from the index at an arbitrary
+      # height (it is a chainstate-only hash, valid only at the tip).
+      if coinHashType == cshtHashSerialized:
+        raise newRpcError(RpcInvalidParameter,
+          "hash_serialized_3 hash type cannot be queried for a specific block")
 
-    # Build the index-path response shape (blockchain.cpp:1112-1173).  When the
-    # index is used, Core OMITS `transactions` + `disk_size` and ADDS
-    # `total_unspendable_amount` + `block_info`.
-    var resp = %*{
-      "height": stats.height,
-      "bestblock": reverseHex(toHex(array[32, byte](stats.blockHash))),
-      "txouts": stats.transactionOutputCount,
-      "bogosize": stats.bogoSize
-    }
-    if coinHashType == cshtMuHash:
-      resp["muhash"] = %reverseHex(toHex(stats.muhash))
-    resp["total_amount"] = parseJson(formatBtcAmount(stats.totalAmount))
+      # Resolve hash_or_height -> a block height present in the active chain.
+      var targetHeight: int32
+      case params[1].kind
+      of JInt:
+        let hOrH = params[1].getInt()
+        # Core's ParseHashOrHeight treats a small integer as a height and a
+        # 64-hex string as a block hash.  Bounds-check the height.
+        if hOrH < 0 or hOrH > int(rpc.chainState.bestHeight):
+          raise newRpcError(RpcInvalidParameter,
+                            "Target block height " & $hOrH & " after current tip " &
+                            $rpc.chainState.bestHeight)
+        targetHeight = int32(hOrH)
+      of JString:
+        let blockHash = parseBlockHash(params[1].getStr())
+        let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
+        if idxOpt.isNone:
+          raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+        let bidx = idxOpt.get()
+        # Must be on the active chain (Core resolves via the active ChainstateManager).
+        let atHeight = rpc.chainState.db.getBlockHashByHeight(bidx.height)
+        if atHeight.isNone or atHeight.get() != bidx.hash:
+          raise newRpcError(RpcInvalidParameter, "Block is not in main chain")
+        targetHeight = bidx.height
+      else:
+        raise newRpcError(RpcInvalidParameter,
+                          "hash_or_height must be a height (int) or block hash (string)")
 
-    let blockTotalUnspendable = stats.totalUnspendablesGenesisBlock +
-                                stats.totalUnspendablesBip30 +
-                                stats.totalUnspendablesScripts +
-                                stats.totalUnspendablesUnclaimedRewards
-    resp["total_unspendable_amount"] =
-      parseJson(formatBtcAmount(blockTotalUnspendable))
+      # Pull the per-height snapshot the index folded forward on connect.
+      let statsOpt = rpc.coinStatsIndex.getStats(targetHeight)
+      if statsOpt.isNone:
+        # The index is enabled but has not (yet) indexed this height.  Mirror
+        # Core's "still syncing" path with an internal error rather than a -8.
+        raise newRpcError(RpcInternalError,
+          "Unable to get data because coinstatsindex is still syncing. " &
+          "Current height: " & $rpc.coinStatsIndex.bestIndexedHeight())
+      let stats = statsOpt.get()
 
-    # Per-block deltas vs the parent height's snapshot (block_info).  Zeroes at
-    # height 0 (no parent).  The harness does not gate block_info, but we emit
-    # it for Core-shape parity.
-    var prevPrevoutSpent: uint64 = 0
-    var prevCoinbase: uint64 = 0
-    var prevNewOutputs: uint64 = 0
-    var prevUnspendableGenesis: int64 = 0
-    var prevUnspendableBip30: int64 = 0
-    var prevUnspendableScripts: int64 = 0
-    var prevUnspendableUnclaimed: int64 = 0
-    if stats.height > 0:
-      let prevOpt = rpc.coinStatsIndex.getStats(stats.height - 1)
-      if prevOpt.isSome:
-        let prev = prevOpt.get()
-        prevPrevoutSpent = prev.totalPrevoutSpentAmount
-        prevCoinbase = prev.totalCoinbaseAmount
-        prevNewOutputs = prev.totalNewOutputsExCoinbase
-        prevUnspendableGenesis = prev.totalUnspendablesGenesisBlock
-        prevUnspendableBip30 = prev.totalUnspendablesBip30
-        prevUnspendableScripts = prev.totalUnspendablesScripts
-        prevUnspendableUnclaimed = prev.totalUnspendablesUnclaimedRewards
+      # Build the index-path response shape (blockchain.cpp:1112-1173).  When the
+      # index is used, Core OMITS `transactions` + `disk_size` and ADDS
+      # `total_unspendable_amount` + `block_info`.
+      var resp = %*{
+        "height": stats.height,
+        "bestblock": reverseHex(toHex(array[32, byte](stats.blockHash))),
+        "txouts": stats.transactionOutputCount,
+        "bogosize": stats.bogoSize
+      }
+      if coinHashType == cshtMuHash:
+        resp["muhash"] = %reverseHex(toHex(stats.muhash))
+      resp["total_amount"] = parseJson(formatBtcAmount(stats.totalAmount))
 
-    let prevBlockTotalUnspendable = prevUnspendableGenesis + prevUnspendableBip30 +
-                                    prevUnspendableScripts + prevUnspendableUnclaimed
-    var blockInfo = %*{
-      "prevout_spent": parseJson(formatBtcAmount(
-        int64(stats.totalPrevoutSpentAmount - prevPrevoutSpent))),
-      "coinbase": parseJson(formatBtcAmount(
-        int64(stats.totalCoinbaseAmount - prevCoinbase))),
-      "new_outputs_ex_coinbase": parseJson(formatBtcAmount(
-        int64(stats.totalNewOutputsExCoinbase - prevNewOutputs))),
-      "unspendable": parseJson(formatBtcAmount(
-        blockTotalUnspendable - prevBlockTotalUnspendable))
-    }
-    blockInfo["unspendables"] = %*{
-      "genesis_block": parseJson(formatBtcAmount(
-        stats.totalUnspendablesGenesisBlock - prevUnspendableGenesis)),
-      "bip30": parseJson(formatBtcAmount(
-        stats.totalUnspendablesBip30 - prevUnspendableBip30)),
-      "scripts": parseJson(formatBtcAmount(
-        stats.totalUnspendablesScripts - prevUnspendableScripts)),
-      "unclaimed_rewards": parseJson(formatBtcAmount(
-        stats.totalUnspendablesUnclaimedRewards - prevUnspendableUnclaimed))
-    }
-    resp["block_info"] = blockInfo
-    return resp
+      let blockTotalUnspendable = stats.totalUnspendablesGenesisBlock +
+                                  stats.totalUnspendablesBip30 +
+                                  stats.totalUnspendablesScripts +
+                                  stats.totalUnspendablesUnclaimedRewards
+      resp["total_unspendable_amount"] =
+        parseJson(formatBtcAmount(blockTotalUnspendable))
 
-  # Tip path: walk ONE RocksDB snapshot, labelled from that snapshot, with
-  # no flush -- this runs on the RPC thread, and flushing the main thread's
-  # caches from here raced connectBlock (see computeUtxoSetInfoAt). Single
-  # requests take asyncGetTxOutSetInfo instead, which runs the same walk on
-  # its own thread; this inline form serves batches.
-  var view = openSnapshotView(rpc.chainState.db.db)
+      # Per-block deltas vs the parent height's snapshot (block_info).  Zeroes at
+      # height 0 (no parent).  The harness does not gate block_info, but we emit
+      # it for Core-shape parity.
+      var prevPrevoutSpent: uint64 = 0
+      var prevCoinbase: uint64 = 0
+      var prevNewOutputs: uint64 = 0
+      var prevUnspendableGenesis: int64 = 0
+      var prevUnspendableBip30: int64 = 0
+      var prevUnspendableScripts: int64 = 0
+      var prevUnspendableUnclaimed: int64 = 0
+      if stats.height > 0:
+        let prevOpt = rpc.coinStatsIndex.getStats(stats.height - 1)
+        if prevOpt.isSome:
+          let prev = prevOpt.get()
+          prevPrevoutSpent = prev.totalPrevoutSpentAmount
+          prevCoinbase = prev.totalCoinbaseAmount
+          prevNewOutputs = prev.totalNewOutputsExCoinbase
+          prevUnspendableGenesis = prev.totalUnspendablesGenesisBlock
+          prevUnspendableBip30 = prev.totalUnspendablesBip30
+          prevUnspendableScripts = prev.totalUnspendablesScripts
+          prevUnspendableUnclaimed = prev.totalUnspendablesUnclaimedRewards
+
+      let prevBlockTotalUnspendable = prevUnspendableGenesis + prevUnspendableBip30 +
+                                      prevUnspendableScripts + prevUnspendableUnclaimed
+      var blockInfo = %*{
+        "prevout_spent": parseJson(formatBtcAmount(
+          int64(stats.totalPrevoutSpentAmount - prevPrevoutSpent))),
+        "coinbase": parseJson(formatBtcAmount(
+          int64(stats.totalCoinbaseAmount - prevCoinbase))),
+        "new_outputs_ex_coinbase": parseJson(formatBtcAmount(
+          int64(stats.totalNewOutputsExCoinbase - prevNewOutputs))),
+        "unspendable": parseJson(formatBtcAmount(
+          blockTotalUnspendable - prevBlockTotalUnspendable))
+      }
+      blockInfo["unspendables"] = %*{
+        "genesis_block": parseJson(formatBtcAmount(
+          stats.totalUnspendablesGenesisBlock - prevUnspendableGenesis)),
+        "bip30": parseJson(formatBtcAmount(
+          stats.totalUnspendablesBip30 - prevUnspendableBip30)),
+        "scripts": parseJson(formatBtcAmount(
+          stats.totalUnspendablesScripts - prevUnspendableScripts)),
+        "unclaimed_rewards": parseJson(formatBtcAmount(
+          stats.totalUnspendablesUnclaimedRewards - prevUnspendableUnclaimed))
+      }
+      resp["block_info"] = blockInfo
+      return resp
+
+  # Tip path. The chain lock covers the flush and the snapshot only (Core
+  # gettxoutsetinfo: LOCK(cs_main) around CoinsDB().Cursor()). The walk reads
+  # that snapshot. Batches and handleMethod take this inline form; a single
+  # request takes asyncGetTxOutSetInfo, which runs the same walk off the RPC
+  # thread.
+  var view: DbSnapshotView
+  var fbHeight: int32
+  var fbHash: BlockHash
+  withChainLock(rpc.chainState):
+    if rpc.stopping.load(moAcquire):
+      raise newRpcError(RpcClientNotConnected, "Shutting down")
+    view = rpc.chainState.openConsistentSnapshot()
+    fbHeight = rpc.chainState.bestHeight
+    fbHash = rpc.chainState.bestBlockHash
+    rpc.beginSnapshotWalk()
   var info: UtxoSetInfo
   try:
-    info = computeUtxoSetInfoAt(view, coinHashType, rpc.chainState.bestHeight,
-                                rpc.chainState.bestBlockHash)
+    try:
+      info = computeUtxoSetInfoAt(view, coinHashType, fbHeight, fbHash,
+                                  interrupt = true)
+    except UtxoWalkInterrupted:
+      raise newRpcError(RpcClientNotConnected, "Shutting down")
   finally:
     closeSnapshotView(view)
+    rpc.endSnapshotWalk()
   txOutSetInfoJson(info, coinHashType)
 
 proc parseScanObject(rpc: RpcServer, scanobject: JsonNode): seq[byte] =
@@ -15626,6 +15684,8 @@ const ChainLockFreeMethods* = [
   "uptime", "logging", "getrpcinfo", "stop",
   # Take the chain lock themselves, only around the parts that need it:
   "scantxoutset",        # lock: flush + snapshot; walk the snapshot unlocked
+  "dumptxoutset",        # lock: rollback + snapshot; walk the snapshot unlocked
+  "gettxoutsetinfo",     # lock: flush + snapshot; walk the snapshot unlocked
   "sendpayjoinrequest",  # network I/O to the receiver must not run under it
 ]
 
@@ -15915,6 +15975,7 @@ type
     fbHash: BlockHash
     info: UtxoSetInfo
     failed: bool
+    interrupted: bool
     errMsg: array[256, char]
     done: Atomic[bool]
     thread: Thread[ptr TxoWalkJob]
@@ -15923,7 +15984,9 @@ proc txoWalkThread(job: ptr TxoWalkJob) {.thread.} =
   {.gcsafe.}:
     try:
       job.info = computeUtxoSetInfoAt(job.view, job.hashType, job.fbHeight,
-                                      job.fbHash)
+                                      job.fbHash, interrupt = true)
+    except UtxoWalkInterrupted:
+      job.interrupted = true
     except Exception as e:
       job.failed = true
       let n = min(e.msg.len, job.errMsg.len - 1)
@@ -15946,6 +16009,8 @@ proc runTxoWalk*(view: DbSnapshotView, hashType: CoinStatsHashType,
     started = true
     while not job.done.load(moAcquire):
       await sleepAsync(20)
+    if job.interrupted:
+      raise newRpcError(RpcClientNotConnected, "Shutting down")
     if job.failed:
       raise newRpcError(RpcInternalError,
         "gettxoutsetinfo walk failed: " & $cast[cstring](addr job.errMsg[0]))
@@ -16002,17 +16067,23 @@ proc asyncGetTxOutSetInfo(rpc: RpcServer, params: JsonNode): Future[JsonNode] {.
     rpc.prepTxOutSetInfo(params, done, coinHashType)
   if done != nil:
     return done
-  # Open the snapshot and read the fallback label under one chain-lock hold
-  # (Core gettxoutsetinfo: LOCK(cs_main) around the cursor + best block), then
-  # walk the snapshot with the lock released.
+  # Flush + snapshot under the chain lock (Core: CoinsDB().Cursor() under
+  # cs_main). The walk runs on its own thread with the lock released.
   var view: DbSnapshotView
   var fbHeight: int32
   var fbHash: BlockHash
   withChainLock(rpc.chainState):
-    view = openSnapshotView(rpc.chainState.db.db)
+    if rpc.stopping.load(moAcquire):
+      raise newRpcError(RpcClientNotConnected, "Shutting down")
+    view = rpc.chainState.openConsistentSnapshot()
     fbHeight = rpc.chainState.bestHeight
     fbHash = rpc.chainState.bestBlockHash
-  let info = await runTxoWalk(view, coinHashType, fbHeight, fbHash)
+    rpc.beginSnapshotWalk()
+  var info: UtxoSetInfo
+  try:
+    info = await runTxoWalk(view, coinHashType, fbHeight, fbHash)
+  finally:
+    rpc.endSnapshotWalk()
   try:
     {.gcsafe.}:
       return txOutSetInfoJson(info, coinHashType)

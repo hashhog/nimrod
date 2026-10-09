@@ -12,6 +12,7 @@ import ../crypto/muhash
 import ../consensus/params
 import ../consensus/assumevalid
 import ../util/fatal
+import ../util/shutdown
 import ./chain_lock
 import chronicles
 
@@ -57,6 +58,19 @@ when defined(nimrodRaceHooks):
       if raceHook != nil: raceHook(point, hash)
 else:
   template racePoint(point: string, hash: BlockHash) = discard
+
+proc noteUtxoWalkCoin*(txid: TxId) {.inline, gcsafe, raises: [].} =
+  ## Long UTXO walks (gettxoutsetinfo, dumptxoutset) call this once per coin.
+  ## A test installs `raceHook` for point "utxo.walk" to park the walk.
+  when defined(nimrodRaceHooks):
+    racePoint("utxo.walk", BlockHash(array[32, byte](txid)))
+
+type UtxoWalkInterrupted* = object of CatchableError
+
+proc raiseIfUtxoWalkShutdown*() {.inline.} =
+  ## Stop a snapshot walk once shutdown has been requested so the DB can close.
+  if shutdownRequested():
+    raise newException(UtxoWalkInterrupted, "Shutting down")
 
 type
   ChainStateError* = object of CatchableError
@@ -2653,6 +2667,17 @@ proc openFlushedSnapshot*(cs: var ChainState): DbSnapshotView =
     cs.flushCache()
   openSnapshotView(cs.db.db)
 
+proc openConsistentSnapshot*(cs: var ChainState): DbSnapshotView =
+  ## Chain lock held by the caller or taken here. Flush an unflushed IBD
+  ## batch so the snapshot is the current tip (Core ForceFlushStateToDisk
+  ## before CoinsDB().Cursor()), then open one RocksDB snapshot. Steady-state
+  ## connectBlock already committed coins and the tip in one batch, so the
+  ## read cache stays resident (Core passes wipe_cache=false).
+  lockChainScope(cs)
+  if cs.ibdMode:
+    cs.flushIBDBatch()
+  openSnapshotView(cs.db.db)
+
 proc snapshotTip*(v: DbSnapshotView, fallbackHeight: int32,
                   fallbackHash: BlockHash): tuple[height: int32, hash: BlockHash] =
   ## The best-block pointer stored IN the snapshot (committed in the same
@@ -2742,6 +2767,7 @@ proc addUtxoRow(info: var UtxoSetInfo, acc: var UtxoStatsAcc,
              (uint32(key[34]) shl 8)  or
               uint32(key[35])
   let outpoint = OutPoint(txid: TxId(txidBytes), vout: vout)
+  noteUtxoWalkCoin(outpoint.txid)
 
   # Distinct-tx count: increment whenever the leading 32 bytes change.
   if not acc.sawAny or txidBytes != acc.prevTxid:
@@ -2821,7 +2847,8 @@ proc computeUtxoSetInfo*(cs: var ChainState,
 
 proc computeUtxoSetInfoAt*(v: DbSnapshotView, hashType: CoinStatsHashType,
                            fallbackHeight: int32,
-                           fallbackHash: BlockHash): UtxoSetInfo =
+                           fallbackHash: BlockHash,
+                           interrupt: bool = false): UtxoSetInfo =
   ## `computeUtxoSetInfo` over ONE RocksDB snapshot, with no ChainState access
   ## and no flush, so it can run on its own OS thread while the main thread
   ## keeps connecting blocks (Core's ComputeUTXOStats walks a cursor snapshot
@@ -2837,6 +2864,8 @@ proc computeUtxoSetInfoAt*(v: DbSnapshotView, hashType: CoinStatsHashType,
   ##
   ## In IBD mode the snapshot is the last `flushIBDBatch` checkpoint (still
   ## self-consistent). The fallbacks are used only when the pointer is absent.
+  if interrupt:
+    raiseIfUtxoWalkShutdown()
   result.hashType = hashType
   result.height = fallbackHeight
   result.bestBlock = fallbackHash
@@ -2851,8 +2880,13 @@ proc computeUtxoSetInfoAt*(v: DbSnapshotView, hashType: CoinStatsHashType,
     result.height = cast[int32](uint32(d[0]) or (uint32(d[1]) shl 8) or
                                 (uint32(d[2]) shl 16) or (uint32(d[3]) shl 24))
   var acc = initUtxoStatsAcc()
+  var seen = 0
   for (key, value) in v.iterCf(cfUtxo):
     addUtxoRow(result, acc, key, value)
+    if interrupt:
+      inc seen
+      if (seen and 1023) == 0:
+        raiseIfUtxoWalkShutdown()
   finishUtxoStats(result, acc)
 
 proc maybeRetainIbdBody(cs: var ChainState, blk: Block, blockHash: BlockHash) =
