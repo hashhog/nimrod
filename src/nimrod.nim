@@ -1132,39 +1132,26 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
         echo getStackTrace(e)
     if blockAccepted:
       {.gcsafe.}:
-        # Reorg-drop fix (Part 2): when processBlock promoted a heavier competing
-        # fork via the side-branch path, the active tip switched to that branch.
-        # The mempool refresh then differs from a plain extension: FIRST refill
-        # the disconnected old-chain non-coinbase txs (Pattern B —
-        # MaybeUpdateMempoolForReorg via the disconnect pool), THEN drop the txs
-        # confirmed by EVERY newly-connected fork block (not just msg.blk, which
-        # is only the new tip).  Mirrors the submitblock reorg refresh in
-        # rpc/server.nim.  pendingReorgConnectedBlocks is non-empty ONLY on a
-        # reorg; the common (extension) path falls through to the single
-        # removeForBlock below.
+        # The MEMPOOL is not updated here any more: every connected block
+        # (this one, the buffered ones drainBlockBuffer connects after it,
+        # blocks connected from disk, every block of a side-branch reorg) ran
+        # removeForBlock inside the chainstate connect, under the chain lock,
+        # before any hand-off to an RPC waiter, and a reorg ran
+        # MaybeUpdateMempoolForReorg there too (mempool.attachToChainState;
+        # Core ConnectTip / ActivateBestChainStep). Doing it here, after
+        # processBlock returned, is what let getblocktemplate see confirmed
+        # txs (NI-7) and left a child of a double-spent block tx in the pool.
+        # The orphan pool still follows the delivered / reorg-connected blocks
+        # (Core EraseForBlock via BlockConnected).
         let reorgConnected = state.syncManager.pendingReorgConnectedBlocks
-        if reorgConnected.len > 0:
-          let reorgDisconnected = state.syncManager.pendingReorgDisconnectedTxs
-          try:
-            if reorgDisconnected.len > 0:
-              discard state.mempool.blockDisconnected(reorgDisconnected, state.crypto)
-          except CatchableError as e:
-            warn "P2P reorg mempool refill failed", error = e.msg
-          except Exception as e:
-            warn "P2P reorg mempool refill failed", error = e.msg
-          for connected in reorgConnected:
-            state.mempool.removeForBlock(connected)
-            if state.orphanPool != nil:
+        if state.orphanPool != nil:
+          if reorgConnected.len > 0:
+            for connected in reorgConnected:
               discard state.orphanPool.removeForBlock(connected)
-          state.syncManager.pendingReorgConnectedBlocks.setLen(0)
-          state.syncManager.pendingReorgDisconnectedTxs.setLen(0)
-        else:
-          # Remove confirmed transactions from mempool (plain extension).
-          state.mempool.removeForBlock(msg.blk)
-          # Drop orphans that were confirmed (or invalidated by double-spend)
-          # in the new block.  Mirrors EraseForBlock in Core's txorphanage.
-          if state.orphanPool != nil:
+          else:
             discard state.orphanPool.removeForBlock(msg.blk)
+        state.syncManager.pendingReorgConnectedBlocks.setLen(0)
+        state.syncManager.pendingReorgDisconnectedTxs.setLen(0)
       # Clear recently-rejected filter -- rejection reasons may no longer apply
       state.recentlyRejected.clear()
 

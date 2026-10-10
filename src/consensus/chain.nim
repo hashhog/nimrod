@@ -479,6 +479,14 @@ proc invalidateBlock*(
       tipIdx.failureFlags.setFlag(BLOCK_FAILED_VALID)
       cs.db.putBlockIndex(tipIdx)
 
+      # Core InvalidateBlock: MaybeUpdateMempoolForReorg(disconnectpool,
+      # true) after EACH DisconnectTip, under cs_main — the disconnected
+      # block's txs go back to the pool (earliest first), then entries that
+      # are non-final / BIP68-locked / spend an immature coinbase at the new
+      # tip+1 are dropped with their descendants.
+      if cs.mempoolUpdateHook != nil:
+        cs.mempoolUpdateHook()
+
   else:
     # Block is not on active chain, just mark it as invalid
     idx.failureFlags.setFlag(BLOCK_FAILED_VALID)

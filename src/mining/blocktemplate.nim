@@ -1,7 +1,7 @@
 ## Block template generation
 ## Creates block templates for mining with witness commitment support
 
-import std/[times, options, tables]
+import std/[times, options, tables, sets, heapqueue, algorithm]
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation, versionbits]
 import ../mempool/mempool
@@ -275,6 +275,244 @@ proc calculateTxWeight*(tx: Transaction): int =
   let baseSize = serializeLegacy(tx).len
   (baseSize * 3) + fullSize
 
+type
+  PkgScore = object
+    fee: int64
+    weight: int
+
+  # Min-heap key: lower negRate is a higher ancestor feerate. txid then
+  # generation break ties so a stale score loses to the refreshed one.
+  TemplateCand = object
+    negRate: int64
+    txid: array[32, byte]
+    gen: int
+
+proc `<`(a, b: TemplateCand): bool =
+  if a.negRate != b.negRate:
+    return a.negRate < b.negRate
+  if a.txid != b.txid:
+    for i in 0 ..< 32:
+      if a.txid[i] != b.txid[i]:
+        return a.txid[i] < b.txid[i]
+    return false
+  a.gen < b.gen
+
+proc modifiedFeeSat(mp: Mempool, entry: MempoolEntry): int64 =
+  int64(entry.fee) + mp.getFeeDelta(entry.txid)
+
+proc packageRateSatKvB(fee: int64, weight: int): int64 =
+  ## sat/kvB, truncated toward zero the same way the old per-tx gate did.
+  let vbytes = float64(weight) / 4.0
+  if vbytes > 0:
+    int64(float64(fee) / vbytes * 1000.0)
+  else:
+    0'i64
+
+proc txidBytes(id: TxId): array[32, byte] =
+  array[32, byte](id)
+
+proc countInPackageAncestors(mp: Mempool, txid: TxId, package: HashSet[TxId]): int =
+  ## How many package members are ancestors of txid (not counting itself).
+  var seen = initHashSet[TxId]()
+  var stack: seq[TxId] = @[]
+  if txid notin mp.entries:
+    return 0
+  for inp in mp.entries[txid].tx.inputs:
+    if inp.prevOut.txid in package:
+      stack.add(inp.prevOut.txid)
+  while stack.len > 0:
+    let parent = stack.pop()
+    if parent in seen:
+      continue
+    seen.incl(parent)
+    if parent notin mp.entries:
+      continue
+    for inp in mp.entries[parent].tx.inputs:
+      let grand = inp.prevOut.txid
+      if grand in package and grand notin seen:
+        stack.add(grand)
+  seen.len
+
+proc cmpTxid(a, b: TxId): int =
+  let aa = txidBytes(a)
+  let bb = txidBytes(b)
+  for i in 0 ..< 32:
+    if aa[i] < bb[i]: return -1
+    if aa[i] > bb[i]: return 1
+  0
+
+proc packageInTopoOrder(mp: Mempool, root: TxId, included: HashSet[TxId]): seq[TxId] =
+  ## root plus every in-mempool ancestor not already selected, parents first.
+  ## Ancestor-count order matches Core SortForBlock (CompareTxIterByAncestorCount).
+  var package = initHashSet[TxId]()
+  var stack = @[root]
+  while stack.len > 0:
+    let id = stack.pop()
+    if id in package or id in included:
+      continue
+    if id notin mp.entries:
+      continue
+    package.incl(id)
+    for inp in mp.entries[id].tx.inputs:
+      let parent = inp.prevOut.txid
+      if parent in mp.entries and parent notin included and parent notin package:
+        stack.add(parent)
+  for id in package:
+    result.add(id)
+  var counts = initTable[TxId, int]()
+  for id in result:
+    counts[id] = countInPackageAncestors(mp, id, package)
+  result.sort(proc(a, b: TxId): int =
+    let byCount = cmp(counts[a], counts[b])
+    if byCount != 0:
+      return byCount
+    cmpTxid(a, b)
+  )
+
+proc descendantTxids(children: Table[TxId, HashSet[TxId]], start: TxId): seq[TxId] =
+  var seen = initHashSet[TxId]()
+  var queue: seq[TxId] = @[]
+  if children.hasKey(start):
+    for child in children[start]:
+      queue.add(child)
+  var i = 0
+  while i < queue.len:
+    let id = queue[i]
+    inc i
+    if id in seen:
+      continue
+    seen.incl(id)
+    result.add(id)
+    if children.hasKey(id):
+      for child in children[id]:
+        if child notin seen:
+          queue.add(child)
+
+proc selectTemplateTransactions(
+  mempool: Mempool,
+  nBlockMaxWeight: int,
+  nBlockReservedWeight: int,
+  blockMinFeeRateSatKvB: int64,
+  blockHeight: uint32,
+  lockTimeCutoff: uint32
+): tuple[txs: seq[Transaction], totalFees: Satoshi, nBlockWeight: int, totalSigops: int] =
+  ## Pick transactions for a block template.
+  ##
+  ## The next candidate is the not-yet-selected mempool tx with the highest
+  ## ancestor feerate, where the ancestor set is that tx plus in-mempool
+  ## ancestors still outside the block (modified fee = base + prioritisetransaction
+  ## delta, including ancestors' deltas). The whole package is added in
+  ## parent-before-child order, or the candidate is skipped. A child is never
+  ## emitted without its in-mempool parents, and a parent that was not selected
+  ## keeps its descendants out.
+  ##
+  ## Reference: Bitcoin Core node/miner.cpp addPackageTxs, SortForBlock,
+  ## TestPackage, TestPackageTransactions. Once the best remaining package is
+  ## under blockMinFeeRate, selection stops.
+
+  result.txs = @[]
+  result.totalFees = Satoshi(0)
+  result.nBlockWeight = nBlockReservedWeight
+  result.totalSigops = 0
+
+  var score = initTable[TxId, PkgScore]()
+  var children = initTable[TxId, HashSet[TxId]]()
+  for txid, entry in mempool.entries:
+    var fee = modifiedFeeSat(mempool, entry)
+    var weight = entry.weight
+    for anc in mempool.calculateAncestors(entry.tx):
+      let ancEntry = mempool.entries[anc]
+      fee += modifiedFeeSat(mempool, ancEntry)
+      weight += ancEntry.weight
+    score[txid] = PkgScore(fee: fee, weight: weight)
+    for inp in entry.tx.inputs:
+      let parent = inp.prevOut.txid
+      if parent in mempool.entries:
+        var kids = children.getOrDefault(parent)
+        kids.incl(txid)
+        children[parent] = kids
+
+  var included = initHashSet[TxId]()
+  var failed = initHashSet[TxId]()
+  var generation = initTable[TxId, int]()
+  var heap = initHeapQueue[TemplateCand]()
+  var nConsecutiveFailed = 0
+
+  proc pushCand(id: TxId) =
+    if id in included or id in failed or id notin score:
+      return
+    let gen = generation.getOrDefault(id, 0) + 1
+    generation[id] = gen
+    let rate = packageRateSatKvB(score[id].fee, score[id].weight)
+    heap.push(TemplateCand(negRate: -rate, txid: txidBytes(id), gen: gen))
+
+  for txid in score.keys:
+    pushCand(txid)
+
+  while heap.len > 0:
+    let cand = heap.pop()
+    let id = TxId(cand.txid)
+    if id in included or id in failed:
+      continue
+    if generation.getOrDefault(id, 0) != cand.gen:
+      continue
+
+    let members = packageInTopoOrder(mempool, id, included)
+    if members.len == 0:
+      failed.incl(id)
+      continue
+
+    var pkgFee = 0'i64
+    var pkgWeight = 0
+    var pkgSigops = 0
+    var sigopsOf = initTable[TxId, int]()
+    var allFinal = true
+    for member in members:
+      let entry = mempool.entries[member]
+      let sigops = estimateTxSigops(entry.tx)
+      sigopsOf[member] = sigops
+      pkgFee += modifiedFeeSat(mempool, entry)
+      pkgWeight += entry.weight
+      pkgSigops += sigops
+      if not isFinalTx(entry.tx, blockHeight, lockTimeCutoff):
+        allFinal = false
+
+    if packageRateSatKvB(pkgFee, pkgWeight) < blockMinFeeRateSatKvB:
+      break
+
+    let fitsWeight = result.nBlockWeight + pkgWeight < nBlockMaxWeight
+    let fitsSigops = result.totalSigops + pkgSigops < MaxBlockSigopsCost
+    if not allFinal or not fitsWeight or not fitsSigops:
+      failed.incl(id)
+      if not fitsWeight or not fitsSigops:
+        inc nConsecutiveFailed
+        if nConsecutiveFailed > MaxConsecutiveFailures and
+           result.nBlockWeight + BlockFullEnoughWeightDelta > nBlockMaxWeight:
+          break
+      continue
+
+    nConsecutiveFailed = 0
+    for member in members:
+      let entry = mempool.entries[member]
+      included.incl(member)
+      result.txs.add(entry.tx)
+      result.totalFees = result.totalFees + entry.fee
+      result.nBlockWeight += entry.weight
+      result.totalSigops += sigopsOf[member]
+
+    for member in members:
+      let entry = mempool.entries[member]
+      let subFee = modifiedFeeSat(mempool, entry)
+      let subWeight = entry.weight
+      for desc in descendantTxids(children, member):
+        if desc in included or desc notin score:
+          continue
+        var updated = score[desc]
+        updated.fee -= subFee
+        updated.weight -= subWeight
+        score[desc] = updated
+        pushCand(desc)
+
 proc clampBlockOptions*(maxWeight: int, reservedWeight: int): tuple[maxWeight: int, reservedWeight: int] =
   ## Apply Bitcoin Core ClampOptions logic (node/miner.cpp:79-88).
   ## 1. Clamp reservedWeight to [MinimumBlockReservedWeight, MaxBlockWeight].
@@ -309,10 +547,9 @@ proc buildBlockTemplate*(
   ##   Reject a tx whose sigops would bring the running total to >= MAX_BLOCK_SIGOPS_COST.
   ##   The old code used >, which allowed a tx that brings the total to exactly 80 000.
   ##
-  ## Minimum fee-rate gate (Bitcoin Core addChunks lines 298-301):
-  ##   Skip chunks whose fee rate is below blockMinFeeRate.  Once the sorted list
-  ##   falls below that threshold everything remaining is also below it, so we can
-  ##   return early.
+  ## Minimum fee-rate gate (Bitcoin Core addPackageTxs):
+  ##   Skip a package whose ancestor feerate is below blockMinFeeRate. Once the
+  ##   best remaining package is under that floor, selection stops.
 
   let height = chainState.bestHeight + 1
   let subsidy = getBlockSubsidy(height, params)
@@ -324,75 +561,15 @@ proc buildBlockTemplate*(
   # Apply Core's ClampOptions to keep maxWeight in a valid range.
   let (nBlockMaxWeight, nBlockReservedWeight) = clampBlockOptions(params.maxBlockWeight, CoinbaseReservedWeight)
 
+  # Package selection: ancestor-feerate order, parents before children.
   # nBlockWeight starts at the reserved weight — same as Core resetBlock().
-  var nBlockWeight = nBlockReservedWeight
-  var nBlockSigopsCost = 0
-
-  # Pass the *full* nBlockMaxWeight to the selector; weight accounting is done
-  # below with the running nBlockWeight counter (not by trimming the cap).
-  let selectedEntries = mempool.getTransactionsByFeeRate(nBlockMaxWeight)
-
-  # Build transaction list and enforce sigops limit.
-  # Also filter out non-final transactions.
-  var txList: seq[Transaction]
-  var totalFees = Satoshi(0)
-  var totalSigops = 0
-  var nConsecutiveFailed = 0
-
-  for entry in selectedEntries:
-    # Minimum fee rate gate (Core addChunks lines 298-301).
-    # fee rate in sat/kvB = fee_sat * 1000 / vbytes; vbytes = weight / 4.
-    # FIX-72 parity: the floor compares the MODIFIED feerate (base +
-    # prioritisetransaction delta), mirroring Core, whose txgraph already holds
-    # modified fees.  Without this an operator-prioritised low-base-fee tx that
-    # getTransactionsByFeeRate ranked high would still be dropped here by its base
-    # rate (and the early `break` would skip everything after it).  An
-    # un-prioritised entry has delta 0, so this is the base feerate as before.
-    let modifiedFeeSat = int64(entry.fee) + mempool.getFeeDelta(entry.txid)
-    let entryVbytes = float64(entry.weight) / 4.0
-    let entryFeeRateSatKvB =
-      if entryVbytes > 0: int64(float64(modifiedFeeSat) / entryVbytes * 1000.0)
-      else: int64(entry.feeRate * 1000.0)
-    if entryFeeRateSatKvB < blockMinFeeRateSatKvB:
-      # Entries are sorted by fee rate; once we're below the floor we're done.
-      break
-
-    # Weight limit (Core TestChunkBlockLimits line 241: >= not >).
-    # "nBlockWeight + chunk_feerate.size >= m_options.nBlockMaxWeight" → reject.
-    if nBlockWeight + entry.weight >= nBlockMaxWeight:
-      inc nConsecutiveFailed
-      # Consecutive-failure + full-enough abort (Core addChunks lines 314-317).
-      if nConsecutiveFailed > MaxConsecutiveFailures and
-         nBlockWeight + BlockFullEnoughWeightDelta > nBlockMaxWeight:
-        break
-      continue
-
-    # Sigops limit (Core TestChunkBlockLimits line 244: >= not >).
-    # "nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST" → reject.
-    let txSigops = estimateTxSigops(entry.tx)
-    if nBlockSigopsCost + txSigops >= MaxBlockSigopsCost:
-      inc nConsecutiveFailed
-      if nConsecutiveFailed > MaxConsecutiveFailures and
-         nBlockWeight + BlockFullEnoughWeightDelta > nBlockMaxWeight:
-        break
-      continue
-
-    # Check transaction finality (locktime).
-    # Reference: Bitcoin Core TestChunkTransactions() in node/miner.cpp.
-    if not isFinalTx(entry.tx, uint32(height), lockTimeCutoff):
-      inc nConsecutiveFailed
-      if nConsecutiveFailed > MaxConsecutiveFailures and
-         nBlockWeight + BlockFullEnoughWeightDelta > nBlockMaxWeight:
-        break
-      continue
-
-    # Accepted — reset consecutive-failure counter and accumulate.
-    nConsecutiveFailed = 0
-    txList.add(entry.tx)
-    totalFees = totalFees + entry.fee
-    nBlockWeight += entry.weight
-    nBlockSigopsCost += txSigops
-    totalSigops = nBlockSigopsCost
+  let selected = selectTemplateTransactions(
+    mempool, nBlockMaxWeight, nBlockReservedWeight,
+    blockMinFeeRateSatKvB, uint32(height), lockTimeCutoff)
+  let txList = selected.txs
+  let totalFees = selected.totalFees
+  let totalSigops = selected.totalSigops
+  let nBlockWeight = selected.nBlockWeight
 
   # Check if we have any segwit transactions
   var hasSegwit = false
