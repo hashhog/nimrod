@@ -72,6 +72,7 @@ type
     totalSigops*: int
     height*: int
     target*: array[32, byte]
+    minTime*: uint32  ## Core GetMinimumTime(pindexPrev, interval); GBT "mintime"
 
 proc encodeBip34Height*(height: int32): seq[byte] =
   ## Encode block height for coinbase scriptSig per BIP-34.
@@ -284,6 +285,16 @@ proc clampBlockOptions*(maxWeight: int, reservedWeight: int): tuple[maxWeight: i
   let clampedMax = max(clampedReserved, min(maxWeight, MaxBlockWeight))
   (clampedMax, clampedReserved)
 
+proc getMinimumTime*(prevMtp, prevTime: int64, height: int32,
+                     difficultyAdjustmentInterval: int): int64 =
+  ## Bitcoin Core node/miner.cpp:36-47 GetMinimumTime: the earliest valid
+  ## timestamp for the block at `height` on top of a tip with median time past
+  ## `prevMtp` and block time `prevTime`. BIP94 timewarp bound on every network
+  ## at retarget heights (MAX_TIMEWARP, consensus/consensus.h:35).
+  result = prevMtp + 1
+  if difficultyAdjustmentInterval > 0 and height mod difficultyAdjustmentInterval == 0:
+    result = max(result, prevTime - MaxTimeWarp)
+
 proc buildBlockTemplate*(
   chainState: ChainState,
   mempool: Mempool,
@@ -477,11 +488,23 @@ proc buildBlockTemplate*(
     deployments, prevHash, getBlockIndexFn, getMtpFn, vbCaches
   )
 
+  # Bitcoin Core node/miner.cpp:36-47 GetMinimumTime and :49-53 UpdateTime
+  # (CreateNewBlock calls UpdateTime at :219): nTime = max(min_time, now).
+  var prevMtp = 0'i64
+  var prevTime = 0'i64
+  let prevIdx = chainState.db.getBlockIndex(prevHash)
+  if prevIdx.isSome:
+    prevMtp = int64(getMtpForBlockIndex(chainState.db, prevIdx.get()))
+    prevTime = int64(prevIdx.get().header.timestamp)
+  let minTime = getMinimumTime(prevMtp, prevTime, int32(height),
+                               params.difficultyAdjustmentInterval)
+  let blockTime = max(minTime, getTime().toUnix())
+
   let header = BlockHeader(
     version: blockVersion,
     prevBlock: prevHash,
     merkleRoot: merkleRoot,
-    timestamp: uint32(getTime().toUnix()),
+    timestamp: uint32(blockTime),
     bits: bits,
     nonce: 0
   )
@@ -494,7 +517,8 @@ proc buildBlockTemplate*(
     totalWeight: totalWeight,
     totalSigops: totalSigops,
     height: height,
-    target: computeTarget(bits)
+    target: computeTarget(bits),
+    minTime: uint32(minTime)
   )
 
 proc updateTimestamp*(tmpl: var BlockTemplate, params: ConsensusParams,

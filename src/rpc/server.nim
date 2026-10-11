@@ -6342,7 +6342,7 @@ proc handleGetBlockTemplate(rpc: RpcServer, params: JsonNode): JsonNode =
     "coinbaseaux": %*{},
     "coinbasevalue": int64(tmpl.totalFees) + int64(getBlockSubsidy(int32(tmpl.height), rpc.params)),
     "target": reverseHex(toHex(tmpl.target)),
-    "mintime": tmpl.header.timestamp,
+    "mintime": tmpl.minTime,  # Core rpc/mining.cpp:997 GetMinimumTime
     "mutable": ["time", "transactions", "prevblock"],
     "noncerange": "00000000ffffffff",
     "sigoplimit": MaxBlockSigopsCost,
