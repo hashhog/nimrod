@@ -243,3 +243,51 @@ suite "mempool follows the chain inside connect / disconnect / reorg (NI-7, T4)"
     check f.cs.invalidateBlock(f.hash[112]).isOk
     check "EARLY" notin f.pool
     f.teardown()
+
+  test "invalidateblock of a block holding a 64-child parent keeps parent + children 1..63 (KB-192, harness warden_e)":
+    # Core v31.1 MaybeUpdateMempoolForReorg (validation.cpp:310-341) re-accepts
+    # the parent with bypass_limits; ATMP assumes a new entry has no in-mempool
+    # children, so the parent enters, and UpdateTransactionsFromBlock
+    # (txmempool.cpp) links its 64 children and calls TxGraph::Trim() to get the
+    # 65-tx cluster back under DEFAULT_CLUSTER_LIMIT (64): the lowest-feerate
+    # child goes. Measured on Core v31.1 (harness warden_e): parent + children
+    # 1..63 stay. Before the fix the parent was rejected as too-large-cluster
+    # and removeRecursive emptied the pool.
+    var f = setup110()
+    const ParentFee = 10_000'i64
+    let spendable = int64(f.cb[1].outputs[0].value) - ParentFee
+    let each = spendable div 64
+    var outs: seq[TxOut]
+    for i in 0 ..< 64:
+      let v = each + (if i == 0: spendable - each * 64 else: 0'i64)
+      outs.add(TxOut(value: Satoshi(v), scriptPubKey: p2shTrue()))
+    let parent = f.name("PARENT", Transaction(version: 2,
+      inputs: @[TxIn(prevOut: OutPoint(txid: f.cb[1].txid(), vout: 0),
+                     scriptSig: @[byte(0x01), byte(OP_TRUE)],
+                     sequence: 0xFFFFFFFE'u32)],
+      outputs: outs, witnesses: @[], lockTime: 0))
+    let b111 = blockOf(f.hash[110], 111, @[coinbaseTx(111), parent])
+    check f.cs.connectBlock(b111, 111).isOk
+    var children: seq[Transaction]
+    for i in 0 ..< 64:
+      let fee = int64(i + 1) * 1000
+      let child = f.name("C" & $i, Transaction(version: 2,
+        inputs: @[TxIn(prevOut: OutPoint(txid: parent.txid(), vout: uint32(i)),
+                       scriptSig: @[byte(0x01), byte(OP_TRUE)],
+                       sequence: 0xFFFFFFFE'u32)],
+        outputs: @[TxOut(value: Satoshi(int64(outs[i].value) - fee),
+                         scriptPubKey: p2shTrue())],
+        witnesses: @[], lockTime: 0))
+      check f.accept(child)
+      children.add(child)
+    check f.mp.entries.len == 64
+    check f.cs.invalidateBlock(hashOf(b111)).isOk
+    check f.cs.bestHeight == 110
+    var want = S("PARENT")
+    for i in 1 ..< 64: want.incl("C" & $i)
+    check f.mp.entries.len == 64
+    check f.pool == want
+    check "C0" notin f.pool
+    # The survivors count the re-added parent as an ancestor.
+    check f.mp.entries[children[63].txid()].ancestorCount == 2
+    f.teardown()
