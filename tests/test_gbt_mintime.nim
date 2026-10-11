@@ -100,21 +100,52 @@ suite "getblocktemplate mintime / curtime (Core GetMinimumTime)":
     check t["mintime"].getBiggestInt() == int64(base) + 7
     check t["curtime"].getBiggestInt() == t["mintime"].getBiggestInt()
 
-  test "BIP94: mintime is at least prev time - 600 on a retarget height":
-    # Shrink the retarget interval so the template height (16) is a multiple of it.
-    var params = regtestParams()
-    params.difficultyAdjustmentInterval = 16
+  # Core regtest: nPowTargetTimespan = 24*60*60, nPowTargetSpacing = 10*60
+  # (kernel/chainparams.cpp:576-577), so DifficultyAdjustmentInterval() =
+  # 86400 / 600 = 144 (consensus/params.h) and height 144 is a retarget height
+  # for GetMinimumTime's BIP94 clamp (miner.cpp:36-47). Plain regtestParams().
+  test "regtest params: retarget interval is 144 (86400 / 600), as in Core":
+    let params = regtestParams()
+    check params.powTargetTimespan == 86_400
+    check params.powTargetSpacing == 600
+    check params.difficultyAdjustmentInterval == 144
+
+  test "regtest height 144: mintime is the tip time - 600 (BIP94 clamp)":
+    let params = regtestParams()
     var cs = newChainState(TestDbPath, params)
     defer: cs.close()
     var times: seq[uint32]
-    for h in 0 .. 14: times.add(1700000000'u32 + uint32(h))
-    times.add(1700010000'u32)                 # tip (height 15) jumps ahead
+    for h in 0 .. 142: times.add(1700000000'u32 + uint32(h))
+    times.add(1700100000'u32)                 # tip 143 jumps ahead
     buildChain(cs, times)
     let t = gbt(cs, params)
-    check t["height"].getInt() == 16
-    # MTP(5..15) = 1700000010, so MTP+1 = 1700000011; prev time - MAX_TIMEWARP = 1700009400 wins.
-    check t["mintime"].getBiggestInt() == 1700009400
-    # Not a retarget height: plain MTP+1 even with a big jump at the tip.
-    var params2 = regtestParams()
-    params2.difficultyAdjustmentInterval = 2016
-    check gbt(cs, params2)["mintime"].getBiggestInt() == 1700000011
+    check t["height"].getInt() == 144
+    # Core v31.1 on this chain: mintime 1700099400 (MTP+1 would be 1700000139).
+    check t["mintime"].getBiggestInt() == 1700099400
+
+  test "regtest height 144, tip 7000 s ahead of the clock: curtime is raised to tip - 600":
+    let params = regtestParams()
+    var cs = newChainState(TestDbPath, params)
+    defer: cs.close()
+    let tip = uint32(getTime().toUnix() + 7000)
+    var times: seq[uint32]
+    for h in 0 .. 142: times.add(1700000000'u32 + uint32(h))
+    times.add(tip)
+    buildChain(cs, times)
+    let t = gbt(cs, params)
+    check t["height"].getInt() == 144
+    check t["mintime"].getBiggestInt() == int64(tip) - 600
+    check t["curtime"].getBiggestInt() == int64(tip) - 600
+
+  test "regtest height 145 is not a retarget height: plain MTP + 1":
+    let params = regtestParams()
+    var cs = newChainState(TestDbPath, params)
+    defer: cs.close()
+    var times: seq[uint32]
+    for h in 0 .. 143: times.add(1700000000'u32 + uint32(h))
+    times.add(1700100000'u32)                 # tip 144 jumps ahead
+    buildChain(cs, times)
+    let t = gbt(cs, params)
+    check t["height"].getInt() == 145
+    # MTP(134..144) = 1700000139
+    check t["mintime"].getBiggestInt() == 1700000140
