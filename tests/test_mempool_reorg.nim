@@ -143,6 +143,59 @@ proc buildTo112(f: var Fx): Vec =
 
 proc S(xs: varargs[string]): HashSet[string] = toHashSet(@xs)
 
+type TrimSpec = tuple[n, src: string, fee: int64]
+
+proc kidsFrom(start: int): seq[TrimSpec] =
+  for i in start ..< 64:
+    result.add(("C" & $i, "P:" & $i, 3_050'i64 + 100'i64 * int64(i)))
+
+proc runTrim(spec: seq[TrimSpec], parentFee = 10_000'i64): HashSet[string] =
+  ## Confirm a 64-output parent in block 111, accept `spec` into the mempool
+  ## (children of the parent, or of an earlier spec entry), invalidate 111 and
+  ## return the surviving pool by name.
+  var f = setup110()
+  let spendable = int64(f.cb[1].outputs[0].value) - parentFee
+  let each = spendable div 64
+  var outs: seq[TxOut]
+  for i in 0 ..< 64:
+    let v = each + (if i == 0: spendable - each * 64 else: 0'i64)
+    outs.add(TxOut(value: Satoshi(v), scriptPubKey: p2shTrue()))
+  let parent = f.name("PARENT", Transaction(version: 2,
+    inputs: @[TxIn(prevOut: OutPoint(txid: f.cb[1].txid(), vout: 0),
+                   scriptSig: @[byte(0x01), byte(OP_TRUE)],
+                   sequence: 0xFFFFFFFE'u32)],
+    outputs: outs, witnesses: @[], lockTime: 0))
+  let b111 = blockOf(f.hash[110], 111, @[coinbaseTx(111), parent])
+  doAssert f.cs.connectBlock(b111, 111).isOk
+  var made = initTable[string, Transaction]()
+  for (n, src, fee) in spec:
+    var prev: OutPoint
+    var v: int64
+    if src.len > 2 and src[0 .. 1] == "P:":
+      var i = 0
+      for ch in src[2 .. ^1]: i = i * 10 + (ord(ch) - ord('0'))
+      prev = OutPoint(txid: parent.txid(), vout: uint32(i))
+      v = int64(outs[i].value)
+    else:
+      let t = made[src]
+      prev = OutPoint(txid: t.txid(), vout: 0)
+      v = int64(t.outputs[0].value)
+    let tx = f.name(n, Transaction(version: 2,
+      inputs: @[TxIn(prevOut: prev, scriptSig: @[byte(0x01), byte(OP_TRUE)],
+                     sequence: 0xFFFFFFFE'u32)],
+      outputs: @[TxOut(value: Satoshi(v - fee), scriptPubKey: p2shTrue())],
+      witnesses: @[], lockTime: 0))
+    doAssert f.accept(tx), n
+    made[n] = tx
+  doAssert f.cs.invalidateBlock(hashOf(b111)).isOk
+  result = f.pool
+  f.teardown()
+
+proc allBut(spec: seq[TrimSpec], gone: varargs[string]): HashSet[string] =
+  result.incl("PARENT")
+  for t in spec: result.incl(t.n)
+  for g in gone: result.excl(g)
+
 suite "mempool follows the chain inside connect / disconnect / reorg (NI-7, T4)":
 
   test "connectBlock: confirmed txs and conflicts (with descendants) leave before the call returns":
@@ -291,3 +344,25 @@ suite "mempool follows the chain inside connect / disconnect / reorg (NI-7, T4)"
     # The survivors count the re-added parent as an ancestor.
     check f.mp.entries[children[63].txid()].ancestorCount == 2
     f.teardown()
+
+  # KB-192 trim divergence. Core v31.1 TxGraph::Trim (txgraph.cpp:3285-) keeps
+  # transactions in a merged order of the pre-merge clusters' CHUNK feerates and
+  # drops whatever no longer fits (plus descendants). Expected sets below are
+  # Core v31.1's, measured on the same shapes with P2WPKH spends through the
+  # core-regtest harness (probe groups trim_a/a2/c/c2, Oct 11 2026); the fee
+  # orderings carry over to these 85-vB P2SH(OP_TRUE) spends.
+  test "KB-192 trim (a): a low child whose own child is above every leaf but whose chunk is lowest goes with it":
+    let spec = @[("C0", "P:0", 200'i64), ("G0", "C0", 4_000'i64)] & kidsFrom(1)
+    check runTrim(spec) == allBut(spec, "C0", "G0")
+
+  test "KB-192 trim (a2): chunk {C0,G0} below every leaf, GG0 lowest: all three go":
+    let spec = @[("C0", "P:0", 200'i64), ("G0", "C0", 6_000'i64), ("GG0", "G0", 150'i64)] & kidsFrom(1)
+    check runTrim(spec) == allBut(spec, "C0", "G0", "GG0")
+
+  test "KB-192 trim (c): a low child CPFP'd above every leaf stays; the two lowest leaves go":
+    let spec = @[("C0", "P:0", 200'i64), ("G0", "C0", 20_000'i64)] & kidsFrom(1)
+    check runTrim(spec) == allBut(spec, "C1", "C2")
+
+  test "KB-192 trim (c2): low-fee re-added parent, lowest child goes":
+    let spec = @[("C0", "P:0", 500'i64)] & kidsFrom(1)
+    check runTrim(spec, parentFee = 1_000) == allBut(spec, "C0")
