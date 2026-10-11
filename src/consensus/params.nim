@@ -547,9 +547,12 @@ proc regtestParams*(): ConsensusParams =
   result.powLimit = hexToBytes32(
     "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
   )
-  result.powTargetTimespan = 1_209_600
+  # Bitcoin Core kernel/chainparams.cpp:576-577: nPowTargetTimespan = 24 * 60 * 60,
+  # nPowTargetSpacing = 10 * 60, so DifficultyAdjustmentInterval()
+  # (consensus/params.h:126, timespan / spacing) is 144 on regtest.
+  result.powTargetTimespan = 86_400
   result.powTargetSpacing = 600
-  result.difficultyAdjustmentInterval = 2016
+  result.difficultyAdjustmentInterval = 144
   # PoW rules: regtest never retargets, always allows min-difficulty
   result.powAllowMinDifficultyBlocks = true
   result.powNoRetargeting = true
