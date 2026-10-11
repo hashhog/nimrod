@@ -965,7 +965,8 @@ proc maxClusterSizeWeight*(mp: Mempool): int64 =
   int64(mp.clusterSizeLimit) * int64(WitnessScaleFactor)
 
 proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
-                            sigopCost: int64 = 0): (int, int64) =
+                            sigopCost: int64 = 0,
+                            countSpenders: bool = true): (int, int64) =
   ## Returns (cluster tx count including `tx`, cluster size in WEIGHT units
   ## including `tx`) for the cluster that `tx` would join.
   ##
@@ -989,10 +990,15 @@ proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
   for input in tx.inputs:
     if input.prevOut.txid in mp.entries:
       toVisit.add(input.prevOut.txid)
-  for vout in 0 ..< tx.outputs.len:
-    let op = OutPoint(txid: selfTxid, vout: uint32(vout))
-    if op in mp.spentBy:
-      toVisit.add(mp.spentBy[op])
+  ## countSpenders = false is the reorg re-add (bypass_limits): Core's ATMP
+  ## assumes a new entry has no in-mempool children (validation.cpp:322-334
+  ## comment) and links them afterwards in UpdateTransactionsFromBlock, which
+  ## trims an oversized cluster instead of rejecting the tx (trimClusterToLimits).
+  if countSpenders:
+    for vout in 0 ..< tx.outputs.len:
+      let op = OutPoint(txid: selfTxid, vout: uint32(vout))
+      if op in mp.spentBy:
+        toVisit.add(mp.spentBy[op])
 
   while toVisit.len > 0:
     let cur = toVisit.pop()
@@ -1019,7 +1025,8 @@ proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
 
 # Check cluster limits for a new transaction
 proc checkPackageLimits*(mp: Mempool, tx: Transaction, weight: int,
-                         sigopCost: int64 = 0): MempoolResult[void] =
+                         sigopCost: int64 = 0,
+                         countSpenders: bool = true): MempoolResult[void] =
   ## Check whether adding this transaction would violate the CLUSTER limits.
   ## This is mempool POLICY, not consensus — it must never affect block
   ## validation.
@@ -1052,7 +1059,7 @@ proc checkPackageLimits*(mp: Mempool, tx: Transaction, weight: int,
   ## Returns ok(()) if both limits are satisfied, err("too-large-cluster")
   ## otherwise.
   let (clusterCount, clusterSize) =
-    mp.calculateClusterStats(tx, weight, sigopCost)
+    mp.calculateClusterStats(tx, weight, sigopCost, countSpenders)
 
   # C1: cluster transaction count.  Strict `>` — a cluster of exactly
   # clusterLimit transactions is accepted.
@@ -1578,7 +1585,10 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # Cluster limits.  Core surfaces the BARE token with an empty debug string
   # (validation.cpp:1024, :1116, :1343, :1521), so pass the error through
   # verbatim rather than prefixing it.
-  let packageLimitsResult = mp.checkPackageLimits(tx, weight, txSigopCost)
+  # A reorg re-add (bypassLimits) does not count in-mempool spenders of the
+  # tx; maybeUpdateMempoolForReorg trims the merged cluster afterwards.
+  let packageLimitsResult = mp.checkPackageLimits(tx, weight, txSigopCost,
+                                                  countSpenders = not args.bypassLimits)
   if not packageLimitsResult.isOk:
     return err(AtmpAcceptInfo, packageLimitsResult.error)
 
@@ -1895,6 +1905,73 @@ proc limitMempoolSize*(mp: Mempool) =
   while mp.currentSize > mp.maxSize and mp.entries.len > 0:
     mp.evictLowestFee()
 
+proc clusterMembers(mp: Mempool, seed: TxId): seq[TxId] =
+  ## The in-mempool connected component of `seed` (parents and children).
+  if seed notin mp.entries:
+    return
+  var seen = initHashSet[TxId]()
+  var stack = @[seed]
+  while stack.len > 0:
+    let cur = stack.pop()
+    if cur in seen or cur notin mp.entries:
+      continue
+    seen.incl(cur)
+    result.add(cur)
+    let e = mp.entries[cur]
+    for input in e.tx.inputs:
+      if input.prevOut.txid in mp.entries:
+        stack.add(input.prevOut.txid)
+    for vout in 0 ..< e.tx.outputs.len:
+      let op = OutPoint(txid: cur, vout: uint32(vout))
+      if op in mp.spentBy:
+        stack.add(mp.spentBy[op])
+
+proc hasInPoolChild(mp: Mempool, txid: TxId): bool =
+  let e = mp.entries[txid]
+  for vout in 0 ..< e.tx.outputs.len:
+    let op = OutPoint(txid: txid, vout: uint32(vout))
+    if op in mp.spentBy and mp.spentBy[op] in mp.entries:
+      return true
+  false
+
+proc trimClusterToLimits*(mp: Mempool, seed: TxId) =
+  ## Core UpdateTransactionsFromBlock -> TxGraph::Trim() (txmempool.cpp):
+  ## after a reorg re-add links an entry to its in-mempool children, a cluster
+  ## over the count (clusterLimit) or weight (clusterSizeLimit * 4) limit loses
+  ## its lowest-feerate transactions until it fits, never a parent before its
+  ## children. This removes the lowest modified-feerate LEAF one at a time, an
+  ## approximation of Trim's chunk order that keeps dependencies intact.
+  while true:
+    let members = mp.clusterMembers(seed)
+    if members.len == 0:
+      return
+    var count = 0
+    var size = 0'i64
+    for m in members:
+      let e = mp.entries[m]
+      inc count
+      size += clusterSizeContribution(e.weight, e.sigopCost)
+    if count <= mp.clusterLimit and size <= mp.maxClusterSizeWeight():
+      return
+    var worst = none(TxId)
+    var worstFee = 0'i64
+    var worstWeight = 1'i64
+    for m in members:
+      if mp.hasInPoolChild(m):
+        continue
+      let e = mp.entries[m]
+      let fee = int64(e.fee) + mp.getFeeDelta(m)
+      let w = max(int64(e.weight), 1'i64)
+      # fee / w < worstFee / worstWeight, ties broken by txid for determinism.
+      if worst.isNone or fee * worstWeight < worstFee * w or
+         (fee * worstWeight == worstFee * w and $m < $worst.get()):
+        worst = some(m)
+        worstFee = fee
+        worstWeight = w
+    if worst.isNone:
+      return
+    mp.removeTransaction(worst.get())
+
 proc maybeUpdateMempoolForReorg*(mp: Mempool, addToMempool: bool = true) =
   ## Core MaybeUpdateMempoolForReorg (validation.cpp:294-386), run under the
   ## chain lock after InvalidateBlock's each DisconnectTip and once at the end
@@ -1909,6 +1986,7 @@ proc maybeUpdateMempoolForReorg*(mp: Mempool, addToMempool: bool = true) =
   ##      spends at the new tip+1, with descendants;
   ##   3. LimitMempoolSize.
   let queued = mp.disconnectPool
+  var relinked: seq[TxId]
   mp.disconnectPool.setLen(0)
   mp.disconnectPoolBytes = 0
   if addToMempool and queued.len > 0 and not mp.reorgCryptoReady:
@@ -1930,10 +2008,17 @@ proc maybeUpdateMempoolForReorg*(mp: Mempool, addToMempool: bool = true) =
       except CatchableError:
         accepted = false
       if accepted:
-        for d in mp.descendantsBySpend(txid, tx.outputs.len):
+        let desc = mp.descendantsBySpend(txid, tx.outputs.len)
+        for d in desc:
           mp.refreshAncestorState(d)
+        if desc.len > 0:
+          relinked.add(txid)
     if not accepted:
       mp.removeRecursive(txid, tx.outputs.len)
+  # Core UpdateTransactionsFromBlock: enforce cluster limits on the clusters
+  # the re-added txs merged with their in-mempool children.
+  for txid in relinked:
+    mp.trimClusterToLimits(txid)
   mp.removeForReorg()
   mp.limitMempoolSize()
 
