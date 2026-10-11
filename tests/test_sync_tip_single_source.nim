@@ -366,3 +366,52 @@ suite "RPC tip moves that are not extensions":
     waitFor f.sm.handleHeaders(f.peer, @[z.header])
     check f.sm.processBlock(f.peer, z)
     check f.cs.bestHeight == 6
+
+suite "submitblock of a block the index already knows (Core AcceptBlockHeader / fAlreadyHave)":
+
+  test "invalidated block -> duplicate-invalid, never reconnected; reconsiderblock re-activates":
+    # fleet-conformance INV-SUBMIT (2026-10-08): deployed 0c6c660 reconnected
+    # the invalidated block because its parent was the tip (tip 294 -> 295,
+    # answer null). Core: "duplicate-invalid" (validation.cpp AcceptBlockHeader
+    # BLOCK_FAILED_VALID; rpc/mining.cpp submitblock -> BIP22ValidationResult).
+    var f = buildFix("/tmp/nimrod_invsubmit_1")
+    defer:
+      f.cs.close()
+      removeDir(f.path)
+    let t3 = f.chain[3]
+    let t3h = hashOf(t3)
+    let x4 = mineBlock(t3h, 4, t3.header.timestamp + 600, 0x41)
+    check f.submit(x4) == "null"
+    check f.cs.bestHeight == 4
+    # already active -> "duplicate" (accepted, not a new block)
+    check f.submit(x4) == "\"duplicate\""
+    check f.submit(t3) == "\"duplicate\""
+    check f.cs.bestHeight == 4
+    var hexT3: array[32, byte]
+    for i in 0 ..< 32: hexT3[i] = array[32, byte](t3h)[31 - i]
+    discard f.rpc.handleMethod("invalidateblock", %*[hexOf(hexT3)])
+    check f.cs.bestHeight == 2
+    # the disconnected blocks no longer own their active-chain height slots
+    check f.cs.db.getBlockHashByHeight(3).isNone
+    check f.cs.db.getBlockHashByHeight(4).isNone
+    # the invalidated block itself: parent is the tip, still refused
+    check f.submit(t3) == "\"duplicate-invalid\""
+    check f.cs.bestHeight == 2
+    check f.cs.bestBlockHash == hashOf(f.chain[2])
+    # its (stored) descendant is failed too
+    check f.submit(x4) == "\"duplicate-invalid\""
+    check f.cs.bestHeight == 2
+    # an unknown child of the failed block: BLOCK_INVALID_PREV
+    let y4 = mineBlock(t3h, 4, t3.header.timestamp + 601, 0x42)
+    check f.submit(y4) == "\"bad-prevblk\""
+    check f.cs.bestHeight == 2
+    check f.cs.getUtxo(cbOut(t3)).isNone
+    # reconsiderblock = ResetBlockFailureFlags + ActivateBestChain: back on X4
+    # before the RPC returns, with X4's coins.
+    discard f.rpc.handleMethod("reconsiderblock", %*[hexOf(hexT3)])
+    checkpoint "after reconsiderblock: tip=" & $f.cs.bestHeight
+    check f.cs.bestHeight == 4
+    check f.cs.bestBlockHash == hashOf(x4)
+    check f.cs.getUtxo(cbOut(x4)).isSome
+    check f.submit(t3) == "\"duplicate\""
+    check utxoStats(f.rpc) == referenceStats(f.path & "_ref", f.p, f.chain & @[x4])
