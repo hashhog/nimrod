@@ -95,10 +95,12 @@ suite "W123 G3 — GBT bits little-endian wrong":
 # conflating mintime with curtime.  A miner that back-dates the timestamp on
 # template re-use would fail BIP-113.
 suite "W123 G4 — mintime conflated with curtime":
-  test "BUG-4: GBT mintime must be MTP(prev)+1 (with BIP-94 timewarp), not template ts":
-    # Structural absence — no GetMinimumTime call site in server.nim:3577-3668.
-    var hasBug = true
-    check hasBug == true
+  test "FIX-4: GBT mintime is GetMinimumTime (MTP(prev)+1, BIP-94 at retarget)":
+    # Fixed: buildBlockTemplate computes getMinimumTime and the GBT handler
+    # emits tmpl.minTime. End-to-end RPC checks: tests/test_gbt_mintime.nim.
+    check getMinimumTime(1700000005, 1700000010, 111, 2016) == 1700000006
+    check getMinimumTime(1700000005, 1700010000, 2016, 2016) == 1700009400
+    check getMinimumTime(1700000005, 1700000010, 2016, 2016) == 1700000006
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G5  GBT MUST reject when client rules omit "segwit" — W108 carry-forward
