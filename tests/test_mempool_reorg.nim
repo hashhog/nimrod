@@ -149,7 +149,8 @@ proc kidsFrom(start: int): seq[TrimSpec] =
   for i in start ..< 64:
     result.add(("C" & $i, "P:" & $i, 3_050'i64 + 100'i64 * int64(i)))
 
-proc runTrim(spec: seq[TrimSpec], parentFee = 10_000'i64): HashSet[string] =
+proc runTrim(spec: seq[TrimSpec], parentFee = 10_000'i64,
+             twoOut: seq[string] = @[]): HashSet[string] =
   ## Confirm a 64-output parent in block 111, accept `spec` into the mempool
   ## (children of the parent, or of an earlier spec entry), invalidate 111 and
   ## return the surviving pool by name.
@@ -183,7 +184,11 @@ proc runTrim(spec: seq[TrimSpec], parentFee = 10_000'i64): HashSet[string] =
     let tx = f.name(n, Transaction(version: 2,
       inputs: @[TxIn(prevOut: prev, scriptSig: @[byte(0x01), byte(OP_TRUE)],
                      sequence: 0xFFFFFFFE'u32)],
-      outputs: @[TxOut(value: Satoshi(v - fee), scriptPubKey: p2shTrue())],
+      outputs: (if n in twoOut:
+                  @[TxOut(value: Satoshi((v - fee) div 2), scriptPubKey: p2shTrue()),
+                    TxOut(value: Satoshi(v - fee - (v - fee) div 2), scriptPubKey: p2shTrue())]
+                else:
+                  @[TxOut(value: Satoshi(v - fee), scriptPubKey: p2shTrue())]),
       witnesses: @[], lockTime: 0))
     doAssert f.accept(tx), n
     made[n] = tx
@@ -366,3 +371,21 @@ suite "mempool follows the chain inside connect / disconnect / reorg (NI-7, T4)"
   test "KB-192 trim (c2): low-fee re-added parent, lowest child goes":
     let spec = @[("C0", "P:0", 500'i64)] & kidsFrom(1)
     check runTrim(spec, parentFee = 1_000) == allBut(spec, "C0")
+
+  # (b) Core v31.1 Trim orders the heap only by chunk FeeFrac (txgraph.cpp:3336-3341,
+  # feefrac.h:178-183: feerate, then smaller size first). C0 and C1 have the
+  # same fee and size, so FeeFrac cannot separate them; Core v31.1 keeps the
+  # first-accepted one and drops C1 (harness probe trim_b, and the
+  # trim_b_rev / trim_b_last / trim_b_hi orderings, 3/3 runs each).
+  test "KB-192 trim (b): two lowest childless txs with equal fee and size: the later-accepted one goes":
+    let spec = @[("C0", "P:0", 2_000'i64), ("C1", "P:1", 2_000'i64)] & kidsFrom(2)
+    check runTrim(spec) == allBut(spec, "C1")
+
+  test "KB-192 trim (b'): same order with C1 accepted first: C0 goes":
+    let spec = @[("C1", "P:1", 2_000'i64), ("C0", "P:0", 2_000'i64)] & kidsFrom(2)
+    check runTrim(spec) == allBut(spec, "C0")
+
+  test "KB-192 trim (b2): equal feerate, larger size goes (FeeFrac tie: smaller size first)":
+    # 1-in-1-out P2SH(OP_TRUE) spend = 340 WU, 1-in-2-out = 468 WU: 850/340 == 1170/468.
+    let spec = @[("C0", "P:0", 850'i64), ("C1", "P:1", 1_170'i64)] & kidsFrom(2)
+    check runTrim(spec, twoOut = @["C1"]) == allBut(spec, "C1")
