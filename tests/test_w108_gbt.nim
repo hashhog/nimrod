@@ -7,7 +7,7 @@
 ## required) — they exercise the mining helpers directly via the library API.
 
 import unittest2
-import std/[times, strutils, tables, options]
+import std/[times, strutils, tables, options, json, os]
 
 import ../src/primitives/[types, serialize]
 import ../src/consensus/params
@@ -15,6 +15,9 @@ import ../src/consensus/versionbits
 import ../src/storage/chainstate
 import ../src/crypto/hashing
 import ../src/mining/blocktemplate
+import ../src/mining/fees
+import ../src/mempool/mempool
+import ../src/rpc/server
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G1  GBT response MUST contain "longpollid"   (BIP-22 §8)
@@ -80,18 +83,98 @@ suite "W108 GBT gate G3 — vbrequired missing":
     check vbrequired == 0  # correct value per BIP-23 §3 and Core mining.cpp:996
 
 # ─────────────────────────────────────────────────────────────────────────────
-# G4  GBT transaction entries MUST contain "depends"  (BIP-22 §5)
+# G4  GBT order is parent-before-child, and each tx carries BIP-22 "depends"
 # ─────────────────────────────────────────────────────────────────────────────
-# BUG-4: Each transaction in the GBT "transactions" array must include a
-# "depends" field: an array of 1-based indices of other transactions in the
-# list that must precede this one (parent→child ordering).
-# Core builds a setTxIndex map keyed by txid; for each vin it checks whether
-# in.prevout.hash is already in the block's tx set.
-# Nimrod's tx entry objects have no "depends" key at all.
-suite "W108 GBT gate G4 — depends array missing from tx entries":
-  test "BUG-4: GBT transaction entries must include depends array (BIP-22 §5)":
-    var hasBug = true  # depends field absent from GBT transaction entries
-    check hasBug == true
+# Ancestor-feerate selection ranks a high-feerate child ahead of its
+# low-feerate parent. The template must still emit the parent first, and
+# must not emit a child whose in-mempool parent was left out.
+# "depends" is the list of 1-based indexes into "transactions" of the
+# in-template txs this one spends (BIP-22 §5, Core mining.cpp setTxIndex).
+suite "W108 GBT gate G4 — depends and parent order":
+  test "low-feerate parent is emitted before a higher-feerate child":
+    let dbPath = "/tmp/nimrod_w108_g4_" & $getCurrentProcessId()
+    if dirExists(dbPath):
+      removeDir(dbPath)
+    let params = regtestParams()
+    var cs = newChainState(dbPath, params)
+    var mp = newMempool(cs, params)
+    let rpc = newRpcServer(
+      port = 18443'u16,
+      chainState = cs,
+      mempool = mp,
+      peerManager = nil,
+      feeEstimator = newFeeEstimator(),
+      params = params)
+
+    # Confirmed outpoint — not in the mempool, so the parent has no
+    # in-template dependency.
+    var confirmed: array[32, byte]
+    confirmed[0] = 0x11
+    confirmed[31] = 0x22
+
+    proc chainTx(marker: byte, spends: TxId): Transaction =
+      Transaction(
+        version: 2,
+        inputs: @[TxIn(
+          prevOut: OutPoint(txid: spends, vout: 0'u32),
+          scriptSig: @[marker],
+          sequence: 0xffffffff'u32
+        )],
+        outputs: @[TxOut(
+          value: Satoshi(50_000),
+          scriptPubKey: @[0x51'u8, marker]
+        )],
+        witnesses: @[],
+        lockTime: 0
+      )
+
+    proc putEntry(tx: Transaction, fee, weight, ancFee, ancWeight: int) =
+      let id = tx.txid()
+      let vbytes = float64(weight) / 4.0
+      mp.entries[id] = MempoolEntry(
+        tx: tx,
+        txid: id,
+        wtxid: tx.wtxid(),
+        fee: Satoshi(fee),
+        weight: weight,
+        feeRate: float64(fee) / vbytes,
+        timeAdded: getTime(),
+        height: 0,
+        ancestorFee: Satoshi(ancFee),
+        ancestorWeight: ancWeight
+      )
+
+    # Parent is above the block-min floor (2 sat/vB) but well below the child.
+    # Child ancestor-feerate (parent+child) outranks the parent alone, which
+    # is what used to place the child first. Grandchild is cheaper than the
+    # child and still above the floor, so it must follow both.
+    let parent = chainTx(0xA1, TxId(confirmed))
+    let child = chainTx(0xA2, parent.txid())
+    let grand = chainTx(0xA3, child.txid())
+    putEntry(parent, fee = 2_000, weight = 4_000, ancFee = 2_000, ancWeight = 4_000)
+    putEntry(child, fee = 10_000, weight = 400, ancFee = 12_000, ancWeight = 4_400)
+    putEntry(grand, fee = 500, weight = 400, ancFee = 12_500, ancWeight = 4_800)
+
+    let res = rpc.handleMethod("getblocktemplate", %*[%*{"rules": ["segwit"]}])
+    let txs = res["transactions"]
+    check txs.kind == JArray
+    check txs.len == 3
+    check txs[0]["txid"].getStr() == $parent.txid()
+    check txs[1]["txid"].getStr() == $child.txid()
+    check txs[2]["txid"].getStr() == $grand.txid()
+    for i in 0 ..< txs.len:
+      check txs[i].hasKey("depends")
+    if txs[0].hasKey("depends") and txs[1].hasKey("depends") and
+        txs[2].hasKey("depends"):
+      check txs[0]["depends"].kind == JArray
+      check txs[0]["depends"].len == 0
+      check txs[1]["depends"].len == 1
+      check txs[1]["depends"][0].getInt() == 1
+      check txs[2]["depends"].len == 1
+      check txs[2]["depends"][0].getInt() == 2
+
+    cs.close()
+    removeDir(dbPath)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G5  GBT "bits" MUST be big-endian hex  (Core: strprintf("%08x", block.nBits))

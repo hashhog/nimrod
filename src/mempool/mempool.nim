@@ -105,8 +105,22 @@ type
     ## applies if the tx re-enters via ApplyDelta in PreChecks.  An entry whose
     ## net delta returns to 0 is erased.  Survives restart via mempool.dat.
     feeDeltas*: Table[TxId, int64]
+    ## Core DisconnectedBlockTransactions (kernel/disconnected_transactions.h):
+    ## non-coinbase txs of blocks disconnected from the active chain and not
+    ## yet re-confirmed, EARLIEST-CONFIRMED FIRST (the order
+    ## MaybeUpdateMempoolForReorg re-accepts them in). Filled by the chainstate
+    ## disconnect hook, pruned by removeForBlock, drained by
+    ## maybeUpdateMempoolForReorg.
+    disconnectPool*: seq[Transaction]
+    disconnectPoolBytes*: int
+    ## Verifier context for the reorg re-accept (the hooks run on whichever
+    ## thread holds the chain lock, so the pool owns its own context).
+    reorgCrypto: CryptoEngine
+    reorgCryptoReady: bool
 
 const
+  ## Core MAX_DISCONNECTED_TX_POOL_BYTES (kernel/disconnected_transactions.h).
+  MaxDisconnectedTxPoolBytes* = 20_000_000
   DefaultMaxMempoolSize* = 300_000_000  ## 300 MB
   DefaultMinFeeRate* = 0.1              ## 0.1 sat/vB = 100 sat/kvB minimum
                                         ## (Core DEFAULT_MIN_RELAY_TX_FEE = 100
@@ -226,6 +240,8 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
                     conflicts: HashSet[TxId], incrementalRelayFee: float64 = DefaultIncrementalRelayFee): MempoolResult[HashSet[TxId]]
 proc removeConflicts*(mp: Mempool, conflicts: HashSet[TxId])
 proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true)
+proc attachToChainState*(mp: Mempool) {.gcsafe, raises: [].}
+proc expire*(mp: Mempool, maxAgeOverride: int = -1)
 
 # Constructor
 proc newMempool*(chainState: ChainState, params: ConsensusParams,
@@ -240,7 +256,7 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
                  clusterSizeLimit: int = DefaultClusterSizeLimit,
                  incrementalRelayFeeRate: float64 = DefaultIncrementalRelayFeeSatKvB,
                  expiryHours: int = DefaultMempoolExpiryHours): Mempool =
-  Mempool(
+  result = Mempool(
     entries: initTable[TxId, MempoolEntry](),
     byWtxid: initTable[TxId, TxId](),
     spentBy: initTable[OutPoint, TxId](),
@@ -263,6 +279,10 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
     expiryHours: expiryHours,
     feeDeltas: initTable[TxId, int64]()
   )
+  # Keep the pool consistent with the chain from inside every connect /
+  # disconnect / reorg (Core ConnectTip / DisconnectTip /
+  # MaybeUpdateMempoolForReorg under cs_main).
+  result.attachToChainState()
 
 # Basic accessors
 proc size*(mp: Mempool): int =
@@ -945,7 +965,8 @@ proc maxClusterSizeWeight*(mp: Mempool): int64 =
   int64(mp.clusterSizeLimit) * int64(WitnessScaleFactor)
 
 proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
-                            sigopCost: int64 = 0): (int, int64) =
+                            sigopCost: int64 = 0,
+                            countSpenders: bool = true): (int, int64) =
   ## Returns (cluster tx count including `tx`, cluster size in WEIGHT units
   ## including `tx`) for the cluster that `tx` would join.
   ##
@@ -969,10 +990,15 @@ proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
   for input in tx.inputs:
     if input.prevOut.txid in mp.entries:
       toVisit.add(input.prevOut.txid)
-  for vout in 0 ..< tx.outputs.len:
-    let op = OutPoint(txid: selfTxid, vout: uint32(vout))
-    if op in mp.spentBy:
-      toVisit.add(mp.spentBy[op])
+  ## countSpenders = false is the reorg re-add (bypass_limits): Core's ATMP
+  ## assumes a new entry has no in-mempool children (validation.cpp:322-334
+  ## comment) and links them afterwards in UpdateTransactionsFromBlock, which
+  ## trims an oversized cluster instead of rejecting the tx (trimReorgClusters).
+  if countSpenders:
+    for vout in 0 ..< tx.outputs.len:
+      let op = OutPoint(txid: selfTxid, vout: uint32(vout))
+      if op in mp.spentBy:
+        toVisit.add(mp.spentBy[op])
 
   while toVisit.len > 0:
     let cur = toVisit.pop()
@@ -999,7 +1025,8 @@ proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
 
 # Check cluster limits for a new transaction
 proc checkPackageLimits*(mp: Mempool, tx: Transaction, weight: int,
-                         sigopCost: int64 = 0): MempoolResult[void] =
+                         sigopCost: int64 = 0,
+                         countSpenders: bool = true): MempoolResult[void] =
   ## Check whether adding this transaction would violate the CLUSTER limits.
   ## This is mempool POLICY, not consensus — it must never affect block
   ## validation.
@@ -1032,7 +1059,7 @@ proc checkPackageLimits*(mp: Mempool, tx: Transaction, weight: int,
   ## Returns ok(()) if both limits are satisfied, err("too-large-cluster")
   ## otherwise.
   let (clusterCount, clusterSize) =
-    mp.calculateClusterStats(tx, weight, sigopCost)
+    mp.calculateClusterStats(tx, weight, sigopCost, countSpenders)
 
   # C1: cluster transaction count.  Strict `>` — a cluster of exactly
   # clusterLimit transactions is accepted.
@@ -1558,7 +1585,10 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # Cluster limits.  Core surfaces the BARE token with an empty debug string
   # (validation.cpp:1024, :1116, :1343, :1521), so pass the error through
   # verbatim rather than prefixing it.
-  let packageLimitsResult = mp.checkPackageLimits(tx, weight, txSigopCost)
+  # A reorg re-add (bypassLimits) does not count in-mempool spenders of the
+  # tx; maybeUpdateMempoolForReorg trims the merged cluster afterwards.
+  let packageLimitsResult = mp.checkPackageLimits(tx, weight, txSigopCost,
+                                                  countSpenders = not args.bypassLimits)
   if not packageLimitsResult.isOk:
     return err(AtmpAcceptInfo, packageLimitsResult.error)
 
@@ -1699,40 +1729,487 @@ proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true) =
         # No child spends this parent's ephemeral dust, evict it too
         mp.removeTransaction(parentTxid, evictEphemeral = false)  # Prevent infinite recursion
 
+# ----------------------------------------------------------------------------
+# Mempool <-> active chain (Core txmempool.cpp removeForBlock / removeRecursive
+# / removeForReorg, validation.cpp MaybeUpdateMempoolForReorg,
+# kernel/disconnected_transactions.cpp)
+# ----------------------------------------------------------------------------
+
+proc descendantsBySpend(mp: Mempool, txid: TxId, nOutputs: int): seq[TxId] =
+  ## In-mempool descendants of `txid` (not including it), found through the
+  ## spentBy index — O(descendants), unlike calculateDescendants which scans
+  ## every entry per step. `txid` itself need not be in the pool (a tx that
+  ## was confirmed, or that failed to re-enter after a reorg).
+  var seen = initHashSet[TxId]()
+  var queue: seq[(TxId, int)] = @[(txid, nOutputs)]
+  while queue.len > 0:
+    let (t, n) = queue.pop()
+    for v in 0 ..< n:
+      let op = OutPoint(txid: t, vout: uint32(v))
+      if op in mp.spentBy:
+        let child = mp.spentBy[op]
+        if child notin seen and child in mp.entries:
+          seen.incl(child)
+          result.add(child)
+          queue.add((child, mp.entries[child].tx.outputs.len))
+
+proc refreshAncestorState(mp: Mempool, txid: TxId) =
+  ## Recompute an entry's cached ancestor aggregates after a parent entered or
+  ## left the pool (Core UpdateTransactionsFromBlock / UpdateForRemoveFromMempool).
+  if txid notin mp.entries:
+    return
+  var e = mp.entries[txid]
+  let selfFee = Satoshi(int64(e.fee) + mp.getFeeDelta(txid))
+  let (aFee, aWeight) = mp.calculateAncestorFeesAndWeight(e.tx, selfFee, e.weight)
+  let (aCount, aSize) = mp.calculateAncestorStats(e.tx, (e.weight + 3) div 4)
+  e.ancestorFee = aFee
+  e.ancestorWeight = aWeight
+  e.ancestorCount = aCount
+  e.ancestorSize = aSize
+  mp.entries[txid] = e
+
+proc removeRecursive*(mp: Mempool, txid: TxId, nOutputs: int) =
+  ## Core CTxMemPool::removeRecursive: `txid` (if present) and every in-mempool
+  ## descendant. `nOutputs` is the tx's output count (the tx may not be in the
+  ## pool any more, so it cannot be looked up).
+  let desc = mp.descendantsBySpend(txid, nOutputs)
+  if txid in mp.entries:
+    mp.removeTransaction(txid)
+  for d in desc:
+    if d in mp.entries:
+      mp.removeTransaction(d)
+
+proc removeRecursive*(mp: Mempool, tx: Transaction) =
+  mp.removeRecursive(tx.txid(), tx.outputs.len)
+
 # Remove transactions confirmed in a block
 proc removeForBlock*(mp: Mempool, blk: Block) =
-  ## Remove transactions that were included in a block.
-  ## Also removes any transactions that spend outputs created by block txs
-  ## (double-spend conflicts).
+  ## Core CTxMemPool::removeForBlock (txmempool.cpp:405) + the
+  ## DisconnectedBlockTransactions::removeForBlock ConnectTip pairs with it.
+  ## Called for EVERY connected block from inside the chainstate connect (the
+  ## mempoolConnectHook), under the chain lock:
+  ##   * each block tx leaves the pool (its in-mempool children stay — they
+  ##     now spend a confirmed output — with their ancestor state refreshed),
+  ##   * every pool tx that spends an input a block tx spends is a CONFLICT
+  ##     and leaves WITH ALL ITS DESCENDANTS (removeConflicts ->
+  ##     removeRecursive; it used to drop only the direct conflict),
+  ##   * each block tx leaves the disconnect pool.
   ## Sets blockSinceLastRollingFeeBump = true so GetMinFee decays the rolling
-  ## floor after the next update interval.
-  ## Core reference: txmempool.cpp:426-427 (lastRollingFeeUpdate + blockSinceLastRollingFeeBump
-  ## reset happens at the end of CTxMemPool::removeForBlock).
+  ## floor after the next update interval (txmempool.cpp:426-427).
+  mp.lastRollingFeeUpdate = getTime().toUnix()
+  mp.blockSinceLastRollingFeeBump = true
+  # Nothing to do for an empty pool (IBD): skip hashing every tx.
+  if mp.entries.len == 0 and mp.disconnectPool.len == 0:
+    return
 
-  # Collect txids to remove
-  var toRemove: seq[TxId]
-
+  var confirmed = initHashSet[TxId]()
+  var childrenToRefresh: seq[TxId]
   for tx in blk.txs:
     let txid = tx.txid()
+    confirmed.incl(txid)
     if txid in mp.entries:
-      toRemove.add(txid)
-
-    # Check for conflicting mempool transactions
-    # (transactions that spend outputs now used by this block tx)
+      childrenToRefresh.add(mp.descendantsBySpend(txid, tx.outputs.len))
+      mp.removeTransaction(txid)
+    # Conflicts: pool txs spending an outpoint this block tx spends.
     for input in tx.inputs:
       if input.prevOut in mp.spentBy:
         let conflictTxid = mp.spentBy[input.prevOut]
-        if conflictTxid notin toRemove:
-          toRemove.add(conflictTxid)
+        if conflictTxid != txid and conflictTxid in mp.entries:
+          mp.removeRecursive(conflictTxid,
+                             mp.entries[conflictTxid].tx.outputs.len)
 
-  # Remove all collected transactions
-  for txid in toRemove:
-    mp.removeTransaction(txid)
+  for c in childrenToRefresh:
+    mp.refreshAncestorState(c)
 
-  # After block removal: reset rolling fee decay timer so fee floor can decay.
-  # Core sets these at the end of removeForBlock (txmempool.cpp:426-427).
-  mp.lastRollingFeeUpdate = getTime().toUnix()
-  mp.blockSinceLastRollingFeeBump = true
+  if mp.disconnectPool.len > 0:
+    var kept: seq[Transaction]
+    var keptBytes = 0
+    for tx in mp.disconnectPool:
+      if tx.txid() notin confirmed:
+        kept.add(tx)
+        keptBytes += serialize(tx).len
+    mp.disconnectPool = kept
+    mp.disconnectPoolBytes = keptBytes
+
+proc addDisconnectedBlock*(mp: Mempool, blk: Block) =
+  ## Core DisconnectTip -> DisconnectedBlockTransactions::AddTransactionsFromBlock.
+  ## Blocks are disconnected tip-first, so each one's txs go IN FRONT of what is
+  ## already queued: the pool stays earliest-confirmed first. Over
+  ## MaxDisconnectedTxPoolBytes, the most recently confirmed txs are dropped
+  ## (Core LimitMemoryUsage evicts the first-added, i.e. tip-most, entries).
+  var txs: seq[Transaction]
+  var bytes = 0
+  for i, tx in blk.txs:
+    if i == 0:
+      continue  # coinbase never re-enters the pool
+    txs.add(tx)
+    bytes += serialize(tx).len
+  if txs.len == 0:
+    return
+  mp.disconnectPool = txs & mp.disconnectPool
+  mp.disconnectPoolBytes += bytes
+  while mp.disconnectPoolBytes > MaxDisconnectedTxPoolBytes and
+        mp.disconnectPool.len > 0:
+    let dropped = mp.disconnectPool.pop()
+    mp.disconnectPoolBytes -= serialize(dropped).len
+    # Core removeRecursive's whatever spends a tx it gives up on.
+    mp.removeRecursive(dropped)
+
+proc isFinalAndMatureAtTip(mp: Mempool, tx: Transaction): bool =
+  ## The removeForReorg filter Core builds in MaybeUpdateMempoolForReorg
+  ## (validation.cpp:345-381): a pool tx survives only if, at tip+1, it is
+  ## final (CheckFinalTxAtTip, BIP113), its BIP68 sequence locks are met
+  ## (CheckSequenceLocksAtTip; in-pool parents count as height tip+1) and no
+  ## confirmed coinbase it spends is immature.
+  let tipHeight = mp.chainState.bestHeight
+  let mtp = getMtpForHeight(mp.chainState.db, tipHeight)
+  if not isFinalTx(tx, uint32(tipHeight + 1), mtp):
+    return false
+  for input in tx.inputs:
+    if input.prevOut.txid in mp.entries:
+      continue
+    let utxo = mp.chainState.getUtxo(input.prevOut)
+    if utxo.isNone:
+      return false  # input gone: cannot stay (Core asserts this never happens)
+    let coin = utxo.get()
+    if coin.isCoinbase and
+       (tipHeight + 1) - coin.height < int32(mp.params.coinbaseMaturity):
+      return false
+  proc lookupForSeqLock(op: OutPoint): Option[UtxoEntry] =
+    let confirmed = mp.chainState.getUtxo(op)
+    if confirmed.isSome:
+      return confirmed
+    if op.txid in mp.entries:
+      return some(UtxoEntry(output: TxOut(), height: int32(tipHeight + 1),
+                            isCoinbase: false))
+    none(UtxoEntry)
+  proc getMtpAt(h: int32): uint32 = getMtpForHeight(mp.chainState.db, h)
+  checkSequenceLocksForTx(tx, lookupForSeqLock, tipHeight + 1, mtp, getMtpAt,
+                          mp.params).isOk
+
+proc removeForReorg*(mp: Mempool) =
+  ## Core CTxMemPool::removeForReorg (txmempool.cpp:360) with the
+  ## filter_final_and_mature predicate: every entry that is no longer valid at
+  ## the new tip+1 leaves the pool with all its descendants.
+  var drop: seq[TxId]
+  for txid, entry in mp.entries:
+    if not mp.isFinalAndMatureAtTip(entry.tx):
+      drop.add(txid)
+  for txid in drop:
+    if txid in mp.entries:
+      mp.removeRecursive(txid, mp.entries[txid].tx.outputs.len)
+
+proc limitMempoolSize*(mp: Mempool) =
+  ## Core LimitMempoolSize (validation.cpp:268): expire, then trim to size.
+  mp.expire()
+  while mp.currentSize > mp.maxSize and mp.entries.len > 0:
+    mp.evictLowestFee()
+
+proc clusterMembers(mp: Mempool, seed: TxId): seq[TxId] =
+  ## The in-mempool connected component of `seed` (parents and children).
+  if seed notin mp.entries:
+    return
+  var seen = initHashSet[TxId]()
+  var stack = @[seed]
+  while stack.len > 0:
+    let cur = stack.pop()
+    if cur in seen or cur notin mp.entries:
+      continue
+    seen.incl(cur)
+    result.add(cur)
+    let e = mp.entries[cur]
+    for input in e.tx.inputs:
+      if input.prevOut.txid in mp.entries:
+        stack.add(input.prevOut.txid)
+    for vout in 0 ..< e.tx.outputs.len:
+      let op = OutPoint(txid: cur, vout: uint32(vout))
+      if op in mp.spentBy:
+        stack.add(mp.spentBy[op])
+
+proc hasInPoolChild(mp: Mempool, txid: TxId): bool =
+  let e = mp.entries[txid]
+  for vout in 0 ..< e.tx.outputs.len:
+    let op = OutPoint(txid: txid, vout: uint32(vout))
+    if op in mp.spentBy and mp.spentBy[op] in mp.entries:
+      return true
+  false
+
+type TrimFrac = tuple[fee, size: int64]
+
+proc trimBetter(a, b: TrimFrac): bool =
+  ## Core FeeFrac operator<=> (util/feefrac.h:178-183): a > b by feerate,
+  ## and at equal feerate the SMALLER size is the greater one.
+  let x = a.fee * b.size
+  let y = b.fee * a.size
+  if x != y: x > y else: a.size < b.size
+
+proc trimReorgClusters*(mp: Mempool, readded: seq[TxId]) =
+  ## Core UpdateTransactionsFromBlock -> TxGraph::Trim() (txmempool.cpp:111-119,
+  ## txgraph.cpp:3285-3529) for the clusters a reorg re-add merged with
+  ## in-mempool children.
+  ##
+  ## Trim works on the PRE-MERGE clusters: everything linked before the
+  ## re-add's new parent->child dependencies (txmempool.cpp:108,
+  ## m_deps_to_add). Each pre-merge cluster is linearized and chunked; every tx
+  ## carries its chunk's feerate (AppendTrimData, txgraph.cpp:1398-1436) and an
+  ## implicit dependency on its predecessor in that linearization. Txs then
+  ## leave a max-heap ordered by chunk FeeFrac only (cmp_fn, txgraph.cpp:3336-
+  ## 3341) once all their dependencies are included. A tx is kept if the
+  ## would-be cluster it joins (union-find over its dependencies) stays within
+  ## the count and size limits, and skipped otherwise (txgraph.cpp:3485-3497).
+  ## A skipped tx never satisfies its dependents, so they are dropped too
+  ## (txgraph.cpp:3518-3527): no survivor ever loses an ancestor.
+  ##
+  ## Core breaks a tie between equal FeeFracs with std::pop_heap order, which
+  ## is not a specified rule. This port keeps the earlier-accepted tx (then
+  ## the lower txid). That matches Core v31.1 for two-way ties (probes trim_b,
+  ## trim_b_rev, trim_b_last, trim_b_hi) but not necessarily for 3+-way ties.
+  var readdedSet = initHashSet[TxId]()
+  for t in readded: readdedSet.incl(t)
+  var done = initHashSet[TxId]()
+  let countLimit = mp.clusterLimit
+  let sizeLimit = mp.maxClusterSizeWeight()
+  for seed in readded:
+    if seed notin mp.entries or seed in done:
+      continue
+    var members = mp.clusterMembers(seed)
+    for m in members: done.incl(m)
+    var total = 0'i64
+    for m in members:
+      total += clusterSizeContribution(mp.entries[m].weight, mp.entries[m].sigopCost)
+    if members.len <= countLimit and total <= sizeLimit:
+      continue
+    members.sort(proc(a, b: TxId): int = cmp($a, $b))
+    let n = members.len
+    var idx = initTable[TxId, int]()
+    for i, m in members: idx[m] = i
+    var fr = newSeq[TrimFrac](n)
+    var added = newSeq[Time](n)
+    var parents = newSeq[seq[int]](n)
+    var oldParents = newSeq[seq[int]](n)   # dependencies present before the re-add linked children
+    for i, m in members:
+      let e = mp.entries[m]
+      fr[i] = (int64(e.fee) + mp.getFeeDelta(m), clusterSizeContribution(e.weight, e.sigopCost))
+      added[i] = e.timeAdded
+      for input in e.tx.inputs:
+        let p = input.prevOut.txid
+        if p in idx and idx[p] notin parents[i]:
+          parents[i].add(idx[p])
+          # m_deps_to_add: a re-added parent and a child that was already in the pool.
+          if not (p in readdedSet and m notin readdedSet):
+            oldParents[i].add(idx[p])
+    proc earlier(a, b: int): bool =
+      if added[a] != added[b]: added[a] < added[b] else: $members[a] < $members[b]
+    # Pre-merge clusters: connected components over the old dependencies.
+    var comp = newSeq[int](n)
+    for i in 0 ..< n: comp[i] = i
+    proc root(x: int): int =
+      var r = x
+      while comp[r] != r: r = comp[r]
+      r
+    for i in 0 ..< n:
+      for p in oldParents[i]:
+        let a = root(i)
+        let b = root(p)
+        if a != b: comp[a] = b
+    var groups = initTable[int, seq[int]]()
+    for i in 0 ..< n: groups.mgetOrPut(root(i), @[]).add(i)
+    # Linearize each pre-merge cluster (ancestor-set selection; optimal for
+    # the small shapes a reorg re-add produces) and chunk it like Core's
+    # ChunkLinearization: merge while the new chunk has a strictly higher feerate.
+    var chunkFr = newSeq[TrimFrac](n)
+    var pred = newSeq[int](n)
+    for i in 0 ..< n: pred[i] = -1
+    for _, g in groups:
+      var remaining = initHashSet[int]()
+      for i in g: remaining.incl(i)
+      var lin: seq[int]
+      while remaining.len > 0:
+        var best = -1
+        var bestSet: seq[int]
+        var bestFr: TrimFrac
+        for i in g:
+          if i notin remaining: continue
+          var anc: seq[int]
+          var stack = @[i]
+          var seen = initHashSet[int]()
+          while stack.len > 0:
+            let c = stack.pop()
+            if c in seen or c notin remaining: continue
+            seen.incl(c)
+            anc.add(c)
+            for p in oldParents[c]: stack.add(p)
+          var f: TrimFrac = (0'i64, 0'i64)
+          for a in anc: f = (f.fee + fr[a].fee, f.size + fr[a].size)
+          if best < 0 or trimBetter(f, bestFr) or
+             (not trimBetter(bestFr, f) and earlier(i, best)):
+            best = i
+            bestSet = anc
+            bestFr = f
+        # Emit the ancestor set parents-first.
+        var depth = initTable[int, int]()
+        proc depthOf(x: int): int =
+          if x in depth: return depth[x]
+          var d = 0
+          for p in oldParents[x]:
+            if p in remaining: d = max(d, depthOf(p) + 1)
+          depth[x] = d
+          d
+        bestSet.sort(proc(a, b: int): int =
+          let da = depthOf(a)
+          let db = depthOf(b)
+          if da != db: cmp(da, db) elif earlier(a, b): -1 else: 1)
+        for a in bestSet:
+          lin.add(a)
+          remaining.excl(a)
+      var chunks: seq[(seq[int], TrimFrac)]
+      for i in lin:
+        var c = (@[i], fr[i])
+        while chunks.len > 0 and
+              c[1].fee * chunks[^1][1].size > chunks[^1][1].fee * c[1].size:
+          let last = chunks.pop()
+          c = (last[0] & c[0], (last[1].fee + c[1].fee, last[1].size + c[1].size))
+        chunks.add(c)
+      for (txs, f) in chunks:
+        for t in txs: chunkFr[t] = f
+      for k in 1 ..< lin.len: pred[lin[k]] = lin[k - 1]
+    # Dependencies for the merge: every in-cluster parent (old and newly
+    # linked) plus the implicit linearization predecessor.
+    var deps = newSeq[seq[int]](n)
+    var children = newSeq[seq[int]](n)
+    for i in 0 ..< n:
+      for p in parents[i]:
+        if p notin deps[i]: deps[i].add(p)
+      if pred[i] >= 0 and pred[i] notin deps[i]: deps[i].add(pred[i])
+      for p in deps[i]: children[p].add(i)
+    var left = newSeq[int](n)
+    var heap: seq[int]
+    for i in 0 ..< n:
+      left[i] = deps[i].len
+      if left[i] == 0 and fr[i].size <= sizeLimit: heap.add(i)
+    var uf = newSeq[int](n)
+    var ufCount = newSeq[int](n)
+    var ufSize = newSeq[int64](n)
+    var included = newSeq[bool](n)
+    proc find(x: int): int =
+      var r = x
+      while uf[r] != r: r = uf[r]
+      r
+    while heap.len > 0:
+      var bi = 0
+      for k in 1 ..< heap.len:
+        let a = heap[k]
+        let b = heap[bi]
+        if trimBetter(chunkFr[a], chunkFr[b]) or
+           (not trimBetter(chunkFr[b], chunkFr[a]) and earlier(a, b)):
+          bi = k
+      let e = heap[bi]
+      heap.del(bi)
+      uf[e] = e
+      ufCount[e] = 1
+      ufSize[e] = fr[e].size
+      var roots: seq[int]
+      for p in deps[e]:
+        let r = find(p)
+        if r notin roots: roots.add(r)
+      var newCount = 1
+      var newSize = fr[e].size
+      for r in roots:
+        newCount += ufCount[r]
+        newSize += ufSize[r]
+      if newCount > countLimit or newSize > sizeLimit:
+        continue
+      for r in roots:
+        uf[r] = e
+      ufCount[e] = newCount
+      ufSize[e] = newSize
+      included[e] = true
+      for c in children[e]:
+        dec left[c]
+        if left[c] == 0: heap.add(c)
+    # Drop everything not included, descendants first.
+    var drop: seq[int]
+    for i in 0 ..< n:
+      if not included[i]: drop.add(i)
+    drop.sort(proc(a, b: int): int =
+      cmp(mp.entries[members[b]].ancestorCount, mp.entries[members[a]].ancestorCount))
+    for i in drop:
+      mp.removeTransaction(members[i])
+
+proc maybeUpdateMempoolForReorg*(mp: Mempool, addToMempool: bool = true) =
+  ## Core MaybeUpdateMempoolForReorg (validation.cpp:294-386), run under the
+  ## chain lock after InvalidateBlock's each DisconnectTip and once at the end
+  ## of a reorg:
+  ##   1. re-accept the disconnect pool EARLIEST FIRST with bypass_limits
+  ##      (no fee floor / size limit, every other check); a tx that fails is
+  ##      removeRecursive'd so its in-pool descendants (e.g. a child of a tx
+  ##      the new branch double-spent) go too; a re-added tx's in-pool
+  ##      descendants are kept and their ancestor state refreshed
+  ##      (UpdateTransactionsFromBlock);
+  ##   2. removeForReorg: drop non-final / BIP68-locked / immature-coinbase
+  ##      spends at the new tip+1, with descendants;
+  ##   3. LimitMempoolSize.
+  let queued = mp.disconnectPool
+  var relinked: seq[TxId]
+  mp.disconnectPool.setLen(0)
+  mp.disconnectPoolBytes = 0
+  if addToMempool and queued.len > 0 and not mp.reorgCryptoReady:
+    try:
+      mp.reorgCrypto = newCryptoEngine()
+      mp.reorgCryptoReady = true
+    except CatchableError:
+      discard
+  for tx in queued:
+    let txid = tx.txid()
+    var accepted = txid in mp.entries
+    if not accepted and addToMempool and mp.reorgCryptoReady:
+      var args = defaultAtmpArgs()
+      args.bypassLimits = true
+      var r: MempoolResult[TxId]
+      try:
+        r = mp.acceptTransaction(tx, mp.reorgCrypto, args)
+        accepted = r.isOk
+      except CatchableError:
+        accepted = false
+      if accepted:
+        let desc = mp.descendantsBySpend(txid, tx.outputs.len)
+        for d in desc:
+          mp.refreshAncestorState(d)
+        if desc.len > 0:
+          relinked.add(txid)
+    if not accepted:
+      mp.removeRecursive(txid, tx.outputs.len)
+  # Core UpdateTransactionsFromBlock: enforce cluster limits on the clusters
+  # the re-added txs merged with their in-mempool children.
+  mp.trimReorgClusters(relinked)
+  mp.removeForReorg()
+  mp.limitMempoolSize()
+
+proc attachToChainState*(mp: Mempool) {.gcsafe, raises: [].} =
+  ## Install the chainstate hooks that keep this pool consistent with the
+  ## active chain from inside every connect / disconnect / reorg, under the
+  ## chain lock (see ChainState.mempoolConnectHook).
+  if mp.chainState == nil:
+    return
+  let pool = mp
+  mp.chainState.mempoolConnectHook = proc(blk: Block) {.gcsafe, raises: [].} =
+    try:
+      {.cast(gcsafe).}:
+        pool.removeForBlock(blk)
+    except Exception:
+      discard
+  mp.chainState.mempoolDisconnectHook = proc(blk: Block) {.gcsafe, raises: [].} =
+    try:
+      {.cast(gcsafe).}:
+        pool.addDisconnectedBlock(blk)
+    except Exception:
+      discard
+  mp.chainState.mempoolUpdateHook = proc() {.gcsafe, raises: [].} =
+    try:
+      {.cast(gcsafe).}:
+        pool.maybeUpdateMempoolForReorg(true)
+    except Exception:
+      discard
 
 # Re-admit transactions that came back from a disconnected block during a reorg.
 # Mirrors Bitcoin Core's `MaybeUpdateMempoolForReorg`
@@ -1983,7 +2460,8 @@ proc evictLowestFee*(mp: Mempool) =
 
 # Select transactions for a new block
 proc selectTransactionsForBlock*(mp: Mempool, maxWeight: int = MaxBlockWeight): seq[Transaction] =
-  ## Select transactions for block template (greedy by ancestor fee rate)
+  ## Ancestor-feerate list, capped by maxWeight. Not used for block templates:
+  ## buildBlockTemplate packages by ancestor feerate and emits parents first.
   let entries = mp.getTransactionsByFeeRate(maxWeight)
   for entry in entries:
     result.add(entry.tx)
