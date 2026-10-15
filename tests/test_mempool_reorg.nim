@@ -389,3 +389,52 @@ suite "mempool follows the chain inside connect / disconnect / reorg (NI-7, T4)"
     # 1-in-1-out P2SH(OP_TRUE) spend = 340 WU, 1-in-2-out = 468 WU: 850/340 == 1170/468.
     let spec = @[("C0", "P:0", 850'i64), ("C1", "P:1", 1_170'i64)] & kidsFrom(2)
     check runTrim(spec, twoOut = @["C1"]) == allBut(spec, "C1")
+
+  # (b3..b64g) Ties of three or more equal FeeFracs. Core v31.1 has no rule
+  # for these: the survivor falls out of libstdc++'s std::sort permutation of
+  # equal keys (GroupClusters' an_deps, Trim's deps_by_parent) and of
+  # std::make_heap / push_heap / pop_heap over equal elements. Neither
+  # "earliest accepted stays" nor "latest accepted goes" fits: b3 drops the
+  # first-accepted C0, b5 the second-accepted C1, b64 C35. Expected sets were
+  # measured on Core v31.1 regtest with these exact shapes (P2SH(OP_TRUE)
+  # spends, 64-output parent mined in 111 without entering the mempool,
+  # children accepted in spec order, invalidateblock 111), 3/3 runs each:
+  # staged-patches/kb192/core_trim_probe.py in the meta-repo.
+  proc eqKids(ids: seq[int], fee = 2_000'i64): seq[TrimSpec] =
+    for i in ids: result.add(("C" & $i, "P:" & $i, fee))
+
+  test "KB-192 trim (b3): three-way tie at the bottom, accepted C0,C1,C2: Core drops C0":
+    let spec = eqKids(@[0, 1, 2]) & kidsFrom(3)
+    check runTrim(spec) == allBut(spec, "C0")
+
+  test "KB-192 trim (b3_rev): three-way tie accepted C2,C1,C0: Core drops C2":
+    let spec = eqKids(@[2, 1, 0]) & kidsFrom(3)
+    check runTrim(spec) == allBut(spec, "C2")
+
+  test "KB-192 trim (b4): four-way tie at the bottom: Core drops C0":
+    let spec = eqKids(@[0, 1, 2, 3]) & kidsFrom(4)
+    check runTrim(spec) == allBut(spec, "C0")
+
+  test "KB-192 trim (b5): five-way tie at the bottom: Core drops C1":
+    let spec = eqKids(@[0, 1, 2, 3, 4]) & kidsFrom(5)
+    check runTrim(spec) == allBut(spec, "C1")
+
+  test "KB-192 trim (b64): all 64 children tie: Core drops C35":
+    var ids: seq[int]
+    for i in 0 ..< 64: ids.add(i)
+    let spec = eqKids(ids)
+    check runTrim(spec) == allBut(spec, "C35")
+
+  test "KB-192 trim (b64g): 64 tied children plus a low grandchild on C0: Core drops G0 and C44":
+    var ids: seq[int]
+    for i in 0 ..< 64: ids.add(i)
+    let spec = eqKids(ids) & @[("G0", "C0", 100'i64)]
+    check runTrim(spec) == allBut(spec, "G0", "C44")
+
+  test "KB-192 trim (b3_two): three-way tie, two must go (C5 CPFP'd by G5): Core drops C0 and C2":
+    let spec = eqKids(@[0, 1, 2]) & kidsFrom(3) & @[("G5", "C5", 50_000'i64)]
+    check runTrim(spec) == allBut(spec, "C0", "C2")
+
+  test "KB-192 trim (b3_hi): a three-way tie above the cut does not move the lowest-fee drop":
+    let spec = @[("C0", "P:0", 1_000'i64)] & eqKids(@[1, 2, 3], 9_000) & kidsFrom(4)
+    check runTrim(spec) == allBut(spec, "C0")
