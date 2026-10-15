@@ -102,6 +102,7 @@ const IncludedTests = [
   "test_createrawtx_vout_range",
   "test_crypto",
   "test_csv_comprehensive",
+  "test_cxxorder",
   "test_deep_reorg_archive",
   "test_descriptor",
   "test_difficulty",
