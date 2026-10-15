@@ -6305,7 +6305,8 @@ proc handleGetBlockTemplate(rpc: RpcServer, params: JsonNode): JsonNode =
     item["hash"] = %reverseHex(toHex(array[32, byte](tx.wtxid())))
     item["depends"] = deps
     item["fee"] = %fee
-    item["sigops"] = %estimateTxSigops(tx)
+    # Core rpc/mining.cpp:927: the template's exact per-tx sigop cost.
+    item["sigops"] = %tmpl.txSigopsCost[i]
     item["weight"] = %validation.calculateTransactionWeight(tx)
     txs.add(item)
 

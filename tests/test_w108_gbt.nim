@@ -427,54 +427,8 @@ suite "W108 GBT gate G11 — DefaultBlockMinFeeRateSatKvB 1000x too high":
 # ─────────────────────────────────────────────────────────────────────────────
 # G12  Sigops must use exact cost from mempool entry, not heuristic estimate
 # ─────────────────────────────────────────────────────────────────────────────
-# BUG-12: Bitcoin Core stores exact sigop costs in CTxMemPoolEntry.GetSigOpCost()
-# computed at acceptance time (including P2SH, witness scale factor).
-# Nimrod's estimateTxSigops() counts output script patterns — it undercounts
-# P2SH redeem-script sigops (which can be up to 20), ignores witness scale
-# (x4 for legacy), and uses a heuristic for input scriptSig length.
-# This means nimrod may fill blocks beyond MAX_BLOCK_SIGOPS_COST = 80 000.
-suite "W108 GBT gate G12 — sigops estimation heuristic (not exact)":
-  test "BUG-12: estimateTxSigops counts outputs only, missing P2SH redeem-script sigops":
-    # A P2SH output contributes 1 sigop (conservative estimate).
-    # But if the corresponding input's redeemScript contains OP_CHECKMULTISIG(15),
-    # that's 15 sigops counted at block-level per BIP-16.
-    # estimateTxSigops will count 1 (conservative) for the P2SH output.
-    let p2shOutput = TxOut(
-      value: Satoshi(1_0000_0000),
-      scriptPubKey: @[0xa9'u8, 0x14] & newSeq[byte](20) & @[0x87'u8]  # P2SH
-    )
-    var tx = Transaction(
-      version: 2,
-      inputs: @[TxIn(
-        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
-        scriptSig: @[],
-        sequence: 0xffffffff'u32
-      )],
-      outputs: @[p2shOutput],
-      witnesses: @[],
-      lockTime: 0
-    )
-    let estimated = estimateTxSigops(tx)
-    # Heuristic returns 1 (from output analysis): documents undercounting
-    check estimated <= 2  # heuristic gives a very low number
-    # A real P2SH-15-of-15 multisig redeem script has 15 sigops at block-level
-
-  test "BUG-12b: estimateTxSigops over-estimates inputs via scriptSig len / 72 heuristic":
-    # An input with a 200-byte scriptSig gets estimated as 200/72 ≈ 2-3 sigops
-    # regardless of actual content (could be 0 sigops if it's a P2WPKH scriptSig = empty)
-    var tx = Transaction(
-      version: 2,
-      inputs: @[TxIn(
-        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
-        scriptSig: newSeq[byte](200),  # 200-byte but could be any data
-        sequence: 0xffffffff'u32
-      )],
-      outputs: @[TxOut(value: Satoshi(0), scriptPubKey: @[0x6a'u8])],  # OP_RETURN
-      witnesses: @[],
-      lockTime: 0
-    )
-    let est = estimateTxSigops(tx)
-    check est >= 2  # heuristic fires even though actual sigops could be 0
+# Fixed (KB-193): estimateTxSigops is gone; the template charges and reports
+# the mempool entry's exact sigop cost.  Covered by tests/test_gbt_sigops.nim.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G13  updateTimestamp missing BIP-94 timewarp rule
@@ -543,20 +497,13 @@ suite "W108 GBT gate G13 — BIP-94 timewarp rule absent":
 # BUG-14: Bitcoin Core's BlockAssembler::resetBlock() (miner.cpp:115):
 #   nBlockSigOpsCost = m_options.coinbase_output_max_additional_sigops;
 # This accounts for sigops the miner adds to the coinbase output scriptPubKey
-# BEFORE selecting transactions.  The default is 0, but the option exists.
-#
-# Nimrod initialises nBlockSigopsCost = 0 in buildBlockTemplate:
-#   var nBlockSigopsCost = 0   (line 321)
-# This is only wrong when a custom coinbase_output_max_additional_sigops > 0
-# is configured, but the structural gap is a deviation from Core's model.
+# BEFORE selecting transactions.  The default is 400 (policy/policy.h:29).
 suite "W108 GBT gate G14 — nBlockSigopsCost initial value":
-  test "BUG-14: nBlockSigopsCost starts at 0 rather than coinbase_output_max_additional_sigops":
-    # Core resetBlock: nBlockSigOpsCost = m_options.coinbase_output_max_additional_sigops
-    # For default options this is 0, but a custom coinbase script with many sigops
-    # would set this higher, reserving space in the sigop budget.
-    # Nimrod uses 0 unconditionally.  Documents structural gap.
-    var hasBug = true  # no coinbase_output_max_additional_sigops option or initialisation
-    check hasBug == true
+  test "BUG-14: nBlockSigopsCost starts at coinbase_output_max_additional_sigops (400)":
+    # Core policy/policy.h:29 DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS{400};
+    # resetBlock starts nBlockSigOpsCost there.  Selection behaviour is pinned
+    # by tests/test_gbt_sigops.nim.
+    check CoinbaseOutputMaxAdditionalSigops == 400
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G15  Template nBits must come from GetNextWorkRequired, not prevBlock.bits

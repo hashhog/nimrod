@@ -31,6 +31,10 @@ const
   ## Default minimum fee rate for block template inclusion (sat/kvB).
   ## Bitcoin Core DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/vbyte = 1000 sat/kvB (policy/policy.h:36).
   DefaultBlockMinFeeRateSatKvB* = 1_000'i64
+  ## Sigop cost held back for the coinbase outputs the miner adds.
+  ## Bitcoin Core DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS (policy/policy.h:29);
+  ## BlockAssembler::resetBlock starts nBlockSigOpsCost here (node/miner.cpp:115).
+  CoinbaseOutputMaxAdditionalSigops* = 400
 
 proc isFinalTx*(tx: Transaction, blockHeight: uint32, blockTime: uint32): bool =
   ## Check if a transaction is final for inclusion in a block
@@ -67,6 +71,9 @@ type
     header*: BlockHeader
     coinbaseTx*: Transaction
     transactions*: seq[Transaction]
+    txSigopsCost*: seq[int]  ## Per-tx sigop cost, parallel to transactions
+                             ## (Core CBlockTemplate::vTxSigOpsCost, plus a
+                             ## coinbase slot at index 0).
     totalFees*: Satoshi
     totalWeight*: int
     totalSigops*: int
@@ -232,44 +239,6 @@ proc computeTarget*(bits: uint32): array[32, byte] =
   ## Convert compact bits to full target
   compactToTarget(bits)
 
-proc estimateTxSigops*(tx: Transaction): int =
-  ## Estimate sigops for a transaction
-  ## This is a simplified estimate - real implementation would
-  ## need to analyze scripts more deeply
-
-  # Legacy sigops: count OP_CHECKSIG, OP_CHECKMULTISIG in scriptPubKey
-  var sigops = 0
-
-  # Estimate based on output types
-  for output in tx.outputs:
-    let script = output.scriptPubKey
-    if script.len == 0:
-      continue
-
-    # P2PKH: 1 sigop
-    if script.len == 25 and script[0] == 0x76:  # OP_DUP
-      sigops += 1
-    # P2SH: assume 1 sigop (conservative)
-    elif script.len == 23 and script[0] == 0xa9:  # OP_HASH160
-      sigops += 1
-    # P2WPKH: 1 sigop (scaled by witness factor)
-    elif script.len == 22 and script[0] == 0x00:
-      sigops += 1
-    # P2WSH: assume 1 sigop
-    elif script.len == 34 and script[0] == 0x00:
-      sigops += 1
-    # P2TR: 1 sigop
-    elif script.len == 34 and script[0] == 0x51:  # OP_1 (v1)
-      sigops += 1
-
-  # Count sigops in inputs (for P2PKH)
-  for input in tx.inputs:
-    if input.scriptSig.len > 0:
-      # Simple heuristic: each signature is ~72 bytes
-      sigops += max(1, input.scriptSig.len div 72)
-
-  sigops
-
 proc calculateTxWeight*(tx: Transaction): int =
   ## Calculate transaction weight
   let fullSize = serialize(tx, includeWitness = true).len
@@ -396,7 +365,8 @@ proc selectTemplateTransactions(
   blockMinFeeRateSatKvB: int64,
   blockHeight: uint32,
   lockTimeCutoff: uint32
-): tuple[txs: seq[Transaction], totalFees: Satoshi, nBlockWeight: int, totalSigops: int] =
+): tuple[txs: seq[Transaction], txSigopsCost: seq[int], totalFees: Satoshi,
+         nBlockWeight: int, totalSigops: int] =
   ## Pick transactions for a block template.
   ##
   ## The next candidate is the not-yet-selected mempool tx with the highest
@@ -410,11 +380,15 @@ proc selectTemplateTransactions(
   ## Reference: Bitcoin Core node/miner.cpp addPackageTxs, SortForBlock,
   ## TestPackage, TestPackageTransactions. Once the best remaining package is
   ## under blockMinFeeRate, selection stops.
+  ##
+  ## Each tx is charged its exact sigop cost from the mempool entry (Core
+  ## entry.GetSigOpCost(), GetTransactionSigOpCost at acceptance), and the
+  ## running total starts at CoinbaseOutputMaxAdditionalSigops (Core resetBlock).
 
   result.txs = @[]
   result.totalFees = Satoshi(0)
   result.nBlockWeight = nBlockReservedWeight
-  result.totalSigops = 0
+  result.totalSigops = CoinbaseOutputMaxAdditionalSigops
 
   var score = initTable[TxId, PkgScore]()
   var children = initTable[TxId, HashSet[TxId]]()
@@ -470,7 +444,7 @@ proc selectTemplateTransactions(
     var allFinal = true
     for member in members:
       let entry = mempool.entries[member]
-      let sigops = estimateTxSigops(entry.tx)
+      let sigops = int(entry.sigopCost)
       sigopsOf[member] = sigops
       pkgFee += modifiedFeeSat(mempool, entry)
       pkgWeight += entry.weight
@@ -497,6 +471,7 @@ proc selectTemplateTransactions(
       let entry = mempool.entries[member]
       included.incl(member)
       result.txs.add(entry.tx)
+      result.txSigopsCost.add(sigopsOf[member])
       result.totalFees = result.totalFees + entry.fee
       result.nBlockWeight += entry.weight
       result.totalSigops += sigopsOf[member]
@@ -692,6 +667,10 @@ proc buildBlockTemplate*(
     transactions: transactions,
     totalFees: totalFees,
     totalWeight: totalWeight,
+    # Slot 0 is the coinbase so the seq stays index-aligned with transactions
+    # (Core's vTxSigOpsCost skips the coinbase; getblocktemplate never reads it).
+    txSigopsCost: @[getLegacySigOpCount(transactions[0]) * WitnessScaleFactor] &
+                  selected.txSigopsCost,
     totalSigops: totalSigops,
     height: height,
     target: computeTarget(bits),

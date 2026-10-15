@@ -235,7 +235,7 @@ proc generateBlockWithTxs*(
     txList.add(entry.tx)
     totalFees = totalFees + entry.fee
     totalWeight += entry.weight
-    totalSigops += estimateTxSigops(entry.tx)
+    totalSigops += int(entry.sigopCost)
 
   # Check weight limit.
   # Use the clamped reserved weight (8000 WU) matching buildBlockTemplate.
