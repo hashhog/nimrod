@@ -2641,6 +2641,10 @@ proc unscanBlockFromWallets(rpc: RpcServer, blk: Block, height: int32) {.gcsafe.
 proc scanBlockIntoWallets(rpc: RpcServer, blk: Block, height: int32,
                           persist: bool = true) {.gcsafe.}
 
+# invalidateblock and reconsiderblock both end in ActivateBestChain (defined
+# after handleSubmitBlock, whose side-branch helpers it shares).
+proc activateBestChain(rpc: RpcServer)
+
 # Chain Management RPCs
 proc handleInvalidateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Permanently marks a block and all its descendants as invalid
@@ -2701,9 +2705,12 @@ proc handleInvalidateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     else:
       raise newRpcError(RpcMiscError, $result.error)
 
-  newJNull()
+  # Core InvalidateBlock RPC: InvalidateBlock, then ActivateBestChain, so the
+  # node moves onto the best remaining branch before the RPC returns instead
+  # of sitting on the invalidated block's parent.
+  rpc.activateBestChain()
 
-proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode
+  newJNull()
 
 proc handleReconsiderBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Removes invalidity status of a block and its descendants
@@ -2743,20 +2750,9 @@ proc handleReconsiderBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
   # Core ReconsiderBlock -> ActivateBestChain (rpc/blockchain.cpp
   # reconsiderblock; validation.cpp ResetBlockFailureFlags re-adds the cleared
-  # entries to setBlockIndexCandidates): the chain moves back onto the
-  # most-work stored branch before the RPC returns, instead of waiting for a
-  # peer to re-announce it. The connect goes through submitblock's own
-  # extend / side-branch-reorg machinery (full validation, mempool, indexes),
-  # still under the chain lock this RPC holds. A missing body on the branch
-  # leaves the tip where it is; sync fills it later (Core: no
-  # HaveNumChainTxs, not a candidate).
-  let cand = rpc.chainState.bestStoredCandidate()
-  if cand.isSome:
-    let blkOpt = rpc.chainState.db.getBlock(cand.get())
-    if blkOpt.isSome:
-      let r = rpc.handleSubmitBlock(%*[toHex(serialize(blkOpt.get()))])
-      debug "reconsiderblock: activated best stored chain", answer = $r,
-            tip = rpc.chainState.bestHeight
+  # entries to setBlockIndexCandidates): the chain moves onto the best stored
+  # branch, by work and then by receive order, before the RPC returns.
+  rpc.activateBestChain()
 
   newJNull()
 
@@ -6396,6 +6392,118 @@ proc raiseFatalVerifyError() {.noreturn.} =
   ## BIP22ValidationResult), and after AbortNode the node is shutting down.
   raise newRpcError(RpcTransactionError, fatalRefusal())
 
+type
+  SideValidateFn = proc(b: Block, prevIdx: chainstate.BlockIndex):
+                     tuple[ok: bool, err: string] {.gcsafe, raises: [].}
+  ReorgBlockHook = proc(b: Block, height: int32): tuple[ok: bool, err: string]
+                     {.gcsafe, raises: [].}
+
+proc sideBranchHooks(rpc: RpcServer): tuple[validate: SideValidateFn,
+                                            verify: ReorgBlockHook,
+                                            connectChecks: ReorgBlockHook] =
+  ## The consensus callbacks a side-branch store and a reorg need, shared by
+  ## submitblock's side-branch arm and activateBestChain so both connect a
+  ## branch under the same checks.
+  let cs = rpc.chainState
+  # validate-for-storage callback: full CheckBlock + ContextualCheckBlock
+  # (scripts deferred to connect-time), bip22-mapped on failure. Wraps
+  # consensus/validation.validateForStorage so chainstate (no validation
+  # import) need not see ValidationError.
+  let validateForSide = proc(b: Block, prevIdx: chainstate.BlockIndex):
+                             tuple[ok: bool, err: string] {.gcsafe, raises: [].} =
+    var vr: ValidationResult[void]
+    try:
+      {.gcsafe.}:
+        vr = validateForStorage(cs, b, prevIdx, rpc.crypto)
+    except CatchableError:
+      # Byte-identical with the old inline arm: an exception here used to
+      # propagate to handleSubmitBlock's outer catch -> %"rejected".
+      return (ok: false, err: "rejected")
+    except Exception:
+      return (ok: false, err: "rejected")
+    if vr.isOk: (ok: true, err: "")
+    else: (ok: false, err: bip22String(vr.error, b.header.version))
+
+  # Per-promoted-block script-verify hook — `handleReorg` fires it against
+  # the UTXO view it rebuilds to the fork point (Core ConnectTip ->
+  # ConnectBlock parity). The hook reads UTXOs via `csCapture.getUtxo`,
+  # which inside the reorg honours the in-flight reorgDeletedUtxos /
+  # utxoCache / DB layering. Returning (ok: false) aborts the reorg and
+  # leaves the original tip intact. `acceptSideBranchBlock` sets/clears
+  # cs.reorgVerifyHook in a try/finally so it cannot leak.
+  let csCapture = cs
+  let reorgCrypto = rpc.crypto
+  let reorgParams = cs.params
+  let reorgVerify = proc(b: Block, height: int32): tuple[ok: bool, err: string]
+                         {.gcsafe, raises: [].} =
+    # A UTXO read failure is recorded, not read as a missing input.
+    let readGuard = newUtxoReadGuard()
+    let utxoLookup = guardedUtxoLookup(csCapture, readGuard)
+    var res: ValidationResult[void]
+    try:
+      {.gcsafe.}:
+        res = verifyScripts(b, utxoLookup, height, reorgCrypto, reorgParams)
+    except CatchableError as e:
+      return (ok: false, err: localErrorToken & ": " & e.msg)
+    except Exception as e:
+      return (ok: false, err: localErrorToken & ": " & e.msg)
+    if readGuard.failed:
+      return (ok: false, err: bip22String(veUtxoReadError) & ": " & readGuard.msg)
+    if res.isOk: (ok: true, err: "")
+    else: (ok: false, err: bip22String(res.error))
+
+  # Per-promoted-block ConnectBlock-consensus hook — re-runs the BIP-68
+  # sequence-lock + BIP-30 checks that validateForStorage deferred, against
+  # the same fork-point UTXO view (`csCapture.getUtxo`) handleReorg rebuilds.
+  # Fired unconditionally by handleReorg (assume-valid gates only scripts).
+  # Closes nimrod#4: a heavier side branch with a v2 tx whose BIP-68 relative
+  # timelock is unmet was previously promoted where Core rejects
+  # "bad-txns-nonfinal".
+  let reorgConnectChecksFn = proc(b: Block, height: int32): tuple[ok: bool, err: string]
+                                  {.gcsafe, raises: [].} =
+    # A UTXO read failure is recorded, not read as a missing input.
+    let readGuard = newUtxoReadGuard()
+    let utxoLookup = guardedUtxoLookup(csCapture, readGuard)
+    var res: ValidationResult[void]
+    try:
+      {.gcsafe.}:
+        res = reorgConnectChecks(b, height, utxoLookup, csCapture.db, reorgParams)
+    except CatchableError as e:
+      return (ok: false, err: localErrorToken & ": " & e.msg)
+    except Exception as e:
+      return (ok: false, err: localErrorToken & ": " & e.msg)
+    if readGuard.failed:
+      return (ok: false, err: bip22String(veUtxoReadError) & ": " & readGuard.msg)
+    if res.isOk: (ok: true, err: "")
+    else: (ok: false, err: bip22String(res.error))
+
+  (validateForSide, reorgVerify, reorgConnectChecksFn)
+
+proc refreshAfterReorg(rpc: RpcServer, disconnectedTxs: seq[Transaction],
+                       newChainBlocks: seq[Block], tipBlk: Block) =
+  ## The bookkeeping submitblock's side-branch arm does after a reorg it
+  ## drove; activateBestChain does the same after each reorg it drives.
+  let cs = rpc.chainState
+  var mp = rpc.mempool
+  if disconnectedTxs.len > 0:
+    let nReadmitted = mp.blockDisconnected(disconnectedTxs, rpc.crypto)
+    debug "reorg: refilled mempool from disconnected blocks",
+          attempted = disconnectedTxs.len, readmitted = nReadmitted
+  for connected in newChainBlocks:
+    mp.removeForBlock(connected)
+
+  if rpc.feeEstimator != nil:
+    var hAt = cs.bestHeight - int32(newChainBlocks.len) + 1
+    for connected in newChainBlocks:
+      var confirmedTxids: seq[TxId]
+      for tx in connected.txs:
+        confirmedTxids.add(tx.txid())
+      rpc.feeEstimator.processBlock(hAt, confirmedTxids)
+      inc hAt
+
+  if rpc.peerManager != nil:
+    rpc.postP2P(P2PCmd(kind: pcBroadcastBlock, blk: tipBlk))
+
 proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   # Gate 6: after AbortNode no block is accepted (RPC_VERIFY_ERROR, -25).
   if isFatal():
@@ -6630,77 +6738,7 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # tokens. Behaviour is verbatim with the former inline arm; the
       # corpus entry `regression/reorg-via-submitblock` must stay green.
 
-      # validate-for-storage callback: full CheckBlock + ContextualCheckBlock
-      # (scripts deferred to connect-time), bip22-mapped on failure. Wraps
-      # consensus/validation.validateForStorage so chainstate (no validation
-      # import) need not see ValidationError.
-      let validateForSide = proc(b: Block, prevIdx: chainstate.BlockIndex):
-                                 tuple[ok: bool, err: string] {.gcsafe, raises: [].} =
-        var vr: ValidationResult[void]
-        try:
-          {.gcsafe.}:
-            vr = validateForStorage(cs, b, prevIdx, rpc.crypto)
-        except CatchableError:
-          # Byte-identical with the old inline arm: an exception here used to
-          # propagate to handleSubmitBlock's outer catch -> %"rejected".
-          return (ok: false, err: "rejected")
-        except Exception:
-          return (ok: false, err: "rejected")
-        if vr.isOk: (ok: true, err: "")
-        else: (ok: false, err: bip22String(vr.error, b.header.version))
-
-      # Per-promoted-block script-verify hook — `handleReorg` fires it against
-      # the UTXO view it rebuilds to the fork point (Core ConnectTip ->
-      # ConnectBlock parity). The hook reads UTXOs via `csCapture.getUtxo`,
-      # which inside the reorg honours the in-flight reorgDeletedUtxos /
-      # utxoCache / DB layering. Returning (ok: false) aborts the reorg and
-      # leaves the original tip intact. `acceptSideBranchBlock` sets/clears
-      # cs.reorgVerifyHook in a try/finally so it cannot leak.
-      let csCapture = cs
-      let reorgCrypto = rpc.crypto
-      let reorgParams = cs.params
-      let reorgVerify = proc(b: Block, height: int32): tuple[ok: bool, err: string]
-                             {.gcsafe, raises: [].} =
-        # A UTXO read failure is recorded, not read as a missing input.
-        let readGuard = newUtxoReadGuard()
-        let utxoLookup = guardedUtxoLookup(csCapture, readGuard)
-        var res: ValidationResult[void]
-        try:
-          {.gcsafe.}:
-            res = verifyScripts(b, utxoLookup, height, reorgCrypto, reorgParams)
-        except CatchableError as e:
-          return (ok: false, err: localErrorToken & ": " & e.msg)
-        except Exception as e:
-          return (ok: false, err: localErrorToken & ": " & e.msg)
-        if readGuard.failed:
-          return (ok: false, err: bip22String(veUtxoReadError) & ": " & readGuard.msg)
-        if res.isOk: (ok: true, err: "")
-        else: (ok: false, err: bip22String(res.error))
-
-      # Per-promoted-block ConnectBlock-consensus hook — re-runs the BIP-68
-      # sequence-lock + BIP-30 checks that validateForStorage deferred, against
-      # the same fork-point UTXO view (`csCapture.getUtxo`) handleReorg rebuilds.
-      # Fired unconditionally by handleReorg (assume-valid gates only scripts).
-      # Closes nimrod#4: a heavier side branch with a v2 tx whose BIP-68 relative
-      # timelock is unmet was previously promoted where Core rejects
-      # "bad-txns-nonfinal".
-      let reorgConnectChecksFn = proc(b: Block, height: int32): tuple[ok: bool, err: string]
-                                      {.gcsafe, raises: [].} =
-        # A UTXO read failure is recorded, not read as a missing input.
-        let readGuard = newUtxoReadGuard()
-        let utxoLookup = guardedUtxoLookup(csCapture, readGuard)
-        var res: ValidationResult[void]
-        try:
-          {.gcsafe.}:
-            res = reorgConnectChecks(b, height, utxoLookup, csCapture.db, reorgParams)
-        except CatchableError as e:
-          return (ok: false, err: localErrorToken & ": " & e.msg)
-        except Exception as e:
-          return (ok: false, err: localErrorToken & ": " & e.msg)
-        if readGuard.failed:
-          return (ok: false, err: bip22String(veUtxoReadError) & ": " & readGuard.msg)
-        if res.isOk: (ok: true, err: "")
-        else: (ok: false, err: bip22String(res.error))
+      let (validateForSide, reorgVerify, reorgConnectChecksFn) = rpc.sideBranchHooks()
 
       var disconnectedTxs: seq[Transaction] = @[]
       var newChainBlocks: seq[Block] = @[]
@@ -6730,25 +6768,7 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # chain.  Fee estimator: process each newly-connected block.  Peer
       # broadcast: relay the new tip.  Pattern B context:
       # CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
-      var mp = rpc.mempool
-      if disconnectedTxs.len > 0:
-        let nReadmitted = mp.blockDisconnected(disconnectedTxs, rpc.crypto)
-        debug "submitblock reorg: refilled mempool from disconnected blocks",
-              attempted = disconnectedTxs.len, readmitted = nReadmitted
-      for connected in newChainBlocks:
-        mp.removeForBlock(connected)
-
-      if rpc.feeEstimator != nil:
-        var hAt = cs.bestHeight - int32(newChainBlocks.len) + 1
-        for connected in newChainBlocks:
-          var confirmedTxids: seq[TxId]
-          for tx in connected.txs:
-            confirmedTxids.add(tx.txid())
-          rpc.feeEstimator.processBlock(hAt, confirmedTxids)
-          inc hAt
-
-      if rpc.peerManager != nil:
-        rpc.postP2P(P2PCmd(kind: pcBroadcastBlock, blk: blk))
+      rpc.refreshAfterReorg(disconnectedTxs, newChainBlocks, blk)
 
       newJNull()  # null = success per BIP-22 (reorg activated this tip)
 
@@ -6765,6 +6785,86 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       raiseFatalVerifyError()
     # Unexpected exception — use "rejected" catch-all per BIP-22.
     %"rejected"
+
+proc activateBestChain(rpc: RpcServer) =
+  ## Core ActivateBestChain as the invalidateblock and reconsiderblock RPCs
+  ## run it (rpc/blockchain.cpp InvalidateBlock / ReconsiderBlock). Moves to
+  ## the best candidate (consensus/chain.nim bestChainCandidate: most work,
+  ## then first received). When a block on the way fails to connect it is
+  ## marked BLOCK_FAILED_VALID with its descendants (InvalidBlockFound) and
+  ## the choice is made again, so the valid prefix of a branch whose tip is
+  ## invalid is still reached. Core gets there by keeping the blocks it
+  ## connected before the failure; nimrod reorgs to a branch as a whole, so
+  ## the prefix's own tip wins the next round instead. Both end on the same
+  ## chain.
+  ##
+  ## A failure that is not a verdict on the block (UTXO read error, undo
+  ## write, exception, a mutated body) stops the loop with nothing marked and
+  ## the tip wherever the last completed reorg left it.
+  if isFatal() or rpc.isBlockSubmissionPaused():
+    return
+  var cs = rpc.chainState
+  lockChainScope(cs)  # cs_main: storage/chain_lock.nim
+  let hooks = rpc.sideBranchHooks()
+  let none32 = BlockHash(default(array[32, byte]))
+  while true:
+    let candOpt = cs.bestChainCandidate()
+    if candOpt.isNone:
+      return
+    let cand = candOpt.get()
+
+    # CheckBlock + ContextualCheckBlock on every block of the branch, as a
+    # side-branch block gets before it is stored: a body stored by another
+    # path has not necessarily had them.
+    var failed = none32
+    var failedBlk: Block
+    var token = ""
+    for b in cand.blocks:
+      let prevIdx = cs.db.getBlockIndex(b.header.prevBlock)
+      if prevIdx.isNone:
+        return
+      let v = hooks.validate(b, prevIdx.get())
+      if not v.ok:
+        failed = BlockHash(doubleSha256(serialize(b.header)))
+        failedBlk = b
+        token = v.err
+        break
+
+    if failed == none32:
+      var disconnectedTxs: seq[Transaction] = @[]
+      var connected: seq[Block] = @[]
+      let r = cs.reorgToStoredBranch(cand.forkPoint, cand.blocks, hooks.verify,
+                                     hooks.connectChecks, disconnectedTxs,
+                                     connected)
+      case r.outcome
+      of sboReorged:
+        rpc.refreshAfterReorg(disconnectedTxs, connected, connected[^1])
+        debug "activateBestChain: moved to candidate", tip = $cand.tip,
+              height = cs.bestHeight
+        continue
+      of sboSideBranch:
+        return
+      of sboRejected:
+        failed = cs.lastRejectedBlock
+        token = r.token
+        for b in cand.blocks:
+          if BlockHash(doubleSha256(serialize(b.header))) == failed:
+            failedBlk = b
+
+    if isFatal() or failed == none32 or
+       blockFailureKindOfToken(token) != bfkInvalid:
+      return
+    let fIdx = cs.db.getBlockIndex(failed)
+    if fIdx.isNone or failedBlk.txs.len == 0 or
+       not bodyMatchesCommitments(failedBlk,
+                                  fIdx.get().height >= int32(cs.params.segwitHeight)):
+      return
+    var idx = fIdx.get()
+    idx.failureFlags.setFlag(BLOCK_FAILED_VALID)
+    cs.db.putBlockIndexHashOnly(idx)
+    cs.setBlockFailureFlags(idx)
+    info "activateBestChain: block failed to connect, marked invalid",
+         hash = $failed, height = idx.height, reason = token
 
 proc handleSubmitHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   ## submitheader "hexdata"

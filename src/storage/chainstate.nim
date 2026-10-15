@@ -89,6 +89,10 @@ const
   BLOCK_FAILED_VALID* = BlockFailureFlags(32)    ## Block failed validation (invalidateblock)
   BLOCK_FAILED_CHILD* = BlockFailureFlags(64)    ## Descendant of a failed block
   BLOCK_NO_FAILURE* = BlockFailureFlags(0)       ## No failure flags set
+  SeqIdBestChainFromDisk* = 0'i32  ## Core chain.h SEQ_ID_BEST_CHAIN_FROM_DISK
+  SeqIdInitFromDisk* = 1'i32       ## Core chain.h SEQ_ID_INIT_FROM_DISK
+  SeqIdTrackMax = 50_000           ## noteBlockReceived evicts at this size ...
+  SeqIdKeepDepth = 2_000'i32       ## ... ids more than this far below the tip
 
 proc `or`*(a, b: BlockFailureFlags): BlockFailureFlags {.borrow.}
 proc `and`*(a, b: BlockFailureFlags): BlockFailureFlags {.borrow.}
@@ -372,6 +376,18 @@ type
     # and punish the right peer — Core InvalidBlockFound(pindex) +
     # BlockChecked/mapBlockSource. Only meaningful immediately after a call.
     lastRejectedBlock*: BlockHash
+    # Core nSequenceId (chain.h), the tie-break of CBlockIndexWorkComparator:
+    # between two chains with equal work the one whose tip was received first
+    # wins. In memory only, like Core: after a restart every block is
+    # SEQ_ID_INIT_FROM_DISK (1) except the loaded tip's chain, which is
+    # SEQ_ID_BEST_CHAIN_FROM_DISK (0); blocks received from then on count up
+    # from 2. Read through blockSeqId. Entries far below the tip are evicted
+    # (noteBlockReceived) so a long session stays bounded; an evicted block
+    # reads as a block loaded from disk.
+    blockSeqIds*: Table[BlockHash, tuple[seq: int32, height: int32]]
+    nextBlockSeqId*: int32
+    loadedTip*: BlockHash
+    loadedTipHeight*: int32
     # Optional tip-advance hook fired AFTER the active-chain tip pointer is
     # durably advanced — on post-IBD connect (`connectBlock`), IBD connect
     # (`connectBlockIBD`), and reorg (`handleReorg`, which atomically advances
@@ -1620,7 +1636,11 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     # scripts verified (fail-safe).
     bestHeaderChainWork: default(array[32, byte]),
     bestHeaderBits: 0'u32,
-    bestHeaderHeight: cdb.bestHeight    # fallback: chain-tip height
+    bestHeaderHeight: cdb.bestHeight,   # fallback: chain-tip height
+    blockSeqIds: initTable[BlockHash, tuple[seq: int32, height: int32]](),
+    nextBlockSeqId: SeqIdInitFromDisk + 1,
+    loadedTip: cdb.bestBlockHash,
+    loadedTipHeight: cdb.bestHeight
   )
   initChainLock(result.chainLock)
   initLock(result.bodyRepairStageLock)
@@ -1637,6 +1657,47 @@ proc close*(cs: var ChainState) =
   cs.undoMgr.close()
   cs.db.close()
   deinitLock(cs.bodyRepairStageLock)
+
+proc noteBlockReceived*(cs: ChainState, hash: BlockHash, height: int32) =
+  ## Give a block its sequence id the first time its body is accepted (Core
+  ## ReceivedBlockTransactions: pindex->nSequenceId = nBlockSequenceId++).
+  ## A block that already has one keeps it.
+  if hash in cs.blockSeqIds:
+    return
+  if cs.blockSeqIds.len >= SeqIdTrackMax:
+    # Ties are only ever decided near the tip; drop ids far below it.
+    var old: seq[BlockHash]
+    for h, v in cs.blockSeqIds:
+      if v.height < cs.bestHeight - SeqIdKeepDepth:
+        old.add(h)
+    for h in old:
+      cs.blockSeqIds.del(h)
+  cs.blockSeqIds[hash] = (seq: cs.nextBlockSeqId, height: height)
+  inc cs.nextBlockSeqId
+
+proc blockSeqId*(cs: ChainState, idx: BlockIndex): int32 =
+  ## Core nSequenceId of `idx` (see ChainState.blockSeqIds): its receive
+  ## order this session, else 0 on the chain the node loaded at startup,
+  ## else 1.
+  if idx.hash in cs.blockSeqIds:
+    return cs.blockSeqIds[idx.hash].seq
+  if cs.loadedTipHeight >= 0 and idx.height <= cs.loadedTipHeight:
+    # Ancestor of the loaded tip? While the active chain still runs through
+    # that tip its height slots answer directly; otherwise walk back.
+    let atLoaded = if cs.bestHeight >= cs.loadedTipHeight:
+                     cs.db.getBlockHashByHeight(cs.loadedTipHeight)
+                   else: none(BlockHash)
+    if atLoaded.isSome and atLoaded.get() == cs.loadedTip:
+      let here = cs.db.getBlockHashByHeight(idx.height)
+      if here.isSome and here.get() == idx.hash:
+        return SeqIdBestChainFromDisk
+    else:
+      var cur = cs.db.getBlockIndex(cs.loadedTip)
+      while cur.isSome and cur.get().height > idx.height:
+        cur = cs.db.getBlockIndex(cur.get().prevHash)
+      if cur.isSome and cur.get().hash == idx.hash:
+        return SeqIdBestChainFromDisk
+  SeqIdInitFromDisk
 
 proc updateBestHeaderInfo*(cs: ChainState, chainWork: array[32, byte],
                            headerHeight: int32, bits: uint32) =
@@ -2243,6 +2304,7 @@ proc connectBlock*(cs: var ChainState, blk: Block, height: int32): ChainStateRes
   cs.bestHeight = height
   cs.db.bestBlockHash = blockHash
   cs.db.bestHeight = height
+  cs.noteBlockReceived(blockHash, height)
 
   # The block is connected and durable from here on: nothing below may turn
   # into a connect failure (the caller would then retry a block that IS the
@@ -4401,6 +4463,80 @@ proc bip22RejectToken(reason: string): string =
   else:
     ""
 
+proc reorgToStoredBranch*(
+    cs: var ChainState,
+    forkPoint: BlockHash,
+    newChainBlocks: seq[Block],
+    verifyHook: proc(blk: Block, height: int32): tuple[ok: bool, err: string]
+                 {.gcsafe, raises: [].},
+    connectChecksHook: proc(blk: Block, height: int32): tuple[ok: bool, err: string]
+                 {.gcsafe, raises: [].},
+    disconnectedTxs: var seq[Transaction],
+    connectedBlocks: var seq[Block]
+  ): tuple[outcome: SideBranchOutcome, token: string] =
+  ## Reorg from the active tip onto stored blocks `newChainBlocks`
+  ## (fork point + 1 .. new tip, every body already on disk), with the same
+  ## per-block ConnectBlock checks and outcome mapping as a heavier side branch
+  ## arriving through acceptSideBranchBlock, which calls this. Also called by
+  ## the invalidateblock / reconsiderblock ActivateBestChain loop
+  ## (rpc/server.nim activateBestChain). Does not compare work: the caller
+  ## has already chosen the branch.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
+  disconnectedTxs.setLen(0)
+  connectedBlocks.setLen(0)
+  cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
+
+  # Wire the per-block script-verification hook so handleReorg re-runs full
+  # per-input script verification on each promoted block (Core ConnectTip ->
+  # ConnectBlock parity); validateFn deliberately skipped verifyScripts at store
+  # time.  Set/clear in try/finally so it can never leak into a later,
+  # unrelated handleReorg call with a stale captured crypto/params.
+  # connectChecksHook re-runs the deferred ConnectBlock consensus checks (BIP-68
+  # sequence locks + BIP-30) on each promoted block, fired unconditionally
+  # (assume-valid gates only scripts). Set/clear alongside reorgVerifyHook in the
+  # SAME try/finally so neither can leak a stale captured crypto/params/db into a
+  # later, unrelated handleReorg.
+  cs.reorgVerifyHook = verifyHook
+  cs.reorgConnectChecksHook = connectChecksHook
+  var reorgRes: ChainStateResult[void]
+  try:
+    reorgRes = cs.handleReorg(forkPoint, newChainBlocks, disconnectedTxs)
+  except CatchableError as e:
+    # A raise inside the reorg (UTXO / undo / block read failure) is a LOCAL
+    # error, not a verdict on the branch: no BIP-22 token, so it lands in the
+    # "inconclusive" arm below (no mark, no punishment). handleReorg has
+    # already restored its in-memory snapshot. Core: a coins-DB read failure
+    # aborts the node; it never marks the block.
+    reorgRes = err("local error during reorg (not a block verdict): " & e.msg)
+  finally:
+    cs.reorgVerifyHook = nil
+    cs.reorgConnectChecksHook = nil
+  if not reorgRes.isOk:
+    # Storage of the side-branch block already succeeded; the reorg failure
+    # leaves the original tip intact.  Surface as a side branch (same shape
+    # Core uses when AcceptBlock succeeds but ActivateBestChain later finds a
+    # problem).  disconnectedTxs was reset by handleReorg's rollback.
+    disconnectedTxs.setLen(0)
+    # If the reorg failed because the heavier branch is CONSENSUS-INVALID
+    # (bad-cb-amount, bad-txns-premature-spend-of-coinbase, missing/spent
+    # inputs, script-verify failure) reject it outright — Bitcoin Core never
+    # leaves such a block as an "inconclusive" side branch.  Only a
+    # transient/internal failure (missing ancestor body, undo-write failure,
+    # reorg-in-progress — none of which carry a BIP-22 token) stays inconclusive.
+    let tok = bip22RejectToken(reorgRes.error)
+    if tok.len > 0:
+      # cs.lastRejectedBlock was set by handleReorg to the promoted block whose
+      # connect failed (zero if the failure was in the disconnect phase).
+      return (sboRejected, tok)
+    else:
+      cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
+      return (sboSideBranch, "inconclusive")
+
+  # Reorg succeeded — this branch is now the active tip.  Surface the connected
+  # blocks for the caller's post-reorg mempool/fee/wallet refresh.
+  connectedBlocks = newChainBlocks
+  (sboReorged, "")
+
 proc acceptSideBranchBlock*(
     cs: var ChainState,
     blk: Block,
@@ -4477,6 +4613,7 @@ proc acceptSideBranchBlock*(
     nTx: int32(blk.txs.len)
   )
   cs.db.putBlockIndexHashOnly(sideIdx)
+  cs.noteBlockReceived(blockHash, newHeight)
 
   # Same or less work than the active chain — accepted as a side branch
   # (BIP-22 "inconclusive": stored but not on the best chain).
@@ -4519,56 +4656,8 @@ proc acceptSideBranchBlock*(
   # newChainBlocks was built tip..fork; reverse to get fork+1..tip order.
   newChainBlocks.reverse()
 
-  # Wire the per-block script-verification hook so handleReorg re-runs full
-  # per-input script verification on each promoted block (Core ConnectTip ->
-  # ConnectBlock parity); validateFn deliberately skipped verifyScripts at store
-  # time.  Set/clear in try/finally so it can never leak into a later,
-  # unrelated handleReorg call with a stale captured crypto/params.
-  # connectChecksHook re-runs the deferred ConnectBlock consensus checks (BIP-68
-  # sequence locks + BIP-30) on each promoted block, fired unconditionally
-  # (assume-valid gates only scripts). Set/clear alongside reorgVerifyHook in the
-  # SAME try/finally so neither can leak a stale captured crypto/params/db into a
-  # later, unrelated handleReorg.
-  cs.reorgVerifyHook = verifyHook
-  cs.reorgConnectChecksHook = connectChecksHook
-  var reorgRes: ChainStateResult[void]
-  try:
-    reorgRes = cs.handleReorg(forkPoint, newChainBlocks, disconnectedTxs)
-  except CatchableError as e:
-    # A raise inside the reorg (UTXO / undo / block read failure) is a LOCAL
-    # error, not a verdict on the branch: no BIP-22 token, so it lands in the
-    # "inconclusive" arm below (no mark, no punishment). handleReorg has
-    # already restored its in-memory snapshot. Core: a coins-DB read failure
-    # aborts the node; it never marks the block.
-    reorgRes = err("local error during reorg (not a block verdict): " & e.msg)
-  finally:
-    cs.reorgVerifyHook = nil
-    cs.reorgConnectChecksHook = nil
-  if not reorgRes.isOk:
-    # Storage of the side-branch block already succeeded; the reorg failure
-    # leaves the original tip intact.  Surface as a side branch (same shape
-    # Core uses when AcceptBlock succeeds but ActivateBestChain later finds a
-    # problem).  disconnectedTxs was reset by handleReorg's rollback.
-    disconnectedTxs.setLen(0)
-    # If the reorg failed because the heavier branch is CONSENSUS-INVALID
-    # (bad-cb-amount, bad-txns-premature-spend-of-coinbase, missing/spent
-    # inputs, script-verify failure) reject it outright — Bitcoin Core never
-    # leaves such a block as an "inconclusive" side branch.  Only a
-    # transient/internal failure (missing ancestor body, undo-write failure,
-    # reorg-in-progress — none of which carry a BIP-22 token) stays inconclusive.
-    let tok = bip22RejectToken(reorgRes.error)
-    if tok.len > 0:
-      # cs.lastRejectedBlock was set by handleReorg to the promoted block whose
-      # connect failed (zero if the failure was in the disconnect phase).
-      return (sboRejected, tok)
-    else:
-      cs.lastRejectedBlock = BlockHash(default(array[32, byte]))
-      return (sboSideBranch, "inconclusive")
-
-  # Reorg succeeded — this branch is now the active tip.  Surface the connected
-  # blocks for the caller's post-reorg mempool/fee/wallet refresh.
-  connectedBlocks = newChainBlocks
-  (sboReorged, "")
+  cs.reorgToStoredBranch(forkPoint, newChainBlocks, verifyHook,
+                        connectChecksHook, disconnectedTxs, connectedBlocks)
 
 # ============================================================================
 # Legacy compatibility functions (operate on ChainDb directly)

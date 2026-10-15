@@ -531,29 +531,92 @@ proc reconsiderBlock*(
 
   chainMgmtOk()
 
-proc bestStoredCandidate*(cs: var ChainState): Option[BlockHash] =
-  ## The most-work block whose body is stored, that is not BLOCK_FAILED_VALID
-  ## and that has strictly more work than the active tip -- the head of Core's
-  ## setBlockIndexCandidates as ActivateBestChain sees it after
-  ## ReconsiderBlock / ResetBlockFailureFlags re-adds the cleared entries
-  ## (validation.cpp ResetBlockFailureFlags + FindMostWorkChain). Whether the
-  ## whole branch down to the active chain has bodies is checked by the
-  ## connect / reorg that follows (a gap leaves the tip where it is).
-  var bestWork = cs.totalWork
-  var best = none(BlockHash)
+type
+  ChainCandidate* = object
+    ## A branch ActivateBestChain can move to: `blocks` are the stored bodies
+    ## from `forkPoint` + 1 (a block on the active chain, possibly the tip
+    ## itself) up to `tip`, in connect order.
+    tip*: BlockHash
+    forkPoint*: BlockHash
+    blocks*: seq[Block]
+
+proc betterThan(aWork: array[32, byte], aSeq: int32,
+                bWork: array[32, byte], bSeq: int32): bool =
+  ## Core CBlockIndexWorkComparator: more work first, then the lower
+  ## sequence id (received earlier). Equal on both is not better; Core's last
+  ## resort, the pointer address, has no stable meaning here, so the current
+  ## tip is kept.
+  let c = compareWork256(aWork, bWork)
+  c > 0 or (c == 0 and aSeq < bSeq)
+
+proc bestChainCandidate*(cs: var ChainState): Option[ChainCandidate] =
+  ## The head of Core's setBlockIndexCandidates as FindMostWorkChain sees it
+  ## (validation.cpp): the best block by CBlockIndexWorkComparator that beats
+  ## the active tip, is not BLOCK_FAILED_VALID, has no failed ancestor off the
+  ## active chain, and whose branch down to the active chain has every body
+  ## stored (Core: HaveNumChainTxs). A candidate that fails any of those is
+  ## skipped for the next best, so one unconnectable branch cannot hide a
+  ## connectable one. none() when the tip is already the best.
+  let tipOpt = cs.db.getBlockIndex(cs.bestBlockHash)
+  if tipOpt.isNone:
+    return none(ChainCandidate)
+  let tipWork = cs.totalWork
+  let tipSeq = cs.blockSeqId(tipOpt.get())
+
+  var cands: seq[tuple[work: array[32, byte], seq: int32, idx: BlockIndex]]
   for (key, value) in chaindb.iterCf(cs.db.db, chaindb.cfBlockIndex):
     if key.len != 32 or value.len == 0:
       continue
     let c = deserializeBlockIndex(value)
     if c.failureFlags.isFailed():
       continue
-    if compareWork256(c.totalWork, bestWork) <= 0:
+    let w = compareWork256(c.totalWork, tipWork)
+    if w < 0:
       continue
     if not cs.db.hasBlockBody(c.hash):
       continue
-    bestWork = c.totalWork
-    best = some(c.hash)
-  best
+    let s = cs.blockSeqId(c)
+    if w == 0 and s >= tipSeq:
+      continue
+    cands.add((work: c.totalWork, seq: s, idx: c))
+
+  cands.sort(proc(a, b: tuple[work: array[32, byte], seq: int32, idx: BlockIndex]): int =
+    if betterThan(a.work, a.seq, b.work, b.seq): -1
+    elif betterThan(b.work, b.seq, a.work, a.seq): 1
+    else: 0)
+
+  for cand in cands:
+    # Walk down to the active chain on index rows first; load bodies only for
+    # the branch that is actually chosen.
+    var branch: seq[BlockHash]
+    var cur = cand.idx
+    var usable = true
+    while true:
+      let active = cs.db.getBlockHashByHeight(cur.height)
+      if cur.height <= cs.bestHeight and active.isSome and active.get() == cur.hash:
+        break
+      if cur.failureFlags.isFailed() or not cs.db.hasBlockBody(cur.hash) or
+         cur.height <= 0:
+        usable = false
+        break
+      branch.add(cur.hash)
+      let prev = cs.db.getBlockIndex(cur.prevHash)
+      if prev.isNone:
+        usable = false
+        break
+      cur = prev.get()
+    if not usable or branch.len == 0:
+      continue
+    var res = ChainCandidate(tip: cand.idx.hash, forkPoint: cur.hash)
+    for i in countdown(branch.len - 1, 0):
+      let b = cs.db.getBlock(branch[i])
+      if b.isNone:
+        usable = false
+        break
+      res.blocks.add(b.get())
+    if usable:
+      return some(res)
+  none(ChainCandidate)
 
 proc preciousBlock*(
   cs: var ChainState,
