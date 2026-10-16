@@ -177,22 +177,8 @@ suite "W123 G8 — mode='proposal' not implemented":
 # ─────────────────────────────────────────────────────────────────────────────
 # G9  GBT sigops must use exact entry.GetSigOpCost(), not estimate
 # ─────────────────────────────────────────────────────────────────────────────
-# BUG-9: Core stores exact sigop costs in CTxMemPoolEntry.GetSigOpCost() —
-# computed at acceptance via GetTransactionSigOpCost (incl. P2SH redeem-script
-# and witness scale).  GBT mining.cpp:927-932 reads tx_sigops.at(idx) which is
-# block_template->getTxSigops()[idx] — the exact stored cost.
-# Nimrod estimateTxSigops (blocktemplate.nim:234-270) counts only output
-# scriptPubKey patterns; it ignores P2SH redeem-script sigops and the witness
-# scale.  Cumulative-sigops accounting may then accept a block above the 80,000
-# cap (rejected by Core peers as "bad-blk-sigops") or reject below it.
-suite "W123 G9 — sigops estimator vs exact entry sigops":
-  test "BUG-9: GBT uses estimateTxSigops, not mempool entry's exact sigopsCost":
-    # Verify there's no SigOpCost field on MempoolEntry. The current entry
-    # stores ancestor fee/weight but no explicit sigop cost.
-    var dummyEntry: MempoolEntry
-    discard dummyEntry  # accessing .sigopsCost would not compile if absent
-    var hasBug = true
-    check hasBug == true
+# Fixed (KB-193): template selection and transactions[].sigops use the mempool
+# entry's exact sigop cost.  Covered by tests/test_gbt_sigops.nim.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # G10 BIP-94 timewarp rule (MAX_TIMEWARP=600) at adjustment boundary

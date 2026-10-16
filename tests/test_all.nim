@@ -129,6 +129,7 @@ const IncludedTests = [
   "test_fundrawtransaction",
   "test_gate6_resource_limits",
   "test_gbt_mintime",
+  "test_gbt_sigops",
   "test_gcs",
   "test_genesis_sync_relay",
   "test_getblockfrompeer",

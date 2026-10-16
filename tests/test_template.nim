@@ -193,49 +193,6 @@ suite "Block Template":
         break
     check not allZero
 
-  test "tx sigops estimation":
-    # P2PKH output
-    let p2pkhOutput = TxOut(
-      value: Satoshi(1_0000_0000),
-      scriptPubKey: @[0x76'u8, 0xa9, 0x14] & newSeq[byte](20) & @[0x88'u8, 0xac]
-    )
-
-    var tx1 = Transaction(
-      version: 2,
-      inputs: @[TxIn(
-        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
-        scriptSig: @[],
-        sequence: 0xffffffff'u32
-      )],
-      outputs: @[p2pkhOutput],
-      witnesses: @[],
-      lockTime: 0
-    )
-
-    let sigops1 = estimateTxSigops(tx1)
-    check sigops1 >= 1
-
-    # P2WPKH output
-    let p2wpkhOutput = TxOut(
-      value: Satoshi(1_0000_0000),
-      scriptPubKey: @[0x00'u8, 0x14] & newSeq[byte](20)
-    )
-
-    var tx2 = Transaction(
-      version: 2,
-      inputs: @[TxIn(
-        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
-        scriptSig: @[],
-        sequence: 0xffffffff'u32
-      )],
-      outputs: @[p2wpkhOutput],
-      witnesses: @[],
-      lockTime: 0
-    )
-
-    let sigops2 = estimateTxSigops(tx2)
-    check sigops2 >= 1
-
   test "tx weight calculation":
     # Simple legacy transaction
     var legacyTx = Transaction(
