@@ -10,6 +10,7 @@ import ../script/interpreter
 import ./package
 import ./standard
 import ./cluster
+import ./cxxorder
 import ../mining/fees
 import ../util/fatal
 export package, standard
@@ -36,6 +37,10 @@ type
                             ## clusterSizeContribution below.  Zero-valued
                             ## entries behave exactly as before (contribution
                             ## collapses to plain weight).
+    graphIndex*: uint64     ## Stand-in for Core's TxGraph GraphIndex: the
+                            ## pool-wide insertion order (Mempool.nextGraphIndex).
+                            ## Core's trim breaks feerate ties by GraphIndex
+                            ## order (trimReorgClusters).
 
   ## Optional caller-supplied knobs for acceptTransaction.  Mirrors a subset of
   ## Bitcoin Core's `ATMPArgs` (validation.cpp:594-) — only the parts that are
@@ -117,6 +122,10 @@ type
     ## thread holds the chain lock, so the pool owns its own context).
     reorgCrypto: CryptoEngine
     reorgCryptoReady: bool
+    ## Next MempoolEntry.graphIndex. Core's TxGraph appends every new entry to
+    ## m_entries (txgraph.cpp AddTransaction), so its GraphIndex follows
+    ## insertion order until removals are compacted away.
+    nextGraphIndex: uint64
 
 const
   ## Core MAX_DISCONNECTED_TX_POOL_BYTES (kernel/disconnected_transactions.h).
@@ -1648,8 +1657,10 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     ancestorWeight: ancestorWeight,
     ancestorCount: ancestorCount,
     ancestorSize: ancestorSize,
-    sigopCost: txSigopCost
+    sigopCost: txSigopCost,
+    graphIndex: mp.nextGraphIndex
   )
+  inc mp.nextGraphIndex
 
   mp.entries[txid] = entry
   mp.byWtxid[wtxid] = txid
@@ -1943,198 +1954,340 @@ proc trimBetter(a, b: TrimFrac): bool =
   let y = b.fee * a.size
   if x != y: x > y else: a.size < b.size
 
+proc trimLess(a, b: TrimFrac): bool =
+  ## Core FeeFrac operator< (util/feefrac.h:178-183), the Trim heap's cmp_fn.
+  trimBetter(b, a)
+
 proc trimReorgClusters*(mp: Mempool, readded: seq[TxId]) =
-  ## Core UpdateTransactionsFromBlock -> TxGraph::Trim() (txmempool.cpp:111-119,
-  ## txgraph.cpp:3285-3529) for the clusters a reorg re-add merged with
-  ## in-mempool children.
+  ## Core UpdateTransactionsFromBlock (txmempool.cpp:91-118) -> TxGraph::Trim()
+  ## (txgraph.cpp:3285-3533), with the GroupClusters pass Trim runs first
+  ## (txgraph.cpp:1856-2065). `readded` is Core's vHashUpdate: every tx the
+  ## reorg re-accepted, in acceptance order.
   ##
-  ## Trim works on the PRE-MERGE clusters: everything linked before the
-  ## re-add's new parent->child dependencies (txmempool.cpp:108,
-  ## m_deps_to_add). Each pre-merge cluster is linearized and chunked; every tx
-  ## carries its chunk's feerate (AppendTrimData, txgraph.cpp:1398-1436) and an
-  ## implicit dependency on its predecessor in that linearization. Txs then
-  ## leave a max-heap ordered by chunk FeeFrac only (cmp_fn, txgraph.cpp:3336-
-  ## 3341) once all their dependencies are included. A tx is kept if the
-  ## would-be cluster it joins (union-find over its dependencies) stays within
-  ## the count and size limits, and skipped otherwise (txgraph.cpp:3485-3497).
-  ## A skipped tx never satisfies its dependents, so they are dropped too
-  ## (txgraph.cpp:3518-3527): no survivor ever loses an ancestor.
+  ## UpdateTransactionsFromBlock walks `readded` in reverse and queues a
+  ## dependency for every in-pool spend of each tx's outputs (m_deps_to_add).
+  ## Trim works on the PRE-MERGE clusters, i.e. without those dependencies.
+  ## Each pre-merge cluster is linearized and chunked, and every tx carries its
+  ## chunk's feerate (AppendTrimData, txgraph.cpp:1398-1436) plus an implicit
+  ## dependency on its predecessor in that linearization. Txs then leave a
+  ## max-heap ordered by chunk FeeFrac (cmp_fn, txgraph.cpp:3336-3341) once all
+  ## their dependencies are included. A tx is kept if the would-be cluster it
+  ## joins stays within the count and size limits, and skipped otherwise
+  ## (txgraph.cpp:3485-3497). A skipped tx never satisfies its dependents, so
+  ## they are dropped too (txgraph.cpp:3518-3527).
   ##
-  ## Core breaks a tie between equal FeeFracs with std::pop_heap order, which
-  ## is not a specified rule. This port keeps the earlier-accepted tx (then
-  ## the lower txid). That matches Core v31.1 for two-way ties (probes trim_b,
-  ## trim_b_rev, trim_b_last, trim_b_hi) but not necessarily for 3+-way ties.
+  ## Core has no rule for equal FeeFracs. The survivor among them falls out of
+  ## libstdc++'s std::sort (GroupClusters' an_deps / an_clusters, Trim's
+  ## deps_by_child / deps_by_parent) and std heap algorithms over equal keys,
+  ## so this port runs the same steps on the same keys with the same
+  ## algorithms (cxxorder.nim). The keys are Core's GraphIndex (here
+  ## MempoolEntry.graphIndex, insertion order) and Cluster::m_sequence (here the
+  ## highest graphIndex in the pre-merge cluster, i.e. when it last changed).
+  ## Both stand-ins are exact for a pool without earlier removals, which is what
+  ## the KB-192 tie cases measure. After removals Core compacts GraphIndexes
+  ## (txgraph.cpp Compact), which this does not model.
   var readdedSet = initHashSet[TxId]()
   for t in readded: readdedSet.incl(t)
-  var done = initHashSet[TxId]()
+  # m_deps_to_add, in the order UpdateTransactionsFromBlock adds them: one per
+  # spent outpoint (mapNextTx), parents in reverse acceptance order.
+  var addDeps: seq[(TxId, TxId)]
+  for k in countdown(readded.high, 0):
+    let p = readded[k]
+    if p notin mp.entries:
+      continue
+    for vout in 0 ..< mp.entries[p].tx.outputs.len:
+      let op = OutPoint(txid: p, vout: uint32(vout))
+      if op in mp.spentBy and mp.spentBy[op] in mp.entries:
+        addDeps.add((p, mp.spentBy[op]))
+  if addDeps.len == 0:
+    return
+  # Every tx in a would-be cluster, indexed in graphIndex order, so comparing
+  # indices compares GraphIndexes.
+  var members: seq[TxId]
+  var seenM = initHashSet[TxId]()
+  for (p, _) in addDeps:
+    if p notin seenM:
+      for m in mp.clusterMembers(p):
+        if m notin seenM:
+          seenM.incl(m)
+          members.add(m)
+  members.sort(proc(a, b: TxId): int =
+    cmp(mp.entries[a].graphIndex, mp.entries[b].graphIndex))
+  let n = members.len
+  var idx = initTable[TxId, int]()
+  for i, m in members: idx[m] = i
   let countLimit = mp.clusterLimit
   let sizeLimit = mp.maxClusterSizeWeight()
-  for seed in readded:
-    if seed notin mp.entries or seed in done:
-      continue
-    var members = mp.clusterMembers(seed)
-    for m in members: done.incl(m)
+  var fr = newSeq[TrimFrac](n)
+  var oldParents = newSeq[seq[int]](n)   # dependencies present before m_deps_to_add
+  for i, m in members:
+    let e = mp.entries[m]
+    fr[i] = (int64(e.fee) + mp.getFeeDelta(m), clusterSizeContribution(e.weight, e.sigopCost))
+    for input in e.tx.inputs:
+      let p = input.prevOut.txid
+      if p in idx and idx[p] notin oldParents[i] and
+         not (p in readdedSet and m notin readdedSet):
+        oldParents[i].add(idx[p])
+  # Pre-merge clusters: connected components over the old dependencies.
+  var comp = newSeq[int](n)
+  for i in 0 ..< n: comp[i] = i
+  proc root(x: int): int =
+    var r = x
+    while comp[r] != r: r = comp[r]
+    r
+  for i in 0 ..< n:
+    for p in oldParents[i]:
+      let a = root(i)
+      let b = root(p)
+      if a != b: comp[a] = b
+  var groups = initTable[int, seq[int]]()
+  for i in 0 ..< n: groups.mgetOrPut(root(i), @[]).add(i)
+  # Linearize a pre-merge cluster (ancestor-set selection; optimal for the
+  # small shapes a reorg re-add produces) and chunk it like Core's
+  # ChunkLinearization: merge while the new chunk has a strictly higher
+  # feerate. Only clusters in an oversized group need this (AppendTrimData).
+  var chunkFr = newSeq[TrimFrac](n)
+  var clSeq = initTable[int, int]()      # pre-merge cluster root -> m_sequence stand-in
+  for r, g in groups: clSeq[r] = max(g)
+  proc linearize(r: int): seq[int] =
+    let g = groups[r]
+    var remaining = initHashSet[int]()
+    for i in g: remaining.incl(i)
+    var order: seq[int]
+    while remaining.len > 0:
+      var best = -1
+      var bestSet: seq[int]
+      var bestFr: TrimFrac
+      for i in g:
+        if i notin remaining: continue
+        var anc: seq[int]
+        var stack = @[i]
+        var seen = initHashSet[int]()
+        while stack.len > 0:
+          let c = stack.pop()
+          if c in seen or c notin remaining: continue
+          seen.incl(c)
+          anc.add(c)
+          for p in oldParents[c]: stack.add(p)
+        var f: TrimFrac = (0'i64, 0'i64)
+        for a in anc: f = (f.fee + fr[a].fee, f.size + fr[a].size)
+        if best < 0 or trimBetter(f, bestFr):
+          best = i
+          bestSet = anc
+          bestFr = f
+      # Emit the ancestor set parents-first.
+      var depth = initTable[int, int]()
+      proc depthOf(x: int): int =
+        if x in depth: return depth[x]
+        var d = 0
+        for p in oldParents[x]:
+          if p in remaining: d = max(d, depthOf(p) + 1)
+        depth[x] = d
+        d
+      bestSet.sort(proc(a, b: int): int =
+        let da = depthOf(a)
+        let db = depthOf(b)
+        if da != db: cmp(da, db) else: cmp(a, b))
+      for a in bestSet:
+        order.add(a)
+        remaining.excl(a)
+    var chunks: seq[(seq[int], TrimFrac)]
+    for i in order:
+      var c = (@[i], fr[i])
+      while chunks.len > 0 and
+            c[1].fee * chunks[^1][1].size > chunks[^1][1].fee * c[1].size:
+        let last = chunks.pop()
+        c = (last[0] & c[0], (last[1].fee + c[1].fee, last[1].size + c[1].size))
+      chunks.add(c)
+    for (txs, f) in chunks:
+      for t in txs: chunkFr[t] = f
+    order
+  # GroupClusters (txgraph.cpp:1856-2065): an_clusters / an_deps, union-find
+  # over the clusters each dependency joins, then both re-sorted by the
+  # representative's sequence. The re-sorts compare equal keys, so their
+  # permutation is libstdc++'s and decides m_deps_to_add's order in Trim.
+  type AnCl = tuple[cl, sq: int]
+  type AnDep = tuple[p, c, sq: int]
+  var anCl: seq[AnCl]
+  var anDeps: seq[AnDep]
+  for (p, c) in addDeps:
+    let ip = idx[p]
+    let ic = idx[c]
+    let pc = root(ip)
+    let cc = root(ic)
+    anCl.add((pc, clSeq[pc]))
+    if cc != pc: anCl.add((cc, clSeq[cc]))
+    anDeps.add((ip, ic, clSeq[cc]))
+  let clLess: CxxLess[AnCl] = proc(a, b: AnCl): bool = a.sq < b.sq
+  let depLess: CxxLess[AnDep] = proc(a, b: AnDep): bool = a.sq < b.sq
+  cxxSort(anCl, clLess)
+  var uniq: seq[AnCl]
+  for x in anCl:
+    if uniq.len == 0 or uniq[^1] != x: uniq.add(x)
+  anCl = uniq
+  cxxSort(anDeps, depLess)
+  var pdSeq = newSeq[int](anCl.len)
+  var pdParent = newSeq[int](anCl.len)
+  var pdRank = newSeq[int](anCl.len)
+  for i in 0 ..< anCl.len:
+    pdSeq[i] = anCl[i].sq
+    pdParent[i] = i
+  proc locate(sq: int): int = lowerBound(pdSeq, sq)
+  proc findRoot(x0: int): int =
+    var x = x0
+    while pdParent[x] != x:
+      let par = pdParent[x]
+      pdParent[x] = pdParent[par]
+      x = par
+    x
+  proc unite(a, b: int): int =
+    var r1 = findRoot(a)
+    var r2 = findRoot(b)
+    if r1 == r2: return r1
+    if pdRank[r1] < pdRank[r2]: swap(r1, r2)
+    pdParent[r2] = r1
+    if pdRank[r1] == pdRank[r2]: inc pdRank[r1]
+    r1
+  var lastChl = -1
+  var lastPart = -1
+  for d in anDeps:
+    let pc = root(d.p)
+    let cc = root(d.c)
+    if pc == cc: continue
+    if cc == lastChl:
+      lastPart = unite(locate(clSeq[pc]), lastPart)
+    else:
+      lastChl = cc
+      lastPart = unite(locate(clSeq[pc]), locate(clSeq[cc]))
+  var di = 0
+  for i in 0 ..< anCl.len:
+    let repSq = pdSeq[findRoot(i)]
+    anCl[i].sq = repSq
+    while di < anDeps.len:
+      if clSeq[root(anDeps[di].c)] > pdSeq[i]: break
+      anDeps[di].sq = repSq
+      inc di
+  cxxSort(anDeps, depLess)
+  cxxSort(anCl, clLess)
+  # Trim, one would-be cluster (group) at a time.
+  let heapLess: CxxLess[int] = proc(a, b: int): bool = trimLess(chunkFr[a], chunkFr[b])
+  let byChild: CxxLess[(int, int)] = proc(a, b: (int, int)): bool = a[1] < b[1]
+  let byParent: CxxLess[(int, int)] = proc(a, b: (int, int)): bool = a[0] < b[0]
+  var included = newSeq[bool](n)
+  var trimmed = newSeq[bool](n)
+  var ci = 0
+  var dj = 0
+  while ci < anCl.len:
+    let rep = anCl[ci].sq
+    var clusters: seq[int]
+    while ci < anCl.len and anCl[ci].sq == rep:
+      clusters.add(anCl[ci].cl)
+      inc ci
+    var groupDeps: seq[(int, int)]
+    while dj < anDeps.len and anDeps[dj].sq == rep:
+      groupDeps.add((anDeps[dj].p, anDeps[dj].c))
+      inc dj
+    var count = 0
     var total = 0'i64
-    for m in members:
-      total += clusterSizeContribution(mp.entries[m].weight, mp.entries[m].sigopCost)
-    if members.len <= countLimit and total <= sizeLimit:
+    for cl in clusters:
+      for t in groups[cl]:
+        inc count
+        total += fr[t].size
+    if count <= countLimit and total <= sizeLimit:
       continue
-    members.sort(proc(a, b: TxId): int = cmp($a, $b))
-    let n = members.len
-    var idx = initTable[TxId, int]()
-    for i, m in members: idx[m] = i
-    var fr = newSeq[TrimFrac](n)
-    var added = newSeq[Time](n)
-    var parents = newSeq[seq[int]](n)
-    var oldParents = newSeq[seq[int]](n)   # dependencies present before the re-add linked children
-    for i, m in members:
-      let e = mp.entries[m]
-      fr[i] = (int64(e.fee) + mp.getFeeDelta(m), clusterSizeContribution(e.weight, e.sigopCost))
-      added[i] = e.timeAdded
-      for input in e.tx.inputs:
-        let p = input.prevOut.txid
-        if p in idx and idx[p] notin parents[i]:
-          parents[i].add(idx[p])
-          # m_deps_to_add: a re-added parent and a child that was already in the pool.
-          if not (p in readdedSet and m notin readdedSet):
-            oldParents[i].add(idx[p])
-    proc earlier(a, b: int): bool =
-      if added[a] != added[b]: added[a] < added[b] else: $members[a] < $members[b]
-    # Pre-merge clusters: connected components over the old dependencies.
-    var comp = newSeq[int](n)
-    for i in 0 ..< n: comp[i] = i
-    proc root(x: int): int =
-      var r = x
-      while comp[r] != r: r = comp[r]
-      r
-    for i in 0 ..< n:
-      for p in oldParents[i]:
-        let a = root(i)
-        let b = root(p)
-        if a != b: comp[a] = b
-    var groups = initTable[int, seq[int]]()
-    for i in 0 ..< n: groups.mgetOrPut(root(i), @[]).add(i)
-    # Linearize each pre-merge cluster (ancestor-set selection; optimal for
-    # the small shapes a reorg re-add produces) and chunk it like Core's
-    # ChunkLinearization: merge while the new chunk has a strictly higher feerate.
-    var chunkFr = newSeq[TrimFrac](n)
-    var pred = newSeq[int](n)
-    for i in 0 ..< n: pred[i] = -1
-    for _, g in groups:
-      var remaining = initHashSet[int]()
-      for i in g: remaining.incl(i)
-      var lin: seq[int]
-      while remaining.len > 0:
-        var best = -1
-        var bestSet: seq[int]
-        var bestFr: TrimFrac
-        for i in g:
-          if i notin remaining: continue
-          var anc: seq[int]
-          var stack = @[i]
-          var seen = initHashSet[int]()
-          while stack.len > 0:
-            let c = stack.pop()
-            if c in seen or c notin remaining: continue
-            seen.incl(c)
-            anc.add(c)
-            for p in oldParents[c]: stack.add(p)
-          var f: TrimFrac = (0'i64, 0'i64)
-          for a in anc: f = (f.fee + fr[a].fee, f.size + fr[a].size)
-          if best < 0 or trimBetter(f, bestFr) or
-             (not trimBetter(bestFr, f) and earlier(i, best)):
-            best = i
-            bestSet = anc
-            bestFr = f
-        # Emit the ancestor set parents-first.
-        var depth = initTable[int, int]()
-        proc depthOf(x: int): int =
-          if x in depth: return depth[x]
-          var d = 0
-          for p in oldParents[x]:
-            if p in remaining: d = max(d, depthOf(p) + 1)
-          depth[x] = d
-          d
-        bestSet.sort(proc(a, b: int): int =
-          let da = depthOf(a)
-          let db = depthOf(b)
-          if da != db: cmp(da, db) elif earlier(a, b): -1 else: 1)
-        for a in bestSet:
-          lin.add(a)
-          remaining.excl(a)
-      var chunks: seq[(seq[int], TrimFrac)]
-      for i in lin:
-        var c = (@[i], fr[i])
-        while chunks.len > 0 and
-              c[1].fee * chunks[^1][1].size > chunks[^1][1].fee * c[1].size:
-          let last = chunks.pop()
-          c = (last[0] & c[0], (last[1].fee + c[1].fee, last[1].size + c[1].size))
-        chunks.add(c)
-      for (txs, f) in chunks:
-        for t in txs: chunkFr[t] = f
-      for k in 1 ..< lin.len: pred[lin[k]] = lin[k - 1]
-    # Dependencies for the merge: every in-cluster parent (old and newly
-    # linked) plus the implicit linearization predecessor.
-    var deps = newSeq[seq[int]](n)
-    var children = newSeq[seq[int]](n)
-    for i in 0 ..< n:
-      for p in parents[i]:
-        if p notin deps[i]: deps[i].add(p)
-      if pred[i] >= 0 and pred[i] notin deps[i]: deps[i].add(pred[i])
-      for p in deps[i]: children[p].add(i)
-    var left = newSeq[int](n)
+    var td: seq[int]
+    var depsByChild: seq[(int, int)]
+    for cl in clusters:
+      let order = linearize(cl)
+      for k, t in order:
+        td.add(t)
+        if k > 0: depsByChild.add((order[k - 1], t))
+    td.sort()
+    for t in td: trimmed[t] = true
+    depsByChild.add(groupDeps)
+    cxxSort(depsByChild, byChild)
+    var parentOff = initTable[int, int]()
+    var parentCnt = initTable[int, int]()
+    var left = initTable[int, int]()
     var heap: seq[int]
-    for i in 0 ..< n:
-      left[i] = deps[i].len
-      if left[i] == 0 and fr[i].size <= sizeLimit: heap.add(i)
+    var pos = 0
+    for t in td:
+      parentOff[t] = pos
+      var cnt = 0
+      while pos < depsByChild.len and depsByChild[pos][1] == t:
+        inc cnt
+        inc pos
+      parentCnt[t] = cnt
+      left[t] = cnt
+      if cnt == 0 and fr[t].size <= sizeLimit: heap.add(t)
+    var depsByParent = depsByChild
+    cxxSort(depsByParent, byParent)
+    var childOff = initTable[int, int]()
+    var childCnt = initTable[int, int]()
+    pos = 0
+    for t in td:
+      childOff[t] = pos
+      var cnt = 0
+      while pos < depsByParent.len and depsByParent[pos][0] == t:
+        inc cnt
+        inc pos
+      childCnt[t] = cnt
+    cxxMakeHeap(heap, 0, heap.len, heapLess)
     var uf = newSeq[int](n)
     var ufCount = newSeq[int](n)
     var ufSize = newSeq[int64](n)
-    var included = newSeq[bool](n)
-    proc find(x: int): int =
-      var r = x
-      while uf[r] != r: r = uf[r]
-      r
+    proc find(x0: int): int =
+      var x = x0
+      while uf[x] != x:
+        let par = uf[x]
+        uf[x] = uf[par]
+        x = par
+      x
     while heap.len > 0:
-      var bi = 0
-      for k in 1 ..< heap.len:
-        let a = heap[k]
-        let b = heap[bi]
-        if trimBetter(chunkFr[a], chunkFr[b]) or
-           (not trimBetter(chunkFr[b], chunkFr[a]) and earlier(a, b)):
-          bi = k
-      let e = heap[bi]
-      heap.del(bi)
+      let e = cxxPopHeap(heap, heapLess)
       uf[e] = e
       ufCount[e] = 1
       ufSize[e] = fr[e].size
-      var roots: seq[int]
-      for p in deps[e]:
-        let r = find(p)
-        if r notin roots: roots.add(r)
+      var cur: seq[int]
+      for k in parentOff[e] ..< parentOff[e] + parentCnt[e]:
+        cur.add(find(depsByChild[k][0]))
+      cur.sort()
+      var uniqueReps: seq[int]
+      for r in cur:
+        if uniqueReps.len == 0 or uniqueReps[^1] != r: uniqueReps.add(r)
+      cur = uniqueReps
       var newCount = 1
       var newSize = fr[e].size
-      for r in roots:
+      for r in cur:
         newCount += ufCount[r]
         newSize += ufSize[r]
       if newCount > countLimit or newSize > sizeLimit:
         continue
-      for r in roots:
-        uf[r] = e
-      ufCount[e] = newCount
-      ufSize[e] = newSize
+      var r = e
+      for c in cur:
+        var r1 = find(c)
+        var r2 = find(r)
+        if r1 != r2:
+          if ufCount[r1] < ufCount[r2]: swap(r1, r2)
+          uf[r2] = r1
+          ufSize[r1] += ufSize[r2]
+          ufCount[r1] += ufCount[r2]
+        r = r1
       included[e] = true
-      for c in children[e]:
+      for k in childOff[e] ..< childOff[e] + childCnt[e]:
+        let c = depsByParent[k][1]
         dec left[c]
-        if left[c] == 0: heap.add(c)
-    # Drop everything not included, descendants first.
-    var drop: seq[int]
-    for i in 0 ..< n:
-      if not included[i]: drop.add(i)
-    drop.sort(proc(a, b: int): int =
-      cmp(mp.entries[members[b]].ancestorCount, mp.entries[members[a]].ancestorCount))
-    for i in drop:
-      mp.removeTransaction(members[i])
+        if left[c] == 0:
+          heap.add(c)
+          cxxPushHeap(heap, heapLess)
+  # Drop everything Trim did not include, descendants first.
+  var drop: seq[int]
+  for i in 0 ..< n:
+    if trimmed[i] and not included[i]: drop.add(i)
+  drop.sort(proc(a, b: int): int =
+    cmp(mp.entries[members[b]].ancestorCount, mp.entries[members[a]].ancestorCount))
+  for i in drop:
+    mp.removeTransaction(members[i])
 
 proc maybeUpdateMempoolForReorg*(mp: Mempool, addToMempool: bool = true) =
   ## Core MaybeUpdateMempoolForReorg (validation.cpp:294-386), run under the
@@ -2150,7 +2303,7 @@ proc maybeUpdateMempoolForReorg*(mp: Mempool, addToMempool: bool = true) =
   ##      spends at the new tip+1, with descendants;
   ##   3. LimitMempoolSize.
   let queued = mp.disconnectPool
-  var relinked: seq[TxId]
+  var readded: seq[TxId]
   mp.disconnectPool.setLen(0)
   mp.disconnectPoolBytes = 0
   if addToMempool and queued.len > 0 and not mp.reorgCryptoReady:
@@ -2175,13 +2328,12 @@ proc maybeUpdateMempoolForReorg*(mp: Mempool, addToMempool: bool = true) =
         let desc = mp.descendantsBySpend(txid, tx.outputs.len)
         for d in desc:
           mp.refreshAncestorState(d)
-        if desc.len > 0:
-          relinked.add(txid)
+        readded.add(txid)
     if not accepted:
       mp.removeRecursive(txid, tx.outputs.len)
-  # Core UpdateTransactionsFromBlock: enforce cluster limits on the clusters
-  # the re-added txs merged with their in-mempool children.
-  mp.trimReorgClusters(relinked)
+  # Core UpdateTransactionsFromBlock(vHashUpdate): enforce cluster limits on
+  # the clusters the re-added txs merged with their in-mempool children.
+  mp.trimReorgClusters(readded)
   mp.removeForReorg()
   mp.limitMempoolSize()
 
