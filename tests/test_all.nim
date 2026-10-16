@@ -146,6 +146,7 @@ const IncludedTests = [
   "test_interpreter_glassbox_fixes",
   "test_invalid_block_p2p",
   "test_isfinaltx",
+  "test_kb181_failed_reorg_activation",
   "test_label",
   "test_listdescriptors",
   "test_listunspent_regtest_hrp",
