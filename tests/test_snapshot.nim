@@ -1997,9 +1997,9 @@ suite "gettxoutsetinfo Core-byte-parity":
     check info.totalAmount == 2'i64 * 50_00000000'i64
     check info.hashSerialized == default(array[32, byte])
 
-  test "RPC handler emits both hash_serialized_3 and hash_serialized_2":
-    # The cross-impl diff-test reads `hash_serialized_2` first; we emit
-    # both keys with identical values for harness compatibility.
+  test "RPC handler emits hash_serialized_3 only (Core v31 has no _2)":
+    # Core v31.1 gettxoutsetinfo reports hash_serialized_3; the legacy _2
+    # alias was a harness-compat extra that Core's shape does not have.
     let testDir = getTempDir() / "nimrod_gtxosi_rpc_keys"
     createDir(testDir)
     defer:
@@ -2021,8 +2021,7 @@ suite "gettxoutsetinfo Core-byte-parity":
     let res = rpc.handleGetTxOutSetInfo(%*[])
 
     check res.hasKey("hash_serialized_3")
-    check res.hasKey("hash_serialized_2")
-    check res["hash_serialized_3"].getStr() == res["hash_serialized_2"].getStr()
+    check not res.hasKey("hash_serialized_2")
     check res["hash_serialized_3"].getStr().len == 64
     check res["hash_serialized_3"].getStr() != "not implemented"
     check res["height"].getInt() == 4
