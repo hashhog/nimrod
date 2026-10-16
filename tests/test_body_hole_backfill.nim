@@ -31,7 +31,7 @@
 ##  12. Body repair yields to one-peer IBD (clearbit 63450d1 class).
 
 import unittest2
-import std/[os, options, json, sets]
+import std/[os, options, json, sets, times]
 import ../src/storage/chainstate
 import ../src/primitives/[types, serialize]
 import ../src/crypto/hashing
@@ -378,16 +378,21 @@ suite "retained-range body hole backfill":
     check queued == 3
     check cs.bodyRepairRemaining() == 3
     let rpc = rpcWithChainState(cs)
-    let before = rpc.handleMethod("getblockchaininfo", %*[])
+    let before = rpc.handleMethod("getbodyrepairinfo", %*[])
     check before["body_repair_remaining"].getInt() == 3
     check before["body_repair_filled"].getInt() == 0
+    # Core's getblockchaininfo has no body_repair_* keys; they live on the
+    # nimrod-only getbodyrepairinfo.
+    let coreShape = rpc.handleMethod("getblockchaininfo", %*[])
+    check not coreShape.hasKey("body_repair_remaining")
+    check not coreShape.hasKey("body_repair_filled")
 
     let sm = newSyncManager(nil, cs.db, regtestParams(), cs)
     for h in [11'i32, 12, 13]:
       check sm.processBlock(nil, bodies[h])
     check cs.bodyRepairRemaining() == 0
     check cs.bodyRepairFilled == 3
-    let after = rpc.handleMethod("getblockchaininfo", %*[])
+    let after = rpc.handleMethod("getbodyrepairinfo", %*[])
     check after["body_repair_remaining"].getInt() == 0
     check after["body_repair_filled"].getInt() == 3
 
@@ -431,14 +436,14 @@ suite "retained-range body hole backfill":
     check holeHash in cs.pendingBodyRepairs
     check cs.bodyRepairRemaining() == 1
     let rpc = rpcWithChainState(cs)
-    check rpc.handleMethod("getblockchaininfo", %*[])[
+    check rpc.handleMethod("getbodyrepairinfo", %*[])[
         "body_repair_remaining"].getInt() == 1
 
     let sm = newSyncManager(nil, cs.db, regtestParams(), cs)
     check sm.processBlock(nil, holeBlk)
     check cs.db.hasBlockBody(holeHash)
     check cs.bodyRepairRemaining() == 0
-    check rpc.handleMethod("getblockchaininfo", %*[])[
+    check rpc.handleMethod("getbodyrepairinfo", %*[])[
         "body_repair_remaining"].getInt() == 0
     let firstBody = discoverFirstBody(cs.db, cs.bestHeight)
     let scan = auditRetainedBodies(cs.db, cs.bestHeight,
@@ -470,7 +475,7 @@ suite "retained-range body hole backfill":
     check cs.bodyRepairRemaining() != audit.holes.len
     check countRetainedBodyHoles(cs.db, cs.bestHeight) == 80
     let rpc = rpcWithChainState(cs)
-    let info = rpc.handleMethod("getblockchaininfo", %*[])
+    let info = rpc.handleMethod("getbodyrepairinfo", %*[])
     check info["body_repair_remaining"].getInt() == 80
     cs.close()
 
@@ -561,3 +566,68 @@ suite "retained-range body hole backfill":
     check not sm.bodyRepairYieldsToIbd()
     cs.close()
 
+
+suite "getblockchaininfo Core shape":
+  setup:
+    cleanupTestDb()
+
+  test "headers is floored at the connected tip when the header chain lags":
+    ## Blocks submitted over RPC never pass through headers-first sync, so the
+    ## sync manager's header chain stays at 0. Core's m_best_header is never
+    ## below the active tip (RecalculateBestHeader starts from it).
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    var bodies: seq[Block] = @[genesis]
+    discard connectKeeping(cs, getBlockHash(genesis), 1, 7, bodies)
+    let rpc = rpcWithChainState(cs)
+    rpc.headerTipProvider = proc(): int32 {.gcsafe, raises: [].} = 0
+    let info = rpc.handleMethod("getblockchaininfo", %*[])
+    check info["blocks"].getInt() == 7
+    check info["headers"].getInt() == 7
+    cs.close()
+
+  test "initialblockdownload follows tip age, not height":
+    ## Core IsInitialBlockDownload: true while the tip is older than
+    ## DEFAULT_MAX_TIP_AGE (24h), false once it is recent, at any height.
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    var bodies: seq[Block] = @[genesis]
+    discard connectKeeping(cs, getBlockHash(genesis), 1, 3, bodies)
+    let rpc = rpcWithChainState(cs)
+    # Tip stamped in 2009: stale, still IBD.
+    check rpc.handleMethod("getblockchaininfo", %*[])["initialblockdownload"].getBool()
+    # A fresh tip with only a handful of blocks is NOT IBD.
+    var recent = makeSimpleBlock(getBlockHash(bodies[^1]), 4)
+    recent.header.timestamp = uint32(getTime().toUnix())
+    check cs.connectBlock(recent, 4).isOk
+    check not rpc.handleMethod("getblockchaininfo", %*[])["initialblockdownload"].getBool()
+    cs.close()
+
+  test "headers counts a header admitted by submitheader":
+    ## Core's m_best_header moves on AcceptBlockHeader. A header-only tip two
+    ## past the active chain must show up in getblockchaininfo.headers.
+    var cs = newChainState(TestDbPath, regtestParams())
+    let genesis = makeSimpleBlock(BlockHash(default(array[32, byte])), 0)
+    check cs.connectBlock(genesis, 0).isOk
+    var bodies: seq[Block] = @[genesis]
+    discard connectKeeping(cs, getBlockHash(genesis), 1, 5, bodies)
+    let rpc = rpcWithChainState(cs)
+    rpc.headerTipProvider = proc(): int32 {.gcsafe, raises: [].} = 0
+    var prev = getBlockHash(bodies[^1])
+    for h in [6'i32, 7]:
+      var hdr = makeSimpleBlock(prev, h).header
+      hdr.version = 0x20000000
+      # regtest target is 2^255-ish: a handful of nonces find a valid PoW.
+      while true:
+        let hh = getBlockHash(Block(header: hdr, txs: @[]))
+        if array[32, byte](hh)[31] < 0x7f: break
+        inc hdr.nonce
+      check rpc.handleMethod("submitheader",
+          %*[toHexLower(serialize(hdr))]).kind == JNull
+      prev = BlockHash(doubleSha256(serialize(hdr)))
+    let info = rpc.handleMethod("getblockchaininfo", %*[])
+    check info["blocks"].getInt() == 5
+    check info["headers"].getInt() == 7
+    cs.close()

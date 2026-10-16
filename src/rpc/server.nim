@@ -126,6 +126,9 @@ type
                                             ## snapshot. nil = single normal chainstate.
                                             ## Read by getchainstates (validated +
                                             ## snapshot_blockhash).
+    submittedHeaderHeight*: int32         ## Highest header admitted by submitheader
+                                          ## (never enters the sync header chain);
+                                          ## floors getblockchaininfo.headers.
     headerTipProvider*: proc(): int32 {.gcsafe, raises: [].}
                                           ## Live header-chain tip height from the
                                           ## sync manager (Core: m_best_header).
@@ -560,10 +563,26 @@ proc rpcBestHeaderHeight(rpc: RpcServer): int32 =
   ## harness gates its window feed on this field reaching the base — the old
   ## bestHeight passthrough let the feed fire before any header existed
   ## (run 20260815T204551Z, 11 false DIVERGENCE rows).
+  ##
+  ## Floor at the connected tip: Core's m_best_header is never below the active
+  ## tip (RecalculateBestHeader starts from it). Blocks that arrive by
+  ## submitblock never pass through headers-first sync, so the sync manager's
+  ## header chain can sit at 0 under a 110-block active chain.
   if rpc.headerTipProvider != nil:
-    rpc.headerTipProvider()
+    max(max(rpc.headerTipProvider(), rpc.chainState.bestHeight),
+        rpc.submittedHeaderHeight)
   else:
-    rpc.chainState.bestHeight
+    max(rpc.chainState.bestHeight, rpc.submittedHeaderHeight)
+
+const MaxTipAgeSecs = 24 * 60 * 60 ## Core DEFAULT_MAX_TIP_AGE (24h)
+
+proc rpcIsInitialBlockDownload(bestHeight: int32, tipTime: uint32): bool =
+  ## Core ChainstateManager::IsInitialBlockDownload: true while there is no
+  ## tip or the tip is older than DEFAULT_MAX_TIP_AGE. The old `bestHeight < 100`
+  ## test said "not IBD" for any long-stale chain and "IBD" for a short fresh one.
+  if bestHeight < 0 or tipTime == 0:
+    return true
+  int64(tipTime) < getTime().toUnix() - MaxTipAgeSecs
 
 proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   ## Return an object containing various state info regarding blockchain processing
@@ -679,7 +698,7 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
     "time": blockTime,
     "mediantime": medianTime,
     "verificationprogress": verificationProgress,
-    "initialblockdownload": rpc.chainState.bestHeight < 100,
+    "initialblockdownload": rpcIsInitialBlockDownload(rpc.chainState.bestHeight, blockTime),
     "chainwork": chainworkBE,
     "size_on_disk": sizeOnDisk,
     "pruned": pruned,
@@ -690,15 +709,6 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   # Add pruneheight only if pruned
   if pruned and pruneHeight >= 0:
     response["pruneheight"] = %pruneHeight
-
-  # Retained-range body-repair progress. pendingBodyRepairs.len is the
-  # untruncated remaining count (the planner no longer caps). Operators
-  # poll this; a falling remaining is stored bodies, a stuck remaining
-  # with repeating getdata is requests that never arrive. Extra field:
-  # R5 getblockchaininfo is an inclusion check, not an exact key set.
-  if rpc.chainState != nil:
-    response["body_repair_remaining"] = %rpc.chainState.bodyRepairRemaining()
-    response["body_repair_filled"] = %rpc.chainState.bodyRepairFilled
 
   # Add prune_target_size if pruning is enabled. Prefer the Pruner's value
   # because manual mode (--prune=1) reports the AutoPruneFloor as the
@@ -712,6 +722,17 @@ proc handleGetBlockchainInfo*(rpc: RpcServer): JsonNode =
   # (softfork state now lives in getdeploymentinfo only). Do not emit it here.
 
   response
+
+proc handleGetBodyRepairInfo(rpc: RpcServer): JsonNode =
+  ## nimrod-only. Retained-range body-repair progress. pendingBodyRepairs.len
+  ## is the untruncated remaining count (the planner no longer caps). Operators
+  ## poll this; a falling remaining is stored bodies, a stuck remaining with
+  ## repeating getdata is requests that never arrive. Moved out of
+  ## getblockchaininfo, whose key set must match Core's.
+  %*{
+    "body_repair_remaining": rpc.chainState.bodyRepairRemaining(),
+    "body_repair_filled": rpc.chainState.bodyRepairFilled
+  }
 
 proc handleGetChainStates(rpc: RpcServer): JsonNode =
   ## Return information about chainstates.
@@ -2671,6 +2692,11 @@ proc handleInvalidateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   if idxOpt.isNone:
     raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
 
+  # Core recomputes m_best_header (RecalculateBestHeader) when block validity
+  # flags change; forget the submitheader high-water mark so `headers` falls
+  # back to the live header chain / active tip instead of a stale branch.
+  rpc.submittedHeaderHeight = 0
+
   # Wallet history unscan (symmetric with the block-connect scan): if the block
   # being invalidated is on the active chain, drop the transaction-history
   # records it and every active-chain descendant contributed, so
@@ -2738,6 +2764,11 @@ proc handleReconsiderBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   let idxOpt = rpc.chainState.db.getBlockIndex(blockHash)
   if idxOpt.isNone:
     raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
+
+  # Core recomputes m_best_header (RecalculateBestHeader) when block validity
+  # flags change; forget the submitheader high-water mark so `headers` falls
+  # back to the live header chain / active tip instead of a stale branch.
+  rpc.submittedHeaderHeight = 0
 
   # Call the chain management function
   let result = rpc.chainState.reconsiderBlock(blockHash)
@@ -7002,6 +7033,10 @@ proc handleSubmitHeader(rpc: RpcServer, params: JsonNode): JsonNode =
     nTx: 0'i32
   )
   cs.db.putBlockIndexHashOnly(hdrIdx)
+  # Core's m_best_header moves with AcceptBlockHeader; surface it in
+  # getblockchaininfo.headers.
+  if hdrIdx.height > rpc.submittedHeaderHeight:
+    rpc.submittedHeaderHeight = hdrIdx.height
 
   newJNull()  # success per Core: ProcessNewBlockHeaders state.IsValid() -> VNULL
 
@@ -8777,13 +8812,11 @@ proc txOutSetInfoJson(info: UtxoSetInfo, coinHashType: CoinStatsHashType): JsonN
 
   case coinHashType
   of cshtHashSerialized:
-    # Emit BOTH `_3` (Core's current key) and `_2` (legacy alias the
-    # cross-impl diff-test prefers). Display byte-order via reverseHex,
-    # mirroring Core's `stats.hashSerialized.GetHex()` (uint256::GetHex
+    # Emit `_3` only, as Core v31 does (the legacy `_2` alias is gone).
+    # Display byte-order via reverseHex, mirroring Core's `stats.hashSerialized.GetHex()` (uint256::GetHex
     # reverses internally).
     let hexStr = reverseHex(toHex(info.hashSerialized))
     response["hash_serialized_3"] = %hexStr
-    response["hash_serialized_2"] = %hexStr
   of cshtMuHash:
     response["muhash"] = %reverseHex(toHex(info.hashSerialized))
   of cshtNone: discard
@@ -15469,6 +15502,8 @@ proc handleMethodUnlocked(rpc: RpcServer, methodName: string, params: JsonNode):
     rpc.handleGetBestBlockHash()
   of "getchainstates":
     rpc.handleGetChainStates()
+  of "getbodyrepairinfo":
+    rpc.handleGetBodyRepairInfo()
   of "getsyncstate":
     rpc.handleGetSyncState()
   of "getblockhash":
