@@ -3140,7 +3140,7 @@ proc validateForStorage*(
   ## Validate a block bound for side-branch storage (submitblock with
   ## prevHash != cs.bestBlockHash). Side-branch blocks are NOT connected
   ## immediately (the UTXO state is on the active tip); they are persisted
-  ## with bsValidated status and connected later via `handleReorg` when a
+  ## with bsDataStored status and connected later via `handleReorg` when a
   ## reorg promotes them.
   ##
   ## Core's BlockManager::AcceptBlock applies the FULL CheckBlock +

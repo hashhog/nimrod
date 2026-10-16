@@ -1783,14 +1783,17 @@ proc handleGetDifficulty(rpc: RpcServer): JsonNode =
   difficultyJson(getDifficultyFromBits(bits))
 
 proc handleGetChainTips(rpc: RpcServer): JsonNode =
-  # For now, just return the active tip
-  # A full implementation would track multiple chain tips
-  %*[{
-    "height": rpc.chainState.bestHeight,
-    "hash": reverseHex(toHex(array[32, byte](rpc.chainState.bestBlockHash))),
-    "branchlen": 0,
-    "status": "active"
-  }]
+  ## Core getchaintips: the active tip plus every side-branch tip in the block
+  ## index (invalid, headers-only, valid-fork, valid-headers) with its
+  ## branchlen. See consensus/chain.nim chainTips.
+  result = newJArray()
+  for t in rpc.chainState.chainTips():
+    result.add(%*{
+      "height": t.height,
+      "hash": reverseHex(toHex(array[32, byte](t.hash))),
+      "branchlen": t.branchLen,
+      "status": t.status
+    })
 
 proc resolveBlockNtx(rpc: RpcServer, idx: BlockIndex): int =
   ## Resolve the number of transactions in a single block, mirroring the
@@ -2665,6 +2668,8 @@ proc scanBlockIntoWallets(rpc: RpcServer, blk: Block, height: int32,
 # invalidateblock and reconsiderblock both end in ActivateBestChain (defined
 # after handleSubmitBlock, whose side-branch helpers it shares).
 proc activateBestChain(rpc: RpcServer)
+proc markConnectFailure(rpc: RpcServer, failed: BlockHash, failedBlk: Block,
+                        token: string): bool
 
 # Chain Management RPCs
 proc handleInvalidateBlock(rpc: RpcServer, params: JsonNode): JsonNode =
@@ -6784,6 +6789,17 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       #   sboReorged   -> success (JSON null) after the post-reorg refresh below.
       if isFatal():
         raiseFatalVerifyError()
+      # A heavier branch whose stored block failed ConnectBlock during the
+      # reorg: Core marks that block (and its descendants) invalid, so it is
+      # never tried again and getchaintips lists it as invalid. A block
+      # rejected before it was stored has no body here and is left alone.
+      if sideResult.outcome == sboRejected and
+         cs.db.hasBlockBody(cs.lastRejectedBlock):
+        let failed = cs.lastRejectedBlock
+        let failedBlk =
+          if failed == BlockHash(doubleSha256(serialize(blk.header))): blk
+          else: cs.db.getBlock(failed).get(Block())
+        discard rpc.markConnectFailure(failed, failedBlk, sideResult.token)
       if sideResult.outcome == sboRejected or
          sideResult.outcome == sboSideBranch:
         return %sideResult.token
@@ -6817,6 +6833,29 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       raiseFatalVerifyError()
     # Unexpected exception — use "rejected" catch-all per BIP-22.
     %"rejected"
+
+proc markConnectFailure(rpc: RpcServer, failed: BlockHash, failedBlk: Block,
+                        token: string): bool =
+  ## Core InvalidBlockFound after ConnectBlock fails: mark `failed`
+  ## BLOCK_FAILED_VALID with its descendants. Only a consensus verdict on a
+  ## body that matches its header counts; a local failure (UTXO read, undo
+  ## write, exception) or a mutated body marks nothing and returns false.
+  var cs = rpc.chainState
+  if isFatal() or failed == BlockHash(default(array[32, byte])) or
+     blockFailureKindOfToken(token) != bfkInvalid:
+    return false
+  let fIdx = cs.db.getBlockIndex(failed)
+  if fIdx.isNone or failedBlk.txs.len == 0 or
+     not bodyMatchesCommitments(failedBlk,
+                                fIdx.get().height >= int32(cs.params.segwitHeight)):
+    return false
+  var idx = fIdx.get()
+  idx.failureFlags.setFlag(BLOCK_FAILED_VALID)
+  cs.db.putBlockIndexHashOnly(idx)
+  cs.setBlockFailureFlags(idx)
+  info "block failed to connect, marked invalid",
+       hash = $failed, height = idx.height, reason = token
+  true
 
 proc activateBestChain(rpc: RpcServer) =
   ## Core ActivateBestChain as the invalidateblock and reconsiderblock RPCs
@@ -6883,20 +6922,8 @@ proc activateBestChain(rpc: RpcServer) =
           if BlockHash(doubleSha256(serialize(b.header))) == failed:
             failedBlk = b
 
-    if isFatal() or failed == none32 or
-       blockFailureKindOfToken(token) != bfkInvalid:
+    if not rpc.markConnectFailure(failed, failedBlk, token):
       return
-    let fIdx = cs.db.getBlockIndex(failed)
-    if fIdx.isNone or failedBlk.txs.len == 0 or
-       not bodyMatchesCommitments(failedBlk,
-                                  fIdx.get().height >= int32(cs.params.segwitHeight)):
-      return
-    var idx = fIdx.get()
-    idx.failureFlags.setFlag(BLOCK_FAILED_VALID)
-    cs.db.putBlockIndexHashOnly(idx)
-    cs.setBlockFailureFlags(idx)
-    info "activateBestChain: block failed to connect, marked invalid",
-         hash = $failed, height = idx.height, reason = token
 
 proc handleSubmitHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   ## submitheader "hexdata"
@@ -6979,7 +7006,11 @@ proc handleSubmitHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   # --- Step 3: idempotency ------------------------------------------------
   # Core's ProcessNewBlockHeaders is idempotent: a header already in the block
   # index is a no-op that returns null (AcceptBlockHeader's "miSelf != end" path).
-  if cs.db.getBlockIndex(blockHash).isSome:
+  # A known header that is BLOCK_FAILED_VALID is "duplicate-invalid" instead.
+  let selfIdx = cs.db.getBlockIndex(blockHash)
+  if selfIdx.isSome:
+    if selfIdx.get().failureFlags.isFailed():
+      raise newRpcError(RpcTransactionError, "duplicate-invalid")
     return newJNull()
 
   # --- Step 4: real header validation -------------------------------------
@@ -6996,6 +7027,12 @@ proc handleSubmitHeader(rpc: RpcServer, params: JsonNode): JsonNode =
                                        checkPow = true, minPowChecked = true)
   if not ctxFreeRes.isOk:
     raise newRpcError(RpcTransactionError, bip22String(ctxFreeRes.error))
+
+  # Core AcceptBlockHeader: a header whose parent is BLOCK_FAILED_VALID is
+  # rejected "bad-prevblk" after CheckBlockHeader and before the contextual
+  # checks, and never enters the block index.
+  if prevIndex.failureFlags.isFailed():
+    raise newRpcError(RpcTransactionError, "bad-prevblk")
 
   let ctxRes = contextualCheckBlockHeader(header, prevIndex, cs.db, cs.params)
   if not ctxRes.isOk:

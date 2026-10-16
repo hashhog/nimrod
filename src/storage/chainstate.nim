@@ -4581,7 +4581,7 @@ proc acceptSideBranchBlock*(
 
   # W155 BUG-17: validate side-branch blocks (full CheckBlock +
   # ContextualCheckBlock, scripts deferred to connect-time) BEFORE persisting
-  # with bsValidated.  validateFn wraps consensus/validation.validateForStorage,
+  # the body.  validateFn wraps consensus/validation.validateForStorage,
   # returning the bip22-mapped error token on failure.
   let sideValidation = validateFn(blk, prevIdx)
   if not sideValidation.ok:
@@ -4599,11 +4599,20 @@ proc acceptSideBranchBlock*(
   # Persist the side-branch block: body + hash-only block-index entry.  We
   # deliberately do NOT update the height -> hash mapping (that belongs to the
   # active chain) and do NOT touch the UTXO set yet (that happens during reorg).
+  # Status bsDataStored (Core BLOCK_HAVE_DATA + BLOCK_VALID_TRANSACTIONS):
+  # the body passed the storage checks but has not been connected. Only a
+  # connect writes bsValidated (Core BLOCK_VALID_SCRIPTS), which is what
+  # getchaintips reports as valid-fork once the block is reorged out; a block
+  # that already connected once keeps that status if its body comes back.
+  let priorIdx = cs.db.getBlockIndex(blockHash)
+  let sideStatus =
+    if priorIdx.isSome and priorIdx.get().status == bsValidated: bsValidated
+    else: bsDataStored
   cs.db.storeBlock(blk)
   let sideIdx = BlockIndex(
     hash: blockHash,
     height: newHeight,
-    status: bsValidated,
+    status: sideStatus,
     prevHash: blk.header.prevBlock,
     header: blk.header,
     totalWork: newTotalWork,
