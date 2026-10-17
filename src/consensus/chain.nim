@@ -285,6 +285,7 @@ proc isBlockOnCheckpointChain*(state: CheckpointState,
 # ============================================================================
 # Reference: Bitcoin Core validation.cpp InvalidateBlock, ReconsiderBlock, PreciousBlock
 
+import std/sets
 import ../storage/chainstate
 import ../storage/db as chaindb
 
@@ -617,6 +618,93 @@ proc bestChainCandidate*(cs: var ChainState): Option[ChainCandidate] =
     if usable:
       return some(res)
   none(ChainCandidate)
+
+type
+  ChainTip* = object
+    ## One getchaintips entry (Core rpc/blockchain.cpp getchaintips).
+    hash*: BlockHash
+    height*: int32
+    branchLen*: int32
+    status*: string
+
+proc chainTips*(cs: ChainState): seq[ChainTip] =
+  ## Core getchaintips over nimrod's block index (cfBlockIndex): the active
+  ## tip plus every block that is off the active chain and has no child in the
+  ## index. Core collects the off-chain blocks and drops any that another
+  ## off-chain block points at; a child of an off-chain block is itself off
+  ## the chain, so "no child at all" is the same set.
+  ##
+  ## Status, in Core's order:
+  ##   active        on the active chain
+  ##   invalid       BLOCK_FAILED_VALID (invalidateblock, or failed to connect;
+  ##                 descendants carry the flag too)
+  ##   headers-only  this block or an off-chain ancestor has no body
+  ##                 (Core: !HaveNumChainTxs)
+  ##   valid-fork    connected once, then reorged out (BLOCK_VALID_SCRIPTS:
+  ##                 nimrod writes bsValidated only when a block connects)
+  ##   valid-headers body stored but never connected (bsDataStored)
+  ## branchlen is the tip's height minus the height of its fork point on the
+  ## active chain. Ordered by height, highest first, like Core's setTips.
+  lockChainScope(cs)  # cs_main: storage/chain_lock.nim
+
+  proc onActive(c: ChainState, idx: BlockIndex): bool =
+    if idx.height > c.bestHeight:
+      return false
+    let h = c.db.getBlockHashByHeight(idx.height)
+    h.isSome and h.get() == idx.hash
+
+  var withChild: HashSet[BlockHash]
+  var rows: seq[BlockIndex]
+  for (key, value) in chaindb.iterCf(cs.db.db, chaindb.cfBlockIndex):
+    if key.len != 32 or value.len == 0:
+      continue
+    let idx = deserializeBlockIndex(value)
+    withChild.incl(idx.prevHash)
+    rows.add(idx)
+
+  result.add(ChainTip(hash: cs.bestBlockHash, height: cs.bestHeight,
+                      branchLen: 0, status: "active"))
+  for idx in rows:
+    if idx.hash in withChild or idx.hash == cs.bestBlockHash:
+      continue
+    if cs.onActive(idx):
+      continue
+    # Walk down to the fork point, noting any off-chain block without a body.
+    var missingBody = false
+    var cur = idx
+    var forkHeight = -1'i32
+    while true:
+      if cs.onActive(cur):
+        forkHeight = cur.height
+        break
+      if not cs.db.hasBlockBody(cur.hash):
+        missingBody = true
+      let prev = cs.db.getBlockIndex(cur.prevHash)
+      if prev.isNone or cur.height <= 0:
+        break
+      cur = prev.get()
+    let status =
+      if idx.failureFlags.hasFlag(BLOCK_FAILED_VALID) or
+         idx.failureFlags.hasFlag(BLOCK_FAILED_CHILD):
+        "invalid"
+      elif missingBody: "headers-only"
+      elif idx.status == bsValidated: "valid-fork"
+      else: "valid-headers"
+    result.add(ChainTip(hash: idx.hash, height: idx.height,
+                        branchLen: idx.height - max(forkHeight, 0'i32),
+                        status: status))
+
+  result.sort(proc(a, b: ChainTip): int =
+    if a.height != b.height: cmp(b.height, a.height)
+    else:
+      let x = array[32, byte](a.hash)
+      let y = array[32, byte](b.hash)
+      var c = 0
+      for i in countdown(31, 0):
+        if x[i] != y[i]:
+          c = cmp(x[i], y[i])
+          break
+      c)
 
 proc preciousBlock*(
   cs: var ChainState,

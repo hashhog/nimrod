@@ -135,6 +135,7 @@ const IncludedTests = [
   "test_getblockfrompeer",
   "test_getblockhash_height_range",
   "test_getchainstates",
+  "test_getchaintips_side_tips",
   "test_getnodeaddresses",
   "test_getorphantxs",
   "test_getpeerinfo_fields",
