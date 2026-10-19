@@ -160,6 +160,7 @@ const IncludedTests = [
   "test_mempool_persist",
   "test_mempool_usage",
   "test_mempool_reorg",
+  "test_mempool_trim_order",
   "test_messages",
   "test_minimalif",
   "test_miniscript",
