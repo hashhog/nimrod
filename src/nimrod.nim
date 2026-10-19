@@ -58,6 +58,8 @@ type
     metricsPort*: uint16  ## Prometheus metrics port (0 = disabled)
     ibdFlushInterval*: int ## Disk flush interval during IBD (0 = use default 2000)
     numVerifyWorkers*: int ## Script verify thread count for parallel IBD (0 = auto = CPU count)
+    maxMempoolMb*: int    ## --maxmempool=<MB>: mempool memory budget in megabytes
+                          ## (Core -maxmempool, default 300).
     dbcacheMiB*: int      ## --dbcache=<MiB>: UTXO cache budget in MiB (Core units).
                           ## 0 = use compiled defaults (2 GiB byte ceiling +
                           ## 200_000 IBD entry target). PERF-ONLY / consensus-neutral.
@@ -310,6 +312,7 @@ proc defaultConfig*(): NimrodConfig =
     metricsPort: 9332,
     ibdFlushInterval: 0,  # 0 = use default (IbdBatchFlushInterval = 2000)
     numVerifyWorkers: 0,  # 0 = auto (CPU count via countProcessors())
+    maxMempoolMb: 300,    # Core DEFAULT_MAX_MEMPOOL_SIZE_MB
     dbcacheMiB: 0,        # 0 = use compiled cache defaults (default-preserving)
     daemon: false,
     pidFile: "",          # derived from dataDir if empty
@@ -413,6 +416,11 @@ proc loadConfigFile*(config: var NimrodConfig) =
     of "par", "verifythreads", "verify-threads":
       try:
         config.numVerifyWorkers = parseInt(value)
+      except ValueError: discard
+    of "maxmempool":
+      try:
+        let v = parseInt(value)
+        if v >= 0: config.maxMempoolMb = v
       except ValueError: discard
     of "dbcache":
       try:
@@ -573,6 +581,8 @@ Options:
                          1 = serial, >1 = that many threads including the
                          master, <0 = leave that many cores free. Default: 0.
   --verify-threads=N     Alias for --par (legacy name)
+  --maxmempool=MB        Mempool memory budget in megabytes (default: 300). The pool
+                         is trimmed to this against Core's DynamicMemoryUsage model.
   --dbcache=N            UTXO cache budget in MiB, Bitcoin Core units (default: 0 =
                          compiled default ~2 GiB ceiling + 200000 IBD entry target;
                          only raises the cache, never shrinks below the default)
@@ -778,6 +788,16 @@ proc parseArgs*(cmdline: seq[string]): tuple[cmd: Command, config: NimrodConfig,
           result.config.numVerifyWorkers = parseInt(p.val)
         except ValueError:
           echo "Invalid par/verify-threads: " & p.val
+          quit(1)
+      of "maxmempool":
+        try:
+          let v = parseInt(p.val)
+          if v < 0:
+            echo "maxmempool must be a non-negative number of MB"
+            quit(1)
+          result.config.maxMempoolMb = v
+        except ValueError:
+          echo "Invalid maxmempool: " & p.val
           quit(1)
       of "dbcache":
         try:
@@ -1439,6 +1459,8 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           try:
             await peer.sendMessage(txMsg)
             servedTxs.inc
+            # Core ProcessGetData: a peer fetched it, so it is no longer unbroadcast.
+            state.mempool.unbroadcast.excl(entryOpt.get().txid)
           except CatchableError as e:
             debug "failed to serve tx", peer = $peer, error = e.msg
         else:
@@ -1456,6 +1478,7 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           try:
             await peer.sendMessage(txMsg)
             servedTxs.inc
+            state.mempool.unbroadcast.excl(entryOpt.get().txid)
           except CatchableError as e:
             debug "failed to serve tx (wtxid)", peer = $peer, error = e.msg
         else:
@@ -2707,7 +2730,8 @@ proc startNode*(config: NimrodConfig) {.async.} =
 
   # 3. Initialize mempool
   info "initializing mempool"
-  state.mempool = newMempool(state.chainState, params)
+  state.mempool = newMempool(state.chainState, params,
+                             maxSize = config.maxMempoolMb * 1_000_000)
 
   # 3a. Restore mempool from prior shutdown dump (mempool.dat). Best-effort:
   # any tx that fails to re-accept is dropped silently, matching Core.

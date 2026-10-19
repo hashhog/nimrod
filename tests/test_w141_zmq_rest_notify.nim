@@ -339,25 +339,23 @@ suite "W141 G15 — getutxos binary wire format (BUG-7)":
 # ---------------------------------------------------------------------------
 suite "W141 G16 — mempool fee-rate units (BUG-8)":
 
-  test "G16 BUG-8 (FIXED): source divides sat/vB by 1e5 (correct), not 1e8":
-    ## sat/vB × 1000 = sat/kvB; sat/kvB / 1e8 = BTC/kvB, i.e. sat/vB / 1e5.
-    ## The rest.nim mempool-info handler uses the correct divisor and reads
-    ## the live mp.minFeeRate field (already coupled to the real floor), so
-    ## after the fee-floor honesty fix it emits 0.1/1e5 = 0.00000100 BTC.
-    ## Source line 773: `let minFee = rest.mempool.minFeeRate / 100000.0`
+  test "G16 BUG-8 (FIXED): REST info is the getmempoolinfo object, amounts in sat/kvB":
+    ## /rest/mempool/info.json used to hand-roll a seven-field object with
+    ## `minRelayFeeRate / 100000.0` floats. Core serves MempoolInfoToJSON for
+    ## both, so the handler now returns the shared builder, which formats
+    ## satoshis per kvB through ValueFromAmount (eight decimals, never 1e8-off).
     let infoBlock =
       restSrc[restSrc.find("handleRestMempoolInfo") ..
               restSrc.find("handleRestMempoolContents")]
-    check "/ 100000.0"    in infoBlock        # correct divisor present
-    check "/ 100000000.0" notin infoBlock     # wrong (1000x-too-small) divisor absent
+    check "mempoolInfoJson(rest.mempool)" in infoBlock
+    check "/ 100000000.0" notin infoBlock
 
-  test "G16 BUG-8: rest mempool info reads live mp.minFeeRate (coupled, not hardcoded)":
+  test "G16 BUG-8: the shared info builder reads live mp.minFeeRate (coupled, not hardcoded)":
     ## The display tracks the real admission floor instead of a literal — a
     ## future floor change can never make the rest display drift.
-    let infoBlock =
-      restSrc[restSrc.find("handleRestMempoolInfo") ..
-              restSrc.find("handleRestMempoolContents")]
-    check "rest.mempool.minFeeRate" in infoBlock
+    let infoSrc = readFile("src/rpc/mempoolinfo.nim")
+    check "mp.minFeeRate" in infoSrc
+    check "mp.getMinFee()" in infoSrc
 
 # ---------------------------------------------------------------------------
 # G17 — mempool/contents.json verbose + mempool_sequence params (BUG-9, P1)

@@ -1,7 +1,7 @@
 ## Transaction mempool
 ## Manages unconfirmed transactions with fee/size policy, CPFP tracking, and eviction
 
-import std/[tables, algorithm, options, times, sets, math]
+import std/[tables, algorithm, options, times, sets, math, atomics]
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation]
 import ../storage/chainstate
@@ -11,9 +11,30 @@ import ./package
 import ./standard
 import ./cluster
 import ./cxxorder
+import ./memusage
 import ../mining/fees
 import ../util/fatal
-export package, standard
+export package, standard, memusage
+
+# Mock clock (Core SetMockTime).  The mempool's time-dependent state -- entry
+# timestamps, the rolling-minimum-fee decay, expiry -- reads this instead of
+# the wall clock, so a regtest harness can drive the 12h halflife.  0 = off.
+var mockTimeUnix: Atomic[int64]
+
+proc setMockTime*(unixSeconds: int64) =
+  ## Core SetMockTime: a positive value freezes the mempool clock there, 0
+  ## returns to the wall clock.
+  mockTimeUnix.store(unixSeconds)
+
+proc mockTime*(): int64 =
+  mockTimeUnix.load()
+
+proc mempoolTime*(): Time =
+  let mock = mockTimeUnix.load()
+  if mock != 0: fromUnix(mock) else: getTime()
+
+proc mempoolUnixTime*(): int64 =
+  mempoolTime().toUnix()
 
 type
   MempoolError* = object of CatchableError
@@ -77,7 +98,12 @@ type
     byWtxid*: Table[TxId, TxId]      ## wtxid -> txid index (BIP141 same-txid-different-witness check)
     spentBy*: Table[OutPoint, TxId]  ## Maps spent outpoint -> spending txid for O(1) double-spend detection
     maxSize*: int           ## Maximum mempool size in bytes (default 300MB)
-    currentSize*: int       ## Current mempool size in bytes
+    currentSize*: int       ## Core CTxMemPool::DynamicMemoryUsage for the pool's entries
+                            ## (see memusage.nim); what getmempoolinfo calls `usage`
+                            ## and what -maxmempool is compared against.
+    totalVsize*: int        ## Core GetTotalTxSize: sum of entry vsizes (`bytes`)
+    randCap*: int           ## modelled capacity of Core's txns_randomized vector
+    unbroadcast*: HashSet[TxId]  ## Core m_unbroadcast_txids: submitted locally, no peer has asked yet
     minFeeRate*: float64    ## Minimum fee rate to accept (sat/vbyte)
     chainState*: ChainState
     params*: ConsensusParams
@@ -251,6 +277,8 @@ proc removeConflicts*(mp: Mempool, conflicts: HashSet[TxId])
 proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true)
 proc attachToChainState*(mp: Mempool) {.gcsafe, raises: [].}
 proc expire*(mp: Mempool, maxAgeOverride: int = -1)
+proc trimToSize*(mp: Mempool)
+proc clusterTermOf(mp: Mempool, seed: TxId): int
 
 # Constructor
 proc newMempool*(chainState: ChainState, params: ConsensusParams,
@@ -271,6 +299,9 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
     spentBy: initTable[OutPoint, TxId](),
     maxSize: maxSize,
     currentSize: 0,
+    totalVsize: 0,
+    randCap: 0,
+    unbroadcast: initHashSet[TxId](),
     minFeeRate: minFeeRate,
     chainState: chainState,
     params: params,
@@ -283,7 +314,7 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
     clusterSizeLimit: clusterSizeLimit,
     rollingMinimumFeeRate: 0.0,
     blockSinceLastRollingFeeBump: false,
-    lastRollingFeeUpdate: getTime().toUnix(),
+    lastRollingFeeUpdate: mempoolUnixTime(),
     incrementalRelayFeeRate: incrementalRelayFeeRate,
     expiryHours: expiryHours,
     feeDeltas: initTable[TxId, int64]()
@@ -296,6 +327,14 @@ proc newMempool*(chainState: ChainState, params: ConsensusParams,
 # Basic accessors
 proc size*(mp: Mempool): int =
   mp.currentSize
+
+proc dynamicMemoryUsage*(mp: Mempool): int =
+  ## Core CTxMemPool::DynamicMemoryUsage: entries + the prioritisetransaction map.
+  mp.currentSize + MapDeltasNode * mp.feeDeltas.len
+
+proc totalTxSize*(mp: Mempool): int =
+  ## Core CTxMemPool::GetTotalTxSize: the sum of entry virtual sizes.
+  mp.totalVsize
 
 proc count*(mp: Mempool): int =
   mp.entries.len
@@ -371,10 +410,14 @@ proc prioritiseTransaction*(mp: Mempool, txid: TxId, feeDelta: int64) =
   ## The per-entry effect on block selection comes from getModifiedFee, which
   ## reads the live map — so there is no separate cached field to update.
   let newDelta = mp.feeDeltas.getOrDefault(txid, 0'i64) + feeDelta
+  # A modified fee can merge or split chunks, which moves the usage estimate.
+  let termBefore = if txid in mp.entries: mp.clusterTermOf(txid) else: 0
   if newDelta == 0:
     mp.feeDeltas.del(txid)
   else:
     mp.feeDeltas[txid] = newDelta
+  if txid in mp.entries:
+    mp.currentSize += mp.clusterTermOf(txid) - termBefore
 
 proc getPrioritisedTransactions*(mp: Mempool): seq[PrioritisedDeltaInfo] =
   ## Core's CTxMemPool::GetPrioritisedTransactions (txmempool.cpp:673): one row
@@ -972,6 +1015,74 @@ proc maxClusterSizeWeight*(mp: Mempool): int64 =
   ## to mirror MemPoolLimits::cluster_size_vbytes and getmempoolinfo's
   ## `limitclustersize` (rpc/mempool.cpp:1062), which Core reports in vbytes.
   int64(mp.clusterSizeLimit) * int64(WitnessScaleFactor)
+
+proc clusterMembers(mp: Mempool, seed: TxId): seq[TxId] =
+  ## The in-mempool connected component of `seed` (parents and children).
+  if seed notin mp.entries:
+    return
+  var seen = initHashSet[TxId]()
+  var stack = @[seed]
+  while stack.len > 0:
+    let cur = stack.pop()
+    if cur in seen or cur notin mp.entries:
+      continue
+    seen.incl(cur)
+    result.add(cur)
+    let e = mp.entries[cur]
+    for input in e.tx.inputs:
+      if input.prevOut.txid in mp.entries:
+        stack.add(input.prevOut.txid)
+    for vout in 0 ..< e.tx.outputs.len:
+      let op = OutPoint(txid: cur, vout: uint32(vout))
+      if op in mp.spentBy:
+        stack.add(mp.spentBy[op])
+
+proc poolNeighbours(mp: Mempool, tx: Transaction, txid: TxId): seq[TxId] =
+  ## In-pool parents and children of `tx` (which need not be in the pool yet).
+  var seen = initHashSet[TxId]()
+  for input in tx.inputs:
+    let parent = input.prevOut.txid
+    if parent in mp.entries and parent != txid and parent notin seen:
+      seen.incl(parent)
+      result.add(parent)
+  for vout in 0 ..< tx.outputs.len:
+    let op = OutPoint(txid: txid, vout: uint32(vout))
+    if op in mp.spentBy:
+      let child = mp.spentBy[op]
+      if child in mp.entries and child != txid and child notin seen:
+        seen.incl(child)
+        result.add(child)
+
+proc clusterTermOfMembers(mp: Mempool, members: seq[TxId]): int =
+  if members.len < 2:
+    return 0
+  var index = initTable[TxId, int]()
+  for i, m in members:
+    index[m] = i
+  var txs = newSeq[ChunkTx](members.len)
+  for i, m in members:
+    let e = mp.entries[m]
+    txs[i].fee = int64(e.fee) + mp.getFeeDelta(m)
+    txs[i].size = clusterSizeContribution(e.weight, e.sigopCost)
+    for input in e.tx.inputs:
+      if input.prevOut.txid in index:
+        txs[i].parents.add(index[input.prevOut.txid])
+  clusterTerm(txs)
+
+proc clusterTermOf(mp: Mempool, seed: TxId): int =
+  ## memusage clusterTerm of the cluster containing `seed` (0 for a singleton).
+  mp.clusterTermOfMembers(mp.clusterMembers(seed))
+
+proc componentsTerm(mp: Mempool, seeds: seq[TxId]): int =
+  ## Summed clusterTerm over the distinct clusters `seeds` fall in.
+  var seen = initHashSet[TxId]()
+  for seed in seeds:
+    if seed in seen or seed notin mp.entries:
+      continue
+    let members = mp.clusterMembers(seed)
+    for m in members:
+      seen.incl(m)
+    result += mp.clusterTermOfMembers(members)
 
 proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
                             sigopCost: int64 = 0,
@@ -1618,32 +1729,6 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   if args.testAccept:
     return ok[AtmpAcceptInfo](info)
 
-  # Check mempool size limit - evict if needed.
-  let txSize = serialize(tx).len
-  while mp.currentSize + txSize > mp.maxSize:
-    mp.evictLowestFee()
-    if mp.entries.len == 0:
-      break
-
-  # W96 GAP #12: post-eviction "mempool full" check (validation.cpp:1402-
-  # 1406).  After TrimToSize, our own tx may have been evicted (its feerate
-  # is no longer above the new rolling floor).  Core returns
-  # TX_RECONSIDERABLE / "mempool full" so the package layer can retry.
-  # CPFP: package members (args.packageFeerates) bypass the per-tx post-trim
-  # floor for the same reason they bypass the pre-trim min-fee gate above
-  # (GAP #6) — the package's AGGREGATE feerate was already validated, so a
-  # low-fee parent paid for by a high-fee child must not be rejected here.
-  # Core gates the equivalent CheckFeeRate on !m_package_feerates
-  # (validation.cpp:948); the post-trim path (TrimToSize) is only reached on
-  # the non-package single-tx submission flow.
-  let rollingFloorAfter = mp.getMinFee()
-  let effectiveMinFeeRateAfter = max(mp.minFeeRate, rollingFloorAfter)
-  if not args.bypassLimits and not args.packageFeerates and
-     feeRate < effectiveMinFeeRateAfter:
-    return err(AtmpAcceptInfo,
-               "mempool full: post-eviction floor " & $effectiveMinFeeRateAfter &
-               " > tx feerate " & $feeRate)
-
   let entry = MempoolEntry(
     tx: tx,
     txid: txid,
@@ -1651,7 +1736,7 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     fee: baseFee,
     weight: weight,
     feeRate: feeRate,
-    timeAdded: getTime(),
+    timeAdded: mempoolTime(),
     height: mp.chainState.bestHeight,
     ancestorFee: ancestorFee,
     ancestorWeight: ancestorWeight,
@@ -1662,17 +1747,39 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   )
   inc mp.nextGraphIndex
 
+  # Usage accounting needs the cluster the new tx joins, measured before and
+  # after it is linked in (a child can bridge several clusters on reorg).
+  let neighbours = mp.poolNeighbours(tx, txid)
+  let termBefore = mp.componentsTerm(neighbours)
+
   mp.entries[txid] = entry
   mp.byWtxid[wtxid] = txid
-  mp.currentSize += txSize
-
   for input in tx.inputs:
     mp.spentBy[input.prevOut] = txid
+
+  mp.totalVsize += int((clusterSizeContribution(weight, txSigopCost) + 3) div 4)
+  if mp.entries.len > mp.randCap:
+    let oldCap = mp.randCap
+    mp.randCap = if oldCap == 0: 1 else: oldCap * 2
+    mp.currentSize += randVectorUsage(mp.randCap) - randVectorUsage(oldCap)
+  mp.currentSize += EntryOverhead + txDynamicUsage(tx) +
+                    MapNextTxNode * tx.inputs.len +
+                    mp.clusterTermOf(txid) - termBefore
 
   # BUG-1 fix (W114 FIX-47): wire fee estimator on successful accept.
   # feeRate here is sat/vbyte; bestHeight is the chain tip height at entry time.
   if mp.feeEstimator != nil:
     mp.feeEstimator.trackTransaction(txid, feeRate, mp.chainState.bestHeight)
+
+  # Core Finalize (validation.cpp:1394): trim the pool to -maxmempool AFTER the
+  # tx is in, then check that the tx itself survived.  The trim can evict the
+  # new tx (it may be the worst chunk), which raises the rolling floor.
+  # Package members skip the survival check -- Core trims once, at the end of
+  # the package -- and reorg replays (bypassLimits) are trimmed by the caller.
+  if not args.bypassLimits:
+    mp.trimToSize()
+    if not args.packageFeerates and txid notin mp.entries:
+      return err(AtmpAcceptInfo, "mempool full")
 
   ok[AtmpAcceptInfo](info)
 
@@ -1702,19 +1809,33 @@ proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true) =
   if evictEphemeral:
     ephemeralParents = mp.getEphemeralDustParents(txid)
 
+  # Cluster accounting: the tx's whole cluster goes, whatever is left of it is
+  # re-measured as the neighbours' (possibly split) components.
+  let neighbours = mp.poolNeighbours(entry.tx, txid)
+  let termBefore = mp.clusterTermOf(txid)
+
   # Remove from spentBy tracking
   for input in entry.tx.inputs:
     mp.spentBy.del(input.prevOut)
-
-  # Update size
-  let txSize = serialize(entry.tx).len
-  mp.currentSize -= txSize
 
   # W96: drop wtxid index entry as well (BIP141 same-txid-different-witness
   # exists-check requires keeping byWtxid in sync with entries).
   if mp.byWtxid.getOrDefault(entry.wtxid, TxId(default(array[32, byte]))) == txid:
     mp.byWtxid.del(entry.wtxid)
+  # Core removeUnchecked: txns_randomized is swapped-and-popped and shrunk
+  # once it is under half full; a lone element is only clear()ed, which keeps
+  # the capacity.
+  let sizeBefore = mp.entries.len
   mp.entries.del(txid)
+  mp.unbroadcast.excl(txid)
+  mp.totalVsize -= int((clusterSizeContribution(entry.weight, entry.sigopCost) + 3) div 4)
+  if sizeBefore > 1 and (sizeBefore - 1) * 2 < mp.randCap:
+    let oldCap = mp.randCap
+    mp.randCap = sizeBefore - 1
+    mp.currentSize += randVectorUsage(mp.randCap) - randVectorUsage(oldCap)
+  mp.currentSize -= EntryOverhead + txDynamicUsage(entry.tx) +
+                    MapNextTxNode * entry.tx.inputs.len +
+                    termBefore - mp.componentsTerm(neighbours)
 
   # BUG-12 fix (W114 FIX-47): notify fee estimator of eviction/removal.
   if mp.feeEstimator != nil:
@@ -1807,7 +1928,7 @@ proc removeForBlock*(mp: Mempool, blk: Block) =
   ##   * each block tx leaves the disconnect pool.
   ## Sets blockSinceLastRollingFeeBump = true so GetMinFee decays the rolling
   ## floor after the next update interval (txmempool.cpp:426-427).
-  mp.lastRollingFeeUpdate = getTime().toUnix()
+  mp.lastRollingFeeUpdate = mempoolUnixTime()
   mp.blockSinceLastRollingFeeBump = true
   # Nothing to do for an empty pool (IBD): skip hashing every tx.
   if mp.entries.len == 0 and mp.disconnectPool.len == 0:
@@ -1913,29 +2034,13 @@ proc removeForReorg*(mp: Mempool) =
 proc limitMempoolSize*(mp: Mempool) =
   ## Core LimitMempoolSize (validation.cpp:268): expire, then trim to size.
   mp.expire()
-  while mp.currentSize > mp.maxSize and mp.entries.len > 0:
-    mp.evictLowestFee()
+  mp.trimToSize()
 
-proc clusterMembers(mp: Mempool, seed: TxId): seq[TxId] =
-  ## The in-mempool connected component of `seed` (parents and children).
-  if seed notin mp.entries:
-    return
-  var seen = initHashSet[TxId]()
-  var stack = @[seed]
-  while stack.len > 0:
-    let cur = stack.pop()
-    if cur in seen or cur notin mp.entries:
-      continue
-    seen.incl(cur)
-    result.add(cur)
-    let e = mp.entries[cur]
-    for input in e.tx.inputs:
-      if input.prevOut.txid in mp.entries:
-        stack.add(input.prevOut.txid)
-    for vout in 0 ..< e.tx.outputs.len:
-      let op = OutPoint(txid: cur, vout: uint32(vout))
-      if op in mp.spentBy:
-        stack.add(mp.spentBy[op])
+proc trimToSize*(mp: Mempool) =
+  ## Core TrimToSize: evict the worst chunk until the pool's dynamic memory
+  ## usage fits -maxmempool.
+  while mp.entries.len > 0 and mp.dynamicMemoryUsage() > mp.maxSize:
+    mp.evictLowestFee()
 
 proc hasInPoolChild(mp: Mempool, txid: TxId): bool =
   let e = mp.entries[txid]
@@ -2464,16 +2569,18 @@ proc getMinFee*(mp: Mempool): float64 =
   ## incrementalRelayFeeRate.  The returned value is always at least
   ## incrementalRelayFeeRate when non-zero.
   if not mp.blockSinceLastRollingFeeBump or mp.rollingMinimumFeeRate == 0:
-    # No block yet or no eviction floor — return raw value as sat/vbyte
-    return mp.rollingMinimumFeeRate / 1000.0
+    # No block yet or no eviction floor: Core returns CFeeRate(llround(rate)).
+    return round(mp.rollingMinimumFeeRate) / 1000.0
 
-  let now = getTime().toUnix()
+  let now = mempoolUnixTime()
   if now > mp.lastRollingFeeUpdate + 10:
     var halflife = float64(RollingFeeHalflife)
-    # Accelerate decay when pool is far below its size limit
-    if mp.currentSize < mp.maxSize div 4:
+    # Accelerate decay when pool is far below its size limit (Core compares
+    # DynamicMemoryUsage(), not the byte total).
+    let usage = mp.dynamicMemoryUsage()
+    if usage < mp.maxSize div 4:
       halflife = halflife / 4.0
-    elif mp.currentSize < mp.maxSize div 2:
+    elif usage < mp.maxSize div 2:
       halflife = halflife / 2.0
 
     let elapsed = float64(now - mp.lastRollingFeeUpdate)
@@ -2485,11 +2592,8 @@ proc getMinFee*(mp: Mempool): float64 =
       mp.rollingMinimumFeeRate = 0.0
       return 0.0
 
-  # Return max(rollingMinimumFeeRate, incrementalRelayFeeRate) in sat/vbyte
-  # (rolling fee is stored in sat/kvB; divide by 1000 for sat/vbyte)
-  let rollingVbyte = mp.rollingMinimumFeeRate / 1000.0
-  let incrementalVbyte = mp.incrementalRelayFeeRate / 1000.0
-  max(rollingVbyte, incrementalVbyte)
+  # max(CFeeRate(llround(rolling)), incremental), both in sat/kvB -> sat/vB
+  max(round(mp.rollingMinimumFeeRate), mp.incrementalRelayFeeRate) / 1000.0
 
 # Evict the package (tx + all descendants) with the lowest combined fee rate.
 # Mirrors CTxMemPool::TrimToSize logic: evict the "worst chunk" (lowest
@@ -2591,9 +2695,10 @@ proc evictLowestFee*(mp: Mempool) =
       chunkFee += int64(e.fee) + mp.getFeeDelta(descTxid)
       chunkWeight += e.weight
 
-  let chunkVbytes = float64(chunkWeight) / 4.0
-  let removedRateSatKvB = if chunkVbytes > 0:
-    float64(chunkFee) / chunkVbytes * 1000.0
+  # Core CFeeRate(fee, vsize): whole sat/kvB, integer division.
+  let chunkVsize = (chunkWeight + 3) div 4
+  let removedRateSatKvB = if chunkVsize > 0:
+    float64(chunkFee * 1000 div int64(chunkVsize))
   else:
     0.0
 
@@ -2627,7 +2732,7 @@ proc expire*(mp: Mempool, maxAgeOverride: int = -1) =
   ## maxAgeOverride: if >= 0, override expiryHours for this call (for testing).
   ## Core reference: CTxMemPool::Expire, txmempool.cpp:811-827.
   let hours = if maxAgeOverride >= 0: maxAgeOverride else: mp.expiryHours
-  let cutoff = getTime() - initDuration(hours = hours)
+  let cutoff = mempoolTime() - initDuration(hours = hours)
 
   # Collect directly-expired txids
   var directlyExpired: seq[TxId]

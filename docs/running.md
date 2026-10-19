@@ -74,6 +74,7 @@ the code but `--network=signet` is rejected with `Unknown network: signet`.
 | `--assumevalid=0`, `--noassumevalid` | assume-valid on | Verify every script from genesis. Other values keep the built-in assume-valid block; an alternate hash cannot be given. |
 | `--prune=MiB` | `0` (off) | `1` = manual pruning with `pruneblockchain` only; `>= 550` = keep about that many MiB of blocks. 2-549 is rejected. |
 | `--dbcache=MiB` | `0` (built-in, about 2 GiB) | UTXO cache budget, 0-1048576. Raises the cache, never lowers it below the default. |
+| `--maxmempool=MB` | `300` | Mempool memory budget in megabytes. The pool is trimmed (worst chunk first) when Bitcoin Core's `DynamicMemoryUsage` estimate of it exceeds this; that estimate is what `getmempoolinfo` reports as `usage`. |
 | `--par=N`, `--verify-threads=N` | `0` (auto) | Script-check threads, as Core's `-par`: 0 = auto, 1 = serial, < 0 leaves that many cores free. |
 | `--reindex` | off | Wipe the chainstate before starting and re-download from peers. |
 | `--load-snapshot=PATH` | none | Load a Core-format UTXO snapshot (assumeUTXO) before starting. |

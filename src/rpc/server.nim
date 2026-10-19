@@ -17,6 +17,7 @@ import ../storage/indexes/coinstatsindex
 import ../storage/indexes/txospenderindex
 import ../storage/indexes/gcs as gcsMod
 import ../mempool/[mempool, package, persist, orphan]
+import ./mempoolinfo
 import ../crypto/[hashing, secp256k1, address, signmessage]
 import ../network/[peer, peermanager, banman, messages, asmap, netgroup, p2p_cmd_queue]
 import ../mining/[fees, blocktemplate]
@@ -2834,47 +2835,7 @@ proc handlePreciousBlock(rpc: RpcServer, params: JsonNode): JsonNode =
 
 # Mempool RPCs
 proc handleGetMempoolInfo*(rpc: RpcServer): JsonNode =
-  # Calculate total fees
-  var totalFeeSat: int64 = 0
-  for _, entry in rpc.mempool.entries:
-    totalFeeSat += int64(entry.fee)
-
-  # Display fields read the REAL admission floor (mp.minFeeRate, sat/vB; default
-  # 100 sat/kvB = 0.00000100 BTC per Core DEFAULT_MIN_RELAY_TX_FEE, policy.h:70).
-  # Coupled to the live mempool field — NOT a hardcoded literal — so the display
-  # can never drift from the floor a tx is actually gated against (CheckFeeRate,
-  # mempool.nim:1238). mempoolminfee = max(rolling, static floor); minrelaytxfee
-  # = the static floor; incrementalrelayfee = mp.incrementalRelayFeeRate.
-  # btcAmountNode takes satoshis (per kvB): sat/vB * 1000 -> sat/kvB.
-  # Reference: bitcoin-core/src/rpc/mempool.cpp MempoolInfoToJSON (1048-1063).
-  let minRelayFeeRateVb = rpc.mempool.minFeeRate                      # sat/vB
-  let mempoolMinFeeRateVb = max(minRelayFeeRateVb, rpc.mempool.getMinFee())
-  let minRelaySats = int64(minRelayFeeRateVb * 1000.0 + 0.5)         # sat/kvB
-  let mempoolMinSats = int64(mempoolMinFeeRateVb * 1000.0 + 0.5)     # sat/kvB
-  let incrementalSats = int64(rpc.mempool.incrementalRelayFeeRate + 0.5)  # sat/kvB
-
-  %*{
-    "loaded": true,
-    "size": rpc.mempool.count,
-    "bytes": rpc.mempool.size,
-    "usage": rpc.mempool.size,
-    "total_fee": float64(totalFeeSat) / 100000000.0,
-    "maxmempool": rpc.mempool.maxSize,
-    "mempoolminfee": btcAmountNode(mempoolMinSats),
-    "minrelaytxfee": btcAmountNode(minRelaySats),
-    "incrementalrelayfee": btcAmountNode(incrementalSats),
-    "unbroadcastcount": 0,
-    # Core master removed the mempoolfullrbf option and hardcodes `true`
-    # (mempool.cpp:1058). Match Core's wire output.
-    "fullrbf": true,
-    # The 5 policy fields Core v31.99 added after fullrbf, in Core order.
-    # Defaults match Core's DEFAULT_* constants (and rustoshi's solved values).
-    "permitbaremultisig": true,            # DEFAULT_PERMIT_BAREMULTISIG
-    "maxdatacarriersize": 100_000,         # MAX_OP_RETURN_RELAY
-    "limitclustercount": 64,               # DEFAULT_CLUSTER_LIMIT
-    "limitclustersize": 101_000,           # DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000
-    "optimal": true                        # DoWork(0) on default mempool
-  }
+  mempoolInfoJson(rpc.mempool)
 
 proc parseTxidParam(hexStr: string): TxId =
   ## Decode a 64-char display-format hex txid into the internal LE representation.
@@ -5156,6 +5117,7 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     if rpc.mempool.contains(txid):
       # Already in mempool, just return the txid (idempotent)
       # Re-broadcast to peers to help propagation
+      rpc.mempool.unbroadcast.incl(txid)
       if rpc.peerManager != nil:
         rpc.postP2P(P2PCmd(kind: pcBroadcastTx, tx: tx))
       return %txidHex
@@ -5193,6 +5155,11 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
         let feeRateBtcKvb = actualFeeRate * 1000.0 / 100_000_000.0
         raise newRpcError(RpcTransactionRejected,
           "fee rate " & $feeRateBtcKvb & " BTC/kvB exceeds maxfeerate " & $maxFeeRate & " BTC/kvB")
+
+    # Core BroadcastTransaction: a locally submitted tx stays in the mempool's
+    # unbroadcast set until a peer asks for it (getmempoolinfo.unbroadcastcount).
+    if txid in rpc.mempool.entries:
+      rpc.mempool.unbroadcast.incl(txid)
 
     # Broadcast inv to peers (let them request the full tx)
     if rpc.peerManager != nil:
@@ -5627,6 +5594,26 @@ proc handlePing(rpc: RpcServer, params: JsonNode): JsonNode =
   rpc.postP2P(P2PCmd(kind: pcPingAll))
 
   # Core returns UniValue::VNULL -> JSON null.
+  newJNull()
+
+proc handleSetMockTime(rpc: RpcServer, params: JsonNode): JsonNode =
+  ## Core setmocktime (rpc/node.cpp): regtest only, hidden from `help`.
+  ## Here it moves the mempool clock -- entry timestamps, the rolling-minimum-fee
+  ## decay and expiry -- so a harness can step through the 12h halflife.
+  ## 0 returns to the wall clock; a negative value is RPC_INVALID_PARAMETER.
+  if rpc.params.network != Regtest:
+    raise newRpcError(RpcMiscError,
+      "setmocktime is for regression testing (-regtest mode) only")
+  if params.len < 1 or params[0].kind == JNull:
+    raise newRpcError(RpcInvalidParameter, "Missing required argument: timestamp")
+  if params[0].kind != JInt:
+    raise newRpcError(RpcTypeError,
+      "JSON value of type " & $params[0].kind & " is not of expected type number")
+  let stamp = params[0].getBiggestInt()
+  if stamp < 0:
+    raise newRpcError(RpcInvalidParameter,
+      "Mocktime cannot be negative: " & $stamp & ".")
+  setMockTime(int64(stamp))
   newJNull()
 
 proc handleSetNetworkActive(rpc: RpcServer, params: JsonNode): JsonNode =
@@ -15678,6 +15665,8 @@ proc handleMethodUnlocked(rpc: RpcServer, methodName: string, params: JsonNode):
     rpc.handlePing(params)
   of "setnetworkactive":
     rpc.handleSetNetworkActive(params)
+  of "setmocktime":
+    rpc.handleSetMockTime(params)
   of "getpeerinfo":
     rpc.handleGetPeerInfo()
   of "getconnectioncount":
