@@ -2863,7 +2863,7 @@ proc handleGetMempoolInfo*(rpc: RpcServer): JsonNode =
     "mempoolminfee": btcAmountNode(mempoolMinSats),
     "minrelaytxfee": btcAmountNode(minRelaySats),
     "incrementalrelayfee": btcAmountNode(incrementalSats),
-    "unbroadcastcount": 0,
+    "unbroadcastcount": rpc.mempool.unbroadcast.len,
     # Core master removed the mempoolfullrbf option and hardcodes `true`
     # (mempool.cpp:1058). Match Core's wire output.
     "fullrbf": true,
@@ -2886,7 +2886,8 @@ proc parseTxidParam(hexStr: string): TxId =
     bytes[i] = byte(parseHexInt(reversed[i*2 .. i*2+1]))
   TxId(bytes)
 
-proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNode =
+proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry,
+                       chunks: var Table[TxId, ChunkInfo]): JsonNode =
   ## Canonical per-entry object for getmempoolentry, getrawmempool (verbose),
   ## getmempoolancestors (verbose), getmempooldescendants (verbose).
   ## Reference: bitcoin-core/src/rpc/mempool.cpp entryToJSON (Core 31.99).
@@ -2901,19 +2902,23 @@ proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNod
   # Without a prioritisation this equals the base fee, preserving prior output.
   let modF   = float64(rpc.mempool.getModifiedFee(txid)) / 100000000.0
   let ancestF = float64(int64(entry.ancestorFee)) / 100000000.0
-  # descendant fee: nimrod mempool tracks per-entry fee only;
-  # for the single-entry case (no descendants) it equals the entry fee.
-  let descendF = feeF
-  # chunkweight: for now emit weight as a proxy (full cluster-aware
-  # chunk scheduling is not yet implemented in nimrod's mempool).
-  let chunkWeight = entry.weight
+  # Descendant totals include the tx itself (Core GetCountWithDescendants etc.)
+  let desc = rpc.mempool.descendantTotals(txid)
+  let descendF = float64(desc.modFee) / 100000000.0
+  # Chunk = the feerate-diagram chunk of the tx's cluster linearization.
+  if txid notin chunks:
+    for k, v in rpc.mempool.clusterChunks(txid):
+      chunks[k] = v
+  let chunk = chunks.getOrDefault(txid,
+    (fee: rpc.mempool.getModifiedFee(txid), weight: int64(entry.weight)))
+  let chunkWeight = chunk.weight
   var obj = newJObject()
   obj["vsize"]           = %vsize
   obj["weight"]          = %entry.weight
   obj["time"]            = %entry.timeAdded.toUnix()
   obj["height"]          = %entry.height
-  obj["descendantcount"] = %1
-  obj["descendantsize"]  = %vsize
+  obj["descendantcount"] = %desc.count
+  obj["descendantsize"]  = %desc.vsize
   obj["ancestorcount"]   = %entry.ancestorCount
   obj["ancestorsize"]    = %entry.ancestorSize
   obj["wtxid"]           = %reverseHex(toHex(array[32, byte](entry.tx.wtxid())))
@@ -2923,10 +2928,21 @@ proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNod
   feesObj["modified"]   = %modF
   feesObj["ancestor"]   = %ancestF
   feesObj["descendant"] = %descendF
-  feesObj["chunk"]      = %feeF
+  feesObj["chunk"]      = %(float64(chunk.fee) / 100000000.0)
   obj["fees"]             = feesObj
-  obj["depends"]          = newJArray()
-  obj["spentby"]          = newJArray()
+  # Core builds depends as a std::set<std::string> of display-hex txids.
+  var dependHex: seq[string]
+  for p in rpc.mempool.inPoolParents(txid):
+    dependHex.add(reverseHex(toHex(array[32, byte](p))))
+  dependHex.sort()
+  var depends = newJArray()
+  for h in dependHex:
+    depends.add(%h)
+  var spentby = newJArray()
+  for c in rpc.mempool.inPoolChildren(txid):
+    spentby.add(%reverseHex(toHex(array[32, byte](c))))
+  obj["depends"]          = depends
+  obj["spentby"]          = spentby
   # FIX-68 (W120 BUG-3): bip125-replaceable must reflect the tx's actual
   # opt-in state.  Walks the tx itself (Gate 1: any input <= 0xfffffffd)
   # AND walks all unconfirmed in-mempool ancestors (Gate 2: inherited
@@ -2934,8 +2950,12 @@ proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNod
   # Reference: bitcoin-core/src/rpc/mempool.cpp entryToJSON
   # → IsRBFOptIn(tx, pool) at line 560.
   obj["bip125-replaceable"] = %rpc.mempool.isBip125Replaceable(txid)
-  obj["unbroadcast"]      = %false
+  obj["unbroadcast"]      = %rpc.mempool.isUnbroadcast(txid)
   obj
+
+proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNode =
+  var chunks = initTable[TxId, ChunkInfo]()
+  mempoolEntryJson(rpc, txid, entry, chunks)
 
 proc handleGetRawMempool(rpc: RpcServer, params: JsonNode): JsonNode =
   ## getrawmempool [verbose] [mempool_sequence]
@@ -2948,8 +2968,9 @@ proc handleGetRawMempool(rpc: RpcServer, params: JsonNode): JsonNode =
     # depends, spentby, unbroadcast, and had hardcoded ancestorcount=1.
     # Now delegates to mempoolEntryJson for byte-parity with Core.
     var entries = newJObject()
+    var chunks = initTable[TxId, ChunkInfo]()
     for txid, entry in rpc.mempool.entries:
-      entries[$txid] = mempoolEntryJson(rpc, txid, entry)
+      entries[$txid] = mempoolEntryJson(rpc, txid, entry, chunks)
     return entries
   else:
     var txids: seq[string]
@@ -5194,6 +5215,10 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
         raise newRpcError(RpcTransactionRejected,
           "fee rate " & $feeRateBtcKvb & " BTC/kvB exceeds maxfeerate " & $maxFeeRate & " BTC/kvB")
 
+    # Core BroadcastTransaction: remember the tx as unbroadcast until a peer
+    # fetches it (getmempoolentry "unbroadcast", getmempoolinfo count).
+    mp.addUnbroadcast(txid)
+
     # Broadcast inv to peers (let them request the full tx)
     if rpc.peerManager != nil:
       rpc.postP2P(P2PCmd(kind: pcBroadcastTx, tx: tx))
@@ -5569,6 +5594,9 @@ proc handleSubmitPackage(rpc: RpcServer, params: JsonNode): JsonNode =
       let feeRateBtcKvb = pkgResult.packageFeerate * 1000.0 / 100_000_000.0
       raise newRpcError(RpcTransactionRejected,
         "package fee rate " & $feeRateBtcKvb & " BTC/kvB exceeds maxfeerate " & $maxFeeRate & " BTC/kvB")
+
+    for tx in txns:
+      mp.addUnbroadcast(tx.txid())
 
     # Broadcast all transactions
     if rpc.peerManager != nil:
@@ -10417,6 +10445,7 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
 
   if not acceptResult.isOk:
     raise newRpcError(RpcTransactionRejected, "mempool rejected: " & acceptResult.error)
+  mp.addUnbroadcast(tx.txid())
 
   # Record the wallet transaction-history entry NOW, before the spent UTXOs are
   # removed below — mirrors Bitcoin Core CWallet::CommitTransaction inserting
@@ -10474,6 +10503,7 @@ proc commitWalletSend(rpc: RpcServer, w: var Wallet, tx: var Transaction,
   let acceptResult = mp.acceptTransaction(tx, rpc.crypto)
   if not acceptResult.isOk:
     raise newRpcError(RpcTransactionRejected, "mempool rejected: " & acceptResult.error)
+  mp.addUnbroadcast(tx.txid())
   var inputValues: seq[Satoshi]
   for input in tx.inputs:
     if input.prevOut in w.utxos:
