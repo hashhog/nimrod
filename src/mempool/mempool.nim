@@ -78,6 +78,9 @@ type
                                    ## TRUC sibling eviction (single-tx only).
     packageFeerates*: bool         ## Core ATMPArgs::m_package_feerates — skip
                                    ## per-tx min-relay check (package will).
+    packageSubmission*: bool       ## Core ATMPArgs::m_package_submission — a
+                                   ## package member: do not LimitMempoolSize
+                                   ## per tx, acceptPackage does it once.
     clientMaxFeeRateSatKvB*: float64
                                    ## Core ATMPArgs::m_client_maxfeerate —
                                    ## reject if effective feerate exceeds this
@@ -257,6 +260,7 @@ proc defaultAtmpArgs*(): AtmpArgs =
     allowReplacement: true,
     allowSiblingEviction: true,
     packageFeerates: false,
+    packageSubmission: false,
     clientMaxFeeRateSatKvB: 0.0,
   )
 
@@ -278,6 +282,7 @@ proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true)
 proc attachToChainState*(mp: Mempool) {.gcsafe, raises: [].}
 proc expire*(mp: Mempool, maxAgeOverride: int = -1)
 proc trimToSize*(mp: Mempool)
+proc limitMempoolSize*(mp: Mempool)
 proc clusterTermOf(mp: Mempool, seed: TxId): int
 
 # Constructor
@@ -1053,9 +1058,8 @@ proc poolNeighbours(mp: Mempool, tx: Transaction, txid: TxId): seq[TxId] =
         seen.incl(child)
         result.add(child)
 
-proc clusterTermOfMembers(mp: Mempool, members: seq[TxId]): int =
-  if members.len < 2:
-    return 0
+proc chunkTxsOf(mp: Mempool, members: seq[TxId]): seq[ChunkTx] =
+  ## The cluster as ChunkTx (modified fee, sigop-adjusted weight, parents).
   var index = initTable[TxId, int]()
   for i, m in members:
     index[m] = i
@@ -1067,7 +1071,12 @@ proc clusterTermOfMembers(mp: Mempool, members: seq[TxId]): int =
     for input in e.tx.inputs:
       if input.prevOut.txid in index:
         txs[i].parents.add(index[input.prevOut.txid])
-  clusterTerm(txs)
+  txs
+
+proc clusterTermOfMembers(mp: Mempool, members: seq[TxId]): int =
+  if members.len < 2:
+    return 0
+  clusterTerm(mp.chunkTxsOf(members))
 
 proc clusterTermOf(mp: Mempool, seed: TxId): int =
   ## memusage clusterTerm of the cluster containing `seed` (0 for a singleton).
@@ -1771,14 +1780,15 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   if mp.feeEstimator != nil:
     mp.feeEstimator.trackTransaction(txid, feeRate, mp.chainState.bestHeight)
 
-  # Core Finalize (validation.cpp:1394): trim the pool to -maxmempool AFTER the
-  # tx is in, then check that the tx itself survived.  The trim can evict the
-  # new tx (it may be the worst chunk), which raises the rolling floor.
-  # Package members skip the survival check -- Core trims once, at the end of
-  # the package -- and reorg replays (bypassLimits) are trimmed by the caller.
-  if not args.bypassLimits:
-    mp.trimToSize()
-    if not args.packageFeerates and txid notin mp.entries:
+  # Core Finalize (validation.cpp:1394-1404): LimitMempoolSize -- expire, then
+  # trim to -maxmempool -- AFTER the tx is in, then check that the tx itself
+  # survived.  The trim can evict the new tx (it may be the worst chunk), which
+  # raises the rolling floor.  Package members skip all of it (Core
+  # m_package_submission): acceptPackage limits the pool once, after every
+  # member is in.  Reorg replays (bypassLimits) are limited by the caller.
+  if not args.bypassLimits and not args.packageSubmission:
+    mp.limitMempoolSize()
+    if txid notin mp.entries:
       return err(AtmpAcceptInfo, "mempool full")
 
   ok[AtmpAcceptInfo](info)
@@ -2037,8 +2047,8 @@ proc limitMempoolSize*(mp: Mempool) =
   mp.trimToSize()
 
 proc trimToSize*(mp: Mempool) =
-  ## Core TrimToSize: evict the worst chunk until the pool's dynamic memory
-  ## usage fits -maxmempool.
+  ## Core TrimToSize: evict the worst chunk (worstMainChunk) until the pool's
+  ## dynamic memory usage fits -maxmempool.
   while mp.entries.len > 0 and mp.dynamicMemoryUsage() > mp.maxSize:
     mp.evictLowestFee()
 
@@ -2595,124 +2605,100 @@ proc getMinFee*(mp: Mempool): float64 =
   # max(CFeeRate(llround(rolling)), incremental), both in sat/kvB -> sat/vB
   max(round(mp.rollingMinimumFeeRate), mp.incrementalRelayFeeRate) / 1000.0
 
-# Evict the package (tx + all descendants) with the lowest combined fee rate.
-# Mirrors CTxMemPool::TrimToSize logic: evict the "worst chunk" (lowest
-# combined/chunk feerate considering all descendants), call trackPackageRemoved
-# to bump the rolling floor, then remove all of them.
-# Core reference: txmempool.cpp:861-911.
-#
-# Crucially, Core evaluates each "chunk" (root tx + all descendants) as a
-# unit when deciding which package to evict.  A low-rate parent that has a
-# high-fee CPFP child is treated as a single package whose rate is the
-# combined (totalFee / totalVsize).  This prevents incorrectly evicting a
-# parent that a child is bumping via CPFP.
-proc evictLowestFee*(mp: Mempool) =
-  ## Remove the package (tx + all descendants) with the lowest combined fee rate.
-  ## Calls trackPackageRemoved so subsequent txs must pay at least as much.
+proc txidAfter(a, b: TxId): bool =
+  ## Core's mempool fallback order (txmempool.cpp:183-187): Txid operator<=>,
+  ## a memcmp of the stored hash bytes.
+  let x = array[32, byte](a)
+  let y = array[32, byte](b)
+  for i in 0 ..< 32:
+    if x[i] != y[i]:
+      return x[i] > y[i]
+  false
 
+proc worstMainChunk*(mp: Mempool): tuple[txs: seq[TxId], fee, size: int64] =
+  ## Core TxGraph::GetWorstMainChunk (txgraph.cpp:3258-3283): the last entry
+  ## of the main chunk index.  Every cluster is linearized and chunked
+  ## (chunkLinearization), and chunks are ordered as CompareMainTransactions
+  ## (txgraph.cpp:492-523) orders them: by chunk feerate, then by the size of
+  ## the run of equal-feerate chunks up to and including this one within its
+  ## cluster (larger is worse), then by the greatest txid in the chunk
+  ## (greater is worse).  Fees are modified fees, sizes sigop-adjusted weight.
+  ## A cluster's chunks fall in feerate, so the worst chunk is always the
+  ## low-feerate tail of its cluster, never a parent without its descendants.
+  # Clusters: union-find over in-pool parent links.
+  var ids: seq[TxId]
+  var pos = initTable[TxId, int]()
+  for txid in mp.entries.keys:
+    pos[txid] = ids.len
+    ids.add(txid)
+  var up = newSeq[int](ids.len)
+  for i in 0 ..< ids.len: up[i] = i
+  proc find(x0: int): int =
+    var x = x0
+    while up[x] != x:
+      up[x] = up[up[x]]
+      x = up[x]
+    x
+  for i, txid in ids:
+    for input in mp.entries[txid].tx.inputs:
+      let p = pos.getOrDefault(input.prevOut.txid, -1)
+      if p >= 0:
+        let a = find(i)
+        let b = find(p)
+        if a != b: up[a] = b
+  var clusters = initTable[int, seq[TxId]]()
+  for i, txid in ids:
+    clusters.mgetOrPut(find(i), @[]).add(txid)
+  var found = false
+  var worstPrefix = 0'i64
+  var worstMax: TxId
+  for members in clusters.values:
+    var prefixFee = 0'i64
+    var prefixSize = 0'i64
+    for ch in chunkLinearization(mp.chunkTxsOf(members)):
+      # Core: restart the equal-feerate run when this chunk's feerate is
+      # strictly lower than the run's, otherwise extend it.
+      if prefixSize == 0 or ch.fee * prefixSize < prefixFee * ch.size:
+        prefixFee = ch.fee
+        prefixSize = ch.size
+      else:
+        prefixFee += ch.fee
+        prefixSize += ch.size
+      var maxTxid = members[ch.txs[0]]
+      for k in ch.txs:
+        if txidAfter(members[k], maxTxid):
+          maxTxid = members[k]
+      var worse = not found
+      if found:
+        let x = ch.fee * result.size
+        let y = result.fee * ch.size
+        worse =
+          if x != y: x < y
+          elif prefixSize != worstPrefix: prefixSize > worstPrefix
+          else: txidAfter(maxTxid, worstMax)
+      if worse:
+        found = true
+        result.txs.setLen(0)
+        for k in ch.txs:
+          result.txs.add(members[k])
+        result.fee = ch.fee
+        result.size = ch.size
+        worstPrefix = prefixSize
+        worstMax = maxTxid
+
+proc evictLowestFee*(mp: Mempool) =
+  ## One step of Core CTxMemPool::TrimToSize (txmempool.cpp:861-906): remove
+  ## the worst chunk and raise the rolling minimum fee to its feerate plus the
+  ## incremental relay feerate.
   if mp.entries.len == 0:
     return
-
-  # For each "root" transaction (one with no in-mempool parents), compute the
-  # combined feerate of the root + all its descendants.  Select the root whose
-  # package has the lowest combined rate.
-  #
-  # We define a "root" as any tx that is not spent by another mempool tx —
-  # i.e. it has no in-mempool ancestor.
-  var lowestRootTxid: TxId
-  var lowestPackageRate = float64.high
-  var foundRoot = false
-
-  for txid, entry in mp.entries:
-    # Check if this tx has any in-mempool ancestors (parents)
-    var hasParent = false
-    for input in entry.tx.inputs:
-      if input.prevOut.txid in mp.entries:
-        hasParent = true
-        break
-
-    if hasParent:
-      continue  # Not a root
-
-    # Compute combined feerate of root + all descendants.
-    # FIX-72 parity (mirrors rustoshi mempool.rs evict-via-modified-fee): each
-    # member contributes its MODIFIED fee (base + its own prioritisetransaction
-    # delta), so an operator-prioritised low-base-fee tx's higher modified fee
-    # raises its package rate and protects it from eviction — Core's TrimToSize
-    # evaluates over the txgraph, which already carries modified fees.  Only the
-    # member's OWN delta is folded (ancestor-delta aggregation is the W106 G8
-    # follow-up).  Un-prioritised members have delta 0 → identical to before.
-    let descendants = mp.calculateDescendants(txid)
-    var chunkFee = int64(entry.fee) + mp.getFeeDelta(txid)
-    var chunkWeight = entry.weight
-    for descTxid in descendants:
-      if descTxid in mp.entries:
-        let e = mp.entries[descTxid]
-        chunkFee += int64(e.fee) + mp.getFeeDelta(descTxid)
-        chunkWeight += e.weight
-
-    let chunkVbytes = float64(chunkWeight) / 4.0
-    let packageRate = if chunkVbytes > 0:
-      float64(chunkFee) / chunkVbytes
-    else:
-      0.0
-
-    if packageRate < lowestPackageRate:
-      lowestPackageRate = packageRate
-      lowestRootTxid = txid
-      foundRoot = true
-
-  if not foundRoot:
-    # Fallback: no rootless tx found (all txs have parents — should not happen
-    # in a well-formed mempool, but handle it gracefully by picking the overall
-    # lowest individual fee rate entry).
-    for txid, entry in mp.entries:
-      # FIX-72 parity: rank by MODIFIED feerate (base + own delta), not base.
-      let modVbytes = float64(entry.weight) / 4.0
-      let modRate =
-        if modVbytes > 0: float64(int64(entry.fee) + mp.getFeeDelta(txid)) / modVbytes
-        else: entry.feeRate
-      if modRate < lowestPackageRate:
-        lowestPackageRate = modRate
-        lowestRootTxid = txid
-        foundRoot = true
-
-  if not foundRoot or mp.entries.len == 0:
-    return
-
-  # Collect the root and all its descendants
-  let descendants = mp.calculateDescendants(lowestRootTxid)
-
-  # Compute the effective fee rate of the chunk being removed (sat/kvB).
-  # This is what we pass to trackPackageRemoved (+ incrementalRelayFeeRate).
-  # FIX-72 parity: use each member's MODIFIED fee (base + own delta), matching
-  # the selection rate above so the rolling floor reflects what was evicted.
-  var chunkFee = int64(mp.entries[lowestRootTxid].fee) + mp.getFeeDelta(lowestRootTxid)
-  var chunkWeight = mp.entries[lowestRootTxid].weight
-  for descTxid in descendants:
-    if descTxid in mp.entries:
-      let e = mp.entries[descTxid]
-      chunkFee += int64(e.fee) + mp.getFeeDelta(descTxid)
-      chunkWeight += e.weight
-
-  # Core CFeeRate(fee, vsize): whole sat/kvB, integer division.
-  let chunkVsize = (chunkWeight + 3) div 4
-  let removedRateSatKvB = if chunkVsize > 0:
-    float64(chunkFee * 1000 div int64(chunkVsize))
-  else:
-    0.0
-
-  # Bump rolling floor: evicted rate + incrementalRelayFeeRate
-  # Core: removed += m_opts.incremental_relay_feerate; trackPackageRemoved(removed)
+  let worst = mp.worstMainChunk()
+  # Core ToFeePerVSize + CFeeRate(fee, vsize): whole sat/kvB.
+  let vsize = (worst.size + 3) div 4
+  let removedRateSatKvB =
+    if vsize > 0: float64(worst.fee * 1000 div vsize) else: 0.0
   mp.trackPackageRemoved(removedRateSatKvB + mp.incrementalRelayFeeRate)
-
-  # Remove the root and all its descendants.
-  var toRemove: seq[TxId]
-  for descTxid in descendants:
-    toRemove.add(descTxid)
-  toRemove.add(lowestRootTxid)
-
-  for txid in toRemove:
+  for txid in worst.txs:
     mp.removeTransaction(txid, evictEphemeral = false)
 
 # Select transactions for a new block
@@ -3049,7 +3035,8 @@ proc isBip125Replaceable*(mp: Mempool, txid: TxId): bool =
 
 proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
                     crypto: CryptoEngine,
-                    usePackageFeerates: bool = true): PackageResult =
+                    usePackageFeerates: bool = true,
+                    limitSize: bool = true): PackageResult =
   ## Validate and accept a package of transactions into the mempool
   ## Package validation allows CPFP: a child can pay for its parent's inclusion
   ##
@@ -3060,6 +3047,10 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
   ## - Max 25 transactions, max 101 kvB total size
   ##
   ## Returns PackageResult with per-tx results and overall status
+  ##
+  ## `limitSize` = false skips the final LimitMempoolSize; testmempoolaccept
+  ## uses it because it rolls the package back afterwards and Core's
+  ## test_accept never touches the pool.
 
   result = PackageResult(
     valid: false,
@@ -3280,6 +3271,7 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
     allowReplacement: true,
     allowSiblingEviction: false,  # Core: sibling-eviction is single-tx only
     packageFeerates: true,        # CPFP: skip the per-tx fee floor (GAP #6/#12)
+    packageSubmission: true,      # no per-member LimitMempoolSize, see below
     clientMaxFeeRateSatKvB: 0.0,
   )
 
@@ -3305,6 +3297,9 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
       # Atomic rollback: undo everything we admitted so far, children first.
       for k in countdown(inserted.high, 0):
         mp.removeTransaction(inserted[k])
+      # Core AcceptPackage calls LimitMempoolSize whatever the outcome.
+      if limitSize:
+        mp.limitMempoolSize()
       return result
 
     # Surface the authoritative fee/vsize the single-tx path computed (it
@@ -3316,3 +3311,17 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
 
   result.valid = true
   result.state = pvUnset
+
+  # Core AcceptPackage (validation.cpp:1727-1765): LimitMempoolSize ONCE, after
+  # every member is in, so a child's fee counts for its parent's chunk.  Any
+  # package tx that is gone afterwards -- submitted now or already in the pool
+  # -- is "mempool full" and the package fails with "transaction failed".
+  if limitSize:
+    mp.limitMempoolSize()
+    for i, txid in txids:
+      if result.txResults[i].allowed and txid notin mp.entries:
+        result.txResults[i].allowed = false
+        result.txResults[i].error = "mempool full"
+        result.valid = false
+        result.state = pvTx
+        result.error = "transaction failed"

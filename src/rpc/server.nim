@@ -5336,7 +5336,8 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
       if mp.contains(tx.txid()):
         preExisting.add(tx.txid())
 
-    let pkgResult = mp.acceptPackage(txns, rpc.crypto, usePackageFeerates = true)
+    let pkgResult = mp.acceptPackage(txns, rpc.crypto, usePackageFeerates = true,
+                                     limitSize = false)
 
     # Rollback: remove every tx that acceptPackage added (was not pre-existing).
     for tx in txns:

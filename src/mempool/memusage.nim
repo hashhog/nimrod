@@ -73,15 +73,19 @@ type ChunkTx* = object
   size*: int64
   parents*: seq[int]  ## indexes of in-cluster parents
 
-proc chunkCount*(txs: seq[ChunkTx]): int =
-  ## Number of chunks in the cluster's linearization: repeatedly take the
+type Chunk* = object
+  txs*: seq[int]      ## cluster indexes of the chunk's members
+  fee*: int64
+  size*: int64
+
+proc chunkLinearization*(txs: seq[ChunkTx]): seq[Chunk] =
+  ## The cluster's chunks, best feerate first: repeatedly take the
   ## best-feerate ancestor-closed set, then merge a chunk into its
   ## predecessor while it pays a strictly higher feerate (Core
   ## ChunkLinearization).  Exact for the small trees a mempool produces.
   let n = txs.len
   var placed = newSeq[bool](n)
   var left = n
-  var chunks: seq[(int64, int64)]
   while left > 0:
     var bestSet: seq[int]
     var bestFee = 0'i64
@@ -109,16 +113,20 @@ proc chunkCount*(txs: seq[ChunkTx]): int =
     for c in bestSet:
       placed[c] = true
     left -= bestSet.len
-    chunks.add((bestFee, bestSize))
-    while chunks.len >= 2:
-      let a = chunks[^2]
-      let b = chunks[^1]
-      if b[0] * a[1] > a[0] * b[1]:
-        chunks.setLen(chunks.len - 2)
-        chunks.add((a[0] + b[0], a[1] + b[1]))
+    result.add(Chunk(txs: bestSet, fee: bestFee, size: bestSize))
+    while result.len >= 2:
+      let a = result[^2]
+      let b = result[^1]
+      if b.fee * a.size > a.fee * b.size:
+        result.setLen(result.len - 2)
+        result.add(Chunk(txs: a.txs & b.txs, fee: a.fee + b.fee,
+                         size: a.size + b.size))
       else:
         break
-  chunks.len
+
+proc chunkCount*(txs: seq[ChunkTx]): int =
+  ## Number of chunks in the cluster's linearization.
+  chunkLinearization(txs).len
 
 proc clusterTerm*(txs: seq[ChunkTx]): int =
   ## The cluster's contribution to usage beyond the per-tx constants.
