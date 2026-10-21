@@ -24,6 +24,7 @@ import ../storage/indexes/txindex
 import ../storage/indexes/blockfilterindex
 import ../storage/indexes/gcs
 import ../mempool/mempool
+import ./mempoolinfo
 import ../crypto/hashing
 import ../wallet/wallet
 import ../wallet/payjoin as payjoinMod
@@ -769,17 +770,8 @@ proc handleRestGetUtxos*(rest: RestServer, uriPart: string): RestResponse =
 # ============================================================================
 
 proc handleRestMempoolInfo*(rest: RestServer): RestResponse =
-  ## GET /rest/mempool/info.json
-  let minFee = rest.mempool.minFeeRate / 100000.0  # sat/vbyte to BTC/kvB
-  restJson(%*{
-    "loaded": true,
-    "size": rest.mempool.count,
-    "bytes": rest.mempool.size,
-    "usage": rest.mempool.size,
-    "maxmempool": rest.mempool.maxSize,
-    "mempoolminfee": minFee,
-    "minrelaytxfee": minFee
-  })
+  ## GET /rest/mempool/info.json -- the same object getmempoolinfo returns.
+  restJson(mempoolInfoJson(rest.mempool))
 
 proc handleRestMempoolContents*(rest: RestServer): RestResponse =
   ## GET /rest/mempool/contents.json

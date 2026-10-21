@@ -287,8 +287,12 @@ suite "W86-G4 evictLowestFee tracks rolling fee":
     check mp.blockSinceLastRollingFeeBump == false
     cs.close()
 
-  test "eviction removes entire descendant package":
-    ## Core TrimToSize evicts the worst chunk and all descendants together.
+  test "eviction removes the worst chunk: an equal-feerate child before its parent":
+    ## Core TrimToSize evicts TxGraph's worst chunk, not a root plus its
+    ## descendants.  A child at its parent's feerate does not merge into the
+    ## parent's chunk (only a strictly higher feerate merges), and of two
+    ## equal-feerate chunks the later one -- larger equal-feerate prefix --
+    ## is worse (txgraph.cpp CompareMainTransactions).
     var cs = newChainState(TestDbPath, regtestParams())
     let mp = newMempool(cs, regtestParams())
 
@@ -299,7 +303,10 @@ suite "W86-G4 evictLowestFee tracks rolling fee":
 
     check mp.count == 2
     mp.evictLowestFee()
-    # Both parent and child should be gone
+    check mp.count == 1
+    check parentId in mp.entries
+    check makeTxId(2) notin mp.entries
+    mp.evictLowestFee()
     check mp.count == 0
     cs.close()
 
