@@ -1459,8 +1459,7 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           try:
             await peer.sendMessage(txMsg)
             servedTxs.inc
-            # Core ProcessGetData: a peer fetched it, so it is no longer unbroadcast.
-            state.mempool.unbroadcast.excl(entryOpt.get().txid)
+            state.mempool.removeUnbroadcast(txid)
           except CatchableError as e:
             debug "failed to serve tx", peer = $peer, error = e.msg
         else:
@@ -1478,7 +1477,7 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
           try:
             await peer.sendMessage(txMsg)
             servedTxs.inc
-            state.mempool.unbroadcast.excl(entryOpt.get().txid)
+            state.mempool.removeUnbroadcast(entryOpt.get().txid)
           except CatchableError as e:
             debug "failed to serve tx (wtxid)", peer = $peer, error = e.msg
         else:

@@ -106,7 +106,9 @@ type
                             ## and what -maxmempool is compared against.
     totalVsize*: int        ## Core GetTotalTxSize: sum of entry vsizes (`bytes`)
     randCap*: int           ## modelled capacity of Core's txns_randomized vector
-    unbroadcast*: HashSet[TxId]  ## Core m_unbroadcast_txids: submitted locally, no peer has asked yet
+    unbroadcast*: HashSet[TxId]  ## Core m_unbroadcast_txids: txs submitted locally (sendrawtransaction,
+                                 ## submitpackage, wallet sends) that no peer has fetched yet. Cleared
+                                 ## when a peer getdata is served or the tx leaves the pool.
     minFeeRate*: float64    ## Minimum fee rate to accept (sat/vbyte)
     chainState*: ChainState
     params*: ConsensusParams
@@ -2059,6 +2061,123 @@ proc hasInPoolChild(mp: Mempool, txid: TxId): bool =
     if op in mp.spentBy and mp.spentBy[op] in mp.entries:
       return true
   false
+
+proc addUnbroadcast*(mp: Mempool, txid: TxId) =
+  ## Core CTxMemPool::AddUnbroadcastTx: only a tx that is in the pool.
+  if txid in mp.entries:
+    mp.unbroadcast.incl(txid)
+
+proc removeUnbroadcast*(mp: Mempool, txid: TxId) =
+  mp.unbroadcast.excl(txid)
+
+proc isUnbroadcast*(mp: Mempool, txid: TxId): bool =
+  txid in mp.unbroadcast
+
+proc inPoolParents*(mp: Mempool, txid: TxId): seq[TxId] =
+  ## Distinct in-pool parents (txs whose outputs `txid` spends), input order.
+  if txid notin mp.entries:
+    return
+  for input in mp.entries[txid].tx.inputs:
+    let p = input.prevOut.txid
+    if p in mp.entries and p notin result:
+      result.add(p)
+
+proc txidByteCmp(a, b: TxId): int =
+  ## uint256::operator< : memcmp over the internal-order bytes.
+  let x = array[32, byte](a)
+  let y = array[32, byte](b)
+  for i in 0 ..< 32:
+    if x[i] != y[i]:
+      return int(x[i]) - int(y[i])
+  0
+
+proc inPoolChildren*(mp: Mempool, txid: TxId): seq[TxId] =
+  ## Distinct in-pool children, found through the spentBy index, ordered like
+  ## Core's CTxMemPool::GetChildren (sorted by CompareIteratorByHash).
+  if txid notin mp.entries:
+    return
+  for vout in 0 ..< mp.entries[txid].tx.outputs.len:
+    let op = OutPoint(txid: txid, vout: uint32(vout))
+    if op in mp.spentBy:
+      let c = mp.spentBy[op]
+      if c in mp.entries and c notin result:
+        result.add(c)
+  result.sort(txidByteCmp)
+
+proc descendantTotals*(mp: Mempool, txid: TxId): tuple[count: int, vsize: int, modFee: int64] =
+  ## Core GetCountWithDescendants / GetSizeWithDescendants /
+  ## GetModFeesWithDescendants: the tx itself plus every in-pool descendant.
+  var seen = initHashSet[TxId]()
+  var stack = @[txid]
+  while stack.len > 0:
+    let cur = stack.pop()
+    if cur in seen or cur notin mp.entries:
+      continue
+    seen.incl(cur)
+    result.count.inc
+    result.vsize += (mp.entries[cur].weight + 3) div 4
+    result.modFee += mp.getModifiedFee(cur)
+    for c in mp.inPoolChildren(cur):
+      stack.add(c)
+
+type ChunkInfo* = tuple[fee: int64, weight: int64]
+
+proc clusterChunks*(mp: Mempool, seed: TxId): Table[TxId, ChunkInfo] =
+  ## Map every member of `seed`'s cluster to the (modified fee, weight) of the
+  ## linearization chunk it falls in (Core getmempoolentry fees.chunk /
+  ## chunkweight). Linearization is the ancestor-set-feerate greedy: repeatedly
+  ## take the highest-feerate ancestor-closed remaining set, then merge a chunk
+  ## into its predecessor while it pays strictly more (the feerate diagram).
+  let members = mp.clusterMembers(seed)
+  var remaining = initHashSet[TxId]()
+  for m in members:
+    remaining.incl(m)
+  var fee = initTable[TxId, int64]()
+  var size = initTable[TxId, int64]()
+  for m in members:
+    fee[m] = mp.getModifiedFee(m)
+    let e = mp.entries[m]
+    size[m] = clusterSizeContribution(e.weight, e.sigopCost)
+  type Chunk = object
+    txs: seq[TxId]
+    fee, size: int64
+  var chunks: seq[Chunk]
+  while remaining.len > 0:
+    var best: Chunk
+    var haveBest = false
+    for m in members:
+      if m notin remaining:
+        continue
+      var anc = initHashSet[TxId]()
+      var stack = @[m]
+      while stack.len > 0:
+        let cur = stack.pop()
+        if cur in anc or cur notin remaining:
+          continue
+        anc.incl(cur)
+        for par in mp.inPoolParents(cur):
+          stack.add(par)
+      var c = Chunk()
+      for t in anc:
+        c.txs.add(t)
+        c.fee += fee[t]
+        c.size += size[t]
+      if not haveBest or c.fee * best.size > best.fee * c.size or
+         (c.fee * best.size == best.fee * c.size and c.size < best.size):
+        best = c
+        haveBest = true
+    for t in best.txs:
+      remaining.excl(t)
+    chunks.add(best)
+    while chunks.len >= 2 and
+          chunks[^1].fee * chunks[^2].size > chunks[^2].fee * chunks[^1].size:
+      let last = chunks.pop()
+      chunks[^1].txs.add(last.txs)
+      chunks[^1].fee += last.fee
+      chunks[^1].size += last.size
+  for c in chunks:
+    for t in c.txs:
+      result[t] = (fee: c.fee, weight: c.size)
 
 type TrimFrac = tuple[fee, size: int64]
 
