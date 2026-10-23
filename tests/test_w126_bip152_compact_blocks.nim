@@ -333,43 +333,43 @@ suite "W126 BIP-152 CMPCTBLOCK receive (G12-G19)":
 
 suite "W126 BIP-152 GETBLOCKTXN serve (G20-G23)":
 
-  test "G20 MISSING (BUG-2): getblocktxn serve sends BLOCKTXN response":
-    # Core net_processing.cpp:4245-4264 — looks up block, calls
-    # SendBlockTransactions(pfrom, peer, block, req).
-    # nimrod peer.nim:1419-1436 is a stub: logs and returns.
-    # Forward-regression source guard: confirm the TODO marker still
-    # stands.
+  test "G20 FIXED (BUG-2): getblocktxn serve sends BLOCKTXN response":
+    # Core net_processing.cpp GETBLOCKTXN -> SendBlockTransactions.
+    # The stub is gone; the reply is built in nimrod.nim's mkGetBlockTxn arm.
     let source = readFile("src/network/peer.nim")
-    check "TODO(BUG-5): look up the block and send a real blocktxn response" in source
-
-    # And: no newBlockTxnMsg call inside the mkGetBlockTxn arm.
-    let mkGetIdx = source.find("of mkGetBlockTxn:")
-    check mkGetIdx >= 0
-    let armEnd = source.find("of mkBlockTxn:", mkGetIdx)
-    check armEnd > mkGetIdx
-    let arm = source[mkGetIdx ..< armEnd]
-    check "newBlockTxnMsg" notin arm
-    check "sendMessage" notin arm
-
-  test "G21 MISSING (BUG-12): blocktxnDepthOk is a dead helper":
-    # Helper defined at compact_blocks.nim:658 with explicit Core ref.
-    check compiles(blocktxnDepthOk)
-    # But: zero callers in src/.  Source-guard for the dead-helper
-    # pattern; once BUG-2 lands and wires blocktxnDepthOk into the
-    # mkGetBlockTxn arm, this assertion flips.
-    let peerSrc = readFile("src/network/peer.nim")
+    check "TODO(BUG-5): look up the block and send a real blocktxn response" notin source
     let nodeSrc = readFile("src/nimrod.nim")
-    check "blocktxnDepthOk" notin peerSrc
-    check "blocktxnDepthOk" notin nodeSrc
+    let armStart = nodeSrc.find("  of mkGetBlockTxn:")
+    check armStart >= 0
+    let armEnd = nodeSrc.find("  of mkGetHeaders:", armStart)
+    check armEnd > armStart
+    let arm = nodeSrc[armStart ..< armEnd]
+    check "newBlockTxnMsg" in arm
+    check "sendMessage" in arm
 
-  test "G22 MISSING (BUG-2): out-of-bounds index → Misbehaving":
-    # Core net_processing.cpp:2602-2605 (SendBlockTransactions) —
-    # `if (req.indexes[i] >= block.vtx.size()) Misbehaving(peer,
-    # "getblocktxn with out-of-bounds tx indices");`
-    # nimrod: implied dead path (BUG-2 makes the entire serve a stub).
-    # No symbol for the check exists.
-    check not compiles(sendBlockTransactions)
-    check not compiles(misbehaveOnOutOfBoundsGetBlockTxn)
+  test "G20 behaviour: blockTxnForRequest returns the requested txs in order":
+    let blk = makeBlock(7, 3)
+    let req = BlockTxnRequest(blockHash: BlockHash(default(array[32, byte])), indexes: @[2'u16, 0'u16])
+    let r = blockTxnForRequest(blk, req)
+    check r.isSome
+    check r.get().blockHash == req.blockHash
+    check r.get().transactions.len == 2
+    check r.get().transactions[0] == blk.txs[2]
+    check r.get().transactions[1] == blk.txs[0]
+
+  test "G21 FIXED (BUG-12): blocktxnDepthOk gates the getblocktxn serve":
+    check compiles(blocktxnDepthOk)
+    let nodeSrc = readFile("src/nimrod.nim")
+    check "blocktxnDepthOk" in nodeSrc
+    check blocktxnDepthOk(100, 110)
+    check not blocktxnDepthOk(99, 110)
+
+  test "G22 FIXED (BUG-2): out-of-bounds index yields no blocktxn":
+    # Core net_processing.cpp SendBlockTransactions:
+    # `if (req.indexes[i] >= block.vtx.size()) Misbehaving(...)`; nothing sent.
+    let blk = makeBlock(7, 2)
+    let req = BlockTxnRequest(blockHash: BlockHash(default(array[32, byte])), indexes: @[0'u16, 2'u16])
+    check blockTxnForRequest(blk, req).isNone
 
   test "G23 PRESENT: BlockTransactionsRequest differential-index codec":
     # Core blockencodings.h:53 — `Using<VectorFormatter<
