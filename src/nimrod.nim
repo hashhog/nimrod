@@ -1495,6 +1495,39 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
       except CatchableError as e:
         debug "failed to send notfound", peer = $peer, error = e.msg
 
+  of mkGetBlockTxn:
+    # BIP 152: a peer that got our cmpctblock asks for the transactions it
+    # lacks.  Reference: bitcoin-core/src/net_processing.cpp (GETBLOCKTXN):
+    #   block within MAX_BLOCKTXN_DEPTH of the tip -> SendBlockTransactions
+    #   (blocktxn; an out-of-bounds index is Misbehaving), else the full block.
+    let req = msg.getBlockTxn
+    if state.chainState == nil:
+      return
+    let idxOpt = state.chainState.db.getBlockIndex(req.blockHash)
+    let blockOpt = state.chainState.db.getBlock(req.blockHash)
+    if idxOpt.isNone or blockOpt.isNone:
+      debug "getblocktxn for unknown block", peer = $peer, hash = $req.blockHash
+      return
+    let blk = blockOpt.get()
+    if blocktxnDepthOk(idxOpt.get().height, state.chainState.bestHeight):
+      let resp = blockTxnForRequest(blk, req)
+      if resp.isNone:
+        warn "getblocktxn with out-of-bounds tx indices", peer = $peer,
+             hash = $req.blockHash
+        await peer.disconnect("getblocktxn with out-of-bounds tx indices")
+        return
+      try:
+        await peer.sendMessage(newBlockTxnMsg(req.blockHash, resp.get().transactions))
+      except CatchableError as e:
+        debug "failed to serve blocktxn", peer = $peer, error = e.msg
+    else:
+      debug "getblocktxn depth exceeded, serving full block", peer = $peer,
+            hash = $req.blockHash
+      try:
+        await peer.sendMessage(newBlockMsg(blk))
+      except CatchableError as e:
+        debug "failed to serve block (getblocktxn fallback)", peer = $peer, error = e.msg
+
   of mkGetHeaders:
     # Serve headers to peers. Reference: bitcoin-core/src/net_processing.cpp
     # NetMsgType::GETHEADERS (line 4306). Locator is descending by height;

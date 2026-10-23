@@ -677,3 +677,14 @@ proc createBlockTxnResponse*(blockHash: BlockHash, blk: Block,
       resp.transactions.add(blk.txs[idx])
 
   resp
+
+proc blockTxnForRequest*(blk: Block, req: BlockTxnRequest): Option[BlockTxnResponse] =
+  ## Build the blocktxn reply to a getblocktxn for `blk`.  Returns none when
+  ## any requested index is outside the block: Core's SendBlockTransactions
+  ## treats that as misbehavior and sends nothing.
+  ## Reference: Bitcoin Core net_processing.cpp SendBlockTransactions
+  ##   if (req.indexes[i] >= block.vtx.size()) { Misbehaving(...); return; }
+  for idx in req.indexes:
+    if int(idx) >= blk.txs.len:
+      return none(BlockTxnResponse)
+  some(createBlockTxnResponse(req.blockHash, blk, req.indexes))
