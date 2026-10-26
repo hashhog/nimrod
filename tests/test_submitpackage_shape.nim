@@ -171,3 +171,33 @@ suite "submitpackage result shape (Core rpc/mempool.cpp)":
     check p["fees"]["effective-includes"][0].getStr() == wtxidHex(parent)
     check parent.txid() in f.rpc.mempool.entries
     f.teardown()
+
+proc bareMultisigSpk(): seq[byte] =
+  ## OP_1 <G> OP_1 OP_CHECKMULTISIG: 20 legacy sigops, cost 80.
+  const g = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+  result = @[byte(0x51), 0x21]
+  for i in countup(0, g.len - 2, 2):
+    result.add byte(parseHexInt(g[i .. i + 1]))
+  result.add @[byte(0x51), 0xae]
+
+proc spendWithMultisig(prev: OutPoint, inValue, fee: int64, n: int): Transaction =
+  result = spend(prev, inValue - fee - int64(n) * 1_000)
+  for _ in 0 ..< n:
+    result.outputs.add TxOut(value: Satoshi(1_000), scriptPubKey: bareMultisigSpk())
+
+suite "submitpackage vsize is Core's sigop-adjusted vsize":
+  test "high-sigop CPFP: vsize and effective-feerate use GetVirtualTransactionSize with sigops":
+    # Core MempoolAcceptResult m_vsize = GetVirtualTransactionSize(weight,
+    # sigop_cost, -bytespersigop): 126 bare multisig outputs = 10,080 sigop
+    # cost = 201,600 adjusted weight = 50,400 vB (raw is about 5,900).
+    var f = setup()
+    let parent = spendWithMultisig(f.cb[1].op, Coin, 1, 126)
+    let child = spendWithMultisig(parent.op, int64(parent.outputs[0].value), 200_000, 126)
+    let r = f.rpc.handleMethod("submitpackage", %*[[hexOf(parent), hexOf(child)]])
+    check r["package_msg"].getStr() == "success"
+    for tx in [parent, child]:
+      check r["tx-results"][wtxidHex(tx)]["vsize"].getInt() == 50_400
+    let expected = float64((200_001 * 1000) div 100_800) / 100_000_000.0
+    check abs(r["tx-results"][wtxidHex(parent)]["fees"]["effective-feerate"].getFloat() -
+              expected) < 1e-12
+    f.teardown()

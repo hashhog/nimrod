@@ -95,6 +95,9 @@ type
     baseFee*: Satoshi
     modifiedFee*: Satoshi
     replaced*: HashSet[TxId]       ## conflicts evicted by this submission
+    sigopVsize*: int               ## Core ws.m_vsize: GetVirtualTransactionSize
+                                   ## with the sigop adjustment (-bytespersigop),
+                                   ## the vsize Core reports for package members
 
   Mempool* = ref object
     entries*: Table[TxId, MempoolEntry]
@@ -1733,6 +1736,7 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     baseFee: baseFee,
     modifiedFee: modifiedFee,
     replaced: conflictsToRemove,
+    sigopVsize: int((clusterSizeContribution(weight, txSigopCost) + 3) div 4),
   )
 
   # W96 GAP #11: m_test_accept — return AFTER all checks pass but BEFORE
@@ -3492,7 +3496,8 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
         result.txResults[i].allowed = true
         result.txResults[i].inMempool = true
         result.txResults[i].fees = entry.fee
-        result.txResults[i].vsize = (entry.weight + 3) div 4
+        result.txResults[i].vsize =
+          int((clusterSizeContribution(entry.weight, entry.sigopCost) + 3) div 4)
       else:
         result.txResults[i].differentWitness = true
         result.txResults[i].otherWtxid = entry.tx.wtxid()
@@ -3503,10 +3508,12 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
       let info = res.value
       result.txResults[i].allowed = true
       result.txResults[i].fees = info.baseFee
-      result.txResults[i].vsize = info.vsize
+      # Core reports the sigop-adjusted vsize (ws.m_vsize) and prices the
+      # effective feerate on it.
+      result.txResults[i].vsize = info.sigopVsize
       result.txResults[i].hasEffective = true
       result.txResults[i].effectiveFeerate =
-        if info.vsize > 0: int64(info.modifiedFee) * 1000 div int64(info.vsize)
+        if info.sigopVsize > 0: int64(info.modifiedFee) * 1000 div int64(info.sigopVsize)
         else: 0'i64
       result.txResults[i].effectiveIncludes = @[result.txResults[i].wtxid]
       continue
@@ -3623,7 +3630,7 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
             failedAt = i
             break
           result.txResults[i].fees = memberRes.value.baseFee
-          result.txResults[i].vsize = memberRes.value.vsize
+          result.txResults[i].vsize = memberRes.value.sigopVsize
           inserted.add(txids[i])
         if not rbfOk:
           discard
