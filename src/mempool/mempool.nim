@@ -3597,11 +3597,15 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
       break packageRbf
     var evalTxns: seq[Transaction]
     var directConflicts = initHashSet[TxId]()
+    var conflicting: seq[int]
     for i, tx in txns:
       if txids[i] in mp.entries:
         continue
       evalTxns.add(tx)
-      for c in mp.findConflicts(tx):
+      let own = mp.findConflicts(tx)
+      if own.len > 0:
+        conflicting.add(i)
+      for c in own:
         directConflicts.incl(c)
     # A lone conflicting member is a single-tx replacement (Core
     # AcceptSubPackage of one tx): acceptTransactionWithArgs judges it.
@@ -3611,10 +3615,10 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
     if not rbf.isOk:
       result.state = pvPolicy
       result.error = rbf.error
-      for i in 0 ..< txns.len:
-        if txids[i] notin mp.entries:
-          result.txResults[i].allowed = false
-          result.txResults[i].error = rbf.error
+      # The members whose replacement was refused carry the reason.
+      for i in conflicting:
+        result.txResults[i].allowed = false
+        result.txResults[i].error = rbf.error
       if limitSize:
         mp.limitMempoolSize()
       return result
