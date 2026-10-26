@@ -184,6 +184,7 @@ const IncludedTests = [
   "test_p2sh_commitment",
   "test_p2sh_taproot_anyonecspend",
   "test_package",
+  "test_package_rbf",
   "test_parallel_script_verify",
   "test_parallel_verify_ibd",
   "test_peer",
