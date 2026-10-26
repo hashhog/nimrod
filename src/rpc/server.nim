@@ -930,7 +930,15 @@ proc handleGetBlockHash(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParameter, "Block height out of range")
   if rpc.chainState != nil and height > rpc.chainState.bestHeight:
     raise newRpcError(RpcInvalidParameter, "Block height out of range")
+  #
+  # The active tip is exempt. A snapshot base is the tip with no body
+  # (loadtxoutset / --load-snapshot store coins, not the block; Core's
+  # base has no BLOCK_HAVE_DATA either), and getblockhash(base) is how a
+  # caller checks the chain the node just told getbestblockhash it is on.
+  # Refusing it failed boot-smoke tip/restart/cliload with an empty hash.
+  # The height-index lookup below still has to resolve.
   if rpc.chainState != nil and height > 0 and
+      height != rpc.chainState.bestHeight and
       not heightHasBody(rpc.chainState.db, height):
     # Floor cutoff over-claimed: a hole above discoverFirstBody (live
     # 966302..967347) still had an index row, so getblockhash handed

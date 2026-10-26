@@ -144,6 +144,23 @@ proc mkRpc(cs: ChainState, params: ConsensusParams): RpcServer =
   newRpcServer(port = 18443'u16, chainState = cs, mempool = mp,
                peerManager = nil, feeEstimator = fe, params = params)
 
+proc displayHash(h: BlockHash): string =
+  ## Core's display order (byte-reversed), what getblockhash returns.
+  let b = array[32, byte](h)
+  var r: array[32, byte]
+  for i in 0 ..< 32: r[i] = b[31 - i]
+  hexOf(r)
+
+proc rpcBlockHashAt(rpc: RpcServer, height: int32): string =
+  ## The RPC answer boot-smoke's check_tip reads. The ChainState-level
+  ## checks in the cell tests below passed while this returned an error:
+  ## getblockhash refused any height without a stored body, and a
+  ## snapshot base never has one.
+  try:
+    rpc.handleMethod("getblockhash", %*[height]).getStr()
+  except RpcError as e:
+    "error " & $e.code & ": " & e.msg
+
 # ===========================================================================
 
 suite "AssumeUTXO dual-chainstate — real background second chainstate":
@@ -350,6 +367,10 @@ suite "AssumeUTXO dual-chainstate — real background second chainstate":
     check rpc.chainState.getBlockHashByHeight(baseHeight).get() == baseHash
     let count = rpc.handleMethod("getblockcount", newJArray())
     check count.getInt == int(baseHeight)
+    check not rpc.chainState.db.hasBlockBody(baseHash)
+    check rpcBlockHashAt(rpc, baseHeight) == displayHash(baseHash)
+    check rpcBlockHashAt(rpc, baseHeight) ==
+      rpc.handleMethod("getbestblockhash", newJArray()).getStr()
     live.close()
 
   test "activated snapshot tip persists across reopen (boot-smoke restart cell)":
@@ -385,6 +406,8 @@ suite "AssumeUTXO dual-chainstate — real background second chainstate":
     check reopened.bestHeight == baseHeight
     check reopened.bestBlockHash == baseHash
     check reopened.getBlockHashByHeight(baseHeight).get() == baseHash
+    check rpcBlockHashAt(mkRpc(reopened, regtest), baseHeight) ==
+      displayHash(baseHash)
     reopened.close()
 
   test "in-place load writes height index (boot-smoke cliload cell)":
@@ -414,12 +437,54 @@ suite "AssumeUTXO dual-chainstate — real background second chainstate":
     check live.bestHeight == baseHeight
     writeSnapshotActivationIndex(live)
     check live.getBlockHashByHeight(baseHeight).get() == baseHash
+    check rpcBlockHashAt(mkRpc(live, regtest), baseHeight) ==
+      displayHash(baseHash)
     live.close()
 
     var reopened = newChainState(root / "live", regtest)
     check reopened.bestHeight == baseHeight
     check reopened.getBlockHashByHeight(baseHeight).get() == baseHash
+    check rpcBlockHashAt(mkRpc(reopened, regtest), baseHeight) ==
+      displayHash(baseHash)
     reopened.close()
+
+  test "getblockhash answers only the snapshot base, not the heights below it":
+    ## The tip exemption must not turn into "answer anything in range".
+    ## Below the base the node holds neither a body nor (CLI path) an
+    ## index row; that stays -1, above the tip stays -8, genesis still
+    ## answers.
+    let root = freshDir("basebounds")
+    defer:
+      try: removeDir(root) except OSError: discard
+    let regtest = regtestParams()
+
+    var source = newChainState(root / "source", regtest)
+    let (baseHeight, baseHash) = buildChain(source)
+    let belowHash = source.getBlockHashByHeight(baseHeight - 1).get()
+    let snapPath = root / "snap.dat"
+    let dump = createSnapshot(source, snapPath, regtest)
+    source.close()
+
+    var live = newChainState(root / "live", regtest)
+    let genesis = makeBlock(BlockHash(default(array[32, byte])), 0,
+                            @[makeCoinbaseTx(0)])
+    doAssert live.connectBlock(genesis, 0).isOk
+    check loadSnapshot(snapPath, live, regtest, @[AssumeutxoData(
+      height: baseHeight, hashSerialized: dump.txoutsetHash,
+      chainTxCount: 0'u64, blockhash: baseHash)]).success
+    writeSnapshotActivationIndex(live)
+    let rpc = mkRpc(live, regtest)
+
+    check rpcBlockHashAt(rpc, baseHeight) == displayHash(baseHash)
+    check rpcBlockHashAt(rpc, baseHeight - 1) ==
+      "error -1: Block not available (pruned data)"
+    check rpcBlockHashAt(rpc, baseHeight - 1) != displayHash(belowHash)
+    check rpcBlockHashAt(rpc, 1) ==
+      "error -1: Block not available (pruned data)"
+    check rpcBlockHashAt(rpc, baseHeight + 1) ==
+      "error -8: Block height out of range"
+    check rpcBlockHashAt(rpc, 0) == displayHash(getBlockHash(genesis))
+    live.close()
 
   test "non-vacuity: the tampered hash truly differs from the real chain hash":
     ## Guards against a vacuous reject test (e.g. if the tampered set happened
