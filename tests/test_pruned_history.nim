@@ -253,6 +253,26 @@ suite "pruned history honesty":
     check tip.kind == JString
     check tip.getStr().len == 64
 
+  test "getblockhash at a body-less tip answers; a body-less height below it does not":
+    ## A snapshot base is the tip with no body. The tip answers (it is
+    ## getbestblockhash), but a body-less height under it that still has
+    ## an index row keeps the -1 above.
+    let dbPath = freshDbPath()
+    var cs = newChainState(dbPath, regtestParams())
+    defer:
+      cs.close()
+      cleanupDb(dbPath)
+    discard seedPrefixGap(cs, floor = 10, tip = 20)
+    punchHoles(cs, 19, 20)
+    let rpc = rpcWithChainState(cs)
+    let tip = rpc.handleMethod("getblockhash", %*[20])
+    check tip.kind == JString
+    check tip.getStr() == rpc.handleMethod("getbestblockhash", %*[]).getStr()
+    check cs.db.getBlockHashByHeight(19).isSome
+    let below = rpc.rpcErr("getblockhash", %*[19])
+    check below.code == -1
+    check below.msg == "Block not available (pruned data)"
+
   test "discoverBodyFloor is 0 on a complete chain":
     let dbPath = freshDbPath()
     var cs = newChainState(dbPath, regtestParams())
