@@ -89,6 +89,9 @@ suite "walletprocesspsbt: Updater + Signer + Finalizer (Core v31.99)":
     )
     wm = newWalletManager(tempDir, cparams, cs)
     rpc.walletManager = wm
+    # No fee estimate on a fresh regtest node: like Core's regtest tests, pass
+    # -fallbackfee=0.0002 (20 sat/vB) or wallet spends refuse to pick a fee.
+    rpc.fallbackFeeRate = 20.0
     var pCreate = newJArray()
     pCreate.add(%"tw")
     discard rpc.handleMethod("createwallet", pCreate)
