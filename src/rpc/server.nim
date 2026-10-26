@@ -5202,6 +5202,19 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcDeserializationError,
       "TX decode failed. Make sure the tx has at least one input.")
 
+proc feeratePerKvbBtc*(feeSats: int64, vsize: int): float64 =
+  ## Core ValueFromAmount(CFeeRate(fee, vsize).GetFeePerK()): the rate in
+  ## BTC/kvB, from the integer sat/kvB (fee * 1000 / vsize, rounded down).
+  if vsize <= 0: return 0.0
+  float64(feeSats * 1000 div int64(vsize)) / 100_000_000.0
+
+proc satPerKvbToBtc*(satPerKvb: int64): float64 =
+  ## sat/kvB (Core CFeeRate::GetFeePerK) -> BTC/kvB (ValueFromAmount).
+  float64(satPerKvb) / 100_000_000.0
+
+proc wtxidHexOf(w: TxId): string =
+  reverseHex(toHex(array[32, byte](w)))
+
 proc testAcceptRejectReason*(reason: string): string =
   ## Map an internal mempool reject reason to the token Bitcoin Core surfaces on
   ## the testmempoolaccept RPC path.  Core remaps TX_MISSING_INPUTS to the bare
@@ -5223,7 +5236,7 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Returns: JSON array with one entry per transaction:
   ##   { "txid": hex, "wtxid": hex,
   ##     "allowed": true, "vsize": N,
-  ##       "fees": { "base": BTC, "effective-feerate": sat/vB,
+  ##       "fees": { "base": BTC, "effective-feerate": BTC/kvB,
   ##                 "effective-includes": [wtxid, ...] }
   ##   }
   ##   or on rejection:
@@ -5342,7 +5355,7 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
       txEntry["vsize"] = %vsize
       txEntry["fees"] = %*{
         "base": feeBtc,
-        "effective-feerate": feeSatPerVb,
+        "effective-feerate": feeratePerKvbBtc(int64(info.modifiedFee), vsize),
         "effective-includes": %*[wtxidHex]
       }
     else:
@@ -5353,90 +5366,71 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
 
   else:
     # ── Multi-tx (package) path ─────────────────────────────────────────────
-    # Run full package validation (usePackageFeerates=true for CPFP), then
-    # roll back all newly-added entries so the mempool is not mutated.
+    # Core ProcessNewPackage(test_accept=true) uses ATMPArgs::PackageTestAccept:
+    # NO package feerates (no CPFP), so every member is judged on its own
+    # feerate, and the first failure ends the run -- members after it carry
+    # only txid/wtxid.  Members that pass are added for real so a child can
+    # spend them, and the whole package is rolled back afterwards.
     var mp = rpc.mempool
-
-    # Record which txids are in the mempool before we call acceptPackage so we
-    # can remove anything that was freshly inserted.
-    var preExisting: seq[TxId]
-    for tx in txns:
-      if mp.contains(tx.txid()):
-        preExisting.add(tx.txid())
-
-    let pkgResult = mp.acceptPackage(txns, rpc.crypto, usePackageFeerates = true,
-                                     limitSize = false)
-
-    # Rollback: remove every tx that acceptPackage added (was not pre-existing).
-    for tx in txns:
-      let txid = tx.txid()
-      var wasPreExisting = false
-      for pe in preExisting:
-        if pe == txid:
-          wasPreExisting = true
-          break
-      if not wasPreExisting and mp.contains(txid):
-        mp.removeTransaction(txid)
-
-    # Build per-tx results
+    let singleArgs = AtmpArgs(
+      testAccept: false,
+      bypassLimits: false,
+      allowReplacement: false,
+      allowSiblingEviction: false,
+      packageFeerates: false,
+      packageSubmission: true,
+      clientMaxFeeRateSatKvB: 0.0
+    )
     let maxFeeRateSatPerVb = if maxFeeRate > 0:
                                maxFeeRate * 100_000_000.0 / 1000.0
                              else: 0.0
 
-    # If the package-level validation failed before we got per-tx results,
-    # mark all txs as rejected with the package error.
-    if pkgResult.txResults.len == 0:
-      for tx in txns:
-        let txid    = tx.txid()
-        let wtxid   = tx.wtxid()
-        let txidHex  = reverseHex(toHex(array[32, byte](txid)))
-        let wtxidHex = reverseHex(toHex(array[32, byte](wtxid)))
-        resultArr.add(%*{
-          "txid": txidHex,
-          "wtxid": wtxidHex,
-          "allowed": false,
-          "reject-reason": testAcceptRejectReason(pkgResult.error)
-        })
-      return resultArr
-
-    for txResult in pkgResult.txResults:
-      let txidHex  = reverseHex(toHex(array[32, byte](txResult.txid)))
-      let wtxidHex = reverseHex(toHex(array[32, byte](txResult.wtxid)))
-
-      var txEntry = %*{ "txid": txidHex, "wtxid": wtxidHex }
-
-      # Core: already-in-mempool is not "allowed" for testmempoolaccept
-      var rejectedAlreadyInMempool = false
-      for pe in preExisting:
-        if pe == txResult.txid:
-          rejectedAlreadyInMempool = true
-          break
-
-      if rejectedAlreadyInMempool:
+    var inserted: seq[TxId]
+    var stopped = false
+    for tx in txns:
+      let txid = tx.txid()
+      let wtxid = tx.wtxid()
+      var txEntry = %*{ "txid": reverseHex(toHex(array[32, byte](txid))),
+                        "wtxid": wtxidHexOf(wtxid) }
+      if stopped:
+        resultArr.add(txEntry)
+        continue
+      if mp.contains(txid):
+        # Core: already-in-mempool is a PreChecks failure.
         txEntry["allowed"] = %false
         txEntry["reject-reason"] = %"txn-already-in-mempool"
-      elif txResult.allowed:
-        let vsize = txResult.vsize
-        let feeBtc = float64(int64(txResult.fees)) / 100_000_000.0
-        let feeSatPerVb = if vsize > 0: float64(int64(txResult.fees)) / float64(vsize)
-                          else: 0.0
-
-        if maxFeeRate > 0 and feeSatPerVb > maxFeeRateSatPerVb:
-          txEntry["allowed"] = %false
-          txEntry["reject-reason"] = %"max-fee-exceeded"
-        else:
-          txEntry["allowed"] = %true
-          txEntry["vsize"] = %vsize
-          txEntry["fees"] = %*{
-            "base": feeBtc,
-            "effective-feerate": pkgResult.packageFeerate,
-            "effective-includes": newJArray()
-          }
-      else:
+        resultArr.add(txEntry)
+        stopped = true
+        continue
+      let res = mp.acceptTransactionWithArgs(tx, rpc.crypto, singleArgs)
+      if not res.isOk:
         txEntry["allowed"] = %false
-        txEntry["reject-reason"] = %testAcceptRejectReason(txResult.error)
-
+        txEntry["reject-reason"] = %testAcceptRejectReason(res.error)
+        resultArr.add(txEntry)
+        stopped = true
+        continue
+      inserted.add(txid)
+      let info = res.value
+      let feeSatPerVb = if info.vsize > 0: float64(int64(info.baseFee)) / float64(info.vsize)
+                        else: 0.0
+      if maxFeeRate > 0 and feeSatPerVb > maxFeeRateSatPerVb:
+        txEntry["allowed"] = %false
+        txEntry["reject-reason"] = %"max-fee-exceeded"
+        stopped = true
+      else:
+        txEntry["allowed"] = %true
+        txEntry["vsize"] = %info.vsize
+        txEntry["fees"] = %*{
+          "base": float64(int64(info.baseFee)) / 100_000_000.0,
+          "effective-feerate": feeratePerKvbBtc(int64(info.modifiedFee), info.vsize),
+          "effective-includes": %*[wtxidHexOf(wtxid)]
+        }
       resultArr.add(txEntry)
+
+    # Rollback, children before parents.
+    for k in countdown(inserted.high, 0):
+      if mp.contains(inserted[k]):
+        mp.removeTransaction(inserted[k])
 
   resultArr
 
@@ -5521,28 +5515,41 @@ proc handleSubmitPackage(rpc: RpcServer, params: JsonNode): JsonNode =
   var mp = rpc.mempool
   let pkgResult = mp.acceptPackage(txns, rpc.crypto, usePackageFeerates = true)
 
-  # Build tx_results object
+  # Build tx_results object -- Core rpc/mempool.cpp submitpackage: keyed by
+  # wtxid; each entry has txid plus ONE of other-wtxid / error / (vsize + fees).
   var txResults = newJObject()
-  for i, txResult in pkgResult.txResults:
-    let txidHex = reverseHex(toHex(array[32, byte](txResult.txid)))
-    let wtxidHex = reverseHex(toHex(array[32, byte](txResult.wtxid)))
-
-    var txResultObj = %*{
-      "txid": txidHex,
-      "wtxid": wtxidHex,
-      "vsize": txResult.vsize
-    }
-
-    if txResult.allowed:
-      # Calculate fee in BTC
-      let feeBtc = float64(int64(txResult.fees)) / 100_000_000.0
-      txResultObj["allowed"] = %true
-      txResultObj["fees"] = %*{
-        "base": feeBtc
+  if pkgResult.txResults.len == 0:
+    # Package-wide abort before any per-tx processing.
+    for tx in txns:
+      txResults[wtxidHexOf(tx.wtxid())] = %*{
+        "txid": reverseHex(toHex(array[32, byte](tx.txid()))),
+        "error": "package-not-validated"
       }
+  for txResult in pkgResult.txResults:
+    let txidHex = reverseHex(toHex(array[32, byte](txResult.txid)))
+    let wtxidHex = wtxidHexOf(txResult.wtxid)
+    var txResultObj = %*{ "txid": txidHex }
+
+    if txResult.differentWitness:
+      txResultObj["other-wtxid"] = %wtxidHexOf(txResult.otherWtxid)
+    elif txResult.allowed:
+      txResultObj["vsize"] = %txResult.vsize
+      var feesObj = %*{ "base": float64(int64(txResult.fees)) / 100_000_000.0 }
+      if txResult.hasEffective:
+        # Not provided for txs that were already in the mempool.
+        feesObj["effective-feerate"] = %satPerKvbToBtc(txResult.effectiveFeerate)
+        var includes = newJArray()
+        for w in txResult.effectiveIncludes:
+          includes.add(%wtxidHexOf(w))
+        feesObj["effective-includes"] = includes
+      txResultObj["fees"] = feesObj
     else:
-      txResultObj["allowed"] = %false
-      txResultObj["reject-reason"] = %txResult.error
+      # A member never validated (an earlier failure ended the run) has no
+      # error of its own; Core reports it as package-not-validated.
+      txResultObj["error"] =
+        %(if txResult.error.startsWith(MissingInputsToken): MissingInputsToken
+          elif txResult.error.len > 0: txResult.error
+          else: "package-not-validated")
 
     txResults[wtxidHex] = txResultObj
 

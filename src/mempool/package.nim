@@ -23,6 +23,12 @@ type
     vsize*: int
     fees*: Satoshi
     error*: string
+    inMempool*: bool          ## already in the mempool (Core MEMPOOL_ENTRY): no effective-feerate
+    differentWitness*: bool   ## same txid, other witness, in the mempool (Core DIFFERENT_WITNESS)
+    otherWtxid*: TxId         ## the mempool copy's wtxid when differentWitness
+    hasEffective*: bool       ## effectiveFeerate / effectiveIncludes are set (Core VALID result)
+    effectiveFeerate*: int64  ## sat/kvB, Core CFeeRate::GetFeePerK of the evaluated (sub)package
+    effectiveIncludes*: seq[TxId]  ## wtxids whose fees and vsizes went into effectiveFeerate
 
   PackageResult* = object
     valid*: bool
