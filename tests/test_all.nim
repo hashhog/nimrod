@@ -313,6 +313,7 @@ const IncludedTests = [
   "test_w99_net_processing",
   "test_wallet",
   "test_wallet_dispatch",
+  "test_wallet_fallbackfee",
   "test_wallet_persist",
   "test_wallet_phase2_segwitv0",
   "test_walletprocesspsbt",

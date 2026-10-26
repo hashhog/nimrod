@@ -44,6 +44,9 @@ type
     mempool*: Mempool
     peerManager*: PeerManager
     feeEstimator*: FeeEstimator
+    fallbackFeeRate*: float64            ## -fallbackfee in sat/vB used by wallet
+                                         ## spends when the estimator has no
+                                         ## data. 0 (Core's default) disables it.
     params*: ConsensusParams
     authUser*: string
     authPass*: string
@@ -10310,6 +10313,21 @@ proc handleGetBalances(rpc: RpcServer, params: JsonNode): JsonNode =
 # Wallet Send/Receive RPCs
 # ============================================================================
 
+proc walletFeeRate(rpc: RpcServer, confTarget: int): float64 =
+  ## Fee rate (sat/vB) for a wallet spend that was given no explicit rate.
+  ## Core wallet/fees.cpp GetMinimumFeeRate: the estimator's answer when it has
+  ## one, else -fallbackfee, else the spend fails (wallet/spend.cpp
+  ## CreateTransactionInternal, RPC_WALLET_INSUFFICIENT_FUNDS).
+  if rpc.feeEstimator != nil:
+    let est = rpc.feeEstimator.estimateFeeOrZero(confTarget)
+    if est > 0.0:
+      return est
+  if rpc.fallbackFeeRate > 0.0:
+    return rpc.fallbackFeeRate
+  raise newRpcError(RpcWalletInsufficientFunds,
+    "Fee estimation failed. Fallbackfee is disabled. " &
+    "Wait a few blocks or enable -fallbackfee.")
+
 proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Send an amount to a given address
   ## Reference: Bitcoin Core wallet/rpc/spend.cpp sendtoaddress
@@ -10376,11 +10394,7 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcMiscError, "wallet is locked; use walletpassphrase to unlock")
 
   # Get fee rate from fee estimator
-  var feeRate: float64
-  if rpc.feeEstimator != nil:
-    feeRate = rpc.feeEstimator.estimateFee(confTarget)
-  else:
-    feeRate = FallbackFeeRate
+  var feeRate = rpc.walletFeeRate(confTarget)
 
   # Create output
   let scriptPubKey = scriptPubKeyForAddress(destAddr)
@@ -10583,13 +10597,11 @@ proc handleSend(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParameter,
       "Invalid parameter, outputs are missing")
 
-  var feeRate = FallbackFeeRate
+  var feeRate = 0.0
   if params.len >= 4 and params[3].kind in {JInt, JFloat}:
     feeRate = params[3].getFloat()
-    if feeRate <= 0:
-      feeRate = FallbackFeeRate
-  elif rpc.feeEstimator != nil:
-    feeRate = rpc.feeEstimator.estimateFee(6)
+  if feeRate <= 0:
+    feeRate = rpc.walletFeeRate(6)
 
   var tx: Transaction
   try:
@@ -12469,10 +12481,7 @@ proc handleWalletCreateFundedPsbt(rpc: RpcServer,
       changeAddrOverride = opts["changeAddress"].getStr()
 
   if feeRate <= 0.0:
-    if rpc.feeEstimator != nil:
-      feeRate = rpc.feeEstimator.estimateFee(6)
-    else:
-      feeRate = FallbackFeeRate
+    feeRate = rpc.walletFeeRate(6)
 
   # ---- Build the unsigned, funded transaction ----
   var fundedTx: Transaction
@@ -13352,10 +13361,7 @@ proc handleFundRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParameter, "changePosition out of bounds")
 
   if feeRate <= 0.0:
-    if rpc.feeEstimator != nil:
-      feeRate = rpc.feeEstimator.estimateFee(6)
-    else:
-      feeRate = FallbackFeeRate
+    feeRate = rpc.walletFeeRate(6)
 
   # ---- 3. Fund via the existing coin-selection engine. ----
   # createTransaction takes the requested outputs, selects coins to cover
