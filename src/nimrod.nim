@@ -58,6 +58,9 @@ type
     metricsPort*: uint16  ## Prometheus metrics port (0 = disabled)
     ibdFlushInterval*: int ## Disk flush interval during IBD (0 = use default 2000)
     numVerifyWorkers*: int ## Script verify thread count for parallel IBD (0 = auto = CPU count)
+    fallbackFeeRate*: float64 ## --fallbackfee=<BTC/kvB>, stored in sat/vB. Wallet
+                          ## spends with no fee estimate use it; 0 (Core's
+                          ## default) disables the fallback and they fail.
     maxMempoolMb*: int    ## --maxmempool=<MB>: mempool memory budget in megabytes
                           ## (Core -maxmempool, default 300).
     dbcacheMiB*: int      ## --dbcache=<MiB>: UTXO cache budget in MiB (Core units).
@@ -312,6 +315,7 @@ proc defaultConfig*(): NimrodConfig =
     metricsPort: 9332,
     ibdFlushInterval: 0,  # 0 = use default (IbdBatchFlushInterval = 2000)
     numVerifyWorkers: 0,  # 0 = auto (CPU count via countProcessors())
+    fallbackFeeRate: 0.0,  # Core DEFAULT_FALLBACK_FEE = 0 (disabled)
     maxMempoolMb: 300,    # Core DEFAULT_MAX_MEMPOOL_SIZE_MB
     dbcacheMiB: 0,        # 0 = use compiled cache defaults (default-preserving)
     daemon: false,
@@ -421,6 +425,11 @@ proc loadConfigFile*(config: var NimrodConfig) =
       try:
         let v = parseInt(value)
         if v >= 0: config.maxMempoolMb = v
+      except ValueError: discard
+    of "fallbackfee":
+      try:
+        let v = parseFloat(value)
+        if v >= 0.0: config.fallbackFeeRate = v * 100_000.0  # BTC/kvB -> sat/vB
       except ValueError: discard
     of "dbcache":
       try:
@@ -583,6 +592,8 @@ Options:
   --verify-threads=N     Alias for --par (legacy name)
   --maxmempool=MB        Mempool memory budget in megabytes (default: 300). The pool
                          is trimmed to this against Core's DynamicMemoryUsage model.
+  --fallbackfee=BTC/kvB  Fee rate wallet spends use when fee estimation has no data
+                         (default: 0 = disabled; such spends then fail like Core's)
   --dbcache=N            UTXO cache budget in MiB, Bitcoin Core units (default: 0 =
                          compiled default ~2 GiB ceiling + 200000 IBD entry target;
                          only raises the cache, never shrinks below the default)
@@ -798,6 +809,16 @@ proc parseArgs*(cmdline: seq[string]): tuple[cmd: Command, config: NimrodConfig,
           result.config.maxMempoolMb = v
         except ValueError:
           echo "Invalid maxmempool: " & p.val
+          quit(1)
+      of "fallbackfee":
+        try:
+          let v = parseFloat(p.val)
+          if v < 0.0:
+            echo "fallbackfee must be a non-negative fee rate in BTC/kvB"
+            quit(1)
+          result.config.fallbackFeeRate = v * 100_000.0  # BTC/kvB -> sat/vB
+        except ValueError:
+          echo "Invalid fallbackfee: " & p.val
           quit(1)
       of "dbcache":
         try:
@@ -3293,6 +3314,7 @@ proc startNode*(config: NimrodConfig) {.async.} =
       config.rpcPassword,
       cookiePass
     )
+    state.rpcServer.fallbackFeeRate = config.fallbackFeeRate
     state.rpcServer.p2pQueue = state.p2pQueue  # before the RPC thread starts
     # Wire the wait-family tip notifier (Core KernelNotifications blockTip /
     # WaitTipChanged). Created once here; the chainstate fires its
