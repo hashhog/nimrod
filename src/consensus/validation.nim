@@ -258,6 +258,9 @@ proc bip22String*(e: ValidationError, blockVersion: int32 = 0'i32): string =
   # too-little-chainwork: header accepted before PRESYNC verified chain meets
   # nMinimumChainWork (validation.cpp:4229, BLOCK_HEADER_LOW_WORK).
   of veInsufficientChainWork: "too-little-chainwork"
+  # Unknown parent. Core AcceptBlockHeader (validation.cpp) ->
+  # state.Invalid(BLOCK_MISSING_PREV, "prev-blk-not-found").
+  of vePrevBlockMissing: "prev-blk-not-found"
   of veUtxoReadError: "utxo-read-error"
   of veScriptInternalError: "script-check-internal-error"
   of veOk: ""
