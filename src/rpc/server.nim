@@ -5368,7 +5368,7 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
         preExisting.add(tx.txid())
 
     let pkgResult = mp.acceptPackage(txns, rpc.crypto, usePackageFeerates = true,
-                                     limitSize = false)
+                                     limitSize = false, allowReplacement = false)
 
     # Rollback: remove every tx that acceptPackage added (was not pre-existing).
     for tx in txns:
@@ -5555,8 +5555,12 @@ proc handleSubmitPackage(rpc: RpcServer, params: JsonNode): JsonNode =
     "tx-results": txResults
   }
 
-  # Add replaced transactions info (empty for now, would need RBF tracking)
-  response["replaced-transactions"] = newJArray()
+  # Core: the txids every member's result replaced, in std::set order
+  # (acceptPackage already sorted them).
+  var replacedArr = newJArray()
+  for id in pkgResult.replaced:
+    replacedArr.add(%reverseHex(toHex(array[32, byte](id))))
+  response["replaced-transactions"] = replacedArr
 
   # If package was accepted, check maxfeerate
   if pkgResult.valid:
