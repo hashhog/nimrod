@@ -6811,7 +6811,8 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
                                              disconnectedTxs, newChainBlocks)
 
       # Map the outcome to byte-identical BIP-22 tokens:
-      #   sboRejected  -> the carried token ("rejected" or bip22String(error))
+      #   sboRejected  -> the carried token ("prev-blk-not-found" or
+      #                   bip22String(error))
       #   sboSideBranch -> "inconclusive" (stored, not best — or reorg deferred)
       #   sboReorged   -> success (JSON null) after the post-reorg refresh below.
       if isFatal():

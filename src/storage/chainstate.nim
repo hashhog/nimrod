@@ -4441,7 +4441,8 @@ type
     sboReorged      ## stored AND promoted: a reorg switched the active tip to
                     ## this branch (BIP-22 success / JSON null)
     sboRejected     ## not stored: unknown parent or validate-for-storage failed
-                    ## (`token` = "rejected" or the bip22String of the error)
+                    ## (`token` = "prev-blk-not-found" or the bip22String of
+                    ## the error)
 
 proc bip22RejectToken(reason: string): string =
   ## Return the leading BIP-22 reject token of `reason` — the substring before
@@ -4571,8 +4572,11 @@ proc acceptSideBranchBlock*(
   let prevHash = blk.header.prevBlock
   let prevIdxOpt = cs.db.getBlockIndex(prevHash)
   if prevIdxOpt.isNone:
-    # Previous block truly unknown — "rejected" is closest BIP-22 token.
-    return (sboRejected, "rejected")
+    # Previous block truly unknown. Core AcceptBlockHeader (validation.cpp)
+    # fails it BLOCK_MISSING_PREV "prev-blk-not-found", and submitblock reports
+    # that reason. Not a verdict on the block: blockFailureKindOfToken reads
+    # this token as undecided, the same as the "rejected" it replaces.
+    return (sboRejected, "prev-blk-not-found")
 
   let prevIdx = prevIdxOpt.get()
   let headerBytes = serialize(blk.header)
