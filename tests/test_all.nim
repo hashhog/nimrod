@@ -232,6 +232,7 @@ const IncludedTests = [
   "test_stale_peer",
   "test_standard",
   "test_storage",
+  "test_submitpackage_shape",
   "test_sync",
   "test_sync_tip_single_source",
   "test_t1_r5_parity",

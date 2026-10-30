@@ -1,7 +1,7 @@
 ## Transaction mempool
 ## Manages unconfirmed transactions with fee/size policy, CPFP tracking, and eviction
 
-import std/[tables, algorithm, options, times, sets, math, atomics]
+import std/[tables, algorithm, options, times, sets, math, atomics, strutils]
 import ../primitives/[types, serialize]
 import ../consensus/[params, validation]
 import ../storage/chainstate
@@ -95,6 +95,9 @@ type
     baseFee*: Satoshi
     modifiedFee*: Satoshi
     replaced*: HashSet[TxId]       ## conflicts evicted by this submission
+    sigopVsize*: int               ## Core ws.m_vsize: GetVirtualTransactionSize
+                                   ## with the sigop adjustment (-bytespersigop),
+                                   ## the vsize Core reports for package members
 
   Mempool* = ref object
     entries*: Table[TxId, MempoolEntry]
@@ -1733,6 +1736,7 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     baseFee: baseFee,
     modifiedFee: modifiedFee,
     replaced: conflictsToRemove,
+    sigopVsize: int((clusterSizeContribution(weight, txSigopCost) + 3) div 4),
   )
 
   # W96 GAP #11: m_test_accept — return AFTER all checks pass but BEFORE
@@ -3357,8 +3361,8 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
   ## test_accept never touches the pool.
   ##
   ## `allowReplacement` = false refuses any member that conflicts with the
-  ## pool (Core ATMPArgs::PackageTestAccept).  testmempoolaccept passes it:
-  ## a package RBF evicts its conflicts, which a test must never do.
+  ## pool and skips package RBF (Core ATMPArgs::PackageTestAccept): a
+  ## package RBF evicts its conflicts, which a test must never do.
 
   result = PackageResult(
     valid: false,
@@ -3427,215 +3431,35 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
     result.error = "missing-ephemeral-spends: " & ephemeralResult.error
     return result
 
-  # Calculate fees and validate each transaction
-  var fees: seq[Satoshi]
-  var txids: seq[TxId]
-  var allValid = true
-
-  # First pass: calculate fees for each transaction
-  # We need to handle intra-package dependencies
-  var packageUtxos = initTable[OutPoint, TxOut]()  # UTXOs created by earlier txs in package
-
-  for i, tx in txns:
-    let txid = tx.txid()
-    txids.add(txid)
-
-    var txResult = TxResult(
-      txid: txid,
-      wtxid: tx.wtxid(),
-      allowed: false,
-      vsize: (weights[i] + 3) div 4,
-      fees: Satoshi(0),
-      error: ""
-    )
-
-    # Check if already in mempool
-    if txid in mp.entries:
-      txResult.allowed = true
-      txResult.fees = mp.entries[txid].fee
-      fees.add(txResult.fees)
-      result.txResults.add(txResult)
-      continue
-
-    # Calculate fee
-    var inputValue: int64 = 0
-    var inputsValid = true
-
-    for input in tx.inputs:
-      # Check chainstate first
-      let utxo = mp.chainState.getUtxo(input.prevOut)
-      if utxo.isSome:
-        inputValue += int64(utxo.get().output.value)
-      # Check package UTXOs (from earlier txs in this package)
-      elif input.prevOut in packageUtxos:
-        inputValue += int64(packageUtxos[input.prevOut].value)
-      # Check mempool for unconfirmed parent
-      elif input.prevOut.txid in mp.entries:
-        let parentEntry = mp.entries[input.prevOut.txid]
-        if int(input.prevOut.vout) < parentEntry.tx.outputs.len:
-          inputValue += int64(parentEntry.tx.outputs[input.prevOut.vout].value)
-        else:
-          inputsValid = false
-          txResult.error = "invalid output index for mempool parent"
-          break
-      else:
-        inputsValid = false
-        txResult.error = "input not found: " & $input.prevOut.txid
-        break
-
-    if not inputsValid:
-      allValid = false
-      fees.add(Satoshi(0))
-      result.txResults.add(txResult)
-      continue
-
-    var outputValue: int64 = 0
-    for output in tx.outputs:
-      outputValue += int64(output.value)
-
-    if inputValue < outputValue:
-      txResult.error = "outputs exceed inputs"
-      allValid = false
-      fees.add(Satoshi(0))
-      result.txResults.add(txResult)
-      continue
-
-    let fee = Satoshi(inputValue - outputValue)
-    txResult.fees = fee
-    fees.add(fee)
-
-    # Add this tx's outputs to package UTXOs for later txs
-    for j, output in tx.outputs:
-      let outpoint = OutPoint(txid: txid, vout: uint32(j))
-      packageUtxos[outpoint] = output
-
-    txResult.allowed = true
-    result.txResults.add(txResult)
-
-  # Calculate package fee rate
-  let packageFeerate = calculatePackageFeerate(fees, weights)
-  result.packageFeerate = packageFeerate
-
-  # Check fee rate policy — must pass max(minFeeRate, rollingMinFee) gate.
-  let pkgRollingFloor = mp.getMinFee()
-  let pkgEffectiveMin = max(mp.minFeeRate, pkgRollingFloor)
-
-  # When using package feerates, the combined package rate must meet the minimum
-  if usePackageFeerates:
-    if packageFeerate < pkgEffectiveMin:
-      result.state = pvPolicy
-      result.error = "package fee rate " & $packageFeerate & " below minimum " & $pkgEffectiveMin
-      return result
-  else:
-    # Check individual fee rates
-    for i in 0 ..< txns.len:
-      if result.txResults[i].allowed:
-        let individualRate = float64(int64(fees[i])) / float64((weights[i] + 3) div 4)
-        if individualRate < pkgEffectiveMin:
-          result.txResults[i].allowed = false
-          result.txResults[i].error = "fee rate " & $individualRate & " below minimum"
-          allValid = false
-
-  if not allValid:
-    result.state = pvTx
-    result.error = "one or more transactions failed validation"
-    return result
-
-  # Second pass: route every member through the SAME single-tx admission
-  # pipeline (acceptTransactionWithArgs) the P2P/RPC single-tx path uses.
-  #
-  # DoS fix (package-relay PreChecks BYPASS): the previous two-pass logic
-  # inserted package members into the mempool after running only fee math + a
-  # bare verifyScript loop, silently skipping every other PreCheck the
-  # single-tx path enforces — IsStandardTx (version/dust/scriptSig/
-  # scriptPubKey/bare-multisig), IsWitnessStandard, ValidateInputsStandardness,
-  # the MAX_P2SH_SIGOPS + sigop-cost caps, BIP-68 sequence locks, the
-  # final-tx (BIP-113) check, RBF conflict detection (findConflicts +
-  # checkRbfRules), TRUC inheritance, the witness-stripped guard, and the
-  # consensus-flag script re-verification.  An attacker could smuggle a
-  # non-standard / conflicting / invalid-script tx into the mempool (and thus
-  # into relay) by wrapping it in a submitpackage / pkgtxns call.
-  #
-  # Core runs full PreChecks for EVERY package member
-  # (validation.cpp AcceptMultipleTransactionsInternal:1432-1556 invokes
-  # PreChecks per member, then PolicyScriptChecks at :1538).  We now do the
-  # same by calling acceptTransactionWithArgs in package (topological) order so
-  # an intra-package parent is already in mp.entries when its child resolves
-  # inputs.
-  #
-  # CPFP PRESERVED: the per-member AtmpArgs set packageFeerates=true, which is
-  # the ONLY thing that changes vs. a normal single-tx submission — it skips
-  # the per-tx absolute + rolling min-fee floor (mempool.nim GAP #6 / GAP #12,
-  # Core validation.cpp:948) because step 6 above already validated the
-  # AGGREGATE package feerate against the relay floor.  So a low-fee parent
-  # bailed out by a high-fee child still enters; all standardness/dust/script/
-  # RBF gates still run.  These flags mirror Core's
-  # ATMPArgs::PackageChildWithParents (allow_replacement=true,
-  # allow_sibling_eviction=false, package_submission=true,
-  # package_feerates=true; validation.cpp:515-528).
-  let memberArgs = AtmpArgs(
+  # Phase 1 -- Core MemPoolAccept::AcceptPackage (validation.cpp:1622-1700):
+  # every member that is not yet in the pool is first submitted ON ITS OWN, in
+  # package order.  Members that pass stay in the mempool for good (their fees
+  # are used once, so they are not part of the package evaluation).  Only a
+  # member that fails for feerate (TX_RECONSIDERABLE) or missing inputs is
+  # retried below as part of a sub-package; any other failure cannot be cured by
+  # a child, so the package is marked failed ("transaction failed") and the
+  # remaining members are still tried on their own.
+  let singleArgs = AtmpArgs(
     testAccept: false,
     bypassLimits: false,
     allowReplacement: allowReplacement,
     allowSiblingEviction: false,  # Core: sibling-eviction is single-tx only
-    packageFeerates: true,        # CPFP: skip the per-tx fee floor (GAP #6/#12)
+    packageFeerates: false,
     packageSubmission: true,      # no per-member LimitMempoolSize, see below
     clientMaxFeeRateSatKvB: 0.0,
   )
-
-  # Package RBF -- Core AcceptMultipleTransactionsInternal runs
-  # PackageRBFChecks when any member it evaluates conflicts with the pool
-  # (m_subpackage.m_rbf), INSTEAD of the per-tx ReplacementChecks: a parent
-  # that cannot replace on its own fees may replace on the package's.  The
-  # checks run before anything is touched; once they pass, the conflicts are
-  # removed (Core stages them in the changeset) and the members go in on the
-  # post-replacement pool.  If a member then fails, the conflicts are put back.
-  var restoreOnFailure: seq[Transaction]
-  var replacedIds = initHashSet[TxId]()
-  block packageRbf:
-    if not allowReplacement:
-      break packageRbf
-    var evalTxns: seq[Transaction]
-    var directConflicts = initHashSet[TxId]()
-    var conflicting: seq[int]
-    for i, tx in txns:
-      if txids[i] in mp.entries:
-        continue
-      evalTxns.add(tx)
-      let own = mp.findConflicts(tx)
-      if own.len > 0:
-        conflicting.add(i)
-      for c in own:
-        directConflicts.incl(c)
-    # A lone conflicting member is a single-tx replacement (Core
-    # AcceptSubPackage of one tx): acceptTransactionWithArgs judges it.
-    if directConflicts.len == 0 or evalTxns.len < 2:
-      break packageRbf
-    let rbf = mp.packageRbfChecks(evalTxns, directConflicts)
-    if not rbf.isOk:
-      result.state = pvPolicy
-      result.error = rbf.error
-      # The members whose replacement was refused carry the reason.
-      for i in conflicting:
-        result.txResults[i].allowed = false
-        result.txResults[i].error = rbf.error
-      if limitSize:
-        mp.limitMempoolSize()
-      return result
-    replacedIds = rbf.value
-    # Removing a conflict can cascade to an ephemeral-dust parent; snapshot
-    # the conflicts and their ancestors so a rollback restores whatever went.
-    var watch = replacedIds
-    for c in replacedIds:
-      if c in mp.entries:
-        for a in mp.calculateAncestors(mp.entries[c].tx):
-          watch.incl(a)
-    let snapshot = mp.topoOrder(watch)
-    mp.removeConflicts(replacedIds)
-    for tx in snapshot:
-      if tx.txid() notin mp.entries:
-        restoreOnFailure.add(tx)
-
+  # Sub-package members: same flags as Core ATMPArgs::PackageChildWithParents
+  # (validation.cpp:515-528) -- packageFeerates skips the per-tx fee floor
+  # (GAP #6/#12) because the aggregate feerate is checked against it first.
+  let memberArgs = AtmpArgs(
+    testAccept: false,
+    bypassLimits: false,
+    allowReplacement: allowReplacement,
+    allowSiblingEviction: false,
+    packageFeerates: true,
+    packageSubmission: true,
+    clientMaxFeeRateSatKvB: 0.0,
+  )
   # Re-admit what a failed package RBF removed, parents first.  They were in
   # the pool a moment ago against the same tip, so bypass the fee floor and
   # limits the way a reorg re-add does.
@@ -3648,48 +3472,246 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
     packageSubmission: true,
     clientMaxFeeRateSatKvB: 0.0,
   )
+  # A package-level reject from the sub-package (Core's package_state of
+  # AcceptSubPackage, e.g. a PackageRBFChecks failure) is the package_msg.
+  var subPackageError = ""
 
-  # Track members WE inserted so the package is atomic: roll back in reverse
-  # (children before parents) on any mid-package rejection.
-  var inserted: seq[TxId]
+  var txids: seq[TxId]
+  var deferred: seq[int]
+  var quitEarly = false
+  var anyFailed = false
 
   for i, tx in txns:
-    let txid = txids[i]
+    let txid = tx.txid()
+    txids.add(txid)
+    result.txResults.add(TxResult(
+      txid: txid, wtxid: tx.wtxid(), allowed: false,
+      vsize: (weights[i] + 3) div 4, fees: Satoshi(0), error: ""))
 
-    # Already-in-mempool members are not re-validated; they count as part of
-    # the package (Core skips them in AcceptMultipleTransactions).
     if txid in mp.entries:
-      result.txResults[i].allowed = true
+      # Core: exact wtxid in the pool -> MempoolTx; same txid, other witness
+      # -> MempoolTxDifferentWitness.  Neither is re-validated.
+      let entry = mp.entries[txid]
+      if entry.tx.wtxid() == result.txResults[i].wtxid:
+        result.txResults[i].allowed = true
+        result.txResults[i].inMempool = true
+        result.txResults[i].fees = entry.fee
+        result.txResults[i].vsize =
+          int((clusterSizeContribution(entry.weight, entry.sigopCost) + 3) div 4)
+      else:
+        result.txResults[i].differentWitness = true
+        result.txResults[i].otherWtxid = entry.tx.wtxid()
       continue
 
-    let memberRes = acceptTransactionWithArgs(mp, tx, crypto, memberArgs)
-    if not memberRes.isOk:
-      result.txResults[i].allowed = false
-      result.txResults[i].error = memberRes.error
-      result.state = pvTx
-      result.error = "package member " & $i & " rejected: " & memberRes.error
-      # Atomic rollback: undo everything we admitted so far, children first.
-      for k in countdown(inserted.high, 0):
-        mp.removeTransaction(inserted[k])
-      for removedTx in restoreOnFailure:
-        discard acceptTransactionWithArgs(mp, removedTx, crypto, restoreArgs)
-      # Core AcceptPackage calls LimitMempoolSize whatever the outcome.
-      if limitSize:
-        mp.limitMempoolSize()
-      return result
+    let res = acceptTransactionWithArgs(mp, tx, crypto, singleArgs)
+    if res.isOk:
+      let info = res.value
+      result.txResults[i].allowed = true
+      result.txResults[i].fees = info.baseFee
+      # Core reports the sigop-adjusted vsize (ws.m_vsize) and prices the
+      # effective feerate on it.
+      result.txResults[i].vsize = info.sigopVsize
+      result.txResults[i].hasEffective = true
+      result.txResults[i].effectiveFeerate =
+        if info.sigopVsize > 0: int64(info.modifiedFee) * 1000 div int64(info.sigopVsize)
+        else: 0'i64
+      result.txResults[i].effectiveIncludes = @[result.txResults[i].wtxid]
+      continue
 
-    # Surface the authoritative fee/vsize the single-tx path computed (it
-    # accounts for sigop-adjusted vsize + modified fees), and mark allowed.
-    result.txResults[i].allowed = true
-    result.txResults[i].fees = memberRes.value.baseFee
-    result.txResults[i].vsize = memberRes.value.vsize
-    inserted.add(txid)
+    let reason = res.error
+    result.txResults[i].error = reason
+    anyFailed = true
+    let reconsiderable = reason.startsWith("min relay fee not met") or
+                         reason.startsWith("mempool min fee not met") or
+                         reason.startsWith("insufficient fee")
+    let missing = reason.startsWith(MissingInputsToken)
+    if txns.len == 1 or not (reconsiderable or missing):
+      quitEarly = true
+    else:
+      deferred.add(i)
 
-  result.valid = true
-  result.state = pvUnset
-  for id in replacedIds:
-    result.replaced.add(id)
-  txidSetOrder(result.replaced)
+  # Phase 2 -- evaluate the deferred members together (Core AcceptSubPackage on
+  # txns_package_eval).  A single deferred member is just its phase-1 result.
+  if usePackageFeerates and not quitEarly and deferred.len > 1:
+    var subFees: seq[Satoshi]
+    var subWeights: seq[int]
+    var subUtxos = initTable[OutPoint, TxOut]()
+    var preChecksOk = true
+    for i in deferred:
+      let tx = txns[i]
+      var inputValue: int64 = 0
+      var missingInput = false
+      for input in tx.inputs:
+        let utxo = mp.chainState.getUtxo(input.prevOut)
+        if utxo.isSome:
+          inputValue += int64(utxo.get().output.value)
+        elif input.prevOut in subUtxos:
+          inputValue += int64(subUtxos[input.prevOut].value)
+        elif input.prevOut.txid in mp.entries and
+             int(input.prevOut.vout) < mp.entries[input.prevOut.txid].tx.outputs.len:
+          inputValue += int64(mp.entries[input.prevOut.txid].tx.outputs[input.prevOut.vout].value)
+        else:
+          missingInput = true
+          break
+      if missingInput:
+        # Core PreChecks fails fast: only this member gets a fresh result.
+        result.txResults[i].error = MissingInputsToken
+        preChecksOk = false
+        break
+      var outputValue: int64 = 0
+      for output in tx.outputs:
+        outputValue += int64(output.value)
+      if inputValue < outputValue:
+        result.txResults[i].error = "bad-txns-in-belowout"
+        preChecksOk = false
+        break
+      subFees.add(Satoshi(inputValue - outputValue))
+      subWeights.add(weights[i])
+      for j, output in tx.outputs:
+        subUtxos[OutPoint(txid: txids[i], vout: uint32(j))] = output
+
+    if preChecksOk:
+      let subFeerate = calculatePackageFeerate(subFees, subWeights)
+      result.packageFeerate = subFeerate
+      let rollingFloor = mp.getMinFee()
+      let effectiveMin = max(mp.minFeeRate, rollingFloor)
+      if subFeerate < effectiveMin:
+        # Core: FeeFailure recorded on the LAST sub-package member only.
+        result.txResults[deferred[^1]].error =
+          if subFeerate < rollingFloor: "mempool min fee not met"
+          else: "min relay fee not met"
+      else:
+        # Package RBF -- Core AcceptMultipleTransactionsInternal runs
+        # PackageRBFChecks when a sub-package member conflicts with the pool
+        # (m_subpackage.m_rbf), instead of the per-tx ReplacementChecks: a
+        # parent that cannot replace on its own fees may replace on the
+        # package's.  The checks run before anything is touched; once they
+        # pass, the conflicts are removed (Core stages them in the changeset)
+        # and the members go in on the post-replacement pool.  If a member
+        # then fails, the conflicts are put back.
+        var subTxns: seq[Transaction]
+        var directConflicts = initHashSet[TxId]()
+        for i in deferred:
+          subTxns.add(txns[i])
+          for c in mp.findConflicts(txns[i]):
+            directConflicts.incl(c)
+        var replacedIds = initHashSet[TxId]()
+        var restoreOnFailure: seq[Transaction]
+        var rbfOk = true
+        if allowReplacement and directConflicts.len > 0:
+          let rbf = mp.packageRbfChecks(subTxns, directConflicts)
+          if not rbf.isOk:
+            # Core returns no per-tx results here: the phase-1 ones stand.
+            rbfOk = false
+            subPackageError = rbf.error
+          else:
+            replacedIds = rbf.value
+            # Removing a conflict can cascade to an ephemeral-dust parent;
+            # snapshot the conflicts and their ancestors so a rollback
+            # restores whatever went.
+            var watch = replacedIds
+            for c in replacedIds:
+              if c in mp.entries:
+                for a in mp.calculateAncestors(mp.entries[c].tx):
+                  watch.incl(a)
+            let snapshot = mp.topoOrder(watch)
+            mp.removeConflicts(replacedIds)
+            for tx in snapshot:
+              if tx.txid() notin mp.entries:
+                restoreOnFailure.add(tx)
+        # Admit the sub-package atomically: on a mid-package rejection undo the
+        # sub-package members (children first); phase-1 acceptances stay.
+        var inserted: seq[TxId]
+        var failedAt = -1
+        for i in (if rbfOk: deferred else: @[]):
+          let memberRes = acceptTransactionWithArgs(mp, txns[i], crypto, memberArgs)
+          if not memberRes.isOk:
+            result.txResults[i].error = memberRes.error
+            failedAt = i
+            break
+          result.txResults[i].fees = memberRes.value.baseFee
+          result.txResults[i].vsize = memberRes.value.sigopVsize
+          inserted.add(txids[i])
+        if not rbfOk:
+          discard
+        elif failedAt >= 0:
+          for k in countdown(inserted.high, 0):
+            mp.removeTransaction(inserted[k])
+          for removedTx in restoreOnFailure:
+            discard acceptTransactionWithArgs(mp, removedTx, crypto, restoreArgs)
+        else:
+          for id in replacedIds:
+            result.replaced.add(id)
+          txidSetOrder(result.replaced)
+          var totalFee: int64 = 0
+          var totalVsize: int64 = 0
+          var includes: seq[TxId]
+          for i in deferred:
+            totalFee += int64(result.txResults[i].fees)
+            totalVsize += int64(result.txResults[i].vsize)
+            includes.add(result.txResults[i].wtxid)
+          let effective = if totalVsize > 0: totalFee * 1000 div totalVsize else: 0'i64
+          for i in deferred:
+            result.txResults[i].allowed = true
+            result.txResults[i].error = ""
+            result.txResults[i].hasEffective = true
+            result.txResults[i].effectiveFeerate = effective
+            result.txResults[i].effectiveIncludes = includes
+          anyFailed = false
+          for r in result.txResults:
+            if not r.allowed and not r.differentWitness:
+              anyFailed = true
+
+  # Package feerate over every member whose fee is computable (the RPC maxfeerate
+  # gate reads it; it is reported even when admission failed).  Members already
+  # in the pool contribute their entry fee; the rest are priced from their
+  # inputs (confirmed UTXOs, pool parents, earlier package outputs).
+  if result.packageFeerate == 0.0:
+    var allFees: seq[Satoshi]
+    var allWeights: seq[int]
+    var pkgOutputs = initTable[OutPoint, TxOut]()
+    for i, tx in txns:
+      var fee = -1'i64
+      if result.txResults[i].inMempool:
+        fee = int64(result.txResults[i].fees)
+      else:
+        var inputValue: int64 = 0
+        var known = true
+        for input in tx.inputs:
+          let utxo = mp.chainState.getUtxo(input.prevOut)
+          if utxo.isSome:
+            inputValue += int64(utxo.get().output.value)
+          elif input.prevOut in pkgOutputs:
+            inputValue += int64(pkgOutputs[input.prevOut].value)
+          elif input.prevOut.txid in mp.entries and
+               int(input.prevOut.vout) < mp.entries[input.prevOut.txid].tx.outputs.len:
+            inputValue += int64(mp.entries[input.prevOut.txid].tx.outputs[input.prevOut.vout].value)
+          else:
+            known = false
+            break
+        if known:
+          var outputValue: int64 = 0
+          for output in tx.outputs:
+            outputValue += int64(output.value)
+          if inputValue >= outputValue:
+            fee = inputValue - outputValue
+      for j, output in tx.outputs:
+        pkgOutputs[OutPoint(txid: txids[i], vout: uint32(j))] = output
+      if fee >= 0:
+        allFees.add(Satoshi(fee))
+        allWeights.add(weights[i])
+    if allFees.len > 0:
+      result.packageFeerate = calculatePackageFeerate(allFees, allWeights)
+
+  result.valid = not anyFailed
+  if anyFailed and subPackageError.len > 0:
+    result.state = pvPolicy
+    result.error = subPackageError
+  elif anyFailed:
+    result.state = pvTx
+    result.error = "transaction failed"
+  else:
+    result.state = pvUnset
 
   # Core AcceptPackage (validation.cpp:1727-1765): LimitMempoolSize ONCE, after
   # every member is in, so a child's fee counts for its parent's chunk.  Any
@@ -3700,6 +3722,8 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
     for i, txid in txids:
       if result.txResults[i].allowed and txid notin mp.entries:
         result.txResults[i].allowed = false
+        result.txResults[i].hasEffective = false
+        result.txResults[i].inMempool = false
         result.txResults[i].error = "mempool full"
         result.valid = false
         result.state = pvTx
