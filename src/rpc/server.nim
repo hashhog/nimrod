@@ -5841,8 +5841,9 @@ proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
 
     for peer in rpc.peerManager.getReadyPeers():
       # Calculate connection time in seconds
-      let connTime = if peer.lastSeen.toUnix() > 0:
-        now - (now - peer.lastSeen.toUnix())  # Connection start time
+      # Fixed at connect (Core CNode::m_connected); lastSeen moves with traffic.
+      let connTime = if peer.connectedAt.toUnix() > 0:
+        peer.connectedAt.toUnix()
       else:
         now
 
