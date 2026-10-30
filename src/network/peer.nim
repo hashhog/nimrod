@@ -292,7 +292,9 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     headersRequestTime: now,
     syncStarted: false,
     chainSyncState: ChainSyncState(),
-    blocksInFlight: 0
+    blocksInFlight: 0,
+    # Overwritten by connect / inbound accept once the socket is up.
+    connectedAt: stdtimes.getTime()
   )
 
 proc handshakeTimeoutDur(peer: Peer): ctimer.Duration =

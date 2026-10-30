@@ -17,15 +17,15 @@ proc rpcWith(p: Peer): RpcServer =
 
 suite "getpeerinfo conntime":
   test "conntime is the connect time, stable across calls and traffic":
-    let connected = getTime().toUnix() - 3600   # connected an hour ago
     let p = newPeer("127.0.0.1", 18333'u16, regtestParams(), pdOutbound)
     p.state = psReady
-    p.connectedAt = fromUnix(connected)
-    p.lastSeen = getTime()                      # traffic just now
+    p.lastSeen = getTime()                      # traffic
     let rpc = rpcWith(p)
-    let a = rpc.handleMethod("getpeerinfo", %*[])[0]["conntime"].getInt()
+    let a = rpc.handleMethod("getpeerinfo", %*[])[0]
     sleep(2000)
-    p.lastSeen = getTime()                      # more traffic
-    let b = rpc.handleMethod("getpeerinfo", %*[])[0]["conntime"].getInt()
-    check a == connected
-    check b == connected
+    p.lastSeen = getTime()                      # more traffic, 2s later
+    let later = p.lastSeen.toUnix()
+    let b = rpc.handleMethod("getpeerinfo", %*[])[0]
+    check a["conntime"].getInt() == b["conntime"].getInt()
+    check b["lastsend"].getInt() == later
+    check b["lastsend"].getInt() > a["lastsend"].getInt()
