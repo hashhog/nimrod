@@ -117,6 +117,7 @@ type
     userAgent*: string
     startHeight*: int32
     # Timing
+    connectedAt*: stdtimes.Time  # set once when the socket is established (Core m_connected)
     lastSeen*: stdtimes.Time
     lastPing*: stdtimes.Time
     pingNonce*: uint64
@@ -291,7 +292,9 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     headersRequestTime: now,
     syncStarted: false,
     chainSyncState: ChainSyncState(),
-    blocksInFlight: 0
+    blocksInFlight: 0,
+    # Overwritten by connect / inbound accept once the socket is up.
+    connectedAt: stdtimes.getTime()
   )
 
 proc handshakeTimeoutDur(peer: Peer): ctimer.Duration =
@@ -336,6 +339,7 @@ proc connect*(peer: Peer): Future[bool] {.async.} =
       # would then stall the serial outbound-dial loop for two minutes.
       peer.transport = await connect(ta).wait(ctimer.seconds(ConnectTimeoutSec))
     peer.state = psConnected
+    peer.connectedAt = stdtimes.getTime()
     peer.lastSeen = stdtimes.getTime()
     info "connected to peer", peer = $peer,
          viaProxy = (peer.proxyManager != nil)
