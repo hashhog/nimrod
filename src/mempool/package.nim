@@ -30,6 +30,7 @@ type
     error*: string
     txResults*: seq[TxResult]
     packageFeerate*: float64  ## sat/vbyte
+    replaced*: seq[TxId]      ## txs evicted by a package RBF (Core m_replaced_transactions)
 
   ## Package to be validated - tracks sender info for misbehavior scoring
   PackageToValidate* = object

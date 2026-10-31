@@ -250,22 +250,27 @@ proc estimateFeeForHorizon*(hs: HorizonStats, targetBlocks: int): float64 =
 
   return 0.0
 
-proc estimateFee*(fe: FeeEstimator, targetBlocks: int): float64 =
-  ## Estimate the fee rate (sat/vbyte) needed to confirm within targetBlocks.
-  ## Dispatches to SHORT (<= 12), MED (<= 48), or LONG (<= 1008) horizon.
-  ## Returns FallbackFeeRate if insufficient data.
+proc estimateFeeOrZero*(fe: FeeEstimator, targetBlocks: int): float64 =
+  ## Fee rate (sat/vbyte) needed to confirm within targetBlocks, or 0.0 when
+  ## the estimator has no data for that target. Dispatches to SHORT (<= 12),
+  ## MED (<= 48), or LONG (<= 1008) horizon. Wallet spends use this so that an
+  ## absent estimate is visible to the caller (Core: no estimate -> -fallbackfee
+  ## or an error), instead of being papered over with FallbackFeeRate.
 
   let target = min(max(targetBlocks, 1), MaxTargetBlocks)
 
   # Select the appropriate horizon
-  let rate =
-    if target <= SHORT_MAX_TARGET:
-      estimateFeeForHorizon(fe.shortHorizon, target)
-    elif target <= MED_MAX_TARGET:
-      estimateFeeForHorizon(fe.medHorizon, target)
-    else:
-      estimateFeeForHorizon(fe.longHorizon, target)
+  if target <= SHORT_MAX_TARGET:
+    estimateFeeForHorizon(fe.shortHorizon, target)
+  elif target <= MED_MAX_TARGET:
+    estimateFeeForHorizon(fe.medHorizon, target)
+  else:
+    estimateFeeForHorizon(fe.longHorizon, target)
 
+proc estimateFee*(fe: FeeEstimator, targetBlocks: int): float64 =
+  ## Estimate the fee rate (sat/vbyte) needed to confirm within targetBlocks.
+  ## Returns FallbackFeeRate if insufficient data.
+  let rate = fe.estimateFeeOrZero(targetBlocks)
   if rate <= 0.0:
     return FallbackFeeRate
   rate

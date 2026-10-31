@@ -2951,6 +2951,92 @@ proc calculateConflictFees*(mp: Mempool, allConflicts: HashSet[TxId]): (Satoshi,
       totalVsize += (entry.weight + 3) div 4  # Round up to vsize
   (Satoshi(totalFee), totalVsize)
 
+proc rbfDiagramImproves(mp: Mempool, conflicts, allConflicts: HashSet[TxId],
+                        replacementFee: int64, replacementVsize: int,
+                        replacementParents: seq[TxId],
+                        sigopAdjusted = false): bool =
+  ## Rule #8 (ImprovesFeerateDiagram): true when replacing `allConflicts` by a
+  ## chunk of `replacementFee` / `replacementVsize` strictly improves the
+  ## feerate diagram.  `sigopAdjusted` sizes the evicted entries the way Core's
+  ## TxGraph does (GetSigOpsAdjustedWeight); the package-RBF path uses it.
+  var cm = newClusterManager()
+  # Collect the universe of txids whose topology matters for this RBF:
+  #  - every directly conflicting tx + every descendant (allConflicts)
+  #  - every in-mempool ancestor of each conflicting tx (so CPFP /
+  #    chain context is preserved when validateRbfDiagram simulates
+  #    removing the conflicts)
+  var universe = initHashSet[TxId]()
+  for txid in allConflicts:
+    universe.incl(txid)
+  for conflictTxid in conflicts:
+    if conflictTxid in mp.entries:
+      let conflictTx = mp.entries[conflictTxid].tx
+      for ancTxid in mp.calculateAncestors(conflictTx):
+        universe.incl(ancTxid)
+  # Add each tx to the transient cluster manager in a topological order
+  # (parents before children). Since `addTransaction` infers cluster
+  # membership from already-present parent txids, we iterate until every
+  # tx whose parents are present has been added.
+  var pending: seq[TxId]
+  for txid in universe:
+    pending.add(txid)
+  var added = initHashSet[TxId]()
+  # Bounded passes — universe.len is at most MaxReplacementCandidates +
+  # ancestor count, well below any pathological loop bound.
+  for _ in 0 ..< (universe.len + 1):
+    if pending.len == 0:
+      break
+    var nextPending: seq[TxId]
+    for txid in pending:
+      if txid notin mp.entries:
+        continue
+      let entry = mp.entries[txid]
+      # Determine in-universe parents (only edges that survive within the
+      # transient cluster contribute to the diagram).
+      var parents: seq[TxId]
+      var allParentsReady = true
+      for input in entry.tx.inputs:
+        let parentTxid = input.prevOut.txid
+        if parentTxid in universe:
+          if parentTxid notin added:
+            allParentsReady = false
+            break
+          parents.add(parentTxid)
+      if not allParentsReady:
+        nextPending.add(txid)
+        continue
+      let vsize =
+        if sigopAdjusted: int((clusterSizeContribution(entry.weight, entry.sigopCost) + 3) div 4)
+        else: (entry.weight + 3) div 4
+      if vsize <= 0:
+        added.incl(txid)
+        continue
+      discard cm.addTransaction(txid, int64(entry.fee), vsize, parents)
+      added.incl(txid)
+    if nextPending.len == pending.len:
+      # No progress (cycle or missing parent edge) — bail out of the loop
+      # and let validateRbfDiagram work with what we managed to add.
+      break
+    pending = nextPending
+  # Replacement's parents in the universe (in-mempool ancestors of the
+  # new tx that aren't being evicted).
+  var inUniverseParents: seq[TxId]
+  for parentTxid in replacementParents:
+    if parentTxid in universe and parentTxid notin allConflicts:
+      inUniverseParents.add(parentTxid)
+  let conflictTxidsSeq = block:
+    var s: seq[TxId]
+    for txid in allConflicts: s.add(txid)
+    s
+  let diagRes = cm.validateRbfDiagram(conflictTxidsSeq,
+                                      replacementFee, replacementVsize,
+                                      inUniverseParents)
+  # Strict-gt: validateRbfDiagram returns Ok(true) only when the new
+  # diagram is dcrBetter (strictly improves at some point with no chunk
+  # worse). Equal-feerate ties resolve to dcrEquivalent → Ok(false) →
+  # REJECT, matching Core's CompareChunks std::is_gt semantic.
+  diagRes.isOk and diagRes.value
+
 proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
                     conflicts: HashSet[TxId], incrementalRelayFee: float64 = DefaultIncrementalRelayFee): MempoolResult[HashSet[TxId]] =
   ## Check if tx can replace the conflicting transactions.
@@ -3042,84 +3128,12 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
   # full descendant chain (everything in `allConflicts`). Edges are wired
   # from mp.spentBy / mp.entries so the simulated linearization preserves
   # CPFP / parent-child topology and matches Core's cluster-aware behaviour.
-  block:
-    var cm = newClusterManager()
-    # Collect the universe of txids whose topology matters for this RBF:
-    #  - every directly conflicting tx + every descendant (allConflicts)
-    #  - every in-mempool ancestor of each conflicting tx (so CPFP /
-    #    chain context is preserved when validateRbfDiagram simulates
-    #    removing the conflicts)
-    var universe = initHashSet[TxId]()
-    for txid in allConflicts:
-      universe.incl(txid)
-    for conflictTxid in conflicts:
-      if conflictTxid in mp.entries:
-        let conflictTx = mp.entries[conflictTxid].tx
-        for ancTxid in mp.calculateAncestors(conflictTx):
-          universe.incl(ancTxid)
-    # Add each tx to the transient cluster manager in a topological order
-    # (parents before children). Since `addTransaction` infers cluster
-    # membership from already-present parent txids, we iterate until every
-    # tx whose parents are present has been added.
-    var pending: seq[TxId]
-    for txid in universe:
-      pending.add(txid)
-    var added = initHashSet[TxId]()
-    # Bounded passes — universe.len is at most MaxReplacementCandidates +
-    # ancestor count, well below any pathological loop bound.
-    for _ in 0 ..< (universe.len + 1):
-      if pending.len == 0:
-        break
-      var nextPending: seq[TxId]
-      for txid in pending:
-        if txid notin mp.entries:
-          continue
-        let entry = mp.entries[txid]
-        # Determine in-universe parents (only edges that survive within the
-        # transient cluster contribute to the diagram).
-        var parents: seq[TxId]
-        var allParentsReady = true
-        for input in entry.tx.inputs:
-          let parentTxid = input.prevOut.txid
-          if parentTxid in universe:
-            if parentTxid notin added:
-              allParentsReady = false
-              break
-            parents.add(parentTxid)
-        if not allParentsReady:
-          nextPending.add(txid)
-          continue
-        let vsize = (entry.weight + 3) div 4
-        if vsize <= 0:
-          added.incl(txid)
-          continue
-        discard cm.addTransaction(txid, int64(entry.fee), vsize, parents)
-        added.incl(txid)
-      if nextPending.len == pending.len:
-        # No progress (cycle or missing parent edge) — bail out of the loop
-        # and let validateRbfDiagram work with what we managed to add.
-        break
-      pending = nextPending
-    # Replacement's parents in the universe (in-mempool ancestors of the
-    # new tx that aren't being evicted).
-    var replacementParents: seq[TxId]
-    for input in tx.inputs:
-      let parentTxid = input.prevOut.txid
-      if parentTxid in universe and parentTxid notin allConflicts:
-        replacementParents.add(parentTxid)
-    let conflictTxidsSeq = block:
-      var s: seq[TxId]
-      for txid in allConflicts: s.add(txid)
-      s
-    let diagRes = cm.validateRbfDiagram(conflictTxidsSeq,
-                                        int64(txFee), txVsize,
-                                        replacementParents)
-    # Strict-gt: validateRbfDiagram returns Ok(true) only when the new
-    # diagram is dcrBetter (strictly improves at some point with no chunk
-    # worse). Equal-feerate ties resolve to dcrEquivalent → Ok(false) →
-    # REJECT, matching Core's CompareChunks std::is_gt semantic.
-    if not diagRes.isOk or not diagRes.value:
-      return err(HashSet[TxId], "rejecting replacement: insufficient feerate: does not improve feerate diagram")
+  var replacementParents: seq[TxId]
+  for input in tx.inputs:
+    replacementParents.add(input.prevOut.txid)
+  if not mp.rbfDiagramImproves(conflicts, allConflicts, int64(txFee), txVsize,
+                               replacementParents):
+    return err(HashSet[TxId], "rejecting replacement: insufficient feerate: does not improve feerate diagram")
 
   ok(allConflicts)
 
@@ -3152,10 +3166,181 @@ proc isBip125Replaceable*(mp: Mempool, txid: TxId): bool =
 # Package Relay (CPFP)
 # ============================================================================
 
+proc pad8(n: int64): string =
+  result = $n
+  while result.len < 8: result = "0" & result
+
+proc coreFormatMoney*(sats: int64): string =
+  ## Core FormatMoney (util/moneystr.cpp): "%d.%08d", trailing zeros trimmed
+  ## down to two decimals.
+  let q = abs(sats) div 100_000_000
+  let r = abs(sats) mod 100_000_000
+  var s = $q & "." & pad8(r)
+  while s.len > 0 and s[^1] == '0' and s[^3] in {'0' .. '9'}:
+    s.setLen(s.len - 1)
+  if sats < 0: "-" & s else: s
+
+proc feePerK(fee: int64, vsize: int64): int64 =
+  ## Core CFeeRate(fee, vsize).GetFeePerK(): sat/kvB, rounded toward zero.
+  if vsize <= 0: 0'i64 else: fee * 1000 div vsize
+
+proc feeRateString(perK: int64): string =
+  ## Core CFeeRate::ToString (FeeRateFormat::BTC_KVB).
+  $(perK div 100_000_000) & "." & pad8(perK mod 100_000_000) & " BTC/kvB"
+
+proc txidSetOrder*(ids: var seq[TxId]) =
+  ## Core std::set<Txid> order: memcmp over the internal byte order.
+  ids.sort(proc(a, b: TxId): int =
+    let x = array[32, byte](a)
+    let y = array[32, byte](b)
+    for i in 0 ..< 32:
+      if x[i] != y[i]: return cmp(x[i], y[i])
+    0)
+
+proc packageRbfChecks(mp: Mempool, txns: seq[Transaction],
+                      directConflicts: HashSet[TxId]): MempoolResult[HashSet[TxId]] =
+  ## Core MemPoolAccept::PackageRBFChecks (validation.cpp:1037-1121) for the
+  ## package members not yet in the pool, at least one of which conflicts with
+  ## the pool.  Returns every tx the package would evict (direct conflicts and
+  ## their descendants), or the package-level reject string Core reports as
+  ## package_msg (PackageValidationState::ToString: "reason, debug").
+  ##
+  ## Sizes are Core's ws.m_vsize: GetVirtualTransactionSize with the sigop
+  ## adjustment, the same contribution TxGraph uses for the cluster limit.
+  ## Nothing here mutates the pool.
+  if txns.len != 2 or not isChildWithParents(txns):
+    return err(HashSet[TxId], "package RBF failed: package must be 1-parent-1-child")
+
+  # A package RBF may not have in-mempool parents: the new cluster must be
+  # exactly the two package txs.
+  for tx in txns:
+    for input in tx.inputs:
+      if input.prevOut.txid in mp.entries:
+        return err(HashSet[TxId], "package RBF failed: new transaction cannot have mempool ancestors")
+
+  let parent = txns[0]
+  let child = txns[1]
+  let childTxid = child.txid()
+
+  # Fees and sigop-adjusted sizes.  The parent's outputs feed the child.
+  var created = initTable[OutPoint, TxOut]()
+  for j, output in parent.outputs:
+    created[OutPoint(txid: parent.txid(), vout: uint32(j))] = output
+  proc lookup(op: OutPoint): Option[UtxoEntry] =
+    let confirmed = mp.chainState.getUtxo(op)
+    if confirmed.isSome:
+      return confirmed
+    if op in created:
+      return some(UtxoEntry(output: created[op], height: mp.chainState.bestHeight,
+                            isCoinbase: false))
+    none(UtxoEntry)
+  var modFees: seq[int64]
+  var vsizes: seq[int64]
+  for tx in txns:
+    var inValue: int64 = 0
+    for input in tx.inputs:
+      let u = lookup(input.prevOut)
+      if u.isNone:
+        return errMissingInputs(HashSet[TxId], $input.prevOut.txid)
+      inValue += int64(u.get().output.value)
+    var outValue: int64 = 0
+    for output in tx.outputs:
+      outValue += int64(output.value)
+    modFees.add(inValue - outValue + mp.getFeeDelta(tx.txid()))
+    let sigops = getTransactionSigOpCost(tx, lookup, useP2SH = true, useWitness = true)
+    let sigopCost = if sigops.isOk: int64(sigops.value) else: 0'i64
+    vsizes.add((clusterSizeContribution(calculateWeight(tx), sigopCost) + 3) div 4)
+  let totalFee = modFees[0] + modFees[1]
+  let totalVsize = vsizes[0] + vsizes[1]
+
+  # Rule #5 (GetEntriesForConflicts): at most MAX_REPLACEMENT_CANDIDATES
+  # distinct clusters directly conflicted.  Not raised for a package.
+  var seen = initHashSet[TxId]()
+  var numClusters = 0
+  for c in directConflicts:
+    if c in seen: continue
+    inc numClusters
+    for m in mp.clusterMembers(c): seen.incl(m)
+  if numClusters > MaxReplacementCandidates:
+    return err(HashSet[TxId], "package RBF failed: too many potential replacements, " &
+               "rejecting replacement " & $childTxid & "; too many conflicting clusters (" &
+               $numClusters & " > " & $MaxReplacementCandidates & ")")
+  let allConflicts = mp.getAllConflictsWithDescendants(directConflicts)
+
+  # PaysForRBF over the whole package, attributed to the child.
+  var conflictFees: int64 = 0
+  for c in allConflicts:
+    if c in mp.entries:
+      conflictFees += int64(mp.entries[c].fee) + mp.getFeeDelta(c)
+  if totalFee < conflictFees:
+    return err(HashSet[TxId], "package RBF failed: insufficient anti-DoS fees, " &
+               "rejecting replacement " & $childTxid & ", less fees than conflicting txs; " &
+               coreFormatMoney(totalFee) & " < " & coreFormatMoney(conflictFees))
+  # CFeeRate::GetFee rounds up (EvaluateFeeUp).
+  let incrementalPerK = int64(mp.incrementalRelayFeeRate)
+  let relayFee = (incrementalPerK * totalVsize + 999) div 1000
+  if totalFee - conflictFees < relayFee:
+    return err(HashSet[TxId], "package RBF failed: insufficient anti-DoS fees, " &
+               "rejecting replacement " & $childTxid & ", not enough additional fees to relay; " &
+               coreFormatMoney(totalFee - conflictFees) & " < " & coreFormatMoney(relayFee))
+
+  # The package must be a chunk on its own: the child may not just pay the
+  # anti-DoS fees for a parent that does not pay for itself.
+  let parentPerK = feePerK(modFees[0], vsizes[0])
+  let packagePerK = feePerK(totalFee, totalVsize)
+  if packagePerK <= parentPerK:
+    return err(HashSet[TxId], "package RBF failed: package feerate is less than or equal to parent feerate, " &
+               "package feerate " & feeRateString(packagePerK) &
+               " <= parent feerate is " & feeRateString(parentPerK))
+
+  # Cluster limits after the conflicts are gone: the new cluster is the two
+  # package txs alone.
+  var clusterWeight: int64 = 0
+  for i, tx in txns:
+    let sigops = getTransactionSigOpCost(tx, lookup, useP2SH = true, useWitness = true)
+    clusterWeight += clusterSizeContribution(calculateWeight(tx),
+                                             if sigops.isOk: int64(sigops.value) else: 0'i64)
+  if 2 > mp.clusterLimit or clusterWeight > mp.maxClusterSizeWeight():
+    return err(HashSet[TxId], "too-large-cluster")
+
+  # ImprovesFeerateDiagram: the package forms one chunk (checked above).
+  if not mp.rbfDiagramImproves(directConflicts, allConflicts, totalFee,
+                               int(totalVsize), @[], sigopAdjusted = true):
+    return err(HashSet[TxId], "package RBF failed: insufficient feerate: does not improve feerate diagram")
+
+  ok(allConflicts)
+
+proc topoOrder(mp: Mempool, ids: HashSet[TxId]): seq[Transaction] =
+  ## The pool txs in `ids`, parents before children.
+  var done = initHashSet[TxId]()
+  var pending: seq[TxId]
+  for id in ids:
+    if id in mp.entries: pending.add(id)
+  while pending.len > 0:
+    var next: seq[TxId]
+    for id in pending:
+      var ready = true
+      for input in mp.entries[id].tx.inputs:
+        if input.prevOut.txid in ids and input.prevOut.txid notin done and
+           input.prevOut.txid in mp.entries:
+          ready = false
+          break
+      if ready:
+        result.add(mp.entries[id].tx)
+        done.incl(id)
+      else:
+        next.add(id)
+    if next.len == pending.len:
+      for id in next: result.add(mp.entries[id].tx)
+      break
+    pending = next
+
+
 proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
                     crypto: CryptoEngine,
                     usePackageFeerates: bool = true,
-                    limitSize: bool = true): PackageResult =
+                    limitSize: bool = true,
+                    allowReplacement: bool = true): PackageResult =
   ## Validate and accept a package of transactions into the mempool
   ## Package validation allows CPFP: a child can pay for its parent's inclusion
   ##
@@ -3170,6 +3355,10 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
   ## `limitSize` = false skips the final LimitMempoolSize; testmempoolaccept
   ## uses it because it rolls the package back afterwards and Core's
   ## test_accept never touches the pool.
+  ##
+  ## `allowReplacement` = false refuses any member that conflicts with the
+  ## pool (Core ATMPArgs::PackageTestAccept).  testmempoolaccept passes it:
+  ## a package RBF evicts its conflicts, which a test must never do.
 
   result = PackageResult(
     valid: false,
@@ -3387,10 +3576,76 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
   let memberArgs = AtmpArgs(
     testAccept: false,
     bypassLimits: false,
-    allowReplacement: true,
+    allowReplacement: allowReplacement,
     allowSiblingEviction: false,  # Core: sibling-eviction is single-tx only
     packageFeerates: true,        # CPFP: skip the per-tx fee floor (GAP #6/#12)
     packageSubmission: true,      # no per-member LimitMempoolSize, see below
+    clientMaxFeeRateSatKvB: 0.0,
+  )
+
+  # Package RBF -- Core AcceptMultipleTransactionsInternal runs
+  # PackageRBFChecks when any member it evaluates conflicts with the pool
+  # (m_subpackage.m_rbf), INSTEAD of the per-tx ReplacementChecks: a parent
+  # that cannot replace on its own fees may replace on the package's.  The
+  # checks run before anything is touched; once they pass, the conflicts are
+  # removed (Core stages them in the changeset) and the members go in on the
+  # post-replacement pool.  If a member then fails, the conflicts are put back.
+  var restoreOnFailure: seq[Transaction]
+  var replacedIds = initHashSet[TxId]()
+  block packageRbf:
+    if not allowReplacement:
+      break packageRbf
+    var evalTxns: seq[Transaction]
+    var directConflicts = initHashSet[TxId]()
+    var conflicting: seq[int]
+    for i, tx in txns:
+      if txids[i] in mp.entries:
+        continue
+      evalTxns.add(tx)
+      let own = mp.findConflicts(tx)
+      if own.len > 0:
+        conflicting.add(i)
+      for c in own:
+        directConflicts.incl(c)
+    # A lone conflicting member is a single-tx replacement (Core
+    # AcceptSubPackage of one tx): acceptTransactionWithArgs judges it.
+    if directConflicts.len == 0 or evalTxns.len < 2:
+      break packageRbf
+    let rbf = mp.packageRbfChecks(evalTxns, directConflicts)
+    if not rbf.isOk:
+      result.state = pvPolicy
+      result.error = rbf.error
+      # The members whose replacement was refused carry the reason.
+      for i in conflicting:
+        result.txResults[i].allowed = false
+        result.txResults[i].error = rbf.error
+      if limitSize:
+        mp.limitMempoolSize()
+      return result
+    replacedIds = rbf.value
+    # Removing a conflict can cascade to an ephemeral-dust parent; snapshot
+    # the conflicts and their ancestors so a rollback restores whatever went.
+    var watch = replacedIds
+    for c in replacedIds:
+      if c in mp.entries:
+        for a in mp.calculateAncestors(mp.entries[c].tx):
+          watch.incl(a)
+    let snapshot = mp.topoOrder(watch)
+    mp.removeConflicts(replacedIds)
+    for tx in snapshot:
+      if tx.txid() notin mp.entries:
+        restoreOnFailure.add(tx)
+
+  # Re-admit what a failed package RBF removed, parents first.  They were in
+  # the pool a moment ago against the same tip, so bypass the fee floor and
+  # limits the way a reorg re-add does.
+  let restoreArgs = AtmpArgs(
+    testAccept: false,
+    bypassLimits: true,
+    allowReplacement: false,
+    allowSiblingEviction: false,
+    packageFeerates: true,
+    packageSubmission: true,
     clientMaxFeeRateSatKvB: 0.0,
   )
 
@@ -3416,6 +3671,8 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
       # Atomic rollback: undo everything we admitted so far, children first.
       for k in countdown(inserted.high, 0):
         mp.removeTransaction(inserted[k])
+      for removedTx in restoreOnFailure:
+        discard acceptTransactionWithArgs(mp, removedTx, crypto, restoreArgs)
       # Core AcceptPackage calls LimitMempoolSize whatever the outcome.
       if limitSize:
         mp.limitMempoolSize()
@@ -3430,6 +3687,9 @@ proc acceptPackage*(mp: Mempool, txns: seq[Transaction],
 
   result.valid = true
   result.state = pvUnset
+  for id in replacedIds:
+    result.replaced.add(id)
+  txidSetOrder(result.replaced)
 
   # Core AcceptPackage (validation.cpp:1727-1765): LimitMempoolSize ONCE, after
   # every member is in, so a child's fee counts for its parent's chunk.  Any
