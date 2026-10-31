@@ -1399,6 +1399,7 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
   peer.handshakeTimeoutMs = pm.handshakeTimeoutMs
   peer.transport = transp
   peer.state = psConnected
+  peer.connectedAt = getTime()
   pm.peers[key] = peer
 
   info "accepted inbound connection", peer = $peer
