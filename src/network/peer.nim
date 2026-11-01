@@ -297,6 +297,22 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     connectedAt: stdtimes.getTime()
   )
 
+proc versionTimeOffset*(peerTimestamp: int64): int64 =
+  ## Peer clock offset from a VERSION message: peerTimestamp - our time.
+  ## The timestamp is the raw wire int64, so the plain subtraction underflows
+  ## for values near low(int64); with overflow checks on that raises
+  ## OverflowDefect, which escapes the handshake and kills the process
+  ## (security audit 2026-10-31 C1).  Saturate to the int64 range instead.
+  ## Core (net_processing.cpp:3788) never traps here; the offset only feeds
+  ## warnings and getpeerinfo.
+  let now = stdtimes.getTime().toUnix()
+  if now > 0 and peerTimestamp < low(int64) + now:
+    low(int64)
+  elif now < 0 and peerTimestamp > high(int64) + now:
+    high(int64)
+  else:
+    peerTimestamp - now
+
 proc handshakeTimeoutDur(peer: Peer): ctimer.Duration =
   let ms = if peer.handshakeTimeoutMs > 0: peer.handshakeTimeoutMs
            else: HandshakeTimeoutSec * 1000
@@ -1522,7 +1538,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     peer.userAgent = versionData.userAgent
     peer.startHeight = versionData.startHeight
     peer.relay = versionData.relay
-    peer.timeOffset = versionData.timestamp - getTime().toUnix()
+    peer.timeOffset = versionTimeOffset(versionData.timestamp)
     peer.versionReceived = true
     peer.remoteNonce = versionData.nonce
     peer.addrLocal = versionData.addrRecv
@@ -1568,7 +1584,7 @@ proc performHandshake*(peer: Peer, ourHeight: int32,
     peer.userAgent = versionData.userAgent
     peer.startHeight = versionData.startHeight
     peer.relay = versionData.relay
-    peer.timeOffset = versionData.timestamp - getTime().toUnix()
+    peer.timeOffset = versionTimeOffset(versionData.timestamp)
     peer.versionReceived = true
     peer.remoteNonce = versionData.nonce
     peer.addrLocal = versionData.addrRecv
@@ -1632,7 +1648,7 @@ proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
     peer.userAgent = msg.version.userAgent
     peer.startHeight = msg.version.startHeight
     peer.relay = msg.version.relay
-    peer.timeOffset = msg.version.timestamp - getTime().toUnix()
+    peer.timeOffset = versionTimeOffset(msg.version.timestamp)
     peer.addrLocal = msg.version.addrRecv
     info "received version", peer = $peer, version = msg.version.version,
          height = msg.version.startHeight
