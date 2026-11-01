@@ -282,6 +282,35 @@ suite "REST blockhashbyheight json":
     check resp.hasKey("blockhash")
     check resp["blockhash"].getStr().len == 64
 
+suite "REST blockhashbyheight height bounds":
+  ## Core parses the height with ToIntegral<int32_t> and answers 400
+  ## "Invalid height" for anything outside int32 (rest.cpp:1098-1100).
+  ## nimrod used to convert with int32(height), which raises a RangeDefect for
+  ## 2^31 and above and took the whole process down (security audit C3).
+  ## The bound is checked before the chain state is touched, so a server
+  ## without one is enough here.
+  let rest = RestServer()
+
+  test "blockhashbyheight above int32 max answers 400 Invalid height":
+    let resp = rest.handleRestBlockHashByHeight("2147483648.json")
+    check resp.status == Http400
+    check resp.body.startsWith("Invalid height: 2147483648")
+
+  test "blockhashbyheight at int64 max answers 400 Invalid height":
+    let resp = rest.handleRestBlockHashByHeight("9223372036854775807.json")
+    check resp.status == Http400
+    check resp.body.startsWith("Invalid height: 9223372036854775807")
+
+  test "blockhashbyheight beyond int64 answers 400 Invalid height":
+    let resp = rest.handleRestBlockHashByHeight("99999999999999999999.json")
+    check resp.status == Http400
+    check resp.body.startsWith("Invalid height: ")
+
+  test "blockhashbyheight negative height answers 400 Invalid height":
+    let resp = rest.handleRestBlockHashByHeight("-1.json")
+    check resp.status == Http400
+    check resp.body.startsWith("Invalid height: -1")
+
 suite "REST blockfilter routing":
   ## Routing-shape only — populating a real BlockFilterIndex is covered by
   ## test_blockfilter.nim. Here we verify URI parsing, error reporting, and
