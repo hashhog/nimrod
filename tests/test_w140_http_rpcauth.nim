@@ -435,20 +435,18 @@ suite "W140 G20 — -rpcthreads worker pool":
 # ---------------------------------------------------------------------------
 suite "W140 G21 — request body size bound":
 
-  test "G21 BUG-21 (P1-SEC): no maximum Content-Length cap":
-    ## src/rpc/server.nim:8660-8662 reads `contentLength` bytes with no
-    ## ceiling check.  Core httpserver.cpp:410 caps at MAX_SIZE (32 MiB).
-    let idx = serverSrc.find("# Read body based on Content-Length")
+  test "G21: Content-Length is capped at Core's MAX_SIZE (32 MiB)":
+    ## Core httpserver.cpp:410 — evhttp_set_max_body_size(http, MAX_SIZE).
+    ## Flipped from the BUG-21 absence pin when MaxBodySize landed (security
+    ## audit 2026-10-31, M8); the behaviour is pinned end-to-end in
+    ## tests/test_rpc_preauth_header_limit.nim.
+    check "MaxBodySize* = 32 * 1024 * 1024" in serverSrc   # Core MAX_SIZE 0x02000000
+    let idx = serverSrc.find("proc processClient")
     check idx >= 0
-    let snippet = serverSrc[idx ..< min(idx + 400, serverSrc.len)]
-    check "if contentLength > 0:" in snippet
-    check "let bodyData = await transp.read(contentLength)" in snippet
-    # No MAX_SIZE / MAX_BODY_SIZE comparison.
-    check "MAX_SIZE" notin snippet
-    check "MAX_BODY_SIZE" notin snippet
-    check "maxBodySize" notin snippet
-    check "33554432" notin snippet   # 32 MiB literal
-    check "0x02000000" notin snippet
+    let endIdx = serverSrc.find("\nproc ", idx + 1)
+    let body = if endIdx >= 0: serverSrc[idx ..< endIdx] else: serverSrc[idx ..< serverSrc.len]
+    check "contentLength > MaxBodySize" in body
+    check "413 Payload Too Large" in body
 
 # ---------------------------------------------------------------------------
 # G22 — Atomic cookie-file write (BUG-22, P0-SEC)
@@ -494,12 +492,15 @@ suite "W140 G23 — -rpcworkqueue + 503":
     check "rpcworkqueue" notin mainSrc.toLowerAscii()
     check "rpcworkqueue" notin serverSrc.toLowerAscii()
 
-  test "G23 BUG-23 (P2-OPS): no 503 Service Unavailable reply":
+  test "G23: past the connection cap a client is answered 503":
     ## Core httpserver.cpp:255-258 sends 503 when work queue depth >=
-    ## g_max_queue_depth.
-    check "503" notin serverSrc
-    check "Service Unavailable" notin serverSrc
+    ## g_max_queue_depth. Flipped from the BUG-23 absence pin when
+    ## RpcMaxConnections landed (security audit 2026-10-31, H6). The cap is
+    ## fixed at Core's default; there is still no -rpcworkqueue flag (above).
+    check "503 Service Unavailable" in serverSrc
+    check "Work queue depth exceeded" in serverSrc
     check CORE_DEFAULT_HTTP_WORKQUEUE == 64
+    check "RpcMaxConnections* = 64" in serverSrc
 
 # ---------------------------------------------------------------------------
 # G24 — -rpcservertimeout (BUG-24, P2-OPS)
@@ -510,16 +511,19 @@ suite "W140 G24 — -rpcservertimeout":
     ## Core httpserver.cpp:408 — default 30 s libevent socket timeout.
     check "rpcservertimeout" notin mainSrc.toLowerAscii()
 
-  test "G24 BUG-24 (P2-OPS): processClient while-loop has no read timeout":
-    ## src/rpc/server.nim:8636-8710 — `while not transp.closed:` with
-    ## bare `await transp.readLine()`.  No `withTimeout` / `wait`.
+  test "G24: processClient reads are bounded by a 30 s timeout":
+    ## Core httpserver.cpp:408 — default 30 s libevent socket timeout.
+    ## Flipped from the BUG-24 absence pin when RpcServerTimeout landed
+    ## (security audit 2026-10-31, H6). Fixed at Core's default; there is
+    ## still no -rpcservertimeout flag (above).
     let idx = serverSrc.find("proc processClient(rpc: RpcServer, transp: StreamTransport)")
     check idx >= 0
     let endIdx = serverSrc.find("\nproc ", idx + 1)
     let body = if endIdx >= 0: serverSrc[idx ..< endIdx] else: serverSrc[idx ..< serverSrc.len]
     check "while not transp.closed:" in body
-    check "withTimeout" notin body
-    check ".wait(" notin body
+    check "lineFut.withTimeout(RpcServerTimeout)" in body
+    check "bodyFut.withTimeout(RpcServerTimeout)" in body
+    check "RpcServerTimeout* = chronos.seconds(30)" in serverSrc
     check CORE_DEFAULT_HTTP_SERVER_TIMEOUT == 30
 
 # ---------------------------------------------------------------------------

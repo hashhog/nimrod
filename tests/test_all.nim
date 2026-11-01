@@ -213,6 +213,7 @@ const IncludedTests = [
   "test_rpc_conversion_before_lookup",
   "test_rpc_int_arg_bounds",
   "test_rpc_p2p_main_loop",
+  "test_rpc_preauth_header_limit",
   "test_rpc_stop_shutdown",
   "test_rpc_thread_lifetime",
   "test_script",
