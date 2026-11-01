@@ -269,6 +269,14 @@ macro peerDefectBoundary*(prc: untyped): untyped =
   ## Core catches every std::exception out of ProcessMessage, logs it and keeps
   ## running (net_processing.cpp:5195).  We also drop the peer: after a Defect
   ## its per-peer state may be half-updated.
+  ##
+  ## Only for frames whose state dies with the peer (handshake, framing,
+  ## deserialization, peer.handleMessage).  Never on a frame that reaches
+  ## chain state (nimrod.nim's handleMessage, the PeerManager callbacks that
+  ## await onMessage): a Defect after handleHeaders' first putBlockIndex would
+  ## leave a partial block index in a live node and blame an honest peer for
+  ## our bug.  chronos runs a callee up to its first await on the caller's
+  ## stack, so a boundary on any caller of those handlers catches it too.
   let body = prc.body
   let li = prc.lineInfoObj
   let where = newLit(if prc.name.kind == nnkEmpty:
@@ -1998,11 +2006,6 @@ proc messageLoop*(peer: Peer, callback: PeerCallback) {.async.} =
     except CatchableError as e:
       if not peer.closing:
         error "error in message loop", peer = $peer, error = e.msg
-      break
-    except Defect as e:
-      # A Defect in this frame (handlePong, or a callback before its first
-      # await) is the peer's fault, not the node's: drop the peer, keep running.
-      discard peerDefectError("messageLoop", e)
       break
 
   if not peer.closing:

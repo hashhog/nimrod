@@ -1155,9 +1155,8 @@ proc activeChainHeaderAtHeight(state: NodeState, height: int32): Option[BlockHea
       return some(blkOpt.get().header)
   none(BlockHeader)
 
-proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.peerDefectBoundary, async.} =
-  ## Handle incoming P2P messages.  peerDefectBoundary: a Defect raised here on
-  ## a peer's message disconnects that peer instead of exiting the process.
+proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
+  ## Handle incoming P2P messages
   case msg.kind
   of mkHeaders:
     await state.syncManager.handleHeaders(peer, msg.headers)
