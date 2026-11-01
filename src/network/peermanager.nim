@@ -1128,7 +1128,7 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
 
       # Start message loop for outbound peer (same as inbound)
       # Wrap callback to handle addr/addrv2/getaddr/feefilter internally
-      let wrappedCb = proc(p: Peer, msg: P2PMessage) {.async.} =
+      let wrappedCb = proc(p: Peer, msg: P2PMessage) {.peerDefectBoundary, async.} =
         {.gcsafe.}:
           try:
             pm.handleAddrInternal(p, msg)
@@ -1146,7 +1146,9 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
         asyncSpawn spawnSafe(peer.sendMessage(feeMsg))
 
       return true
-    except CatchableError as e:
+    except Exception as e:
+      # Exception, not CatchableError: a Defect in this frame on the peer's
+      # VERSION must cost the peer, not the node.
       # BIP-324 fallback bookkeeping: if a v2 outbound handshake was attempted
       # on THIS dial, mark the address v1-only so the next reconnect (driven
       # by `mainLoop`'s ReconnectInterval) skips the v2 probe and goes straight
@@ -1432,7 +1434,7 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
     discard pm.maybeSendLocalAddr(peer, pctInbound)
 
     # Wrap callback to handle addr/addrv2/getaddr/feefilter internally
-    let wrappedCb = proc(p: Peer, msg: P2PMessage) {.async.} =
+    let wrappedCb = proc(p: Peer, msg: P2PMessage) {.peerDefectBoundary, async.} =
       {.gcsafe.}:
         try:
           pm.handleAddrInternal(p, msg)
@@ -1447,7 +1449,9 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
     if peer.version >= FeeFilterVersion:
       let feeMsg = newFeeFilter(100_000'u64)
       asyncSpawn spawnSafe(peer.sendMessage(feeMsg))
-  except CatchableError as e:
+  except Exception as e:
+    # Exception, not CatchableError: a Defect raised in this frame on the
+    # stranger's input must cost the peer, not the node.
     error "inbound handshake failed", peer = $peer, error = e.msg
     await peer.disconnect()
     pm.peers.del(key)
@@ -1460,6 +1464,12 @@ proc inboundConnectionCallback(server: StreamServer, transp: StreamTransport) {.
     await pm.handleInboundConnection(transp)
   except CatchableError as e:
     error "error handling inbound connection", error = e.msg
+    try:
+      await transp.closeWait()
+    except CatchableError:
+      discard
+  except Defect as e:
+    discard peerDefectError("inboundConnectionCallback", e)
     try:
       await transp.closeWait()
     except CatchableError:
