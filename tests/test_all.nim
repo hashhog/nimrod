@@ -251,6 +251,7 @@ const IncludedTests = [
   "test_validateblock_ibd_utxo",
   "test_versionbits",
   "test_w100_coins_view_cache",
+  "test_version_useragent_cap",
   "test_w101_activate_best_chain",
   "test_w103_tx_relay",
   "test_w104_addrman",
