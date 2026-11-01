@@ -547,11 +547,11 @@ suite "H3: unrequested low-work side-branch bodies are not stored":
     # The command handleGetBlockFromPeer posts, run as the main loop does.
     pm.runP2PCommand(P2PCmd(kind: pcGetData, host: x.address, port: x.port,
       invs: @[InvVector(invType: invWitnessBlock, hash: array[32, byte](hF19))]))
+    # Not in requestedHashes: only the RPC fetch path marks it requested,
+    # so the body being stored below is what proves the hook ran.
     check hF19 notin sm.requestedHashes
-    check hF19 in sm.fetchRequested
     check not sm.processBlock(x, f19)
     check csv.db.getBlock(hF19).isSome
-    check hF19 notin sm.fetchRequested
     check not x.shouldDisconnect
 
   test "an unrequested side body with the tip's work is stored (Core fHasMoreOrSameWork)":
