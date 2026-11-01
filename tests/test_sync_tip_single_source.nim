@@ -267,6 +267,11 @@ suite "the tip moves only by connect / disconnect (item 2: sync.nim:4067)":
     check cs.bestBlockHash == hashOf(a[3])
 
     waitFor sm.handleHeaders(peer, @[b[2].header, b[3].header, b[4].header])
+    # The B bodies are fetched (getdata in flight). An unrequested B2 has less
+    # work than the connected A3 and is not stored (Core AcceptBlock
+    # !fRequested; audit H3), and then B4 could never connect.
+    for i in 2 .. 4:
+      sm.requestedHashes.incl(hashOf(b[i]))
     discard sm.processBlock(peer, b[2])
     discard sm.processBlock(peer, b[3])
     discard sm.processBlock(peer, b[4])

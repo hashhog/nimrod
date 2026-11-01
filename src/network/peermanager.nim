@@ -228,6 +228,10 @@ type
     localAddrs*: LocalAddrTable
     discover*: bool
     isIbd*: proc(): bool {.gcsafe, raises: [].}
+    #  - blockFetchHook: told the hash of every block an RPC-posted getdata
+    #    asks for (getblockfrompeer). The SyncManager sets it so that body
+    #    counts as requested (Core FetchBlock -> BlockRequested). nil = unused.
+    blockFetchHook*: proc(hash: BlockHash) {.gcsafe, raises: [].}
 
 # Forward declarations
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
@@ -1761,6 +1765,10 @@ proc runP2PCommand*(pm: PeerManager, cmd: P2PCmd) =
   of pcGetData:
     let p = pm.findPeer(cmd.host, cmd.port)
     if p != nil:
+      if pm.blockFetchHook != nil:
+        for inv in cmd.invs:
+          if inv.invType == invBlock or inv.invType == invWitnessBlock:
+            pm.blockFetchHook(BlockHash(inv.hash))
       asyncSpawn spawnSafe(p.sendGetData(cmd.invs))
   of pcDisconnect:
     let p = pm.findPeer(cmd.host, cmd.port)

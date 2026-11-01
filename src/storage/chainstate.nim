@@ -4538,6 +4538,18 @@ proc reorgToStoredBranch*(
   connectedBlocks = newChainBlocks
   (sboReorged, "")
 
+proc sideBlockHasTipWork*(cs: ChainState, blk: Block): bool =
+  ## Core AcceptBlock fHasMoreOrSameWork: the chain work this block would have
+  ## (parent's totalWork + its own) is at least the active tip's. Same
+  ## arithmetic acceptSideBranchBlock stores and compares. False when the
+  ## parent is unknown (no work to measure).
+  let prevIdxOpt = cs.db.getBlockIndex(blk.header.prevBlock)
+  if prevIdxOpt.isNone:
+    return false
+  var work = prevIdxOpt.get().totalWork
+  addWork(work, calculateBlockWork(blk.header.bits))
+  compareWork256(work, cs.totalWork) >= 0
+
 proc acceptSideBranchBlock*(
     cs: var ChainState,
     blk: Block,
