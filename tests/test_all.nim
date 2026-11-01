@@ -165,6 +165,7 @@ const IncludedTests = [
   "test_mempool_trim_order",
   "test_mempool_unbroadcast",
   "test_messages",
+  "test_metrics_server",
   "test_minimalif",
   "test_miniscript",
   "test_minisketch",
