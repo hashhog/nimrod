@@ -1854,7 +1854,8 @@ suite "acceptSideBranchBlock (reorg-drop fix Part 2)":
     var conn: seq[Block]
     let r = cs.acceptSideBranchBlock(orphan, okValidate, okVerify, okConnectChecks, dtx, conn)
     check r.outcome == sboRejected
-    check r.token == "rejected"
+    # Core AcceptBlockHeader: BLOCK_MISSING_PREV "prev-blk-not-found".
+    check r.token == "prev-blk-not-found"
     check cs.db.getBlockIndex(getBlockHash(orphan)).isNone   # not stored
     cs.close()
 
