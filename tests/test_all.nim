@@ -144,6 +144,7 @@ const IncludedTests = [
   "test_handshake",
   "test_handshake_core_parity",
   "test_header_sync_from_tip",
+  "test_headers_continuity_antidos",
   "test_headerssync",
   "test_ibd_cache_eviction",
   "test_ibd_durability",

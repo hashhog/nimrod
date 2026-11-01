@@ -440,30 +440,60 @@ suite "W168: 'we cannot evaluate' is not 'the header is invalid'":
 
   test "handleHeaders applies NO peer penalty when WE cannot evaluate the rule":
     ## wave-1 lesson 2: our gap must never look like peer misbehaviour.
+    ##
+    ## The gap is a hole in OUR active index (a snapshot-grafted chain has
+    ## hashes with no header below the tail).  This used to be reached with a
+    ## two-header batch [fork header, child of an unrelated dangling side
+    ## header]; that batch is non-continuous, which Core punishes in
+    ## CheckHeadersPoW before any routing, and so does nimrod now (next test).
+    ## A continuous one-header batch reaches the same gap.
+    let p = testnet4Shaped()
+    var (hc, _) = rootChain()
+    discard hc.extendActive(3)                       # h1-3, HARD
+    let lim = hc.extendActive(2, POWLIMIT_BITS)      # h4-5, powLimit
+    discard hc.extendActive(5)                       # h6-10, HARD
+    hc.byHash.del(hashOf(lim[0]))                    # h4 is a hole
+    let sm = syncManagerOn(hc, p)
+    let (pm, peer) = sm.peerOn("203.0.113.60", p)
+
+    # Fork off h5, 600 s later: no min-difficulty exception, so the walk-back
+    # steps past h5 (powLimit) into the hole at h4.
+    let child = mineHeader(hashOf(lim[1]), lim[1].timestamp + 600, HARD_BITS,
+                           salt = 13)  # salt: distinct from the active h6
+    check not sm.headerChain.hasAnyHeader(hashOf(child))
+    check sm.headerChain.checkHeaderDiffbits(child, p) == dboUnevaluable
+    check sm.classifyHeaderBatch(@[child]).routing == hbrDirect
+    check sm.acceptForkHeader(child, hashOf(child), true) == fhoCannotEvaluate
+
+    waitFor sm.handleHeaders(peer, @[child])
+
+    check not pm.isBanned("203.0.113.60")
+    check peer.misbehaviorScore == 0
+    check hashOf(child) notin sm.headerChain.sideHeaders
+
+  test "the old two-branch batch shape is now a non-continuous misbehaviour":
+    ## Core net_processing.cpp:2626 Misbehaving "non-continuous headers
+    ## sequence".  Security audit C2: this shape is how a low-work fork was
+    ## smuggled past the anti-DoS gate.
     let p = testnet4Shaped()
     var (hc, _) = rootChain()
     let active = hc.extendActive(10)
     let sm = syncManagerOn(hc, p)
-    let (pm, peer) = sm.peerOn("203.0.113.60", p)
+    let (pm, peer) = sm.peerOn("203.0.113.59", p)
 
     var gone: array[32, byte]
     gone[3] = 0x5E
     let dangling = mineHeader(BlockHash(gone), T0 + 4000, POWLIMIT_BITS)
     sm.headerChain.sideHeaders[hashOf(dangling)] = SideHeader(
       header: dangling, height: 3'i32, totalWork: default(array[32, byte]))
-
-    # Batch: [legit fork header off height 5, then the unevaluable child].
-    # The first header makes the batch CONNECT (classifyHeaderBatch looks up
-    # headers[0].prevBlock in byHash), so the fork arm is genuinely reached.
     let ok1 = mineHeader(hashOf(active[4]), active[4].timestamp + 600,
                          HARD_BITS, salt = 11)
     let child = mineHeader(hashOf(dangling), dangling.timestamp + 600, HARD_BITS)
 
     waitFor sm.handleHeaders(peer, @[ok1, child])
 
-    check not pm.isBanned("203.0.113.60")
-    check peer.misbehaviorScore == 0
-    check hashOf(ok1) in sm.headerChain.sideHeaders
+    check pm.isBanned("203.0.113.59")
+    check hashOf(ok1) notin sm.headerChain.sideHeaders
     check hashOf(child) notin sm.headerChain.sideHeaders
 
 # ===========================================================================
