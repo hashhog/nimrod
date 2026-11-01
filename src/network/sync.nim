@@ -725,6 +725,25 @@ proc validateHeaderPoW*(header: BlockHeader): bool =
   let hash = BlockHash(doubleSha256(headerBytes))
   hashMeetsTarget(hash, header.bits)
 
+proc checkHeadersBatchPoW*(headers: seq[BlockHeader],
+                           params: ConsensusParams): string =
+  ## Core PeerManagerImpl::CheckHeadersPoW (net_processing.cpp:2617-2681):
+  ## HasValidProofOfWork (CheckProofOfWork per header: target in range and
+  ## <= powLimit, hash <= target), then CheckHeadersAreContinuous (each
+  ## header's prevBlock is the previous header's hash).  Returns "" when the
+  ## batch passes, else Core's Misbehaving message.
+  let powParams = headerssync.toPowParams(params)
+  var hashes = newSeqOfCap[BlockHash](headers.len)
+  for h in headers:
+    let hash = BlockHash(doubleSha256(serialize(h)))
+    if not checkProofOfWork(hash, h.bits, powParams):
+      return "header with invalid proof of work"
+    hashes.add(hash)
+  for i in 1 ..< headers.len:
+    if headers[i].prevBlock != hashes[i - 1]:
+      return "non-continuous headers sequence"
+  ""
+
 proc validateHeaderChainLink*(header: BlockHeader,
     prevHeader: BlockHeader): bool =
   ## Check that header links correctly to previous header (recomputes hash)
@@ -2535,6 +2554,24 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
     peer.noteHeadersTip(sm.locatorStartHeight())
     info "header sync complete", tipHeight = sm.headerChain.tipHeight
     sm.state = ssDownloadingBlocks
+    return
+
+  # Core ProcessHeadersMessage runs CheckHeadersPoW (net_processing.cpp:
+  # 2617-2631, 2985) before ANY routing: every header's PoW against powLimit,
+  # then CheckHeadersAreContinuous.  classifyHeaderBatch's "last header is
+  # already known → no memory cost" shortcut is only sound for a continuous
+  # batch; without this gate a fresh low-work fork followed by one of OUR
+  # headers went direct and every fork header was stored in sideHeaders
+  # (security audit C2, 2026-10-31: 499,850 headers on one connection).
+  let batchCheck = checkHeadersBatchPoW(headers, sm.params)
+  if batchCheck.len > 0:
+    warn "rejecting headers batch", peer = $peer, count = headers.len,
+         reason = batchCheck
+    if sm.peerManager != nil:
+      sm.peerManager.misbehavingPeer(peer, ScoreInvalidBlockHeader, batchCheck)
+    if sm.syncPeer == peer:
+      sm.syncPeer = nil
+      sm.state = ssIdle
     return
 
   # Make a mutable copy for anti-DoS processing
