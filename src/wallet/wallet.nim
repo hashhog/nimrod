@@ -107,6 +107,10 @@ type
 
   Wallet* = ref object
     seed*: array[64, byte]
+    ## Raw length of `seed` (16-64). sethdseed accepts short seeds and the
+    ## master key is derived from exactly those bytes, so a reload must use
+    ## the same length. 0 means 64 (BIP-39 mnemonic seeds).
+    seedLen*: int
     masterKey*: ExtendedKey
     accounts*: seq[Account]
     ## Keys imported by importprivkey (NOT derived from the HD seed). Each is a
@@ -170,6 +174,22 @@ const CoinbaseMaturity* = 100
 
 # Forward declarations
 proc addAccount*(wallet: var Wallet, purpose: uint32 = 84, accountIndex: uint32 = 0, gap: int = 20)
+proc materializeAccounts*(wallet: var Wallet) {.gcsafe.}
+
+proc clampGap*(gap: int): int =
+  ## Gap limit read back from disk: default 20, bounded so a corrupt row
+  ## cannot make a reload derive millions of keys.
+  if gap <= 0: 20 else: min(gap, 10_000)
+
+proc seedBytes*(wallet: Wallet): seq[byte] =
+  ## The raw seed the master key was derived from.
+  let n = if wallet.seedLen >= 16 and wallet.seedLen <= 64: wallet.seedLen else: 64
+  @(wallet.seed.toOpenArray(0, n - 1))
+
+proc canDeriveKeys*(wallet: Wallet): bool =
+  ## True when the in-memory master key holds a private key (hardened BIP-32
+  ## derivation needs it): seeded, and not an encrypted wallet that is locked.
+  wallet.masterKey.isPrivate and not (wallet.isEncrypted and wallet.isLocked)
 
 # BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data).
 # Duplicated locally (also in script/interpreter.nim) to keep the wallet
@@ -611,6 +631,33 @@ proc newWalletFromDb*(db: WalletDb, params: ConsensusParams,
     result.isEncrypted = false
     result.isLocked = false
 
+  # Restore the HD seed (security audit H8). An unencrypted wallet stores the
+  # plaintext seed; an encrypted one stores only its length here and gets the
+  # seed back from the ciphertext at walletpassphrase.
+  let seedRow = db.getHdSeed()
+  if seedRow.isSome:
+    let (plainSeed, seedLen) = seedRow.get()
+    if seedLen < 16 or seedLen > 64:
+      raise newException(WalletError, "wallet database: bad seed length " & $seedLen)
+    result.seedLen = seedLen
+    if not result.isEncrypted:
+      if plainSeed.len != seedLen:
+        raise newException(WalletError, "wallet database: seed is missing or truncated")
+      copyMem(addr result.seed[0], unsafeAddr plainSeed[0], seedLen)
+      result.masterKey = masterKeyFromSeedRaw(plainSeed)
+
+  # Restore account structure and keypool cursors. Keys are derived by
+  # materializeAccounts once the master key is available (now for an
+  # unencrypted wallet, at walletpassphrase for an encrypted one).
+  for acc in db.getAccounts():
+    result.accounts.add(Account(
+      purpose: acc.purpose, coinType: acc.coinType,
+      accountIndex: acc.accountIndex,
+      externalKeys: @[], internalKeys: @[],
+      nextExternal: max(acc.nextExternal, 0),
+      nextInternal: max(acc.nextInternal, 0),
+      gap: clampGap(acc.gap)))
+
   # Load UTXOs
   for stored in db.getUnspentUtxos():
     var outpoint: OutPoint
@@ -635,8 +682,7 @@ proc newWalletFromDb*(db: WalletDb, params: ConsensusParams,
   for (address, label) in db.getAllLabels():
     result.labels[address] = label
 
-  # Note: Keys are not loaded - they will be re-derived when needed
-  # after the wallet is unlocked (for encrypted wallets) or on first use
+  result.materializeAccounts()
 
 proc derivePath(wallet: Wallet, purpose, coinType, account, chain, index: uint32): DerivedKey =
   ## Derive a key at the specified BIP44/49/84/86 path
@@ -740,7 +786,19 @@ proc setHdSeed*(wallet: var Wallet, seed: openArray[byte]) =
   # encrypted-on-disk path; derivation itself uses the raw bytes below).
   for i in 0 ..< wallet.seed.len:
     wallet.seed[i] = if i < seed.len: seed[i] else: 0'u8
+  wallet.seedLen = seed.len
   wallet.masterKey = masterKeyFromSeedRaw(seed)
+  # An unlocked encrypted wallet: re-encrypt under the cached key, or the
+  # next lock/unlock (and any reload) would bring the old seed back.
+  if wallet.isEncrypted:
+    let iv = generateIv()
+    var fullIv: array[32, byte]
+    copyMem(addr fullIv[0], unsafeAddr iv[0], 16)
+    let ct = encryptSecret(wallet.masterKeyCache, wallet.seed, fullIv)
+    var withIv = newSeq[byte](16 + ct.len)
+    copyMem(addr withIv[0], unsafeAddr iv[0], 16)
+    copyMem(addr withIv[16], unsafeAddr ct[0], ct.len)
+    wallet.encryptedSeed = withIv
   # If the wallet has no accounts yet (e.g. created blank), seed the default
   # BIP-84 native-segwit account so getnewaddress works immediately.
   if wallet.accounts.len == 0:
@@ -772,6 +830,20 @@ proc ensureGap(wallet: var Wallet, account: var Account, isInternal: bool) =
       account.internalKeys.add(newKey)
     else:
       account.externalKeys.add(newKey)
+
+proc materializeAccounts*(wallet: var Wallet) {.gcsafe.} =
+  ## Derive every account's keys up to its cursor plus the gap limit. Used
+  ## after a reload (accounts come back as structure + cursors only) and at
+  ## unlock of an encrypted wallet. Idempotent: existing keys are kept and
+  ## only the missing tail is derived. No-op while no private master key is
+  ## available.
+  if not wallet.canDeriveKeys():
+    return
+  for ai in 0 ..< wallet.accounts.len:
+    var acc = wallet.accounts[ai]
+    wallet.ensureGap(acc, false)
+    wallet.ensureGap(acc, true)
+    wallet.accounts[ai] = acc
 
 proc purposeForAddressType*(addrType: AddressType): uint32 =
   ## Get the BIP purpose number for an address type
@@ -1977,13 +2049,16 @@ proc unlockWallet*(wallet: var Wallet, passphrase: string, timeout: int = 0): bo
     # Restore the seed
     copyMem(addr wallet.seed[0], addr decrypted[0], 64)
 
-    # Restore master key
-    wallet.masterKey = masterKeyFromSeed(wallet.seed)
+    # Restore master key from the raw seed length it was derived from
+    wallet.masterKey = masterKeyFromSeedRaw(wallet.seedBytes())
 
     # Cache the encryption key for signing operations
     wallet.masterKeyCache = encKey
 
     wallet.isLocked = false
+
+    # Accounts reloaded from disk come back without keys; derive them now.
+    wallet.materializeAccounts()
 
     # Set unlock expiry
     if timeout > 0:

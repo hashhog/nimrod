@@ -38,6 +38,15 @@ type
     isCoinbase*: bool                       # True if from a coinbase transaction
     spentInTxid*: Option[array[32, byte]]  # Set when spent
 
+  ## Stored HD account (structure + keypool cursors; keys are re-derived)
+  StoredAccount* = object
+    purpose*: uint32
+    coinType*: uint32
+    accountIndex*: uint32
+    nextExternal*: int
+    nextInternal*: int
+    gap*: int
+
   ## Wallet metadata
   WalletMeta* = object
     version*: int
@@ -113,8 +122,11 @@ proc open*(wdb: var WalletDb) =
   wdb.db = cast[pointer](db)
   wdb.isOpen = true
 
-  # Create tables
+  # Create tables. secure_delete: rows that held key material (the plaintext
+  # seed replaced at encryptwallet) are zeroed on disk, not left in free pages.
   let createTables = """
+    PRAGMA secure_delete = ON;
+
     CREATE TABLE IF NOT EXISTS wallet_meta (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       version INTEGER NOT NULL,
@@ -197,6 +209,17 @@ proc open*(wdb: var WalletDb) =
       value TEXT NOT NULL
     );
 
+    -- HD seed of the wallet. `seed` is the plaintext seed of an UNENCRYPTED
+    -- wallet and NULL for an encrypted one (whose seed lives only in
+    -- `encryption`). `seed_len` is the raw seed length (16-64; sethdseed can
+    -- set a short seed) so the BIP-32 master key is re-derived from exactly
+    -- the bytes it was first derived from. Security audit H8 (2026-10-31).
+    CREATE TABLE IF NOT EXISTS hd_seed (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      seed BLOB,
+      seed_len INTEGER NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_keys_address ON keys(address);
     CREATE INDEX IF NOT EXISTS idx_utxos_key_path ON utxos(key_path);
     CREATE INDEX IF NOT EXISTS idx_utxos_spent ON utxos(spent_in_txid);
@@ -208,6 +231,27 @@ proc open*(wdb: var WalletDb) =
   if execRc != SQLITE_OK:
     let msg = if errmsg != nil: $errmsg else: "unknown error"
     raise newException(WalletDbError, "failed to create tables: " & msg)
+
+proc execSql(wdb: WalletDb, sql: string) =
+  ## Run a statement with no parameters and no result rows; raise on error.
+  if not wdb.isOpen:
+    raise newException(WalletDbError, "database not open")
+  var errmsg: cstring
+  let rc = sqlite3_exec(Sqlite3(wdb.db), sql.cstring, nil, nil, addr errmsg)
+  if rc != SQLITE_OK:
+    let msg = if errmsg != nil: $errmsg else: "unknown error"
+    raise newException(WalletDbError, sql & ": " & msg)
+
+template withWalletTx*(wdb: WalletDb, body: untyped) =
+  ## Run `body` inside one sqlite transaction: every write in it lands, or
+  ## none does. Any exception rolls back and is re-raised.
+  execSql(wdb, "BEGIN IMMEDIATE")
+  try:
+    body
+    execSql(wdb, "COMMIT")
+  except CatchableError as e:
+    try: execSql(wdb, "ROLLBACK") except CatchableError: discard
+    raise e
 
 proc close*(wdb: var WalletDb) =
   ## Close the database connection
@@ -583,6 +627,53 @@ proc saveAccount*(wdb: WalletDb, purpose, coinType, accountIndex: uint32,
   discard sqlite3_step(stmt)
   discard sqlite3_finalize(stmt)
 
+proc saveAccountStrict*(wdb: WalletDb, account: StoredAccount) =
+  ## Upsert one account row, raising on any error (saveAccount above
+  ## swallows them, which is wrong for key material).
+  if not wdb.isOpen:
+    raise newException(WalletDbError, "database not open")
+  let db = Sqlite3(wdb.db)
+  let sql = """
+    INSERT OR REPLACE INTO accounts
+    (purpose, coin_type, account_index, next_external, next_internal, gap)
+    VALUES (?, ?, ?, ?, ?, ?)
+  """
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  checkError(db, rc, "prepare account upsert")
+  try:
+    checkError(db, sqlite3_bind_int64(stmt, 1, int64(account.purpose)), "bind purpose")
+    checkError(db, sqlite3_bind_int64(stmt, 2, int64(account.coinType)), "bind coin_type")
+    checkError(db, sqlite3_bind_int64(stmt, 3, int64(account.accountIndex)), "bind account_index")
+    checkError(db, sqlite3_bind_int64(stmt, 4, int64(account.nextExternal)), "bind next_external")
+    checkError(db, sqlite3_bind_int64(stmt, 5, int64(account.nextInternal)), "bind next_internal")
+    checkError(db, sqlite3_bind_int64(stmt, 6, int64(account.gap)), "bind gap")
+    rc = sqlite3_step(stmt)
+    if rc != SQLITE_DONE:
+      checkError(db, rc, "step account upsert")
+  finally:
+    discard sqlite3_finalize(stmt)
+
+proc getAccounts*(wdb: WalletDb): seq[StoredAccount] =
+  ## Every stored account, in insertion order.
+  if not wdb.isOpen:
+    return
+  let db = Sqlite3(wdb.db)
+  let sql = "SELECT purpose, coin_type, account_index, next_external, " &
+            "next_internal, gap FROM accounts ORDER BY id"
+  var stmt: Sqlite3Stmt
+  if sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil) != SQLITE_OK:
+    return
+  while sqlite3_step(stmt) == SQLITE_ROW:
+    result.add(StoredAccount(
+      purpose: uint32(sqlite3_column_int64(stmt, 0)),
+      coinType: uint32(sqlite3_column_int64(stmt, 1)),
+      accountIndex: uint32(sqlite3_column_int64(stmt, 2)),
+      nextExternal: int(sqlite3_column_int64(stmt, 3)),
+      nextInternal: int(sqlite3_column_int64(stmt, 4)),
+      gap: int(sqlite3_column_int64(stmt, 5))))
+  discard sqlite3_finalize(stmt)
+
 proc getTotalBalance*(wdb: WalletDb): int64 =
   ## Get total unspent balance
   if not wdb.isOpen:
@@ -921,3 +1012,56 @@ proc getEncryption*(wdb: WalletDb): Option[tuple[encryptedSeed: seq[byte],
 
   discard sqlite3_finalize(stmt)
   some((encryptedSeed, salt, int(rounds)))
+
+proc deleteEncryption*(wdb: WalletDb) =
+  ## Remove the encryption row (the wallet is unencrypted).
+  execSql(wdb, "DELETE FROM encryption WHERE id = 1")
+
+# =============================================================================
+# HD seed storage (security audit H8)
+# =============================================================================
+
+proc saveHdSeed*(wdb: WalletDb, plainSeed: seq[byte], seedLen: int) =
+  ## Store the seed row. `plainSeed` is empty for an encrypted wallet, which
+  ## keeps only `seed_len` here and its ciphertext in `encryption`. Writing an
+  ## empty `plainSeed` therefore also scrubs a plaintext seed left by an
+  ## earlier unencrypted state (encryptwallet).
+  if not wdb.isOpen:
+    raise newException(WalletDbError, "database not open")
+  let db = Sqlite3(wdb.db)
+  let sql = "INSERT OR REPLACE INTO hd_seed (id, seed, seed_len) VALUES (1, ?, ?)"
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db, sql.cstring, -1, addr stmt, nil)
+  checkError(db, rc, "prepare hd_seed upsert")
+  try:
+    if plainSeed.len > 0:
+      rc = sqlite3_bind_blob(stmt, 1, unsafeAddr plainSeed[0],
+                             cint(plainSeed.len), SQLITE_TRANSIENT)
+    else:
+      rc = sqlite3_bind_blob(stmt, 1, nil, 0, nil)   # NULL
+    checkError(db, rc, "bind seed")
+    checkError(db, sqlite3_bind_int64(stmt, 2, int64(seedLen)), "bind seed_len")
+    rc = sqlite3_step(stmt)
+    if rc != SQLITE_DONE:
+      checkError(db, rc, "step hd_seed upsert")
+  finally:
+    discard sqlite3_finalize(stmt)
+
+proc getHdSeed*(wdb: WalletDb): Option[tuple[plainSeed: seq[byte], seedLen: int]] =
+  ## The seed row, or none for a wallet that never stored one (watch-only,
+  ## or created before the seed was persisted).
+  if not wdb.isOpen:
+    return
+  let db = Sqlite3(wdb.db)
+  var stmt: Sqlite3Stmt
+  if sqlite3_prepare_v2(db, "SELECT seed, seed_len FROM hd_seed WHERE id = 1",
+                        -1, addr stmt, nil) != SQLITE_OK:
+    return
+  if sqlite3_step(stmt) == SQLITE_ROW:
+    var seed: seq[byte]
+    let n = sqlite3_column_bytes(stmt, 0)
+    if n > 0:
+      seed = newSeq[byte](n)
+      copyMem(addr seed[0], sqlite3_column_blob(stmt, 0), n)
+    result = some((seed, int(sqlite3_column_int64(stmt, 1))))
+  discard sqlite3_finalize(stmt)

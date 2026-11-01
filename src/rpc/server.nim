@@ -7151,6 +7151,24 @@ proc persistTargetWallet(rpc: RpcServer) {.gcsafe.} =
     except CatchableError:
       discard
 
+proc persistTargetKeyMaterial(rpc: RpcServer) {.gcsafe.} =
+  ## Write the target wallet's seed and accounts to its database after an RPC
+  ## that changed them (encryptwallet / walletpassphrasechange / sethdseed).
+  ## Unlike the ledger snapshot this is not best-effort: if it fails the
+  ## change would be lost at the next restart, so the RPC reports an error.
+  ## Security audit H8.
+  if rpc.walletManager == nil:
+    return
+  var name = rpc.currentWalletName
+  if name == "":
+    let lwOpt = rpc.walletManager.getDefaultWallet()
+    if lwOpt.isNone:
+      return
+    name = lwOpt.get().name
+  if not rpc.walletManager.persistKeyMaterial(name):
+    raise newRpcError(RpcWalletError,
+      "Error: failed to write the wallet keys to the wallet database")
+
 proc scanBlockIntoWallets(rpc: RpcServer, blk: Block, height: int32,
                           persist: bool) {.gcsafe.} =
   ## Credit/debit every loaded wallet's UTXO ledger from a connected block.
@@ -9916,6 +9934,7 @@ proc handleSetHdSeed(rpc: RpcServer, params: JsonNode): JsonNode =
     w.setHdSeed(seed)
   except WalletError as e:
     raise newRpcError(RpcInvalidParams, e.msg)
+  rpc.persistTargetKeyMaterial()
 
   let mainnet = w.mainnet
   var seedHex = ""
@@ -10899,9 +10918,10 @@ proc handleEncryptWallet(rpc: RpcServer, params: JsonNode): JsonNode =
 
   try:
     discard w.encryptWallet(passphrase)
-    %"wallet encrypted successfully"
   except WalletError as e:
     raise newRpcError(RpcMiscError, e.msg)
+  rpc.persistTargetKeyMaterial()
+  %"wallet encrypted successfully"
 
 proc handleWalletPassphrase(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Unlock an encrypted wallet
@@ -10972,9 +10992,10 @@ proc handleWalletPassphraseChange(rpc: RpcServer, params: JsonNode): JsonNode =
   try:
     if not w.changePassphrase(oldPassphrase, newPassphrase):
       raise newRpcError(RpcMiscError, "incorrect old passphrase")
-    newJNull()
   except WalletError as e:
     raise newRpcError(RpcMiscError, e.msg)
+  rpc.persistTargetKeyMaterial()
+  newJNull()
 
 # ============================================================================
 # Address Label RPCs
