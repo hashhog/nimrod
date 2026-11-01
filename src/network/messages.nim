@@ -18,6 +18,7 @@ const
   MaxGetBlocksInvCount* = 500      # net_processing.cpp:4217 nLimit
   MaxGetAddrCount* = 1000          # Cap for getaddr response (matches Bitcoin Core)
   MaxPkgTxnsCount* = 25            # BIP-331: max txs per pkgtxns (== mempool ancestor limit)
+  MaxSubversionLength* = 256       # net.h:67 MAX_SUBVERSION_LENGTH — VERSION user agent cap
   ProtocolVersion* = 70016'u32
   UserAgent* = "/nimrod:0.1.0/"
   NodeNetwork* = 1'u64
@@ -364,6 +365,17 @@ proc readVarString*(r: var BinaryReader): string =
   for i in 0 ..< int(length):
     result.add(char(r.readUint8()))
 
+proc readLimitedVarString*(r: var BinaryReader, limit: int): string =
+  ## Core LimitedStringFormatter (serialize.h): reject on the CompactSize
+  ## length alone, before reading any of the string.
+  let length = r.readCompactSize()
+  if length > uint64(limit):
+    raise newException(SerializationError, "String length limit exceeded: " &
+                       $length & " > " & $limit)
+  result = ""
+  for i in 0 ..< int(length):
+    result.add(char(r.readUint8()))
+
 # InvVector serialization
 
 proc writeInvVector*(w: var BinaryWriter, inv: InvVector) =
@@ -420,7 +432,10 @@ proc readVersionMsg*(r: var BinaryReader): VersionMsg =
   result.addrRecv = r.readNetAddress()
   result.addrFrom = r.readNetAddress()
   result.nonce = r.readUint64LE()
-  result.userAgent = r.readVarString()
+  # Core net_processing.cpp: LIMITED_STRING(strSubVer, MAX_SUBVERSION_LENGTH).
+  # Unbounded, a stranger's pre-handshake VERSION could carry ~4 MB that the
+  # handshake logged at INF (security audit 2026-10-31, H2).
+  result.userAgent = r.readLimitedVarString(MaxSubversionLength)
   result.startHeight = r.readInt32LE()
   # relay field is optional for older versions
   if r.remaining() >= 1:
