@@ -499,7 +499,10 @@ proc handleRestBlockHashByHeight*(rest: RestServer, uriPart: string): RestRespon
   except ValueError:
     return restError(Http400, "Invalid height: " & heightStr)
 
-  if height < 0:
+  # Core parses with ToIntegral<int32_t> (rest.cpp:1098-1100), so a height
+  # outside int32 is a 400. Bound it before the int32() conversions below:
+  # for 2^31 and above they raise a RangeDefect, which used to end the process.
+  if height < 0 or height > int(high(int32)):
     return restError(Http400, "Invalid height: " & heightStr)
 
   if int32(height) > rest.chainState.bestHeight:
@@ -1189,7 +1192,10 @@ proc processStream(rest: RestServer,
                     resp = rest.handleRestRequest(path)
                 else:
                   resp = rest.handleRestRequest(path)
-              except CatchableError as e:
+              except Exception as e:
+                # Exception, not CatchableError: a Defect (RangeDefect,
+                # IndexDefect, ...) in a handler is a 500 for this request,
+                # not the end of the process (security audit C3/M1).
                 resp = restError(Http500, "Internal error: " & e.msg)
             let httpResponse = formatHttpResponse(resp)
             await writer.write(httpResponse)
@@ -1235,7 +1241,7 @@ proc processStream(rest: RestServer,
                 else:
                   resp = restError(Http404,
                     "POST " & postPath & " not found")
-              except CatchableError as e:
+              except Exception as e:
                 resp = restError(Http500,
                   "Internal error: " & e.msg)
             let httpResponse = formatHttpResponse(resp)
@@ -1278,7 +1284,9 @@ proc processStream(rest: RestServer,
               discard
           # Other headers are skipped (no auth, no Host check on read-only).
 
-    except CatchableError:
+    except Exception:
+      # Drop this connection on any error, Defects included; the listener
+      # and the rest of the node keep running.
       break
 
 proc processRestClient(rest: RestServer, transp: StreamTransport) {.async.} =

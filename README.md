@@ -65,8 +65,8 @@ Every network, mainnet included, gets its own subdirectory of the data directory
 | regtest | 18444 | 18443 |
 
 RPC binds to `127.0.0.1`. P2P listens on `0.0.0.0` and `::`. A Prometheus metrics
-endpoint listens on `0.0.0.0:9332` (`--metricsport=0` turns it off; a busy port only
-disables metrics).
+endpoint listens on `127.0.0.1:9332` (`--metricsbind=ADDR` changes the address,
+`--metricsport=0` turns it off; a busy port only disables metrics).
 
 A full mainnet node keeps every block: plan for at least 1 TB of fast disk, or use
 `--prune=550` (or larger, in MiB) to keep only recent blocks. `--dbcache=<MiB>` raises
