@@ -1721,22 +1721,40 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     # Respond with pong
     discard
 
+  of mkSendPackages:
+    # BIP-331: record that the peer negotiated package relay; getpkgtxns
+    # below is served only to such a peer. The same assignment in
+    # peer.nim's handleMessage never runs in the node: messageLoop calls
+    # that proc only when no callback is installed, and PeerManager always
+    # installs one, so every post-verack message lands here instead.
+    peer.sendsPackages = true
+    peer.pkgRelayVersion = 1
+    debug "peer supports package relay (BIP-331)", peer = $peer
+
   of mkGetPkgTxns:
     # BIP-331: peer wants the ancestor package whose child has the supplied
     # wtxid. Look the child up in our mempool, walk its ancestors, and reply
     # with `pkgtxns` (parents first, child last, capped at MaxPkgTxnsCount).
-    if state.mempool == nil:
+    #
+    # Only a peer that negotiated package relay (sent `sendpackages`) is
+    # served; anyone else is ignored. The child is found through the
+    # mempool's wtxid index: scanning `entries` and recomputing wtxid()
+    # (a re-serialize + double-SHA256) per entry made every 32-byte
+    # message cost a pass over the whole mempool on the P2P event loop.
+    if not peer.sendsPackages:
+      debug "ignoring getpkgtxns: peer did not send sendpackages",
+            peer = $peer
+    elif state.mempool == nil:
       trace "getpkgtxns before mempool init", peer = $peer
     else:
       var childTxid: TxId
       var childFound = false
       let target = msg.getPkgTxns.childWtxid
       {.gcsafe.}:
-        for txid, entry in state.mempool.entries:
-          if array[32, byte](entry.tx.wtxid()) == target:
-            childTxid = txid
-            childFound = true
-            break
+        let childOpt = state.mempool.getByWtxid(TxId(target))
+        if childOpt.isSome:
+          childTxid = childOpt.get().txid
+          childFound = true
       if not childFound:
         trace "getpkgtxns: child wtxid not in mempool",
               peer = $peer, wtxid = target

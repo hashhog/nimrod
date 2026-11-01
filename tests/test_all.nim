@@ -138,6 +138,7 @@ const IncludedTests = [
   "test_getchaintips_side_tips",
   "test_getnodeaddresses",
   "test_getorphantxs",
+  "test_getpkgtxns_gate",
   "test_getpeerinfo_conntime",
   "test_getpeerinfo_fields",
   "test_handshake",
