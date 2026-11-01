@@ -57,6 +57,8 @@ type
                                          ## written (requestNodeShutdown), so
                                          ## `stop` and SIGTERM share one path.
     shutdownSignalled: bool
+    activeClients: int                   ## Connections in processClient, capped
+                                         ## at RpcMaxConnections by start().
     p2pQueue*: P2PCmdQueue               ## RPC -> main-loop P2P commands (NI-6).
                                          ## nil outside the node (unit tests):
                                          ## postP2P then runs on this thread.
@@ -16500,12 +16502,40 @@ const
     ## Cumulative request-line + header budget, matching Core
     ## httpserver.cpp:51 MAX_HEADERS_SIZE / evhttp_set_max_headers_size.
 
+  MaxBodySize* = 32 * 1024 * 1024
+    ## Largest Content-Length accepted; Core httpserver.cpp
+    ## evhttp_set_max_body_size(http, MAX_SIZE), MAX_SIZE = 0x02000000.
+  RpcServerTimeout* = chronos.seconds(30)
+    ## A read that makes no progress for this long drops the connection;
+    ## Core DEFAULT_HTTP_SERVER_TIMEOUT (httpserver.h), libevent's
+    ## evhttp_set_timeout.
+  RpcMaxConnections* = 64
+    ## Concurrent RPC connections served; past this an accepted socket is
+    ## answered 503 and closed. Core DEFAULT_HTTP_WORKQUEUE (httpserver.h).
+
 func cumulativeHeaderBytes*(soFar: int, line: string): int {.inline.} =
   ## One HTTP line plus its terminating CRLF.
   soFar + line.len + 2
 
 func headersExceedCap*(soFar: int, line: string): bool {.inline.} =
   cumulativeHeaderBytes(soFar, line) > MaxHeadersSize
+
+func headerLineReadLimit*(soFar: int): int {.inline.} =
+  ## `limit` for the next readLine: the bytes left in the MaxHeadersSize
+  ## budget, counting the line's CRLF. A line that fills it without a CRLF
+  ## comes back at that length and fails headersExceedCap, so no more than
+  ## this is ever buffered for one line. At least 2, because chronos reads
+  ## limit 0 as unlimited.
+  max(MaxHeadersSize - soFar, 2)
+
+proc writeStatus(transp: StreamTransport, status, body: string) {.async.} =
+  ## A plain-text error answer that closes the connection.
+  let response = "HTTP/1.1 " & status & "\r\n" &
+                 "Connection: close\r\n" &
+                 "Content-Type: text/plain\r\n" &
+                 "Content-Length: " & $body.len & "\r\n" &
+                 "\r\n" & body
+  discard await transp.write(response).withTimeout(RpcServerTimeout)
 
 proc requestNodeShutdown(rpc: RpcServer) =
   ## Deliver SIGTERM to our own process: the kernel routes a process-directed
@@ -16533,15 +16563,15 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
   while not transp.closed:
     try:
       if inHeaders:
-        let line = await transp.readLine()
+        # Bounded while reading, not after: an unlimited readLine buffered a
+        # whole CRLF-less header line before the cap was checked, from any
+        # local UID with no credentials (audit H6: 1 GiB -> 3.1 GB RSS).
+        let lineFut = transp.readLine(limit = headerLineReadLimit(headerBytes))
+        if not await lineFut.withTimeout(RpcServerTimeout):
+          break
+        let line = lineFut.read()
         if headersExceedCap(headerBytes, line):
-          const body = "Bad Request"
-          let response = "HTTP/1.1 400 Bad Request\r\n" &
-                        "Connection: close\r\n" &
-                        "Content-Type: text/plain\r\n" &
-                        "Content-Length: " & $body.len & "\r\n" &
-                        "\r\n" & body
-          discard await transp.write(response)
+          await transp.writeStatus("400 Bad Request", "Bad Request")
           break
         headerBytes = cumulativeHeaderBytes(headerBytes, line)
 
@@ -16565,8 +16595,11 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
 
           # Read body based on Content-Length
           if contentLength > 0:
-            let bodyData = await transp.read(contentLength)
-            let body = cast[string](bodyData)
+            # contentLength <= MaxBodySize (checked when the header was read).
+            let bodyFut = transp.read(contentLength)
+            if not await bodyFut.withTimeout(RpcServerTimeout):
+              break
+            let body = cast[string](bodyFut.read())
 
             # Yield to the event loop before the synchronous chain-state read so
             # that other pending futures (peer I/O, sync loop heartbeats) are not
@@ -16633,12 +16666,33 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
 
             if key == "content-length":
               contentLength = parseInt(value)
+              # Before auth and before any body byte is read, like libevent
+              # (audit M8: there was no cap, so a client could make the node
+              # wait for, and buffer, any length it named).
+              if contentLength < 0:
+                await transp.writeStatus("400 Bad Request", "Bad Request")
+                break
+              if contentLength > MaxBodySize:
+                await transp.writeStatus("413 Payload Too Large",
+                                         "Payload Too Large")
+                break
             elif key == "authorization":
               authHeader = value
 
     except CatchableError:
       break
 
+  await transp.closeWait()
+  dec rpc.activeClients
+
+proc rejectBusyClient(transp: StreamTransport) {.async.} =
+  ## Past RpcMaxConnections: answer like Core's full work queue
+  ## (httpserver.cpp, HTTP_SERVICE_UNAVAILABLE) and close, without reading.
+  try:
+    await transp.writeStatus("503 Service Unavailable",
+                             "Work queue depth exceeded")
+  except CatchableError:
+    discard
   await transp.closeWait()
 
 proc start*(rpc: RpcServer) {.async.} =
@@ -16652,6 +16706,12 @@ proc start*(rpc: RpcServer) {.async.} =
   while rpc.running:
     try:
       let transp = await server.accept()
+      # Counted here, synchronously with accept, so a burst of connects
+      # cannot overshoot the cap before the handlers start running.
+      if rpc.activeClients >= RpcMaxConnections:
+        asyncSpawn rejectBusyClient(transp)
+        continue
+      inc rpc.activeClients
       asyncSpawn rpc.processClient(transp)
     except CatchableError as e:
       if rpc.running:
