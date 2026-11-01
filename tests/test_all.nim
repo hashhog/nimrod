@@ -249,6 +249,7 @@ const IncludedTests = [
   "test_undo",
   "test_utxo_cache",
   "test_validateblock_ibd_utxo",
+  "test_version_timestamp_overflow",
   "test_versionbits",
   "test_w100_coins_view_cache",
   "test_w101_activate_best_chain",
