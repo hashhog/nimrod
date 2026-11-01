@@ -447,3 +447,129 @@ suite "a UTXO read failure is not a verdict":
     check blockFailureKindOfToken("bad-txns-inputs-missingorspent") == bfkInvalid
     check blockFailureKindOfApplyError("utxo-read-error: x") == bfkUndecided
     check blockFailureKindOfApplyError("acceptBlock rejected: " & $veUtxoReadError) == bfkUndecided
+
+# ===========================================================================
+# Security audit H3 (nimrod-2026-10-31): an unrequested side-branch body was
+# stored on disk whatever its work, so a peer could make the node write ~4 MB
+# per cheap fork header. Core ChainstateManager::AcceptBlock with !fRequested
+# returns before WriteBlock when !fHasMoreOrSameWork (pindex->nChainWork <
+# ActiveTip()->nChainWork). A requested body, or one with at least the tip's
+# work, is still stored and can still win a reorg.
+suite "H3: unrequested low-work side-branch bodies are not stored":
+
+  test "unrequested low-work side body is dropped, sender not punished, and fetched later if its branch wins":
+    let p = regtestParams()
+    let path = "/tmp/nimrod_ibp2p_h3_drop"
+    let (cs, blks) = buildDatadir(path, p, 20)
+    defer:
+      var c = cs
+      c.close()
+      removeDir(path)
+      removeDir(path & "_pm")
+    var csv = cs
+    let pm = freshPeerManager(p, path & "_pm")
+    let x = pm.readyPeer("198.51.100.150", p, pdInbound, 20)
+    let sm = newSyncManager(pm, csv.db, p, csv)
+    check sm.chainTipHeight == 20
+
+    # Fork at 18: F19 has less work than the tip (20), F20 the same.
+    let f19 = validBlock(blks[18], 19, 0xF1)
+    let f20 = validBlock(f19, 20, 0xF2)
+    let hF19 = hashOf(f19.header)
+    waitFor sm.handleHeaders(x, @[f19.header, f20.header])
+    check hF19 in sm.headerChain.sideHeaders
+    check hF19 notin sm.requestedHashes
+
+    # Never asked for: not written. PRE-FIX: stored via acceptSideBranchBlock.
+    check not sm.processBlock(x, f19)
+    check csv.db.getBlock(hF19).isNone
+    check not x.shouldDisconnect      # Core returns true, no punishment
+    check sm.chainTip == hashOf(blks[20].header)
+
+    # The dropped block is valid. If its branch later has the most work, the
+    # fork download walk still selects it (its body is missing), and the
+    # requested copy is stored.
+    let f21 = validBlock(f20, 21, 0xF3)
+    waitFor sm.handleHeaders(x, @[f19.header, f20.header, f21.header])
+    check hashOf(f21.header) in sm.headerChain.sideHeaders
+    waitFor sm.requestBlocks(x)
+    var queued = initHashSet[BlockHash]()
+    for h in sm.blockQueue.items:
+      queued.incl(h)
+    check hF19 in queued
+    sm.requestedHashes.incl(hF19)          # the getdata it selected
+    check not sm.processBlock(x, f19)
+    check csv.db.getBlock(hF19).isSome
+
+  test "a requested low-work side body is stored":
+    let p = regtestParams()
+    let path = "/tmp/nimrod_ibp2p_h3_req"
+    let (cs, blks) = buildDatadir(path, p, 20)
+    defer:
+      var c = cs
+      c.close()
+      removeDir(path)
+      removeDir(path & "_pm")
+    var csv = cs
+    let pm = freshPeerManager(p, path & "_pm")
+    let x = pm.readyPeer("198.51.100.151", p, pdInbound, 20)
+    let sm = newSyncManager(pm, csv.db, p, csv)
+    let f19 = validBlock(blks[18], 19, 0xF1)
+    let f20 = validBlock(f19, 20, 0xF2)
+    let hF19 = hashOf(f19.header)
+    waitFor sm.handleHeaders(x, @[f19.header, f20.header])
+    sm.requestedHashes.incl(hF19)          # getdata in flight
+    check not sm.processBlock(x, f19)      # side branch, tip unchanged
+    check csv.db.getBlock(hF19).isSome
+    check not x.shouldDisconnect
+
+  test "an unrequested side body with the tip's work is stored (Core fHasMoreOrSameWork)":
+    let p = regtestParams()
+    let path = "/tmp/nimrod_ibp2p_h3_equal"
+    let (cs, blks) = buildDatadir(path, p, 20)
+    defer:
+      var c = cs
+      c.close()
+      removeDir(path)
+      removeDir(path & "_pm")
+    var csv = cs
+    let pm = freshPeerManager(p, path & "_pm")
+    let x = pm.readyPeer("198.51.100.152", p, pdInbound, 20)
+    let sm = newSyncManager(pm, csv.db, p, csv)
+    let g20 = validBlock(blks[19], 20, 0xE1)
+    let hG20 = hashOf(g20.header)
+    waitFor sm.handleHeaders(x, @[g20.header])
+    check hG20 in sm.headerChain.sideHeaders
+    check hG20 notin sm.requestedHashes
+    check not sm.processBlock(x, g20)
+    check csv.db.getBlock(hG20).isSome
+    check sm.chainTip == hashOf(blks[20].header)
+
+  test "honest heavier fork: requested bodies, then an unrequested heavier tip body, reorgs":
+    let p = regtestParams()
+    let path = "/tmp/nimrod_ibp2p_h3_reorg"
+    let (cs, blks) = buildDatadir(path, p, 20)
+    defer:
+      var c = cs
+      c.close()
+      removeDir(path)
+      removeDir(path & "_pm")
+    var csv = cs
+    let pm = freshPeerManager(p, path & "_pm")
+    let x = pm.readyPeer("198.51.100.153", p, pdInbound, 21)
+    let sm = newSyncManager(pm, csv.db, p, csv)
+    let f19 = validBlock(blks[18], 19, 0xF1)
+    let f20 = validBlock(f19, 20, 0xF2)
+    let f21 = validBlock(f20, 21, 0xF3)
+    waitFor sm.handleHeaders(x, @[f19.header, f20.header, f21.header])
+    # F19 and F20 were fetched (getdata in flight); F21 is pushed unsolicited
+    # (Core direct block relay of a new tip) and has more work than the tip.
+    sm.requestedHashes.incl(hashOf(f19.header))
+    sm.requestedHashes.incl(hashOf(f20.header))
+    check not sm.processBlock(x, f19)
+    check not sm.processBlock(x, f20)
+    check hashOf(f21.header) notin sm.requestedHashes
+    check sm.processBlock(x, f21)          # true: reorged onto F21
+    check sm.chainTip == hashOf(f21.header)
+    check csv.bestBlockHash == hashOf(f21.header)
+    check not x.shouldDisconnect
