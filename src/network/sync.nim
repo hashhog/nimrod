@@ -128,6 +128,7 @@ type
     # Out-of-order block buffer (blocks received ahead of chainTip)
     receivedBlocks*: Table[int32, Block]                    ## height -> block buffer
     requestedHashes*: HashSet[BlockHash]                    ## hashes currently in-flight
+    fetchRequested*: HashSet[BlockHash]  ## getblockfrompeer getdata sent, body not yet seen
     # Per-peer counter of consecutive unconnecting-headers messages.
     # Mirrors Bitcoin Core's `nUnconnectingHeaders` accounting in
     # net_processing.cpp::ProcessHeadersMessage.  When the count exceeds
@@ -1016,6 +1017,17 @@ proc loadHeaderChainFromDb*(chainDb: ChainDb,
        tipHeight = result.tipHeight, bestHeight = bestHeight,
        firstHeight = suffix[0].height, loaded = loaded
 
+const MaxFetchRequested = 1000
+
+proc noteBlockFetchRequested*(sm: SyncManager, hash: BlockHash) =
+  ## getblockfrompeer asked a peer for `hash` (Core FetchBlock marks it
+  ## requested). Its body may be a stale block with less work than the tip,
+  ## which the side-branch gate in processBlock would otherwise drop. An RPC
+  ## loop cannot grow this without bound: at the cap it starts over.
+  if sm.fetchRequested.len >= MaxFetchRequested:
+    sm.fetchRequested.clear()
+  sm.fetchRequested.incl(hash)
+
 proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
                      params: ConsensusParams,
                      chainState: ChainState = nil,
@@ -1068,6 +1080,10 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     txoSpenderIndex: txoSpenderIndex,
     lastRepairRequest: getTime()
   )
+  if pm != nil:
+    let sm = result
+    pm.blockFetchHook = proc(hash: BlockHash) {.gcsafe, raises: [].} =
+      sm.noteBlockFetchRequested(hash)
 
   # Initialize with genesis if chain is empty
   if chainDb.bestHeight < 0:
@@ -4043,6 +4059,8 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   # Remove from in-flight tracking
   let wasRequested = hash in sm.requestedHashes
   sm.requestedHashes.excl(hash)
+  let wasFetched = hash in sm.fetchRequested
+  sm.fetchRequested.excl(hash)
   sm.noteBlockDelivered(hash, peer)
 
   # BLOCK_CACHED_INVALID: a body for a block already marked failed is not
@@ -4115,7 +4133,7 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
       # fork header lets a peer store a full body (audit H3). Not a
       # verdict: no punishment, and the fork download walk still fetches
       # the body if the branch later has the most work.
-      if not wasRequested:
+      if not wasRequested and not wasFetched:
         var enoughWork = false
         try:
           {.gcsafe.}:

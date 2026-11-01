@@ -27,6 +27,7 @@ import ../src/network/sync
 import ../src/network/peer
 import ../src/network/peermanager
 import ../src/network/messages
+import ../src/network/p2p_cmd_queue
 import ../src/consensus/[params, validation, chain]
 import ../src/storage/chainstate
 import ../src/storage/db
@@ -521,6 +522,36 @@ suite "H3: unrequested low-work side-branch bodies are not stored":
     sm.requestedHashes.incl(hF19)          # getdata in flight
     check not sm.processBlock(x, f19)      # side branch, tip unchanged
     check csv.db.getBlock(hF19).isSome
+    check not x.shouldDisconnect
+
+  test "a getblockfrompeer body (RPC-posted getdata) is stored even with less work than the tip":
+    ## Core getblockfrompeer -> FetchBlock -> BlockRequested: the body is
+    ## requested, so a stale block with less work than the tip is written.
+    ## That is what the RPC is for, so the gate must not drop it.
+    let p = regtestParams()
+    let path = "/tmp/nimrod_ibp2p_h3_fetch"
+    let (cs, blks) = buildDatadir(path, p, 20)
+    defer:
+      var c = cs
+      c.close()
+      removeDir(path)
+      removeDir(path & "_pm")
+    var csv = cs
+    let pm = freshPeerManager(p, path & "_pm")
+    let x = pm.readyPeer("198.51.100.154", p, pdInbound, 20)
+    let sm = newSyncManager(pm, csv.db, p, csv)
+    let f19 = validBlock(blks[18], 19, 0xF1)
+    let f20 = validBlock(f19, 20, 0xF2)
+    let hF19 = hashOf(f19.header)
+    waitFor sm.handleHeaders(x, @[f19.header, f20.header])
+    # The command handleGetBlockFromPeer posts, run as the main loop does.
+    pm.runP2PCommand(P2PCmd(kind: pcGetData, host: x.address, port: x.port,
+      invs: @[InvVector(invType: invWitnessBlock, hash: array[32, byte](hF19))]))
+    check hF19 notin sm.requestedHashes
+    check hF19 in sm.fetchRequested
+    check not sm.processBlock(x, f19)
+    check csv.db.getBlock(hF19).isSome
+    check hF19 notin sm.fetchRequested
     check not x.shouldDisconnect
 
   test "an unrequested side body with the tip's work is stored (Core fHasMoreOrSameWork)":
