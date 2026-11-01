@@ -148,6 +148,7 @@ const IncludedTests = [
   "test_headerssync",
   "test_ibd_cache_eviction",
   "test_ibd_durability",
+  "test_ibd_unrequested_buffer",
   "test_inbound_p2p",
   "test_interpreter_glassbox_fixes",
   "test_invalid_block_p2p",

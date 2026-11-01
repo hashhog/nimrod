@@ -1323,6 +1323,11 @@ proc noteBlockDelivered*(sm: SyncManager, hash: BlockHash, peer: Peer,
   if hash notin sm.blocksInFlight:
     return
   let req = sm.blocksInFlight[hash]
+  # Core RemoveBlockRequest(hash, from_peer): a copy from someone else does
+  # not settle a request another peer still owes, or any peer could cancel
+  # (and restart the stall clock of) an honest download by sending first.
+  if peer != nil and req.peer != nil and peer != req.peer:
+    return
   sm.blocksInFlight.del(hash)
   var wasFront = true
   for h2, r2 in sm.blocksInFlight:
@@ -4093,6 +4098,11 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   sm.pendingReorgDisconnectedTxs.setLen(0)
   sm.pendingReorgConnectedBlocks.setLen(0)
 
+  # Who we asked for this body (Core mapBlocksInFlight), read before the
+  # delivery below settles the request. Only that peer's copy may enter the
+  # out-of-order buffer.
+  let inFlightOwner = sm.blocksInFlight.getOrDefault(hash).peer
+
   # Remove from in-flight tracking
   let wasRequested = hash in sm.requestedHashes
   sm.requestedHashes.excl(hash)
@@ -4218,7 +4228,29 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
     sm.drainBlockBuffer()
     return true
   elif blockHeight > expectedHeight and blockHeight <= sm.headerTipHeight:
-    # Out-of-order block - buffer it for later processing
+    # Out-of-order block - buffer it for later processing, but only a body we
+    # asked THIS peer for, that matches its header's commitments, into an
+    # empty slot (audit H4). Core holds no such buffer: CheckBlock rejects a
+    # mutated body before AcceptBlock, which drops unrequested far-ahead
+    # blocks. Anything else is dropped and, if still owed, fetched normally.
+    if not wasRequested or inFlightOwner == nil or inFlightOwner != peer:
+      if wasRequested and inFlightOwner != nil and peer != nil:
+        # Another peer still owes it; noteBlockDelivered left its in-flight
+        # entry alone, so keep the hash requested too.
+        sm.requestedHashes.incl(hash)
+      elif wasRequested:
+        sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+      debug "dropped out-of-order block not requested from this peer",
+            height = blockHeight
+      return false
+    if not bodyMatchesCommitments(blk, sm.segwitActiveAt(int32(blockHeight))):
+      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+      sm.punishForBlock(peer, bfkMutated,
+        "mutated block: body does not match header commitments")
+      return false
+    if int32(blockHeight) in sm.receivedBlocks:
+      sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+      return false
     sm.receivedBlocks[int32(blockHeight)] = blk
     sm.noteBlockSource(hash, peer)
     trace "buffered out-of-order block", height = blockHeight,
