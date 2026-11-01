@@ -378,3 +378,12 @@ suite "H8: HD seed and accounts survive a wallet close + reopen":
     check w2.signsFor(a)
     wm2.close()
     removeDir(dir)
+
+  test "wallet.db that holds the seed is owner-only (0600)":
+    let dir = freshReopenDir()
+    var wm = newWalletManager(dir, regtestParams())
+    discard wm.createWallet("p")
+    check getFilePermissions(dir / "wallets" / "p" / "wallet.db") ==
+      {fpUserRead, fpUserWrite}
+    wm.close()
+    removeDir(dir)

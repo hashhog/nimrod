@@ -215,6 +215,13 @@ proc persistAllWallets*(wm: WalletManager) {.gcsafe.} =
 # no longer sign after one restart. Mirrors Core writing descriptor keys at
 # creation (wallet/walletdb.cpp WriteDescriptorKey / WriteCryptedDescriptorKey).
 
+proc restrictToOwner(path: string) =
+  ## wallet.db now holds the seed (plaintext for an unencrypted wallet): make
+  ## it owner-only, as Core's umask 077 does for wallet.dat. The node-wide
+  ## umask is audit finding M6; this covers the one file H8 puts keys in.
+  when defined(posix):
+    setFilePermissions(path, {fpUserRead, fpUserWrite})
+
 proc writeKeyMaterial(db: WalletDb, wallet: Wallet) =
   ## Write the seed and accounts. Caller wraps this in withWalletTx.
   if wallet.privateKeysDisabled:
@@ -245,6 +252,7 @@ proc persistKeyMaterial*(wm: WalletManager, name: string): bool {.gcsafe.} =
   if lw == nil or lw.wallet == nil:
     return false
   try:
+    restrictToOwner(lw.db.path)
     withWalletTx(lw.db):
       writeKeyMaterial(lw.db, lw.wallet)
     return true
@@ -532,6 +540,7 @@ proc createWallet*(wm: WalletManager, name: string,
   # Metadata, flags, seed and accounts in ONE transaction: a crash can never
   # leave a wallet.db that exists but holds no seed (security audit H8).
   try:
+    restrictToOwner(dbPath)
     withWalletTx(db):
       db.initMeta(networkStr, @[])
       if wallet.privateKeysDisabled:
