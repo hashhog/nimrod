@@ -114,7 +114,8 @@ the code but `--network=signet` is rejected with `Unknown network: signet`.
 | `--rest` | off | Read-only REST server on `127.0.0.1`. |
 | `--restport=PORT` | `rpcport + 1000` | REST port. |
 | `--rpc-tls-cert=PATH`, `--rpc-tls-key=PATH` | none | Serve REST over TLS. Both or neither; the key must be unencrypted PKCS#8 PEM. |
-| `--metricsport=PORT` | `9332` | Not in `--help`. Prometheus endpoint on `0.0.0.0`; `0` disables it. |
+| `--metricsport=PORT` | `9332` | Not in `--help`. Prometheus endpoint; `0` disables it. |
+| `--metricsbind=ADDR` | `127.0.0.1` | Not in `--help`. Address the metrics endpoint listens on. A scraper on another host needs this set (e.g. `0.0.0.0`). |
 
 ## Config file
 
@@ -165,9 +166,12 @@ shut the node down cleanly, as does the `stop` RPC.
 
 ## Metrics
 
-`http://<host>:9332/metrics` serves Prometheus text format: block height, peer count,
-mempool size and similar gauges. If the port is taken, the node logs
-`metrics server bind failed; metrics disabled` and keeps running.
+`http://127.0.0.1:9332/metrics` serves Prometheus text format: block height, peer count,
+mempool size and similar gauges. It listens on loopback only unless `--metricsbind` says
+otherwise. A client that sends no request within 5 seconds is disconnected, and at most
+16 metrics connections are served at once; extra connections are closed on accept. If
+the port is taken, the node logs `metrics server bind failed; metrics disabled` and
+keeps running.
 
 ```bash
 curl -s http://127.0.0.1:9332/metrics | head

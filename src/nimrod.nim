@@ -56,6 +56,9 @@ type
     pruneTarget*: uint64  ## Prune target in MiB (0 = disabled, 1 = manual only)
     importBlocks*: string ## Path to blk*.dat directory, or "-" for framed stdin
     metricsPort*: uint16  ## Prometheus metrics port (0 = disabled)
+    metricsBind*: string  ## --metricsbind=<addr>: metrics listen address.
+                          ## Default 127.0.0.1; a scraper on another host
+                          ## needs it set explicitly (e.g. 0.0.0.0).
     ibdFlushInterval*: int ## Disk flush interval during IBD (0 = use default 2000)
     numVerifyWorkers*: int ## Script verify thread count for parallel IBD (0 = auto = CPU count)
     fallbackFeeRate*: float64 ## --fallbackfee=<BTC/kvB>, stored in sat/vB. Wallet
@@ -313,6 +316,7 @@ proc defaultConfig*(): NimrodConfig =
     listenEnabled: true,
     pruneTarget: 0,  # Pruning disabled by default
     metricsPort: 9332,
+    metricsBind: "127.0.0.1",
     ibdFlushInterval: 0,  # 0 = use default (IbdBatchFlushInterval = 2000)
     numVerifyWorkers: 0,  # 0 = auto (CPU count via countProcessors())
     fallbackFeeRate: 0.0,  # Core DEFAULT_FALLBACK_FEE = 0 (disabled)
@@ -756,6 +760,8 @@ proc parseArgs*(cmdline: seq[string]): tuple[cmd: Command, config: NimrodConfig,
         except ValueError:
           echo "Invalid metrics port: " & p.val
           quit(1)
+      of "metricsbind":
+        result.config.metricsBind = p.val
       of "testnet":
         result.config.network = "testnet3"
         if result.config.rpcPort == 8332: result.config.rpcPort = 18332
@@ -2438,12 +2444,27 @@ proc runBlockImport*(config: NimrodConfig) =
     quit(1)
   echo "Import finished. Tip at height " & $cs.bestHeight
 
+const
+  MetricsReadTimeout* = chronos.seconds(5)
+    ## A metrics client that has not sent its request by then is dropped.
+    ## Without it a socket that sends nothing was held forever (audit H1:
+    ## 3,000 silent sockets took the node from 25 to 3,025 fds).
+  MetricsMaxConnections* = 16
+    ## Concurrent metrics connections.  Past this an accepted socket is
+    ## closed at once, so the fd table (shared with RocksDB) stays bounded.
+  MetricsAcceptErrorBackoff* = chronos.milliseconds(100)
+    ## Pause after a failed accept (e.g. EMFILE) instead of spinning on the
+    ## main event loop.
+
 proc metricsHandler(state: NodeState, transp: StreamTransport) {.async.} =
   ## Handle a single Prometheus metrics request
   try:
-    # Read HTTP request (just consume it)
+    # Read HTTP request (just consume it).  Bounded by MetricsReadTimeout.
     var buf = newString(4096)
-    discard await transp.readOnce(addr buf[0], 4096)
+    let readFut = transp.readOnce(addr buf[0], 4096)
+    if not await readFut.withTimeout(MetricsReadTimeout):
+      await transp.closeWait()
+      return
 
     let height = state.chainState.bestHeight
     let peers = state.peerManager.connectedPeerCount()
@@ -2464,38 +2485,54 @@ proc metricsHandler(state: NodeState, transp: StreamTransport) {.async.} =
                    "Content-Length: " & $body.len & "\r\n" &
                    "Connection: close\r\n\r\n" & body
 
-    discard await transp.write(response)
+    discard await transp.write(response).withTimeout(MetricsReadTimeout)
   except CatchableError:
     discard
 
   await transp.closeWait()
 
 proc startMetricsServer(state: NodeState, port: uint16) {.async.} =
-  ## Start Prometheus metrics HTTP server.
+  ## Start Prometheus metrics HTTP server on state.config.metricsBind
+  ## (default 127.0.0.1, like RPC).
   ## Bind failures (e.g. EADDRINUSE) MUST NOT crash the node — degrade
   ## to "metrics disabled" and let the node keep serving RPC + P2P.
   ## The previous behaviour let TransportOsError escape to asyncSpawn,
   ## which raised FutureDefect on the chronos event loop and killed the
   ## process (regression caught by tools/smoke-harness.sh when port 9332
   ## was already held by another fleet node — e.g. mainnet blockbrew).
-  let ta = initTAddress("0.0.0.0", Port(port))
+  let bindAddr =
+    if state.config.metricsBind.len > 0: state.config.metricsBind
+    else: "127.0.0.1"
   var server: StreamServer
   try:
+    let ta = initTAddress(bindAddr, Port(port))
     server = createStreamServer(ta, flags = {ReuseAddr})
   except CatchableError as e:
     error "metrics server bind failed; metrics disabled",
-          port = port, error = e.msg
+          address = bindAddr, port = port, error = e.msg
     return
 
-  info "Prometheus metrics server started", port = port
+  info "Prometheus metrics server started", address = bindAddr, port = port
+
+  var active = 0
+  proc serve(transp: StreamTransport) {.async.} =
+    try:
+      await metricsHandler(state, transp)
+    finally:
+      dec active
 
   while state.running:
     try:
       let transp = await server.accept()
-      asyncSpawn metricsHandler(state, transp)
+      if active >= MetricsMaxConnections:
+        await transp.closeWait()
+        continue
+      inc active
+      asyncSpawn serve(transp)
     except CatchableError as e:
       if state.running:
         error "Metrics server error", error = e.msg
+        await sleepAsync(MetricsAcceptErrorBackoff)
 
   server.close()
 
