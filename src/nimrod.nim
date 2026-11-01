@@ -2507,7 +2507,9 @@ proc restThreadMain(rest: RestServer) {.thread.} =
   {.gcsafe.}:
     try:
       waitFor rest.start()
-    except CatchableError as e:
+    except Exception as e:
+      # Exception, not CatchableError: a Defect escaping the REST loop must
+      # not unwind past the thread entry and end the whole process.
       error "REST thread crashed", error = e.msg
 
 proc walletReconcileThreadMain(wm: WalletManager) {.thread.} =
