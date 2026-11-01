@@ -842,7 +842,9 @@ suite "BIP-22 submitblock result strings":
     # to Core's "too-little-chainwork" (validation.cpp:4229) — the assertion
     # here was stale.
     check bip22String(veBlockOverweight) == "rejected"
-    check bip22String(vePrevBlockMissing) == "rejected"
+    # vePrevBlockMissing left this list when it was mapped to Core's
+    # "prev-blk-not-found" (AcceptBlockHeader, BLOCK_MISSING_PREV).
+    check bip22String(vePrevBlockMissing) == "prev-blk-not-found"
     check bip22String(veInsufficientChainWork) == "too-little-chainwork"
     check bip22String(veCheckpointMismatch) == "rejected"
 
