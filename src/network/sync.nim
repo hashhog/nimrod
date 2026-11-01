@@ -4110,6 +4110,21 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
     if sm.chainState != nil and
        (hash in sm.headerChain.sideHeaders or
         (sm.chainDb != nil and sm.chainDb.getBlockIndex(hash).isSome)):
+      # Core AcceptBlock !fRequested: a body we did not ask for is written
+      # only if its chain work is at least the tip's. Otherwise each cheap
+      # fork header lets a peer store a full body (audit H3). Not a
+      # verdict: no punishment, and the fork download walk still fetches
+      # the body if the branch later has the most work.
+      if not wasRequested:
+        var enoughWork = false
+        try:
+          {.gcsafe.}:
+            enoughWork = sm.chainState.sideBlockHasTipWork(blk)
+        except CatchableError:
+          discard
+        if not enoughWork:
+          debug "dropped unrequested low-work side-branch body", hash = $hash
+          return false
       let reorged = sm.processSideBranchBody(peer, blk)
       sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
       return reorged
