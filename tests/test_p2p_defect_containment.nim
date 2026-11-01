@@ -1,41 +1,48 @@
 ## A Defect raised while handling one peer's input must disconnect that peer,
-## not exit the node.
+## not exit the node -- but only where the state the Defect may have left
+## half-written dies with the peer.
 ##
 ## Security audit 2026-10-31, M1 (the class behind C1): the handshake caller
-## (`handleInboundConnection`), `messageLoop`, the wrapped message callbacks and
-## the frames that run `deserializePayload` caught only `CatchableError`.  Nim
-## keeps overflow/index/range checks under -d:release, and chronos re-raises a
-## Defect eagerly out of the closure iterator and out of `poll()`, so an
-## IndexDefect in a message handler, or the OverflowDefect of C1 in the
-## handshake, exited the whole process.
+## (`handleInboundConnection`) and the frames that run `deserializePayload`
+## caught only `CatchableError`.  Nim keeps overflow/index/range checks under
+## -d:release, and chronos re-raises a Defect eagerly out of the closure
+## iterator and out of `poll()`, so the OverflowDefect of C1 in the handshake
+## exited the whole process.
 ##
 ## The PeerManager tests drive a real listener with a raw v1 client and inject
 ## the Defect on one path:
-##   * a message handler raising IndexDefect (the wrapped callback frame)
 ##   * the handshake itself: VERSION with timestamp low(int64) (audit C1). The
 ##     overflow happens after `awaitVersionMessage` suspended, i.e. in a frame
 ##     chronos resumes from poll(), where no caller's `except` can see it.
-## and then check that the attacking peer is disconnected and the node still
-## serves: a second, honest client completes a handshake and gets a pong.
-## A last test calls the legacy `peer.handleMessage` dispatcher directly.
-## On the unfixed code the Defect escapes `waitFor`; each test catches it and
-## fails by name.
+##     Contained: the attacker is dropped and a second, honest client still
+##     completes a handshake and gets a pong.
+##   * the message callback (what nimrod.nim's handleMessage runs: headers,
+##     blocks, txs).  NOT contained, by design (Warden on nimrod#26): chronos
+##     runs a callee up to its first await on the caller's stack, and
+##     handleHeaders writes putBlockIndex / updateBestHeaderInfo there (a short
+##     batch never awaits at all).  A Defect in our own header code after the
+##     first stored header must stop the node, not leave a partial block index
+##     in a live process and disconnect an honest peer for our bug.  The
+##     HEADERS test models that: the handler stores header 1, then raises on
+##     header 2, and the Defect has to reach the event loop.
+## A further test calls the legacy `peer.handleMessage` dispatcher directly,
+## and a source check pins that nimrod.nim's handleMessage carries no boundary.
 ##
 ## Not covered, by construction: a Defect raised after an `await` in an async
 ## frame that carries no boundary.  chronos raises it out of poll(), past every
-## caller.  The production frames that run on peer input carry the boundary
-## (peerDefectBoundary on performHandshake, readMessageV1/V2, the wrapped
-## callbacks, peer.handleMessage and nimrod.nim's handleMessage).
+## caller.  The production frames that run on peer input and own only per-peer
+## state carry the boundary (peerDefectBoundary on performHandshake,
+## readMessageV1/V2 and peer.handleMessage).
 ##
 ## Command:
 ##   nim c -r tests/test_p2p_defect_containment.nim
 
 import unittest2
-import std/[times, monotimes, tempfiles, os, tables]
+import std/[times, monotimes, tempfiles, os, tables, strutils]
 import chronos
 import ../src/network/[peer, peermanager, messages]
 import ../src/consensus/params
-import ../src/primitives/serialize
+import ../src/primitives/[types, serialize]
 
 const HandshakeMs = 2000
 
@@ -186,15 +193,52 @@ let quietHandler: peermanager.PeerCallback = proc(p: Peer, msg: P2PMessage) {.as
 proc invMsg(): P2PMessage =
   newInv(@[InvVector(invType: invTx, hash: default(array[32, byte]))])
 
+proc headersMsg(): P2PMessage =
+  var hs: seq[BlockHeader]
+  for i in 0 ..< 3:
+    var h = BlockHeader(version: 4, timestamp: 1_700_000_000'u32 + uint32(i),
+                        bits: 0x207fffff'u32, nonce: uint32(i))
+    h.merkleRoot[0] = byte(i + 1)
+    hs.add(h)
+  newHeaders(hs)
+
 suite "P2P defect containment (audit M1)":
 
-  test "message handler raising IndexDefect before its first await disconnects the peer":
+  test "a Defect in our own message handler before its first await reaches the event loop":
+    # The callback frame is nimrod.nim's handleMessage: chain state, not peer
+    # state.  Its Defect must not be turned into "disconnect the peer".
     let r = runScenario(syncDefect, getTime().toUnix(), invMsg(), true)
     checkpoint("err=" & r.err)
-    check r.err == ""
-    check r.attackerDropped
-    check r.attackerGone
-    check r.honestPong
+    check r.err.startsWith("IndexDefect")
+
+  test "a Defect in header handling after the first stored header is not swallowed":
+    # Models handleHeaders: putBlockIndex for each header in the stretch
+    # before its first await, then our own code raises on the second header.
+    # A boundary anywhere on the caller stack (wrapped callback, messageLoop,
+    # handleMessage) would leave index.len == 1 in a node that keeps running.
+    var index = initTable[uint32, int]()
+    let headersDefect: peermanager.PeerCallback =
+      proc(p: Peer, msg: P2PMessage) {.async.} =
+        if msg.kind == mkHeaders:
+          for i, h in msg.headers:
+            if i == 1:
+              indexDefect()
+            index[h.nonce] = i
+    let r = runScenario(headersDefect, getTime().toUnix(), headersMsg(), true)
+    checkpoint("err=" & r.err & " index.len=" & $index.len)
+    check index.len == 1          # the trigger reached the handler mid-batch
+    check r.err.startsWith("IndexDefect")
+
+  test "nimrod.nim's handleMessage carries no peerDefectBoundary":
+    # It reaches handleHeaders / acceptForkHeader / processBlock; see above.
+    const src = staticRead("../src/nimrod.nim")
+    var sig = ""
+    for line in src.splitLines():
+      if line.startsWith("proc handleMessage(state: NodeState"):
+        sig = line
+    checkpoint("sig=" & sig)
+    check sig.len > 0
+    check "peerDefectBoundary" notin sig
 
   test "a Defect in the handshake (VERSION timestamp low(int64)) does not exit the node":
     # Audit C1 through the handshake frame.  With only this containment the
