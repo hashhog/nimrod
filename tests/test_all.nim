@@ -182,6 +182,7 @@ const IncludedTests = [
   "test_orphan_pool",
   "test_p2a",
   "test_p2a_witness",
+  "test_p2p_defect_containment",
   "test_p2sh_commitment",
   "test_p2sh_taproot_anyonecspend",
   "test_package",
