@@ -1074,7 +1074,12 @@ proc connectToPeerWithType*(pm: PeerManager, address: string, port: uint16,
 
   if await peer.connect():
     try:
-      await peer.performHandshake(pm.ourHeight)
+      try:
+        await peer.performHandshake(pm.ourHeight)
+      except Defect as d:
+        # Only the handshake: it runs on the peer's VERSION and touches no
+        # chain state, so a Defect there costs the peer, not the node.
+        raise peerDefectError("performHandshake", d)
 
       # Create extended peer info.
       # FIX-51 (W115 G25): store the ASN-keyed group so outboundNetGroups
@@ -1405,7 +1410,12 @@ proc handleInboundConnection(pm: PeerManager, transp: StreamTransport) {.async.}
   info "accepted inbound connection", peer = $peer
 
   try:
-    await peer.performHandshake(pm.ourHeight)
+    try:
+      await peer.performHandshake(pm.ourHeight)
+    except Defect as d:
+      # Only the handshake: it runs on the stranger's VERSION and touches no
+      # chain state, so a Defect there costs the peer, not the node.
+      raise peerDefectError("performHandshake", d)
 
     # Create extended peer info.
     # FIX-51: use ASN-keyed group for inbound peers too so eviction's

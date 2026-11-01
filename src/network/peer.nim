@@ -2,7 +2,7 @@
 ## TCP connection with message framing, version handshake, and ping/pong
 ## Uses chronos for async networking
 
-import std/[strformat, random, hashes, tables, os, strutils, options, atomics]
+import std/[strformat, random, hashes, tables, os, strutils, options, atomics, macros]
 import ../util/rng
 import std/times as stdtimes
 import chronos
@@ -236,9 +236,59 @@ type
 
   PeerError* = object of CatchableError
 
+  PeerDefectError* = object of PeerError
+    ## A Defect (IndexDefect, RangeDefect, OverflowDefect, ...) raised while
+    ## handling one peer's input, turned into a PeerError so the peer is
+    ## disconnected instead of the process exiting. See `peerDefectBoundary`.
+
   # Callback type for self-connection detection
   # Must be {.raises: [].} for chronos async compatibility
   SelfConnectChecker* = proc(nonce: uint64): bool {.gcsafe, raises: [].}
+
+proc peerDefectError*(where: string, e: ref Defect): ref PeerDefectError =
+  ## Log a Defect caught at a P2P boundary, with its stack trace, and return
+  ## the PeerError that replaces it.  The caller raises it; the per-peer
+  ## handlers already answer a PeerError by disconnecting the peer.
+  error "defect while handling peer input; disconnecting the peer",
+        where = where, defect = $e.name, error = e.msg,
+        stack = e.getStackTrace()
+  newException(PeerDefectError, where & ": " & $e.name & ": " & e.msg)
+
+macro peerDefectBoundary*(prc: untyped): untyped =
+  ## Proc pragma for code that runs on bytes a peer sent us.  Wraps the body in
+  ## `try: body except Defect: raise peerDefectError(...)`.
+  ##
+  ## Put it BEFORE `async` (`{.peerDefectBoundary, async.}`) so the try lands
+  ## inside the async body.  chronos re-raises a Defect eagerly out of the
+  ## closure iterator, and from there out of `poll()` (asyncmacro.nim
+  ## wrapInTryFinally), so a caller's `except` never sees a Defect raised after
+  ## the callee's first `await`: it has to be caught in the frame it is raised
+  ## in.  Once converted, the PeerDefectError fails the future like any other
+  ## PeerError and the existing handlers disconnect the peer.
+  ##
+  ## Core catches every std::exception out of ProcessMessage, logs it and keeps
+  ## running (net_processing.cpp:5195).  We also drop the peer: after a Defect
+  ## its per-peer state may be half-updated.
+  ##
+  ## Only for frames whose state dies with the peer (handshake, framing,
+  ## deserialization, peer.handleMessage).  Never on a frame that reaches
+  ## chain state (nimrod.nim's handleMessage, the PeerManager callbacks that
+  ## await onMessage): a Defect after handleHeaders' first putBlockIndex would
+  ## leave a partial block index in a live node and blame an honest peer for
+  ## our bug.  chronos runs a callee up to its first await on the caller's
+  ## stack, so a boundary on any caller of those handlers catches it too.
+  let body = prc.body
+  let li = prc.lineInfoObj
+  let where = newLit(if prc.name.kind == nnkEmpty:
+                       "callback at " & li.filename.extractFilename & ":" & $li.line
+                     else: $prc.name)
+  let e = genSym(nskLet, "defect")
+  prc.body = quote do:
+    try:
+      `body`
+    except Defect as `e`:
+      raise peerDefectError(`where`, `e`)
+  prc
 
 proc newPeer*(address: string, port: uint16, params: ConsensusParams,
               direction: PeerDirection = pdOutbound): Peer =
@@ -622,7 +672,7 @@ proc spawnSafe*(fut: Future[void]) {.async.} =
   except CatchableError as e:
     debug "spawned peer op failed", error = e.msg
 
-proc readMessageV1(peer: Peer): Future[P2PMessage] {.async.} =
+proc readMessageV1(peer: Peer): Future[P2PMessage] {.peerDefectBoundary, async.} =
   ## Internal: read a v1 (legacy) message from the peer.
   ## Reads 24-byte header, validates magic, reads payload, verifies checksum.
   # Read header (24 bytes)
@@ -669,7 +719,7 @@ proc readMessageV1(peer: Peer): Future[P2PMessage] {.async.} =
 
   return deserializePayload(command, @payload)
 
-proc readMessageV2(peer: Peer): Future[P2PMessage] {.async.} =
+proc readMessageV2(peer: Peer): Future[P2PMessage] {.peerDefectBoundary, async.} =
   ## Internal: read a v2 (BIP-324 AEAD) packet, decrypt it, and return
   ## the decoded P2PMessage.  Skips decoy packets transparently per
   ## BIP-324 (header byte's IGNORE bit).  AAD is empty in the
@@ -1428,7 +1478,7 @@ proc awaitVerack(peer: Peer, deadline: Moment) {.async.} =
       return
 
 proc performHandshake*(peer: Peer, ourHeight: int32,
-                       checkSelfConnect: SelfConnectChecker = nil) {.async.} =
+                       checkSelfConnect: SelfConnectChecker = nil) {.peerDefectBoundary, async.} =
   ## Perform version handshake with peer
   ## Outbound: send version -> recv version -> send verack -> recv verack
   ## Inbound: recv version -> send version -> send verack -> recv verack
@@ -1639,7 +1689,7 @@ proc handlePong(peer: Peer, nonce: uint64) =
   else:
     trace "pong nonce mismatch", peer = $peer
 
-proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.async.} =
+proc handleMessage*(peer: Peer, msg: P2PMessage): Future[void] {.peerDefectBoundary, async.} =
   ## Process an incoming message (internal handling)
   case msg.kind
   of mkVersion:
