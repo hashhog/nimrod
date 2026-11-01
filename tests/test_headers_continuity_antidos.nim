@@ -229,7 +229,16 @@ suite "C2: what a valid header could now be refused for":
     let rt = buildHeaderChain(BlockHash(default(array[32, byte])), 0, 1)
     check checkHeadersBatchPoW(rt, p) == "header with invalid proof of work"
 
-  test "every network's own genesis passes its own gate":
+  test "every network's real genesis header passes its own gate":
     for p in [mainnetParams(), testnet3Params(), testnet4Params(),
               signetParams(), regtestParams()]:
-      check checkHeadersBatchPoW(@[buildGenesisBlock(p).header], p) == ""
+      var g = buildGenesisBlock(p).header
+      if p.network == Testnet4:
+        # buildGenesisBlock uses the 2009 coinbase for every network; testnet4's
+        # genesis has its own, so put in its real merkle root
+        # (7aa0a7ae...2b7b4e, chainparams.cpp CreateGenesisBlock for testnet4).
+        let mr = "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"
+        for i in 0 ..< 32:
+          g.merkleRoot[31 - i] = byte(fromHex[uint8](mr[2*i .. 2*i+1]))
+      check hashOf(g) == p.genesisBlockHash      # it IS the real genesis
+      check checkHeadersBatchPoW(@[g], p) == ""
