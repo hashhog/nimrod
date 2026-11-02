@@ -206,6 +206,60 @@ proc persistAllWallets*(wm: WalletManager) {.gcsafe.} =
     discard wm.persistWallet(name)
 
 # =============================================================================
+# Key material persistence (security audit H8)
+# =============================================================================
+# The HD seed (plaintext for an unencrypted wallet, ciphertext for an
+# encrypted one) and the account list are written to the wallet's sqlite
+# database in one transaction. Before this, createWallet wrote an empty seed
+# and reload restored neither the seed nor the accounts, so a wallet could
+# no longer sign after one restart. Mirrors Core writing descriptor keys at
+# creation (wallet/walletdb.cpp WriteDescriptorKey / WriteCryptedDescriptorKey).
+
+proc restrictToOwner(path: string) =
+  ## wallet.db now holds the seed (plaintext for an unencrypted wallet): make
+  ## it owner-only, as Core's umask 077 does for wallet.dat. The node-wide
+  ## umask is audit finding M6; this covers the one file H8 puts keys in.
+  when defined(posix):
+    setFilePermissions(path, {fpUserRead, fpUserWrite})
+
+proc writeKeyMaterial(db: WalletDb, wallet: Wallet) =
+  ## Write the seed and accounts. Caller wraps this in withWalletTx.
+  if wallet.privateKeysDisabled:
+    return
+  if wallet.isEncrypted:
+    db.saveEncryption(wallet.encryptedSeed, wallet.encryptionSalt,
+                      wallet.encryptionRounds)
+    # NULL seed: also scrubs a plaintext seed from before encryptwallet.
+    db.saveHdSeed(@[], wallet.seedBytes().len)
+  elif wallet.masterKey.isPrivate:
+    db.deleteEncryption()
+    db.saveHdSeed(wallet.seedBytes(), wallet.seedBytes().len)
+  for acc in wallet.accounts:
+    db.saveAccountStrict(StoredAccount(
+      purpose: acc.purpose, coinType: acc.coinType,
+      accountIndex: acc.accountIndex, nextExternal: acc.nextExternal,
+      nextInternal: acc.nextInternal, gap: acc.gap))
+
+proc persistKeyMaterial*(wm: WalletManager, name: string): bool {.gcsafe.} =
+  ## Rewrite a loaded wallet's seed and accounts after encryptwallet,
+  ## walletpassphrasechange or sethdseed. Returns false (and writes
+  ## nothing) on failure; the caller reports it.
+  var lw: LoadedWallet
+  withLock wm.walletsLock:
+    if not wm.wallets.hasKey(name):
+      return false
+    lw = wm.wallets[name]
+  if lw == nil or lw.wallet == nil:
+    return false
+  try:
+    restrictToOwner(lw.db.path)
+    withWalletTx(lw.db):
+      writeKeyMaterial(lw.db, lw.wallet)
+    return true
+  except CatchableError:
+    return false
+
+# =============================================================================
 # Wallet Enumeration
 # =============================================================================
 
@@ -316,6 +370,8 @@ proc loadWallet*(wm: WalletManager, filename: string,
                  "rebuilt by rescan")
   else:
     discard
+  # The snapshot can advance cursors and add accounts; derive their keys.
+  wallet.materializeAccounts()
 
   # Restore watch-only state from sqlite: the disable_private_keys flag and
   # the watched descriptors (re-expanded to scriptPubKeys so block scanning
@@ -424,9 +480,6 @@ proc createWallet*(wm: WalletManager, name: string,
   var db = newWalletDb(dbPath)
   db.open()
 
-  # Initialize metadata
-  db.initMeta(networkStr, @[])
-
   var wallet: Wallet
 
   if options.disablePrivateKeys:
@@ -450,7 +503,6 @@ proc createWallet*(wm: WalletManager, name: string,
       lastSyncedHeight: -1,
       privateKeysDisabled: true
     )
-    db.setWalletFlag("disable_private_keys", "1")
   elif options.blank:
     # Create blank wallet - generate seed but no accounts
     let mnemonic = generateMnemonic(24)
@@ -459,6 +511,7 @@ proc createWallet*(wm: WalletManager, name: string,
 
     wallet = Wallet(
       seed: seed,
+      seedLen: 64,
       masterKey: masterKey,
       params: wm.params,
       mainnet: mainnet,
@@ -476,8 +529,6 @@ proc createWallet*(wm: WalletManager, name: string,
 
     if options.passphrase != "":
       discard wallet.encryptWallet(options.passphrase)
-      # Save encryption to db
-      db.saveEncryption(wallet.encryptedSeed, wallet.encryptionSalt, wallet.encryptionRounds)
   else:
     # Create standard HD wallet with default accounts
     let mnemonic = generateMnemonic(24)
@@ -485,12 +536,21 @@ proc createWallet*(wm: WalletManager, name: string,
 
     if options.passphrase != "":
       discard wallet.encryptWallet(options.passphrase)
-      db.saveEncryption(wallet.encryptedSeed, wallet.encryptionSalt, wallet.encryptionRounds)
 
-    # Save accounts to database
-    for acc in wallet.accounts:
-      db.saveAccount(acc.purpose, acc.coinType, acc.accountIndex,
-                     acc.nextExternal, acc.nextInternal, acc.gap)
+  # Metadata, flags, seed and accounts in ONE transaction: a crash can never
+  # leave a wallet.db that exists but holds no seed (security audit H8).
+  try:
+    restrictToOwner(dbPath)
+    withWalletTx(db):
+      db.initMeta(networkStr, @[])
+      if wallet.privateKeysDisabled:
+        db.setWalletFlag("disable_private_keys", "1")
+      writeKeyMaterial(db, wallet)
+  except CatchableError as e:
+    db.close()
+    try: removeFile(dbPath) except CatchableError: discard
+    raise newException(WalletManagerError,
+                       "Failed to write new wallet to disk: " & e.msg)
 
   # New wallets attach at the current chain tip (Core CWallet::AttachChain)
   # so they do not rescan history they could not have participated in.

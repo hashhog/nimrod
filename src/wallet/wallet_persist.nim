@@ -262,6 +262,7 @@ proc applySnapshot(wallet: var Wallet, snap: DecodedSnapshot) =
     if label.len > 0:
       wallet.labels[address] = label
   for c in snap.accountCursors:
+    var found = false
     for ai in 0 ..< wallet.accounts.len:
       if wallet.accounts[ai].purpose == c.purpose and
          wallet.accounts[ai].coinType == c.coinType and
@@ -270,7 +271,19 @@ proc applySnapshot(wallet: var Wallet, snap: DecodedSnapshot) =
           wallet.accounts[ai].nextExternal = c.nextExternal
         if c.nextInternal > wallet.accounts[ai].nextInternal:
           wallet.accounts[ai].nextInternal = c.nextInternal
+        found = true
         break
+    # An account opened after createwallet (getnewaddress with another
+    # address_type) is only recorded here. Bring it back as structure +
+    # cursors; materializeAccounts derives its keys. Security audit H8.
+    if not found and c.purpose in [44'u32, 49, 84, 86]:
+      wallet.accounts.add(Account(
+        purpose: c.purpose, coinType: c.coinType,
+        accountIndex: c.accountIndex,
+        externalKeys: @[], internalKeys: @[],
+        nextExternal: max(c.nextExternal, 0),
+        nextInternal: max(c.nextInternal, 0),
+        gap: clampGap(c.gap)))
 
 proc tryDecodeFile(path: string): Option[DecodedSnapshot] =
   ## Read + decode a single snapshot file. None on missing/unreadable/corrupt.
