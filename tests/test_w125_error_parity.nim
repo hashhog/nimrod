@@ -221,11 +221,13 @@ suite "W125 Gate 10: -8 RPC_INVALID_PARAMETER — MISSING (xfail)":
     let r = rpc.rpcMethodErr("sendrawtransaction", %*["00", 5.0])
     check r.code == -32602
 
-  test "xfail — testmempoolaccept empty rawtxs array currently -32602":
-    ## TODO(W125 Gate 10): expected -8.  See server.nim:3024.
+  test "PRESENT — testmempoolaccept empty rawtxs array is -8":
+    ## Core rpc/mempool.cpp testmempoolaccept: size outside 1..25 is
+    ## RPC_INVALID_PARAMETER (core-regtest operator/testmempoolaccept/empty-array).
     let rpc = minimalRpcServer()
     let r = rpc.rpcMethodErr("testmempoolaccept", %*[newJArray()])
-    check r.code == -32602
+    check r.code == -8
+    check r.msg == "Array must contain between 1 and 25 transactions."
 
   test "PRESENT — submitpackage empty rawtxs array is -8":
     ## Closed by the T2 R5 probe parity fix: Core MAX_PACKAGE_COUNT bound.
