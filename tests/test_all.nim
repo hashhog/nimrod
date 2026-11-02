@@ -240,6 +240,7 @@ const IncludedTests = [
   "test_standard",
   "test_storage",
   "test_strict_tx_decode",
+  "test_submitblock_failed_connect_invalid_tip",
   "test_submitblock_prevblk_token",
   "test_submitpackage_shape",
   "test_sync",

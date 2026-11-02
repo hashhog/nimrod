@@ -4684,6 +4684,36 @@ proc acceptSideBranchBlock*(
   cs.reorgToStoredBranch(forkPoint, newChainBlocks, verifyHook,
                         connectChecksHook, disconnectedTxs, connectedBlocks)
 
+proc storeRejectedTipExtension*(cs: var ChainState, blk: Block,
+                                prevIdx: BlockIndex): BlockHash =
+  ## Keep a block that extends the active tip but failed to connect in the
+  ## block index, the way acceptSideBranchBlock keeps a side-branch block:
+  ## body + hash-only index entry (bsDataStored), never the height -> hash
+  ## slot or the UTXO set. Core has already added the block to m_block_index
+  ## (AcceptBlockHeader) and written it to disk (AcceptBlock) before
+  ## ConnectTip runs ConnectBlock, so a block that fails there is still in the
+  ## index; the caller marks it BLOCK_FAILED_VALID (InvalidBlockFound).
+  ## Returns the block's hash.
+  lockChainScope(cs)  # cs_main: see storage/chain_lock.nim
+  let blockHash = BlockHash(doubleSha256(serialize(blk.header)))
+  var totalWork = prevIdx.totalWork
+  addWork(totalWork, calculateBlockWork(blk.header.bits))
+  cs.db.storeBlock(blk)
+  cs.db.putBlockIndexHashOnly(BlockIndex(
+    hash: blockHash,
+    height: prevIdx.height + 1,
+    status: bsDataStored,
+    prevHash: blk.header.prevBlock,
+    header: blk.header,
+    totalWork: totalWork,
+    undoPos: FlatFilePos(fileNum: -1, pos: -1),
+    failureFlags: BLOCK_NO_FAILURE,
+    sequenceId: 0,
+    nTx: int32(blk.txs.len)
+  ))
+  cs.noteBlockReceived(blockHash, prevIdx.height + 1)
+  blockHash
+
 # ============================================================================
 # Legacy compatibility functions (operate on ChainDb directly)
 # ============================================================================
