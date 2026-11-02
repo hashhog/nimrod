@@ -157,6 +157,7 @@ const IncludedTests = [
   "test_label",
   "test_listdescriptors",
   "test_listunspent_regtest_hrp",
+  "test_loadtxoutset_nonempty_chainstate",
   "test_maturity",
   "test_mempool",
   "test_mempool_clock",
