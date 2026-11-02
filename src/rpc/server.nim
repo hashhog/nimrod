@@ -4529,7 +4529,15 @@ proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     if not isHexStr(txHex):
       raise newRpcError(RpcDeserializationError, "TX decode failed")
     txBytes = hexToBytes(txHex)
-    tx = deserializeTransaction(txBytes)
+    # Core decoderawtransaction: `iswitness` present forces that mode
+    # (try_witness = iswitness, try_no_witness = !iswitness); absent tries
+    # both. DecodeTx (core_read.cpp) needs the whole stream consumed.
+    var tryWitness = true
+    var tryNoWitness = true
+    if params.len >= 2 and params[1].kind == JBool:
+      tryWitness = params[1].getBool()
+      tryNoWitness = not tryWitness
+    tx = deserializeTransactionExact(txBytes, tryWitness, tryNoWitness)
   except RpcError:
     raise
   except CatchableError:
@@ -5132,7 +5140,7 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
   try:
     let txBytes = hexToBytes(txHex)
-    let tx = deserializeTransaction(txBytes)
+    let tx = deserializeTransactionExact(txBytes)
     let txid = tx.txid()
     let txidHex = reverseHex(toHex(array[32, byte](txid)))
 
@@ -5295,7 +5303,7 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
     let txHex = rawTxNode.getStr()
     try:
       let txBytes = hexToBytes(txHex)
-      let tx = deserializeTransaction(txBytes)
+      let tx = deserializeTransactionExact(txBytes)
       txns.add(tx)
     except CatchableError:
       # Core rpc/mempool.cpp:332-334: DecodeHexTx failure is -22 with the

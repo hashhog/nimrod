@@ -401,6 +401,40 @@ proc deserializeTransactionLegacyForced*(data: seq[byte]): Transaction =
   result.lockTime = r.readUint32LE()
   result.witnesses = newSeq[seq[seq[byte]]](result.inputs.len)
 
+proc deserializeTransactionExact*(data: seq[byte], tryWitness = true,
+                                  tryNoWitness = true): Transaction =
+  ## Core's DecodeTx (bitcoin-core/src/core_read.cpp): a hex tx is accepted only
+  ## if a parse CONSUMES THE WHOLE STREAM. Core tries TX_NO_WITNESS first, then
+  ## TX_WITH_WITNESS, each gated by try_no_witness / try_witness (the
+  ## `iswitness` RPC argument forces one mode). Trailing bytes after a complete
+  ## tx therefore fail the decode ("TX decode failed") instead of being ignored,
+  ## which is what plain deserializeTransaction does.
+  ## Raises SerializationError when no permitted parse consumes every byte.
+  if tryNoWitness:
+    try:
+      var r = BinaryReader(data: data, pos: 0)
+      result.version = r.readInt32LE()
+      let inputCount = r.readCompactSize()
+      for i in 0 ..< int(inputCount):
+        result.inputs.add(r.readTxIn())
+      let outputCount = r.readCompactSize()
+      for i in 0 ..< int(outputCount):
+        result.outputs.add(r.readTxOut())
+      result.lockTime = r.readUint32LE()
+      # witnesses stays empty, as in readTransaction's legacy path: a non-empty
+      # witnesses seq makes serialize() emit the segwit marker/flag.
+      if r.pos == data.len:
+        return
+    except CatchableError:
+      discard
+    result = Transaction()
+  if tryWitness:
+    var r = BinaryReader(data: data, pos: 0)
+    result = r.readTransaction()
+    if r.pos == data.len:
+      return
+  raise newException(SerializationError, "TX decode failed")
+
 proc deserializeBlockHeader*(data: seq[byte]): BlockHeader =
   var r = BinaryReader(data: data, pos: 0)
   r.readBlockHeader()
