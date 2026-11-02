@@ -4529,7 +4529,15 @@ proc handleDecodeRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
     if not isHexStr(txHex):
       raise newRpcError(RpcDeserializationError, "TX decode failed")
     txBytes = hexToBytes(txHex)
-    tx = deserializeTransaction(txBytes)
+    # Core decoderawtransaction: `iswitness` present forces that mode
+    # (try_witness = iswitness, try_no_witness = !iswitness); absent tries
+    # both. DecodeTx (core_read.cpp) needs the whole stream consumed.
+    var tryWitness = true
+    var tryNoWitness = true
+    if params.len >= 2 and params[1].kind == JBool:
+      tryWitness = params[1].getBool()
+      tryNoWitness = not tryWitness
+    tx = deserializeTransactionExact(txBytes, tryWitness, tryNoWitness)
   except RpcError:
     raise
   except CatchableError:
@@ -5132,7 +5140,7 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
   try:
     let txBytes = hexToBytes(txHex)
-    let tx = deserializeTransaction(txBytes)
+    let tx = deserializeTransactionExact(txBytes)
     let txid = tx.txid()
     let txidHex = reverseHex(toHex(array[32, byte](txid)))
 
@@ -5295,7 +5303,7 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
     let txHex = rawTxNode.getStr()
     try:
       let txBytes = hexToBytes(txHex)
-      let tx = deserializeTransaction(txBytes)
+      let tx = deserializeTransactionExact(txBytes)
       txns.add(tx)
     except CatchableError:
       # Core rpc/mempool.cpp:332-334: DecodeHexTx failure is -22 with the
@@ -8795,6 +8803,29 @@ proc handleLoadTxOutSetImpl*(rpc: RpcServer, path: string): JsonNode =
 
   let assumeData = rpc.effectiveAssumeutxoData()
 
+  # nimrod has ONE coins store: activation copies the snapshot coins into the
+  # live cfUtxo. Core instead builds a separate snapshot chainstate and only
+  # activates it if it has more work than the active tip (validation.cpp:5706,
+  # 5785-5788), so the old chain's coins can never merge. Refuse anything past
+  # genesis: on a node with its own chain the copy left that chain's coins
+  # spendable under a tip claiming the snapshot base (audit H7: 309 txouts vs
+  # the fixture's 299), and a tip at/above the base was re-pointed with no
+  # disconnect. The one exception is a live tip that already IS a whitelisted
+  # base: nothing is copied (the live coins are the snapshot's) and only the
+  # background re-derivation runs.
+  let live = rpc.chainState
+  if live.bestHeight > 0:
+    var atBase = false
+    for d in assumeData:
+      if d.blockhash == live.bestBlockHash and d.height == live.bestHeight:
+        atBase = true
+        break
+    if not atBase:
+      raise newRpcError(RpcInternalError,
+        "Unable to load UTXO snapshot: the active chainstate is not empty " &
+        "(tip height " & $live.bestHeight & "); a snapshot can only be " &
+        "activated on a node at genesis. (" & path & ")")
+
   # Derive isolated store directories siblings to the active chainstate.
   # `undoMgr.dataDir` is `<dbPath>/blocks`, so parentDir is the active store dir.
   let activeDir = rpc.chainState.undoMgr.dataDir.parentDir
@@ -8832,6 +8863,19 @@ proc handleLoadTxOutSetImpl*(rpc: RpcServer, path: string): JsonNode =
       baseHeight = d.height
       break
   snapshotCs.targetUtxoHash = some(assumedHash)
+
+  # The early guard let a non-genesis tip through only because it is SOME
+  # whitelisted base; it must be THIS file's base, or the copy below would
+  # merge again (a tip at a lower base, a file for a higher one).
+  if live.bestHeight > 0 and (live.bestBlockHash != snapCs.bestBlockHash or
+                              live.bestHeight != baseHeight):
+    snapCs.close()
+    try: removeDir(snapDir) except OSError: discard
+    try: removeDir(bgDir) except OSError: discard
+    raise newRpcError(RpcInternalError,
+      "Unable to load UTXO snapshot: the active chainstate is not empty " &
+      "(tip height " & $live.bestHeight & ") and is not the snapshot base; " &
+      "a snapshot can only be activated on a node at genesis. (" & path & ")")
 
   # Activate onto the LIVE chainstate. Isolated load is the hash-gate
   # refuse-safety; without this step handleGetBlockCount keeps returning
