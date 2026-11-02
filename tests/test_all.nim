@@ -238,6 +238,7 @@ const IncludedTests = [
   "test_stale_peer",
   "test_standard",
   "test_storage",
+  "test_submitblock_failed_connect_invalid_tip",
   "test_submitblock_prevblk_token",
   "test_submitpackage_shape",
   "test_sync",

@@ -6577,6 +6577,27 @@ proc refreshAfterReorg(rpc: RpcServer, disconnectedTxs: seq[Transaction],
   if rpc.peerManager != nil:
     rpc.postP2P(P2PCmd(kind: pcBroadcastBlock, blk: tipBlk))
 
+proc markTipExtensionFailure(rpc: RpcServer, blk: Block, prevIdx: BlockIndex,
+                              token: string) =
+  ## A block that extends the active tip and failed AcceptBlock's contextual
+  ## checks or ConnectBlock. Core has already added it to the block index
+  ## (AcceptBlockHeader) by then, and marks it BLOCK_FAILED_VALID
+  ## (validation.cpp AcceptBlock "pindex->nStatus |= BLOCK_FAILED_VALID" on a
+  ## ContextualCheckBlock failure; ConnectTip -> InvalidBlockFound on a
+  ## ConnectBlock failure), so getchaintips lists it as "invalid" and a
+  ## resubmission answers "duplicate-invalid". Same rule as markConnectFailure
+  ## on the reorg path: only a consensus verdict on a body that matches its
+  ## header commitments (Core skips BLOCK_MUTATED) is recorded; a local error
+  ## leaves no trace in the index.
+  var cs = rpc.chainState
+  if isFatal() or prevIdx.height < 0 or blk.txs.len == 0 or
+     blockFailureKindOfToken(token) != bfkInvalid or
+     not bodyMatchesCommitments(blk,
+                                prevIdx.height + 1 >= int32(cs.params.segwitHeight)):
+    return
+  let failed = cs.storeRejectedTipExtension(blk, prevIdx)
+  discard rpc.markConnectFailure(failed, blk, token)
+
 proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   # Gate 6: after AbortNode no block is accepted (RPC_VERIFY_ERROR, -25).
   if isFatal():
@@ -6723,7 +6744,9 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
                     utxoReadGuard.msg)
           raiseFatalVerifyError()
       if not acceptResult.isOk:
-        return %bip22String(acceptResult.error, blk.header.version)
+        let token = bip22String(acceptResult.error, blk.header.version)
+        rpc.markTipExtensionFailure(blk, prevIdx, token)
+        return %token
 
       # Use IBD fast path when far from tip (>1000 blocks behind assume-valid)
       let useIBD = cs.params.assumeValidHeight > 0 and
@@ -6752,7 +6775,9 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         if isFatal() or connectResult.error.startsWith(fatalErrorToken):
           raiseFatalVerifyError()
         # Map chainstate error string to BIP-22 token
-        return %bip22ChainError(connectResult.error)
+        let token = bip22ChainError(connectResult.error)
+        rpc.markTipExtensionFailure(blk, prevIdx, token)
+        return %token
 
       # Optional index population (no-op when nil/disabled).  Both the BIP-157
       # filter index and the coinstatsindex are folded forward here, mirroring
