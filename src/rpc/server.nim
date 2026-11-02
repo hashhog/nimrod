@@ -5238,6 +5238,19 @@ proc testAcceptRejectReason*(reason: string): string =
   else:
     reason
 
+proc setTestAcceptReject(entry: JsonNode, error: string) =
+  ## allowed:false + reject-reason, plus reject-details (Core's
+  ## state.ToString(), rpc/mempool.cpp:399-403) where nimrod can state it
+  ## exactly.  Core omits it for missing-inputs.  For the two already-known
+  ## tokens ToString() is the bare token (no debug string); for every other
+  ## nimrod reason the text after the token is nimrod's own wording, which would
+  ## not equal Core's debug string, so it is left out rather than invented.
+  entry["allowed"] = %false
+  let token = testAcceptRejectReason(error)
+  entry["reject-reason"] = %token
+  if token in ["txn-already-in-mempool", "txn-already-known"]:
+    entry["reject-details"] = %token
+
 proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Dry-run mempool acceptance check for one or more raw transactions.
   ## Reference: Bitcoin Core testmempoolaccept RPC (rpc/mempool.cpp)
@@ -5259,16 +5272,20 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Multi tx   → acceptPackage(usePackageFeerates=true) then rollback
   if params.len < 1:
     raise newRpcError(RpcInvalidParams, "missing rawtxs array parameter")
+  # Core rawtxs is an RPCArg ARR: a non-array is RPC_TYPE_ERROR with the
+  # "Wrong type passed" wrapper; a size outside 1..MAX_PACKAGE_COUNT is
+  # RPC_INVALID_PARAMETER (rpc/mempool.cpp testmempoolaccept).
   if params[0].kind != JArray:
-    raise newRpcError(RpcInvalidParams, "rawtxs must be an array of hex strings")
+    raise newRpcError(RpcTypeError,
+      "Wrong type passed:\n{\n    \"Position 1 (rawtxs)\": " &
+      "\"JSON value of type " & uvTypeName(params[0]) &
+      " is not of expected type array\"\n}")
 
   let rawTxsArray = params[0]
-  if rawTxsArray.len == 0:
-    raise newRpcError(RpcInvalidParams, "rawtxs array must not be empty")
-  if rawTxsArray.len > MaxPackageCount:
-    raise newRpcError(RpcInvalidParams,
-      "too many transactions in package: " & $rawTxsArray.len &
-      " > " & $MaxPackageCount)
+  if rawTxsArray.len == 0 or rawTxsArray.len > MaxPackageCount:
+    raise newRpcError(RpcInvalidParameter,
+      "Array must contain between 1 and " & $MaxPackageCount &
+      " transactions.")
 
   # Parse maxfeerate (BTC/kvB, default 0.10; 0 = unlimited)
   var maxFeeRate = DefaultMaxFeeRate
@@ -5325,12 +5342,8 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
     # Core CHECK_NONFATAL: already-in-mempool txns are not "allowed" for
     # testmempoolaccept (rpc/mempool.cpp:370).
     if rpc.mempool.contains(txid):
-      var entry = %*{
-        "txid": txidHex,
-        "wtxid": wtxidHex,
-        "allowed": false,
-        "reject-reason": "txn-already-in-mempool"
-      }
+      var entry = %*{ "txid": txidHex, "wtxid": wtxidHex }
+      setTestAcceptReject(entry, "txn-already-in-mempool")
       resultArr.add(entry)
       return resultArr
 
@@ -5372,8 +5385,7 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
         "effective-includes": %*[wtxidHex]
       }
     else:
-      txEntry["allowed"] = %false
-      txEntry["reject-reason"] = %testAcceptRejectReason(res.error)
+      setTestAcceptReject(txEntry, res.error)
 
     resultArr.add(txEntry)
 
@@ -5410,15 +5422,13 @@ proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
         continue
       if mp.contains(txid):
         # Core: already-in-mempool is a PreChecks failure.
-        txEntry["allowed"] = %false
-        txEntry["reject-reason"] = %"txn-already-in-mempool"
+        setTestAcceptReject(txEntry, "txn-already-in-mempool")
         resultArr.add(txEntry)
         stopped = true
         continue
       let res = mp.acceptTransactionWithArgs(tx, rpc.crypto, singleArgs)
       if not res.isOk:
-        txEntry["allowed"] = %false
-        txEntry["reject-reason"] = %testAcceptRejectReason(res.error)
+        setTestAcceptReject(txEntry, res.error)
         resultArr.add(txEntry)
         stopped = true
         continue
