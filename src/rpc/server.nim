@@ -269,8 +269,17 @@ proc newRpcServer*(
   authPass: string = "",
   cookiePassword: string = ""
 ): RpcServer =
+  # Core rebuilds m_best_header from the stored block index on load
+  # (validation.cpp ChainstateManager::LoadBlockIndex), so headers admitted by
+  # submitheader before a restart still count in getblockchaininfo.headers.
+  # Seed the submitheader high-water mark the same way; it lived only in memory.
+  let seededHeaderHeight =
+    if chainState != nil and chainState.bestHeight >= 0:
+      chainState.bestHeaderIndexHeight()
+    else: 0'i32
   RpcServer(
     port: port,
+    submittedHeaderHeight: seededHeaderHeight,
     chainState: chainState,
     mempool: mempool,
     peerManager: peerManager,
