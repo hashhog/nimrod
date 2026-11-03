@@ -68,6 +68,7 @@ const IncludedTests = [
   "test_atmp_w96",
   "test_banman",
   "test_bench_crypto",
+  "test_best_header_after_restart",
   "test_bip141_witness_commitment",
   "test_bip174",
   "test_bip30",

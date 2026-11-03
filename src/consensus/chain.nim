@@ -619,6 +619,46 @@ proc bestChainCandidate*(cs: var ChainState): Option[ChainCandidate] =
       return some(res)
   none(ChainCandidate)
 
+proc bestHeaderIndexHeight*(cs: ChainState): int32 =
+  ## Height of the best header in the stored block index: Core's
+  ## m_best_header as LoadBlockIndex / RecalculateBestHeader compute it
+  ## (validation.cpp): start at the active tip and take any index entry with
+  ## more chain work that is not BLOCK_FAILED_VALID. Core flags every
+  ## descendant of a failed block as failed too; nimrod may not have, so an
+  ## entry above the tip's work only counts when no ancestor down to the
+  ## active chain is failed. Only entries with more work than the tip are
+  ## walked, so on a node without a header lead this is one index scan.
+  lockChainScope(cs)  # cs_main: storage/chain_lock.nim
+  result = cs.bestHeight
+  var bestWork = cs.totalWork
+
+  proc onActive(c: ChainState, idx: BlockIndex): bool =
+    if idx.height > c.bestHeight:
+      return false
+    let h = c.db.getBlockHashByHeight(idx.height)
+    h.isSome and h.get() == idx.hash
+
+  for (key, value) in chaindb.iterCf(cs.db.db, chaindb.cfBlockIndex):
+    if key.len != 32 or value.len == 0:
+      continue
+    let idx = deserializeBlockIndex(value)
+    if compareWork256(idx.totalWork, bestWork) <= 0:
+      continue
+    var cur = idx
+    var usable = true
+    while not cs.onActive(cur):
+      if cur.failureFlags.isFailed() or cur.height <= 0:
+        usable = false
+        break
+      let prev = cs.db.getBlockIndex(cur.prevHash)
+      if prev.isNone:
+        usable = false
+        break
+      cur = prev.get()
+    if usable:
+      bestWork = idx.totalWork
+      result = idx.height
+
 type
   ChainTip* = object
     ## One getchaintips entry (Core rpc/blockchain.cpp getchaintips).
