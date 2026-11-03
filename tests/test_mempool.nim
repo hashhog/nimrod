@@ -1586,10 +1586,12 @@ suite "Mempool RBF rules validation":
       lockTime: 0
     )
 
-    # Total evictions = 1 (parent) + 100 (children) = 101 > 100 limit
+    # Total evictions = 1 (parent) + 100 (children) = 101, but that is ONE
+    # cluster; Core v31 rule 5 counts clusters (policy/rbf.cpp), so it is not
+    # refused for "too many potential replacements".
     let result = mp.checkRbfRules(newTx, Satoshi(100000), 100, conflicts)
-    check not result.isOk
-    check "too many potential replacements" in result.error
+    if not result.isOk:
+      check "too many potential replacements" notin result.error
 
     cs.close()
 
