@@ -813,9 +813,10 @@ suite "W120 G18-G20 Rule #5 MAX_REPLACEMENT_CANDIDATES":
                      sequence: 0xfffffffd'u32)],
       outputs: @[TxOut(value: Satoshi(50_000), scriptPubKey: @[])],
       witnesses: @[], lockTime: 0)
+    # One cluster of 101 txs: rule 5 counts clusters in Core v31.
     let res = mp.checkRbfRules(newTx, Satoshi(50_000), 200, conflicts)
-    check not res.isOk
-    check res.error.find("too many potential replacements") >= 0
+    if not res.isOk:
+      check res.error.find("too many potential replacements") < 0
     cs.close()
     cleanupTestDb()
 
@@ -827,8 +828,8 @@ suite "W120 G18-G20 Rule #5 MAX_REPLACEMENT_CANDIDATES":
     ## nimrod's mempool.nim:1853-1859 applies the 100 limit to
     ## (conflicts ∪ descendants), which is stricter than Core.
     ##
-    ## Pin the divergent surface: the limit is checked against
-    ## `len(allConflicts)` not unique-cluster-count.
+    ## FIXED (refill-20261103-nimrod-node_error): the limit is now checked
+    ## against the unique-cluster count; see tests/test_rbf_clusters.nim.
     check MaxReplacementCandidates == 100
     # The divergent behavior is observable in G19 above: nimrod rejects
     # 101 total evictions; Core would reject only if >100 UNIQUE CLUSTERS

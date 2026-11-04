@@ -229,7 +229,7 @@ suite "BIP-125 Gate 3 — Rule #5 MAX_REPLACEMENT_CANDIDATES":
 
     cs.close()
 
-  test "101 evictions: rejected":
+  test "101 evictions in one cluster: not refused by rule 5":
     var cs = newChainState(TestDbPath, regtestParams())
     var mp = newMempool(cs, regtestParams(), fullRbf = true)
 
@@ -268,9 +268,10 @@ suite "BIP-125 Gate 3 — Rule #5 MAX_REPLACEMENT_CANDIDATES":
       outputs: @[TxOut(value: Satoshi(50000), scriptPubKey: @[])],
       witnesses: @[], lockTime: 0)
 
+    # 101 evictions in ONE cluster: Core v31 rule 5 counts clusters.
     let result = mp.checkRbfRules(newTx, Satoshi(50000), 200, conflicts)
-    check not result.isOk
-    check result.error.find("too many potential replacements") >= 0
+    if not result.isOk:
+      check result.error.find("too many potential replacements") < 0
 
     cs.close()
 

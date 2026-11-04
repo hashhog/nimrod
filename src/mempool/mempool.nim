@@ -3049,7 +3049,7 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
   ## BIP-125 gates (reference: Bitcoin Core src/policy/rbf.cpp):
   ## Gate 1  — tx (or ancestor) signals opt-in via nSequence <= 0xfffffffd; skipped in fullRbf mode.
   ## Gate 2  — ancestor inheritance: any mempool ancestor that signals makes tx replaceable.
-  ## Rule #5 — conflicts + descendants must not exceed MAX_REPLACEMENT_CANDIDATES (100).
+  ## Rule #5 — directly conflicted clusters must not exceed MAX_REPLACEMENT_CANDIDATES (100).
   ## Rule #2 — replacement must not spend outputs from transactions it is evicting.
   ## Rule #3 — replacement fees >= original fees (>= not >; equal is allowed).
   ## Rule #4 — additional fees >= min_relay_fee * replacement_vsize (pays for bandwidth).
@@ -3079,13 +3079,21 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
     if not anySignals:
       return err(HashSet[TxId], "rejecting replacement: original transaction does not signal RBF opt-in (BIP-125)")
 
-  # Rule #5: Don't evict more than MAX_REPLACEMENT_CANDIDATES transactions.
-  # Reference: Bitcoin Core src/policy/rbf.cpp GetEntriesForConflicts() — checks cluster count.
-  # We conservatively count total evicted txs (conflicts + descendants) since we lack cluster tracking.
-  let allConflicts = mp.getAllConflictsWithDescendants(conflicts)
-  if len(allConflicts) > MaxReplacementCandidates:
+  # Rule #5 (GetEntriesForConflicts, policy/rbf.cpp, Core v31 cluster mempool):
+  # at most MAX_REPLACEMENT_CANDIDATES distinct *clusters* directly conflicted.
+  # The descendants are then added without a count: a 105-tx eviction across
+  # five clusters is accepted.  Counting evicted txs (the pre-cluster rule)
+  # rejects replacements Core accepts.
+  var seenCluster = initHashSet[TxId]()
+  var numClusters = 0
+  for c in conflicts:
+    if c in seenCluster: continue
+    inc numClusters
+    for m in mp.clusterMembers(c): seenCluster.incl(m)
+  if numClusters > MaxReplacementCandidates:
     return err(HashSet[TxId], "rejecting replacement: too many potential replacements (" &
-               $len(allConflicts) & " > " & $MaxReplacementCandidates & ")")
+               $numClusters & " > " & $MaxReplacementCandidates & ")")
+  let allConflicts = mp.getAllConflictsWithDescendants(conflicts)
 
   # Rule #2 (HasNoNewUnconfirmed): replacement must not spend outputs from any evicted tx.
   # Reference: Bitcoin Core src/policy/rbf.cpp EntriesAndTxidsDisjoint().  Core's

@@ -208,6 +208,7 @@ const IncludedTests = [
   "test_psbt_convert_join",
   "test_psbt_emptyvin_gate",
   "test_rbf",
+  "test_rbf_clusters",
   "test_regtest",
   "test_reject_token_remap",
   "test_relay",
