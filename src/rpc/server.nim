@@ -1227,7 +1227,18 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
     raise newRpcError(RpcInvalidParams, "missing blockhash parameter")
 
   let hashHex = params[0].getStr()
-  let verbose = if params.len >= 2: params[1].getBool() else: true
+  # Core's RPCHelpMan type-checks every argument before the handler runs
+  # (rpc/util.cpp RPCHelpMan::HandleRequest -> RPCTypeCheckArgument): a non-bool
+  # `verbose` is RPC_TYPE_ERROR (-3) "Wrong type passed" with the Position
+  # wrapper, ahead of any hash parsing or lookup. JSON null means "default".
+  if params.len >= 2 and params[1].kind notin {JBool, JNull}:
+    raise newRpcError(RpcTypeError,
+      "Wrong type passed:\n{\n    \"Position 2 (verbose)\": " &
+      "\"JSON value of type " & uvTypeName(params[1]) &
+      " is not of expected type bool\"\n}")
+  let verbose =
+    if params.len >= 2 and params[1].kind == JBool: params[1].getBool()
+    else: true
 
   # Core ParseHashV (blockchain.cpp:639, name "hash"): a malformed blockhash is
   # RPC_INVALID_PARAMETER (-8) before any lookup. A well-formed-but-absent hash
