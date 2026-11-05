@@ -249,6 +249,7 @@ const IncludedTests = [
   "test_sync_tip_single_source",
   "test_t1_r5_parity",
   "test_t2_r5_parity",
+  "test_sendrawtransaction_core_errors",
   "test_testmempoolaccept_args",
   "test_t3_r5_parity",
   "test_taproot_commitment",
