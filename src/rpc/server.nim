@@ -5141,7 +5141,8 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
       try:
         maxFeeRate = parseFloat(params[1].getStr())
       except ValueError:
-        raise newRpcError(RpcInvalidParams, "invalid maxfeerate")
+        # Core AmountFromValue: unparsable amount is RPC_TYPE_ERROR "Invalid amount"
+        raise newRpcError(RpcTypeError, "Invalid amount")
 
   # Reject fee rates > 1 BTC/kvB (sanity check per Bitcoin Core)
   if maxFeeRate > 1.0:
@@ -5155,14 +5156,19 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
 
     # Check if transaction is already in chain
     # If any output of this transaction exists in the UTXO set, it's confirmed
-    let utxo = rpc.chainState.getUtxo(OutPoint(txid: txid, vout: 0))
-    if utxo.isSome:
-      raise newRpcError(RpcTransactionAlreadyInChain, "transaction already in block chain")
+    # Core BroadcastTransaction checks every output vout for the txid in the
+    # UTXO set and reports ALREADY_IN_UTXO_SET ("Transaction outputs already in
+    # utxo set", node/transaction.cpp, RPC_TRANSACTION_ALREADY_IN_UTXO_SET -27).
+    for vout in 0 ..< tx.outputs.len:
+      if rpc.chainState.getUtxo(OutPoint(txid: txid, vout: uint32(vout))).isSome:
+        raise newRpcError(RpcTransactionAlreadyInChain,
+          "Transaction outputs already in utxo set")
 
     # Also check tx index if available
     let locOpt = rpc.chainState.db.getTxIndex(txid)
     if locOpt.isSome:
-      raise newRpcError(RpcTransactionAlreadyInChain, "transaction already in block chain")
+      raise newRpcError(RpcTransactionAlreadyInChain,
+        "Transaction outputs already in utxo set")
 
     # Check if already in mempool - this is idempotent, return txid without error
     if rpc.mempool.contains(txid):
@@ -5185,6 +5191,10 @@ proc handleSendRawTransaction(rpc: RpcServer, params: JsonNode): JsonNode =
       let errMsg = acceptResult.error
       # Map error messages to appropriate error codes
       if errMsg.contains("input not found") or errMsg.contains("missing"):
+        # Core surfaces the bare reject token for TX_MISSING_INPUTS
+        # (RPC_TRANSACTION_ERROR -25, "bad-txns-inputs-missingorspent").
+        if errMsg.startsWith(MissingInputsToken):
+          raise newRpcError(RpcTransactionError, MissingInputsToken)
         raise newRpcError(RpcTransactionError, "missing inputs: " & errMsg)
       elif errMsg.contains("double spend"):
         raise newRpcError(RpcTransactionRejected, errMsg)
