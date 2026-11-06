@@ -4,6 +4,7 @@
 
 import std/[json, strutils, tables, options, base64, parseutils, times, sets, os, algorithm, streams, sysrand, atomics, locks]
 from std/posix import nil
+from std/net import nil
 import chronos
 import chronicles
 import jsony
@@ -5887,6 +5888,34 @@ proc peerNetworkName*(address: string): string =
       return "not_publicly_routable"
     return "ipv4"
 
+proc netAddrPortString(ip: array[16, byte], port: uint16): string =
+  ## Core CService::ToStringAddrPort: "a.b.c.d:port" for IPv4 (including the
+  ## ::ffff:a.b.c.d mapping), "[h:h:...]:port" for IPv6.
+  var v4mapped = ip[10] == 0xFF and ip[11] == 0xFF
+  for i in 0 ..< 10:
+    if ip[i] != 0: v4mapped = false
+  if v4mapped:
+    $ip[12] & "." & $ip[13] & "." & $ip[14] & "." & $ip[15] & ":" & $port
+  else:
+    # RFC 5952 compression, as Core's inet_ntop-style rendering.
+    "[" & net.`$`(net.IpAddress(family: net.IpAddressFamily.IPv6, address_v6: ip)) & "]:" & $port
+
+proc isValidNetAddr(ip: array[16, byte]): bool =
+  ## Core CNetAddr::IsValid for the cases that matter here: the unspecified
+  ## address (:: and 0.0.0.0, the latter as ::ffff:0.0.0.0) and the IPv4
+  ## broadcast address are not valid, so Core reports no `addrlocal` for them.
+  var allZero = true
+  for b in ip:
+    if b != 0: allZero = false
+  if allZero: return false
+  var v4mapped = ip[10] == 0xFF and ip[11] == 0xFF
+  for i in 0 ..< 10:
+    if ip[i] != 0: v4mapped = false
+  if v4mapped:
+    let v4 = [ip[12], ip[13], ip[14], ip[15]]
+    if v4 == [0'u8, 0, 0, 0] or v4 == [255'u8, 255, 255, 255]: return false
+  true
+
 proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
   ## Return data about each connected network peer
   ## Reference: Bitcoin Core rpc/net.cpp getpeerinfo
@@ -5944,7 +5973,7 @@ proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
       # Reference: bitcoin-core/src/rpc/net.cpp:235 GetNetworkName(stats.m_network).
       let peerNetwork = peerNetworkName(peer.address)
 
-      peers.add(%*{
+      var peerObj = %*{
         "id": id,
         "addr": peer.address & ":" & $peer.port,
         "network": peerNetwork,
@@ -5988,9 +6017,34 @@ proc handleGetPeerInfo(rpc: RpcServer): JsonNode =
         "bytesrecv_per_msg": newJObject(),
         "connection_type": (if peer.direction == pdInbound: "inbound" else: "outbound-full-relay"),
         "transport_protocol_type": "v1",
-        "session_id": "",
-        "mapped_as": mappedAs
-      })
+        "session_id": ""
+      }
+      # Core rpc/net.cpp: addrbind/addrlocal (after addr) and mapped_as (after network) are optional;
+      # absent when unknown (addrbind invalid,
+      # addrlocal empty, mapped_as == 0 i.e. no asmap or no mapping).
+      var optional = newJObject()
+      if peer.transport != nil and not peer.transport.closed:
+        try:
+          let la = peer.transport.localAddress()
+          case la.family
+          of AddressFamily.IPv4, AddressFamily.IPv6:
+            optional["addrbind"] = %($la)
+          else: discard
+        except CatchableError:
+          discard
+      if isValidNetAddr(peer.addrLocal.ip):
+        optional["addrlocal"] = %netAddrPortString(peer.addrLocal.ip, peer.addrLocal.port)
+      if mappedAs != 0:
+        optional["mapped_as"] = %mappedAs
+      var ordered = newJObject()
+      for k, v in peerObj.pairs:
+        ordered[k] = v
+        if k == "addr":
+          for ok in ["addrbind", "addrlocal"]:
+            if optional.hasKey(ok): ordered[ok] = optional[ok]
+        elif k == "network" and optional.hasKey("mapped_as"):
+          ordered["mapped_as"] = optional["mapped_as"]
+      peers.add(ordered)
       inc id
 
   peers

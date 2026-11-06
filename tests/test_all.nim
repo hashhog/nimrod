@@ -142,6 +142,7 @@ const IncludedTests = [
   "test_getpkgtxns_gate",
   "test_getpeerinfo_conntime",
   "test_getpeerinfo_fields",
+  "test_getpeerinfo_optional_addrs",
   "test_handshake",
   "test_handshake_core_parity",
   "test_header_sync_from_tip",
