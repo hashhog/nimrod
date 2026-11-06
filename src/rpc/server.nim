@@ -1478,6 +1478,12 @@ proc blockStrippedSize(b: Block): int =
     size += serializeLegacy(tx).len
   size
 
+proc enrichVerbosity2(rpc: RpcServer, tx: Transaction, result: var JsonNode,
+                      mainnet: bool,
+                      currentBlockIdx: Option[BlockIndex],
+                      txInBlockIdx: int,
+                      regtest: bool = false)
+
 proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   ## getblock <hash> [verbosity]
   ##   verbosity=0 → raw hex
@@ -1495,8 +1501,13 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   # Core reads verbosity with getInt<int>, whose width check lives INSIDE the
   # conversion -- so an out-of-int32 value is -1 before the block is looked up.
   # nimrod looked the block up first and answered -5 "Block not found".
+  # Core ParseVerbosity(request.params[1], /*default_verbosity=*/1,
+  # /*allow_bool=*/true): a JSON bool is 1 (true) or 0 (false). Nim's
+  # JsonNode.getInt() answers 0 for a bool, which made `getblock <hash> true`
+  # return the raw hex instead of the decoded block.
   let verbosity =
     if params.len >= 2 and params[1].kind == JInt: coreInt32Bound(params[1].getBiggestInt())
+    elif params.len >= 2 and params[1].kind == JBool: (if params[1].getBool(): 1 else: 0)
     elif params.len >= 2: params[1].getInt()
     else: 1
 
@@ -1738,6 +1749,12 @@ proc handleGetBlock(rpc: RpcServer, params: JsonNode): JsonNode =
         let fee = amtIn - amtOut
         if allInputsKnown and fee >= 0:
           txObj["fee"] = btcAmountNode(fee)
+
+      # Core getblock verbosity >= 3 is TxVerbosity::SHOW_DETAILS_AND_PREVOUT
+      # (blockchain.cpp: `if (verbosity >= 3) tx_verbosity = ...`): every
+      # non-coinbase vin also carries {generated, height, value, scriptPubKey}.
+      if verbosity >= 3 and txIdx > 0:
+        rpc.enrichVerbosity2(tx, txObj, mainnet, idxOpt, txIdx, regtest)
 
       # hex is pushed last (after the optional fee), per Core TxToUniv.
       txObj["hex"] = %toHex(fullTxBytes)
