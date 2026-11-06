@@ -43,7 +43,7 @@ suite "RPC stop requests shutdown (gate 5)":
     check not rpc.shutdownRequested
     let resp = rpc.handleMethod("stop", %*[])
     check resp.kind == JString
-    check resp.getStr() == "nimrod server stopping"
+    check resp.getStr() == "Bitcoin Core stopping"
     check rpc.shutdownRequested
 
   test "numeric wait is accepted":

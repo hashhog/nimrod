@@ -16058,7 +16058,9 @@ proc handleMethodUnlocked(rpc: RpcServer, methodName: string, params: JsonNode):
     # was a no-op and the node kept running.
     if params.len >= 1 and params[0].kind notin {JInt, JNull}: raise newRpcError(RpcTypeError, "JSON value of type " & uvTypeName(params[0]) & " is not of expected type number")
     rpc.shutdownRequested = true
-    %"nimrod server stopping"
+    # Core rpc/server.cpp stop: return "Bitcoin Core stopping" (a fixed string,
+    # not branded per node), so scripts matching the reply work against nimrod.
+    %"Bitcoin Core stopping"
   of "uptime":
     rpc.handleUptime()
   of "getmemoryinfo":
