@@ -54,7 +54,7 @@ suite "W124 lifecycle + shutdown (G1-G10)":
     # Find the `stop` handler and assert the confession is still there:
     check "of \"stop\":" in src
     check "# Return success - actual shutdown handled by caller" in src
-    check "nimrod server stopping" in src
+    check "Bitcoin Core stopping" in src
     # The fix would add a `triggerShutdown` proc OR set
     # globalNodeState.running = false inside the handler.  Neither exists:
     check not compiles(rpc_server.triggerShutdown)
@@ -70,7 +70,7 @@ suite "W124 lifecycle + shutdown (G1-G10)":
         for j in 1 .. 3:
           if i + j < lines.len:
             let body = lines[i + j]
-            if "nimrod server stopping" in body:
+            if "Bitcoin Core stopping" in body:
               sawNoOp = true
             check "globalNodeState.running = false" notin body
             check "kill(getpid()" notin body
