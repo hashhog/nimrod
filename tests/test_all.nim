@@ -135,6 +135,7 @@ const IncludedTests = [
   "test_genesis_sync_relay",
   "test_getblockfrompeer",
   "test_getblockhash_height_range",
+  "test_getblock_verbosity_forms",
   "test_getchainstates",
   "test_getchaintips_side_tips",
   "test_getnodeaddresses",
