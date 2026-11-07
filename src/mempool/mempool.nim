@@ -3147,7 +3147,11 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
     replacementParents.add(input.prevOut.txid)
   if not mp.rbfDiagramImproves(conflicts, allConflicts, int64(txFee), txVsize,
                                replacementParents):
-    return err(HashSet[TxId], "rejecting replacement: insufficient feerate: does not improve feerate diagram")
+    # Core ReplacementChecks: state.Invalid(TX_RECONSIDERABLE,
+    # "replacement-failed", "insufficient feerate: does not improve feerate
+    # diagram") (validation.cpp); ToString() = "<token>, <debug>".
+    return err(HashSet[TxId],
+      "replacement-failed, insufficient feerate: does not improve feerate diagram")
 
   ok(allConflicts)
 

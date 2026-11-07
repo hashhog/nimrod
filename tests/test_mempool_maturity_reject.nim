@@ -158,6 +158,11 @@ when declared(splitRejectState):
         "bad-txns-premature-spend-of-coinbase, tried to spend coinbase at depth 99")
       check tok == "bad-txns-premature-spend-of-coinbase"
       check det == "bad-txns-premature-spend-of-coinbase, tried to spend coinbase at depth 99"
+    test "replacement-failed splits like Core":
+      let (tok, det) = splitRejectState(
+        "replacement-failed, insufficient feerate: does not improve feerate diagram")
+      check tok == "replacement-failed"
+      check det == "replacement-failed, insufficient feerate: does not improve feerate diagram"
     test "bare token has no details":
       let (tok, det) = splitRejectState("bad-txns-vin-empty")
       check tok == "bad-txns-vin-empty"

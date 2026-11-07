@@ -1043,7 +1043,8 @@ suite "G20 — Rule 8 ImprovesFeerateDiagram wired into single-tx RBF path":
                                 Satoshi(110_001), 10_000, conflicts)
     ## FIX ASSERTED: nimrod now rejects this via ImprovesFeerateDiagram, matching Core 27+.
     check not res.isOk
-    check res.error.contains("feerate diagram")
+    check res.error ==
+      "replacement-failed, insufficient feerate: does not improve feerate diagram"
 
 # ===========================================================================
 # G21 — TRUC (v3) single-tx: version check, size limits
