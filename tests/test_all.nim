@@ -170,6 +170,7 @@ const IncludedTests = [
   "test_mempool_persist",
   "test_mempool_usage",
   "test_mempool_reorg",
+  "test_mempool_script_verify_token",
   "test_mempool_trim_order",
   "test_mempool_unbroadcast",
   "test_messages",
