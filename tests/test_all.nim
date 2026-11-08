@@ -218,6 +218,7 @@ const IncludedTests = [
   "test_reorg_coinbase_inflation",
   "test_reorg_p2p",
   "test_rest",
+  "test_rest_mempool_contents_entry",
   "test_retained_body_holes",
   "test_rpc",
   "test_rpc_conversion_before_lookup",

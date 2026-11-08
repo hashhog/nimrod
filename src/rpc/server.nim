@@ -2902,68 +2902,10 @@ proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry,
                        chunks: var Table[TxId, ChunkInfo]): JsonNode =
   ## Canonical per-entry object for getmempoolentry, getrawmempool (verbose),
   ## getmempoolancestors (verbose), getmempooldescendants (verbose).
-  ## Reference: bitcoin-core/src/rpc/mempool.cpp entryToJSON (Core 31.99).
-  ##
-  ## Field order matches Core exactly.  Notable: top-level "fee"/"modifiedfee"/
-  ## "descendantfees"/"ancestorfees" are ABSENT (removed in Core 31.99, replaced
-  ## by the "fees" sub-object).  "chunkweight" and "fees.chunk" are added.
-  ## W70d: aligned to Core 31.99 entryToJSON field set.
-  let vsize = (entry.weight + 3) div 4
-  let feeF   = float64(int64(entry.fee))   / 100000000.0
-  # modified fee = base + PrioritiseTransaction delta (Core GetModifiedFee).
-  # Without a prioritisation this equals the base fee, preserving prior output.
-  let modF   = float64(rpc.mempool.getModifiedFee(txid)) / 100000000.0
-  let ancestF = float64(int64(entry.ancestorFee)) / 100000000.0
-  # Descendant totals include the tx itself (Core GetCountWithDescendants etc.)
-  let desc = rpc.mempool.descendantTotals(txid)
-  let descendF = float64(desc.modFee) / 100000000.0
-  # Chunk = the feerate-diagram chunk of the tx's cluster linearization.
-  if txid notin chunks:
-    for k, v in rpc.mempool.clusterChunks(txid):
-      chunks[k] = v
-  let chunk = chunks.getOrDefault(txid,
-    (fee: rpc.mempool.getModifiedFee(txid), weight: int64(entry.weight)))
-  let chunkWeight = chunk.weight
-  var obj = newJObject()
-  obj["vsize"]           = %vsize
-  obj["weight"]          = %entry.weight
-  obj["time"]            = %entry.timeAdded.toUnix()
-  obj["height"]          = %entry.height
-  obj["descendantcount"] = %desc.count
-  obj["descendantsize"]  = %desc.vsize
-  obj["ancestorcount"]   = %entry.ancestorCount
-  obj["ancestorsize"]    = %entry.ancestorSize
-  obj["wtxid"]           = %reverseHex(toHex(array[32, byte](entry.tx.wtxid())))
-  obj["chunkweight"]     = %chunkWeight
-  var feesObj = newJObject()
-  feesObj["base"]       = %feeF
-  feesObj["modified"]   = %modF
-  feesObj["ancestor"]   = %ancestF
-  feesObj["descendant"] = %descendF
-  feesObj["chunk"]      = %(float64(chunk.fee) / 100000000.0)
-  obj["fees"]             = feesObj
-  # Core builds depends as a std::set<std::string> of display-hex txids.
-  var dependHex: seq[string]
-  for p in rpc.mempool.inPoolParents(txid):
-    dependHex.add(reverseHex(toHex(array[32, byte](p))))
-  dependHex.sort()
-  var depends = newJArray()
-  for h in dependHex:
-    depends.add(%h)
-  var spentby = newJArray()
-  for c in rpc.mempool.inPoolChildren(txid):
-    spentby.add(%reverseHex(toHex(array[32, byte](c))))
-  obj["depends"]          = depends
-  obj["spentby"]          = spentby
-  # FIX-68 (W120 BUG-3): bip125-replaceable must reflect the tx's actual
-  # opt-in state.  Walks the tx itself (Gate 1: any input <= 0xfffffffd)
-  # AND walks all unconfirmed in-mempool ancestors (Gate 2: inherited
-  # signaling).  In full-RBF mode every mempool tx is replaceable.
-  # Reference: bitcoin-core/src/rpc/mempool.cpp entryToJSON
-  # → IsRBFOptIn(tx, pool) at line 560.
-  obj["bip125-replaceable"] = %rpc.mempool.isBip125Replaceable(txid)
-  obj["unbroadcast"]      = %rpc.mempool.isUnbroadcast(txid)
-  obj
+  ## Reference: bitcoin-core/src/rpc/mempool.cpp entryToJSON.  The builder
+  ## lives in mempoolinfo.nim so `/rest/mempool/contents.json` emits the same
+  ## object (Core rest.cpp rest_mempool -> MempoolToJSON -> entryToJSON).
+  mempoolEntryJson(rpc.mempool, txid, entry, chunks)
 
 proc mempoolEntryJson*(rpc: RpcServer, txid: TxId, entry: MempoolEntry): JsonNode =
   var chunks = initTable[TxId, ChunkInfo]()
