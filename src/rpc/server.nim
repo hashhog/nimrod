@@ -5286,18 +5286,34 @@ proc testAcceptRejectReason*(reason: string): string =
   else:
     reason
 
+proc splitRejectState*(error: string): tuple[token, details: string] =
+  ## Split a Core-style validation state string "<token>, <debug>"
+  ## (state.ToString()) into reject-reason (the token) and reject-details (the
+  ## whole string).  A string with no ", " or whose prefix is not a single
+  ## token (free text such as "insufficient fee, rejecting ...") is returned
+  ## whole as the token with no details.
+  let sep = error.find(", ")
+  if sep > 0 and ' ' notin error[0 ..< sep]:
+    (error[0 ..< sep], error)
+  else:
+    (error, "")
+
 proc setTestAcceptReject(entry: JsonNode, error: string) =
   ## allowed:false + reject-reason, plus reject-details (Core's
   ## state.ToString(), rpc/mempool.cpp:399-403) where nimrod can state it
   ## exactly.  Core omits it for missing-inputs.  For the two already-known
-  ## tokens ToString() is the bare token (no debug string); for every other
-  ## nimrod reason the text after the token is nimrod's own wording, which would
-  ## not equal Core's debug string, so it is left out rather than invented.
+  ## tokens ToString() is the bare token (no debug string); a reason already in
+  ## Core's "<token>, <debug>" form is split by splitRejectState; any other
+  ## nimrod reason is nimrod's own wording, which would not equal Core's debug
+  ## string, so details are left out rather than invented.
   entry["allowed"] = %false
-  let token = testAcceptRejectReason(error)
+  let (splitToken, splitDetails) = splitRejectState(error)
+  let token = testAcceptRejectReason(splitToken)
   entry["reject-reason"] = %token
   if token in ["txn-already-in-mempool", "txn-already-known"]:
     entry["reject-details"] = %token
+  elif splitDetails.len > 0:
+    entry["reject-details"] = %splitDetails
 
 proc handleTestMempoolAccept(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Dry-run mempool acceptance check for one or more raw transactions.

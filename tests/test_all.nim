@@ -166,6 +166,7 @@ const IncludedTests = [
   "test_mempool_clock",
   "test_mempool_cluster_fields",
   "test_mempool_eviction_w86",
+  "test_mempool_maturity_reject",
   "test_mempool_persist",
   "test_mempool_usage",
   "test_mempool_reorg",

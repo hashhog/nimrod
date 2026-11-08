@@ -1365,8 +1365,10 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
         # coin that is mature at the tip-the-block-will-extend.
         let age = (tipHeight + 1) - entry.height
         if age < int32(mp.params.coinbaseMaturity):
-          return err(AtmpAcceptInfo, "bad-txns-premature-spend-of-coinbase: age=" &
-                     $age & " required=" & $mp.params.coinbaseMaturity)
+          # Core CheckTxInputs: Invalid(TX_PREMATURE_SPEND, token,
+          # "tried to spend coinbase at depth N"); ToString() = "token, debug".
+          return err(AtmpAcceptInfo, "bad-txns-premature-spend-of-coinbase, " &
+                     "tried to spend coinbase at depth " & $age)
 
   # BIP-68 sequence locks (CheckSequenceLocksAtTip, validation.cpp:887).
   proc lookupForSeqLock(op: OutPoint): Option[UtxoEntry] =
@@ -3145,7 +3147,11 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
     replacementParents.add(input.prevOut.txid)
   if not mp.rbfDiagramImproves(conflicts, allConflicts, int64(txFee), txVsize,
                                replacementParents):
-    return err(HashSet[TxId], "rejecting replacement: insufficient feerate: does not improve feerate diagram")
+    # Core ReplacementChecks: state.Invalid(TX_RECONSIDERABLE,
+    # "replacement-failed", "insufficient feerate: does not improve feerate
+    # diagram") (validation.cpp); ToString() = "<token>, <debug>".
+    return err(HashSet[TxId],
+      "replacement-failed, insufficient feerate: does not improve feerate diagram")
 
   ok(allConflicts)
 
