@@ -5234,6 +5234,17 @@ proc splitRejectState*(error: string): tuple[token, details: string] =
   ## whole string).  A string with no ", " or whose prefix is not a single
   ## token (free text such as "insufficient fee, rejecting ...") is returned
   ## whole as the token with no details.
+  ##
+  ## A token may carry a parenthesised ScriptErrorString, as in Core's
+  ## "mempool-script-verify-flag-failed (<text>)" (validation.cpp:2120); the
+  ## text has spaces, so such a token ends at the "), " after its " (".
+  let paren = error.find(" (")
+  if paren > 0 and ' ' notin error[0 ..< paren]:
+    let close = error.find("), ", paren)
+    if close > 0:
+      return (error[0 .. close], error)
+    if error.endsWith(")"):
+      return (error, "")
   let sep = error.find(", ")
   if sep > 0 and ' ' notin error[0 ..< sep]:
     (error[0 ..< sep], error)

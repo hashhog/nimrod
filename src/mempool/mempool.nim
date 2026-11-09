@@ -1643,7 +1643,13 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   let consensusFlags = getBlockScriptFlags(mp.chainState.bestHeight, mp.params)
   let policyFlags = standardScriptVerifyFlags(consensusFlags)
 
-  proc verifyAt(flags: set[ScriptFlags]): MempoolResult[void] =
+  proc verifyAt(flags: set[ScriptFlags], token: string): MempoolResult[void] =
+    ## On failure, the error is Core's CheckInputScripts state string
+    ## (validation.cpp:2119-2123 + CScriptCheck debug, validation.cpp:2021):
+    ##   "<token> (<ScriptErrorString>), input N of <txid> (wtxid <wtxid>),
+    ##    spending <prevtxid>:<n>"
+    ## The verdict is still verifyScript's bool; verifyScriptWithError is run
+    ## only after a failure, to name the error for the text.
     for inputIdx, input in tx.inputs:
       var scriptPubKey: seq[byte]
       var amount: Satoshi
@@ -1662,43 +1668,29 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
       let verified = verifyScript(
         input.scriptSig, scriptPubKey, tx, inputIdx, amount, flags, witness)
       if not verified:
+        let se = verifyScriptWithError(
+          input.scriptSig, scriptPubKey, tx, inputIdx, amount, flags, witness)
+        # Core's ScriptError starts as SCRIPT_ERR_UNKNOWN_ERROR ("unknown
+        # error"); keep that if the error-reporting twin disagrees.
+        let errText = if se == seOk: "unknown error"
+                      else: coreScriptErrorString(se)
         return MempoolResult[void](isOk: false,
-          error: "script verification failed for input " & $inputIdx)
+          error: token & " (" & errText & "), input " & $inputIdx & " of " &
+                 $tx.txid() & " (wtxid " & $tx.wtxid() & "), spending " &
+                 $input.prevOut.txid & ":" & $input.prevOut.vout)
     MempoolResult[void](isOk: true)
 
-  let policyVer = verifyAt(policyFlags)
+  # Core: flags with any STANDARD_NOT_MANDATORY bit -> "mempool-script-verify-
+  # flag-failed", otherwise "block-script-verify-flag-failed"
+  # (validation.cpp:2119-2123).  PolicyScriptChecks always runs the standard
+  # set; ConsensusScriptChecks runs the block flags.
+  let policyVer = verifyAt(policyFlags, "mempool-script-verify-flag-failed")
   if not policyVer.isOk:
-    # W96 GAP #10: TX_WITNESS_STRIPPED detection (validation.cpp:1148).
-    # If the tx HAS NO witness data but spends a non-anchor witness program,
-    # this is almost certainly witness-stripped relay corruption; surface a
-    # distinct error so p2p rejection caching matches Core.
-    var anyWitnessSpend = false
-    var hasWitness = false
-    for w in tx.witnesses:
-      if w.len > 0:
-        hasWitness = true
-        break
-    if not hasWitness:
-      for input in tx.inputs:
-        let utxo = mp.chainState.getUtxo(input.prevOut)
-        var spk: seq[byte]
-        if utxo.isSome:
-          spk = utxo.get().output.scriptPubKey
-        elif input.prevOut.txid in mp.entries:
-          spk = mp.entries[input.prevOut.txid].tx.outputs[input.prevOut.vout].scriptPubKey
-        let kind = classifyStdTxout(spk)
-        if kind in {stxP2WPKH, stxP2WSH, stxWitnessUnknown}:
-          # Note: P2TR (witness v1, BIP-340) is anchor-spendable for some
-          # paths (key-spend with empty witness is invalid; treat as
-          # witness-stripped also).
-          anyWitnessSpend = true
-          break
-        if kind == stxP2TR:
-          anyWitnessSpend = true
-          break
-    if anyWitnessSpend:
-      return err(AtmpAcceptInfo, "witness-stripped: " & policyVer.error)
-    return err(AtmpAcceptInfo, "non-mandatory-script-verify-flag: " & policyVer.error)
+    # TX_WITNESS_STRIPPED (validation.cpp:1147-1151): Core only re-labels the
+    # result class and keeps the same reject reason and debug message, so the
+    # text is the same.  nimrod has no separate result class for it; the
+    # former "witness-stripped: " prefix was read by nothing.
+    return err(AtmpAcceptInfo, policyVer.error)
 
   # === ConsensusScriptChecks ================================================
   # Re-verify with the current block's flags (consensus only).  validation.cpp
@@ -1706,10 +1698,9 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # bug accepted a tx that consensus rejects), we have a serious bug; Core
   # logs "BUG! PLEASE REPORT THIS!" and asserts.  Here we surface a hard
   # error.
-  let consensusVer = verifyAt(consensusFlags)
+  let consensusVer = verifyAt(consensusFlags, "block-script-verify-flag-failed")
   if not consensusVer.isOk:
-    return err(AtmpAcceptInfo,
-               "mandatory-script-verify-flag-failed: " & consensusVer.error)
+    return err(AtmpAcceptInfo, consensusVer.error)
 
   # === Submission ===========================================================
 

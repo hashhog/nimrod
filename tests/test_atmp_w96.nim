@@ -497,7 +497,7 @@ suite "W96 PolicyScriptChecks — script verify gates":
   teardown:
     cleanupTestDb()
 
-  test "script verification failure surfaced as non-mandatory- or mandatory-":
+  test "script verification failure surfaced as Core's mempool-script-verify-flag-failed":
     var cs = newChainState(TestDbPath, regtestParams())
     let params = regtestParams()
     var mp = newMempool(cs, params, minFeeRate = 0.0)
@@ -507,9 +507,11 @@ suite "W96 PolicyScriptChecks — script verify gates":
     let tx = makeSpendTx(spendable, 0, 4_999_000_000)
     let r = mp.acceptTransaction(tx, crypto)
     check not r.isOk
-    check ("non-mandatory-script-verify-flag" in r.error or
-           "mandatory-script-verify-flag-failed" in r.error or
-           "script verification failed" in r.error)
+    # Core CheckInputScripts (validation.cpp:2120) + CScriptCheck debug (:2021).
+    # hash160(empty) != the fixture's zero hash -> SCRIPT_ERR_EQUALVERIFY.
+    check r.error.startsWith("mempool-script-verify-flag-failed " &
+      "(Script failed an OP_EQUALVERIFY operation), input 0 of " & $tx.txid() &
+      " (wtxid " & $tx.wtxid() & "), spending " & $spendable & ":0")
     cs.close()
 
 suite "W96 wtxid index lifecycle":

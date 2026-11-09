@@ -308,6 +308,77 @@ const
   SEQUENCE_LOCKTIME_MASK* = 0x0000ffff'u32
 
 # Helper: check if executing (all conditions in execStack are true)
+proc coreScriptErrorString*(e: ScriptError): string =
+  ## Bitcoin Core's ScriptErrorString (script/script_error.cpp:11-127) for a
+  ## nimrod ScriptError.  Used only for reject TEXT (mempool
+  ## "mempool-script-verify-flag-failed (<this>)"); it never feeds a verdict.
+  ## nimrod's enum is coarser than Core's in a few places; each such value maps
+  ## to the Core error its sites most often stand for:
+  ##   seVerify      also covers false/empty final stack -> SCRIPT_ERR_EVAL_FALSE
+  ##                 (the common case: a failed CHECKSIG leaves false); a failed
+  ##                 OP_VERIFY reads as EVAL_FALSE too.
+  ##   seInvalidStack also covers a truncated push (Core BAD_OPCODE).
+  ##   seWitnessProgramMismatch also covers empty witness / wrong item count.
+  ##   seTaprootError is a failed key-path spend -> SCHNORR_SIG.
+  case e
+  of seOk: "No error"
+  of seVerify:
+    "Script evaluated without error but finished with a false/empty top stack element"
+  of seEqualVerify: "Script failed an OP_EQUALVERIFY operation"
+  of seCheckMultisigVerify: "Script failed an OP_CHECKMULTISIGVERIFY operation"
+  of seCheckSigVerify: "Script failed an OP_CHECKSIGVERIFY operation"
+  of seNumEqualVerify: "Script failed an OP_NUMEQUALVERIFY operation"
+  of seScriptSize: "Script is too big"
+  of sePushSize: "Push value size limit exceeded"
+  of seOpCount: "Operation limit exceeded"
+  of seStackSize: "Stack size limit exceeded"
+  of seSigCount: "Signature count negative or greater than pubkey count"
+  of sePubkeyCount: "Pubkey count negative or limit exceeded"
+  of seUnknownOpcode, seInvalidOpcode, seBadOpcode:
+    "Opcode missing or not understood"
+  of seDisabledOpcode: "Attempted to use a disabled opcode"
+  of seInvalidStack: "Operation not valid with the current stack size"
+  of seOpReturn: "OP_RETURN was encountered"
+  of seUnbalancedConditional: "Invalid OP_IF construction"
+  of seNegativeLocktime: "Negative locktime"
+  of seUnsatisfiedLocktime: "Locktime requirement not satisfied"
+  of seSigHashType: "Signature hash type missing or not understood"
+  of seSigDer, seInvalidSig: "Non-canonical DER signature"
+  of seMinimalData: "Data push larger than necessary"
+  of seSigPushOnly: "Only push operators allowed in signatures"
+  of seSigHighS: "Non-canonical signature: S value is unnecessarily high"
+  of seNullDummy: "Dummy CHECKMULTISIG argument must be zero"
+  of seMinimalIf: "OP_IF/NOTIF argument must be minimal"
+  of seNullFail: "Signature must be zero for failed CHECK(MULTI)SIG operation"
+  of seDiscourageUpgradableNops: "NOPx reserved for soft-fork upgrades"
+  of seDiscourageUpgradableWitnessProgram:
+    "Witness version reserved for soft-fork upgrades"
+  of seDiscourageUpgradableTaprootVersion:
+    "Taproot version reserved for soft-fork upgrades"
+  of seDiscourageOpSuccess: "OP_SUCCESSx reserved for soft-fork upgrades"
+  of seDiscourageUpgradablePubkeyType:
+    "Public key version reserved for soft-fork upgrades"
+  of seInvalidPubkey: "Public key is neither compressed or uncompressed"
+  of seCleanStack: "Stack size must be exactly one after execution"
+  of seWitnessProgramWrongLength: "Witness program has incorrect length"
+  of seWitnessProgramMismatch: "Witness program hash mismatch"
+  of seWitnessMalleated: "Witness requires empty scriptSig"
+  of seWitnessMalleatedP2SH: "Witness requires only-redeemscript scriptSig"
+  of seWitnessUnexpected: "Witness provided for non-witness script"
+  of seWitnessPubkeyType: "Using non-compressed keys in segwit"
+  of seSchnorrSigSize: "Invalid Schnorr signature size"
+  of seSchnorrSigHashtype: "Invalid Schnorr signature hash type"
+  of seSchnorrSig, seTaprootError: "Invalid Schnorr signature"
+  of seTaprootWrongControlSize: "Invalid Taproot control block size"
+  of seTapscriptValidationWeight:
+    "Too much signature validation relative to witness weight"
+  of seTapscriptCheckmultisig:
+    "OP_CHECKMULTISIG(VERIFY) is not available in tapscript"
+  of seTapscriptMinimalIf: "OP_IF/NOTIF argument must be minimal in tapscript"
+  of seTapscriptEmptyPubkey: "Empty public key in tapscript"
+  of seOpCodeSeparator: "Using OP_CODESEPARATOR in non-witness script"
+  of seSigFindAndDelete: "Signature is found in scriptCode"
+
 proc isExecuting(interp: ScriptInterpreter): bool =
   for exec in interp.execStack:
     if not exec:
