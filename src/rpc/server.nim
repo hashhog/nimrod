@@ -10335,6 +10335,8 @@ proc handleListUnspent(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Arguments:
   ## 1. minconf (numeric, optional, default=1) - Minimum confirmations
   ## 2. maxconf (numeric, optional, default=9999999) - Maximum confirmations
+  ## 5. query_options (object, optional) - only `include_immature_coinbase`
+  ##    (bool, default false) is honoured here.
   ##
   ## Returns: Array of UTXOs
 
@@ -10360,6 +10362,21 @@ proc handleListUnspent(rpc: RpcServer, params: JsonNode): JsonNode =
           "Invalid parameter, duplicated address: " & s)
       filterAddrs.incl(s)
 
+  # Core skips immature coinbase outputs unless the caller opts in through
+  # query_options.include_immature_coinbase (default false):
+  # bitcoin-core/src/wallet/spend.h:86 (CoinFilterParams default),
+  # src/wallet/rpc/coins.cpp:567 (type-checked VBOOL) and :583-585 (parsed),
+  # src/wallet/spend.cpp:357 (AvailableCoins `continue`s past them).
+  var includeImmatureCoinbase = false
+  if params.len >= 5 and params[4].kind == JObject and
+      params[4].hasKey("include_immature_coinbase"):
+    let v = params[4]["include_immature_coinbase"]
+    if v.kind != JBool:
+      raise newRpcError(RpcTypeError,
+        "JSON value of type " & uvTypeName(v) &
+        " for field include_immature_coinbase is not of expected type bool")
+    includeImmatureCoinbase = v.getBool()
+
   let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
   let mainnet = rpc.params.network == Mainnet
   # Regtest has its own bech32 HRP ("bcrt"); without this flag segwit
@@ -10376,12 +10393,17 @@ proc handleListUnspent(rpc: RpcServer, params: JsonNode): JsonNode =
       if haveFilter:
         if addrOpt.isNone or addrOpt.get() notin filterAddrs:
           continue
-      # Immature coinbase coins are listed but flagged non-spendable/unsafe,
-      # matching Core's AvailableCoins semantics (a coinbase at height H is
-      # spendable once currentHeight - H >= COINBASE_MATURITY, i.e. it has
-      # COINBASE_MATURITY+1 confirmations). isMatureCoinbase returns true for
-      # all non-coinbase coins.
-      let spendable = utxo.isMatureCoinbase(currentHeight)
+      # Immature coinbases (fewer than COINBASE_MATURITY+1 confirmations,
+      # CWallet::IsTxImmatureCoinBase wallet.cpp:3345) are NOT listed by
+      # default — Core's AvailableCoins drops them (spend.cpp:357). Listing
+      # them flagged spendable:false/safe:false was a nimrod invention.
+      # isMatureCoinbase returns true for every non-coinbase coin.
+      if not includeImmatureCoinbase and not utxo.isMatureCoinbase(currentHeight):
+        continue
+      # Every coin Core lists reports spendable:true (rpc/coins.cpp:675,
+      # "Any coins we list are always spendable"); a confirmed coin is
+      # trusted, so safe is true as well (spend.cpp:368 CachedTxIsTrusted).
+      let spendable = true
       let addrStr = if addrOpt.isSome: addrOpt.get() else: ""
       var entry = %*{
         "txid": reverseHex(toHex(array[32, byte](utxo.outpoint.txid))),

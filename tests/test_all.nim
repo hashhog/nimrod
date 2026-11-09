@@ -159,6 +159,7 @@ const IncludedTests = [
   "test_kb181_failed_reorg_activation",
   "test_label",
   "test_listdescriptors",
+  "test_listunspent_immature_coinbase",
   "test_listunspent_regtest_hrp",
   "test_loadtxoutset_nonempty_chainstate",
   "test_maturity",
