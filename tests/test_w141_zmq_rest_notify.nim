@@ -384,23 +384,26 @@ suite "W141 G17 — mempool/contents.json query params (BUG-9)":
 # ---------------------------------------------------------------------------
 suite "W141 G18 — mempool/contents.json fake DAG + sat-denominated fees":
 
-  test "G18 BUG-10: descendantcount/ancestorcount hardcoded to 1":
+  test "G18 BUG-10 (FIXED): contents.json entries come from the shared entryToJSON builder":
+    ## Was a hand-rolled object with descendantcount/ancestorcount hardcoded
+    ## to 1. Core rest.cpp rest_mempool serves MempoolToJSON(pool, true), i.e.
+    ## entryToJSON per entry; the handler now calls the shared builder, which
+    ## walks the in-pool DAG (behaviour: tests/test_rest_mempool_contents_entry.nim).
     let body =
       restSrc[restSrc.find("handleRestMempoolContents") ..
               restSrc.find("# ============================================================================\n# Block filter")]
-    check "\"descendantcount\": 1" in body
-    check "\"ancestorcount\": 1"   in body
-    # No mempool DAG walk:
-    check "getDescendants"  notin body
-    check "getAncestors"    notin body
+    check "mempoolEntryJson(rest.mempool" in body
+    check "\"descendantcount\": 1" notin body
+    check "\"ancestorcount\": 1"   notin body
 
-  test "G18 BUG-11: descendantfees / ancestorfees emitted as int sat (Core: BTC float)":
+  test "G18 BUG-11 (FIXED): no top-level sat-denominated descendantfees / ancestorfees":
+    ## Core entryToJSON has no top-level fee/descendantfees/ancestorfees; the
+    ## amounts are BTC values inside the "fees" sub-object.
     let body =
       restSrc[restSrc.find("handleRestMempoolContents") ..
               restSrc.find("# ============================================================================\n# Block filter")]
-    # int64(entry.fee) used directly — sat not BTC.
-    check "\"descendantfees\": int64(entry.fee)" in body
-    check "\"ancestorfees\": int64(entry.ancestorFee)" in body
+    check "\"descendantfees\": int64(entry.fee)" notin body
+    check "\"ancestorfees\": int64(entry.ancestorFee)" notin body
 
 # ---------------------------------------------------------------------------
 # G19 — /rest/block JSON missing versionHex/mediantime/difficulty (BUG-12)

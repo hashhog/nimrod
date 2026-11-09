@@ -12,7 +12,7 @@
 ## once at startup; failures abort the listener immediately rather than
 ## silently fall back to plaintext.  W119 + FIX-64.
 
-import std/[json, strutils, tables, options, times, os]
+import std/[json, strutils, tables, options, os]
 import chronos
 import chronos/streams/[asyncstream, tlsstream]
 import chronicles
@@ -778,22 +778,14 @@ proc handleRestMempoolInfo*(rest: RestServer): RestResponse =
 
 proc handleRestMempoolContents*(rest: RestServer): RestResponse =
   ## GET /rest/mempool/contents.json
+  ## Core rest.cpp rest_mempool serves MempoolToJSON(pool, true): an object
+  ## keyed by display txid whose values are entryToJSON objects -- the same
+  ## per-entry object getrawmempool true returns (src/rpc/mempool.cpp).
   var entries = newJObject()
+  var chunks = initTable[TxId, ChunkInfo]()
   for txid, entry in rest.mempool.entries:
-    let vsize = (entry.weight + 3) div 4
-    entries[reverseHex(toHex(array[32, byte](txid)))] = %*{
-      "vsize": vsize,
-      "weight": entry.weight,
-      "fee": float64(int64(entry.fee)) / 100000000.0,
-      "time": entry.timeAdded.toUnix(),
-      "height": entry.height,
-      "descendantcount": 1,
-      "descendantsize": vsize,
-      "descendantfees": int64(entry.fee),
-      "ancestorcount": 1,
-      "ancestorsize": vsize,
-      "ancestorfees": int64(entry.ancestorFee)
-    }
+    entries[reverseHex(toHex(array[32, byte](txid)))] =
+      mempoolEntryJson(rest.mempool, txid, entry, chunks)
   restJson(entries)
 
 # ============================================================================
