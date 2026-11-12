@@ -1189,6 +1189,15 @@ proc buildTxAmounts(wallet: Wallet, tx: Transaction,
         isMine: ismine,
         amount: output.value,
         vout: uint32(voutIdx)))
+      # Core CachedTxGetAmounts: an owned non-change output of a tx we paid for
+      # is ALSO a receive entry (send-to-self lists send and receive).
+      if ismine:
+        details.add(WalletTxDetail(
+          scriptPubKey: output.scriptPubKey,
+          isSend: false,
+          isMine: true,
+          amount: output.value,
+          vout: uint32(voutIdx)))
     elif ismine:
       details.add(WalletTxDetail(
         scriptPubKey: output.scriptPubKey,
