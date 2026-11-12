@@ -1,6 +1,6 @@
 ## gettransaction.details for a send-to-self (wallet-cause-D).
 ##
-## CONTROL: `nim c -r tests/test_selfsend_details.nim`
+## CONTROL: `nim c -r tests/selfsend_details/test_selfsend_details.nim`
 ##
 ## Core CachedTxGetAmounts (wallet/receive.cpp), used by ListTransactions:
 ## when the wallet paid for the tx, change is skipped, every other output is a
@@ -10,10 +10,10 @@
 
 import unittest2
 import std/[tables, options]
-import ../src/wallet/wallet
-import ../src/consensus/params
-import ../src/primitives/[types, serialize]
-import ../src/crypto/address
+import ../../src/wallet/wallet
+import ../../src/consensus/params
+import ../../src/primitives/[types, serialize]
+import ../../src/crypto/address
 
 const Mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
