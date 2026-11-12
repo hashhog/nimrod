@@ -10449,11 +10449,8 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
     if lwOpt.isSome:
       walletName = lwOpt.get().name
 
-  let balance = w.getBalance()
   # Core txcount is mapWallet.size (confirmed + mempool wallet txs), not UTXOs.
   let txCount = if w.txHistory.len > 0: w.txHistory.len else: w.utxos.len
-  let currentHeight = if rpc.chainState != nil: rpc.chainState.bestHeight else: 0'i32
-  let immatureBalance = w.getImmatureBalance(currentHeight)
 
   # private_keys_enabled = !WALLET_FLAG_DISABLE_PRIVATE_KEYS — derived from
   # the persisted flag, no longer hardcoded true. A disable_private_keys
@@ -10464,9 +10461,6 @@ proc handleGetWalletInfo(rpc: RpcServer, params: JsonNode): JsonNode =
     "walletname": walletName,
     "walletversion": 1,
     "format": "sqlite",
-    "balance": float64(int64(balance)) / 100_000_000.0,
-    "unconfirmed_balance": 0.0,
-    "immature_balance": float64(int64(immatureBalance)) / 100_000_000.0,
     "txcount": txCount,
     "keypoolsize": keypool,
     "keypoolsize_hd_internal": keypool,
