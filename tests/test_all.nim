@@ -259,6 +259,7 @@ const IncludedTests = [
   "test_t2_r5_parity",
   "test_sendrawtransaction_core_errors",
   "test_testmempoolaccept_args",
+  "test_getblockheader_sidebranch_mediantime",
   "test_getblockheader_verbose_type",
   "test_t3_r5_parity",
   "test_taproot_commitment",

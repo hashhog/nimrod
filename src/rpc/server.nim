@@ -1285,9 +1285,12 @@ proc handleGetBlockHeader(rpc: RpcServer, params: JsonNode): JsonNode =
   let chainwork    = computeChainwork(rpc.chainState.db, blockHash, idx.height)
   let chainworkHex = chainworkHexBE(chainwork)
 
-  # mediantime: Bitcoin Core GetMedianTimePast() — median of this block and up
-  # to 10 predecessors (same window as getMtpForHeight).
-  let mediantime = int64(getMtpForHeight(rpc.chainState.db, idx.height))
+  # mediantime: Bitcoin Core CBlockIndex::GetMedianTimePast() (chain.h) —
+  # median of this entry and up to 10 predecessors, walked through the
+  # entry's own prevBlock links.  The active chain's height index
+  # (getMtpForHeight) is wrong for an entry off that chain: a header above
+  # the active tip got 0 and a fork entry got the active block's MTP.
+  let mediantime = int64(getMtpForBlockIndex(rpc.chainState.db, idx))
 
   # target: big-endian 64-char hex of the full 256-bit difficulty target derived
   # from bits. compactToTarget returns little-endian; reverseHex for big-endian.
