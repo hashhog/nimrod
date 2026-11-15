@@ -1239,6 +1239,13 @@ proc standardScriptVerifyFlags*(consensusFlags: set[ScriptFlags]): set[ScriptFla
   result.incl(sfDiscourageOpSuccess)
   result.incl(sfDiscourageUpgradablePubkeyType)
 
+proc floorFeeFor(rateSatVb: float64, vsize: int): int64 =
+  ## Core CFeeRate::GetFee(vsize) for a floor held here in sat/vB: the
+  ## sat/kvB rate (CFeeRate stores an integer CAmount per kvB) times vsize,
+  ## rounded UP (FeeFrac::EvaluateFeeUp, policy/feerate.cpp:24).
+  let perK = int64(round(rateSatVb * 1000.0))
+  (perK * int64(vsize) + 999) div 1000
+
 # Accept a transaction into the mempool
 proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
                                 crypto: CryptoEngine,
@@ -1557,11 +1564,19 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     # feeRate < max(minFeeRate, rollingFloor) — because feeRate >= 0 makes the
     # (rollingFloor <= 0 and feeRate < rollingFloor) sub-case vacuous; only the
     # surfaced token differs so the two Core reasons are reported separately.
+    #
+    # Each reject carries Core's debug string "%d < %d" (modified fee vs the
+    # floor's CFeeRate::GetFee(vsize), rounded up -- policy/feerate.cpp:20), so
+    # the reason reads like Core's state.ToString():
+    # "min relay fee not met, 1 < 11".  testmempoolaccept splits it into
+    # reject-reason + reject-details.
     let rollingFloor = mp.getMinFee()
     if rollingFloor > 0.0 and feeRate < rollingFloor:
-      return err(AtmpAcceptInfo, "mempool min fee not met")
+      return err(AtmpAcceptInfo, "mempool min fee not met, " & $int64(modifiedFee) &
+                 " < " & $floorFeeFor(rollingFloor, vsizeInt))
     if feeRate < mp.minFeeRate:
-      return err(AtmpAcceptInfo, "min relay fee not met")
+      return err(AtmpAcceptInfo, "min relay fee not met, " & $int64(modifiedFee) &
+                 " < " & $floorFeeFor(mp.minFeeRate, vsizeInt))
 
   # W96 GAP #7: client_maxfeerate (validation.cpp:1368).
   # Core compares the effective feerate against the caller-supplied max
