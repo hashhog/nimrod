@@ -280,6 +280,7 @@ proc getMinFee*(mp: Mempool): float64
 proc findConflicts*(mp: Mempool, tx: Transaction): HashSet[TxId]
 proc getAllConflictsWithDescendants*(mp: Mempool, conflicts: HashSet[TxId]): HashSet[TxId]
 proc calculateConflictFees*(mp: Mempool, allConflicts: HashSet[TxId]): (Satoshi, int)
+proc coreFormatMoney*(sats: int64): string
 proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
                     conflicts: HashSet[TxId], incrementalRelayFee: float64 = DefaultIncrementalRelayFee): MempoolResult[HashSet[TxId]]
 proc removeConflicts*(mp: Mempool, conflicts: HashSet[TxId])
@@ -3107,20 +3108,24 @@ proc checkRbfRules*(mp: Mempool, tx: Transaction, txFee: Satoshi, txVsize: int,
   #
   # Reject-reason TOKEN must match Core's category: ReplacementChecks emits
   # state.Invalid(..., "insufficient fee", err_string) for BOTH PaysForRBF
-  # failures (validation.cpp:1013-1014).  We mirror that token so the
-  # reject-reason CATEGORY agrees with Core; the Core detail string
-  # ("less fees than conflicting txs") follows for forensics.
+  # failures (validation.cpp:1013-1014), and err_string is PaysForRBF's own
+  # text (policy/rbf.cpp:110-121): it names the replacement's txid and prints
+  # both amounts with FormatMoney, so state.ToString() reads
+  # "insufficient fee, rejecting replacement <txid>, less fees than
+  # conflicting txs; 0.00006 < 0.00021".
   if int64(txFee) < int64(conflictFees):
-    return err(HashSet[TxId], "insufficient fee, rejecting replacement, less fees than conflicting txs; " &
-               $int64(txFee) & " < " & $int64(conflictFees) & " sats")
+    return err(HashSet[TxId], "insufficient fee, rejecting replacement " & $tx.txid() &
+               ", less fees than conflicting txs; " &
+               coreFormatMoney(int64(txFee)) & " < " & coreFormatMoney(int64(conflictFees)))
 
   # Rule #4 (PaysForRBF part 2): additional fees >= incremental relay fee * replacement vsize.
   # Reference: Bitcoin Core src/policy/rbf.cpp PaysForRBF() line 118.
   let additionalFee = int64(txFee) - int64(conflictFees)
   let requiredAdditionalFee = int64(incrementalRelayFee * float64(txVsize))
   if additionalFee < requiredAdditionalFee:
-    return err(HashSet[TxId], "insufficient fee, rejecting replacement, not enough additional fees to relay; " &
-               $additionalFee & " < " & $requiredAdditionalFee & " sats")
+    return err(HashSet[TxId], "insufficient fee, rejecting replacement " & $tx.txid() &
+               ", not enough additional fees to relay; " &
+               coreFormatMoney(additionalFee) & " < " & coreFormatMoney(requiredAdditionalFee))
 
   # Rule #8 (ImprovesFeerateDiagram, Core 27+): the replacement must strictly improve
   # the feerate diagram vs. the evicted set.

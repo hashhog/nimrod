@@ -214,6 +214,7 @@ const IncludedTests = [
   "test_psbt_emptyvin_gate",
   "test_rbf",
   "test_rbf_clusters",
+  "test_rbf_paysforrbf_reject_text",
   "test_regtest",
   "test_reject_token_remap",
   "test_relay",
