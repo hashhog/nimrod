@@ -831,9 +831,14 @@ suite "G15 MAX_REPLACEMENT_CANDIDATES = 100":
     let conflicts = mp.findConflicts(replacingTx)
     let res = mp.checkRbfRules(replacingTx, replacingFee, 150, conflicts)
     check not res.isOk
-    check res.error.contains("too many potential replacements") or
-          res.error.contains("too many conflict") or
-          res.error.contains("100")
+    # Core counts directly conflicted CLUSTERS for rule 5 (policy/rbf.cpp
+    # GetEntriesForConflicts): the chain of 101 is one cluster, so rule 5
+    # passes and the reject is rule 3's PaysForRBF (4M < 1M + 100 x 100k).
+    # The old `or contains("100")` alternative only matched the raw-satoshi
+    # amount "11000000" in that rule-3 text.
+    check not res.error.contains("too many potential replacements")
+    check res.error == "insufficient fee, rejecting replacement " & $replacingTx.txid() &
+      ", less fees than conflicting txs; 0.04 < 0.11"
 
 # ===========================================================================
 # G16 — Rule #2 (EntriesAndTxidsDisjoint): no spending from to-be-evicted tx
