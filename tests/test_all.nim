@@ -176,6 +176,7 @@ const IncludedTests = [
   "test_mempool_unbroadcast",
   "test_messages",
   "test_metrics_server",
+  "test_min_relay_fee_reject_details",
   "test_minimalif",
   "test_miniscript",
   "test_minisketch",

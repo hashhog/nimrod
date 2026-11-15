@@ -5238,6 +5238,13 @@ proc splitRejectState*(error: string): tuple[token, details: string] =
   ## A token may carry a parenthesised ScriptErrorString, as in Core's
   ## "mempool-script-verify-flag-failed (<text>)" (validation.cpp:2120); the
   ## text has spaces, so such a token ends at the "), " after its " (".
+  ##
+  ## Core's CheckFeeRate tokens are several words ("min relay fee not met",
+  ## "mempool min fee not met", validation.cpp:705/709) and carry a
+  ## "<fee> < <required>" debug string, so they are matched by name.
+  for feeToken in ["min relay fee not met", "mempool min fee not met"]:
+    if error.startsWith(feeToken & ", "):
+      return (feeToken, error)
   let paren = error.find(" (")
   if paren > 0 and ' ' notin error[0 ..< paren]:
     let close = error.find("), ", paren)

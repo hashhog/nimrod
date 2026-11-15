@@ -2527,7 +2527,9 @@ suite "Reject-reason token parity (Core bare tokens)":
     let tx = makeSpendTx(coinbaseTxid, 0, 4_999_999_999)
     let r = mp.acceptTransaction(tx, crypto)
     check not r.isOk
-    check r.error == "min relay fee not met"
+    # Core state.ToString(): token + CheckFeeRate's "%d < %d" debug string
+    # (validation.cpp:709-710); the 1-sat fee is the left-hand number.
+    check r.error.startsWith("min relay fee not met, 1 < ")
     cs.close()
 
 when isMainModule:
