@@ -9986,7 +9986,7 @@ proc handleGetNewAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Reference: Bitcoin Core wallet/rpc/addresses.cpp getnewaddress
   ##
   ## Arguments:
-  ## 1. label (string, optional) - Account label (ignored for now)
+  ## 1. label (string, optional, default "") - Address-book label
   ## 2. address_type (string, optional) - Address type: "legacy", "p2sh-segwit", "bech32", "bech32m"
   ##
   ## Returns: New address string
@@ -10008,10 +10008,14 @@ proc handleGetNewAddress(rpc: RpcServer, params: JsonNode): JsonNode =
 
   try:
     let addrStr = w.getNewAddressByTypeName(addressType)
+    # Core records every new receive address in the address book, with the
+    # given label or "" (wallet/rpc/addresses.cpp:51 LabelFromValue;
+    # wallet/wallet.cpp GetNewDestination -> SetAddressBook(.., RECEIVE)).
+    # An empty label is still an address-book entry: getaddressinfo lists it.
+    var label = ""
     if params.len >= 1 and params[0].kind == JString:
-      let label = params[0].getStr()
-      if label.len > 0:
-        w.labels[addrStr] = label
+      label = params[0].getStr()
+    w.labels[addrStr] = label
     # Persist the keypool advance immediately so a crash can't reissue this
     # address (gap-limit safety). DATA-LOSS FIX wa0fq5wtk.
     rpc.persistTargetWallet()
@@ -11780,8 +11784,10 @@ proc handleGetAddressInfo*(rpc: RpcServer, params: JsonNode): JsonNode =
   result["ischange"] = %(keyOpt.isSome and keyOpt.get().path.contains("/1/"))
   if watched and watchEntry.timestamp > 0:
     result["timestamp"] = %watchEntry.timestamp
+  # Core: one entry, the address-book label, when the address has an
+  # address-book entry, even if that label is "" (addresses.cpp:504-507).
   var labels = newJArray()
-  if addrStr in w.labels and w.labels[addrStr].len > 0:
+  if addrStr in w.labels:
     labels.add(%w.labels[addrStr])
   result["labels"] = labels
 

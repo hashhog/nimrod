@@ -133,6 +133,7 @@ const IncludedTests = [
   "test_gbt_sigops",
   "test_gcs",
   "test_genesis_sync_relay",
+  "test_getaddressinfo_empty_label",
   "test_getblockfrompeer",
   "test_getblockhash_height_range",
   "test_getblock_verbosity_forms",
