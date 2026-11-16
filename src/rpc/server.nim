@@ -9792,6 +9792,19 @@ proc raiseWalletSpendError(msg: string) {.noReturn.} =
 # Wallet Management RPCs
 # ============================================================================
 
+proc pushWarnings*(obj: JsonNode, warnings: seq[string]) =
+  ## Core's PushWarnings (rpc/util.cpp:1393-1403): add a "warnings" string
+  ## array only when there is at least one warning; otherwise add nothing.
+  ## createwallet / loadwallet / unloadwallet / restorewallet all use it
+  ## (wallet/rpc/wallet.cpp:271, 427, 482; wallet/rpc/backup.cpp:658).
+  ## Core v31 has no singular "warning" field.
+  if warnings.len == 0:
+    return
+  var warr = newJArray()
+  for wmsg in warnings:
+    warr.add(%wmsg)
+  obj["warnings"] = warr
+
 proc handleCreateWallet(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Create a new wallet
   ## Reference: Bitcoin Core wallet/rpc/wallet.cpp createwallet
@@ -9805,7 +9818,7 @@ proc handleCreateWallet(rpc: RpcServer, params: JsonNode): JsonNode =
   ## 6. descriptors (bool, optional, default=true) - Create descriptor wallet
   ## 7. load_on_startup (bool, optional) - Add to auto-load list
   ##
-  ## Returns: { "name": wallet_name, "warning": "" }
+  ## Returns: { "name": wallet_name, "warnings"?: [..] } (warnings only if any)
 
   if rpc.walletManager == nil:
     raise newRpcError(RpcMiscError, "wallet functionality not enabled")
@@ -9852,17 +9865,8 @@ proc handleCreateWallet(rpc: RpcServer, params: JsonNode): JsonNode =
 
   try:
     let (lw, warnings) = rpc.walletManager.createWallet(walletName, options)
-    var resp = %*{
-      "name": lw.name,
-      "warning": if warnings.len > 0: warnings.join("; ") else: ""
-    }
-    # Core shape: optional "warnings" string array (wallet.cpp:425-427).
-    # The joined "warning" string above is kept for backward compatibility.
-    if warnings.len > 0:
-      var warr = newJArray()
-      for wmsg in warnings:
-        warr.add(%wmsg)
-      resp["warnings"] = warr
+    var resp = %*{"name": lw.name}
+    resp.pushWarnings(warnings)  # wallet.cpp:425-427
     return resp
   except WalletManagerError as e:
     raiseWalletMgrRpc(e)
@@ -9877,7 +9881,7 @@ proc handleLoadWallet(rpc: RpcServer, params: JsonNode): JsonNode =
   ## 1. filename (string, required) - Wallet name or path
   ## 2. load_on_startup (bool, optional) - Add to auto-load list
   ##
-  ## Returns: { "name": wallet_name, "warning": "" }
+  ## Returns: { "name": wallet_name, "warnings"?: [..] } (warnings only if any)
 
   if rpc.walletManager == nil:
     raise newRpcError(RpcMiscError, "wallet functionality not enabled")
@@ -9893,11 +9897,9 @@ proc handleLoadWallet(rpc: RpcServer, params: JsonNode): JsonNode =
 
   try:
     let (lw, warnings) = rpc.walletManager.loadWallet(filename, loadOnStartup)
-    var result = %*{
-      "name": lw.name,
-      "warning": if warnings.len > 0: warnings.join("; ") else: ""
-    }
-    result
+    var resp = %*{"name": lw.name}
+    resp.pushWarnings(warnings)  # wallet.cpp:269-271
+    resp
   except WalletManagerError as e:
     raiseWalletMgrRpc(e)
   except CatchableError as e:
@@ -9911,7 +9913,7 @@ proc handleUnloadWallet(rpc: RpcServer, params: JsonNode): JsonNode =
   ## 1. wallet_name (string, optional) - Wallet name (defaults to current wallet)
   ## 2. load_on_startup (bool, optional) - Update auto-load setting
   ##
-  ## Returns: { "warning": "" }
+  ## Returns: {} or { "warnings": [..] } (warnings only if any)
 
   if rpc.walletManager == nil:
     raise newRpcError(RpcMiscError, "wallet functionality not enabled")
@@ -9939,9 +9941,9 @@ proc handleUnloadWallet(rpc: RpcServer, params: JsonNode): JsonNode =
 
   try:
     let warnings = rpc.walletManager.unloadWallet(walletName, loadOnStartup)
-    %*{
-      "warning": if warnings.len > 0: warnings.join("; ") else: ""
-    }
+    var resp = newJObject()
+    resp.pushWarnings(warnings)  # wallet.cpp:480-482
+    resp
   except WalletManagerError as e:
     raiseWalletMgrRpc(e)
   except CatchableError as e:
@@ -10851,11 +10853,7 @@ proc handleRestoreWallet(rpc: RpcServer, params: JsonNode): JsonNode =
     let (lw, warnings) = rpc.walletManager.restoreWalletFromBackup(
       params[0].getStr(), params[1].getStr(), loadOnStartup)
     var resp = %*{"name": lw.name}
-    if warnings.len > 0:
-      var warr = newJArray()
-      for wmsg in warnings:
-        warr.add(%wmsg)
-      resp["warnings"] = warr
+    resp.pushWarnings(warnings)
     return resp
   except WalletManagerError as e:
     raiseWalletMgrRpc(e)

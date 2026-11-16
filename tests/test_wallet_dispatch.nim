@@ -86,7 +86,9 @@ suite "wallet management RPC dispatch (createwallet/loadwallet/unloadwallet/list
     check resp.kind == JObject
     check resp.hasKey("name")
     check resp["name"].getStr() == "smoke_w1"
-    check resp.hasKey("warning")
+    # Core PushWarnings: no "warning" field, and "warnings" only when non-empty.
+    check not resp.hasKey("warning")
+    check not resp.hasKey("warnings")
 
     # listwallets should now reflect the new wallet
     let lw = rpc.handleMethod("listwallets", newJArray())
@@ -105,7 +107,9 @@ suite "wallet management RPC dispatch (createwallet/loadwallet/unloadwallet/list
     pUnload.add(%"smoke_w2")
     let resp = rpc.handleMethod("unloadwallet", pUnload)
     check resp.kind == JObject
-    check resp.hasKey("warning")
+    # Core PushWarnings: no "warning" field, and "warnings" only when non-empty.
+    check not resp.hasKey("warning")
+    check not resp.hasKey("warnings")
 
     # Should be gone now
     let lw = rpc.handleMethod("listwallets", newJArray())
@@ -129,7 +133,9 @@ suite "wallet management RPC dispatch (createwallet/loadwallet/unloadwallet/list
     check resp.kind == JObject
     check resp.hasKey("name")
     check resp["name"].getStr() == "smoke_w3"
-    check resp.hasKey("warning")
+    # Core PushWarnings: no "warning" field, and "warnings" only when non-empty.
+    check not resp.hasKey("warning")
+    check not resp.hasKey("warnings")
 
   test "all 5 methods are NOT routed to method-not-found":
     ## Regression guard: if someone deletes the dispatch entries again, this
