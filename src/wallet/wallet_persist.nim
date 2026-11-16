@@ -258,9 +258,10 @@ proc applySnapshot(wallet: var Wallet, snap: DecodedSnapshot) =
   wallet.lastSyncedHeight = snap.lastSyncedHeight
   for u in snap.utxos:
     wallet.utxos[u.outpoint] = u
+  # An empty label is an address-book entry too (getnewaddress with no
+  # label), so it must survive a reload; Core keeps "" in the address book.
   for (address, label) in snap.labels:
-    if label.len > 0:
-      wallet.labels[address] = label
+    wallet.labels[address] = label
   for c in snap.accountCursors:
     var found = false
     for ai in 0 ..< wallet.accounts.len:
