@@ -9783,9 +9783,16 @@ proc solvingDescriptor(key: DerivedKey): string =
 
 proc raiseWalletSpendError(msg: string) {.noReturn.} =
   ## Map coin-selection failures onto Core's spend-family codes.
+  ## When selection cannot reach the target Core reports the bare, general
+  ## "Insufficient funds" (wallet/spend.cpp:1214-1234 CreateTransactionInternal:
+  ## an empty SelectCoins error means "Insufficient funds"), whether the wallet
+  ## has too little or no spendable coin at all, and sendtoaddress/sendmany
+  ## raise it as RPC_WALLET_INSUFFICIENT_FUNDS (wallet/rpc/spend.cpp:187).
+  ## The internal selector texts ("insufficient funds", "no spendable UTXOs")
+  ## are not what an RPC client sees.
   let low = msg.toLowerAscii()
   if "insufficient" in low or "no spendable" in low:
-    raise newRpcError(RpcWalletInsufficientFunds, msg)
+    raise newRpcError(RpcWalletInsufficientFunds, "Insufficient funds")
   raise newRpcError(RpcWalletError, msg)
 
 # ============================================================================
@@ -10584,12 +10591,15 @@ proc handleSendToAddress(rpc: RpcServer, params: JsonNode): JsonNode =
   let replaceable = if params.len >= 6 and params[5].kind == JBool: params[5].getBool() else: true
   let confTarget = if params.len >= 7: params[6].getInt() else: 6
 
-  # Validate and decode address
+  # Validate and decode address. Core decodes the destination in ParseOutputs
+  # (rpc/rawtransaction_util.cpp:117-122) after AmountFromValue, and names the
+  # rejected string: "Invalid Bitcoin address: <address>" (-5). The decoder's
+  # own reason (checksum, HRP, ...) is not part of Core's message.
   var destAddr: Address
   try:
     destAddr = decodeAddress(addressStr)
-  except AddressError as e:
-    raise newRpcError(RpcInvalidAddressOrKey, "invalid address: " & e.msg)
+  except AddressError:
+    raise newRpcError(RpcInvalidAddressOrKey, "Invalid Bitcoin address: " & addressStr)
 
   # Check if wallet is locked
   if w.isEncrypted and w.isLocked:

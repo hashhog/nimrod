@@ -236,6 +236,7 @@ const IncludedTests = [
   "test_script_vectors",
   "test_self_advertise",
   "test_send_stall_no_wedge",
+  "test_sendtoaddress_error_text",
   "test_sequence_lock",
   "test_serialize",
   "test_serving",
