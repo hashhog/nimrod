@@ -345,6 +345,7 @@ const IncludedTests = [
   "test_wallet_fallbackfee",
   "test_wallet_persist",
   "test_wallet_phase2_segwitv0",
+  "test_wallet_warnings_field",
   "test_walletprocesspsbt",
   "test_weight_vsize",
   "test_witness_cleanstack",
