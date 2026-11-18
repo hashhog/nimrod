@@ -1161,6 +1161,24 @@ proc activeChainHeaderAtHeight(state: NodeState, height: int32): Option[BlockHea
       return some(blkOpt.get().header)
   none(BlockHeader)
 
+proc limitedGetDataAction(state: NodeState,
+                          hash: array[32, byte]): LimitedBlockRequest =
+  ## Core ProcessGetBlockData's NODE_NETWORK_LIMITED gate
+  ## (net_processing.cpp:2383-2391), run for every block inv type before
+  ## anything is sent. Only an ACTIVE-chain block more than 288 + 2 below the
+  ## tip disconnects; a side block there is refused without a disconnect
+  ## (Core BlockRequestAllowed ignores it); tip-289 / tip-290 fall through
+  ## and are served when the body is on disk (Core BLOCK_HAVE_DATA).
+  if servesFullHistory() or state.chainState == nil:
+    return lbrAllow
+  let idxOpt = state.chainState.db.getBlockIndex(BlockHash(hash))
+  if idxOpt.isNone:
+    return lbrAllow
+  let h = idxOpt.get().height
+  let active = state.chainState.db.getBlockHashByHeight(h)
+  limitedBlockRequestAction(false, state.chainState.bestHeight, h,
+    active.isSome and array[32, byte](active.get()) == hash)
+
 proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
   ## Handle incoming P2P messages
   case msg.kind
@@ -1393,41 +1411,30 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
     # are aggregated into a single NOTFOUND so the peer can move on instead
     # of timing out.
     #
-    # BIP-159 peer-served-blocks gate: when prune mode is on, refuse to
-    # serve blocks below tip - MIN_BLOCKS_TO_KEEP (288).  Mirrors Core's
-    # net_processing.cpp short-circuit; emits notfound rather than reading
-    # a possibly-deleted block file.
-    # Uses params.MinBlocksToKeep (imported at the top of this module).
-    # This was a THIRD function-local copy of the same 288 that nobody
-    # updating the pruning margin would have thought to look for.
-    # Same gate for a snapshot-bootstrapped datadir: without NODE_NETWORK we
-    # advertised only the recent window (Core net_processing.cpp:2383-2388
-    # applies it to every NODE_NETWORK_LIMITED-only node, pruned or not).
-    let pruneActive = not servesFullHistory()
-    var pruneHorizon: int32 = -1
-    if pruneActive and state.chainState != nil and
-        state.chainState.bestHeight > MinBlocksToKeep:
-      pruneHorizon = state.chainState.bestHeight - MinBlocksToKeep
+    # NODE_NETWORK_LIMITED gate (BIP-159): see limitedGetDataAction. Applies
+    # to every node that advertises without NODE_NETWORK (pruned or a
+    # snapshot-bootstrapped datadir), for MSG_BLOCK, MSG_WITNESS_BLOCK and
+    # MSG_CMPCTBLOCK alike.
     var notFound: seq[InvVector] = @[]
     var servedBlocks = 0
     var servedTxs = 0
     for item in msg.getData:
+      if item.invType == invBlock or item.invType == invWitnessBlock or
+          item.invType == invCmpctBlock:
+        case limitedGetDataAction(state, item.hash)
+        of lbrDisconnect:
+          # Core: fDisconnect, no reply (not notfound).
+          info "getdata below NODE_NETWORK_LIMITED window; disconnecting",
+            peer = $peer
+          await peer.disconnect("getdata below limited window")
+          return
+        of lbrRefuse:
+          # Side block below the window: Core ignores it, no disconnect.
+          notFound.add(item)
+          continue
+        of lbrAllow:
+          discard  # tip-289/tip-290 race buffer: served when the body exists
       if item.invType == invBlock or item.invType == invWitnessBlock:
-        if pruneHorizon >= 0:
-          let idxOpt = state.chainState.db.getBlockIndex(BlockHash(item.hash))
-          if idxOpt.isSome and shouldDisconnectForLimitedBlockRequest(
-              servesFullHistory(), state.chainState.bestHeight,
-              idxOpt.get().height):
-            # Core: fDisconnect, no reply (not notfound).
-            info "getdata below NODE_NETWORK_LIMITED window; disconnecting",
-              peer = $peer, height = idxOpt.get().height
-            await peer.disconnect("getdata below limited window")
-            return
-          if idxOpt.isSome and idxOpt.get().height < pruneHorizon:
-            # Inside the +2 race buffer but below the keep floor: block may
-            # be gone; Core silently skips (no data), we answer notfound.
-            notFound.add(item)
-            continue
         let blockOpt = state.chainState.db.getBlock(BlockHash(item.hash))
         if blockOpt.isSome:
           var blkMsg = newBlockMsg(blockOpt.get())

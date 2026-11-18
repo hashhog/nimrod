@@ -841,6 +841,31 @@ proc shouldDisconnectForLimitedBlockRequest*(servesFull: bool, tipHeight,
   ## NoBan exemption has no equivalent here.)
   not servesFull and tipHeight - blockHeight > NodeNetworkLimitedMinBlocks + 2
 
+type LimitedBlockRequest* = enum
+  lbrAllow       ## inside the window (or full history): serve if body stored
+  lbrDisconnect  ## active-chain block below the window: disconnect, no reply
+  lbrRefuse      ## side block below the window: no disconnect, never served
+
+proc limitedBlockRequestAction*(servesFull: bool, tipHeight, blockHeight: int32,
+                                onActiveChain: bool): LimitedBlockRequest =
+  ## Core ProcessGetBlockData order for a block getdata (MSG_BLOCK,
+  ## MSG_WITNESS_BLOCK and MSG_CMPCTBLOCK alike, before compact-vs-full):
+  ##   1. BlockRequestAllowed: a block not in the active chain (and past the
+  ##      stale-relay limit) is ignored -- no disconnect.
+  ##   2. the NODE_NETWORK_LIMITED window: active-chain block more than
+  ##      MIN_BLOCKS + 2 below tip -> disconnect.
+  ##   3. otherwise send if BLOCK_HAVE_DATA, so tip-289 / tip-290 (the race
+  ##      buffer) are still served when the body is on disk.
+  ## A side block below the window is never served here: Core either ignores
+  ## it (stale) or disconnects (recent); nimrod keeps the peer and answers
+  ## notfound.
+  if not shouldDisconnectForLimitedBlockRequest(servesFull, tipHeight, blockHeight):
+    lbrAllow
+  elif onActiveChain:
+    lbrDisconnect
+  else:
+    lbrRefuse
+
 # BIP-157 NODE_COMPACT_FILTERS advertisement gate.  W121 G15 / FIX-71.
 # Set from `nimrod.nim` at daemon startup, computed as
 # `config.peerblockfilters and config.blockfilterindex`.  When true,
