@@ -826,6 +826,21 @@ proc servesFullHistory*(): bool =
   ## True when NODE_NETWORK is advertised: all bodies from height 1 are kept.
   fullHistoryAdvertise and not pruneModeAdvertise
 
+# Core net_processing.cpp NODE_NETWORK_LIMITED_MIN_BLOCKS: the recent window a
+# limited-only node promises to serve.
+const NodeNetworkLimitedMinBlocks* = 288'i32
+
+proc shouldDisconnectForLimitedBlockRequest*(servesFull: bool, tipHeight,
+                                             blockHeight: int32): bool =
+  ## Core ProcessGetBlockData (net_processing.cpp:2383-2391): a node that
+  ## advertises NODE_NETWORK_LIMITED without NODE_NETWORK DISCONNECTS a peer
+  ## that requests a block more than MIN_BLOCKS + 2 (race buffer) below the
+  ## tip, instead of answering notfound -- so the peer cannot probe the prune
+  ## height and does not wait on a block we will never send. A full-history
+  ## node never does this. (nimrod has no NoBan permission flag, so the
+  ## NoBan exemption has no equivalent here.)
+  not servesFull and tipHeight - blockHeight > NodeNetworkLimitedMinBlocks + 2
+
 # BIP-157 NODE_COMPACT_FILTERS advertisement gate.  W121 G15 / FIX-71.
 # Set from `nimrod.nim` at daemon startup, computed as
 # `config.peerblockfilters and config.blockfilterindex`.  When true,

@@ -1415,7 +1415,17 @@ proc handleMessage(state: NodeState, peer: Peer, msg: P2PMessage) {.async.} =
       if item.invType == invBlock or item.invType == invWitnessBlock:
         if pruneHorizon >= 0:
           let idxOpt = state.chainState.db.getBlockIndex(BlockHash(item.hash))
+          if idxOpt.isSome and shouldDisconnectForLimitedBlockRequest(
+              servesFullHistory(), state.chainState.bestHeight,
+              idxOpt.get().height):
+            # Core: fDisconnect, no reply (not notfound).
+            info "getdata below NODE_NETWORK_LIMITED window; disconnecting",
+              peer = $peer, height = idxOpt.get().height
+            await peer.disconnect("getdata below limited window")
+            return
           if idxOpt.isSome and idxOpt.get().height < pruneHorizon:
+            # Inside the +2 race buffer but below the keep floor: block may
+            # be gone; Core silently skips (no data), we answer notfound.
             notFound.add(item)
             continue
         let blockOpt = state.chainState.db.getBlock(BlockHash(item.hash))
