@@ -826,6 +826,46 @@ proc servesFullHistory*(): bool =
   ## True when NODE_NETWORK is advertised: all bodies from height 1 are kept.
   fullHistoryAdvertise and not pruneModeAdvertise
 
+# Core net_processing.cpp NODE_NETWORK_LIMITED_MIN_BLOCKS: the recent window a
+# limited-only node promises to serve.
+const NodeNetworkLimitedMinBlocks* = 288'i32
+
+proc shouldDisconnectForLimitedBlockRequest*(servesFull: bool, tipHeight,
+                                             blockHeight: int32): bool =
+  ## Core ProcessGetBlockData (net_processing.cpp:2383-2391): a node that
+  ## advertises NODE_NETWORK_LIMITED without NODE_NETWORK DISCONNECTS a peer
+  ## that requests a block more than MIN_BLOCKS + 2 (race buffer) below the
+  ## tip, instead of answering notfound -- so the peer cannot probe the prune
+  ## height and does not wait on a block we will never send. A full-history
+  ## node never does this. (nimrod has no NoBan permission flag, so the
+  ## NoBan exemption has no equivalent here.)
+  not servesFull and tipHeight - blockHeight > NodeNetworkLimitedMinBlocks + 2
+
+type LimitedBlockRequest* = enum
+  lbrAllow       ## inside the window (or full history): serve if body stored
+  lbrDisconnect  ## active-chain block below the window: disconnect, no reply
+  lbrRefuse      ## side block below the window: no disconnect, never served
+
+proc limitedBlockRequestAction*(servesFull: bool, tipHeight, blockHeight: int32,
+                                onActiveChain: bool): LimitedBlockRequest =
+  ## Core ProcessGetBlockData order for a block getdata (MSG_BLOCK,
+  ## MSG_WITNESS_BLOCK and MSG_CMPCTBLOCK alike, before compact-vs-full):
+  ##   1. BlockRequestAllowed: a block not in the active chain (and past the
+  ##      stale-relay limit) is ignored -- no disconnect.
+  ##   2. the NODE_NETWORK_LIMITED window: active-chain block more than
+  ##      MIN_BLOCKS + 2 below tip -> disconnect.
+  ##   3. otherwise send if BLOCK_HAVE_DATA, so tip-289 / tip-290 (the race
+  ##      buffer) are still served when the body is on disk.
+  ## A side block below the window is never served here: Core either ignores
+  ## it (stale) or disconnects (recent); nimrod keeps the peer and answers
+  ## notfound.
+  if not shouldDisconnectForLimitedBlockRequest(servesFull, tipHeight, blockHeight):
+    lbrAllow
+  elif onActiveChain:
+    lbrDisconnect
+  else:
+    lbrRefuse
+
 # BIP-157 NODE_COMPACT_FILTERS advertisement gate.  W121 G15 / FIX-71.
 # Set from `nimrod.nim` at daemon startup, computed as
 # `config.peerblockfilters and config.blockfilterindex`.  When true,

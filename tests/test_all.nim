@@ -210,6 +210,8 @@ const IncludedTests = [
   "test_proof_pin_closure",
   "test_proxy",
   "test_pruner",
+  "test_pruned_getdata_disconnect",
+  "test_pruned_getdata_handler",
   "test_pruned_history",
   "test_psbt",
   "test_psbt_convert_join",
