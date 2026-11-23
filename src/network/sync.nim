@@ -4110,6 +4110,26 @@ proc processBlock*(sm: SyncManager, peer: Peer, blk: Block): bool =
   sm.fetchRequested.excl(hash)
   sm.noteBlockDelivered(hash, peer)
 
+  # Core ProcessMessage("block"): IsBlockMutated -> Misbehaving("mutated
+  # block") + RemoveBlockRequest, and the body never reaches ProcessNewBlock.
+  # The no-coinbase / 64-byte-transaction clause is checked here, before any
+  # arm (hole fill, side branch, buffer, connect) can store the forged body
+  # under the real block's hash or turn its bad-cb-missing into a verdict on
+  # that hash. The other IsBlockMutated clauses run in each arm
+  # (bodyMatchesCommitments / confirmVerdict).
+  # RemoveBlockRequest(hash, from_peer) releases only a request made to the
+  # SENDER: a forged copy from another peer must not cancel an honest
+  # download still in flight (same rule as the out-of-order arm below).
+  if isNoCoinbase64ByteMutated(blk):
+    if wasRequested:
+      if inFlightOwner != nil and peer != nil and inFlightOwner != peer:
+        sm.requestedHashes.incl(hash)
+      else:
+        sm.pendingBlocks = max(0, sm.pendingBlocks - 1)
+    sm.punishForBlock(peer, bfkMutated,
+      "mutated block: no coinbase and a 64-byte transaction")
+    return false
+
   # BLOCK_CACHED_INVALID: a body for a block already marked failed is not
   # validated again (Core AcceptBlockHeader "duplicate-invalid" ->
   # MaybePunishNodeForBlock: outbound discouraged, inbound not).
