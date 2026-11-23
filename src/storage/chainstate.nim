@@ -4198,8 +4198,17 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     # coinbase claims more than subsidy+fees would inflate the money supply.
     # nFees = sum over non-coinbase txs of (sum(spent input values) -
     # sum(output values)); mirrors CheckTxInputs' per-tx txfee accumulation.
-    var blockInputValue: int64 = 0
-    var blockOutputValueNonCoinbase: int64 = 0
+    #
+    # The fee is accumulated PER TX, with Core's CheckTxInputs value checks
+    # (consensus/tx_verify.cpp:164-211) and ConnectBlock's accumulated-fee
+    # MoneyRange check (validation.cpp:2543-2547) applied to each tx before it
+    # is counted. An aggregate-only sum let one tx's negative fee be absorbed
+    # by the block total: a heavier side branch whose tx spent 1 sat into
+    # 1 BTC, with a coinbase paying less than the subsidy, passed the ceiling
+    # below and was reorged onto where Core rejects "bad-txns-in-belowout".
+    # All sums are int64 and each term is range-checked against MAX_MONEY
+    # before it is added, so no accumulator can overflow.
+    var blockFees: int64 = 0
 
     # Process each transaction.
     for txIdx, tx in blk.txs:
@@ -4207,6 +4216,7 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
 
       # Spend inputs (skip coinbase).
       if txIdx > 0:
+        var txValueIn: int64 = 0
         for input in tx.inputs:
           let utxoOpt = cs.getUtxo(input.prevOut)
           if utxoOpt.isNone:
@@ -4227,7 +4237,17 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
                          $newHeight & ", coinbase height " & $entry.height &
                          ", age " & $age & " < " & $cs.params.coinbaseMaturity)
 
-          blockInputValue += int64(entry.output.value)
+          # Core CheckTxInputs: each spent coin's value and the running
+          # input total must stay in MoneyRange
+          # ("bad-txns-inputvalues-outofrange").
+          let coinValue = int64(entry.output.value)
+          if coinValue < 0 or coinValue > int64(MaxMoney) or
+             txValueIn > int64(MaxMoney) - coinValue:
+            rollbackInMemory()
+            return err("bad-txns-inputvalues-outofrange: input values out " &
+                       "of range during reorg at height " & $newHeight &
+                       " in tx " & $txId)
+          txValueIn += coinValue
 
           let key = utxoKey(array[32, byte](input.prevOut.txid), input.prevOut.vout)
           batch.delete(cfUtxo, key)
@@ -4235,9 +4255,41 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
           cs.reorgDeletedUtxos[][outpointKey(input.prevOut)] = true
 
         # Sum ALL outputs of this non-coinbase tx (spendable or not — Core's
-        # GetValueOut counts every output) for the block-fee computation.
+        # GetValueOut counts every output). CheckBlock at store time already
+        # bounds each output and the total by MAX_MONEY; re-checked here so
+        # the subtraction below can never wrap.
+        var txValueOut: int64 = 0
         for output in tx.outputs:
-          blockOutputValueNonCoinbase += int64(output.value)
+          let v = int64(output.value)
+          if v < 0 or v > int64(MaxMoney) or txValueOut > int64(MaxMoney) - v:
+            rollbackInMemory()
+            return err("bad-txns-txouttotal-toolarge: output total out of " &
+                       "range during reorg at height " & $newHeight &
+                       " in tx " & $txId)
+          txValueOut += v
+
+        # Core CheckTxInputs: value_in < value_out -> "bad-txns-in-belowout".
+        if txValueIn < txValueOut:
+          rollbackInMemory()
+          return err("bad-txns-in-belowout: value in (" & $txValueIn &
+                     ") < value out (" & $txValueOut & ") during reorg at " &
+                     "height " & $newHeight & " in tx " & $txId)
+        # Core CheckTxInputs: txfee must be in MoneyRange
+        # ("bad-txns-fee-outofrange"); unreachable once both sides are in
+        # range and in >= out, kept for parity.
+        let txFee = txValueIn - txValueOut
+        if txFee > int64(MaxMoney):
+          rollbackInMemory()
+          return err("bad-txns-fee-outofrange: fee out of range during " &
+                     "reorg at height " & $newHeight & " in tx " & $txId)
+        # Core ConnectBlock: nFees += txfee; !MoneyRange(nFees) ->
+        # "bad-txns-accumulated-fee-outofrange".
+        if blockFees > int64(MaxMoney) - txFee:
+          rollbackInMemory()
+          return err("bad-txns-accumulated-fee-outofrange: accumulated fee " &
+                     "in the block out of range during reorg at height " &
+                     $newHeight)
+        blockFees += txFee
 
       # Create outputs.
       for voutIdx, output in tx.outputs:
@@ -4266,7 +4318,6 @@ proc handleReorg*(cs: var ChainState, forkPoint: BlockHash, newChain: seq[Block]
     # Enforced here on EVERY reorg-promoted block (this loop is nimrod's
     # ConnectBlock equivalent); without it a heavier side branch could claim a
     # coinbase larger than subsidy+fees and inflate the money supply.
-    let blockFees = blockInputValue - blockOutputValueNonCoinbase
     let subsidy = int64(getBlockSubsidy(int(newHeight), cs.params))
     let blockReward = subsidy + blockFees
     var coinbaseValueOut: int64 = 0
