@@ -817,6 +817,41 @@ proc getMtpForBlockIndex*(utxos: ChainDb, prevIndex: BlockIndex): uint32 =
     cur = parentOpt.get()
   getMedianTimePast(headers)
 
+proc getAncestorIndex*(utxos: ChainDb, start: BlockIndex,
+                       targetHeight: int32): Option[BlockIndex] =
+  ## The ancestor of `start` at `targetHeight` on `start`'s OWN chain — Core's
+  ## CBlockIndex::GetAncestor (chain.cpp), which follows pprev/pskip and never
+  ## consults the active chain.
+  ##
+  ## Walks hash-linked parents (header.prevBlock).  As soon as the walk reaches a
+  ## block that owns its own active-chain height slot, every lower ancestor is an
+  ## active-chain block, so the height index answers directly — this bounds the
+  ## walk to the branch segment above the fork point (a reorg depth, not a chain
+  ## height) when a deep coin is spent.  A jump target whose height disagrees is
+  ## treated as missing.  none() if `targetHeight` is above `start` or negative,
+  ## or if an ancestor row is missing (caller decides how to fail).
+  if targetHeight < 0 or targetHeight > start.height:
+    return none(BlockIndex)
+  var cur = start
+  while cur.height > targetHeight:
+    let slot = utxos.getBlockHashByHeight(cur.height)
+    if slot.isSome and slot.get() == cur.hash:
+      let targetSlot = utxos.getBlockHashByHeight(targetHeight)
+      if targetSlot.isNone:
+        return none(BlockIndex)
+      let jumped = utxos.getBlockIndex(targetSlot.get())
+      if jumped.isNone or jumped.get().height != targetHeight:
+        return none(BlockIndex)
+      return jumped
+    let parentOpt = utxos.getBlockIndex(cur.header.prevBlock)
+    if parentOpt.isNone:
+      return none(BlockIndex)
+    let parent = parentOpt.get()
+    if parent.height != cur.height - 1:
+      return none(BlockIndex)
+    cur = parent
+  some(cur)
+
 # ============================================================================
 # Per-block script verification flags — faithful port of Bitcoin Core
 # GetBlockScriptFlags (validation.cpp:2249-2289).
@@ -2637,8 +2672,26 @@ proc reorgConnectChecks*(
     if parentOpt.isSome and parentOpt.get().height >= 0:
       prevBlockMtp = getMtpForBlockIndex(db, parentOpt.get())
 
+    # A time-type BIP-68 lock is measured from the MTP of the coin's block's
+    # parent ON THE BRANCH BEING CONNECTED: Core's CalculateSequenceLocks takes
+    # nCoinTime = block.GetAncestor(max(nCoinHeight-1, 0))->GetMedianTimePast()
+    # (consensus/tx_verify.cpp).  It must NOT go through the height index:
+    # during handleReorg the new branch's height rows are only staged in the
+    # uncommitted WriteBatch, so getMtpForHeight would read the OLD chain's
+    # blocks at those heights (or nothing above the old tip -> MTP 0) and
+    # accept a branch Core rejects bad-txns-nonfinal, or reject a valid one.
+    # Every ancestor at h <= height-1 is an ancestor of the parent.  A missing
+    # ancestor is a local read failure, never a verdict: it fails closed below.
+    var ancestorMissing = false
     proc getMtpAtHeight(h: int32): uint32 =
-      getMtpForHeight(db, h)
+      if parentOpt.isNone:
+        ancestorMissing = true
+        return 0
+      let ancOpt = getAncestorIndex(db, parentOpt.get(), h)
+      if ancOpt.isNone:
+        ancestorMissing = true
+        return 0
+      getMtpForBlockIndex(db, ancOpt.get())
 
     var intraBlockUtxos = initTable[string, UtxoEntry]()
     # Seed the coinbase outputs (created at this height) so an intra-block spend
@@ -2653,6 +2706,8 @@ proc reorgConnectChecks*(
       if bip68VersionActive(tx.version):
         let seqLockResult = checkSequenceLocksForTx(
           tx, utxos, height, prevBlockMtp, getMtpAtHeight, params, intraBlockUtxos)
+        if ancestorMissing:
+          return voidErr(veUtxoReadError)
         if not seqLockResult.isOk:
           return voidErr(seqLockResult.error)
       # Maintain the intra-block UTXO set exactly as validateBlock does: drop
