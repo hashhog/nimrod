@@ -28,7 +28,7 @@
 import unittest2
 import std/[os, options]
 import ../src/consensus/[validation, params]
-import ../src/primitives/types
+import ../src/primitives/[types, serialize]
 import ../src/storage/chainstate
 
 const TestDbPath = "/tmp/nimrod_cffix_reorg_bip68_mtp_test"
@@ -133,6 +133,36 @@ proc runConnect(cs: ChainState, fx: Fixture, coinHeight: int32,
     if op == coinOutpoint: some(coin) else: none(UtxoEntry)
   reorgConnectChecks(blk, height, lookup, cs.db, regtestParams())
 
+proc runConnectIntraBlock(cs: ChainState, fx: Fixture,
+                          lockUnits: uint32): ValidationResult[void] =
+  ## Same block position, but coin D is created IN this block: tx1 (v1) spends
+  ## coin C (at h1, below the fork) into D, tx2 (v2) spends D with a time lock.
+  ## D's coin height is the block's own height, so its coin time is the MTP of
+  ## the block's PARENT on the connecting branch.
+  let height = fx.newTip.height + 1
+  let tx1 = Transaction(
+    version: 1,
+    inputs: @[TxIn(prevOut: coinOutpoint, scriptSig: @[], sequence: 0xffffffff'u32)],
+    outputs: @[TxOut(value: Satoshi(50_000), scriptPubKey: @[0x51'u8])],
+    witnesses: @[], lockTime: 0)
+  let tx2 = Transaction(
+    version: 2,
+    inputs: @[TxIn(prevOut: OutPoint(txid: tx1.txid(), vout: 0), scriptSig: @[],
+                   sequence: SequenceLockTypeFlag or lockUnits)],
+    outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[0x51'u8])],
+    witnesses: @[], lockTime: 0)
+  let blk = Block(
+    header: BlockHeader(version: 4, prevBlock: fx.newTip.hash,
+                        merkleRoot: default(array[32, byte]),
+                        timestamp: fx.newTip.header.timestamp + 1,
+                        bits: 0x207fffff'u32, nonce: 9),
+    txs: @[coinbaseTx(height), tx1, tx2])
+  let coin = UtxoEntry(output: TxOut(value: Satoshi(100_000), scriptPubKey: @[0x51'u8]),
+                       height: 1, isCoinbase: false)
+  let lookup = proc(op: OutPoint): Option[UtxoEntry] {.gcsafe, raises: [].} =
+    if op == coinOutpoint: some(coin) else: none(UtxoEntry)
+  reorgConnectChecks(blk, height, lookup, cs.db, regtestParams())
+
 # Fork-point timestamps shared by every case: MTP(h2) = 2000.
 const Common = [1000'u32, 2000, 5000]
 
@@ -196,6 +226,23 @@ suite "cffix-nimrod-reorg-bip68-mtp: reorg BIP-68 coin MTP comes from the connec
     check getMtpForBlockIndex(cs.db, fx.newByHeight[3]) == 6000'u32
     check getMtpForBlockIndex(cs.db, fx.newTip) == 7000'u32
     let res = runConnect(cs, fx, ForkHeight + 5, 4)
+    check not res.isOk
+    if not res.isOk:
+      check bip22String(res.error) == "bad-txns-nonfinal"
+    cs.close()
+
+  test "intra-block coin above the old tip: coin time is the parent's MTP on the new branch":
+    ## Block at F+5' (h7), parent F+4' (h6) — above the old tip (h5).  Coin D is
+    ## created in the block itself, so Core's coin time = MTP(F+4') = the block
+    ## MTP = 6000.  Any lock of >= 1 unit is then non-final; 0 units is final
+    ## (6000 > 6000 - 1).  Pre-fix the old index has no row at h6 -> coin time
+    ## 0 -> a 1-unit lock reads as final.
+    var cs = newChainState(TestDbPath, regtestParams())
+    let fx = buildFixture(cs, Common, [2001'u32, 2002, 2003],
+                          [6000'u32, 7000, 8000, 9000])
+    check getMtpForHeight(cs.db, ForkHeight + 4) == 0'u32
+    check runConnectIntraBlock(cs, fx, 0).isOk
+    let res = runConnectIntraBlock(cs, fx, 1)
     check not res.isOk
     if not res.isOk:
       check bip22String(res.error) == "bad-txns-nonfinal"
