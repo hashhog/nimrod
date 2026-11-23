@@ -817,40 +817,42 @@ proc getMtpForBlockIndex*(utxos: ChainDb, prevIndex: BlockIndex): uint32 =
     cur = parentOpt.get()
   getMedianTimePast(headers)
 
-proc getAncestorIndex*(utxos: ChainDb, start: BlockIndex,
-                       targetHeight: int32): Option[BlockIndex] =
-  ## The ancestor of `start` at `targetHeight` on `start`'s OWN chain — Core's
-  ## CBlockIndex::GetAncestor (chain.cpp), which follows pprev/pskip and never
-  ## consults the active chain.
+proc extendAncestorPath*(utxos: ChainDb, path: var seq[BlockIndex],
+                         targetHeight: int32): Option[BlockIndex] =
+  ## `path` is a hash-linked ancestor path: path[0] is the start block and
+  ## path[i] is its ancestor at height path[0].height - i.  Extend it by
+  ## following header.prevBlock until it reaches `targetHeight`, and return the
+  ## ancestor there.  Already-walked heights are answered from `path`, so a
+  ## caller resolving several heights below the same start walks each block once.
   ##
-  ## Walks hash-linked parents (header.prevBlock).  As soon as the walk reaches a
-  ## block that owns its own active-chain height slot, every lower ancestor is an
-  ## active-chain block, so the height index answers directly — this bounds the
-  ## walk to the branch segment above the fork point (a reorg depth, not a chain
-  ## height) when a deep coin is spent.  A jump target whose height disagrees is
-  ## treated as missing.  none() if `targetHeight` is above `start` or negative,
-  ## or if an ancestor row is missing (caller decides how to fail).
-  if targetHeight < 0 or targetHeight > start.height:
+  ## Never consults the height->hash index.  That index is not a description of
+  ## `path[0]`'s chain: inside handleReorg the new branch's rows are only staged
+  ## in the uncommitted WriteBatch, and header sync (network/sync.nim) fills
+  ## EMPTY slots with header-only blocks of whatever branch it saw first, so a
+  ## row that names a block on the branch does not imply that the rows below it
+  ## do.  none() if `targetHeight` is above path[0] or negative, or if a parent
+  ## row is missing or has an inconsistent height (caller decides how to fail).
+  if path.len == 0 or targetHeight < 0 or targetHeight > path[0].height:
     return none(BlockIndex)
-  var cur = start
-  while cur.height > targetHeight:
-    let slot = utxos.getBlockHashByHeight(cur.height)
-    if slot.isSome and slot.get() == cur.hash:
-      let targetSlot = utxos.getBlockHashByHeight(targetHeight)
-      if targetSlot.isNone:
-        return none(BlockIndex)
-      let jumped = utxos.getBlockIndex(targetSlot.get())
-      if jumped.isNone or jumped.get().height != targetHeight:
-        return none(BlockIndex)
-      return jumped
+  let want = int(path[0].height - targetHeight)
+  while path.len <= want:
+    let cur = path[^1]
     let parentOpt = utxos.getBlockIndex(cur.header.prevBlock)
     if parentOpt.isNone:
       return none(BlockIndex)
     let parent = parentOpt.get()
     if parent.height != cur.height - 1:
       return none(BlockIndex)
-    cur = parent
-  some(cur)
+    path.add parent
+  some(path[want])
+
+proc getAncestorIndex*(utxos: ChainDb, start: BlockIndex,
+                       targetHeight: int32): Option[BlockIndex] =
+  ## The ancestor of `start` at `targetHeight` on `start`'s OWN chain — Core's
+  ## CBlockIndex::GetAncestor (chain.cpp), which follows pprev/pskip and never
+  ## consults the active chain.  Pure hash-linked walk; see extendAncestorPath.
+  var path = @[start]
+  extendAncestorPath(utxos, path, targetHeight)
 
 # ============================================================================
 # Per-block script verification flags — faithful port of Bitcoin Core
@@ -2682,12 +2684,16 @@ proc reorgConnectChecks*(
     # accept a branch Core rejects bad-txns-nonfinal, or reject a valid one.
     # Every ancestor at h <= height-1 is an ancestor of the parent.  A missing
     # ancestor is a local read failure, never a verdict: it fails closed below.
+    # The walked path from the parent is shared by every input of the block.
     var ancestorMissing = false
+    var ancestorPath: seq[BlockIndex] = @[]
+    if parentOpt.isSome:
+      ancestorPath.add parentOpt.get()
     proc getMtpAtHeight(h: int32): uint32 =
-      if parentOpt.isNone:
+      if ancestorPath.len == 0:
         ancestorMissing = true
         return 0
-      let ancOpt = getAncestorIndex(db, parentOpt.get(), h)
+      let ancOpt = extendAncestorPath(db, ancestorPath, h)
       if ancOpt.isNone:
         ancestorMissing = true
         return 0

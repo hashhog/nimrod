@@ -63,9 +63,12 @@ type Fixture = object
   newTip: BlockIndex       ## highest stored new-branch block (parent of the block under test)
   newByHeight: seq[BlockIndex]
 
-proc buildFixture(cs: ChainState, common, old, new: openArray[uint32]): Fixture =
+proc buildFixture(cs: ChainState, common, old, new: openArray[uint32],
+                  newRowsAbove: int32 = high(int32)): Fixture =
   ## common -> heights 0..F (height rows), old -> F+1.. (height rows),
-  ## new -> F+1'.. (hash-only).  Returns the new branch.
+  ## new -> F+1'.. (hash-only).  New-branch blocks ABOVE `newRowsAbove` also
+  ## get a height row, the way header sync (network/sync.nim) fills EMPTY slots
+  ## with header-only blocks.  Returns the new branch.
   doAssert common.len == int(ForkHeight) + 1
   var prev = BlockHash(default(array[32, byte]))
   var forkIdx: BlockIndex
@@ -83,7 +86,10 @@ proc buildFixture(cs: ChainState, common, old, new: openArray[uint32]): Fixture 
   prev = forkIdx.hash
   for i, ts in new:
     let idx = mkIdx(NewTag, ForkHeight + 1 + int32(i), prev, ts)
-    cs.db.putBlockIndexHashOnly(idx)
+    if idx.height > newRowsAbove:
+      cs.db.putBlockIndex(idx)
+    else:
+      cs.db.putBlockIndexHashOnly(idx)
     prev = idx.hash
     result.newByHeight.add idx
   result.newTip = result.newByHeight[^1]
@@ -248,6 +254,30 @@ suite "cffix-nimrod-reorg-bip68-mtp: reorg BIP-68 coin MTP comes from the connec
       check bip22String(res.error) == "bad-txns-nonfinal"
     cs.close()
 
+  test "stale header-sync rows above the old tip do not let the walk jump onto the old chain":
+    ## Header sync wrote height rows for new-branch headers F+4', F+5' into the
+    ## empty slots above the old tip (h5).  The block under test is F+6' (h8),
+    ## parent F+5' — which therefore OWNS its height slot — and spends coin C
+    ## created at F+3' (h5).  Below h6 the slots still name the OLD chain, so
+    ## any "the parent owns its slot, trust the index below it" shortcut
+    ## resolves the coin's parent F+2 to the old block.
+    ##   coin MTP must be MTP(F+2') = 5000;  old-chain MTP(F+2) = 2001
+    ##   block MTP = MTP(F+5')      = median{1000,2000,5000,6000..10000} = 7000
+    ## L = 4: new 5000+2047 = 7047 >= 7000 -> NON-FINAL (Core);
+    ##        old 2001+2047 = 4048 <  7000 -> final (index-based resolution).
+    var cs = newChainState(TestDbPath, regtestParams())
+    let fx = buildFixture(cs, Common, [2001'u32, 2002, 2003],
+                          [6000'u32, 7000, 8000, 9000, 10000],
+                          newRowsAbove = ForkHeight + 3)
+    check cs.db.getBlockHashByHeight(fx.newTip.height) == some(fx.newTip.hash)
+    check cs.db.getBlockHashByHeight(ForkHeight + 2) == some(tagHash(OldTag, ForkHeight + 2))
+    check getMtpForBlockIndex(cs.db, fx.newTip) == 7000'u32
+    let res = runConnect(cs, fx, ForkHeight + 3, 4)
+    check not res.isOk
+    if not res.isOk:
+      check bip22String(res.error) == "bad-txns-nonfinal"
+    cs.close()
+
   test "coin below the fork resolves through the shared ancestry (both chains agree)":
     ## Control: coin C at h1 (common).  coin MTP = MTP(h0) = 1000 on either
     ## chain; block MTP = 6000.  L = 9 (4608 s): 1000+4607 = 5607 < 6000 ->
@@ -263,7 +293,7 @@ suite "cffix-nimrod-reorg-bip68-mtp: reorg BIP-68 coin MTP comes from the connec
       check bip22String(res.error) == "bad-txns-nonfinal"
     cs.close()
 
-  test "getAncestorIndex follows the branch above the fork and the index below it":
+  test "getAncestorIndex follows the connecting branch's own parent links":
     when declared(getAncestorIndex):
       var cs = newChainState(TestDbPath, regtestParams())
       let fx = buildFixture(cs, Common, [2001'u32, 2002, 2003],
