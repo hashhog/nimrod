@@ -260,3 +260,37 @@ suite "cffix reorg in-belowout: reorg-promoted blocks get CheckTxInputs":
     check f.cs.bestBlockHash == tipA
     check f.cs.bestHeight == 101
     check f.cs.getUtxo(f.oneSat).isSome
+
+  test "intra-block chain: a valid in-block spend reorgs, a below-out one is rejected":
+    ## t2 spends t1's output in the SAME block, so its input value comes from
+    ## an output this block just created. Valid at zero fee; rejected when t2
+    ## pays out more than t1 gave it.
+    for bad in [false, true]:
+      let dbPath = freshDbPath()
+      defer: cleanupDb(dbPath)
+      var f = buildFixture(dbPath)
+      defer: f.cs.close()
+      let hooks = realHooks(f.cs)
+      let tipA = hashOf(f.blks[101])
+
+      let t1 = spend(f.bigCoin, Subsidy - 1)                    # zero fee
+      let t2 = spend(OutPoint(txid: t1.txid(), vout: 0),
+                     if bad: Subsidy else: Subsidy - 1)
+      let cbValue = if bad: 0'i64 else: Subsidy
+      let b1 = mine(hashOf(f.blks[100]), 101,
+                    coinbase(101, @[cbValue], if bad: 0xF1'u8 else: 0xF3'u8),
+                    @[t1, t2])
+      let b2 = mine(hashOf(b1), 102,
+                    coinbase(102, @[Subsidy], if bad: 0xF2'u8 else: 0xF4'u8))
+
+      check feed(f.cs, hooks, b1).outcome == sboSideBranch
+      let r2 = feed(f.cs, hooks, b2)
+      if bad:
+        check r2.outcome == sboRejected
+        check r2.token == "bad-txns-in-belowout"
+        check f.cs.bestBlockHash == tipA
+        check f.cs.getUtxo(f.bigCoin).isSome
+      else:
+        check r2.outcome == sboReorged
+        check f.cs.bestBlockHash == hashOf(b2)
+        check f.cs.getUtxo(OutPoint(txid: t2.txid(), vout: 0)).isSome
