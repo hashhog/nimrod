@@ -244,6 +244,7 @@ const IncludedTests = [
   "test_sendtoaddress_error_text",
   "test_sequence_lock",
   "test_serialize",
+  "test_serialize_tx_codec",
   "test_serving",
   "test_sha256_bench",
   "test_shutdown_flush",
