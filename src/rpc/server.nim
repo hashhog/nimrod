@@ -6805,8 +6805,13 @@ proc handleSubmitBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       # skipScripts).  All three nimrod block-acceptance entry points delegate
       # to this single helper; structural divergence between paths is impossible.
       # Reference: bitcoin-core/src/validation.cpp::Chainstate::ProcessNewBlock.
-      let skipScripts = cs.params.assumeValidHeight > 0 and
-                        height <= cs.params.assumeValidHeight
+      # Script skipping goes through the same assumevalid gate as the P2P
+      # path (Core ConnectBlock, validation.cpp:2355-2383): the assumevalid
+      # block must be indexed and this block an ancestor of it and of the
+      # best header, with minimum chain work and the two-week margin. A bare
+      # `height <= assumeValidHeight` skipped scripts for any submitted block
+      # while the node was below the assumevalid height.
+      let skipScripts = cs.computeSkipScripts(submittedHash, height)
       # A UTXO read failure is a local error, not bad-txns-inputs-missingorspent.
       # Gate 6: retried once, then AbortNode + RPC_VERIFY_ERROR (-25) — never
       # a BIP-22 token. A script check with no result twice has latched inside
