@@ -946,20 +946,12 @@ proc handleGetBlockHash(rpc: RpcServer, params: JsonNode): JsonNode =
   if rpc.chainState != nil and height > rpc.chainState.bestHeight:
     raise newRpcError(RpcInvalidParameter, "Block height out of range")
   #
-  # The active tip is exempt. A snapshot base is the tip with no body
-  # (loadtxoutset / --load-snapshot store coins, not the block; Core's
-  # base has no BLOCK_HAVE_DATA either), and getblockhash(base) is how a
-  # caller checks the chain the node just told getbestblockhash it is on.
-  # Refusing it failed boot-smoke tip/restart/cliload with an empty hash.
-  # The height-index lookup below still has to resolve.
-  if rpc.chainState != nil and height > 0 and
-      height != rpc.chainState.bestHeight and
-      not heightHasBody(rpc.chainState.db, height):
-    # Floor cutoff over-claimed: a hole above discoverFirstBody (live
-    # 966302..967347) still had an index row, so getblockhash handed
-    # out a hash for a body we do not hold. Ask cfBlocks.
-    raise newRpcError(RpcMiscError, "Block not available (pruned data)")
-
+  # Core answers from the active chain's block index (m_chain[height]),
+  # never from block data, so a height whose body we do not hold (snapshot
+  # prefix, retained-range hole) still has its hash returned when the
+  # height index resolves. Only getblock needs the body. A previous body-
+  # presence gate here made the nightly consensus-diff UNCOMPARABLE on
+  # getblockhash(945000) (and cost an extra DB probe per call).
   # Use ChainState.getBlockHashByHeight which also checks the IBD in-memory map,
   # covering heights not yet flushed to RocksDB (up to 2000 blocks).
   let hashOpt = rpc.chainState.getBlockHashByHeight(height)
