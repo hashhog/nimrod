@@ -86,6 +86,23 @@ let
   nimrodSrc      = readFile("src/nimrod.nim")
   syncSrc        = readFile("src/network/sync.nim")
 
+proc sourceBlock(src, header: string): string =
+  ## The block opened by the first line containing `header`: that line plus
+  ## every following line indented deeper (blank lines kept), up to the first
+  ## non-blank line at the header's indentation or less. "" when absent.
+  let lines = src.splitLines()
+  for i, line in lines:
+    if header in line:
+      let indent = line.len - line.strip(trailing = false).len
+      var res = @[line]
+      for j in i + 1 ..< lines.len:
+        let l = lines[j]
+        if l.strip().len > 0 and l.len - l.strip(trailing = false).len <= indent:
+          break
+        res.add l
+      return res.join("\n")
+  ""
+
 # ---------------------------------------------------------------------------
 # G1 — RelayManager is a DEAD MODULE (BUG-1, P0-NET)
 # ---------------------------------------------------------------------------
@@ -140,13 +157,38 @@ suite "W136 G2 — sendSendHeaders unconditional (BUG-2)":
     ## Core `MaybeSendSendHeaders` (net_processing.cpp:5519-5538) gates on
     ## `!m_sent_sendheaders && GetCommonVersion() >= SENDHEADERS_VERSION
     ## && pindexBestKnownBlock != nullptr && nChainWork > MinChainWork`.
-    ## nimrod sends unconditionally at the end of `performHandshake`.
-    check "await peer.sendSendHeaders()" in peerSrc
-    # No chain-work / sent-once guard anywhere near the call:
-    check "m_sent_sendheaders" notin peerSrc
-    check "sentSendHeaders" notin peerSrc
-    check "MinimumChainWork" notin peerSrc
-    check "pindexBestKnownBlock" notin peerSrc
+    ##
+    ## Version half: closed by a8982ff, pinned by the "(flipped)" test below.
+    ## Chain-work half: STILL OPEN. nimrod sends sendheaders once, right
+    ## after verack, inside `performHandshake`, before it knows any block
+    ## the peer has; Core waits until the peer's best known block has more
+    ## than the minimum chain work.
+    ##
+    ## RE-SCOPED 2026-11-24: this pin used to grep the WHOLE of peer.nim
+    ## for `pindexBestKnownBlock`. 92ce079 (availableHeight doc comment)
+    ## and bdab2f5 (Peer.onInvalidChain field comment) added that word to
+    ## comments unrelated to sendheaders, which failed the pin while the
+    ## gap stayed open. It now reads only `performHandshake`, the one
+    ## place sendheaders is sent, so it fails when that send gains a
+    ## chain-work or sent-once gate (or moves out of the handshake), and
+    ## not when an unrelated comment mentions Core's field name.
+    let hs = sourceBlock(peerSrc, "proc performHandshake*(")
+    check hs.len > 0
+    # The handshake is the only production sender of sendheaders:
+    check peerSrc.count("await peer.sendSendHeaders()") == 1
+    check "await peer.sendSendHeaders()" in hs
+    for other in [peerMgrSrc, syncSrc, nimrodSrc, relaySrc]:
+      check "sendSendHeaders" notin other
+    # Its only guard is the version gate on the line just before it:
+    check "  if peer.version >= SendHeadersVersion:\n    await peer.sendSendHeaders()" in hs
+    # No chain-work / best-known-block / sent-once guard in the handshake:
+    let hsLower = hs.toLowerAscii()
+    for word in ["pindexbestknownblock", "bestknown", "minimumchainwork",
+                 "chainwork", "sentsendheaders", "m_sent_sendheaders"]:
+      check word notin hsLower
+    # No deferred MaybeSendSendHeaders twin anywhere on the wire path:
+    for s in [peerSrc, peerMgrSrc, syncSrc, nimrodSrc, relaySrc]:
+      check "maybesendsendheaders" notin s.toLowerAscii()
 
   test "G2 BUG-2 cont: Peer object has NO m_sent_sendheaders field":
     ## Core net_processing.cpp:406 — `std::atomic<bool> m_sent_sendheaders{false}`.

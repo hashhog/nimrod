@@ -28,6 +28,23 @@ import ../src/nimrod as nimrod_main
 import ../src/util/ops
 import ../src/rpc/server as rpc_server
 
+proc sourceBlock(src, header: string): string =
+  ## The block opened by the first line containing `header`: that line plus
+  ## every following line indented deeper (blank lines kept), up to the first
+  ## non-blank line at the header's indentation or less. "" when absent.
+  let lines = src.splitLines()
+  for i, line in lines:
+    if header in line:
+      let indent = line.len - line.strip(trailing = false).len
+      var res = @[line]
+      for j in i + 1 ..< lines.len:
+        let l = lines[j]
+        if l.strip().len > 0 and l.len - l.strip(trailing = false).len <= indent:
+          break
+        res.add l
+      return res.join("\n")
+  ""
+
 # ============================================================================
 # G1-G10: lifecycle + shutdown
 # ============================================================================
@@ -44,38 +61,43 @@ suite "W124 lifecycle + shutdown (G1-G10)":
     check "signal(SIGHUP, sigHupHandler)" in src
 
   test "G2 BUG-1 (P0): RPC `stop` is a no-op confession":
-    ## src/rpc/server.nim:8457-8459 — the handler returns a polite string
-    ## and the inline comment confesses "actual shutdown handled by caller"
-    ## but NO caller of `handleMethod` acts on the return value to flip
-    ## `globalNodeState.running`.  `nimrod stop` claims success and the
-    ## node keeps running.  The 11th confession-comment observed across
-    ## the fleet (cf. W120 BUG-5 blockbrew getmempoolinfo).
+    ## FLIPPED: BUG-1 is fixed; this test now pins the fix. (The name is
+    ## kept so the stale pin's failure traces to this test.)
+    ##
+    ## The bug: the `stop` arm only answered, and its inline comment
+    ## confessed "actual shutdown handled by caller" while no caller acted,
+    ## so `stop` claimed success and the node kept running.
+    ##
+    ## Fixed by e4d3829 ("RPC stop shuts the node down through the SIGTERM
+    ## path (gate 5)"), reply text by dc8f604. Core rpc/server.cpp `stop`
+    ## calls StartShutdown() and returns "Bitcoin Core stopping"; the
+    ## process then exits as on SIGTERM. nimrod's arm sets
+    ## `rpc.shutdownRequested`, and processClient, once the reply is written,
+    ## calls requestNodeShutdown, which sends SIGTERM to its own pid, so
+    ## `stop` runs the same sigHandler (G1) an operator's `kill -TERM` runs.
+    ## tests/test_rpc_stop_shutdown.nim drives the arm in-process; this test
+    ## pins the wiring, which cannot run in-process (it would SIGTERM the
+    ## test runner).
     let src = readFile("src/rpc/server.nim")
-    # Find the `stop` handler and assert the confession is still there:
-    check "of \"stop\":" in src
-    check "# Return success - actual shutdown handled by caller" in src
-    check "Bitcoin Core stopping" in src
-    # The fix would add a `triggerShutdown` proc OR set
-    # globalNodeState.running = false inside the handler.  Neither exists:
-    check not compiles(rpc_server.triggerShutdown)
-    # Source-level: handler body must NOT touch globalNodeState today.
-    # Walk the lines near 8457 and confirm globalNodeState is not flipped.
-    let lines = src.splitLines()
-    var sawStop = false
-    var sawNoOp = false
-    for i, line in lines:
-      if "of \"stop\":" in line:
-        sawStop = true
-        # Inspect the next 3 lines for the no-op pattern.
-        for j in 1 .. 3:
-          if i + j < lines.len:
-            let body = lines[i + j]
-            if "Bitcoin Core stopping" in body:
-              sawNoOp = true
-            check "globalNodeState.running = false" notin body
-            check "kill(getpid()" notin body
-    check sawStop
-    check sawNoOp
+    # The no-op and its confession are gone:
+    check "actual shutdown handled by caller" notin src
+    # The arm requests shutdown and answers Core's fixed string:
+    let stopArm = sourceBlock(src, "of \"stop\":")
+    check stopArm.len > 0
+    check "rpc.shutdownRequested = true" in stopArm
+    check "%\"Bitcoin Core stopping\"" in stopArm
+    check compiles(default(rpc_server.RpcServer).shutdownRequested)
+    # processClient raises the shutdown only AFTER the reply is on the wire:
+    let client = sourceBlock(src, "proc processClient(")
+    let raised = client.find("rpc.requestNodeShutdown()")
+    check raised > 0
+    check "if rpc.shutdownRequested:" in client
+    check "await transp.write(httpResponse)" in
+      client[max(0, raised - 200) ..< max(0, raised)]
+    # requestNodeShutdown signals SIGTERM to self, at most once:
+    let req = sourceBlock(src, "proc requestNodeShutdown(")
+    check "posix.kill(posix.getpid(), posix.SIGTERM)" in req
+    check "if rpc.shutdownSignalled:" in req
 
   test "G3 PRESENT: SIGHUP reopens debug log":
     ## src/util/ops.nim:152-168 — reopenLog uses POSIX open/dup2/close only
