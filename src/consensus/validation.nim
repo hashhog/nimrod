@@ -1491,15 +1491,21 @@ proc countScriptSigops*(script: seq[byte], accurate: bool = false): int =
     let opcode = script[pc]
     pc += 1
 
-    # Skip push data
+    # Skip push data. A PUSHDATA1/2/4 without its length bytes ends the walk:
+    # Core's GetSigOpCount `break`s when GetOp fails (script.cpp:167-168), so
+    # the stray length bytes are never read as opcodes. (A short payload makes
+    # pc run past the end, which ends the loop the same way.)
     if opcode >= 0x01 and opcode <= 0x4b:
       pc += int(opcode)
-    elif opcode == OP_PUSHDATA1 and pc < script.len:
+    elif opcode == OP_PUSHDATA1:
+      if pc + 1 > script.len: break
       pc += 1 + int(script[pc])
-    elif opcode == OP_PUSHDATA2 and pc + 1 < script.len:
+    elif opcode == OP_PUSHDATA2:
+      if pc + 2 > script.len: break
       let len = int(script[pc]) or (int(script[pc + 1]) shl 8)
       pc += 2 + len
-    elif opcode == OP_PUSHDATA4 and pc + 3 < script.len:
+    elif opcode == OP_PUSHDATA4:
+      if pc + 4 > script.len: break
       let len = int(script[pc]) or (int(script[pc + 1]) shl 8) or
                 (int(script[pc + 2]) shl 16) or (int(script[pc + 3]) shl 24)
       pc += 4 + len
@@ -1556,24 +1562,34 @@ proc isWitnessProgram*(script: seq[byte]): tuple[valid: bool, version: int, prog
   (true, version, script[2 ..< 2 + programLen])
 
 proc isPushOnly*(script: seq[byte]): bool =
-  ## Check if script contains only push operations (no opcodes > OP_16)
+  ## Check if script contains only push operations (no opcodes > OP_16).
+  ## Like Core's CScript::IsPushOnly, a push that GetOp cannot read (missing
+  ## length bytes or a short payload) makes the script NOT push-only.
   var pc = 0
   while pc < script.len:
     let opcode = script[pc]
     if opcode > OP_16:
       return false
     pc += 1
+    var n = 0
     if opcode >= 0x01 and opcode <= 0x4b:
-      pc += int(opcode)
-    elif opcode == OP_PUSHDATA1 and pc < script.len:
-      pc += 1 + int(script[pc])
-    elif opcode == OP_PUSHDATA2 and pc + 1 < script.len:
-      let len = int(script[pc]) or (int(script[pc + 1]) shl 8)
-      pc += 2 + len
-    elif opcode == OP_PUSHDATA4 and pc + 3 < script.len:
-      let len = int(script[pc]) or (int(script[pc + 1]) shl 8) or
-                (int(script[pc + 2]) shl 16) or (int(script[pc + 3]) shl 24)
-      pc += 4 + len
+      n = int(opcode)
+    elif opcode == OP_PUSHDATA1:
+      if pc + 1 > script.len: return false
+      n = int(script[pc])
+      pc += 1
+    elif opcode == OP_PUSHDATA2:
+      if pc + 2 > script.len: return false
+      n = int(script[pc]) or (int(script[pc + 1]) shl 8)
+      pc += 2
+    elif opcode == OP_PUSHDATA4:
+      if pc + 4 > script.len: return false
+      n = int(script[pc]) or (int(script[pc + 1]) shl 8) or
+          (int(script[pc + 2]) shl 16) or (int(script[pc + 3]) shl 24)
+      pc += 4
+    if n > script.len - pc:
+      return false
+    pc += n
   true
 
 proc getLastPushData*(script: seq[byte]): seq[byte] =
@@ -1604,6 +1620,8 @@ proc getLastPushData*(script: seq[byte]): seq[byte] =
           pc += pushLen
         else:
           return @[]
+      else:
+        return @[]   # GetOp fails: Core returns 0 P2SH sigops
     elif opcode == OP_PUSHDATA2:
       if pc + 1 < script.len:
         let pushLen = int(script[pc]) or (int(script[pc + 1]) shl 8)
@@ -1613,6 +1631,8 @@ proc getLastPushData*(script: seq[byte]): seq[byte] =
           pc += pushLen
         else:
           return @[]
+      else:
+        return @[]   # GetOp fails: Core returns 0 P2SH sigops
     elif opcode == OP_PUSHDATA4:
       if pc + 3 < script.len:
         let pushLen = int(script[pc]) or (int(script[pc + 1]) shl 8) or
@@ -1623,6 +1643,8 @@ proc getLastPushData*(script: seq[byte]): seq[byte] =
           pc += pushLen
         else:
           return @[]
+      else:
+        return @[]   # GetOp fails: Core returns 0 P2SH sigops
     elif opcode >= OP_1NEGATE and opcode <= OP_16:
       # Small integer push - not real data
       lastData = @[]
