@@ -786,7 +786,12 @@ proc preciousBlock*(
 
   # Set this block's sequence ID to one less than the minimum
   idx.sequenceId = minSeqId - 1
-  cs.db.putBlockIndex(idx)
+  # Hash row only: putBlockIndex would also point the height -> hash slot at
+  # this (possibly side-branch) block without connecting it, so getblockhash
+  # and every height-slot reader (getMtpForHeight, checkBip30, the assumevalid
+  # gate) would see a block that is not on the active chain. Core's
+  # PreciousBlock changes the active chain only through ActivateBestChain.
+  cs.db.putBlockIndexHashOnly(idx)
 
   chainMgmtOk()
 
