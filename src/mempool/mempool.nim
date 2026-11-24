@@ -1443,7 +1443,10 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     if kind == stxNonStandard:
       return err(AtmpAcceptInfo,
                  "bad-txns-nonstandard-inputs: input " & $inputIdx & " script unknown")
-    if kind == stxWitnessUnknown:
+    # Core's Solver returns TxoutType::ANCHOR for OP_1 <0x4e73> (checked
+    # before WITNESS_UNKNOWN), which AreInputsStandard allows: a native P2A
+    # spend is standard. classifyStdTxout files P2A under stxWitnessUnknown.
+    if kind == stxWitnessUnknown and not isP2A(prevSpk):
       return err(AtmpAcceptInfo,
                  "bad-txns-nonstandard-inputs: input " & $inputIdx & " witness program is undefined")
     if kind == stxP2SH:
