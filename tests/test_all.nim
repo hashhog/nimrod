@@ -86,6 +86,7 @@ const IncludedTests = [
   "test_boot_body_audit_gate",
   "test_campaign_builtin_confirmation",
   "test_cffix_reorg_in_belowout",
+  "test_cffix_reorg_sigop_cost",
   "test_chain_lock_handoff",
   "test_chain_lock_race",
   "test_chain_management",
