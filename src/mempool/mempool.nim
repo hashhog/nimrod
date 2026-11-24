@@ -1666,26 +1666,37 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
     ##    spending <prevtxid>:<n>"
     ## The verdict is still verifyScript's bool; verifyScriptWithError is run
     ## only after a failure, to name the error for the text.
+    ##
+    ## Every input's spent output is resolved first and handed to the
+    ## interpreter (Core's PrecomputedTransactionData m_spent_outputs,
+    ## validation.cpp:1182): a BIP-341 signature commits to ALL input amounts
+    ## and scriptPubKeys, so passing only the current input's made every
+    ## multi-input taproot spend fail here.
+    var allAmounts = newSeq[Satoshi](tx.inputs.len)
+    var allSpks = newSeq[seq[byte]](tx.inputs.len)
     for inputIdx, input in tx.inputs:
-      var scriptPubKey: seq[byte]
-      var amount: Satoshi
       let utxo = mp.chainState.getUtxo(input.prevOut)
       if utxo.isSome:
-        scriptPubKey = utxo.get().output.scriptPubKey
-        amount = utxo.get().output.value
+        allSpks[inputIdx] = utxo.get().output.scriptPubKey
+        allAmounts[inputIdx] = utxo.get().output.value
       else:
         let parentEntry = mp.entries[input.prevOut.txid]
         let parentOutput = parentEntry.tx.outputs[input.prevOut.vout]
-        scriptPubKey = parentOutput.scriptPubKey
-        amount = parentOutput.value
+        allSpks[inputIdx] = parentOutput.scriptPubKey
+        allAmounts[inputIdx] = parentOutput.value
+    for inputIdx, input in tx.inputs:
+      let scriptPubKey = allSpks[inputIdx]
+      let amount = allAmounts[inputIdx]
       var witness: seq[seq[byte]] = @[]
       if inputIdx < tx.witnesses.len:
         witness = tx.witnesses[inputIdx]
       let verified = verifyScript(
-        input.scriptSig, scriptPubKey, tx, inputIdx, amount, flags, witness)
+        input.scriptSig, scriptPubKey, tx, inputIdx, amount, flags, witness,
+        allAmounts, allSpks)
       if not verified:
         let se = verifyScriptWithError(
-          input.scriptSig, scriptPubKey, tx, inputIdx, amount, flags, witness)
+          input.scriptSig, scriptPubKey, tx, inputIdx, amount, flags, witness,
+          allAmounts, allSpks)
         # Core's ScriptError starts as SCRIPT_ERR_UNKNOWN_ERROR ("unknown
         # error"); keep that if the error-reporting twin disagrees.
         let errText = if se == seOk: "unknown error"
