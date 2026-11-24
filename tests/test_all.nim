@@ -208,6 +208,7 @@ const IncludedTests = [
   "test_perf",
   "test_ping_timeout",
   "test_pre_handshake",
+  "test_preciousblock_height_slot",
   "test_prioritisetransaction",
   "test_proof_pin_closure",
   "test_proxy",
