@@ -177,7 +177,7 @@ suite "pruned history honesty":
       check info["pruneheight"].getInt() == 10
     check not info.hasKey("prune_target_size")
 
-  test "getblockhash below floor is -1 not -8":
+  test "getblockhash below floor returns the indexed hash (Core: index, not body)":
     let dbPath = freshDbPath()
     var cs = newChainState(dbPath, regtestParams())
     defer:
@@ -185,12 +185,12 @@ suite "pruned history honesty":
       cleanupDb(dbPath)
     discard seedPrefixGap(cs, floor = 10, tip = 20)
     let rpc = rpcWithChainState(cs)
-    let r = rpc.rpcErr("getblockhash", %*[5])
-    check r.code == -1
-    check r.msg == "Block not available (pruned data)"
-    check r.msg != "Block height out of range"
+    let h = rpc.handleMethod("getblockhash", %*[5])
+    check h.kind == JString
+    check h.getStr().len == 64
+    check cs.db.getBlockHashByHeight(5).isSome
 
-  test "getblockhash 1 below floor is -1 not -8":
+  test "getblockhash 1 below floor returns the indexed hash":
     let dbPath = freshDbPath()
     var cs = newChainState(dbPath, regtestParams())
     defer:
@@ -198,9 +198,9 @@ suite "pruned history honesty":
       cleanupDb(dbPath)
     discard seedPrefixGap(cs, floor = 10, tip = 20)
     let rpc = rpcWithChainState(cs)
-    let r = rpc.rpcErr("getblockhash", %*[1])
-    check r.code == -1
-    check r.msg == "Block not available (pruned data)"
+    let h = rpc.handleMethod("getblockhash", %*[1])
+    check h.kind == JString
+    check h.getStr().len == 64
 
   test "getblockhash above tip is still -8":
     let dbPath = freshDbPath()
@@ -253,7 +253,7 @@ suite "pruned history honesty":
     check tip.kind == JString
     check tip.getStr().len == 64
 
-  test "getblockhash at a body-less tip answers; a body-less height below it does not":
+  test "getblockhash answers for a body-less tip and a body-less height below it":
     ## A snapshot base is the tip with no body. The tip answers (it is
     ## getbestblockhash), but a body-less height under it that still has
     ## an index row keeps the -1 above.
@@ -269,9 +269,9 @@ suite "pruned history honesty":
     check tip.kind == JString
     check tip.getStr() == rpc.handleMethod("getbestblockhash", %*[]).getStr()
     check cs.db.getBlockHashByHeight(19).isSome
-    let below = rpc.rpcErr("getblockhash", %*[19])
-    check below.code == -1
-    check below.msg == "Block not available (pruned data)"
+    let below = rpc.handleMethod("getblockhash", %*[19])
+    check below.kind == JString
+    check below.getStr().len == 64
 
   test "discoverBodyFloor is 0 on a complete chain":
     let dbPath = freshDbPath()
@@ -353,7 +353,7 @@ suite "pruned history honesty":
     check not bodyViaGetblock(13)
     check bodyViaGetblock(10)
 
-  test "getblockhash at an interior hole is -1 not the index hash":
+  test "getblockhash at an interior hole returns the index hash":
     let dbPath = freshDbPath()
     var cs = newChainState(dbPath, regtestParams())
     defer:
@@ -362,9 +362,9 @@ suite "pruned history honesty":
     seedGappedRetention(cs, firstBody = 6, holeLo = 11, holeHi = 13, tip = 20)
     let rpc = rpcWithChainState(cs)
     check cs.db.getBlockHashByHeight(11).isSome
-    let hole = rpc.rpcErr("getblockhash", %*[11])
-    check hole.code == -1
-    check hole.msg == "Block not available (pruned data)"
+    let hole = rpc.handleMethod("getblockhash", %*[11])
+    check hole.kind == JString
+    check hole.getStr().len == 64
     let atFloor = rpc.handleMethod("getblockhash", %*[14])
     check atFloor.kind == JString
     check atFloor.getStr().len == 64

@@ -2650,16 +2650,35 @@ proc reorgConnectChecks*(
   ##       -> state.Invalid(..., "bad-txns-nonfinal", ...).
   ##     * BIP-30 duplicate-unspent-coinbase scan — validation.cpp:2467-2472,
   ##       view.HaveCoin(...) -> "bad-txns-BIP30".
+  ##     * the block sigop-cost limit — validation.cpp:2564-2570,
+  ##       GetTransactionSigOpCost(...) > MAX_BLOCK_SIGOPS_COST -> "bad-blk-sigops".
   ## The reorg loop already inlines the other ConnectBlock checks it needs
   ## (missing-inputs, coinbase maturity, the bad-cb-amount ceiling, and — via the
-  ## script-verify hook — per-input script verification); these two were the gap
-  ## (nimrod#4). Assume-valid gates ONLY script verification, never BIP-68/BIP-30,
-  ## so the caller fires this unconditionally.
+  ## script-verify hook — per-input script verification); BIP-68/BIP-30 were the
+  ## gap in nimrod#4 and the sigop cost the next one. Assume-valid gates ONLY
+  ## script verification, never these, so the caller fires this unconditionally.
   ##
   ## `utxos` is the fork-point UTXO view rebuilt by handleReorg (cs.getUtxo, which
   ## honours the in-flight reorgDeletedUtxos / utxoCache / DB layering), fired
   ## BEFORE this block's own UTXO mutation is staged — exactly the view Core's
   ## ConnectBlock sees. `db` supplies chain-context reads (parent MTP, ancestry).
+
+  # Block sigop cost (BIP-141). Core ConnectBlock (validation.cpp:2564-2570)
+  # adds GetTransactionSigOpCost(tx, view, flags) for EVERY tx (coinbase
+  # included) and rejects "bad-blk-sigops" as soon as the running total exceeds
+  # MAX_BLOCK_SIGOPS_COST. The flags are the block's exception-aware script
+  # flags (GetBlockScriptFlags), exactly as validateBlock uses them. The P2SH
+  # and witness parts read the spent coins, so this cannot be done context-free
+  # and the side-branch store path (skipConnectChecks=true) never ran it.
+  # Assume-valid does not gate it: Core counts sigops before and independently
+  # of the script-check skip.
+  let sigopBlockHash = $BlockHash(doubleSha256(serialize(blk.header)))
+  let sigopFlags = getBlockScriptFlags(height, params, sigopBlockHash)
+  let useP2SHSigops = sfP2SH in sigopFlags
+  let useWitnessSigops = sfWitness in sigopFlags
+  var totalSigopCost = getLegacySigOpCount(blk.txs[0]) * WitnessScaleFactor
+  if totalSigopCost > MaxBlockSigopsCost:
+    return voidErr(veSigopExceeded)
 
   # BIP-68 sequence locks. Mirrors validateBlock (skipConnectChecks=false),
   # validation.nim:1615-1727: same activation gate (csvHeight + tx.version>=2),
@@ -2668,63 +2687,82 @@ proc reorgConnectChecks*(
   # scored against the block's own height (Core builds prevheights from the view,
   # where same-block coins already carry pindex->nHeight).
   let bip68Active = height >= int32(params.csvHeight)
+  var prevBlockMtp: uint32 = 0
+  # A time-type BIP-68 lock is measured from the MTP of the coin's block's
+  # parent ON THE BRANCH BEING CONNECTED: Core's CalculateSequenceLocks takes
+  # nCoinTime = block.GetAncestor(max(nCoinHeight-1, 0))->GetMedianTimePast()
+  # (consensus/tx_verify.cpp).  It must NOT go through the height index:
+  # during handleReorg the new branch's height rows are only staged in the
+  # uncommitted WriteBatch, so getMtpForHeight would read the OLD chain's
+  # blocks at those heights (or nothing above the old tip -> MTP 0) and
+  # accept a branch Core rejects bad-txns-nonfinal, or reject a valid one.
+  # Every ancestor at h <= height-1 is an ancestor of the parent.  A missing
+  # ancestor is a local read failure, never a verdict: it fails closed below.
+  # The walked path from the parent is shared by every input of the block.
+  var ancestorMissing = false
+  var ancestorPath: seq[BlockIndex] = @[]
   if bip68Active:
-    var prevBlockMtp: uint32 = 0
     let parentOpt = db.getBlockIndex(blk.header.prevBlock)
     if parentOpt.isSome and parentOpt.get().height >= 0:
       prevBlockMtp = getMtpForBlockIndex(db, parentOpt.get())
-
-    # A time-type BIP-68 lock is measured from the MTP of the coin's block's
-    # parent ON THE BRANCH BEING CONNECTED: Core's CalculateSequenceLocks takes
-    # nCoinTime = block.GetAncestor(max(nCoinHeight-1, 0))->GetMedianTimePast()
-    # (consensus/tx_verify.cpp).  It must NOT go through the height index:
-    # during handleReorg the new branch's height rows are only staged in the
-    # uncommitted WriteBatch, so getMtpForHeight would read the OLD chain's
-    # blocks at those heights (or nothing above the old tip -> MTP 0) and
-    # accept a branch Core rejects bad-txns-nonfinal, or reject a valid one.
-    # Every ancestor at h <= height-1 is an ancestor of the parent.  A missing
-    # ancestor is a local read failure, never a verdict: it fails closed below.
-    # The walked path from the parent is shared by every input of the block.
-    var ancestorMissing = false
-    var ancestorPath: seq[BlockIndex] = @[]
     if parentOpt.isSome:
       ancestorPath.add parentOpt.get()
-    proc getMtpAtHeight(h: int32): uint32 =
-      if ancestorPath.len == 0:
-        ancestorMissing = true
-        return 0
-      let ancOpt = extendAncestorPath(db, ancestorPath, h)
-      if ancOpt.isNone:
-        ancestorMissing = true
-        return 0
-      getMtpForBlockIndex(db, ancOpt.get())
 
-    var intraBlockUtxos = initTable[string, UtxoEntry]()
-    # Seed the coinbase outputs (created at this height) so an intra-block spend
-    # of the coinbase is resolvable — identical to validateBlock's coinbase seed.
-    let coinbaseTxid = blk.txs[0].txid()
-    for vout, output in blk.txs[0].outputs:
-      let key = utxoMapKey(coinbaseTxid, vout)
-      intraBlockUtxos[key] = UtxoEntry(output: output, height: height, isCoinbase: true)
+  proc getMtpAtHeight(h: int32): uint32 =
+    if ancestorPath.len == 0:
+      ancestorMissing = true
+      return 0
+    let ancOpt = extendAncestorPath(db, ancestorPath, h)
+    if ancOpt.isNone:
+      ancestorMissing = true
+      return 0
+    getMtpForBlockIndex(db, ancOpt.get())
 
-    for i in 1 ..< blk.txs.len:
-      let tx = blk.txs[i]
-      if bip68VersionActive(tx.version):
-        let seqLockResult = checkSequenceLocksForTx(
-          tx, utxos, height, prevBlockMtp, getMtpAtHeight, params, intraBlockUtxos)
-        if ancestorMissing:
-          return voidErr(veUtxoReadError)
-        if not seqLockResult.isOk:
-          return voidErr(seqLockResult.error)
-      # Maintain the intra-block UTXO set exactly as validateBlock does: drop
-      # this tx's spent inputs, then add its created outputs at the block height.
-      for inp in tx.inputs:
-        let key = utxoMapKey(inp.prevOut.txid, inp.prevOut.vout)
-        intraBlockUtxos.del(key)
-      let thisTxid = tx.txid()
-      for vout, output in tx.outputs:
-        let key = utxoMapKey(thisTxid, vout)
-        intraBlockUtxos[key] = UtxoEntry(output: output, height: height, isCoinbase: false)
+  var intraBlockUtxos = initTable[string, UtxoEntry]()
+  # Seed the coinbase outputs (created at this height) so an intra-block spend
+  # of the coinbase is resolvable — identical to validateBlock's coinbase seed.
+  let coinbaseTxid = blk.txs[0].txid()
+  for vout, output in blk.txs[0].outputs:
+    let key = utxoMapKey(coinbaseTxid, vout)
+    intraBlockUtxos[key] = UtxoEntry(output: output, height: height, isCoinbase: true)
+
+  # Fork-point view plus this block's own earlier outputs, for the sigop count
+  # (a P2SH/witness input may spend an output created earlier in the block).
+  proc lookupUtxo(op: OutPoint): Option[UtxoEntry] =
+    let key = utxoMapKey(op.txid, op.vout)
+    if key in intraBlockUtxos:
+      return some(intraBlockUtxos[key])
+    utxos(op)
+
+  for i in 1 ..< blk.txs.len:
+    let tx = blk.txs[i]
+    if bip68Active and bip68VersionActive(tx.version):
+      let seqLockResult = checkSequenceLocksForTx(
+        tx, utxos, height, prevBlockMtp, getMtpAtHeight, params, intraBlockUtxos)
+      if ancestorMissing:
+        return voidErr(veUtxoReadError)
+      if not seqLockResult.isOk:
+        return voidErr(seqLockResult.error)
+    # Per-tx order as in Core: sequence locks, then the sigop total.
+    let sigopResult = getTransactionSigOpCost(tx, lookupUtxo,
+                                              useP2SH = useP2SHSigops,
+                                              useWitness = useWitnessSigops)
+    if not sigopResult.isOk:
+      # A spent coin is missing: Core's CheckTxInputs rejects this tx before
+      # its sigops are counted.
+      return voidErr(veInputsMissing)
+    totalSigopCost += sigopResult.value
+    if totalSigopCost > MaxBlockSigopsCost:
+      return voidErr(veSigopExceeded)
+    # Maintain the intra-block UTXO set exactly as validateBlock does: drop
+    # this tx's spent inputs, then add its created outputs at the block height.
+    for inp in tx.inputs:
+      let key = utxoMapKey(inp.prevOut.txid, inp.prevOut.vout)
+      intraBlockUtxos.del(key)
+    let thisTxid = tx.txid()
+    for vout, output in tx.outputs:
+      let key = utxoMapKey(thisTxid, vout)
+      intraBlockUtxos[key] = UtxoEntry(output: output, height: height, isCoinbase: false)
 
   # BIP-30 duplicate-coinbase scan. Mirrors acceptBlock step 3 (validation.nim:2419-2442):
   # the SAME checkBip30 call, against the reorg fork-point view, fired before this
