@@ -273,6 +273,7 @@ const IncludedTests = [
   "test_taproot_p1_gaps",
   "test_tapscript_validation_weight",
   "test_template",
+  "test_testnet4_genesis",
   "test_truc",
   "test_txindex",
   "test_txoutset_snapshot_walk",
