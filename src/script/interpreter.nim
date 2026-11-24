@@ -712,9 +712,10 @@ proc nextOpEnd(script: seq[byte], pc: int): int =
 # push-prefix-agnostic. A sig pushed via a different (e.g. non-minimal
 # OP_PUSHDATA1) encoding does NOT match. Only used for sig_version BASE.
 proc findAndDelete*(script: seq[byte], sig: seq[byte]): seq[byte] =
-  if sig.len == 0:
-    return script
-
+  # No early return for an empty sig: Core deletes `CScript() << vchSig`
+  # (interpreter.cpp:330, :1146), and for an empty vchSig that is OP_0 (0x00),
+  # a non-empty pattern. Every opcode-aligned OP_0 leaves the scriptCode, which
+  # changes the legacy sighash of the other CHECKMULTISIG signatures.
   let pushB = encodePush(sig)
   let bn = pushB.len
 
@@ -2226,9 +2227,9 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
     of OP_CHECKLOCKTIMEVERIFY:
       if sfCheckLockTimeVerify notin interp.flags:
-        # Treat as NOP if flag not set
-        if sfDiscourageUpgradableNops in interp.flags:
-          return seDiscourageUpgradableNops
+        # Not enabled: a plain NOP2. Core (interpreter.cpp:524-527) does NOT
+        # apply DISCOURAGE_UPGRADABLE_NOPS here.
+        discard
       else:
         if interp.stack.len < 1:
           return seInvalidStack
@@ -2260,9 +2261,9 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
     of OP_CHECKSEQUENCEVERIFY:
       if sfCheckSequenceVerify notin interp.flags:
-        # Treat as NOP if flag not set
-        if sfDiscourageUpgradableNops in interp.flags:
-          return seDiscourageUpgradableNops
+        # Not enabled: a plain NOP3. Core (interpreter.cpp:563-566) does NOT
+        # apply DISCOURAGE_UPGRADABLE_NOPS here.
+        discard
       else:
         if interp.stack.len < 1:
           return seInvalidStack

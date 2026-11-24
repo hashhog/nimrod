@@ -122,7 +122,10 @@ suite "CLTV G1: flag not set → NOP":
     let err = runCLTVNoFlag(scriptNumLE(100), tx)
     check err == seOk
 
-  test "CLTV without flag: DISCOURAGE_UPGRADABLE_NOPS returns error":
+  test "CLTV without flag: still a NOP under DISCOURAGE_UPGRADABLE_NOPS":
+    # Core interpreter.cpp:524-527: a disabled CLTV is a plain NOP2 and does
+    # not consult DISCOURAGE_UPGRADABLE_NOPS (this test used to assert the
+    # opposite, nimrod's old behaviour).
     var interp = newInterpreter({sfDiscourageUpgradableNops})
     interp.push(scriptNumLE(100))
     var ctx = SigCheckContext(
@@ -133,7 +136,7 @@ suite "CLTV G1: flag not set → NOP":
       codesepPos: 0xFFFFFFFF'u32
     )
     let err = interp.eval(@[OP_CHECKLOCKTIMEVERIFY], ctx)
-    check err == seDiscourageUpgradableNops
+    check err == seOk
 
 # ---------------------------------------------------------------------------
 # G2: Stack empty → seInvalidStack

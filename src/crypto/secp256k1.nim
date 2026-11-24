@@ -600,15 +600,13 @@ when defined(useSystemSecp256k1):
   proc isLowS*(derSignature: openArray[byte]): bool =
     ## Check if the S value in a DER signature is in the lower half of the curve order.
     ## Used for LOW_S flag enforcement.
+    ## Mirrors Core CPubKey::CheckLowS (pubkey.cpp:424-430): the LAX parser,
+    ## which zeroes both R and S when either is >= N (so R >= N with a high S
+    ## counts as low). The strict parser zeroed R alone and kept the high S.
     if derSignature.len == 0:
       return false
     var sig: Secp256k1EcdsaSignature
-    var sigData = newSeq[byte](derSignature.len)
-    for i, b in derSignature:
-      sigData[i] = b
-    if secp256k1_ecdsa_signature_parse_der(
-      getContext(), addr sig, addr sigData[0], csize_t(derSignature.len)
-    ) != 1:
+    if not ecdsaSignatureParseDerLax(sig, derSignature):
       return false
     # normalize returns 1 if sig was NOT normalized (i.e. S was high)
     result = secp256k1_ecdsa_signature_normalize(getContext(), nil, addr sig) != 1
