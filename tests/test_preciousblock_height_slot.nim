@@ -13,7 +13,7 @@
 ## and a slot below the tip names the tip's ancestor.
 
 import unittest2
-import std/[os, json]
+import std/[os, json, options]
 import ../src/consensus/[params, validation]
 import ../src/storage/chainstate
 import ../src/primitives/[types, serialize]
@@ -21,7 +21,7 @@ import ../src/crypto/hashing
 import ../src/mempool/mempool
 import ../src/mining/fees
 import ../src/rpc/server
-from ../src/network/sync import validateHeaderPoW
+from ../src/network/sync import validateHeaderPoW, calculateWork, addWork
 
 const EASY_BITS = 0x207fffff'u32
 const BASE_TIME = 1_700_000_000'u32
@@ -221,3 +221,38 @@ suite "N20 preciousblock decides an equal-work tie and nothing else":
     check n.best() == displayHex(hashOf(m[4]))
     check n.hashAt(5) == displayHex(hashOf(m[4]))
     check n.tipStatus(displayHex(hashOf(bad))) == "invalid"
+
+  test "N20i: a less-work preciousblock does not start ActivateBestChain":
+    ## Core PreciousBlock returns before ActivateBestChain when the block has
+    ## less work than the tip ("Nothing to do"). B6 (on B5 on A4) is stored
+    ## with its body and more work than A5 but not connected, the way a
+    ## branch is left when an earlier activation stopped without a verdict.
+    ## preciousblock on a less-work block must not move the chain onto it.
+    var n = openNode("lesswait")
+    defer: n.shut()
+    let m = n.mainChain(5, 0x10)
+    let b5 = mkBlock(hashOf(m[3]), 5, 0x77)
+    discard n.submit(b5)
+    let b5Idx = n.cs.db.getBlockIndex(hashOf(b5))
+    check b5Idx.isSome
+    let b6 = mkBlock(hashOf(b5), 6, 0x78)
+    n.cs.db.storeBlock(b6)
+    n.cs.db.putBlockIndexHashOnly(BlockIndex(
+      hash: hashOf(b6), height: 6, status: bsDataStored, prevHash: hashOf(b5),
+      header: b6.header,
+      totalWork: addWork(b5Idx.get().totalWork, calculateWork(EASY_BITS)),
+      undoPos: FlatFilePos(fileNum: -1, pos: -1),
+      failureFlags: BLOCK_NO_FAILURE, sequenceId: 0, nTx: 1))
+    check n.best() == displayHex(hashOf(m[4]))       # B6 is waiting
+    let c3 = mkBlock(hashOf(m[1]), 3, 0x79)          # C3 on A2: less work
+    discard n.submit(c3)
+    discard n.rpc.handleMethod("preciousblock", %*[displayHex(hashOf(c3))])
+    check n.best() == displayHex(hashOf(m[4]))
+    check n.hashAt(5) == displayHex(hashOf(m[4]))
+    # Control: the waiting branch is reachable, so the check above can fail.
+    # An equal-work preciousblock (the tip itself) runs ActivateBestChain,
+    # and the more-work B6 wins.
+    discard n.rpc.handleMethod("preciousblock", %*[displayHex(hashOf(m[4]))])
+    check n.best() == displayHex(hashOf(b6))
+    check n.hashAt(6) == displayHex(hashOf(b6))
+    check n.hashAt(5) == displayHex(hashOf(b5))
