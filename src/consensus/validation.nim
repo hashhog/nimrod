@@ -743,11 +743,42 @@ proc checkWitnessMalleation*(blk: Block, segwitActive: bool): ValidationResult[v
 
   ok()
 
+proc isNoCoinbase64ByteMutated*(blk: Block): bool =
+  ## Core IsBlockMutated (validation.cpp), the clause after CheckMerkleRoot:
+  ## a body whose first transaction is not a coinbase is MUTATED if any of
+  ## its transactions serializes to exactly 64 bytes without witness.
+  ##
+  ## A 64-byte transaction has the size of an inner merkle node (two 32-byte
+  ## hashes), so for a real 2-tx block whose cbTxid||tx2Txid happens to parse
+  ## as a legacy transaction, the one-"transaction" body holding that parse
+  ## reproduces the header's merkle root ("Weaknesses in Bitcoin's Merkle
+  ## Root Construction", section 3.1). That forged body fails with
+  ## bad-cb-missing, and pinning the failure on the block HASH would condemn
+  ## the real block and its descendants.
+  ##
+  ## Not a consensus change: it only fires for bodies without a coinbase
+  ## first, which can never be valid; it changes the verdict from "this hash
+  ## is invalid" to "this copy is mutated". A body that starts with a
+  ## coinbase is never caught here (Core neglects a 64-byte coinbase: it
+  ## needs at least 224 bits of work), so a valid block that contains a
+  ## 64-byte transaction is unaffected.
+  if blk.txs.len > 0 and blk.txs[0].isCoinbase():
+    return false
+  for tx in blk.txs:
+    if serializeLegacy(tx).len == 64:
+      return true
+  false
+
 proc bodyMatchesCommitments*(blk: Block, segwitActive: bool): bool =
   ## True when this body is the one the header commits to: merkle root matches
-  ## and is not CVE-2012-2459-mutated, and the witness data matches the
-  ## coinbase commitment (or there is none and no witness). Only then can a
-  ## validation failure be pinned on the block HASH rather than on this copy.
+  ## and is not CVE-2012-2459-mutated, it is not a no-coinbase body holding a
+  ## 64-byte transaction (an inner merkle node passed off as a transaction),
+  ## and the witness data matches the coinbase commitment (or there is none
+  ## and no witness). Only then can a validation failure be pinned on the
+  ## block HASH rather than on this copy. Core's IsBlockMutated clauses in
+  ## its order; unlike Core, witness malleation is still checked for a
+  ## no-coinbase body without a 64-byte tx (pre-existing, stricter only in
+  ## downgrading a never-valid body to "mutated").
   if blk.txs.len == 0:
     return false
   var txHashes: seq[array[32, byte]]
@@ -756,6 +787,8 @@ proc bodyMatchesCommitments*(blk: Block, segwitActive: bool): bool =
   var mutated = false
   let root = computeMerkleRootMutated(txHashes, mutated)
   if mutated or root != blk.header.merkleRoot:
+    return false
+  if isNoCoinbase64ByteMutated(blk):
     return false
   checkWitnessMalleation(blk, segwitActive).isOk
 
