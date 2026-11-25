@@ -130,3 +130,71 @@ suite "N20 preciousblock keeps the height index on the active chain":
     discard n.submit(side)
     check n.hashAt(5) == displayHex(hashOf(m[4]))
     check n.best() == displayHex(hashOf(m[4]))
+
+suite "N20 preciousblock decides an equal-work tie and nothing else":
+  ## Core PreciousBlock sets the block's nSequenceId below every other
+  ## candidate's and then runs ActivateBestChain (validation.cpp, v31.1), so
+  ## an equal-work precious block becomes the tip, a less-work one does not,
+  ## and more work still wins afterwards (Core test/functional/
+  ## rpc_preciousblock.py). After each step getblockhash(h) is the active
+  ## chain at every height, including the height the side block shares.
+
+  test "N20d: an equal-work precious side block becomes the tip":
+    var n = openNode("tie")
+    defer: n.shut()
+    let m = n.mainChain(5, 0x10)
+    let side = mkBlock(hashOf(m[3]), 5, 0x77)        # B5 on A4: equal work
+    discard n.submit(side)
+    check n.best() == displayHex(hashOf(m[4]))       # first received keeps it
+    check n.rpc.handleMethod("preciousblock",
+                             %*[displayHex(hashOf(side))]).kind == JNull
+    check n.best() == displayHex(hashOf(side))
+    check n.rpc.handleMethod("getblockcount", %*[]).getInt() == 5
+    check n.hashAt(5) == displayHex(hashOf(side))
+    for h in 1 .. 4:
+      check n.hashAt(h) == displayHex(hashOf(m[h - 1]))
+
+  test "N20e: preciousblock back on the first tip moves the chain back":
+    var n = openNode("back")
+    defer: n.shut()
+    let m = n.mainChain(5, 0x10)
+    let side = mkBlock(hashOf(m[3]), 5, 0x77)
+    discard n.submit(side)
+    discard n.rpc.handleMethod("preciousblock", %*[displayHex(hashOf(side))])
+    check n.best() == displayHex(hashOf(side))
+    # A later call gets a lower id than the earlier one (Core's reverse
+    # counter), so it wins the same tie the other way.
+    discard n.rpc.handleMethod("preciousblock", %*[displayHex(hashOf(m[4]))])
+    check n.best() == displayHex(hashOf(m[4]))
+    check n.hashAt(5) == displayHex(hashOf(m[4]))
+    check n.hashAt(4) == displayHex(hashOf(m[3]))
+
+  test "N20f: a precious block with less work than the tip does not become the tip":
+    var n = openNode("less")
+    defer: n.shut()
+    let m = n.mainChain(5, 0x10)
+    let b4 = mkBlock(hashOf(m[2]), 4, 0x77)          # B4 on A3: one block short
+    discard n.submit(b4)
+    check n.rpc.handleMethod("preciousblock",
+                             %*[displayHex(hashOf(b4))]).kind == JNull
+    check n.best() == displayHex(hashOf(m[4]))
+    check n.rpc.handleMethod("getblockcount", %*[]).getInt() == 5
+    check n.hashAt(4) == displayHex(hashOf(m[3]))    # the height B4 shares
+    check n.hashAt(5) == displayHex(hashOf(m[4]))
+
+  test "N20g: after a precious tip, a block with more work still becomes the tip":
+    var n = openNode("more")
+    defer: n.shut()
+    let m = n.mainChain(5, 0x10)
+    let side = mkBlock(hashOf(m[3]), 5, 0x77)
+    discard n.submit(side)
+    discard n.rpc.handleMethod("preciousblock", %*[displayHex(hashOf(side))])
+    check n.best() == displayHex(hashOf(side))
+    let a6 = mkBlock(hashOf(m[4]), 6, 0x16)          # A6 on A5: more work
+    check n.submit(a6).kind == JNull
+    check n.best() == displayHex(hashOf(a6))
+    check n.rpc.handleMethod("getblockcount", %*[]).getInt() == 6
+    check n.hashAt(6) == displayHex(hashOf(a6))
+    check n.hashAt(5) == displayHex(hashOf(m[4]))    # the height B5 shares
+    for h in 1 .. 4:
+      check n.hashAt(h) == displayHex(hashOf(m[h - 1]))
