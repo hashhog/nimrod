@@ -2877,6 +2877,12 @@ proc handlePreciousBlock(rpc: RpcServer, params: JsonNode): JsonNode =
     else:
       raise newRpcError(RpcMiscError, $result.error)
 
+  # Core PreciousBlock ends in ActivateBestChain: an equal-work precious block
+  # now sorts ahead of the tip (bestChainCandidate reads its id through
+  # blockSeqId), so the node moves onto it before the RPC returns. A block
+  # with less work than the tip was left alone above and is not a candidate.
+  rpc.activateBestChain()
+
   newJNull()
 
 # Mempool RPCs
