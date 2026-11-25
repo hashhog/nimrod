@@ -579,7 +579,10 @@ suite "BIP-112 NOP behavior without sfCheckSequenceVerify flag":
     # NOP: CSV does nothing, stack has [99999 bytes] on it, execution succeeds
     check err == seOk
 
-  test "CSV as NOP with sfDiscourageUpgradableNops → seDiscourageUpgradableNops":
+  test "CSV as NOP with sfDiscourageUpgradableNops → still a NOP (seOk)":
+    # Core interpreter.cpp:563-566: a disabled CSV is a plain NOP3 and does
+    # not consult DISCOURAGE_UPGRADABLE_NOPS (this test used to assert the
+    # opposite, nimrod's old behaviour).
     let script = csvScript(1)
     let tx = makeTx(1, @[makeInput(0)])
     var interp = newInterpreter({sfDiscourageUpgradableNops})  # no sfCheckSequenceVerify
@@ -590,7 +593,7 @@ suite "BIP-112 NOP behavior without sfCheckSequenceVerify flag":
       codesepPos: 0xFFFFFFFF'u32
     )
     let err = interp.eval(script, ctx)
-    check err == seDiscourageUpgradableNops
+    check err == seOk
 
 # ---------------------------------------------------------------------------
 # BIP-68 block-level activation: no enforcement before csvHeight

@@ -159,6 +159,7 @@ const IncludedTests = [
   "test_ibd_unrequested_buffer",
   "test_inbound_p2p",
   "test_interpreter_glassbox_fixes",
+  "test_interpreter_neon_parity",
   "test_invalid_block_p2p",
   "test_isfinaltx",
   "test_kb181_failed_reorg_activation",
