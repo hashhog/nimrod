@@ -211,11 +211,13 @@ suite "N20 preciousblock decides an equal-work tie and nothing else":
     let m = n.mainChain(5, 0x10)
     let bad = mkBlock(hashOf(m[3]), 5, 0x77, 50 * COIN + 1)
     discard n.submit(bad)
+    proc tipStatus(n: Node, h: string): string =
+      for t in n.rpc.handleMethod("getchaintips", %*[]):
+        if t["hash"].getStr() == h:
+          return t["status"].getStr()
+    # Stored and never tried: the connect below is what rejects it.
+    check n.tipStatus(displayHex(hashOf(bad))) == "valid-headers"
     discard n.rpc.handleMethod("preciousblock", %*[displayHex(hashOf(bad))])
     check n.best() == displayHex(hashOf(m[4]))
     check n.hashAt(5) == displayHex(hashOf(m[4]))
-    var status = ""
-    for t in n.rpc.handleMethod("getchaintips", %*[]):
-      if t["hash"].getStr() == displayHex(hashOf(bad)):
-        status = t["status"].getStr()
-    check status == "invalid"
+    check n.tipStatus(displayHex(hashOf(bad))) == "invalid"
