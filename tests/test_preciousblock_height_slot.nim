@@ -40,14 +40,15 @@ proc displayHex(h: BlockHash): string =
   for i in 0 ..< 32: r[i] = a[31 - i]
   hexOf(r)
 
-proc mkBlock(prev: BlockHash, height: int32, tag: byte): Block =
+proc mkBlock(prev: BlockHash, height: int32, tag: byte,
+             value: int64 = 50 * COIN): Block =
   let cb = Transaction(
     version: 1,
     inputs: @[TxIn(
       prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0xFFFFFFFF'u32),
       scriptSig: encodeBip34Height(height) & @[byte(0x02), 0xF7, tag],
       sequence: 0xFFFFFFFF'u32)],
-    outputs: @[TxOut(value: Satoshi(50 * COIN), scriptPubKey: @[byte(0x51)])],
+    outputs: @[TxOut(value: Satoshi(value), scriptPubKey: @[byte(0x51)])],
     witnesses: @[], lockTime: 0)
   var hdr = BlockHeader(version: 0x20000000'i32, prevBlock: prev,
                         merkleRoot: merkleRoot(@[array[32, byte](cb.txid())]),
@@ -198,3 +199,23 @@ suite "N20 preciousblock decides an equal-work tie and nothing else":
     check n.hashAt(5) == displayHex(hashOf(m[4]))    # the height B5 shares
     for h in 1 .. 4:
       check n.hashAt(h) == displayHex(hashOf(m[h - 1]))
+
+  test "N20h: an equal-work precious block that fails to connect does not become the tip":
+    ## The safety side of N20d: preciousblock only reorders candidates, it
+    ## does not skip validation. B5 pays its coinbase one satoshi too much,
+    ## which only ConnectBlock checks (Core: bad-cb-amount), so it is stored
+    ## as an equal-work side block. preciousblock runs ActivateBestChain, the
+    ## connect fails, B5 is marked invalid and the tip stays on A5.
+    var n = openNode("badcb")
+    defer: n.shut()
+    let m = n.mainChain(5, 0x10)
+    let bad = mkBlock(hashOf(m[3]), 5, 0x77, 50 * COIN + 1)
+    discard n.submit(bad)
+    discard n.rpc.handleMethod("preciousblock", %*[displayHex(hashOf(bad))])
+    check n.best() == displayHex(hashOf(m[4]))
+    check n.hashAt(5) == displayHex(hashOf(m[4]))
+    var status = ""
+    for t in n.rpc.handleMethod("getchaintips", %*[]):
+      if t["hash"].getStr() == displayHex(hashOf(bad)):
+        status = t["status"].getStr()
+    check status == "invalid"
