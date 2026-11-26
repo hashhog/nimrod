@@ -2857,19 +2857,12 @@ proc verifyWitnessProgram*(
     else:
       return false
 
-  elif version == 1 and sfTaproot in flags:
-    # Taproot (SegWit v1)
-    if program.len != 32:
-      # Non-32-byte v1 programs (including P2A anchors) succeed unconditionally
-      # per BIP 341 for forward compatibility
-      return true
-
-    # Core interpreter.cpp:1947: Taproot only applies to non-P2SH witness v1+32.
-    # A P2SH-wrapped v1+32 program is anyone-can-spend (forward soft-fork compat),
-    # matching Core's `!is_p2sh` gate on the Taproot branch.
-    if isP2SH:
-      if sfDiscourageUpgradableWitnessProgram in flags:
-        return false
+  elif version == 1 and program.len == 32 and not isP2SH:
+    # Taproot (SegWit v1). Core interpreter.cpp:1947-1949: BIP-341 applies to
+    # a NATIVE 32-byte v1 program only, and succeeds at once when TAPROOT is
+    # not active. A P2SH-wrapped v1+32, every other v1 size and a P2SH-wrapped
+    # P2A all take the upgradable branch at the end (DISCOURAGE-gated).
+    if sfTaproot notin flags:
       return true
 
     if witness.len == 0:
@@ -3126,11 +3119,16 @@ proc verifyWitnessProgram*(
 
       return castToBool(interp.peek())
 
+  elif not isP2SH and isP2AFromProgram(version, program):
+    # BIP-444 Pay-to-Anchor: a NATIVE OP_1 <0x4e73> always succeeds, even
+    # under DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM (Core interpreter.cpp:1990).
+    return true
+
   else:
-    # Unknown witness version (incl. v1 + non-32 non-P2A, and v2-v16):
-    # anyone-can-spend per BIP-141 forward soft-fork compatibility.
-    # Per Core script/interpreter.cpp:1992-1997, witness contents are
-    # NOT checked here — the future soft fork defines them.
+    # Unknown witness version (incl. v1 + non-32 non-P2A, P2SH-wrapped v1
+    # programs including P2SH-P2A, and v2-v16): anyone-can-spend per BIP-141
+    # forward soft-fork compatibility. Per Core script/interpreter.cpp:
+    # 1992-1997, witness contents are NOT checked here.
     if sfDiscourageUpgradableWitnessProgram in flags:
       return false
     return true
@@ -3243,20 +3241,11 @@ proc verifyWitnessProgramWithError*(
     else:
       return seWitnessProgramMismatch
 
-  elif version == 1 and program.len == 2 and program[0] == 0x4e'u8 and program[1] == 0x73'u8:
-    # BIP-444 Pay-to-Anchor (P2A): OP_1 <0x4e73>. Always spendable;
-    # the relay DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM flag does NOT
-    # apply (Core script/interpreter.cpp:1990 returns true unconditionally
-    # for P2A).
-    return seOk
-
-  elif version == 1 and sfTaproot in flags and program.len == 32:
-    # Taproot (SegWit v1, 32-byte program)
-    # Core interpreter.cpp:1947: Taproot only applies to non-P2SH witness v1+32.
-    # A P2SH-wrapped v1+32 program is anyone-can-spend (forward soft-fork compat).
-    if isP2SH:
-      if sfDiscourageUpgradableWitnessProgram in flags:
-        return seDiscourageUpgradableWitnessProgram
+  elif version == 1 and program.len == 32 and not isP2SH:
+    # Taproot (SegWit v1, native 32-byte program). Core interpreter.cpp:
+    # 1947-1949: succeeds at once when TAPROOT is not active; a P2SH-wrapped
+    # v1+32 takes the upgradable branch at the end.
+    if sfTaproot notin flags:
       return seOk
 
     if witness.len == 0:
@@ -3444,11 +3433,18 @@ proc verifyWitnessProgramWithError*(
 
       return seOk
 
+  elif not isP2SH and isP2AFromProgram(version, program):
+    # BIP-444 Pay-to-Anchor (P2A): a NATIVE OP_1 <0x4e73> is always
+    # spendable; DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM does NOT apply (Core
+    # interpreter.cpp:1990 `!is_p2sh && IsPayToAnchor`). P2SH-wrapped P2A
+    # takes the upgradable branch below.
+    return seOk
+
   else:
-    # Unknown witness version (incl. v1 + non-32 non-P2A, and v2-v16):
-    # anyone-can-spend per BIP-141 forward soft-fork compatibility.
-    # Per Core script/interpreter.cpp:1992-1997, witness contents are
-    # NOT checked here — the future soft fork defines them.
+    # Unknown witness version (incl. v1 + non-32 non-P2A, P2SH-wrapped v1
+    # programs including P2SH-P2A, and v2-v16): anyone-can-spend per BIP-141
+    # forward soft-fork compatibility. Per Core script/interpreter.cpp:
+    # 1992-1997, witness contents are NOT checked here.
     if sfDiscourageUpgradableWitnessProgram in flags:
       return seDiscourageUpgradableWitnessProgram
     return seOk
