@@ -238,8 +238,11 @@ proc readWitness*(r: var BinaryReader): seq[seq[byte]] =
 
 proc writeTransaction*(w: var BinaryWriter, tx: Transaction, includeWitness: bool = true) =
   ## Write transaction in wire format
-  ## If includeWitness is true and tx has witness data, writes segwit format
-  let hasWitness = tx.witnesses.len > 0 and includeWitness
+  ## If includeWitness is true and tx has witness data, writes segwit format.
+  ## Like Core's SerializeTransaction, "has witness data" means some input has
+  ## a NON-EMPTY stack (HasWitness): a witnesses seq holding only empty stacks
+  ## is written in the legacy form, never as a superfluous witness record.
+  let hasWitness = includeWitness and tx.isSegwit()
 
   w.writeInt32LE(tx.version)
 
@@ -279,6 +282,13 @@ proc readTransaction*(r: var BinaryReader): Transaction =
   if marker == 0x00:
     # Potential segwit transaction
     let flag = r.readUint8()
+    if flag == 0x00:
+      # Core UnserializeTransaction: an empty vin followed by flags == 0 reads
+      # neither vin/vout again nor witnesses, so `version 00 00 locktime` is a
+      # tx with no inputs and no outputs (CheckTransaction then rejects it
+      # bad-txns-vin-empty).
+      result.lockTime = r.readUint32LE()
+      return
     if flag != 0x01:
       raise newException(SerializationError, "invalid segwit flag")
     isSegwit = true
