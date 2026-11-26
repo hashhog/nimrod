@@ -254,6 +254,7 @@ const IncludedTests = [
   "test_shutdown_flush",
   "test_signrawtransactionwithwallet",
   "test_sigop",
+  "test_sigop_truncated_push",
   "test_snapshot",
   "test_snapshot_header_boot",
   "test_softforks_bridge",
