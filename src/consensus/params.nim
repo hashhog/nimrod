@@ -1040,7 +1040,7 @@ proc buildGenesisBlock*(params: ConsensusParams): Block =
   ## Coinbase: "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
 
   # Build coinbase scriptSig
-  # All networks use the same coinbase script as mainnet:
+  # Every network except testnet4 uses mainnet's coinbase script:
   # 04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73
   # This is: push 4 bytes (0xffff001d = 0x1d00ffff in LE), push 1 byte (0x04), push 69-byte message
   var coinbaseScript: seq[byte]
@@ -1049,15 +1049,26 @@ proc buildGenesisBlock*(params: ConsensusParams): Block =
   coinbaseScript = @[0x04'u8, 0xff, 0xff, 0x00, 0x1d]
   # Push 1 byte: 0x04 (extra nonce byte)
   coinbaseScript.add([0x01'u8, 0x04])
-  # Push 69-byte message
-  let message = "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
+  # Push the timestamp message. Core CreateGenesisBlock pushes pszTimestamp
+  # with CScript() << vector: a direct push up to 75 bytes, OP_PUSHDATA1
+  # beyond (testnet4's message is 76 bytes).
+  let message =
+    if params.network == Testnet4:
+      # BIP-94 / Core CTestNet4Params (kernel/chainparams.cpp)
+      "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
+    else:
+      "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
+  if message.len >= 0x4c:
+    coinbaseScript.add(0x4c'u8)  # OP_PUSHDATA1
   coinbaseScript.add(byte(message.len))
   for c in message:
     coinbaseScript.add(byte(c))
 
   # Build coinbase output script (pubkey to satoshi's pubkey, OP_CHECKSIG)
   # Mainnet genesis: 04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f OP_CHECKSIG
-  let genesisOutputScript = @[
+  # Testnet4 (Core CTestNet4Params): <33 zero bytes> OP_CHECKSIG.
+  let testnet4OutputScript = @[0x21'u8] & newSeq[byte](33) & @[0xac'u8]
+  let mainnetOutputScript = @[
     0x41'u8, # Push 65 bytes
     0x04, 0x67, 0x8a, 0xfd, 0xb0, 0xfe, 0x55, 0x48, 0x27, 0x19, 0x67, 0xf1,
     0xa6, 0x71, 0x30, 0xb7,
@@ -1070,6 +1081,9 @@ proc buildGenesisBlock*(params: ConsensusParams): Block =
     0x5f,
     0xac     # OP_CHECKSIG
   ]
+  let genesisOutputScript =
+    if params.network == Testnet4: testnet4OutputScript
+    else: mainnetOutputScript
 
   # Build coinbase transaction
   let coinbaseTx = Transaction(
