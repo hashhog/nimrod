@@ -23,7 +23,7 @@
 ## fails on its assertion, by name.
 
 import unittest2
-import std/[sets, times]
+import std/[sets, tables, times]
 import ../src/network/messages
 import ../src/network/peermanager
 import ../src/network/peer
