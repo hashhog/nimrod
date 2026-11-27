@@ -503,6 +503,39 @@ suite "cffix precomputed sighash: BIP-143 / BIP-341 vectors unchanged":
       checkpoint "no PrecomputedTxData"
       fail()
 
+  test "verifier ignores per-tx data unless given the full spent-output arrays":
+    ## Invalid-made-valid guard. Without the full arrays the verifier signs
+    ## over its single-input fallback (other inputs: 0 sats, empty script), so
+    ## a multi-input key-path spend fails. Handing it per-tx data built from
+    ## the REAL arrays must not turn that failure into a pass.
+    when HasTxData:
+      let s = mkP2tr(3)
+      var td = initPrecomputedTxData(s.tx, s.amounts, s.spks)
+      check td.bip341Ready
+      let flags = getBlockScriptFlags(BlockHeight, regtestParams())
+      for i in 0 ..< 3:
+        # Full arrays: valid with or without the per-tx data.
+        check verifyScriptWithError(s.tx.inputs[i].scriptSig, s.spks[i], s.tx, i,
+                                    s.amounts[i], flags, s.tx.witnesses[i],
+                                    s.amounts, s.spks, addr td) == seOk
+        check verifyScript(s.tx.inputs[i].scriptSig, s.spks[i], s.tx, i,
+                           s.amounts[i], flags, s.tx.witnesses[i],
+                           s.amounts, s.spks, addr td)
+        # No arrays: the same verdict as without per-tx data (a failure).
+        let direct = verifyScriptWithError(s.tx.inputs[i].scriptSig, s.spks[i],
+                                           s.tx, i, s.amounts[i], flags,
+                                           s.tx.witnesses[i])
+        check direct != seOk
+        check verifyScriptWithError(s.tx.inputs[i].scriptSig, s.spks[i], s.tx, i,
+                                    s.amounts[i], flags, s.tx.witnesses[i],
+                                    @[], @[], addr td) == direct
+        check not verifyScript(s.tx.inputs[i].scriptSig, s.spks[i], s.tx, i,
+                               s.amounts[i], flags, s.tx.witnesses[i],
+                               @[], @[], addr td)
+    else:
+      checkpoint "no PrecomputedTxData"
+      fail()
+
   test "readiness follows Core's PrecomputedTransactionData::Init":
     when HasTxData:
       let tr = mkP2tr(2)
