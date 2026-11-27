@@ -24,11 +24,14 @@ proc txidOf(a, b: byte): TxId =
   arr[1] = b
   TxId(arr)
 
-proc addEntry(mp: var Mempool, id: TxId, prev: OutPoint) =
+proc addEntry(mp: var Mempool, id: TxId, prev: OutPoint, nOut = 1) =
+  var outs: seq[TxOut]
+  for _ in 0 ..< nOut:
+    outs.add TxOut(value: Satoshi(10000), scriptPubKey: @[])
   let tx = Transaction(
     version: 1,
     inputs: @[TxIn(prevOut: prev, scriptSig: @[], sequence: 0xfffffffd'u32)],
-    outputs: @[TxOut(value: Satoshi(10000), scriptPubKey: @[])],
+    outputs: outs,
     witnesses: @[], lockTime: 0)
   mp.entries[id] = MempoolEntry(
     tx: tx, txid: id, fee: Satoshi(10), weight: 400, feeRate: 1.0,
@@ -43,7 +46,8 @@ proc addRoot(mp: var Mempool, n: int, children: int): (TxId, OutPoint) =
   coin[1] = byte(n)
   let rootId = txidOf(byte(n), 0)
   let coinOp = OutPoint(txid: TxId(coin), vout: 0)
-  mp.addEntry(rootId, coinOp)
+  # One output per child: child c spends root:(c-1), which must exist.
+  mp.addEntry(rootId, coinOp, max(children, 1))
   for c in 1 .. children:
     mp.addEntry(txidOf(byte(n), byte(c)), OutPoint(txid: rootId, vout: uint32(c - 1)))
   (rootId, coinOp)
