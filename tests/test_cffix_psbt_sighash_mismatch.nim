@@ -81,7 +81,8 @@ suite "cffix walletprocesspsbt: PSBT_IN_SIGHASH_TYPE vs caller sighashtype (Core
 
   ## A one-input PSBT spending a wallet-owned P2WPKH coin, with
   ## PSBT_IN_SIGHASH_TYPE set to `field` (none = field absent).
-  proc makePsbt(seedByte: byte, field: Option[int32]): string =
+  proc makePsbt(seedByte: byte, field: Option[int32],
+                foreignSpk: seq[byte] = @[]): string =
     let wOpt = wm.getWallet("tw")
     doAssert wOpt.isSome
     var w = wOpt.get().wallet
@@ -110,6 +111,12 @@ suite "cffix walletprocesspsbt: PSBT_IN_SIGHASH_TYPE vs caller sighashtype (Core
     var p = fromBase64(rpc.handleMethod("walletcreatefundedpsbt", pc)["psbt"].getStr())
     doAssert p.inputs.len == 1
     p.inputs[0].sighashType = field
+    if foreignSpk.len > 0:
+      # Replace the UTXO data with an output the wallet holds no key for, so
+      # the input is someone else's (witness_utxo present, nothing to sign).
+      p.inputs[0].witnessUtxo = some(TxOut(value: Satoshi(100_000_000),
+                                           scriptPubKey: foreignSpk))
+      p.inputs[0].nonWitnessUtxo = none(Transaction)
     p.toBase64()
 
   ## walletprocesspsbt "psbt" sign sighashtype(null = omitted) bip32derivs finalize=false
@@ -212,3 +219,37 @@ suite "cffix walletprocesspsbt: PSBT_IN_SIGHASH_TYPE vs caller sighashtype (Core
     let resp = rpc.handleMethod("walletprocesspsbt", pp)
     check resp["complete"].getBool() == true
     check resp.hasKey("hex")
+
+  # A P2TR and a P2WPKH output whose keys the wallet does not hold.
+  proc foreignP2tr(): seq[byte] =
+    result = @[0x51'u8, 0x20]
+    for i in 0 ..< 32: result.add(byte(0x40 + i))
+  proc foreignP2wpkh(): seq[byte] =
+    result = @[0x00'u8, 0x14]
+    for i in 0 ..< 20: result.add(byte(0x90 + i))
+
+  test "foreign P2WPKH input with stored NONE is refused although the wallet cannot sign it":
+    # Core calls SignPSBTInput for every input with UTXO data, so the
+    # mismatch fires before (and without) any key lookup.
+    let b64 = makePsbt(31, some(0x02'i32), foreignP2wpkh())
+    var pp = newJArray()
+    pp.add(%b64)
+    checkMismatch(callErr(pp))
+
+  test "foreign P2TR input with stored ALL and default args is refused (taproot default is DEFAULT)":
+    let b64 = makePsbt(32, some(0x01'i32), foreignP2tr())
+    var pp = newJArray()
+    pp.add(%b64)
+    checkMismatch(callErr(pp))
+
+  test "control: foreign P2TR input with stored DEFAULT (0x00) and default args is accepted":
+    let b64 = makePsbt(33, some(0x00'i32), foreignP2tr())
+    let resp = process(b64)
+    check resp["complete"].getBool() == false
+    let p = fromBase64(resp["psbt"].getStr())
+    check p.inputs[0].partialSigs.len == 0
+
+  test "control: foreign P2TR input with stored ALL and explicit ALL is accepted":
+    let b64 = makePsbt(34, some(0x01'i32), foreignP2tr())
+    let resp = process(b64, sighash = %"ALL")
+    check resp["complete"].getBool() == false
