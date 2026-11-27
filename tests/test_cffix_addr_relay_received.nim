@@ -18,12 +18,16 @@
 ##     (nTime > now - 10 min), in a message of <= 10 entries, via RelayAddress
 ##     (:2277) to up to 2 peers that can carry it (IsAddrCompatible), with the
 ##     address's own nTime;
+##   - ProcessAddrs skips (neither stores nor relays) an address whose services
+##     have neither NODE_NETWORK nor NODE_NETWORK_LIMITED (:5672-5673);
 ##   - GETADDR (:4815-4848) answers with GetAddresses: a random addrman sample
-##     carrying each address's stored nTime;
+##     carrying each address's stored nTime, cached per network for
+##     21 h + rand(6 h) (net.cpp:3702-3738);
 ##   - AddrMan::AddSingle drops a non-routable address, so it is never stored.
 ##
 ## The relays are read off real loopback sockets, so this file runs the same
-## code path on master and on the fix; it needs no proc the fix adds.
+## code path on master and on the fix.  The one field the fix adds
+## (PeerManager.getAddrCache) is touched only under `when compiles(...)`.
 
 import unittest2
 import std/[os, sets, tables, times, options, strutils]
@@ -213,6 +217,25 @@ suite "cffix addr relay: relay what was received, not the stored prefix":
     check relayedEntries(s2.received()).len == 0
     s1.closeSink(); s2.closeSink(); removeDir(dir)
 
+  test "an address advertising neither NODE_NETWORK nor NODE_NETWORK_LIMITED is not relayed":
+    ## Core ProcessAddrs skips it before relay (net_processing.cpp:5672-5673).
+    let (pm, dir) = freshPm("svc")
+    let s1 = pm.addSink("46.0.7.1", wantsV2 = false)
+    let s2 = pm.addSink("46.0.7.2", wantsV2 = false)
+    var b = addrOf(47, 1, 2, 7, uint32(getTime().toUnix()) - 60'u32)
+    b.address.services = 8'u64          # NODE_WITNESS only
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddr, addresses: @[b]))
+    check relayedEntries(s1.received()).len == 0
+    check relayedEntries(s2.received()).len == 0
+    # Control: the same address with NODE_NETWORK_LIMITED is relayed.
+    b.address.services = 1024'u64 or 8'u64
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddr, addresses: @[b]))
+    check relayedEntries(s1.received()).len == 1
+    check relayedEntries(s2.received()).len == 1
+    s1.closeSink(); s2.closeSink(); removeDir(dir)
+
   test "an 11-entry addr relays nothing":
     let (pm, dir) = freshPm("eleven")
     pm.seedA(20, uint32(getTime().toUnix()) - 86400'u32)
@@ -290,15 +313,39 @@ suite "cffix getaddr: random sample with stored timestamps":
         lastSeen: uint32(getTime().toUnix()) - 86400'u32)
       pm.knownAddresses.add(na)
       if i < 230: prefix.incl keyOf(na)
-    # Five fresh inbound peers, one getaddr each (cap = 23% of 1000 = 230).
+    # cap = 23% of 1000 = 230.
+    let resp = pm.buildGetAddrResponse(
+      newPeer("51.0.0.1", 8333'u16, regtestParams(), pdInbound))
+    check resp.len == 230
     var outsidePrefix = 0
-    for k in 0 ..< 5:
-      let resp = pm.buildGetAddrResponse(
-        newPeer("51.0.0." & $(k + 1), 8333'u16, regtestParams(), pdInbound))
-      check resp.len == 230
-      for ta in resp:
-        if keyOf(ta.address) notin prefix: inc outsidePrefix
-    # A uniform sample of 230 of 1000 puts ~77% of its entries outside the
-    # first 230; the prefix answer puts none there.
-    check outsidePrefix > 500
+    for ta in resp:
+      if keyOf(ta.address) notin prefix: inc outsidePrefix
+    # A uniform sample of 230 of 1000 puts ~177 of its entries outside the
+    # first 230 (sd ~6); the prefix answer puts none there.
+    check outsidePrefix > 100
+    removeDir(dir)
+
+  test "getaddr replies are cached per network, then redrawn when the cache expires":
+    ## Core CConnman::GetAddresses (net.cpp:3702-3738): one reply per network
+    ## for 21 h + rand(6 h), so reconnecting cannot scrape the whole store.
+    let (pm, dir) = freshPm("gacache")
+    for i in 0 ..< 1000:
+      pm.knownAddresses.add(NetAddress(services: 1'u64,
+        ip: ip4(52, 0, byte(i shr 8), byte(i and 0xFF)), port: 8333,
+        lastSeen: uint32(getTime().toUnix()) - 86400'u32))
+    proc keys(r: seq[TimestampedAddr]): seq[string] =
+      for ta in r: result.add keyOf(ta.address)
+    let r1 = pm.buildGetAddrResponse(
+      newPeer("53.0.0.1", 8333'u16, regtestParams(), pdInbound))
+    let r2 = pm.buildGetAddrResponse(
+      newPeer("53.0.0.2", 8333'u16, regtestParams(), pdInbound))
+    check r1.len == 230
+    check keys(r2) == keys(r1)          # same network, inside the lifetime
+    # Expire the cache (master has no cache; there the reply never changes).
+    when compiles(pm.getAddrCache):
+      for k, v in pm.getAddrCache.mpairs: v.expiry = 0
+    let r3 = pm.buildGetAddrResponse(
+      newPeer("53.0.0.3", 8333'u16, regtestParams(), pdInbound))
+    check r3.len == 230
+    check keys(r3) != keys(r1)          # redrawn
     removeDir(dir)
