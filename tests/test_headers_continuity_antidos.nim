@@ -42,7 +42,7 @@ proc buildHeaderChain(startHash: BlockHash, startTime: uint32,
   var ts = startTime
   for i in 0 ..< count:
     ts += 600
-    var hdr = BlockHeader(version: 1, prevBlock: prev,
+    var hdr = BlockHeader(version: 4, prevBlock: prev,
                           merkleRoot: default(array[32, byte]),
                           timestamp: ts, bits: 0x207fffff'u32, nonce: 0)
     while not validateHeaderPoW(hdr):

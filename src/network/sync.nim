@@ -814,6 +814,102 @@ proc validateDifficultyRetarget*(header: BlockHeader, hc: HeaderChain,
     return true # Genesis has no parent to measure against.
   checkHeaderDiffbits(hc, header, params) == dboOk
 
+# =============================================================================
+# ContextualCheckBlockHeader gates 2-5 AT HEADER ADMISSION
+# (Bitcoin Core validation.cpp:4091-4118)
+#
+# Core runs ContextualCheckBlockHeader from AcceptBlockHeader for EVERY header,
+# active-tip extension and competing fork alike.  After bad-diffbits (above)
+# come time-too-old (:4092), the BIP94 timewarp floor (:4102), time-too-new
+# (:4108) and bad-version (:4113).  The fork arm used to run none of them and
+# the active arm skipped timewarp and bad-version, so such headers were stored
+# in `sideHeaders`/`byHash` and written to RocksDB as header-only rows.
+#
+# The rules themselves are not re-implemented here: they are
+# validation.contextualCheckBlockHeaderEx, which takes the chain-derived
+# inputs (parent header, MTP) explicitly.  This file supplies those inputs
+# from THE CANDIDATE'S OWN ANCESTRY (prev-pointer hops), and pins Ex's nBits
+# gate to the header's own nBits because bad-diffbits has already been
+# decided by `checkHeaderDiffbits` over the real pointer walk (Ex's own
+# ancestor model is a synthetic one meant for the differential shim).
+# =============================================================================
+
+type
+  HeaderContextOutcome* = enum
+    hcoOk          ## gates 2-5 passed
+    hcoTimeTooOld  ## nTime <= parent's MTP — Core "time-too-old"
+    hcoTimewarp    ## BIP94 floor — Core "time-timewarp-attack"
+    hcoTimeTooNew  ## nTime > now + 2h — Core "time-too-new" (BLOCK_TIME_FUTURE:
+                   ## not punished by Core, net_processing.cpp:1943)
+    hcoBadVersion  ## obsolete nVersion — Core "bad-version"
+
+const
+  HeaderErrTimeTooOld* = "timestamp not greater than MTP"
+  HeaderErrTimewarp* = "time-timewarp-attack"
+  HeaderErrTimeTooNew* = "timestamp too far in future"
+  HeaderErrBadVersion* = "bad-version"
+
+proc medianTimePastByAncestry*(hc: HeaderChain, hash: BlockHash): Option[uint32] =
+  ## Core CBlockIndex::GetMedianTimePast (chain.h) of the header `hash`:
+  ## the median of it and up to 10 of its ancestors, reached by following
+  ## prev POINTERS across the active chain and `sideHeaders` — never by
+  ## height, which at a fork describes a different branch.  `none` when an
+  ## ancestor the window needs is not in our index (our gap, not the peer's).
+  var window: seq[BlockHeader]
+  var cur = hc.lookupHeaderByHash(hash)
+  while window.len < MedianTimeSpan:
+    if cur.isNone:
+      return none(uint32)
+    let c = cur.get()
+    window.add(c.header)
+    if c.height == 0:
+      break
+    let up = hc.lookupHeaderByHash(c.header.prevBlock)
+    if up.isSome and up.get().height >= c.height:
+      return none(uint32)
+    cur = up
+  some(getMedianTimePast(window))
+
+proc checkHeaderContext*(header: BlockHeader, height: int32,
+                         prevHeader: BlockHeader, prevHash: BlockHash,
+                         mtp: uint32, params: ConsensusParams,
+                         nowSec: int64 = 0): HeaderContextOutcome =
+  ## ContextualCheckBlockHeader gates 2-5 in Core's order.  `prevHeader`,
+  ## `prevHash` and `mtp` must describe the candidate's OWN parent.
+  ## `nowSec` = 0 means the wall clock.
+  # Ex's synthetic getAncestor closure can raise, and its effect is inferred
+  # into this proc even though the pinned nBits means it is never called; the
+  # async handleHeaders cannot carry an unlisted raise.  If anything did
+  # escape, fail closed on the header (same reasoning as requiredBitsForHeader).
+  var r: ValidationResult[void]
+  {.cast(gcsafe).}:
+    try:
+      r = contextualCheckBlockHeaderEx(header, height, prevHeader, prevHash,
+                                       mtp, params,
+                                       expectedBitsOverride = int64(header.bits))
+    except Exception:
+      return hcoBadVersion
+  var badVersion = false
+  if not r.isOk:
+    case r.error
+    of veBadTimestamp:
+      return hcoTimeTooOld
+    of veTimeWarpAttack:
+      return hcoTimewarp
+    of veBadBlockVersion:
+      # Core checks time-too-new (:4108) BEFORE bad-version (:4113).
+      badVersion = true
+    else:
+      # Gate 1 was pinned to the header's own nBits, so Ex cannot return
+      # anything else; treat a surprise as invalid rather than admit it.
+      return hcoBadVersion
+  let now = if nowSec != 0: nowSec else: getTime().toUnix()
+  if int64(header.timestamp) > now + int64(MaxFutureBlockTime):
+    return hcoTimeTooNew
+  if badVersion:
+    return hcoBadVersion
+  hcoOk
+
 proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
                      params: ConsensusParams,
                      minPowChecked: bool = true): tuple[valid: bool,
@@ -876,14 +972,29 @@ proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
       # Not a peer offence: the caller must drop without penalty.
       return (false, HeaderErrCannotEvaluate)
 
-    # Gate 2 — time-too-old (MTP).  Core validation.cpp:4092-4093.
-    if not validateHeaderMTP(header, hc, height):
-      return (false, "timestamp not greater than MTP")
+    # Gates 2-5 — time-too-old (:4092), BIP94 timewarp (:4102), time-too-new
+    # (:4108), bad-version (:4113).  This arm only admits a header that
+    # extends our tip, so the tip IS the candidate's parent and the height
+    # index up to it IS the candidate's ancestry (the MTP read below is the
+    # one this arm has always used, which also copes with snapshot-grafted
+    # chains whose lower heights are holes).
+    let parentOpt = hc.lookupHeaderByHash(prevHash)
+    if parentOpt.isNone:
+      return (false, HeaderErrCannotEvaluate)
+    let mtp = getMedianTimePastFromChain(hc, height - 1)
+    case checkHeaderContext(header, height, parentOpt.get().header, prevHash,
+                            mtp, params)
+    of hcoOk: discard
+    of hcoTimeTooOld: return (false, HeaderErrTimeTooOld)
+    of hcoTimewarp: return (false, HeaderErrTimewarp)
+    of hcoTimeTooNew: return (false, HeaderErrTimeTooNew)
+    of hcoBadVersion: return (false, HeaderErrBadVersion)
+    return (true, "")
 
-  # time-too-new.  Core validation.cpp:4108.
+  # Height 0 (genesis) has no parent: only time-too-new applies.
   let now = getTime().toUnix().uint32
   if header.timestamp > now + uint32(MaxFutureBlockTime):
-    return (false, "timestamp too far in future")
+    return (false, HeaderErrTimeTooNew)
 
   (true, "")
 
@@ -2424,6 +2535,11 @@ type ForkHeaderOutcome* = enum
                     ## OUR index.  The header is NOT known-invalid — caller
                     ## drops it, asks for the bridging headers, and applies
                     ## NO peer penalty.  Our gap is not peer misbehaviour.
+  fhoBadHeader      ## time-too-old / time-timewarp-attack / bad-version
+                    ## (Core BLOCK_INVALID_HEADER, validation.cpp:4092-4118);
+                    ## the header IS invalid — caller bans
+  fhoTimeTooNew     ## time-too-new (Core BLOCK_TIME_FUTURE, :4108): not stored,
+                    ## and, as in Core (net_processing.cpp:1943), not punished
 
 proc acceptForkHeader*(sm: SyncManager, header: BlockHeader,
                        hash: BlockHash,
@@ -2437,6 +2553,12 @@ proc acceptForkHeader*(sm: SyncManager, header: BlockHeader,
   ##   * no resolvable parent      -> fhoNotFork (caller falls back to ban)
   ##   * nBits != required         -> fhoBadDiffbits (ban)
   ##   * required not computable   -> fhoCannotEvaluate (drop, NO penalty)
+  ##   * time-too-old, BIP94 timewarp, bad-version -> fhoBadHeader (ban)
+  ##   * time-too-new              -> fhoTimeTooNew (drop, NO penalty)
+  ##   * MTP window not resolvable -> fhoCannotEvaluate (drop, NO penalty)
+  ##
+  ## The time and version gates (Core validation.cpp:4092-4118) read the
+  ## fork's OWN parent and an MTP walked along its own prev pointers.
   ##
   ## W168: the bad-diffbits gate was previously ABSENT from this arm on every
   ## network.  The original design note here claimed Core defers the contextual
@@ -2499,6 +2621,19 @@ proc acceptForkHeader*(sm: SyncManager, header: BlockHeader,
   # canonical work path (calculateWork/addWork) that builds the active chain's
   # totalWork, so the two are directly comparable (Core nChainWork parity).
   let cumWork = addWork(p.totalWork, calculateWork(header.bits))
+
+  # Gates 2-5 of ContextualCheckBlockHeader (Core validation.cpp:4092-4118),
+  # against this candidate's own parent and its own MTP window.  Nothing has
+  # been stored yet, so a rejection leaves no sideHeaders entry and no DB row.
+  let parentHdr = sm.headerChain.lookupHeaderByHash(header.prevBlock)
+  let forkMtp = sm.headerChain.medianTimePastByAncestry(header.prevBlock)
+  if parentHdr.isNone or forkMtp.isNone:
+    return fhoCannotEvaluate
+  case checkHeaderContext(header, forkHeight, parentHdr.get().header,
+                          header.prevBlock, forkMtp.get(), sm.params)
+  of hcoOk: discard
+  of hcoTimeTooNew: return fhoTimeTooNew
+  of hcoTimeTooOld, hcoTimewarp, hcoBadVersion: return fhoBadHeader
 
   sm.headerChain.sideHeaders[hash] = SideHeader(
     header: header,
@@ -2764,9 +2899,11 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
         # which is exactly the reorg-drop blocker (a heavier branch forking
         # below the tip got the honest peer disconnected and the node stuck).
         #
-        # acceptForkHeader runs PoW + parent-exists + cumulative-work only
-        # (Core AcceptBlockHeader; contextual MTP/retarget deferred to the body
-        # path) and stores the header to sideHeaders + a bsHeaderOnly DB row.
+        # acceptForkHeader runs PoW + parent-exists + the full
+        # ContextualCheckBlockHeader set (bad-diffbits, time-too-old, BIP94
+        # timewarp, time-too-new, bad-version) against the fork's own
+        # ancestry, as Core AcceptBlockHeader does (validation.cpp:4224), and
+        # only then stores the header to sideHeaders + a bsHeaderOnly DB row.
         # It returns fhoNotFork when the parent is UNKNOWN — i.e. a true
         # unlinked header — in which case we fall through to the original ban.
         # PoW-invalid forks (fhoBadPow) are ALSO banned: genuine-bad rejection
@@ -2790,7 +2927,14 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
                peer = $peer, prevBlock = $header.prevBlock
           await sm.requestHeaders(peer)
           return
-        of fhoNotFork, fhoBadPow, fhoBadDiffbits:
+        of fhoTimeTooNew:
+          # Core BLOCK_TIME_FUTURE: the header may become valid later, so it
+          # is dropped without a penalty (net_processing.cpp:1943).  Like
+          # Core, stop at the first header that fails.
+          info "fork header timestamp too far in future — dropped",
+               peer = $peer, hash = $hash
+          return
+        of fhoNotFork, fhoBadPow, fhoBadDiffbits, fhoBadHeader:
           # Genuine unlinked/orphan header or PoW-invalid fork: ban as before.
           warn "received unlinked header", peer = $peer,
                expected = $prevHashOpt.get(), got = $header.prevBlock,

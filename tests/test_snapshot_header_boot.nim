@@ -42,7 +42,7 @@ proc headerToHex(h: BlockHeader): string =
 
 proc mineHeader(prev: BlockHash, ts: uint32, bits: uint32): BlockHeader =
   result = BlockHeader(
-    version: 1,
+    version: 4,
     prevBlock: prev,
     merkleRoot: default(array[32, byte]),
     timestamp: ts,

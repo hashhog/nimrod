@@ -48,7 +48,7 @@ proc buildHeaderChain(startHash: BlockHash, startTime: uint32,
   for i in 0 ..< count:
     ts += 600
     var hdr = BlockHeader(
-      version: 1,
+      version: 4,
       prevBlock: prev,
       merkleRoot: default(array[32, byte]),
       timestamp: ts,
