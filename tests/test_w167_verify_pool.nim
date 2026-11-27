@@ -51,6 +51,11 @@ proc p2pkhScript(pub: PublicKey): seq[byte] =
 # Mandatory-ish flag set for legacy P2PKH ECDSA verification (no taproot).
 const P2pkhFlags = {sfP2SH, sfDERSig, sfStrictEnc, sfLowS, sfNullFail}
 
+# ScriptCheck.tx points at the spending tx (Core: const CTransaction*). The
+# txs built by mkSignedP2pkhCheck are kept here, each in its own heap cell, so
+# every check's pointer stays valid for the whole module.
+var gCheckTxs: seq[ref Transaction]
+
 proc mkSignedP2pkhCheck(seed: int,
                         storeOut: var seq[TxPrevouts]): ScriptCheck =
   ## Build ONE fully-signed P2PKH input as a self-contained ScriptCheck doing
@@ -85,10 +90,14 @@ proc mkSignedP2pkhCheck(seed: int,
     allScriptPubKeys: @[spk]
   ))
 
+  let kept = new Transaction
+  kept[] = tx
+  gCheckTxs.add(kept)
+
   ScriptCheck(
     scriptSig: tx.inputs[0].scriptSig,
     scriptPubKey: spk,
-    tx: tx,
+    tx: addr kept[],
     inputIndex: 0,
     amount: Satoshi(0),
     flags: P2pkhFlags,
@@ -245,7 +254,7 @@ suite "W167 — G21: multi-input Taproot key-path uses the FULL prevout arrays":
       goodChecks.add(ScriptCheck(
         scriptSig: tx.inputs[idx].scriptSig,
         scriptPubKey: allSpks[idx],
-        tx: tx,
+        tx: addr tx,
         inputIndex: idx,
         amount: allAmounts[idx],
         flags: TrFlags,
@@ -273,14 +282,14 @@ suite "W167 — G21: multi-input Taproot key-path uses the FULL prevout arrays":
     droppedChecks.add(ScriptCheck(
       scriptSig: tx.inputs[0].scriptSig,
       scriptPubKey: allSpks[0],
-      tx: tx, inputIndex: 0, amount: allAmounts[0], flags: TrFlags,
+      tx: addr tx, inputIndex: 0, amount: allAmounts[0], flags: TrFlags,
       witness: tx.witnesses[0],
       prevoutsPtr: addr droppedStore[0]   # truncated: len 1 != 2 → fallback
     ))
     droppedChecks.add(ScriptCheck(
       scriptSig: tx.inputs[1].scriptSig,
       scriptPubKey: allSpks[1],
-      tx: tx, inputIndex: 1, amount: allAmounts[1], flags: TrFlags,
+      tx: addr tx, inputIndex: 1, amount: allAmounts[1], flags: TrFlags,
       witness: tx.witnesses[1],
       prevoutsPtr: addr droppedStore1[0]  # full arrays, but input 0 broken
     ))
@@ -298,7 +307,7 @@ suite "W167 — G21: multi-input Taproot key-path uses the FULL prevout arrays":
       tamperedChecks.add(ScriptCheck(
         scriptSig: tx.inputs[idx].scriptSig,
         scriptPubKey: allSpks[idx],
-        tx: tx, inputIndex: idx, amount: allAmounts[idx], flags: TrFlags,
+        tx: addr tx, inputIndex: idx, amount: allAmounts[idx], flags: TrFlags,
         witness: tx.witnesses[idx],
         prevoutsPtr: addr tamperedStore[0]
       ))

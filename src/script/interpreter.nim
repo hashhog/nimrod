@@ -1139,7 +1139,14 @@ proc isPushOnly*(script: seq[byte]): bool =
 # Signature checking context
 type
   SigCheckContext* = object
-    tx*: Transaction
+    ## `tx` borrows the spending transaction instead of owning a copy (Core's
+    ## checker holds `const CTransaction* txTo`). Under ARC a {.cursor.} field
+    ## is a non-owning alias: building a context neither copies the tx nor
+    ## destroys it. Every verifier builds its context from its own `tx`
+    ## parameter, so the tx outlives the context. A copy here cost O(tx size)
+    ## per input, O(inputs x tx size) to verify one tx. Code that builds a
+    ## context itself must keep the tx alive while the context is used.
+    tx* {.cursor.}: Transaction
     inputIndex*: int
     amount*: Satoshi
     scriptPubKey*: seq[byte]

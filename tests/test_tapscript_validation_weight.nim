@@ -43,15 +43,18 @@ suite "BIP-342 tapscript validation-weight budget":
   ## OP_CHECKSIG / OP_CHECKSIGADD through the budget gate without a
   ## real BIP-340 Schnorr signature.
   proc makeTapscriptCtx(): SigCheckContext =
-    var dummyTx = Transaction()
-    dummyTx.version = 2
-    dummyTx.inputs = @[TxIn(
-      prevOut: OutPoint(txid: default(TxId), vout: 0),
-      scriptSig: @[],
-      sequence: 0xffffffff'u32
-    )]
-    dummyTx.outputs = @[TxOut(value: Satoshi(0), scriptPubKey: @[])]
-    dummyTx.lockTime = 0
+    # SigCheckContext.tx borrows its tx ({.cursor.}), so the tx must outlive
+    # every context this returns: build it once, in a global.
+    var dummyTx {.global.} = Transaction()
+    if dummyTx.inputs.len == 0:
+      dummyTx.version = 2
+      dummyTx.inputs = @[TxIn(
+        prevOut: OutPoint(txid: default(TxId), vout: 0),
+        scriptSig: @[],
+        sequence: 0xffffffff'u32
+      )]
+      dummyTx.outputs = @[TxOut(value: Satoshi(0), scriptPubKey: @[])]
+      dummyTx.lockTime = 0
     SigCheckContext(
       tx: dummyTx,
       inputIndex: 0,
