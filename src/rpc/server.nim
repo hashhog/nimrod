@@ -10839,6 +10839,27 @@ proc handleSend(rpc: RpcServer, params: JsonNode): JsonNode =
     raiseWalletSpendError(e.msg)
   for i in 0 ..< tx.inputs.len:
     tx.inputs[i].sequence = 0xfffffffd'u32
+
+  # A locked wallet must not sign. Core's send funds the tx first (so funding
+  # errors still win), then FinishTransaction runs FillPSBT(sign=true): a
+  # locked wallet hands it no private keys, the PSBT stays incomplete, and
+  # send returns {"psbt", "complete": false} without committing anything (no
+  # mempool entry, no wallet spend). Reference: bitcoin-core
+  # src/wallet/rpc/spend.cpp FinishTransaction. Checked here and not inside
+  # signTransaction because the derived account keys stay in memory while
+  # locked, so the signer itself cannot tell.
+  if w.isEncrypted and w.isLocked:
+    for i in 0 ..< tx.witnesses.len:
+      tx.witnesses[i] = @[]
+    var psbtObj = createPsbt(tx)
+    for i, inp in tx.inputs:
+      if inp.prevOut in w.utxos:
+        psbtObj.updateInput(i, w.utxos[inp.prevOut].output, isWitness = true)
+    return %*{
+      "psbt": psbtObj.toBase64(),
+      "complete": false
+    }
+
   let txidHex = rpc.commitWalletSend(w, tx, feeRate)
   result = %*{
     "complete": true,
