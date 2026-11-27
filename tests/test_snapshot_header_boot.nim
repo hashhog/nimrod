@@ -202,12 +202,25 @@ suite "snapshot-boot header chain starts at the assumeUTXO base":
     check sm.buildBlockLocator()[0] == array[32, byte](baseHash)
 
     # A header that extends the grafted base must CONNECT, not go
-    # unconnecting — that is the stall. Raise minimumChainWork so a
-    # dense from-genesis batch would PRESYNC; the grafted tip-extend
-    # path must still be Direct.
+    # unconnecting — that is the stall. Raise minimumChainWork to the
+    # snapshot base's own chainwork, so a dense from-genesis batch would
+    # PRESYNC; the grafted tip-extend clears it with the base's persisted
+    # work (Core's chain_start->nChainWork) and must still be Direct, even
+    # with the cached totalWork zeroed.
+    let next = mineHeader(baseHash, tail[^1].timestamp + 600, 0x207fffff'u32)
+    sm.minimumChainWork = initUInt256(cw)
+    let savedWork = sm.headerChain.totalWork
+    sm.headerChain.totalWork = default(array[32, byte])
+    check sm.classifyHeaderBatch(@[next]).routing == hbrDirect
+    sm.headerChain.totalWork = savedWork
+    # A minimum ABOVE the snapshot's work (2^192) is a below-minimum chain:
+    # Core's TryLowWorkHeadersSync has no tip shortcut, so the tip-extend
+    # goes to the anti-DoS path (cffix-nimrod-tip-extend-min-chainwork;
+    # this line used to assert hbrDirect).
     sm.minimumChainWork = initUInt256()
     sm.minimumChainWork.limbs[3] = 1'u64
-    let next = mineHeader(baseHash, tail[^1].timestamp + 600, 0x207fffff'u32)
+    check sm.classifyHeaderBatch(@[next]).routing == hbrAntiDoS
+    sm.minimumChainWork = initUInt256(cw)
     let cls = sm.classifyHeaderBatch(@[next])
     check cls.routing == hbrDirect
     check cls.connectHash == baseHash
