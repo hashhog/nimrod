@@ -614,6 +614,21 @@ proc isUnevaluableHeaderError*(err: string): bool {.inline.} =
   ## rule", not "the header is invalid".  Never ban/penalise on this.
   err == HeaderErrCannotEvaluate
 
+const HeaderErrTimeTooNew* = "time-too-new"
+  ## `validateHeader` error token for a header whose nTime is more than
+  ## MAX_FUTURE_BLOCK_TIME ahead of our clock — Core's BLOCK_TIME_FUTURE
+  ## "time-too-new" (validation.cpp:4108).  The header is not known-invalid:
+  ## it may become acceptable once our clock catches up, and our clock may be
+  ## the wrong one.  Core's MaybePunishNodeForBlock therefore does not punish
+  ## it (net_processing.cpp:1943, `case BLOCK_TIME_FUTURE: break;`).
+
+proc isNoPunishHeaderError*(err: string): bool {.inline.} =
+  ## True when `validateHeader`'s rejection must drop the header WITHOUT a
+  ## misbehaviour penalty.  Covers time-too-new only; the unevaluable-diffbits
+  ## case has its own handling (`isUnevaluableHeaderError`, it also asks for
+  ## the bridging headers).
+  err == HeaderErrTimeTooNew
+
 proc lookupHeaderByHash*(hc: HeaderChain, hash: BlockHash):
     Option[tuple[header: BlockHeader, height: int32]] =
   ## Resolve a header BY HASH across the active chain and the competing-fork
@@ -883,7 +898,7 @@ proc validateHeader*(header: BlockHeader, hc: HeaderChain, height: int32,
   # time-too-new.  Core validation.cpp:4108.
   let now = getTime().toUnix().uint32
   if header.timestamp > now + uint32(MaxFutureBlockTime):
-    return (false, "timestamp too far in future")
+    return (false, HeaderErrTimeTooNew)
 
   (true, "")
 
@@ -2821,6 +2836,18 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
         info "cannot evaluate header difficulty — requesting bridging headers",
              peer = $peer, height = expectedHeight
         await sm.requestHeaders(peer)
+        return
+      if isNoPunishHeaderError(error):
+        # time-too-new: Core MaybePunishNodeForBlock breaks on
+        # BLOCK_TIME_FUTURE (net_processing.cpp:1943) — drop the header and
+        # the rest of this batch, but no misbehaviour score, no ban.  The
+        # header is not stored, so the peer can offer it again once it is no
+        # longer too far ahead of our clock.
+        info "header timestamp too far in the future — dropped, peer not punished",
+             peer = $peer, height = expectedHeight,
+             timestamp = header.timestamp
+        sm.syncPeer = nil
+        sm.state = ssIdle
         return
       warn "invalid header", peer = $peer, height = expectedHeight, error = error
       # G17 (W99): use Misbehaving framework so noBan/manual guards are

@@ -89,6 +89,7 @@ const IncludedTests = [
   "test_cffix_reorg_bip68_mtp",
   "test_cffix_reorg_in_belowout",
   "test_cffix_reorg_sigop_cost",
+  "test_cffix_time_too_new_no_punish",
   "test_chain_lock_handoff",
   "test_chain_lock_race",
   "test_chain_management",
