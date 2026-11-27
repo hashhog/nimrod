@@ -56,6 +56,11 @@ const
   #    (Core MAX_PCT_ADDR_TO_SEND); the effective cap is the min of the two.
   MaxAddrToSend* = 1000        # Core MAX_ADDR_TO_SEND
   MaxPctAddrToSend* = 23       # Core MAX_PCT_ADDR_TO_SEND
+  # Core CConnman::GetAddresses (net.cpp:3734-3735): a getaddr reply is cached
+  # per network for 21 h plus a random 0-6 h, so reconnecting cannot scrape
+  # the whole store with its real timestamps.
+  GetAddrCacheBaseSec* = 21'i64 * 3600
+  GetAddrCacheJitterSec* = 6'i64 * 3600
   # Inbound addr-message rate limiting (token bucket; Core net_processing.cpp):
   #  - MaxAddrRatePerSecond: bucket refill rate (Core MAX_ADDR_RATE_PER_SECOND).
   #  - MaxAddrProcessingTokenBucket: soft cap on accumulated tokens
@@ -116,6 +121,10 @@ type
     peer*: Peer
     requestTime*: Time
 
+  GetAddrCacheEntry* = object
+    addrs*: seq[TimestampedAddr]
+    expiry*: int64              # unix seconds; redrawn once now > expiry
+
   PeerManager* = ref object
     peers*: Table[string, Peer]
     extendedPeers*: Table[string, ExtendedPeer]
@@ -130,6 +139,9 @@ type
     ## addrv2 messages here (they cannot be represented in the legacy 16-byte
     ## NetAddress format).  Relayed as addrv2 to peers that signaled wantsAddrV2.
     knownAddressesV2*: seq[TimestampedAddrV2]
+    ## Cached getaddr replies, keyed by the requesting peer's network
+    ## (Core m_addr_response_caches, net.cpp:3702-3738).
+    getAddrCache*: Table[string, GetAddrCacheEntry]
     ## AXIS #2: Core-bucketed address manager (CAddrMan).  knownAddresses above
     ## stays as the rich getnodeaddresses/addr-sharing metadata store; this
     ## table is the NEW[1024][64]/TRIED[256][64] placement + anti-Sybil engine +
@@ -2197,7 +2209,12 @@ proc isRelayableReceived(ta: TimestampedAddrV2, nowSec: uint32): bool =
   ## Core ProcessAddrs relay gate per address (net_processing.cpp:5690):
   ## `addr.nTime > current_time - 10min && addr.IsRoutable()` (the message
   ## size gate is applied by the caller).  `ta.timestamp` is the already
-  ## clamped value, as in Core.
+  ## clamped value, as in Core.  Core also skips, before relay, an address
+  ## whose services are not useful (:5672-5673, `!MayHaveUsefulAddressDB &&
+  ## !HasAllDesirableServiceFlags`); every desirable set includes NODE_NETWORK
+  ## or NODE_NETWORK_LIMITED, so that is "has neither flag".
+  if (ta.services and (NodeNetwork or NodeNetworkLimited)) == 0:
+    return false
   if ta.timestamp <= nowSec - 600'u32:
     return false
   let legacy = toLegacyTimestampedAddr(ta)
@@ -2231,10 +2248,22 @@ proc buildGetAddrResponse*(pm: PeerManager, peer: Peer): seq[TimestampedAddr] =
   if cap > MaxAddrToSend:
     cap = MaxAddrToSend
   let count = min(total, cap)
+  # Core GetAddresses (net.cpp:3702-3738): one cached reply per network,
+  # redrawn after 21 h + rand(6 h).  Core keys the cache on the local socket
+  # the request arrived on; nimrod keys it on the requesting peer's network.
+  let cacheKey =
+    if peer.address.endsWith(".onion"): "onion"
+    elif peer.address.endsWith(".i2p"): "i2p"
+    elif ':' in peer.address: "ipv6"
+    else: "ipv4"
+  let nowSec = getTime().toUnix()
+  if cacheKey in pm.getAddrCache and
+      pm.getAddrCache[cacheKey].expiry >= nowSec:
+    return pm.getAddrCache[cacheKey].addrs
   # A uniform random sample, each entry with its stored timestamp, like Core's
-  # GetAddresses (addrman.cpp GetAddr_: shuffled draw, stored nTime).  It used
-  # to be knownAddresses[0..count) stamped `now`: the same oldest entries on
-  # every request, all looking fresh.  Partial Fisher-Yates over indexes.
+  # GetAddressesUnsafe (addrman.cpp GetAddr_: shuffled draw, stored nTime).
+  # It used to be knownAddresses[0..count) stamped `now`: the same oldest
+  # entries on every request, all looking fresh.  Partial Fisher-Yates.
   var idx = newSeq[int](total)
   for i in 0 ..< total: idx[i] = i
   var addrs: seq[TimestampedAddr]
@@ -2243,6 +2272,9 @@ proc buildGetAddrResponse*(pm: PeerManager, peer: Peer): seq[TimestampedAddr] =
     swap(idx[i], idx[j])
     let na = pm.knownAddresses[idx[i]]
     addrs.add(TimestampedAddr(timestamp: na.lastSeen, address: na))
+  pm.getAddrCache[cacheKey] = GetAddrCacheEntry(addrs: addrs,
+    expiry: nowSec + GetAddrCacheBaseSec +
+            nodeRng().rand(GetAddrCacheJitterSec - 1))
   addrs
 
 proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
