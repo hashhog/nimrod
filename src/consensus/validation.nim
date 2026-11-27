@@ -2121,6 +2121,13 @@ proc validateBlock*(
     # CRITICAL: Maintain intra-block UTXOs for txs that spend outputs from earlier txs in same block
     var totalFees = int64(0)
     var intraBlockUtxos = initTable[string, UtxoEntry]()
+    # Outpoints already spent by an earlier tx of THIS block. Core's
+    # CCoinsViewCache::SpendCoin leaves the coin spent in the block's view, so
+    # a later tx spending it again fails CheckTxInputs with
+    # bad-txns-inputs-missingorspent (BLOCK_CONSENSUS). Deleting from
+    # intraBlockUtxos covers only outputs CREATED in this block; a coin from
+    # the UTXO set would otherwise fall through to the DB and be found again.
+    var spentInBlock = initTable[string, bool]()
     var totalSigopCost = 0  # Track sigop cost with witness discount
 
     # Determine which sigop rules apply to THIS block.
@@ -2169,6 +2176,8 @@ proc validateBlock*(
         let key = utxoMapKey(op.txid, op.vout)
         if key in intraBlockUtxos:
           return some(intraBlockUtxos[key])
+        if key in spentInBlock:
+          return none(UtxoEntry)
         if getUtxoOverride != nil:
           return getUtxoOverride(op)
         utxos.getUtxo(op)
@@ -2198,10 +2207,12 @@ proc validateBlock*(
         if not seqLockResult.isOk:
           return voidErr(seqLockResult.error)
 
-      # Mark spent UTXOs (remove from intra-block set or mark for removal from UTXO set)
+      # Mark spent UTXOs: remove an in-block output and tombstone the
+      # outpoint, so no later tx of this block can spend it again.
       for inp in tx.inputs:
         let key = utxoMapKey(inp.prevOut.txid, inp.prevOut.vout)
         intraBlockUtxos.del(key)
+        spentInBlock[key] = true
 
       # Add this transaction's outputs to intra-block UTXOs
       let thisTxid = tx.txid()

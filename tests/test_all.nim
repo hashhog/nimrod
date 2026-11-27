@@ -94,6 +94,7 @@ const IncludedTests = [
   "test_chain_management",
   "test_chainstate",
   "test_chainwork_memo",
+  "test_cffix_intrablock_doublespend_verdict",
   "test_checkpoint",
   "test_cltv",
   "test_cluster",
