@@ -253,3 +253,21 @@ suite "cffix walletprocesspsbt: PSBT_IN_SIGHASH_TYPE vs caller sighashtype (Core
     let b64 = makePsbt(34, some(0x01'i32), foreignP2tr())
     let resp = process(b64, sighash = %"ALL")
     check resp["complete"].getBool() == false
+
+  test "default and DEFAULT signs leave PSBT_IN_SIGHASH_TYPE unset (Core sets it only for non-ALL)":
+    let r1 = process(makePsbt(41, none(int32)))
+    check fromBase64(r1["psbt"].getStr()).inputs[0].sighashType.isNone
+    let r2 = process(makePsbt(42, none(int32)), sighash = %"DEFAULT")
+    check fromBase64(r2["psbt"].getStr()).inputs[0].sighashType.isNone
+
+  test "a PSBT signed with DEFAULT can be processed again with DEFAULT":
+    # Core: no field is written for DEFAULT/ALL, so the second call has
+    # nothing to mismatch against and succeeds.
+    let r1 = process(makePsbt(43, none(int32)), sighash = %"DEFAULT")
+    var e: ref RpcError = nil
+    try:
+      discard process(r1["psbt"].getStr(), sighash = %"DEFAULT")
+    except RpcError as err:
+      e = err
+    check e == nil
+

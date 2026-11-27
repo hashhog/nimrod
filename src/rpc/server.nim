@@ -12944,9 +12944,11 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     none(TxOut)
 
   # Inputs Core's FillPSBT would see UTXO data for: the PSBT's own
-  # witness_utxo / non_witness_utxo, or a wallet transaction (CWallet::FillPSBT
-  # fills non_witness_utxo from mapWallet). Recorded before the Updater below,
-  # which also resolves prevouts from chainstate, something Core does not do.
+  # witness_utxo / non_witness_utxo, or the wallet's coin. (CWallet::FillPSBT
+  # fills non_witness_utxo from any mapWallet transaction; this uses the
+  # wallet's unspent coins only, a narrower set.) Recorded before the Updater
+  # below, which also resolves prevouts from chainstate, something Core does
+  # not do.
   var coreHasUtxo = newSeq[bool](psbtObj.inputs.len)
   for i in 0 ..< psbtObj.inputs.len:
     coreHasUtxo[i] = psbtObj.inputs[i].witnessUtxo.isSome or
@@ -13096,8 +13098,13 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
         psbtObj.addPartialSig(i, pub, derSig)
         if redeemForPsbt.len > 0 and psbtObj.inputs[i].redeemScript.len == 0:
           psbtObj.inputs[i].redeemScript = redeemForPsbt
-        # Record the sighash type we signed with (BIP-174 PSBT_IN_SIGHASH_TYPE).
-        if psbtObj.inputs[i].sighashType.isNone:
+        # Record the sighash type we signed with (BIP-174 PSBT_IN_SIGHASH_TYPE)
+        # only when it is neither DEFAULT nor ALL, as Core's SignPSBTInput
+        # does for non-taproot inputs (the only kind signed here; DEFAULT has
+        # been aliased to ALL above). Writing 0x01 for a default sign would
+        # make the mismatch check above refuse a later "DEFAULT" call on this
+        # PSBT, which Core accepts.
+        if psbtObj.inputs[i].sighashType.isNone and inHashType != 0x01'u32:
           psbtObj.inputs[i].sighashType = some(int32(inHashType))
 
   # ------------------------------------------------------------------
