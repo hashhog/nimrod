@@ -2839,15 +2839,18 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
         return
       if isNoPunishHeaderError(error):
         # time-too-new: Core MaybePunishNodeForBlock breaks on
-        # BLOCK_TIME_FUTURE (net_processing.cpp:1943) — drop the header and
-        # the rest of this batch, but no misbehaviour score, no ban.  The
-        # header is not stored, so the peer can offer it again once it is no
-        # longer too far ahead of our clock.
+        # BLOCK_TIME_FUTURE (net_processing.cpp:1943) and ProcessHeadersMessage
+        # just returns (:3093) — drop the header and the rest of this batch,
+        # no misbehaviour, and leave syncPeer / state alone.  Resetting them
+        # (as the banning branch below does for a peer it has just
+        # disconnected) would re-select this still-connected peer and re-ask
+        # it for the same header in a loop.  If it is our sync peer and never
+        # sends anything else, the headers-sync timeout rotates it
+        # (handleHeadersSyncTimeout).  The header is not stored, so it can be
+        # offered again once it is no longer too far ahead of our clock.
         info "header timestamp too far in the future — dropped, peer not punished",
              peer = $peer, height = expectedHeight,
              timestamp = header.timestamp
-        sm.syncPeer = nil
-        sm.state = ssIdle
         return
       warn "invalid header", peer = $peer, height = expectedHeight, error = error
       # G17 (W99): use Misbehaving framework so noBan/manual guards are

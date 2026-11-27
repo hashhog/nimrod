@@ -129,14 +129,19 @@ proc tipExtension(f: Fixture, timestamp: uint32,
 proc nowPlus(secs: int64): uint32 =
   uint32(getTime().toUnix() + secs)
 
+const TooNew = int64(MaxFutureBlockTime) + 60
+  ## now + 7260: past Core's limit (nTime > now + 7200).  The 60 s margin over
+  ## the minimal now+7201 keeps the test from flaking when the wall-clock
+  ## second ticks between building the header and validateHeader's getTime().
+
 suite "time-too-new header: dropped, peer not punished (Core BLOCK_TIME_FUTURE)":
 
   teardown:
     removeDir(scratchDir())
 
-  test "tip-extending header at now+7201 is dropped and the peer is not punished":
+  test "tip-extending header more than 7200 s ahead is dropped and the peer is not punished":
     var f = setup300("203.0.113.81")
-    let hdr = f.tipExtension(nowPlus(int64(MaxFutureBlockTime) + 1))
+    let hdr = f.tipExtension(nowPlus(TooNew))
     waitFor f.sm.handleHeaders(f.peer, @[hdr])
     # Dropped: the active header chain did not move.
     check f.sm.headerChain.tipHeight == 300
@@ -150,7 +155,7 @@ suite "time-too-new header: dropped, peer not punished (Core BLOCK_TIME_FUTURE)"
 
   test "validateHeader names the rejection with Core's time-too-new token":
     var f = setup300("203.0.113.82")
-    let hdr = f.tipExtension(nowPlus(int64(MaxFutureBlockTime) + 1))
+    let hdr = f.tipExtension(nowPlus(TooNew))
     let (valid, error) = validateHeader(hdr, f.sm.headerChain, 301, f.params,
                                         minPowChecked = true)
     check not valid
@@ -159,11 +164,32 @@ suite "time-too-new header: dropped, peer not punished (Core BLOCK_TIME_FUTURE)"
       check isNoPunishHeaderError(error)
 
   test "boundary: a header at exactly now+7200 is still accepted":
-    ## Core rejects only nTime > now + MAX_FUTURE_BLOCK_TIME.
+    ## Core rejects only nTime > now + MAX_FUTURE_BLOCK_TIME.  Deterministic:
+    ## the clock only moves forward between nowPlus() and validateHeader's
+    ## getTime(), so the header is never more than 7200 s ahead when checked.
     var f = setup300("203.0.113.83")
-    let hdr = f.tipExtension(nowPlus(int64(MaxFutureBlockTime) - 5))
+    let hdr = f.tipExtension(nowPlus(int64(MaxFutureBlockTime)))
     waitFor f.sm.handleHeaders(f.peer, @[hdr])
     check f.sm.headerChain.tipHeight == 301
+    check not f.peer.shouldDisconnect
+    check not f.pm.isBanned(f.peer.address)
+
+  test "time-too-new from a non-sync peer leaves the sync peer and state alone":
+    ## Core ProcessHeadersMessage returns after MaybePunishNodeForBlock without
+    ## touching the header-sync state (net_processing.cpp:3093).  Dropping the
+    ## sync peer here would let any peer interrupt sync with another one, and
+    ## re-select a still-connected sender in a getheaders loop.
+    var f = setup300("203.0.113.86")
+    let syncer = newPeer("203.0.113.87", 8333, f.params, pdOutbound)
+    syncer.services = NodeNetwork or NodeWitness
+    f.pm.peers["203.0.113.87:8333"] = syncer
+    f.sm.syncPeer = syncer
+    f.sm.state = ssSyncingHeaders
+    let hdr = f.tipExtension(nowPlus(TooNew))
+    waitFor f.sm.handleHeaders(f.peer, @[hdr])
+    check f.sm.headerChain.tipHeight == 300
+    check f.sm.syncPeer == syncer
+    check f.sm.state == ssSyncingHeaders
     check not f.peer.shouldDisconnect
     check not f.pm.isBanned(f.peer.address)
 
