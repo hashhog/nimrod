@@ -1234,8 +1234,11 @@ proc standardScriptVerifyFlags*(consensusFlags: set[ScriptFlags]): set[ScriptFla
   result.incl(sfLowS)
   result.incl(sfDiscourageUpgradableWitnessProgram)
   result.incl(sfWitnessPubkeyType)
-  # sfConstScriptCode — not modelled separately in nimrod interpreter (treated
-  # as mandatory under BIP-143).
+  # SCRIPT_VERIFY_CONST_SCRIPTCODE (policy only): in BASE script it rejects
+  # any OP_CODESEPARATOR, even unexecuted, and a signature that
+  # FindAndDelete finds in the scriptCode (interpreter.cpp:474-476, :330-332,
+  # :1146-1148).
+  result.incl(sfConstScriptCode)
   result.incl(sfDiscourageUpgradableTaprootVersion)
   result.incl(sfDiscourageOpSuccess)
   result.incl(sfDiscourageUpgradablePubkeyType)
