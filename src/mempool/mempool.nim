@@ -1687,6 +1687,9 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
         let parentOutput = parentEntry.tx.outputs[input.prevOut.vout]
         allSpks[inputIdx] = parentOutput.scriptPubKey
         allAmounts[inputIdx] = parentOutput.value
+    # Core PrecomputedTransactionData (ws.m_precomputed_txdata): the
+    # whole-tx sighash digests are hashed once here, not once per signature.
+    var txdata = initPrecomputedTxData(tx, allAmounts, allSpks)
     for inputIdx, input in tx.inputs:
       let scriptPubKey = allSpks[inputIdx]
       let amount = allAmounts[inputIdx]
@@ -1695,11 +1698,11 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
         witness = tx.witnesses[inputIdx]
       let verified = verifyScript(
         input.scriptSig, scriptPubKey, tx, inputIdx, amount, flags, witness,
-        allAmounts, allSpks)
+        allAmounts, allSpks, addr txdata)
       if not verified:
         let se = verifyScriptWithError(
           input.scriptSig, scriptPubKey, tx, inputIdx, amount, flags, witness,
-          allAmounts, allSpks)
+          allAmounts, allSpks, addr txdata)
         # Core's ScriptError starts as SCRIPT_ERR_UNKNOWN_ERROR ("unknown
         # error"); keep that if the error-reporting twin disagrees.
         let errText = if se == seOk: "unknown error"

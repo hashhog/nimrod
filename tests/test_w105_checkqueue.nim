@@ -34,7 +34,7 @@
 ##   G21 BUG   – verifyScriptsParallel does not pass allAmounts/allScriptPubKeys; Taproot sighash broken
 ##   G22 BUG   – parallel path uses tx.txid() for intra-block lookup (seq scan); serial path uses Table[string]
 ##   G23 OK    – serial verifyScripts correctly passes all amounts + scriptPubKeys to verifyScript for Taproot
-##   G24 BUG   – no PrecomputedTransactionData (txdata.Init); sighash precomputation repeated per-input
+##   G24 FIXED – PrecomputedTxData (txdata.Init) built once per tx; see test_cffix_precomputed_sighash
 ##   G25 BUG   – verifyInputScript passes coinbase flag into InputVerificationTask but never uses it
 ##   G26 BUG   – parallel_verify imports validation.nim but re-computes script flags ignoring blockHash exceptions
 ##               (BIP16/Taproot exception hashes not checked in parallel path)
@@ -51,7 +51,7 @@
 
 import unittest2
 import std/[options, tables, sets, cpuinfo]
-import ../src/perf/[parallel_verify, sig_cache]
+import ../src/perf/[parallel_verify, sig_cache, verify_pool]
 import ../src/consensus/[validation, params]
 import ../src/primitives/[types, serialize]
 import ../src/storage/chainstate
@@ -592,20 +592,53 @@ suite "G21 — parallel path missing BIP-341 sighash inputs (allAmounts/allScrip
     check true  ## structural bug documented above
 
 # ---------------------------------------------------------------------------
-# G24: no PrecomputedTransactionData — sighash recomputed per-input
+# G24: PrecomputedTransactionData — FIXED (cffix-nimrod-precomputed-sighash)
 # ---------------------------------------------------------------------------
-suite "G24 — no PrecomputedTransactionData (sighash precomputation)":
+suite "G24 — PrecomputedTransactionData (sighash precomputation, fixed)":
   ## Core: PrecomputedTransactionData.Init() computes hashPrevouts, hashSequences,
   ## hashOutputs once per transaction, then all inputs share it.
   ## CScriptCheck holds a pointer to the shared txdata.
-  ## Nimrod: each verifyScript call recomputes sighash components from scratch.
-  ## For a tx with 100 inputs, Core computes hashPrevouts once; nimrod 100 times.
+  ## Nimrod: collectChecks builds one PrecomputedTxData per tx into its
+  ## TxPrevouts, and every ScriptCheck of that tx reads it through
+  ## prevoutsPtr. The byte-count proof is tests/test_cffix_precomputed_sighash.
 
-  test "G24a: serial verifyScripts has no PrecomputedTransactionData field":
-    ## verifyScripts (validation.nim:1460) has no txdata or precomputed parameter.
-    ## Every call to verifyScript inside the loop recomputes sighash independently.
-    ## BUG G24: O(n_inputs) sighash work vs Core's O(1) precomputation + O(n) verification.
-    check true  ## structural performance bug
+  test "G24a: each tx's TxPrevouts carries its PrecomputedTxData":
+    ## Two P2TR witness inputs (collectChecks resolves coins and builds the
+    ## checks; it does not run scripts, so the signatures need not be valid).
+    when compiles(TxPrevouts().txdata):
+      var fundTxid: array[32, byte]
+      fundTxid[0] = 0x24
+      let spk = @[0x51'u8, 0x20] & newSeq[byte](32)
+      var tx = Transaction(version: 2, lockTime: 0)
+      for v in 0'u32 .. 1'u32:
+        tx.inputs.add TxIn(prevOut: OutPoint(txid: TxId(fundTxid), vout: v),
+                           scriptSig: @[], sequence: 0xFFFFFFFF'u32)
+        tx.witnesses.add @[newSeq[byte](64)]
+      tx.outputs = @[TxOut(value: Satoshi(1000), scriptPubKey: @[0x51'u8])]
+      let cb = Transaction(version: 1,
+        inputs: @[TxIn(prevOut: OutPoint(txid: TxId(default(array[32, byte])),
+                                         vout: 0xFFFFFFFF'u32),
+                       scriptSig: @[0x01'u8, 0x64, 0x01, 0], sequence: 0xFFFFFFFF'u32)],
+        outputs: @[TxOut(value: Satoshi(1000), scriptPubKey: @[0x51'u8])],
+        witnesses: @[], lockTime: 0)
+      let blk = Block(header: BlockHeader(version: 4), txs: @[cb, tx])
+      let lookup = proc(op: OutPoint): Option[UtxoEntry] =
+        if array[32, byte](op.txid) == fundTxid:
+          some(UtxoEntry(output: TxOut(value: Satoshi(5000), scriptPubKey: spk),
+                         height: 1, isCoinbase: false))
+        else: none(UtxoEntry)
+      var checks: seq[ScriptCheck]
+      var store: seq[TxPrevouts]
+      check collectChecks(blk, lookup, 200'i32, regtestParams(), checks,
+                          store).isOk
+      check store.len == 1
+      check checks.len == 2
+      check store[0].txdata.bip341Ready
+      for c in checks:
+        check c.prevoutsPtr == addr store[0]
+    else:
+      checkpoint "TxPrevouts carries no PrecomputedTxData"
+      fail()
 
 # ---------------------------------------------------------------------------
 # G25: coinbase flag in InputVerificationTask is unused

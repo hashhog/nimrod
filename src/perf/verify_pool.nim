@@ -102,6 +102,11 @@ type
     ## every worker access.
     allAmounts*: seq[Satoshi]
     allScriptPubKeys*: seq[seq[byte]]
+    txdata*: PrecomputedTxData
+      ## The tx's BIP-143 / BIP-341 sighash digests, built once from this
+      ## tx and the two arrays above (initPrecomputedTxData) before any check
+      ## runs, and only read afterwards. A default (not ready) value makes
+      ## every check hash them itself, as before.
 
   ScriptCheck* = object
     ## Self-contained, by-value description of ONE input's script verification.
@@ -215,7 +220,8 @@ proc runOne(chk: ScriptCheck): ScriptError {.gcsafe.} =
       chk.flags,
       chk.witness,
       amounts,
-      scriptPKs
+      scriptPKs,
+      if prevouts != nil: addr prevouts[].txdata else: nil
     )
 
 proc runOneSafe(chk: ScriptCheck): tuple[err: ScriptError, internal: bool,

@@ -2,7 +2,7 @@
 ## Stack-based virtual machine for transaction validation
 ## Supports P2PKH, P2SH, P2WPKH, P2WSH, and P2TR
 
-import std/[sequtils, algorithm]
+import std/[sequtils, algorithm, atomics]
 import nimcrypto/sha
 import ../primitives/types
 import ../primitives/serialize
@@ -851,43 +851,174 @@ proc computeSighashLegacy*(tx: Transaction, inputIndex: int,
 
   doubleSha256(w.data)
 
+# Test hook: bytes fed to SHA-256 while building BIP-143 / BIP-341 sighashes.
+# Off unless a test sets `sighashByteCounting = true`, so the hot path pays one
+# bool load. Atomic because the script-check pool hashes on worker threads.
+var sighashByteCounting*: bool = false
+var gSighashHashedBytes: Atomic[int]
+
+proc resetSighashHashedBytes*() =
+  {.cast(gcsafe).}:
+    gSighashHashedBytes.store(0, moRelaxed)
+
+proc sighashHashedBytes*(): int =
+  {.cast(gcsafe).}:
+    result = gSighashHashedBytes.load(moRelaxed)
+
+template countSighashBytes(n: int) =
+  {.cast(gcsafe).}:
+    if sighashByteCounting:
+      discard gSighashHashedBytes.fetchAdd(n, moRelaxed)
+
+type
+  PrecomputedTxData* = object
+    ## Core's PrecomputedTransactionData (script/interpreter.h:163): the
+    ## whole-transaction parts of the BIP-143 and BIP-341 signature messages,
+    ## hashed ONCE per transaction and shared by every input's signature
+    ## checks. Without it each CHECKSIG / CHECKSIGADD / key-path verify
+    ## re-hashed every prevout, sequence, spent output and output: O(sigs x
+    ## inputs) bytes of SHA-256 per tx.
+    ##
+    ## Plain data, built before any script runs and read-only afterwards, so
+    ## script-check worker threads may share one by pointer.
+    ##
+    ## A half that is not ready is never read: the sighash procs then build
+    ## the digest from the transaction, exactly as before. `nIn` / `nOut`
+    ## record the shape it was built for; a tx of another shape never uses it.
+    bip143Ready*: bool
+    bip341Ready*: bool
+    nIn*, nOut*: int
+    # BIP-143: SHA256d of the serialized prevouts / sequences / outputs.
+    hashPrevouts*, hashSequence*, hashOutputs*: array[32, byte]
+    # BIP-341: single SHA256 of the same, plus the spent amounts and scripts.
+    shaPrevouts*, shaSequences*, shaOutputs*: array[32, byte]
+    shaAmounts*, shaScriptPubKeys*: array[32, byte]
+
+proc initPrecomputedTxData*(tx: Transaction, amounts: openArray[Satoshi],
+                            scriptPubKeys: openArray[seq[byte]],
+                            force = false): PrecomputedTxData =
+  ## Core PrecomputedTransactionData::Init (interpreter.cpp:1404). The spent
+  ## outputs count as known only when there is one amount and one script per
+  ## input. Unless `force`, a half is built only when some input needs it: an
+  ## input with a witness spending a P2TR output (known spent outputs) needs
+  ## the BIP-341 half, any other input with a witness the BIP-143 half.
+  ##
+  ## The caller must pass the same `amounts` / `scriptPubKeys` it later hands
+  ## to the verifier: the BIP-341 half commits to them.
+  result.nIn = tx.inputs.len
+  result.nOut = tx.outputs.len
+  let spentKnown = amounts.len == tx.inputs.len and
+                   scriptPubKeys.len == tx.inputs.len
+  var uses143 = force
+  var uses341 = force
+  if not force:
+    for i in 0 ..< tx.inputs.len:
+      if i < tx.witnesses.len and tx.witnesses[i].len > 0:
+        # Core: scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE && [0] == OP_1
+        if spentKnown and scriptPubKeys[i].len == 34 and
+           scriptPubKeys[i][0] == 0x51'u8:
+          uses341 = true
+        else:
+          uses143 = true
+      if uses143 and uses341: break
+  if not (uses143 or uses341):
+    return
+
+  var w = BinaryWriter()
+  for input in tx.inputs:
+    w.writeOutPoint(input.prevOut)
+  countSighashBytes(w.data.len)
+  result.shaPrevouts = sha256(w.data)
+
+  w = BinaryWriter()
+  for input in tx.inputs:
+    w.writeUint32LE(input.sequence)
+  countSighashBytes(w.data.len)
+  result.shaSequences = sha256(w.data)
+
+  w = BinaryWriter()
+  for output in tx.outputs:
+    w.writeTxOut(output)
+  countSighashBytes(w.data.len)
+  result.shaOutputs = sha256(w.data)
+
+  if uses143:
+    # Core: hashPrevouts = SHA256(m_prevouts_single_hash), i.e. SHA256d.
+    countSighashBytes(3 * 32)
+    result.hashPrevouts = sha256(result.shaPrevouts)
+    result.hashSequence = sha256(result.shaSequences)
+    result.hashOutputs = sha256(result.shaOutputs)
+    result.bip143Ready = true
+
+  if uses341 and spentKnown:
+    w = BinaryWriter()
+    for amt in amounts:
+      w.writeInt64LE(int64(amt))
+    countSighashBytes(w.data.len)
+    result.shaAmounts = sha256(w.data)
+
+    w = BinaryWriter()
+    for spk in scriptPubKeys:
+      w.writeVarBytes(spk)
+    countSighashBytes(w.data.len)
+    result.shaScriptPubKeys = sha256(w.data)
+    result.bip341Ready = true
+
 proc computeSighashSegwitV0*(tx: Transaction, inputIndex: int,
                               scriptCode: openArray[byte],
                               amount: Satoshi,
-                              hashType: uint32): array[32, byte] =
+                              hashType: uint32,
+                              txdata: ptr PrecomputedTxData = nil): array[32, byte] =
   ## BIP-143 sighash for SegWit v0
   ## Commits to: version | hashPrevouts | hashSequence | outpoint |
   ##             scriptCode | amount | sequence | hashOutputs | locktime | hashType
 
   let baseType = hashType and 0x1f
   let anyoneCanPay = (hashType and uint32(SIGHASH_ANYONECANPAY)) != 0
+  # Per-tx digests built once per transaction (Core: cacheready =
+  # cache && cache->m_bip143_segwit_ready); else hash them here.
+  let cached = txdata != nil and txdata.bip143Ready and
+               txdata.nIn == tx.inputs.len and txdata.nOut == tx.outputs.len
 
   # hashPrevouts
   var hashPrevouts: array[32, byte]
   if not anyoneCanPay:
-    var w = BinaryWriter()
-    for input in tx.inputs:
-      w.writeOutPoint(input.prevOut)
-    hashPrevouts = doubleSha256(w.data)
+    if cached:
+      hashPrevouts = txdata.hashPrevouts
+    else:
+      var w = BinaryWriter()
+      for input in tx.inputs:
+        w.writeOutPoint(input.prevOut)
+      countSighashBytes(w.data.len + 32)
+      hashPrevouts = doubleSha256(w.data)
 
   # hashSequence
   var hashSequence: array[32, byte]
   if not anyoneCanPay and baseType != uint32(SIGHASH_SINGLE) and baseType != uint32(SIGHASH_NONE):
-    var w = BinaryWriter()
-    for input in tx.inputs:
-      w.writeUint32LE(input.sequence)
-    hashSequence = doubleSha256(w.data)
+    if cached:
+      hashSequence = txdata.hashSequence
+    else:
+      var w = BinaryWriter()
+      for input in tx.inputs:
+        w.writeUint32LE(input.sequence)
+      countSighashBytes(w.data.len + 32)
+      hashSequence = doubleSha256(w.data)
 
   # hashOutputs
   var hashOutputs: array[32, byte]
   if baseType != uint32(SIGHASH_SINGLE) and baseType != uint32(SIGHASH_NONE):
-    var w = BinaryWriter()
-    for output in tx.outputs:
-      w.writeTxOut(output)
-    hashOutputs = doubleSha256(w.data)
+    if cached:
+      hashOutputs = txdata.hashOutputs
+    else:
+      var w = BinaryWriter()
+      for output in tx.outputs:
+        w.writeTxOut(output)
+      countSighashBytes(w.data.len + 32)
+      hashOutputs = doubleSha256(w.data)
   elif baseType == uint32(SIGHASH_SINGLE) and inputIndex < tx.outputs.len:
     var w = BinaryWriter()
     w.writeTxOut(tx.outputs[inputIndex])
+    countSighashBytes(w.data.len + 32)
     hashOutputs = doubleSha256(w.data)
 
   # Build preimage
@@ -903,6 +1034,7 @@ proc computeSighashSegwitV0*(tx: Transaction, inputIndex: int,
   preimage.writeUint32LE(tx.lockTime)
   preimage.writeUint32LE(hashType)
 
+  countSighashBytes(preimage.data.len + 32)
   doubleSha256(preimage.data)
 
 proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
@@ -912,13 +1044,22 @@ proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
                             extFlag: uint8 = 0,
                             annex: seq[byte] = @[],
                             tapleafHash: array[32, byte] = default(array[32, byte]),
-                            codesepPos: uint32 = 0xFFFFFFFF'u32): array[32, byte] =
+                            codesepPos: uint32 = 0xFFFFFFFF'u32,
+                            txdata: ptr PrecomputedTxData = nil): array[32, byte] =
   ## BIP-341 taproot sighash
   ## Uses tagged hashes: SHA256(SHA256("TapSighash") || SHA256("TapSighash") || epoch || ...)
+  ##
+  ## `txdata`, when given, must have been built from this tx and from these
+  ## same `amounts` / `scriptPubKeys` (initPrecomputedTxData).
 
   let effectiveHashType = if hashType == 0x00: SIGHASH_ALL else: hashType
   let baseType = effectiveHashType and 0x1f
   let anyoneCanPay = (effectiveHashType and SIGHASH_ANYONECANPAY) != 0
+  # Per-tx digests built once per transaction (Core SignatureHashSchnorr
+  # reads cache.m_*_single_hash); else hash them here.
+  let cached = txdata != nil and txdata.bip341Ready and
+               txdata.nIn == tx.inputs.len and txdata.nOut == tx.outputs.len and
+               amounts.len == tx.inputs.len and scriptPubKeys.len == tx.inputs.len
 
   var preimage: seq[byte]
 
@@ -940,36 +1081,50 @@ proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
 
   # sha_prevouts, sha_amounts, sha_scriptpubkeys, sha_sequences
   if not anyoneCanPay:
-    # sha_prevouts
-    w = BinaryWriter()
-    for input in tx.inputs:
-      w.writeOutPoint(input.prevOut)
-    preimage.add(sha256(w.data))
+    if cached:
+      preimage.add(txdata.shaPrevouts)
+      preimage.add(txdata.shaAmounts)
+      preimage.add(txdata.shaScriptPubKeys)
+      preimage.add(txdata.shaSequences)
+    else:
+      # sha_prevouts
+      w = BinaryWriter()
+      for input in tx.inputs:
+        w.writeOutPoint(input.prevOut)
+      countSighashBytes(w.data.len)
+      preimage.add(sha256(w.data))
 
-    # sha_amounts
-    w = BinaryWriter()
-    for amt in amounts:
-      w.writeInt64LE(int64(amt))
-    preimage.add(sha256(w.data))
+      # sha_amounts
+      w = BinaryWriter()
+      for amt in amounts:
+        w.writeInt64LE(int64(amt))
+      countSighashBytes(w.data.len)
+      preimage.add(sha256(w.data))
 
-    # sha_scriptpubkeys
-    w = BinaryWriter()
-    for spk in scriptPubKeys:
-      w.writeVarBytes(spk)
-    preimage.add(sha256(w.data))
+      # sha_scriptpubkeys
+      w = BinaryWriter()
+      for spk in scriptPubKeys:
+        w.writeVarBytes(spk)
+      countSighashBytes(w.data.len)
+      preimage.add(sha256(w.data))
 
-    # sha_sequences
-    w = BinaryWriter()
-    for input in tx.inputs:
-      w.writeUint32LE(input.sequence)
-    preimage.add(sha256(w.data))
+      # sha_sequences
+      w = BinaryWriter()
+      for input in tx.inputs:
+        w.writeUint32LE(input.sequence)
+      countSighashBytes(w.data.len)
+      preimage.add(sha256(w.data))
 
   # sha_outputs
   if baseType != uint32(SIGHASH_NONE) and baseType != uint32(SIGHASH_SINGLE):
-    w = BinaryWriter()
-    for output in tx.outputs:
-      w.writeTxOut(output)
-    preimage.add(sha256(w.data))
+    if cached:
+      preimage.add(txdata.shaOutputs)
+    else:
+      w = BinaryWriter()
+      for output in tx.outputs:
+        w.writeTxOut(output)
+      countSighashBytes(w.data.len)
+      preimage.add(sha256(w.data))
 
   # spend_type
   var spendType: uint8 = extFlag * 2
@@ -1003,6 +1158,7 @@ proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
   if annex.len > 0:
     w = BinaryWriter()
     w.writeVarBytes(annex)
+    countSighashBytes(w.data.len)
     preimage.add(sha256(w.data))
 
   # sha_single_output (for SIGHASH_SINGLE)
@@ -1010,6 +1166,7 @@ proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
     if inputIndex < tx.outputs.len:
       w = BinaryWriter()
       w.writeTxOut(tx.outputs[inputIndex])
+      countSighashBytes(w.data.len)
       preimage.add(sha256(w.data))
     else:
       # Return error hash
@@ -1028,6 +1185,7 @@ proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
     w.writeUint32LE(codesepPos)
     preimage.add(w.data)
 
+  countSighashBytes(preimage.len + 64)
   taggedHash("TapSighash", preimage)
 
 # Script pattern detection
@@ -1149,6 +1307,11 @@ type
     annex*: seq[byte]
     tapleafHash*: array[32, byte]
     codesepPos*: uint32
+    txdata*: ptr PrecomputedTxData
+      ## Per-tx sighash digests shared by every input (Core: the
+      ## PrecomputedTransactionData a CScriptCheck points at). nil = none;
+      ## for BIP-341 it is set only when `amounts` / `scriptPubKeys` are the
+      ## full spent-output arrays it was built from.
 
 # CheckMinimalPush: verify that a push opcode uses the minimal encoding
 proc checkMinimalPush(data: seq[byte], opcode: uint8): bool =
@@ -1958,7 +2121,8 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
               else:
                 scriptCode = @script
 
-            let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, scriptCode, ctx.amount, hashType)
+            let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, scriptCode, ctx.amount, hashType,
+                                                  ctx.txdata)
             # W160 BUG-11 fix: per-sig cache; see legacy branch above.
             if globalSigCache.lookup(sighash, pubkey, sigWithoutHashType):
               success = true
@@ -2038,7 +2202,8 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             # 0xFFFFFFFF regardless of any executed OP_CODESEPARATOR.
             let sighash = computeSighashTaproot(
               ctx.tx, ctx.inputIndex, ctx.amounts, ctx.scriptPubKeys,
-              hashType, extFlag, ctx.annex, ctx.tapleafHash, interp.codesepPos
+              hashType, extFlag, ctx.annex, ctx.tapleafHash, interp.codesepPos,
+              ctx.txdata
             )
             # SIGHASH_SINGLE out-of-range output: computeSighashTaproot
             # returns the all-zero sentinel; treat as hard hashtype error
@@ -2191,7 +2356,8 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
                 scriptCode = script[int(interp.codesepByteOffset) ..< script.len]
               else:
                 scriptCode = @script
-              let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, scriptCode, ctx.amount, hashType)
+              let sighash = computeSighashSegwitV0(ctx.tx, ctx.inputIndex, scriptCode, ctx.amount, hashType,
+                                                  ctx.txdata)
               verified = verifyDerLax(pubkey, sighash, sigWithoutHashType)
 
           else:
@@ -2388,7 +2554,8 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
           # OP_CHECKSIG site above for the full rationale.
           let sighash = computeSighashTaproot(
             ctx.tx, ctx.inputIndex, ctx.amounts, ctx.scriptPubKeys,
-            hashType, 1, ctx.annex, ctx.tapleafHash, interp.codesepPos
+            hashType, 1, ctx.annex, ctx.tapleafHash, interp.codesepPos,
+            ctx.txdata
           )
           # SIGHASH_SINGLE out-of-range output: Core returns false from
           # SignatureHashSchnorr -> SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.
@@ -2447,7 +2614,8 @@ proc verifyWitnessProgram*(
   flags: set[ScriptFlags],
   allAmounts: seq[Satoshi] = @[],
   allScriptPubKeys: seq[seq[byte]] = @[],
-  isP2SH: bool = false
+  isP2SH: bool = false,
+  txdata: ptr PrecomputedTxData = nil
 ): bool
 
 proc verifyScript*(
@@ -2459,7 +2627,8 @@ proc verifyScript*(
   flags: set[ScriptFlags] = {},
   witness: seq[seq[byte]] = @[],
   allAmounts: seq[Satoshi] = @[],
-  allScriptPubKeys: seq[seq[byte]] = @[]
+  allScriptPubKeys: seq[seq[byte]] = @[],
+  txdata: ptr PrecomputedTxData = nil
 ): bool =
   ## Verify a transaction input
   ## allAmounts/allScriptPubKeys: for BIP341 taproot sighash, ALL input amounts
@@ -2472,6 +2641,11 @@ proc verifyScript*(
                    else: @[amount]
   let ctxScriptPubKeys = if allScriptPubKeys.len == tx.inputs.len: allScriptPubKeys
                          else: @[scriptPubKey]
+  # The per-tx sighash data is only valid with the full spent-output arrays
+  # it was built from; without them, every digest is built here as before.
+  let td = if allAmounts.len == tx.inputs.len and
+              allScriptPubKeys.len == tx.inputs.len: txdata
+           else: nil
 
   # Create signature check context
   var ctx = SigCheckContext(
@@ -2482,7 +2656,8 @@ proc verifyScript*(
     sigVersion: sigBase,
     amounts: ctxAmounts,
     scriptPubKeys: ctxScriptPubKeys,
-    codesepPos: 0xFFFFFFFF'u32
+    codesepPos: 0xFFFFFFFF'u32,
+    txdata: td
   )
 
   # SIG_PUSHONLY: scriptSig must be push-only when flag is set
@@ -2527,7 +2702,7 @@ proc verifyScript*(
 
     return verifyWitnessProgram(
       witness, witnessVersion, witnessProgram, tx, inputIndex, amount, flags,
-      ctxAmounts, ctxScriptPubKeys
+      ctxAmounts, ctxScriptPubKeys, txdata = td
     )
 
   # P2SH handling
@@ -2571,7 +2746,7 @@ proc verifyScript*(
         return false  # seWitnessMalleatedP2SH
       return verifyWitnessProgram(
         witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags,
-        ctxAmounts, ctxScriptPubKeys, isP2SH = true
+        ctxAmounts, ctxScriptPubKeys, isP2SH = true, txdata = td
       )
 
   # BIP141: if WITNESS flag is set and the script is NOT a witness program,
@@ -2601,7 +2776,8 @@ proc verifyWitnessProgramWithError*(
   flags: set[ScriptFlags],
   allAmounts: seq[Satoshi] = @[],
   allScriptPubKeys: seq[seq[byte]] = @[],
-  isP2SH: bool = false
+  isP2SH: bool = false,
+  txdata: ptr PrecomputedTxData = nil
 ): ScriptError
 
 proc verifyScriptWithError*(
@@ -2613,7 +2789,8 @@ proc verifyScriptWithError*(
   flags: set[ScriptFlags] = {},
   witness: seq[seq[byte]] = @[],
   allAmounts: seq[Satoshi] = @[],
-  allScriptPubKeys: seq[seq[byte]] = @[]
+  allScriptPubKeys: seq[seq[byte]] = @[],
+  txdata: ptr PrecomputedTxData = nil
 ): ScriptError =
   ## Verify a transaction input, returning the specific error on failure
 
@@ -2624,6 +2801,11 @@ proc verifyScriptWithError*(
                    else: @[amount]
   let ctxScriptPubKeys = if allScriptPubKeys.len == tx.inputs.len: allScriptPubKeys
                          else: @[scriptPubKey]
+  # The per-tx sighash data is only valid with the full spent-output arrays
+  # it was built from; without them, every digest is built here as before.
+  let td = if allAmounts.len == tx.inputs.len and
+              allScriptPubKeys.len == tx.inputs.len: txdata
+           else: nil
 
   # Create signature check context
   var ctx = SigCheckContext(
@@ -2634,7 +2816,8 @@ proc verifyScriptWithError*(
     sigVersion: sigBase,
     amounts: ctxAmounts,
     scriptPubKeys: ctxScriptPubKeys,
-    codesepPos: 0xFFFFFFFF'u32
+    codesepPos: 0xFFFFFFFF'u32,
+    txdata: td
   )
 
   # SIG_PUSHONLY: scriptSig must be push-only when flag is set
@@ -2679,7 +2862,7 @@ proc verifyScriptWithError*(
 
     return verifyWitnessProgramWithError(
       witness, witnessVersion, witnessProgram, tx, inputIndex, amount, flags,
-      ctxAmounts, ctxScriptPubKeys
+      ctxAmounts, ctxScriptPubKeys, txdata = td
     )
 
   # P2SH handling
@@ -2723,7 +2906,7 @@ proc verifyScriptWithError*(
         return seWitnessMalleatedP2SH
       return verifyWitnessProgramWithError(
         witness, p2shVersion, p2shProgram, tx, inputIndex, amount, flags,
-        ctxAmounts, ctxScriptPubKeys, isP2SH = true
+        ctxAmounts, ctxScriptPubKeys, isP2SH = true, txdata = td
       )
 
   # BIP141: if WITNESS flag is set and script is NOT a witness program,
@@ -2750,7 +2933,8 @@ proc verifyWitnessProgram*(
   flags: set[ScriptFlags],
   allAmounts: seq[Satoshi] = @[],
   allScriptPubKeys: seq[seq[byte]] = @[],
-  isP2SH: bool = false
+  isP2SH: bool = false,
+  txdata: ptr PrecomputedTxData = nil
 ): bool =
   ## Verify a witness program
   ## allAmounts/allScriptPubKeys: for BIP341 taproot, ALL input prevout data
@@ -2789,7 +2973,8 @@ proc verifyWitnessProgram*(
         sigVersion: sigWitnessV0,
         amounts: @[amount],
         scriptPubKeys: @[@[OP_0, 0x14'u8] & program],
-        codesepPos: 0xFFFFFFFF'u32
+        codesepPos: 0xFFFFFFFF'u32,
+        txdata: txdata
       )
 
       let err = interp.eval(scriptCode, ctx)
@@ -2840,7 +3025,8 @@ proc verifyWitnessProgram*(
         sigVersion: sigWitnessV0,
         amounts: @[amount],
         scriptPubKeys: @[@[OP_0, 0x20'u8] & program],
-        codesepPos: 0xFFFFFFFF'u32
+        codesepPos: 0xFFFFFFFF'u32,
+        txdata: txdata
       )
 
       let err = interp.eval(witnessScript, ctx)
@@ -2902,9 +3088,11 @@ proc verifyWitnessProgram*(
       # Use provided arrays if available, otherwise fall back to single-input
       var taprootAmounts: seq[Satoshi]
       var taprootScriptPubKeys: seq[seq[byte]]
+      var taprootTxdata: ptr PrecomputedTxData = nil
       if allAmounts.len == tx.inputs.len and allScriptPubKeys.len == tx.inputs.len:
         taprootAmounts = allAmounts
         taprootScriptPubKeys = allScriptPubKeys
+        taprootTxdata = txdata
       else:
         # Fallback for single-input txs or when full data not available
         for i, inp in tx.inputs:
@@ -2923,7 +3111,8 @@ proc verifyWitnessProgram*(
         return false
 
       let sighash = computeSighashTaproot(
-        tx, inputIndex, taprootAmounts, taprootScriptPubKeys, hashType, 0, annex
+        tx, inputIndex, taprootAmounts, taprootScriptPubKeys, hashType, 0, annex,
+        txdata = taprootTxdata
       )
 
       var xonlyPk: array[32, byte]
@@ -3083,9 +3272,11 @@ proc verifyWitnessProgram*(
       # Get all input amounts and scriptPubKeys for taproot sighash
       var tapAmounts: seq[Satoshi]
       var tapScriptPubKeys: seq[seq[byte]]
+      var tapTxdata: ptr PrecomputedTxData = nil
       if allAmounts.len == tx.inputs.len and allScriptPubKeys.len == tx.inputs.len:
         tapAmounts = allAmounts
         tapScriptPubKeys = allScriptPubKeys
+        tapTxdata = txdata
       else:
         for i, inp in tx.inputs:
           if i == inputIndex:
@@ -3105,7 +3296,8 @@ proc verifyWitnessProgram*(
         scriptPubKeys: tapScriptPubKeys,
         annex: annex,
         tapleafHash: tapleafHash,
-        codesepPos: 0xFFFFFFFF'u32
+        codesepPos: 0xFFFFFFFF'u32,
+        txdata: tapTxdata
       )
 
       let err = interp.eval(tapscript, ctx)
@@ -3143,7 +3335,8 @@ proc verifyWitnessProgramWithError*(
   flags: set[ScriptFlags],
   allAmounts: seq[Satoshi] = @[],
   allScriptPubKeys: seq[seq[byte]] = @[],
-  isP2SH: bool = false
+  isP2SH: bool = false,
+  txdata: ptr PrecomputedTxData = nil
 ): ScriptError =
   ## Verify a witness program, returning the specific error on failure
   ## isP2SH: true when the witness program came from a P2SH redeemScript; gates
@@ -3178,7 +3371,8 @@ proc verifyWitnessProgramWithError*(
         sigVersion: sigWitnessV0,
         amounts: @[amount],
         scriptPubKeys: @[@[OP_0, 0x14'u8] & program],
-        codesepPos: 0xFFFFFFFF'u32
+        codesepPos: 0xFFFFFFFF'u32,
+        txdata: txdata
       )
 
       let err = interp.eval(scriptCode, ctx)
@@ -3222,7 +3416,8 @@ proc verifyWitnessProgramWithError*(
         sigVersion: sigWitnessV0,
         amounts: @[amount],
         scriptPubKeys: @[@[OP_0, 0x20'u8] & program],
-        codesepPos: 0xFFFFFFFF'u32
+        codesepPos: 0xFFFFFFFF'u32,
+        txdata: txdata
       )
 
       let err = interp.eval(witnessScript, ctx)
@@ -3262,7 +3457,7 @@ proc verifyWitnessProgramWithError*(
     if witnessStack.len == 1:
       # Key path spend - delegate to bool version for signature check
       if verifyWitnessProgram(witness, version, program, tx, inputIndex, amount, flags,
-                              allAmounts, allScriptPubKeys):
+                              allAmounts, allScriptPubKeys, txdata = txdata):
         return seOk
       else:
         return seTaprootError
@@ -3395,9 +3590,11 @@ proc verifyWitnessProgramWithError*(
       # Get all input amounts and scriptPubKeys for taproot sighash
       var tapAmts: seq[Satoshi]
       var tapSpks: seq[seq[byte]]
+      var tapTxdata: ptr PrecomputedTxData = nil
       if allAmounts.len == tx.inputs.len and allScriptPubKeys.len == tx.inputs.len:
         tapAmts = allAmounts
         tapSpks = allScriptPubKeys
+        tapTxdata = txdata
       else:
         for i, inp in tx.inputs:
           if i == inputIndex:
@@ -3417,7 +3614,8 @@ proc verifyWitnessProgramWithError*(
         scriptPubKeys: tapSpks,
         annex: annex,
         tapleafHash: tapleafHash,
-        codesepPos: 0xFFFFFFFF'u32
+        codesepPos: 0xFFFFFFFF'u32,
+        txdata: tapTxdata
       )
 
       let err = interp.eval(tapscript, ctx)
