@@ -121,13 +121,26 @@ type
     sigTaproot = 2     # Taproot (SegWit v1)
     sigTapscript = 3   # Tapscript
 
+  ConditionStack* = object
+    ## IF/NOTIF/ELSE/ENDIF execution state, kept the way Core's
+    ## ConditionStack does it (script/interpreter.cpp:273-320). It stands for
+    ## a stack of booleans but stores only its size and the position of the
+    ## lowest false entry, because every entry above a false one is irrelevant
+    ## to whether we execute. Each operation is O(1). A seq[bool] that had to
+    ## be scanned before every opcode made nested OP_IF quadratic in
+    ## tapscript, where neither the 10,000-byte script limit nor the 201-op
+    ## limit applies.
+    size*: int            ## number of open IF/NOTIF blocks
+    firstFalsePos*: int   ## index of the lowest false entry, or NoFalse
+    checks*: int          ## allTrue calls (one per opcode); a cost counter for tests
+
   ScriptInterpreter* = object
     stack*: seq[seq[byte]]
     altStack*: seq[seq[byte]]
     flags*: set[ScriptFlags]
     opCount*: int
     crypto*: CryptoEngine
-    execStack*: seq[bool]  # Track IF/ELSE execution state
+    condStack*: ConditionStack  # Track IF/ELSE execution state
     codesepPos*: uint32    # OPCODE INDEX of last OP_CODESEPARATOR (BIP-341 tapscript sigmsg)
     # BYTE OFFSET just after the last executed OP_CODESEPARATOR, used for the
     # legacy / SegWit-v0 sighash scriptCode = CScript(pbegincodehash, pend).
@@ -307,7 +320,6 @@ const
   SEQUENCE_LOCKTIME_TYPE_FLAG* = 1'u32 shl 22
   SEQUENCE_LOCKTIME_MASK* = 0x0000ffff'u32
 
-# Helper: check if executing (all conditions in execStack are true)
 proc coreScriptErrorString*(e: ScriptError): string =
   ## Bitcoin Core's ScriptErrorString (script/script_error.cpp:11-127) for a
   ## nimrod ScriptError.  Used only for reject TEXT (mempool
@@ -379,11 +391,48 @@ proc coreScriptErrorString*(e: ScriptError): string =
   of seOpCodeSeparator: "Using OP_CODESEPARATOR in non-witness script"
   of seSigFindAndDelete: "Signature is found in scriptCode"
 
-proc isExecuting(interp: ScriptInterpreter): bool =
-  for exec in interp.execStack:
-    if not exec:
-      return false
-  true
+const NoFalse* = -1  ## ConditionStack.firstFalsePos when every entry is true
+
+proc initConditionStack*(): ConditionStack =
+  ConditionStack(size: 0, firstFalsePos: NoFalse, checks: 0)
+
+proc empty*(cs: ConditionStack): bool {.inline.} =
+  cs.size == 0
+
+proc allTrue*(cs: var ConditionStack): bool {.inline.} =
+  ## True when no entry is false, i.e. the current branch executes.
+  inc cs.checks
+  cs.firstFalsePos == NoFalse
+
+proc pushBack*(cs: var ConditionStack, f: bool) {.inline.} =
+  if cs.firstFalsePos == NoFalse and not f:
+    # The stack consists of all-true values, and a false is added.
+    # The first false value will appear at the current size.
+    cs.firstFalsePos = cs.size
+  inc cs.size
+
+proc popBack*(cs: var ConditionStack) {.inline.} =
+  ## Caller must check `empty` first, as Core asserts it.
+  dec cs.size
+  if cs.firstFalsePos == cs.size:
+    # When popping off the first false value, everything becomes true.
+    cs.firstFalsePos = NoFalse
+
+proc toggleTop*(cs: var ConditionStack) {.inline.} =
+  ## Caller must check `empty` first, as Core asserts it.
+  if cs.firstFalsePos == NoFalse:
+    # The current stack is all true values; the first false will be the top.
+    cs.firstFalsePos = cs.size - 1
+  elif cs.firstFalsePos == cs.size - 1:
+    # The top is the first false value; toggling it will make everything true.
+    cs.firstFalsePos = NoFalse
+  else:
+    # There is a false value, but not on top. No action is needed as
+    # toggling anything but the first false value is unobservable.
+    discard
+
+proc isExecuting(interp: var ScriptInterpreter): bool =
+  interp.condStack.allTrue()
 
 # Stack operations
 proc newInterpreter*(): ScriptInterpreter =
@@ -391,7 +440,7 @@ proc newInterpreter*(): ScriptInterpreter =
   result.altStack = @[]
   result.flags = {}
   result.opCount = 0
-  result.execStack = @[]
+  result.condStack = initConditionStack()
   result.codesepPos = 0xFFFFFFFF'u32  # BIP341: initialize to max
   result.codesepByteOffset = 0xFFFFFFFF'u32  # legacy/segwit-v0: start-of-script sentinel
 
@@ -1387,15 +1436,15 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
     if not executing:
       case opcode
       of OP_IF, OP_NOTIF:
-        interp.execStack.add(false)
+        interp.condStack.pushBack(false)
       of OP_ELSE:
-        if interp.execStack.len == 0:
+        if interp.condStack.empty:
           return seUnbalancedConditional
-        interp.execStack[interp.execStack.len - 1] = not interp.execStack[interp.execStack.len - 1]
+        interp.condStack.toggleTop()
       of OP_ENDIF:
-        if interp.execStack.len == 0:
+        if interp.condStack.empty:
           return seUnbalancedConditional
-        discard interp.execStack.pop()
+        interp.condStack.popBack()
       of OP_RETURN:
         # OP_RETURN in non-executing branch does NOT terminate
         discard
@@ -1442,17 +1491,17 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
       if opcode == OP_NOTIF:
         condition = not condition
-      interp.execStack.add(condition)
+      interp.condStack.pushBack(condition)
 
     of OP_ELSE:
-      if interp.execStack.len == 0:
+      if interp.condStack.empty:
         return seUnbalancedConditional
-      interp.execStack[interp.execStack.len - 1] = not interp.execStack[interp.execStack.len - 1]
+      interp.condStack.toggleTop()
 
     of OP_ENDIF:
-      if interp.execStack.len == 0:
+      if interp.condStack.empty:
         return seUnbalancedConditional
-      discard interp.execStack.pop()
+      interp.condStack.popBack()
 
     of OP_VERIFY:
       if interp.stack.len < 1:
@@ -2429,7 +2478,7 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
       return seStackSize
 
   # Check for unbalanced conditionals
-  if interp.execStack.len > 0:
+  if not interp.condStack.empty:
     return seUnbalancedConditional
 
   seOk
