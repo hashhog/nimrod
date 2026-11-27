@@ -1815,13 +1815,28 @@ proc pingPeers(pm: PeerManager) {.async.} =
   ## uses, so the keepalive and an RPC-triggered ping emit identical BIP-31 PINGs.
   await pm.sendPingsNow()
 
+proc getAddrEligible*(pm: PeerManager, peer: Peer): bool =
+  ## Core sends getaddr only to outbound peers that take part in addr relay:
+  ## never to inbound, block-relay-only or feeler connections
+  ## (net_processing.cpp:3750-3767, `if (!pfrom.IsInboundConn())
+  ## send_getaddr = SetupAddressRelay(...)`).
+  if peer.direction == pdInbound:
+    return false
+  let key = peerKey(peer)
+  if key in pm.extendedPeers and
+      pm.extendedPeers.getOrDefault(key).connType in {pctBlockRelayOnly, pctFeeler}:
+    return false
+  true
+
 proc noteGetAddrSent*(pm: PeerManager, peer: Peer) =
   ## We are sending `peer` a getaddr: accept up to MaxAddrToSend more addrs in
   ## its reply, beyond the processing-bucket cap (Core net_processing.cpp:
   ## 3762-3767, `m_addr_token_bucket += MAX_ADDR_TO_SEND`).  Core sends getaddr
   ## once per connection; nimrod re-sends periodically, so the top-up is
-  ## applied only the first time on a connection.
-  if peer.getaddrSent:
+  ## applied only the first time on a connection.  A peer Core would never
+  ## send getaddr to (getAddrEligible) gets no top-up: otherwise an inbound
+  ## host could wait for the tick, send 1000 addrs, reconnect and repeat.
+  if peer.getaddrSent or not pm.getAddrEligible(peer):
     return
   peer.getaddrSent = true
   peer.addrTokenBucket += float64(MaxAddrToSend)
@@ -1830,6 +1845,8 @@ proc requestAddresses(pm: PeerManager) {.async.} =
   let msg = newGetAddr()
   # Spawned per peer: runs in the PM main loop (see sendPingsNow).
   for peer in pm.getReadyPeers():
+    if not pm.getAddrEligible(peer):
+      continue
     # Make room for the reply before it can arrive (Core adds the tokens
     # when it pushes GETADDR, net_processing.cpp:3767).
     pm.noteGetAddrSent(peer)

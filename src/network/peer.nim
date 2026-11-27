@@ -318,7 +318,9 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     getaddrRecvd: false,
     getaddrSent: false,
     addrTokenBucket: 1.0,
-    addrTokenTimestamp: 0,
+    # Core m_addr_token_timestamp{NodeClock::now()} (net_processing.cpp:382):
+    # the refill clock starts at connect time, not at the first addr message.
+    addrTokenTimestamp: stdtimes.getTime().toUnix(),
     # Handshake state
     handshakeComplete: false,
     versionReceived: false,

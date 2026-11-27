@@ -149,3 +149,28 @@ suite "cffix knownAddresses cap (Core m_addr_token_bucket + bounded AddrMan)":
     # The solicited reply is processed in full.
     pm.handleAddrInternal(peer, newAddr(uniqueAddrs(5, 1000)))
     check pm.knownAddresses.len == 1000
+
+  test "an inbound peer gets no getaddr top-up (Core never sends getaddr inbound)":
+    ## Core net_processing.cpp:3753: getaddr (and its +MAX_ADDR_TO_SEND) only
+    ## for !IsInboundConn().  Otherwise an inbound host waits for the periodic
+    ## getaddr tick, sends 1000 addrs, reconnects and repeats.
+    let pm = newPm()
+    let peer = freshInbound(11)
+    when declared(noteGetAddrSent):
+      pm.noteGetAddrSent(peer)
+    when declared(getAddrEligible):
+      check not pm.getAddrEligible(peer)
+    check peer.addrTokenBucket == 1.0
+    pm.handleAddrInternal(peer, newAddr(uniqueAddrs(6, 1000)))
+    check pm.knownAddresses.len == 1
+
+  test "a block-relay-only outbound peer gets no getaddr top-up":
+    let pm = newPm()
+    let peer = newPeer("198.51.100.9", 8333'u16, mainnetParams(), pdOutbound)
+    pm.extendedPeers["198.51.100.9:8333"] = ExtendedPeer(
+      peer: peer, connType: pctBlockRelayOnly)
+    when declared(noteGetAddrSent):
+      pm.noteGetAddrSent(peer)
+    when declared(getAddrEligible):
+      check not pm.getAddrEligible(peer)
+    check peer.addrTokenBucket == 1.0
