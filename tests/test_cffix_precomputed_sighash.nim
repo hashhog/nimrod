@@ -267,6 +267,9 @@ suite "cffix precomputed sighash: SHA-256 bytes grow linearly with inputs":
     let g = growth("control no-txdata P2TR", mkP2tr, runDirectNoTxdata)
     when HasCounter:
       check g >= 3.5
+    else:
+      checkpoint "no sighashHashedBytes() test hook: nothing to control"
+      fail()
 
   test "block verifyScripts, P2TR key path: growth < 3x":
     check growth("block P2TR", mkP2tr, runBlockSerial) < GrowthBar
