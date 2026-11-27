@@ -84,8 +84,12 @@ let redeems = @[
   push(sigBadHashtype) & @[byte(OP_DROP)] & push(gPub) & @[byte(OP_CHECKSIG), OP_NOT],
   # 7: R14, as 6 with a non-DER sig: master says SIG_DER
   push(sigNotDer) & @[byte(OP_DROP)] & push(gPub) & @[byte(OP_CHECKSIG), OP_NOT],
+  # 8: hostile, P2SH(OP_0 OP_0 OP_1 <G> OP_1 CHECKMULTISIG NOT): dummy, an
+  #    empty sig, 1-of-1 -- nimrod master accepts (CHECKMULTISIG's FAD pass was
+  #    already in Core's order, it only lacked the flag)
+  @[byte(OP_0), OP_0, OP_1] & push(gPub) & @[byte(OP_1), OP_CHECKMULTISIG, OP_NOT],
 ]
-# 8: control, P2WSH(OP_CODESEPARATOR OP_1): CONST_SCRIPTCODE is BASE-only
+# 9: control, P2WSH(OP_CODESEPARATOR OP_1): CONST_SCRIPTCODE is BASE-only
 let wsCodesep = @[byte(OP_CODESEPARATOR), OP_1]
 
 proc coinbaseTx(height: int32): Transaction =
@@ -233,6 +237,14 @@ suite "r3fix const-scriptcode: CHECKSIG FindAndDelete runs first":
     check r.error == coreState(tx, FadText)
     f.teardown()
 
+  test "P2SH(OP_0 OP_0 OP_1 <G> OP_1 CHECKMULTISIG NOT): the empty sig's OP_0 is found -> SIG_FINDANDDELETE":
+    var f = setup()
+    let tx = f.p2shSpend(8)
+    let r = f.accept(tx)
+    check not r.isOk
+    check r.error == coreState(tx, FadText)
+    f.teardown()
+
 # ---------------------------------------------------------------------------
 # Consensus: block flags never carry CONST_SCRIPTCODE, and FindAndDelete
 # still strips the sig from the legacy sighash's scriptCode.
@@ -302,6 +314,11 @@ suite "r3fix const-scriptcode: consensus (block flags) outcomes unchanged":
 
   test "OP_0 OP_0 CHECKSIG NOT is consensus-valid":
     let spk = redeems[5]
+    var tx = bareTx()
+    check verifyScriptWithError(@[], spk, tx, 0, Satoshi(0), blockFlags) == seOk
+
+  test "OP_0 OP_0 OP_1 <G> OP_1 CHECKMULTISIG NOT is consensus-valid":
+    let spk = redeems[8]
     var tx = bareTx()
     check verifyScriptWithError(@[], spk, tx, 0, Satoshi(0), blockFlags) == seOk
 
