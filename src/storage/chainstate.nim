@@ -386,6 +386,14 @@ type
     # reads as a block loaded from disk.
     blockSeqIds*: Table[BlockHash, tuple[seq: int32, height: int32]]
     nextBlockSeqId*: int32
+    # Core nBlockReverseSequenceId / nLastPreciousChainwork, held by Core's
+    # chainstate manager (validation.cpp PreciousBlock): preciousblock hands
+    # out -1, -2, ... so the newest precious block wins an equal-work tie
+    # against every received (>= 2) or loaded-from-disk (0 / 1) id; the
+    # counter restarts at -1 once the tip has gained work since the last
+    # call. In memory only, like Core.
+    preciousNextSeqId*: int32
+    lastPreciousWork*: array[32, byte]
     loadedTip*: BlockHash
     loadedTipHeight*: int32
     # Optional tip-advance hook fired AFTER the active-chain tip pointer is
@@ -1639,6 +1647,7 @@ proc newChainState*(dbPath: string, params: ConsensusParams): ChainState =
     bestHeaderHeight: cdb.bestHeight,   # fallback: chain-tip height
     blockSeqIds: initTable[BlockHash, tuple[seq: int32, height: int32]](),
     nextBlockSeqId: SeqIdInitFromDisk + 1,
+    preciousNextSeqId: -1,
     loadedTip: cdb.bestBlockHash,
     loadedTipHeight: cdb.bestHeight
   )

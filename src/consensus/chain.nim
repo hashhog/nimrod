@@ -754,7 +754,9 @@ proc preciousBlock*(
   ## Reference: Bitcoin Core's PreciousBlock
   ##
   ## Precious blocks get a lower (more negative) sequenceId, which causes
-  ## them to be preferred over other blocks with equal chainwork.
+  ## them to be preferred over other blocks with equal chainwork. This only
+  ## sets the id; the preciousblock RPC then runs activateBestChain, as Core's
+  ## PreciousBlock ends in ActivateBestChain.
   ##
   ## This is used when a node operator wants to manually prefer one chain
   ## over another without invalidating the competing chain.
@@ -773,20 +775,29 @@ proc preciousBlock*(
     # Block has less work than current tip, nothing to do
     return chainMgmtOk()
 
-  # Assign a negative sequence ID to mark as precious
-  # Lower (more negative) values are more precious
-  # We use a simple decrementing counter approach
-  var minSeqId: int32 = 0
-  for h in 0'i32 .. cs.bestHeight:
-    let hashOpt = cs.db.getBlockHashByHeight(h)
-    if hashOpt.isSome:
-      let existingIdx = cs.db.getBlockIndex(hashOpt.get())
-      if existingIdx.isSome and existingIdx.get().sequenceId < minSeqId:
-        minSeqId = existingIdx.get().sequenceId
+  # Core PreciousBlock: a reverse counter (-1, -2, ...) that restarts once
+  # the tip has gained work since the last call. The id goes where chain
+  # selection reads it (blockSeqId -> bestChainCandidate), so the RPC's
+  # ActivateBestChain moves to this block when it ties the tip on work; more
+  # work still wins. Core sets it on a block without its body too, but
+  # ReceivedBlockTransactions overwrites it when the body arrives, so only a
+  # stored body keeps it here (noteBlockReceived leaves an existing id alone).
+  if compareWork256(cs.totalWork, cs.lastPreciousWork) > 0:
+    cs.preciousNextSeqId = -1
+  cs.lastPreciousWork = cs.totalWork
+  let preciousId = cs.preciousNextSeqId
+  if cs.preciousNextSeqId > low(int32):
+    dec cs.preciousNextSeqId
+  if cs.db.hasBlockBody(blockHash):
+    cs.blockSeqIds[blockHash] = (seq: preciousId, height: idx.height)
 
-  # Set this block's sequence ID to one less than the minimum
-  idx.sequenceId = minSeqId - 1
-  cs.db.putBlockIndex(idx)
+  idx.sequenceId = preciousId
+  # Hash row only: putBlockIndex would also point the height -> hash slot at
+  # this (possibly side-branch) block without connecting it, so getblockhash
+  # and every height-slot reader (getMtpForHeight, checkBip30, the assumevalid
+  # gate) would see a block that is not on the active chain. Core's
+  # PreciousBlock changes the active chain only through ActivateBestChain.
+  cs.db.putBlockIndexHashOnly(idx)
 
   chainMgmtOk()
 

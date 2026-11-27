@@ -2868,6 +2868,12 @@ proc handlePreciousBlock(rpc: RpcServer, params: JsonNode): JsonNode =
   if idxOpt.isNone:
     raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
 
+  # Core PreciousBlock returns before ActivateBestChain when the block has
+  # less work than the tip ("Nothing to do"), so a less-work call never
+  # moves the chain, even onto some other branch still waiting.
+  let lessWork =
+    compareWork256(idxOpt.get().totalWork, rpc.chainState.totalWork) < 0
+
   # Call the chain management function
   let result = rpc.chainState.preciousBlock(blockHash)
   if not result.isOk:
@@ -2876,6 +2882,12 @@ proc handlePreciousBlock(rpc: RpcServer, params: JsonNode): JsonNode =
       raise newRpcError(RpcInvalidAddressOrKey, "Block not found")
     else:
       raise newRpcError(RpcMiscError, $result.error)
+
+  # Otherwise Core PreciousBlock ends in ActivateBestChain: an equal-work
+  # precious block now sorts ahead of the tip (bestChainCandidate reads its
+  # id through blockSeqId), so the node moves onto it before the RPC returns.
+  if not lessWork:
+    rpc.activateBestChain()
 
   newJNull()
 
