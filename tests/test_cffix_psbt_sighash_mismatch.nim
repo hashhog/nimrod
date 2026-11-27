@@ -81,8 +81,13 @@ suite "cffix walletprocesspsbt: PSBT_IN_SIGHASH_TYPE vs caller sighashtype (Core
 
   ## A one-input PSBT spending a wallet-owned P2WPKH coin, with
   ## PSBT_IN_SIGHASH_TYPE set to `field` (none = field absent).
+  ## foreignSpk: replace witness_utxo with this scriptPubKey. With
+  ## keepWalletCoin=false the coin is also dropped from the wallet, so the
+  ## input is someone else's; with true it stays a wallet coin whose
+  ## witness_utxo misreports its scriptPubKey.
   proc makePsbt(seedByte: byte, field: Option[int32],
-                foreignSpk: seq[byte] = @[]): string =
+                foreignSpk: seq[byte] = @[],
+                keepWalletCoin = false): string =
     let wOpt = wm.getWallet("tw")
     doAssert wOpt.isSome
     var w = wOpt.get().wallet
@@ -112,11 +117,13 @@ suite "cffix walletprocesspsbt: PSBT_IN_SIGHASH_TYPE vs caller sighashtype (Core
     doAssert p.inputs.len == 1
     p.inputs[0].sighashType = field
     if foreignSpk.len > 0:
-      # Replace the UTXO data with an output the wallet holds no key for, so
-      # the input is someone else's (witness_utxo present, nothing to sign).
+      # Replace the UTXO data with an output the wallet holds no key for.
       p.inputs[0].witnessUtxo = some(TxOut(value: Satoshi(100_000_000),
                                            scriptPubKey: foreignSpk))
       p.inputs[0].nonWitnessUtxo = none(Transaction)
+      if not keepWalletCoin:
+        w.utxos.del(op)
+        doAssert op notin w.utxos
     p.toBase64()
 
   ## walletprocesspsbt "psbt" sign sighashtype(null = omitted) bip32derivs finalize=false
@@ -267,6 +274,25 @@ suite "cffix walletprocesspsbt: PSBT_IN_SIGHASH_TYPE vs caller sighashtype (Core
     var e: ref RpcError = nil
     try:
       discard process(r1["psbt"].getStr(), sighash = %"DEFAULT")
+    except RpcError as err:
+      e = err
+    check e == nil
+
+  # Core takes the prevout from the wallet's own transaction before the
+  # PSBT's witness_utxo (CWallet::FillPSBT fills non_witness_utxo, which
+  # SignPSBTInput prefers), so a witness_utxo that misreports a wallet
+  # P2WPKH coin as P2TR does not change the default sighash (ALL).
+  test "wallet coin with a P2TR-misreporting witness_utxo and stored DEFAULT (0x00) is refused":
+    let b64 = makePsbt(51, some(0x00'i32), foreignP2tr(), keepWalletCoin = true)
+    var pp = newJArray()
+    pp.add(%b64)
+    checkMismatch(callErr(pp))
+
+  test "control: wallet coin with a P2TR-misreporting witness_utxo and stored ALL is accepted":
+    let b64 = makePsbt(52, some(0x01'i32), foreignP2tr(), keepWalletCoin = true)
+    var e: ref RpcError = nil
+    try:
+      discard process(b64)
     except RpcError as err:
       e = err
     check e == nil

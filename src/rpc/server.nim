@@ -13001,10 +13001,24 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
       continue
     if psbtObj.inputs[i].sighashType.isNone:
       continue
-    let prevOpt = resolvePrevOut(i)
-    if prevOpt.isNone:
+    # The prevout whose type picks the default, in Core's order: the PSBT's
+    # non_witness_utxo, else the wallet's own coin (CWallet::FillPSBT fills
+    # non_witness_utxo from the wallet when absent), else witness_utxo
+    # (SignPSBTInput prefers non_witness_utxo). resolvePrevOut prefers
+    # witness_utxo, which the PSBT author controls, so it is not used here.
+    let op = unsignedTx.inputs[i].prevOut
+    var checkSpk: Option[seq[byte]]
+    if psbtObj.inputs[i].nonWitnessUtxo.isSome:
+      let prevTx = psbtObj.inputs[i].nonWitnessUtxo.get()
+      if int(op.vout) < prevTx.outputs.len:
+        checkSpk = some(prevTx.outputs[int(op.vout)].scriptPubKey)
+    elif op in w.utxos:
+      checkSpk = some(w.utxos[op].output.scriptPubKey)
+    elif psbtObj.inputs[i].witnessUtxo.isSome:
+      checkSpk = some(psbtObj.inputs[i].witnessUtxo.get().scriptPubKey)
+    if checkSpk.isNone:
       continue
-    let wanted = requestedSighash(prevOpt.get().scriptPubKey)
+    let wanted = requestedSighash(checkSpk.get())
     if int64(psbtObj.inputs[i].sighashType.get()) != int64(wanted):
       raise newRpcError(RpcDeserializationError,
         "Specified sighash value does not match value stored in PSBT")
