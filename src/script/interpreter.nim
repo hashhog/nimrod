@@ -2,7 +2,7 @@
 ## Stack-based virtual machine for transaction validation
 ## Supports P2PKH, P2SH, P2WPKH, P2WSH, and P2TR
 
-import std/[sequtils, algorithm]
+import std/[sequtils, algorithm, atomics]
 import nimcrypto/sha
 import ../primitives/types
 import ../primitives/serialize
@@ -851,6 +851,25 @@ proc computeSighashLegacy*(tx: Transaction, inputIndex: int,
 
   doubleSha256(w.data)
 
+# Test hook: bytes fed to SHA-256 while building BIP-143 / BIP-341 sighashes.
+# Off unless a test sets `sighashByteCounting = true`, so the hot path pays one
+# bool load. Atomic because the script-check pool hashes on worker threads.
+var sighashByteCounting*: bool = false
+var gSighashHashedBytes: Atomic[int]
+
+proc resetSighashHashedBytes*() =
+  {.cast(gcsafe).}:
+    gSighashHashedBytes.store(0, moRelaxed)
+
+proc sighashHashedBytes*(): int =
+  {.cast(gcsafe).}:
+    result = gSighashHashedBytes.load(moRelaxed)
+
+template countSighashBytes(n: int) =
+  {.cast(gcsafe).}:
+    if sighashByteCounting:
+      discard gSighashHashedBytes.fetchAdd(n, moRelaxed)
+
 proc computeSighashSegwitV0*(tx: Transaction, inputIndex: int,
                               scriptCode: openArray[byte],
                               amount: Satoshi,
@@ -868,6 +887,7 @@ proc computeSighashSegwitV0*(tx: Transaction, inputIndex: int,
     var w = BinaryWriter()
     for input in tx.inputs:
       w.writeOutPoint(input.prevOut)
+    countSighashBytes(w.data.len + 32)
     hashPrevouts = doubleSha256(w.data)
 
   # hashSequence
@@ -876,6 +896,7 @@ proc computeSighashSegwitV0*(tx: Transaction, inputIndex: int,
     var w = BinaryWriter()
     for input in tx.inputs:
       w.writeUint32LE(input.sequence)
+    countSighashBytes(w.data.len + 32)
     hashSequence = doubleSha256(w.data)
 
   # hashOutputs
@@ -884,10 +905,12 @@ proc computeSighashSegwitV0*(tx: Transaction, inputIndex: int,
     var w = BinaryWriter()
     for output in tx.outputs:
       w.writeTxOut(output)
+    countSighashBytes(w.data.len + 32)
     hashOutputs = doubleSha256(w.data)
   elif baseType == uint32(SIGHASH_SINGLE) and inputIndex < tx.outputs.len:
     var w = BinaryWriter()
     w.writeTxOut(tx.outputs[inputIndex])
+    countSighashBytes(w.data.len + 32)
     hashOutputs = doubleSha256(w.data)
 
   # Build preimage
@@ -903,6 +926,7 @@ proc computeSighashSegwitV0*(tx: Transaction, inputIndex: int,
   preimage.writeUint32LE(tx.lockTime)
   preimage.writeUint32LE(hashType)
 
+  countSighashBytes(preimage.data.len + 32)
   doubleSha256(preimage.data)
 
 proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
@@ -944,24 +968,28 @@ proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
     w = BinaryWriter()
     for input in tx.inputs:
       w.writeOutPoint(input.prevOut)
+    countSighashBytes(w.data.len)
     preimage.add(sha256(w.data))
 
     # sha_amounts
     w = BinaryWriter()
     for amt in amounts:
       w.writeInt64LE(int64(amt))
+    countSighashBytes(w.data.len)
     preimage.add(sha256(w.data))
 
     # sha_scriptpubkeys
     w = BinaryWriter()
     for spk in scriptPubKeys:
       w.writeVarBytes(spk)
+    countSighashBytes(w.data.len)
     preimage.add(sha256(w.data))
 
     # sha_sequences
     w = BinaryWriter()
     for input in tx.inputs:
       w.writeUint32LE(input.sequence)
+    countSighashBytes(w.data.len)
     preimage.add(sha256(w.data))
 
   # sha_outputs
@@ -969,6 +997,7 @@ proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
     w = BinaryWriter()
     for output in tx.outputs:
       w.writeTxOut(output)
+    countSighashBytes(w.data.len)
     preimage.add(sha256(w.data))
 
   # spend_type
@@ -1003,6 +1032,7 @@ proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
   if annex.len > 0:
     w = BinaryWriter()
     w.writeVarBytes(annex)
+    countSighashBytes(w.data.len)
     preimage.add(sha256(w.data))
 
   # sha_single_output (for SIGHASH_SINGLE)
@@ -1010,6 +1040,7 @@ proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
     if inputIndex < tx.outputs.len:
       w = BinaryWriter()
       w.writeTxOut(tx.outputs[inputIndex])
+      countSighashBytes(w.data.len)
       preimage.add(sha256(w.data))
     else:
       # Return error hash
@@ -1028,6 +1059,7 @@ proc computeSighashTaproot*(tx: Transaction, inputIndex: int,
     w.writeUint32LE(codesepPos)
     preimage.add(w.data)
 
+  countSighashBytes(preimage.len + 64)
   taggedHash("TapSighash", preimage)
 
 # Script pattern detection
