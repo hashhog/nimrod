@@ -110,6 +110,9 @@ suite "cffix: half-open inbound sockets are eviction candidates (Core AttemptToE
     let pm = newPeerManager(mainnetParams(), maxIn = 2,
                             dataDir = freshDataDir("disc"))
     let gone = pm.addHalfOpen("203.0.113.9", psDisconnected)
+    # Alone, a disconnected socket is the only possible pick, so this is
+    # what sees a candidate list that forgot to skip it.
+    check pm.tryEvictInbound().isNone
     let live = pm.addHalfOpen("198.51.100.9", psConnected)
     let evicted = pm.tryEvictInbound()
     check evicted.isSome
