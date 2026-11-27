@@ -62,6 +62,13 @@ const
   #    (Core MAX_ADDR_PROCESSING_TOKEN_BUCKET = MAX_ADDR_TO_SEND).
   MaxAddrRatePerSecond* = 0.1
   MaxAddrProcessingTokenBucket* = 1000.0
+  # Cap on EACH flat address store (knownAddresses, knownAddressesV2).  Core
+  # keeps addresses only in AddrMan's fixed-size tables (NEW 1024x64 + TRIED
+  # 256x64 = 81,920 slots); these seqs had no bound at all.  16,384 (the size
+  # of Core's TRIED table) still lets a getaddr reply reach MaxAddrToSend
+  # (23% of 4,348 already does).  When a store is full a new address replaces
+  # a random stored one, so the store keeps taking fresh addresses.
+  MaxKnownAddresses* = 16384
   # 3F FIX: relay gate — Core net_processing.cpp:5688 only relays addr/addrv2
   # when the incoming message has <= 10 entries (large responses are getaddr
   # replies and must NOT be forwarded).
@@ -111,6 +118,8 @@ type
     keyedNetGroup*: uint64
     noBan*: bool
 
+  KnownAddrKey* = tuple[ip: array[16, byte], port: uint16]
+
   InFlightBlock* = object
     hash*: BlockHash
     peer*: Peer
@@ -130,6 +139,15 @@ type
     ## addrv2 messages here (they cannot be represented in the legacy 16-byte
     ## NetAddress format).  Relayed as addrv2 to peers that signaled wantsAddrV2.
     knownAddressesV2*: seq[TimestampedAddrV2]
+    ## Hash indexes over the two stores above: (ip, port) / addrv2 key ->
+    ## position in the seq.  O(1) dedup instead of a linear scan per address.
+    ## Both seqs are capped at MaxKnownAddresses.  Kept in step by
+    ## storeKnownAddress / storeKnownAddressV2; re-synced from the seq if a
+    ## caller appended to the seq directly.
+    knownAddrIndex*: Table[KnownAddrKey, int]
+    knownAddrV2Index*: Table[string, int]
+    knownAddrIndexedLen: int
+    knownAddrV2IndexedLen: int
     ## AXIS #2: Core-bucketed address manager (CAddrMan).  knownAddresses above
     ## stays as the rich getnodeaddresses/addr-sharing metadata store; this
     ## table is the NEW[1024][64]/TRIED[256][64] placement + anti-Sybil engine +
@@ -1797,10 +1815,24 @@ proc pingPeers(pm: PeerManager) {.async.} =
   ## uses, so the keepalive and an RPC-triggered ping emit identical BIP-31 PINGs.
   await pm.sendPingsNow()
 
+proc noteGetAddrSent*(pm: PeerManager, peer: Peer) =
+  ## We are sending `peer` a getaddr: accept up to MaxAddrToSend more addrs in
+  ## its reply, beyond the processing-bucket cap (Core net_processing.cpp:
+  ## 3762-3767, `m_addr_token_bucket += MAX_ADDR_TO_SEND`).  Core sends getaddr
+  ## once per connection; nimrod re-sends periodically, so the top-up is
+  ## applied only the first time on a connection.
+  if peer.getaddrSent:
+    return
+  peer.getaddrSent = true
+  peer.addrTokenBucket += float64(MaxAddrToSend)
+
 proc requestAddresses(pm: PeerManager) {.async.} =
   let msg = newGetAddr()
   # Spawned per peer: runs in the PM main loop (see sendPingsNow).
   for peer in pm.getReadyPeers():
+    # Make room for the reply before it can arrive (Core adds the tokens
+    # when it pushes GETADDR, net_processing.cpp:3767).
+    pm.noteGetAddrSent(peer)
     asyncSpawn spawnSafe(peer.sendMessage(msg))
 
 proc tryFeelerConnection*(pm: PeerManager) {.async.} =
@@ -1928,6 +1960,83 @@ proc stop*(pm: PeerManager) =
   pm.extendedPeers.clear()
   pm.outboundNetGroups.clear()
 
+proc knownAddrV2Key(ta: TimestampedAddrV2): string =
+  ## Dedup key for the addrv2 store: network id, address bytes, port.
+  template addBytes(bs: untyped) =
+    for b in bs: result.add char(b)
+  result = newStringOfCap(36)
+  result.add char(ord(ta.address.networkId))
+  case ta.address.networkId
+  of netIPv4: addBytes(ta.address.ipv4)
+  of netIPv6: addBytes(ta.address.ipv6)
+  of netTorV2: addBytes(ta.address.torv2)
+  of netTorV3: addBytes(ta.address.torv3)
+  of netI2P: addBytes(ta.address.i2p)
+  of netCJDNS: addBytes(ta.address.cjdns)
+  result.add char(ta.port and 0xFF)
+  result.add char(ta.port shr 8)
+
+proc syncKnownAddrIndex(pm: PeerManager) =
+  ## Rebuild the legacy index if the seq was changed without going through
+  ## storeKnownAddress (tests append to it directly).
+  if pm.knownAddrIndexedLen == pm.knownAddresses.len and
+      pm.knownAddrIndex.len <= pm.knownAddresses.len:
+    return
+  pm.knownAddrIndex.clear()
+  for i, na in pm.knownAddresses:
+    discard pm.knownAddrIndex.hasKeyOrPut((na.ip, na.port), i)
+  pm.knownAddrIndexedLen = pm.knownAddresses.len
+
+proc syncKnownAddrV2Index(pm: PeerManager) =
+  if pm.knownAddrV2IndexedLen == pm.knownAddressesV2.len and
+      pm.knownAddrV2Index.len <= pm.knownAddressesV2.len:
+    return
+  pm.knownAddrV2Index.clear()
+  for i, ta in pm.knownAddressesV2:
+    discard pm.knownAddrV2Index.hasKeyOrPut(knownAddrV2Key(ta), i)
+  pm.knownAddrV2IndexedLen = pm.knownAddressesV2.len
+
+proc storeKnownAddress*(pm: PeerManager, na: NetAddress): bool =
+  ## Put `na` in the flat legacy store unless its (ip, port) is already there.
+  ## O(1).  At MaxKnownAddresses a random stored entry is replaced, so the
+  ## store is bounded.  true when `na` was stored.
+  pm.syncKnownAddrIndex()
+  let key: KnownAddrKey = (na.ip, na.port)
+  if key in pm.knownAddrIndex:
+    return false
+  if pm.knownAddresses.len < MaxKnownAddresses:
+    pm.knownAddrIndex[key] = pm.knownAddresses.len
+    pm.knownAddresses.add(na)
+  else:
+    let slot = nodeRng().rand(pm.knownAddresses.len - 1)
+    let old = pm.knownAddresses[slot]
+    let oldKey: KnownAddrKey = (old.ip, old.port)
+    if pm.knownAddrIndex.getOrDefault(oldKey, -1) == slot:
+      pm.knownAddrIndex.del(oldKey)
+    pm.knownAddresses[slot] = na
+    pm.knownAddrIndex[key] = slot
+  pm.knownAddrIndexedLen = pm.knownAddresses.len
+  true
+
+proc storeKnownAddressV2*(pm: PeerManager, ta: TimestampedAddrV2): bool =
+  ## Same as storeKnownAddress for the addrv2 (Tor v3 / I2P / CJDNS) store.
+  pm.syncKnownAddrV2Index()
+  let key = knownAddrV2Key(ta)
+  if key in pm.knownAddrV2Index:
+    return false
+  if pm.knownAddressesV2.len < MaxKnownAddresses:
+    pm.knownAddrV2Index[key] = pm.knownAddressesV2.len
+    pm.knownAddressesV2.add(ta)
+  else:
+    let slot = nodeRng().rand(pm.knownAddressesV2.len - 1)
+    let oldKey = knownAddrV2Key(pm.knownAddressesV2[slot])
+    if pm.knownAddrV2Index.getOrDefault(oldKey, -1) == slot:
+      pm.knownAddrV2Index.del(oldKey)
+    pm.knownAddressesV2[slot] = ta
+    pm.knownAddrV2Index[key] = slot
+  pm.knownAddrV2IndexedLen = pm.knownAddressesV2.len
+  true
+
 proc addKnownAddress*(pm: PeerManager, address: NetAddress,
                       source: array[16, byte] = default(array[16, byte])) =
   ## Add address to the known-address pool.
@@ -1941,7 +2050,7 @@ proc addKnownAddress*(pm: PeerManager, address: NetAddress,
   # stamp the connect/advertise time so getnodeaddresses emits a real `time`.
   if a.lastSeen == 0:
     a.lastSeen = uint32(epochTime().int)
-  pm.knownAddresses.add(a)
+  discard pm.storeKnownAddress(a)
   # AXIS #2: also place the address in the Core-bucketed addrman (NEW table).
   # The source group defaults to the address itself (self-announce) when the
   # caller has no source peer.  This is the anti-Sybil + persistence engine;
@@ -2134,10 +2243,7 @@ proc injectKnownAddress*(pm: PeerManager, address: string, port: uint16,
       discard pm.addrMan.good(ipBytes, port, getTime().toUnix(),
                               pm.netGroupManager)
   # Dedup by ip+port (mirrors the addr-message insert path).
-  for ka in pm.knownAddresses:
-    if ka.ip == ipBytes and ka.port == port:
-      return true
-  pm.knownAddresses.add(NetAddress(
+  discard pm.storeKnownAddress(NetAddress(
     services: services,
     ip: ipBytes,
     port: port,
@@ -2281,13 +2387,9 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
           addrNowSec - 5'u32 * 24'u32 * 3600'u32
         else:
           addrWireTs
-      var found = false
-      for ka in pm.knownAddresses:
-        if ka.ip == na.ip and ka.port == na.port:
-          found = true
-          break
-      if not found:
-        pm.knownAddresses.add(na)
+      # O(1) hashed dedup into the capped store (was a linear scan over an
+      # unbounded seq).
+      discard pm.storeKnownAddress(na)
     # Relay to up to 2 random peers (not back to source).
     # 3F FIX: Core net_processing.cpp:5688 only relays when vAddr.size() <= 10.
     # A large addr message is a getaddr response — those are not relayed.
@@ -2346,40 +2448,18 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
           else:
             la.timestamp
         if isRoutable(la.address.ip):
-          var found = false
-          for ka in pm.knownAddresses:
-            if ka.ip == la.address.ip and ka.port == la.address.port:
-              found = true
-              break
-          if not found:
-            pm.knownAddresses.add(la.address)
+          discard pm.storeKnownAddress(la.address)
       else:
-        # Tor v3, I2P, or CJDNS — store in v2 pool
-        var found = false
-        for ka in pm.knownAddressesV2:
-          if ka.address.networkId == ta.address.networkId and ka.port == ta.port:
-            # Simple duplicate check by network type + port; deep byte comparison
-            # below avoids false negatives.
-            case ta.address.networkId
-            of netTorV3:
-              if ka.address.torv3 == ta.address.torv3:
-                found = true; break
-            of netI2P:
-              if ka.address.i2p == ta.address.i2p:
-                found = true; break
-            of netCJDNS:
-              if ka.address.cjdns == ta.address.cjdns:
-                found = true; break
-            else: discard
-        if not found:
-          # 3G FIX: clamp the wire timestamp before storing (Tor/I2P/CJDNS path).
-          # Core net_processing.cpp:5678-5680: same clamp applies to addrv2.
-          var taStored = ta
-          let torNowSec = uint32(getTime().toUnix())
-          if taStored.timestamp <= 100_000_000'u32 or
-              taStored.timestamp > torNowSec + 600'u32:
-            taStored.timestamp = torNowSec - 5'u32 * 24'u32 * 3600'u32
-          pm.knownAddressesV2.add(taStored)
+        # Tor v3, I2P, or CJDNS — store in v2 pool (O(1) hashed dedup on
+        # network id + address bytes + port, capped at MaxKnownAddresses).
+        # 3G FIX: clamp the wire timestamp before storing (Tor/I2P/CJDNS path).
+        # Core net_processing.cpp:5678-5680: same clamp applies to addrv2.
+        var taStored = ta
+        let torNowSec = uint32(getTime().toUnix())
+        if taStored.timestamp <= 100_000_000'u32 or
+            taStored.timestamp > torNowSec + 600'u32:
+          taStored.timestamp = torNowSec - 5'u32 * 24'u32 * 3600'u32
+        discard pm.storeKnownAddressV2(taStored)
     # 3F FIX: Core net_processing.cpp:5688 only relays when vAddr.size() <= 10.
     # A large addrv2 message is a getaddr response — those are not relayed.
     # Reference: bitcoin-core/src/net_processing.cpp:5688.

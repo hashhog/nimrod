@@ -169,8 +169,13 @@ type
     #    INBOUND addr messages.  Refilled at MAX_ADDR_RATE_PER_SECOND (0.1/s),
     #    capped at MAX_ADDR_PROCESSING_TOKEN_BUCKET (1000); each processed addr
     #    spends one token, excess is dropped (Core m_addr_token_bucket;
-    #    net_processing.cpp:5646-5670).
+    #    net_processing.cpp:5646-5670).  Starts at 1.0, like Core.
+    #  - getaddrSent: true once we have sent this peer a getaddr on this
+    #    connection and added MAX_ADDR_TO_SEND tokens for its reply (Core sends
+    #    getaddr once per connection, net_processing.cpp:3762-3767; nimrod
+    #    re-sends periodically, but the top-up is applied only the first time).
     getaddrRecvd*: bool
+    getaddrSent*: bool
     # Self-address advertisement (Core CNode::addrLocal /
     # Peer::m_next_local_addr_send):
     #  - addrLocal: the addr_recv field of the peer's VERSION = the address the
@@ -305,16 +310,14 @@ proc newPeer*(address: string, port: uint16, params: ConsensusParams,
     closing: false,
     misbehaviorScore: 0,
     shouldDisconnect: false,
-    # Anti-DoS addr-relay state.  NOTE: Core actually inits m_addr_token_bucket
-    # = 1.0 (net_processing.cpp:380) and tops it up by MAX_ADDR_TO_SEND=1000 only
-    # when WE send a getaddr (net_processing.cpp:3767, once per connection).
-    # nimrod sends getaddr periodically to all ready peers (requestAddresses)
-    # rather than once-per-connection, so it uses a permissive full bucket here;
-    # after the first 1000 processed addrs the 0.1/s refill governs exactly as
-    # Core.  TODO(anti-eclipse): adopt the once-per-connection getaddr + 1.0 init
-    # + 1000 top-up to also rate-limit the first unsolicited addr burst.
+    # Anti-DoS addr-relay state.  Core inits m_addr_token_bucket = 1.0
+    # (net_processing.cpp:380) and adds MAX_ADDR_TO_SEND=1000 only when WE send
+    # the peer a getaddr (net_processing.cpp:3767, once per connection; here
+    # PeerManager.noteGetAddrSent).  A full bucket at connect time let a host
+    # push 1000 unsolicited addrs per connection, then reconnect and repeat.
     getaddrRecvd: false,
-    addrTokenBucket: 1000.0,
+    getaddrSent: false,
+    addrTokenBucket: 1.0,
     addrTokenTimestamp: 0,
     # Handshake state
     handshakeComplete: false,
