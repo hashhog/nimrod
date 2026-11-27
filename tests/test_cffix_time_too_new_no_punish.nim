@@ -188,7 +188,10 @@ suite "time-too-new header: dropped, peer not punished (Core BLOCK_TIME_FUTURE)"
     let hdr = f.tipExtension(nowPlus(TooNew))
     waitFor f.sm.handleHeaders(f.peer, @[hdr])
     check f.sm.headerChain.tipHeight == 300
-    check f.sm.syncPeer == syncer
+    # Compared through a bool: on failure unittest2 prints each operand, and
+    # `$` of the nil Peer master leaves here would SIGSEGV the whole run.
+    let syncPeerKept = f.sm.syncPeer == syncer
+    check syncPeerKept
     check f.sm.state == ssSyncingHeaders
     check not f.peer.shouldDisconnect
     check not f.pm.isBanned(f.peer.address)
