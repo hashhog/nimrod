@@ -61,6 +61,17 @@ type
     tip*: BlockHash
     tipHeight*: int32
     totalWork*: array[32, byte]    ## Cumulative work of the chain
+    # Cumulative work THROUGH each active height — Core's
+    # CBlockIndex::nChainWork, kept per height so the work at a non-tip active
+    # ancestor is an O(1) read instead of a walk from genesis. It holds exactly
+    # what that walk returned: on a dense chain the calculateWork sum over
+    # 0..i (never a stored block-index row's totalWork, which pre-0be5041
+    # rows carry quantised and too LOW — chainstate.nim calculateWork note);
+    # on a snapshot-grafted chain the tip's totalWork minus the filled
+    # headers above i. Each append adds the new header's work to the previous
+    # slot. Trusted only while `cumWork.len == headers.len`; a chain built by
+    # hand without it (or left inconsistent) falls back to summing.
+    cumWork*: seq[array[32, byte]]
     # Competing-fork headers that branch BELOW the active tip.  Keyed by the
     # fork header's own hash.  Populated by handleHeaders' fork arm (does NOT
     # ban the peer); read by requestBlocks to walk the fork's ancestry and
@@ -293,9 +304,16 @@ proc reconcileActiveChain*(sm: SyncManager): bool {.gcsafe, raises: [].}
 # 256-bit arithmetic for proof of work calculations
 # =============================================================================
 
+var headerWorkEvals* {.threadvar.}: int
+  ## Count of per-header work evaluations (calculateWork, and the
+  ## getBlockProof sums in classifyHeaderBatch). Test instrument only: lets a
+  ## test assert that the work at an active ancestor is read, not recomputed
+  ## from genesis (tests/test_cffix_header_work_cache.nim).
+
 proc calculateWork*(bits: uint32): array[32, byte] =
   ## Calculate work for a block: 2^256 / (target+1)
   ## This represents the expected number of hashes to find this block
+  inc headerWorkEvals
   let target = compactToTarget(bits)
 
   # Check for zero target (invalid)
@@ -439,6 +457,31 @@ proc initHeaderChain*(genesisHeader: BlockHeader,
   result.tip = genesisHash
   result.tipHeight = 0
   result.totalWork = calculateWork(genesisHeader.bits)
+  result.cumWork.add(result.totalWork)
+
+proc cachedWorkAt(hc: HeaderChain, idx: int): Option[array[32, byte]] =
+  ## Cumulative work through active slot `idx`, if the per-height cache is
+  ## consistent with the header seq. none -> caller must compute it.
+  if hc.cumWork.len == hc.headers.len and idx >= 0 and idx < hc.cumWork.len:
+    some(hc.cumWork[idx])
+  else:
+    none(array[32, byte])
+
+proc appendActiveHeader*(hc: var HeaderChain, header: BlockHeader,
+                         hash: BlockHash, height: int32) =
+  ## Extend the active header chain by one header: seq slot, hash index,
+  ## cumulative work and the per-height work cache move together.
+  let idx = hc.headers.len
+  let cacheOk = hc.cumWork.len == idx
+  hc.headers.add(header)
+  hc.hashes.add(hash)
+  hc.byHash[hash] = idx
+  let hw = calculateWork(header.bits)
+  hc.totalWork = addWork(hc.totalWork, hw)
+  if cacheOk:
+    hc.cumWork.add(if idx == 0: hw else: addWork(hc.cumWork[idx - 1], hw))
+  hc.tip = hash
+  hc.tipHeight = height
 
 proc hasHeader*(hc: HeaderChain, hash: BlockHash): bool =
   hash in hc.byHash
@@ -506,6 +549,10 @@ proc resolveParentWork*(hc: HeaderChain,
     let idx = hc.byHash[prevHash]
     if idx == int(hc.tipHeight):
       return some((height: int32(idx), totalWork: hc.totalWork))
+    # Core reads pindexPrev->nChainWork; the per-height cache is that read.
+    let cached = hc.cachedWorkAt(idx)
+    if cached.isSome:
+      return some((height: int32(idx), totalWork: cached.get()))
     if len(hc.byHash) == hc.headers.len:
       var w: array[32, byte]
       for i in 0 .. idx:
@@ -929,6 +976,15 @@ proc loadHeaderChainFromDb*(chainDb: ChainDb,
   var prevHash = genesisHash
   var loaded: int32 = 0
   var height = 1'i32
+  # Exact per-height work for the cumWork cache. nBits changes once per
+  # retarget period on mainnet, so the 256-bit division runs a few hundred
+  # times for the whole chain, not once per header.
+  var bitsWork = initTable[uint32, array[32, byte]]()
+  proc workOf(bits: uint32): array[32, byte] =
+    if bits in bitsWork:
+      return bitsWork.getOrDefault(bits)
+    result = calculateWork(bits)
+    bitsWork[bits] = result
   while height <= bestHeight:
     let hashOpt = chainDb.getBlockHashByHeight(height)
     if hashOpt.isNone:
@@ -961,6 +1017,7 @@ proc loadHeaderChainFromDb*(chainDb: ChainDb,
     # Use the cumulative work the block index already cached for this block
     # (kept consistent with connectBlock); no need to re-sum per header.
     result.totalWork = idx.totalWork
+    result.cumWork.add(addWork(result.cumWork[^1], workOf(idx.header.bits)))
     prevHash = hash
     inc loaded
     inc height
@@ -1021,6 +1078,8 @@ proc loadHeaderChainFromDb*(chainDb: ChainDb,
 
   result.headers.setLen(int(bestHeight) + 1)
   result.hashes.setLen(int(bestHeight) + 1)
+  # Hole slots stay zero; they have no byHash entry, so no lookup reads them.
+  result.cumWork.setLen(int(bestHeight) + 1)
   for idx in suffix:
     let i = int(idx.height)
     if i <= 0 or i > int(bestHeight):
@@ -1031,6 +1090,17 @@ proc loadHeaderChainFromDb*(chainDb: ChainDb,
   result.tip = suffix[^1].hash
   result.tipHeight = bestHeight
   result.totalWork = suffix[^1].totalWork
+  # Filled slots: tip work minus the filled headers above (the walk
+  # resolveParentWork does on a grafted chain), so the cache answers the same.
+  block:
+    var w = result.totalWork
+    var i = int(bestHeight)
+    while i >= 1:
+      if result.byHash.getOrDefault(result.hashes[i], -1) == i:
+        result.cumWork[i] = w
+        w = subtractWork(w, workOf(result.headers[i].bits))
+      dec i
+    result.cumWork[0] = w
   loaded = int32(suffix.len)
   info "reloaded header chain from snapshot suffix",
        tipHeight = result.tipHeight, bestHeight = bestHeight,
@@ -1831,11 +1901,16 @@ proc classifyHeaderBatch*(sm: SyncManager,
   # nimrod sums per-header proofs; on a snapshot-grafted chain (holes below
   # the tail) summing would count empty slots, so use the cached tip work
   # and subtract filled headers above the connect point.
+  let cachedConnect = sm.headerChain.cachedWorkAt(connectIdx)
   if connectIdx == int(sm.headerChain.tipHeight):
     result.connectWork = initUInt256(sm.headerChain.totalWork)
+  elif cachedConnect.isSome:
+    # chain_start->nChainWork, O(1): no per-message walk from genesis.
+    result.connectWork = initUInt256(cachedConnect.get())
   elif len(sm.headerChain.byHash) == sm.headerChain.headers.len:
     var startWork = initUInt256()
     for i in 0 .. connectIdx:
+      inc headerWorkEvals
       startWork = startWork + headerssync.getBlockProof(sm.headerChain.headers[i])
     result.connectWork = startWork
   else:
@@ -1844,6 +1919,7 @@ proc classifyHeaderBatch*(sm: SyncManager,
     while i > connectIdx:
       if i < sm.headerChain.hashes.len and
           sm.headerChain.byHash.getOrDefault(sm.headerChain.hashes[i], -1) == i:
+        inc headerWorkEvals
         w = w - headerssync.getBlockProof(sm.headerChain.headers[i])
       dec i
     result.connectWork = w
@@ -2046,6 +2122,10 @@ proc truncateActiveHeaders(sm: SyncManager, toHeight: int32) =
         if sm.chainDb != nil and i > sm.chainTipHeight:
           sm.chainDb.deleteHeightIndexIf(i, h)
     dec i
+  if hc.cumWork.len == hc.headers.len:
+    hc.cumWork.setLen(int(toHeight) + 1)
+  else:
+    hc.cumWork.setLen(0)  # was not trusted; never let a cut make it look so
   hc.headers.setLen(int(toHeight) + 1)
   hc.hashes.setLen(int(toHeight) + 1)
   hc.tip = hc.hashes[toHeight]
@@ -2164,10 +2244,14 @@ proc reconcileActiveChain*(sm: SyncManager): bool {.gcsafe, raises: [].} =
         let idx = path[k]
         sm.headerChain.sideHeaders.del(idx.hash)
         let pos = sm.headerChain.headers.len
+        let cacheOk = sm.headerChain.cumWork.len == pos
         sm.headerChain.headers.add(idx.header)
         sm.headerChain.hashes.add(idx.hash)
         sm.headerChain.byHash[idx.hash] = pos
-        w = addWork(w, calculateWork(idx.header.bits))
+        let hw = calculateWork(idx.header.bits)
+        w = addWork(w, hw)
+        if cacheOk:
+          sm.headerChain.cumWork.add(addWork(sm.headerChain.cumWork[pos - 1], hw))
       if path.len > 0:
         sm.headerChain.tip = path[0].hash
         sm.headerChain.tipHeight = tipH
@@ -2244,9 +2328,13 @@ proc promoteBestValidSideBranch(sm: SyncManager) =
     let (h, sh) = branch[j]
     sm.headerChain.sideHeaders.del(h)
     let idx = sm.headerChain.headers.len
+    let cacheOk = sm.headerChain.cumWork.len == idx
     sm.headerChain.headers.add(sh.header)
     sm.headerChain.hashes.add(h)
     sm.headerChain.byHash[h] = idx
+    if cacheOk:
+      sm.headerChain.cumWork.add(addWork(sm.headerChain.cumWork[idx - 1],
+                                         calculateWork(sh.header.bits)))
   sm.headerChain.totalWork = cand.totalWork
   sm.headerChain.tip = branch[0].hash
   sm.headerChain.tipHeight = cand.height
@@ -2476,8 +2564,10 @@ proc acceptForkHeader*(sm: SyncManager, header: BlockHeader,
   # Parent must resolve to a KNOWN below-tip ancestor (active chain or an
   # already-stored fork header).  If it does not, this is not a recognisable
   # competing branch — let the caller fall back to its unlinked-header ban.
-  let parent = sm.headerChain.resolveParentWork(header.prevBlock)
-  if parent.isNone:
+  # Existence only: the parent's cumulative work is not needed until the
+  # header has passed bad-diffbits (Core: ContextualCheckBlockHeader runs
+  # before AddToBlockIndex sums nChainWork).
+  if not sm.headerChain.hasAnyHeader(header.prevBlock):
     return fhoNotFork
 
   # Gate 1 — bad-diffbits (Core validation.cpp:4086-4089), run for fork headers
@@ -2493,6 +2583,9 @@ proc acceptForkHeader*(sm: SyncManager, header: BlockHeader,
   of dboUnevaluable:
     return fhoCannotEvaluate
 
+  let parent = sm.headerChain.resolveParentWork(header.prevBlock)
+  if parent.isNone:
+    return fhoNotFork
   let p = parent.get()
   let forkHeight = p.height + 1
   # Cumulative work = parent.totalWork + this header's work, on the SAME
@@ -2831,19 +2924,8 @@ proc handleHeaders*(sm: SyncManager, peer: Peer,
       sm.state = ssIdle
       return
 
-    # Add header to chain
-    let idx = sm.headerChain.headers.len
-    sm.headerChain.headers.add(header)
-    sm.headerChain.hashes.add(hash)
-    sm.headerChain.byHash[hash] = idx
-
-    # Update chain work
-    let headerWork = calculateWork(header.bits)
-    sm.headerChain.totalWork = addWork(sm.headerChain.totalWork, headerWork)
-
-    # Update tip
-    sm.headerChain.tip = hash
-    sm.headerChain.tipHeight = expectedHeight
+    # Add header to chain (seq, hash index, cumulative work, work cache, tip)
+    sm.headerChain.appendActiveHeader(header, hash, expectedHeight)
     sm.headerTip = hash
     sm.headerTipHeight = expectedHeight
 
@@ -4555,17 +4637,8 @@ proc processHeaders*(sync: BlockSync, headers: seq[BlockHeader]): int =
     if not valid:
       continue
 
-    # Add to chain
-    let idx = sync.headerChain.headers.len
-    sync.headerChain.headers.add(header)
-    sync.headerChain.hashes.add(hash)
-    sync.headerChain.byHash[hash] = idx
-
-    let headerWork = calculateWork(header.bits)
-    sync.headerChain.totalWork = addWork(sync.headerChain.totalWork, headerWork)
-
-    sync.headerChain.tip = hash
-    sync.headerChain.tipHeight = expectedHeight
+    # Add to chain (seq, hash index, cumulative work, work cache, tip)
+    sync.headerChain.appendActiveHeader(header, hash, expectedHeight)
     sync.headerTip = hash
     sync.headerTipHeight = expectedHeight
 
