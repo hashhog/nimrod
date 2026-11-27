@@ -1,0 +1,304 @@
+## test_cffix_addr_relay_received.nim
+##
+## cffix-nimrod-addr-relay-received
+## (fingerprint nimrod:peermanager:addr-relay-and-getaddr-serve-insertion-prefix-with-fresh-timestamps)
+##
+## Before the fix:
+##   - relayAddresses sent knownAddresses[0..10) stamped with epochTime()
+##     whenever an addr/addrv2 message of 1-10 entries arrived, whatever that
+##     message held and even when none of its entries was accepted (rate
+##     limited, unroutable, stale);
+##   - buildGetAddrResponse answered with the same insertion-order prefix of
+##     knownAddresses, every entry stamped "now";
+##   - the legacy addr path stored non-routable addresses (10/8, 192.168/16...).
+##
+## Core:
+##   - ProcessAddrs (net_processing.cpp:5625-5700) relays EACH received address
+##     that passed the token bucket, is routable and is recent
+##     (nTime > now - 10 min), in a message of <= 10 entries, via RelayAddress
+##     (:2277) to up to 2 peers that can carry it (IsAddrCompatible), with the
+##     address's own nTime;
+##   - GETADDR (:4815-4848) answers with GetAddresses: a random addrman sample
+##     carrying each address's stored nTime;
+##   - AddrMan::AddSingle drops a non-routable address, so it is never stored.
+##
+## The relays are read off real loopback sockets, so this file runs the same
+## code path on master and on the fix; it needs no proc the fix adds.
+
+import unittest2
+import std/[os, sets, tables, times, options, strutils]
+import chronos
+import ../src/network/messages
+import ../src/network/addr
+import ../src/network/peermanager
+import ../src/network/peer
+import ../src/consensus/params
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+proc ip4(a, b, c, d: byte): array[16, byte] =
+  result[10] = 0xFF; result[11] = 0xFF
+  result[12] = a; result[13] = b; result[14] = c; result[15] = d
+
+proc freshPm(tag: string): (PeerManager, string) =
+  let dir = getTempDir() / ("nimrod_cffix_addr_relay_" & tag & "_" &
+    $getCurrentProcessId() & "_" & $epochTime())
+  createDir(dir)
+  (newPeerManager(regtestParams(), dataDir = dir), dir)
+
+type Sink = object
+  peer: Peer               # the PeerManager's view of the connection
+  remote: StreamTransport  # the far end, where relayed bytes arrive
+  inbox: ref seq[byte]     # bytes read off `remote` so far
+
+var server {.threadvar.}: StreamServer
+
+proc ensureServer() =
+  if server.isNil:
+    server = createStreamServer(initTAddress("127.0.0.1:0"), flags = {ReuseAddr})
+
+proc pump(t: StreamTransport, inbox: ref seq[byte]) {.async.} =
+  ## Copy everything that arrives on `t` into `inbox` until the socket closes.
+  var buf = newSeq[byte](65536)
+  try:
+    while true:
+      let n = await t.readOnce(addr buf[0], buf.len)
+      if n == 0: break
+      inbox[].add buf[0 ..< n]
+  except CatchableError:
+    discard
+
+proc addSink(pm: PeerManager, host: string, wantsV2: bool): Sink =
+  ## A ready peer in pm.peers backed by a real loopback TCP connection.
+  ensureServer()
+  let p = newPeer(host, 8333'u16, regtestParams(), pdOutbound)
+  let acceptF = server.accept()
+  p.transport = waitFor connect(server.localAddress())
+  let remote = waitFor acceptF
+  p.state = psReady
+  p.wantsAddrV2 = wantsV2
+  pm.peers[host & ":8333"] = p
+  result = Sink(peer: p, remote: remote, inbox: new(seq[byte]))
+  asyncSpawn pump(remote, result.inbox)
+
+proc received(s: Sink): seq[P2PMessage] =
+  ## Every complete P2P message sent to the sink since the last call.
+  waitFor sleepAsync(chronos.milliseconds(300))   # let the spawned writers run
+  let data = s.inbox[]
+  s.inbox[].setLen(0)
+  var pos = 0
+  while data.len - pos >= 24:
+    var cmd = ""
+    for i in 4 ..< 16:
+      if data[pos + i] == 0: break
+      cmd.add char(data[pos + i])
+    let ln = int(data[pos + 16]) or (int(data[pos + 17]) shl 8) or
+             (int(data[pos + 18]) shl 16) or (int(data[pos + 19]) shl 24)
+    if data.len - pos - 24 < ln: break
+    let payload = data[pos + 24 ..< pos + 24 + ln]
+    result.add deserializePayload(cmd, payload)
+    pos += 24 + ln
+
+proc closeSink(s: Sink) =
+  s.peer.transport.close()
+  s.remote.close()
+
+type Relayed = tuple[key: string, ts: uint32, kind: string]
+
+proc keyOf(na: NetAddress): string =
+  var s = ""
+  for b in na.ip: s.add toHex(b)
+  s & ":" & $na.port
+
+proc keyOf(ta: TimestampedAddrV2): string =
+  let legacy = toLegacyTimestampedAddr(ta)
+  if legacy.isSome: return keyOf(legacy.get().address)
+  $ta.address & ":" & $ta.port
+
+proc relayedEntries(msgs: seq[P2PMessage]): seq[Relayed] =
+  for m in msgs:
+    case m.kind
+    of mkAddr:
+      for ta in m.addresses:
+        result.add((keyOf(ta.address), ta.timestamp, "addr"))
+    of mkAddrV2:
+      for ta in m.addressesV2:
+        result.add((keyOf(ta), ta.timestamp, "addrv2"))
+    else: discard
+
+proc seedA(pm: PeerManager, n: int, lastSeen: uint32) =
+  ## A1..An straight into the store, all with an old lastSeen.
+  for i in 1 .. n:
+    pm.knownAddresses.add(NetAddress(services: 1'u64,
+      ip: ip4(44, 0, 0, byte(i)), port: 8333, lastSeen: lastSeen))
+
+proc sourcePeer(tokens: float64): Peer =
+  result = newPeer("45.0.0.1", 8333'u16, regtestParams(), pdInbound)
+  result.addrTokenBucket = tokens
+  result.addrTokenTimestamp = getTime().toUnix()   # no refill in the window
+
+proc addrOf(a, b, c, d: byte; ts: uint32): TimestampedAddr =
+  TimestampedAddr(timestamp: ts,
+    address: NetAddress(services: 1'u64, ip: ip4(a, b, c, d), port: 8333))
+
+# ---------------------------------------------------------------------------
+
+suite "cffix addr relay: relay what was received, not the stored prefix":
+
+  test "a 1-entry addr relays the received address B only, with B's own timestamp":
+    let (pm, dir) = freshPm("b")
+    let old = uint32(getTime().toUnix()) - 3'u32 * 24'u32 * 3600'u32
+    pm.seedA(20, old)
+    let s1 = pm.addSink("46.0.0.1", wantsV2 = false)
+    let s2 = pm.addSink("46.0.0.2", wantsV2 = false)
+    discard s1.received(); discard s2.received()   # drain: nothing before B
+    let bTs = uint32(getTime().toUnix()) - 60'u32
+    let b = addrOf(47, 1, 2, 3, bTs)
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddr, addresses: @[b]))
+    let r1 = relayedEntries(s1.received())
+    let r2 = relayedEntries(s2.received())
+    # Both candidate peers get exactly {B} (Core relays a reachable address
+    # to 2 peers), carrying B's wire nTime, never A1..A10 stamped now.
+    checkpoint "B = " & keyOf(b.address) & " ts=" & $bTs
+    checkpoint "relayed to s1: " & $r1
+    checkpoint "relayed to s2: " & $r2
+    check r1 == @[(keyOf(b.address), bTs, "addr")]
+    check r2 == @[(keyOf(b.address), bTs, "addr")]
+    s1.closeSink(); s2.closeSink(); removeDir(dir)
+
+  test "an addr whose only entry is rate-limited relays nothing":
+    let (pm, dir) = freshPm("rl")
+    pm.seedA(20, uint32(getTime().toUnix()) - 86400'u32)
+    let s1 = pm.addSink("46.0.1.1", wantsV2 = false)
+    let s2 = pm.addSink("46.0.1.2", wantsV2 = false)
+    let b = addrOf(47, 1, 2, 4, uint32(getTime().toUnix()) - 60'u32)
+    pm.handleAddrInternal(sourcePeer(0.0),
+      P2PMessage(kind: mkAddr, addresses: @[b]))
+    check relayedEntries(s1.received()).len == 0
+    check relayedEntries(s2.received()).len == 0
+    s1.closeSink(); s2.closeSink(); removeDir(dir)
+
+  test "a legacy addr 10.0.0.1 is not stored and not relayed":
+    let (pm, dir) = freshPm("nr")
+    pm.seedA(20, uint32(getTime().toUnix()) - 86400'u32)
+    let s1 = pm.addSink("46.0.2.1", wantsV2 = false)
+    let s2 = pm.addSink("46.0.2.2", wantsV2 = false)
+    let priv = addrOf(10, 0, 0, 1, uint32(getTime().toUnix()) - 60'u32)
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddr, addresses: @[priv]))
+    var stored = false
+    for ka in pm.knownAddresses:
+      if ka.ip == priv.address.ip: stored = true
+    check not stored
+    check relayedEntries(s1.received()).len == 0
+    check relayedEntries(s2.received()).len == 0
+    s1.closeSink(); s2.closeSink(); removeDir(dir)
+
+  test "an address older than 10 minutes is stored but not relayed":
+    let (pm, dir) = freshPm("old")
+    pm.seedA(20, uint32(getTime().toUnix()) - 86400'u32)
+    let s1 = pm.addSink("46.0.3.1", wantsV2 = false)
+    let s2 = pm.addSink("46.0.3.2", wantsV2 = false)
+    let b = addrOf(47, 1, 2, 5, uint32(getTime().toUnix()) - 3600'u32)
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddr, addresses: @[b]))
+    var stored = false
+    for ka in pm.knownAddresses:
+      if ka.ip == b.address.ip: stored = true
+    check stored
+    check relayedEntries(s1.received()).len == 0
+    check relayedEntries(s2.received()).len == 0
+    s1.closeSink(); s2.closeSink(); removeDir(dir)
+
+  test "an 11-entry addr relays nothing":
+    let (pm, dir) = freshPm("eleven")
+    pm.seedA(20, uint32(getTime().toUnix()) - 86400'u32)
+    let s1 = pm.addSink("46.0.4.1", wantsV2 = false)
+    let nowTs = uint32(getTime().toUnix()) - 60'u32
+    var addrs: seq[TimestampedAddr]
+    for i in 1'u8 .. 11'u8:
+      addrs.add addrOf(47, 2, 0, i, nowTs)
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddr, addresses: addrs))
+    check relayedEntries(s1.received()).len == 0
+    s1.closeSink(); removeDir(dir)
+
+  test "a 1-entry addrv2 Tor v3 address goes only to the addrv2 peer, with its own timestamp":
+    let (pm, dir) = freshPm("tor")
+    pm.seedA(20, uint32(getTime().toUnix()) - 86400'u32)
+    let v2 = pm.addSink("46.0.5.1", wantsV2 = true)
+    let v1 = pm.addSink("46.0.5.2", wantsV2 = false)
+    let tTs = uint32(getTime().toUnix()) - 30'u32
+    var a = NetAddressV2(networkId: netTorV3)
+    for i in 0 ..< 32: a.torv3[i] = byte(i + 1)
+    let t = TimestampedAddrV2(timestamp: tTs, services: 1'u64, address: a,
+                              port: 8333)
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddrV2, addressesV2: @[t]))
+    check relayedEntries(v2.received()) == @[(keyOf(t), tTs, "addrv2")]
+    # A Tor v3 address cannot be written in a legacy addr message (Core
+    # IsAddrCompatible), so the legacy peer gets nothing at all.
+    check relayedEntries(v1.received()).len == 0
+    v2.closeSink(); v1.closeSink(); removeDir(dir)
+
+  test "a 1-entry addrv2 IPv4 address reaches a legacy peer as addr {B}":
+    let (pm, dir) = freshPm("v2ip")
+    pm.seedA(20, uint32(getTime().toUnix()) - 86400'u32)
+    let s1 = pm.addSink("46.0.6.1", wantsV2 = false)
+    let s2 = pm.addSink("46.0.6.2", wantsV2 = true)
+    let bTs = uint32(getTime().toUnix()) - 45'u32
+    var a = NetAddressV2(networkId: netIPv4)
+    a.ipv4 = [47'u8, 3, 3, 3]
+    let b = TimestampedAddrV2(timestamp: bTs, services: 1'u64, address: a,
+                              port: 8333)
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddrV2, addressesV2: @[b]))
+    check relayedEntries(s1.received()) == @[(keyOf(b), bTs, "addr")]
+    check relayedEntries(s2.received()) == @[(keyOf(b), bTs, "addrv2")]
+    s1.closeSink(); s2.closeSink(); removeDir(dir)
+
+suite "cffix getaddr: random sample with stored timestamps":
+
+  test "getaddr reply carries each address's stored timestamp, not now":
+    let (pm, dir) = freshPm("gats")
+    let base = uint32(getTime().toUnix()) - 10'u32 * 86400'u32
+    var want: Table[string, uint32]
+    for i in 0 ..< 100:
+      let na = NetAddress(services: 1'u64, ip: ip4(48, 0, byte(i shr 8), byte(i)),
+                          port: 8333, lastSeen: base + uint32(i) * 60'u32)
+      pm.knownAddresses.add(na)
+      want[keyOf(na)] = na.lastSeen
+    let resp = pm.buildGetAddrResponse(
+      newPeer("49.0.0.1", 8333'u16, regtestParams(), pdInbound))
+    check resp.len == 23   # floor(23% of 100)
+    var mismatched = 0
+    for ta in resp:
+      if want.getOrDefault(keyOf(ta.address), 0'u32) != ta.timestamp:
+        inc mismatched
+    check mismatched == 0
+    removeDir(dir)
+
+  test "getaddr reply is a random sample, not the insertion-order prefix":
+    let (pm, dir) = freshPm("gasample")
+    var prefix: HashSet[string]
+    for i in 0 ..< 1000:
+      let na = NetAddress(services: 1'u64,
+        ip: ip4(50, 0, byte(i shr 8), byte(i and 0xFF)), port: 8333,
+        lastSeen: uint32(getTime().toUnix()) - 86400'u32)
+      pm.knownAddresses.add(na)
+      if i < 230: prefix.incl keyOf(na)
+    # Five fresh inbound peers, one getaddr each (cap = 23% of 1000 = 230).
+    var outsidePrefix = 0
+    for k in 0 ..< 5:
+      let resp = pm.buildGetAddrResponse(
+        newPeer("51.0.0." & $(k + 1), 8333'u16, regtestParams(), pdInbound))
+      check resp.len == 230
+      for ta in resp:
+        if keyOf(ta.address) notin prefix: inc outsidePrefix
+    # A uniform sample of 230 of 1000 puts ~77% of its entries outside the
+    # first 230; the prefix answer puts none there.
+    check outsidePrefix > 500
+    removeDir(dir)
