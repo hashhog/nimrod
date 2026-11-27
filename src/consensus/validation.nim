@@ -2335,9 +2335,13 @@ proc collectChecks*(
 
     # Append one TxPrevouts for this tx (moving the seq storage in — no heap copy).
     # The store was pre-sized above so this add() cannot trigger a realloc.
+    # Core: txsdata[i].Init(tx, spent_outputs) once per tx (ConnectBlock),
+    # so every input's signature checks share the whole-tx sighash digests.
+    let txdata = initPrecomputedTxData(tx, allAmounts, allScriptPubKeys)
     txPrevoutsStore.add(TxPrevouts(
       allAmounts: move(allAmounts),
-      allScriptPubKeys: move(allScriptPubKeys)
+      allScriptPubKeys: move(allScriptPubKeys),
+      txdata: txdata
     ))
     # Stable pointer into the last element (pre-sized, no realloc possible).
     let txPrevoutsPtr = addr txPrevoutsStore[txPrevoutsStore.len - 1]
