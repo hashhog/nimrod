@@ -88,6 +88,7 @@ const IncludedTests = [
   "test_cffix_64byte_mutation_rule",
   "test_cffix_reorg_bip68_mtp",
   "test_cffix_reorg_in_belowout",
+  "test_cffix_scriptcheck_shared_tx",
   "test_cffix_reorg_sigop_cost",
   "test_chain_lock_handoff",
   "test_chain_lock_race",
