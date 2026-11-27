@@ -179,6 +179,13 @@ type
     # Last time planRepairInventory was allowed to retry in-flight hole
     # fetches. A mute peer must not pin a retained-range hole forever.
     lastRepairRequest*: SyncTime
+    # Memo for reliableChainWorkAt's dense GetBlockProof sum: the work through
+    # header-chain height `chainWorkMemoHeight` (hash `chainWorkMemoHash`).
+    # Lets the tip-extend anti-DoS check extend the previous sum instead of
+    # re-walking from genesis on every headers message. -1 = empty.
+    chainWorkMemoHeight*: int
+    chainWorkMemoHash*: BlockHash
+    chainWorkMemo*: UInt256
     # Blocks known to be consensus-invalid (BLOCK_FAILED_VALID) and their
     # descendants — Core InvalidBlockFound / InvalidChainFound. Mirrors the
     # persisted BlockIndex.failureFlags (the authority; see isKnownInvalid) so
@@ -1097,7 +1104,8 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     filterIndex: filterIndex,
     coinStatsIndex: coinStatsIndex,
     txoSpenderIndex: txoSpenderIndex,
-    lastRepairRequest: getTime()
+    lastRepairRequest: getTime(),
+    chainWorkMemoHeight: -1
   )
   if pm != nil:
     let sm = result
@@ -1559,6 +1567,72 @@ proc calculateClaimedHeadersWork*(headers: seq[BlockHeader]): UInt256 =
   for header in headers:
     result = result + headerssync.getBlockProof(header)
 
+proc reliableChainWorkAt*(sm: SyncManager, idx: int,
+                          hash: BlockHash): UInt256 =
+  ## Cumulative chain work through header-chain entry `idx` (whose hash is
+  ## `hash`), Core's CBlockIndex::nChainWork, taken from a source that does
+  ## not depend on the incrementally cached `headerChain.totalWork` (that
+  ## cache can be zero, quantised or use calculateWork; see the 967057 note
+  ## in classifyHeaderBatch).
+  ##
+  ## * Dense genesis-rooted chain (every slot filled): GetBlockProof summed
+  ##   from genesis through `idx`, exactly Core's nChainWork. The sum is
+  ##   memoised and extended from the last answer when that answer is still
+  ##   an ancestor (same hash at its height; a hash commits to its ancestry),
+  ##   so a peer cannot make each headers message re-walk the whole chain.
+  ## * Snapshot-grafted chain (holes below the tail): the persisted block
+  ##   index row's totalWork for `hash`.
+  ## * Neither available: zero, so the caller falls back to the anti-DoS
+  ##   path (Core's behaviour for a chain_start without enough work).
+  if idx < 0 or idx >= sm.headerChain.headers.len or
+      idx >= sm.headerChain.hashes.len or sm.headerChain.hashes[idx] != hash:
+    return initUInt256()
+  if len(sm.headerChain.byHash) == sm.headerChain.headers.len:
+    var start = 0
+    var w = initUInt256()
+    let m = sm.chainWorkMemoHeight
+    if m >= 0 and m <= idx and m < sm.headerChain.hashes.len and
+        sm.headerChain.hashes[m] == sm.chainWorkMemoHash:
+      start = m + 1
+      w = sm.chainWorkMemo
+    for i in start .. idx:
+      w = w + headerssync.getBlockProof(sm.headerChain.headers[i])
+    sm.chainWorkMemoHeight = idx
+    sm.chainWorkMemoHash = hash
+    sm.chainWorkMemo = w
+    return w
+  if sm.chainDb != nil:
+    let row = sm.chainDb.getBlockIndex(hash)
+    if row.isSome:
+      return initUInt256(row.get().totalWork)
+  initUInt256()
+
+proc tipExtendMeetsMinimumChainWork*(sm: SyncManager,
+                                     headers: seq[BlockHeader]): bool =
+  ## True when `headers` extends the header tip of a chain above genesis AND
+  ## the tip's reliable chain work plus the batch's claimed work reaches
+  ## minimumChainWork. This is the only case where a tip-extend may skip the
+  ## PRESYNC pipeline despite the cached-work comparison saying "low work"
+  ## (the 967057 livelock: cache wrong, chain fine).
+  ##
+  ## Core TryLowWorkHeadersSync (net_processing.cpp:2633) compares
+  ## chain_start->nChainWork + claimed work against GetAntiDoSWorkThreshold()
+  ## = max(near-tip work, MinimumChainWork()). With chain_start == the tip,
+  ## near-tip work (tip work minus 144 blocks) is always below tip work +
+  ## claimed work, so Core's test reduces to `>= MinimumChainWork()`. There
+  ## is no tip shortcut: a chain below minimumChainWork (REDOWNLOAD releasing
+  ## headers, restart mid-IBD) does not get its tip extended by cheap headers.
+  if headers.len == 0 or sm.headerChain.tipHeight <= 0:
+    return false
+  if headers[0].prevBlock != sm.headerChain.tip:
+    return false
+  let tipIdx = sm.headerChain.byHash.getOrDefault(sm.headerChain.tip, -1)
+  if tipIdx < 0:
+    return false
+  let work = sm.reliableChainWorkAt(tipIdx, sm.headerChain.tip) +
+             calculateClaimedHeadersWork(headers)
+  work >= sm.minimumChainWork
+
 proc tryLowWorkHeadersSync*(sm: SyncManager, peer: Peer,
                              chainStartHeight: int32,
                              chainStartHash: BlockHash,
@@ -1599,9 +1673,11 @@ proc tryLowWorkHeadersSync*(sm: SyncManager, peer: Peer,
     # hbrAntiDoS, and clearing them here is the silent drop that
     # livelocked mainnet at 967057 (301 headers, zero "processed
     # headers", 60s timeout on every peer). Let the caller process a
-    # tip-extend directly.
-    if headers.len > 0 and headers[0].prevBlock == sm.headerChain.tip and
-        sm.headerChain.tipHeight > 0:
+    # tip-extend directly -- but only when the tip's reliable chain work
+    # plus the claimed work reaches minimumChainWork. Unconditionally, any
+    # peer could extend a below-minimum chain with cheap headers (Core has
+    # no tip shortcut).
+    if sm.tipExtendMeetsMinimumChainWork(headers):
       return false
     warn "ignoring low-work headers (incomplete message)",
          peer = $peer, headers = headers.len, work = $totalWork,
@@ -1854,28 +1930,39 @@ proc classifyHeaderBatch*(sm: SyncManager,
   let claimedWork = calculateClaimedHeadersWork(headers)
   let totalWork = result.connectWork + claimedWork
   let threshold = sm.getAntiDoSWorkThreshold()
-  # Tip-extending batch (connect point IS our current header tip) on a
-  # chain that already has height H>0: do not enter PRESYNC.
-  # PRESYNC protects a node that does not yet have a minimum-work chain
-  # (from-genesis). A node whose header tip is already above genesis is
-  # not that node — Core reads chain_start->nChainWork from CBlockIndex,
-  # which at the tip is the validated chain's work. nimrod's in-memory
-  # totalWork cache can be 0, quantised, or a different formula
-  # (calculateWork vs getBlockProof), so the comparison above mis-routes
-  # a tip-extend as hbrAntiDoS; tryLowWorkHeadersSync then silently
-  # drops a <2000 batch. Live 2026-09-17: 0675bde at 967057, 301 headers
-  # from public peers, zero "processed headers". b89aba8 summed
-  # getBlockProof and accepted. Grafted snapshot-boot (holes below the
-  # tail, tipHeight > 0) is the same shape. From-genesis (tipHeight==0,
-  # firstPrev==genesis==tip) still goes through the work comparison
-  # (W162).
-  if firstPrev == sm.headerChain.tip and sm.headerChain.tipHeight > 0:
-    result.routing = hbrDirect
-  elif totalWork < threshold:
-    result.routing = hbrAntiDoS
-  else:
+  if totalWork >= threshold:
     # Enough work already (or threshold == 0 on regtest): validate directly.
     result.routing = hbrDirect
+  elif sm.tipExtendMeetsMinimumChainWork(headers):
+    # Tip-extending batch whose cached-work comparison above says "low
+    # work" although the chain really has it. nimrod's in-memory totalWork
+    # cache can be 0, quantised, or a different formula (calculateWork vs
+    # getBlockProof); Core reads chain_start->nChainWork from CBlockIndex.
+    # Live 2026-09-17: 0675bde at 967057 mis-routed 301 tip-extending
+    # headers as hbrAntiDoS and tryLowWorkHeadersSync silently dropped them
+    # (b89aba8 summed getBlockProof and accepted). Re-check against the
+    # reliable work (dense GetBlockProof sum, or the persisted index row on
+    # a grafted snapshot chain) and route direct only if it reaches
+    # minimumChainWork. This used to be an unconditional tip shortcut taken
+    # BEFORE the work test, which let any peer extend a below-minimum chain
+    # (REDOWNLOAD releasing headers, restart mid-IBD) with cheap headers
+    # that skipped validateHeader's too-little-chainwork gate. Core has no
+    # tip shortcut (net_processing.cpp:2633). From-genesis (tipHeight==0)
+    # never takes this branch (W162).
+    result.routing = hbrDirect
+  else:
+    result.routing = hbrAntiDoS
+    # The caller seeds PRESYNC (HeadersSyncState's starting chain work) with
+    # connectWork; Core uses chain_start->nChainWork. At the tip connectWork
+    # came from the cache above, which may be zero or low (the 967057
+    # fault). A tip-extend reaching PRESYNC from a chain above genesis is
+    # new with the gate above; seeding it from a low cache would make an
+    # honest peer supply the whole minimum by itself and fail PRESYNC on
+    # every attempt. Use the reliable work when one is available.
+    if connectIdx == int(sm.headerChain.tipHeight):
+      let reliable = sm.reliableChainWorkAt(connectIdx, firstPrev)
+      if not reliable.isZero():
+        result.connectWork = reliable
 
 proc continuationLocator*(sm: SyncManager, lastHash: BlockHash):
     seq[array[32, byte]] =
