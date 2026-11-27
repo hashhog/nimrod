@@ -1816,10 +1816,12 @@ proc pingPeers(pm: PeerManager) {.async.} =
   await pm.sendPingsNow()
 
 proc getAddrEligible*(pm: PeerManager, peer: Peer): bool =
-  ## Core sends getaddr only to outbound peers that take part in addr relay:
-  ## never to inbound, block-relay-only or feeler connections
-  ## (net_processing.cpp:3750-3767, `if (!pfrom.IsInboundConn())
-  ## send_getaddr = SetupAddressRelay(...)`).
+  ## Core sends getaddr only to outbound peers that take part in addr relay,
+  ## never to inbound or block-relay-only connections (net_processing.cpp:
+  ## 3750-3767, `if (!pfrom.IsInboundConn()) send_getaddr =
+  ## SetupAddressRelay(...)`, which is false for block-relay-only).  Core
+  ## does send it to a feeler but disconnects the feeler in the same VERSION
+  ## handler (:3801-3804), so no reply is ever read; feelers are skipped here.
   if peer.direction == pdInbound:
     return false
   let key = peerKey(peer)
