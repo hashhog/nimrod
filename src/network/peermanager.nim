@@ -1326,43 +1326,73 @@ proc startOutboundConnections*(pm: PeerManager) {.async.} =
 proc tryEvictInbound(pm: PeerManager): Option[string] =
   ## Try to select an inbound peer to evict
   ## Returns peer key if eviction candidate found
+  ##
+  ## Candidates are EVERY inbound socket in pm.peers that is not already
+  ## disconnecting, handshaked or not. Core CConnman::AttemptToEvictConnection
+  ## (net.cpp:1689) walks all of m_nodes (skipping only fDisconnect), and
+  ## inboundCount -- which decides that eviction is needed -- counts half-open
+  ## sockets too. Drawing only from extendedPeers (filled after the handshake)
+  ## meant a flood of raw TCP connects that never send VERSION made every new
+  ## connect evict an established honest peer.
   var candidates: seq[EvictionCandidate]
+  var keys: seq[string]   # keys[i] is the pm.peers key of candidates[i]
 
-  var peerId: int64 = 0
-  for key, ext in pm.extendedPeers:
-    if ext.connType != pctInbound:
+  for key, peer in pm.peers:
+    if peer.direction != pdInbound or peer.state == psDisconnected:
       continue
 
-    let ip = parseIpAddr(ext.peer.address)
-    candidates.add(EvictionCandidate(
-      id: peerId,
-      address: ext.peer.address,
-      connected: ext.connectedTime,
-      minPingTime: ext.minPingTime,
-      lastBlockTime: ext.lastBlockTime,
-      lastTxTime: ext.lastTxTime,
-      relevantServices: (ext.peer.services and (NodeNetwork or NodeWitness)) != 0,
-      relayTxs: true,  # TODO: track this properly
-      bloomFilter: false,
-      keyedNetGroup: ext.keyedNetGroup,
-      preferEvict: false,
-      isLocal: ip.isLocal(),
-      netGroup: ext.netGroup,
-      noBan: ext.noBan,
-      connType: ctInbound
-    ))
-    inc peerId
+    let ip = parseIpAddr(peer.address)
+    if key in pm.extendedPeers:
+      let ext = pm.extendedPeers[key]
+      if ext.connType != pctInbound:
+        continue
+      candidates.add(EvictionCandidate(
+        id: int64(keys.len),
+        address: peer.address,
+        connected: ext.connectedTime,
+        minPingTime: ext.minPingTime,
+        lastBlockTime: ext.lastBlockTime,
+        lastTxTime: ext.lastTxTime,
+        relevantServices: (peer.services and (NodeNetwork or NodeWitness)) != 0,
+        relayTxs: true,  # TODO: track this properly
+        bloomFilter: false,
+        keyedNetGroup: ext.keyedNetGroup,
+        preferEvict: false,
+        isLocal: ip.isLocal(),
+        netGroup: ext.netGroup,
+        noBan: ext.noBan,
+        connType: ctInbound
+      ))
+    else:
+      # Half-open (psConnected / psHandshaking): no VERSION yet, so -- as in
+      # Core for a node that has not finished the handshake -- no ping sample
+      # (max), no block/tx time (epoch), no wanted services and no tx relay.
+      # It earns none of the usefulness protections; it still gets the
+      # netgroup, network and uptime ones every candidate gets.
+      candidates.add(EvictionCandidate(
+        id: int64(keys.len),
+        address: peer.address,
+        connected: peer.connectedAt,
+        minPingTime: initDuration(seconds = int64.high div 1_000_000_000),
+        lastBlockTime: Time(),
+        lastTxTime: Time(),
+        relevantServices: false,
+        relayTxs: false,
+        bloomFilter: false,
+        keyedNetGroup: getKeyedNetGroup(ip, pm.netgroupKey),
+        preferEvict: false,
+        isLocal: ip.isLocal(),
+        netGroup: getNetGroupAsn(pm.netGroupManager, ip),
+        noBan: false,
+        connType: ctInbound
+      ))
+    keys.add(key)
 
   let evictIdOpt = selectNodeToEvict(candidates)
   if evictIdOpt.isSome:
     let evictId = evictIdOpt.get()
-    # Find the key for this ID
-    var idx: int64 = 0
-    for key, ext in pm.extendedPeers:
-      if ext.connType == pctInbound:
-        if idx == evictId:
-          return some(key)
-        inc idx
+    if evictId >= 0 and evictId < int64(keys.len):
+      return some(keys[evictId])
 
   return none(string)
 
