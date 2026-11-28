@@ -12922,7 +12922,9 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   # not, and walletprocesspsbt answers RPC_DESERIALIZATION_ERROR with
   # "TX decode failed <reason>" (wallet/rpc/spend.cpp). Without the check the
   # signer below took the amount and script from whatever transaction the
-  # PSBT author attached.
+  # PSBT author attached. Core throws std::ios_base::failure, whose what()
+  # on libstdc++ (the Linux release build) ends in ": iostream error", so
+  # that suffix is part of Core's answer.
   for i in 0 ..< min(psbtObj.inputs.len, unsignedTx.inputs.len):
     if psbtObj.inputs[i].nonWitnessUtxo.isNone:
       continue
@@ -12930,10 +12932,10 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     let prevTx = psbtObj.inputs[i].nonWitnessUtxo.get()
     if prevTx.txid() != op.txid:
       raise newRpcError(RpcDeserializationError,
-        "TX decode failed Non-witness UTXO does not match outpoint hash")
+        "TX decode failed Non-witness UTXO does not match outpoint hash: iostream error")
     if int(op.vout) >= prevTx.outputs.len:
       raise newRpcError(RpcDeserializationError,
-        "TX decode failed Input specifies output index that does not exist")
+        "TX decode failed Input specifies output index that does not exist: iostream error")
 
   # The wallet's own record of the output an input spends: an unspent wallet
   # coin, else an output of a transaction in the wallet's history. This is
@@ -12956,7 +12958,9 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   # PSBT's non_witness_utxo (checked against the prevout above), else the
   # wallet's own record, else the PSBT's witness_utxo, which the PSBT author
   # controls and nothing here can check, so it is not trusted. Chainstate
-  # last, for inputs the PSBT carries no data for.
+  # last, for inputs the PSBT carries no data for; it is not wallet data and
+  # Core's walletprocesspsbt has no such source, so it gets no more trust
+  # than witness_utxo (the Updater stashes it there anyway).
   proc resolvePrevOut(idx: int): tuple[prev: Option[TxOut], trusted: bool] =
     if psbtObj.inputs[idx].nonWitnessUtxo.isSome:
       let prevTx = psbtObj.inputs[idx].nonWitnessUtxo.get()
@@ -12972,7 +12976,7 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     if rpc.chainState != nil:
       let u = rpc.chainState.getUtxo(op)
       if u.isSome:
-        return (some(u.get().output), true)
+        return (some(u.get().output), false)
     (none(TxOut), false)
 
   # ------------------------------------------------------------------
