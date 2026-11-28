@@ -2,7 +2,7 @@
 ## Implements persistent ban list with JSON storage (Bitcoin Core compatible)
 ## Reference: /home/max/hashhog/bitcoin/src/banman.cpp
 
-import std/[tables, times, os, strutils]
+import std/[tables, times, os, strutils, net]
 import chronicles
 import jsony
 
@@ -41,22 +41,63 @@ proc newBanManager*(dataDir: string = "."): BanManager =
 proc banListPath*(bm: BanManager): string =
   bm.dataDir / BanListFileName
 
+proc isPortText(s: string): bool =
+  s.len > 0 and s.allCharsInSet(Digits)
+
+proc canonicalIp(ip: IpAddress): string =
+  ## One text form per address, so the key compares like Core's CNetAddr
+  ## (by bytes): lowercase, zero-compressed IPv6, and an IPv4-mapped IPv6
+  ## address folded to dotted IPv4 (Core stores ::ffff:a.b.c.d as IPv4, and
+  ## anchors.ipToString writes it that way too).
+  if ip.family == IpAddressFamily.IPv6:
+    var mapped = ip.address_v6[10] == 0xff'u8 and ip.address_v6[11] == 0xff'u8
+    for i in 0 ..< 10:
+      if ip.address_v6[i] != 0: mapped = false
+    if mapped:
+      let b = ip.address_v6
+      return $b[12] & "." & $b[13] & "." & $b[14] & "." & $b[15]
+  $ip
+
 proc normalizeAddress*(address: string): string =
-  ## Normalize address for consistent lookup (strip port if present)
-  ## Ban by IP, not IP:port
+  ## Normalize address for consistent lookup: ban by IP, not IP:port.
+  ##
+  ## A port is stripped only from "[v6]:port" or a single-colon "host:port"
+  ## (IPv4:port). A bare IPv6 literal -- which is exactly what inbound peers
+  ## hand us as `$remoteAddr.address` -- is kept whole: cutting it at the
+  ## last ':' turned "2001:db8::1" into the key "2001:db8:", so one ban hit
+  ## every neighbour that differs only in the last group. Core's BanMan bans
+  ## the exact CNetAddr (or an explicit subnet ban), never a derived range.
+  ## A numeric IP is returned in canonical form (see canonicalIp), so the
+  ## inbound, anchor (full eight-group) and setban spellings of one address
+  ## share one key.
+  # 1. A bare numeric IP (v4 or unbracketed v6).
+  try:
+    return canonicalIp(parseIpAddress(address))
+  except ValueError:
+    discard
+  # 2. "[v6]" or "[v6]:port" -> the bracketed part.
+  if address.len > 0 and address[0] == '[':
+    let closeBracket = address.find(']')
+    if closeBracket > 0:
+      let rest = address[closeBracket + 1 .. ^1]
+      if rest.len == 0 or (rest[0] == ':' and isPortText(rest[1 .. ^1])):
+        let inner = address[1 ..< closeBracket]
+        try:
+          return canonicalIp(parseIpAddress(inner))
+        except ValueError:
+          return inner
+    return address
+  # 3. "host:port" with exactly one colon (IPv4:port). Anything with two or
+  #    more colons is IPv6 text (e.g. a "2001:db8::/32" subnet) and is left
+  #    alone rather than truncated.
   let colonIdx = address.rfind(':')
-  if colonIdx > 0:
-    # Check if this might be IPv6
-    let bracketIdx = address.find('[')
-    if bracketIdx >= 0:
-      # IPv6 format: [::1]:8333 - extract the IP portion
-      let closeBracket = address.find(']')
-      if closeBracket > bracketIdx:
-        return address[bracketIdx + 1 ..< closeBracket]
-      return address
-    else:
-      # IPv4 format: 192.168.1.1:8333
-      return address[0 ..< colonIdx]
+  if colonIdx > 0 and address.find(':') == colonIdx and
+      isPortText(address[colonIdx + 1 .. ^1]):
+    let host = address[0 ..< colonIdx]
+    try:
+      return canonicalIp(parseIpAddress(host))
+    except ValueError:
+      return host
   address
 
 proc load*(bm: BanManager) =
@@ -74,7 +115,14 @@ proc load*(bm: BanManager) =
     for entry in banList.entries:
       # Skip expired entries
       if entry.banUntil > now:
-        bm.bannedPeers[entry.address] = entry
+        # Re-key through normalizeAddress: a file written before keys were
+        # canonical can hold e.g. "2001:DB8::1", which lookups never produce.
+        var e = entry
+        e.address = normalizeAddress(entry.address)
+        if e.address in bm.bannedPeers and
+            bm.bannedPeers[e.address].banUntil >= e.banUntil:
+          continue
+        bm.bannedPeers[e.address] = e
 
     info "loaded ban list", count = bm.bannedPeers.len, path = path
   except CatchableError as e:
