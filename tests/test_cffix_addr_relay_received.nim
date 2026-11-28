@@ -285,8 +285,10 @@ suite "cffix addr relay: relay what was received, not the stored prefix":
                         services: 1'u64, address: v, port: 8333)]))
     check relayedEntries(full.received()).len == 0
     # Control: the same address from a full-relay source is relayed.
-    pm.handleAddrInternal(sourcePeer(1000.0),
-      P2PMessage(kind: mkAddr, addresses: @[b]))
+    let other = newPeer("45.0.0.2", 8333'u16, regtestParams(), pdInbound)
+    other.addrTokenBucket = 1000.0
+    other.addrTokenTimestamp = getTime().toUnix()
+    pm.handleAddrInternal(other, P2PMessage(kind: mkAddr, addresses: @[b]))
     check relayedEntries(full.received()).len == 1
     full.closeSink(); removeDir(dir)
 
