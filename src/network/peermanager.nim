@@ -79,7 +79,6 @@ const
   DefaultMaxInbound* = 117
   DEFAULT_MAX_CONNECTIONS* = 125
   DEFAULT_BIND_HOSTS* = ["0.0.0.0", "::"]
-  NetgroupKey* = 0x6c0edd8036ef4036'u64  # SHA256("netgroup")[0:8]
   # BIP-324: cap the v1-only address cache.  Mirrors clearbit's
   # V2_FALLBACK_CACHE_MAX = 4096.  Bounded so a churn-y network doesn't
   # leak memory; eviction is a single-pop on insert when full.
@@ -184,7 +183,10 @@ type
     dataDir*: string
     # Eclipse protection state
     outboundNetGroups*: HashSet[NetGroup]  # Network groups of current outbound peers
-    netgroupKey*: uint64
+    netgroupKey*: NetgroupSeed
+      ## Per-process random SipHash key for the keyed netgroup (Core
+      ## CConnman nSeed0/nSeed1).  Never a constant: a public key makes the
+      ## eviction-protected netgroups the same, and known, on every node.
     # ASN-aware eclipse protection (FIX-51 / W115 G25+G27)
     # When an asmap file is loaded this manager yields ASN-keyed groups instead
     # of /16 or /32 prefixes, mirroring Bitcoin Core's CConnman::m_netgroupman.
@@ -521,7 +523,7 @@ proc newPeerManager*(params: ConsensusParams,
     running: false,
     dataDir: dataDir,
     outboundNetGroups: initHashSet[NetGroup](),
-    netgroupKey: NetgroupKey,
+    netgroupKey: newNetgroupSeed(),
     # Use provided NetGroupManager or a no-asmap fallback.
     # Reference: bitcoin-core/src/net.cpp CConnman constructor passes m_netgroupman
     netGroupManager: if netGroupMgr != nil: netGroupMgr else: newNetGroupManager(),

@@ -197,6 +197,7 @@ const IncludedTests = [
   "test_mtp_sidebranch",
   "test_muhash_vectors",
   "test_netgroup",
+  "test_cffix_netgroup_random_key",
   "test_networkdisable",
   "test_ni8_walk_off_lock",
   "test_nil_db_height_index",

@@ -3,9 +3,10 @@
 ## when an asmap is loaded via NetGroupManager.
 ## Reference: Bitcoin Core netgroup.cpp GetGroup()
 
-import std/[net, strutils, hashes]
+import std/[net, strutils, hashes, sysrand]
 import chronicles
 import ./asmap
+import ../crypto/siphash
 
 export asmap
 
@@ -396,17 +397,49 @@ proc getNetGroup*(address: string): NetGroup =
   let ip = parseIpAddr(addrStr)
   return getNetGroup(ip)
 
-proc getKeyedNetGroup*(ip: IpAddr, key: uint64): uint64 =
-  ## Get a keyed (randomized) network group identifier
-  ## Used for deterministic but unpredictable protection in eviction
-  ## Reference: Bitcoin Core eviction.cpp CompareNetGroupKeyed
+const
+  RandomizerIdNetgroup* = 0x6c0edd8036ef4036'u64
+    ## Domain separator for the keyed netgroup, SHA256("netgroup")[0:8].
+    ## It is public and the same on every node, so it is NOT a key: it only
+    ## separates this use of the per-process SipHash seed from others.
+    ## Reference: bitcoin-core/src/net.cpp:110 RANDOMIZER_ID_NETGROUP.
+
+type
+  NetgroupSeed* = tuple[k0, k1: uint64]
+    ## 128-bit SipHash key for the keyed netgroup, drawn once per process.
+    ## Reference: bitcoin-core/src/net.h CConnman::nSeed0 / nSeed1.
+
+proc newNetgroupSeed*(): NetgroupSeed =
+  ## Draw a fresh SipHash key from the OS CSPRNG.  Core seeds CConnman with
+  ## GetRand<uint64_t>() twice (init.cpp), so the protected netgroups in
+  ## inbound eviction differ per node and per restart and cannot be predicted.
+  ## Fails closed: a node that cannot get randomness must not fall back to a
+  ## public key.
+  var raw: array[16, byte]
+  if not urandom(raw):
+    raise newException(OSError, "netgroup seed unavailable (urandom failed)")
+  for i in 0 ..< 8:
+    result.k0 = result.k0 or (uint64(raw[i]) shl (i * 8))
+    result.k1 = result.k1 or (uint64(raw[8 + i]) shl (i * 8))
+
+proc getKeyedNetGroup*(ip: IpAddr, seed: NetgroupSeed): uint64 =
+  ## Keyed netgroup used to pick which netgroups inbound eviction protects.
+  ## SipHash-2-4 keyed with the per-process seed, over the domain separator
+  ## then the netgroup bytes, as Core does:
+  ##   GetDeterministicRandomizer(RANDOMIZER_ID_NETGROUP).Write(vchNetGroup)
+  ##   = CSipHasher(nSeed0, nSeed1).Write(id).Write(vchNetGroup).Finalize()
+  ## Reference: bitcoin-core/src/net.cpp:4139-4148.
   let group = getNetGroup(ip)
-  var h = key
-  for b in group.data:
-    h = h xor uint64(b)
-    h = h * 0x5851F42D4C957F2D'u64  # FNV-style mixing
-    h = h xor (h shr 47)
-  result = h
+  var h = newSipHasher(seed.k0, seed.k1)
+  h.write(RandomizerIdNetgroup)
+  h.write(group.data)
+  result = h.finalize()
+
+proc getKeyedNetGroup*(ip: IpAddr, key: uint64): uint64 =
+  ## Single-word-key form, kept for callers that pass a fixed key (tests,
+  ## newEvictionCandidate).  Same SipHash as above with key (key, 0).
+  ## Production code passes the per-process NetgroupSeed instead.
+  getKeyedNetGroup(ip, (k0: key, k1: 0'u64))
 
 proc sameNetGroup*(a, b: IpAddr): bool =
   ## Check if two IPs are in the same network group
