@@ -17,6 +17,8 @@ export coinselection
 export db_sqlite.WalletDb, db_sqlite.StoredKey, db_sqlite.StoredUtxo
 export db_sqlite.StoredWatchedDescriptor, db_sqlite.saveWatchedDescriptor,
        db_sqlite.getWatchedDescriptors, db_sqlite.setWalletFlag,
+       db_sqlite.saveDescriptorSecret, db_sqlite.getDescriptorSecrets,
+       db_sqlite.deleteWatchedDescriptor, db_sqlite.saveImportedDescriptor,
        db_sqlite.getWalletFlag
 
 type
@@ -155,6 +157,16 @@ type
     # sqlite wallet_flags table and restored on load.
     # Reference: bitcoin-core/src/wallet/walletutil.h WALLET_FLAG_DISABLE_PRIVATE_KEYS.
     privateKeysDisabled*: bool
+    ## Private forms of imported descriptors, keyed by the PUBLIC canonical
+    ## descriptor string that watched_descriptors and watchedScripts hold.
+    ## Each value is sealed (sealDescriptorSecret): IV || AES-256-CBC under a
+    ## key derived from the HD seed, so it opens only while the seed is in
+    ## memory (unencrypted, or encrypted and unlocked). Persisted in the
+    ## descriptor_secrets table. Core encrypts descriptor keys in an
+    ## encrypted wallet too (wallet/scriptpubkeyman.cpp
+    ## DescriptorScriptPubKeyMan::AddDescriptorKeyWithDB -> EncryptSecret,
+    ## WriteCryptedDescriptorKey). cffix-nimrod-listdescriptors-private.
+    descriptorSecrets*: Table[string, seq[byte]]
     # Watch-only scripts registered via importdescriptors:
     # scriptPubKey bytes -> WatchedScript. Checked by scanBlockForWallet /
     # buildTxAmounts when findKeyForScript misses, so watched outputs are
@@ -185,6 +197,64 @@ proc seedBytes*(wallet: Wallet): seq[byte] =
   ## The raw seed the master key was derived from.
   let n = if wallet.seedLen >= 16 and wallet.seedLen <= 64: wallet.seedLen else: 64
   @(wallet.seed.toOpenArray(0, n - 1))
+
+const DescriptorSecretTag = "nimrod/descriptor-secret/v1"
+
+proc descriptorSecretKey(wallet: Wallet): array[32, byte] =
+  ## AES key for imported descriptor secrets: SHA256d(tag || HD seed). Using
+  ## the seed rather than the passphrase-derived key means encryptwallet and
+  ## walletpassphrasechange need no re-encryption pass: the seed is what the
+  ## passphrase protects, and while the wallet is locked it is not in memory.
+  ## sethdseed replaces the seed and re-seals (setHdSeed).
+  if wallet.isEncrypted and wallet.isLocked:
+    raise newException(WalletError,
+      "Error: Please enter the wallet passphrase with walletpassphrase first.")
+  let seed = wallet.seedBytes()
+  var zero = true
+  for b in seed:
+    if b != 0:
+      zero = false
+      break
+  if zero:
+    # Only a wallet created by an older build that never stored its seed.
+    raise newException(WalletError,
+      "Cannot store private keys: this wallet has no HD seed (run sethdseed first)")
+  var data = newSeqOfCap[byte](DescriptorSecretTag.len + seed.len)
+  for c in DescriptorSecretTag:
+    data.add(byte(c))
+  data.add(seed)
+  sha256d(data)
+
+proc sealDescriptorSecret*(wallet: Wallet, privateDesc: string): seq[byte] =
+  ## Encrypt a private descriptor string for wallet.descriptorSecrets.
+  let key = wallet.descriptorSecretKey()
+  let iv = generateIv()
+  var fullIv: array[32, byte]
+  copyMem(addr fullIv[0], unsafeAddr iv[0], 16)
+  var plain = newSeq[byte](privateDesc.len)
+  for i, c in privateDesc:
+    plain[i] = byte(c)
+  result = @iv
+  result.add(encryptSecret(key, plain, fullIv))
+  for i in 0 ..< plain.len:
+    plain[i] = 0
+
+proc openDescriptorSecret*(wallet: Wallet, sealed: seq[byte]): string =
+  ## Decrypt a value of wallet.descriptorSecrets. Raises WalletError when the
+  ## wallet is locked or the value does not decrypt.
+  let key = wallet.descriptorSecretKey()
+  if sealed.len < 32:
+    raise newException(WalletError, "corrupt descriptor secret")
+  var fullIv: array[32, byte]
+  copyMem(addr fullIv[0], unsafeAddr sealed[0], 16)
+  var plain: seq[byte]
+  try:
+    plain = decryptSecret(key, sealed[16 .. ^1], fullIv)
+  except CrypterError:
+    raise newException(WalletError, "descriptor secret does not decrypt")
+  result = newString(plain.len)
+  for i, b in plain:
+    result[i] = char(b)
 
 proc canDeriveKeys*(wallet: Wallet): bool =
   ## True when the in-memory master key holds a private key (hardened BIP-32
@@ -782,6 +852,11 @@ proc setHdSeed*(wallet: var Wallet, seed: openArray[byte]) =
   ## addresses across the entire derivation tree.
   if seed.len < 16 or seed.len > 64:
     raise newException(WalletError, "seed must be 16-64 bytes")
+  # Imported descriptor secrets are sealed under the old seed: open them now
+  # and re-seal under the new one below, or they would be lost.
+  var openedSecrets: seq[tuple[pubDesc, privDesc: string]] = @[]
+  for pubDesc, sealed in wallet.descriptorSecrets:
+    openedSecrets.add((pubDesc, wallet.openDescriptorSecret(sealed)))
   # Cache the seed (zero-pad / truncate into the fixed 64-byte slot for the
   # encrypted-on-disk path; derivation itself uses the raw bytes below).
   for i in 0 ..< wallet.seed.len:
@@ -799,6 +874,8 @@ proc setHdSeed*(wallet: var Wallet, seed: openArray[byte]) =
     copyMem(addr withIv[0], unsafeAddr iv[0], 16)
     copyMem(addr withIv[16], unsafeAddr ct[0], ct.len)
     wallet.encryptedSeed = withIv
+  for (pubDesc, privDesc) in openedSecrets:
+    wallet.descriptorSecrets[pubDesc] = wallet.sealDescriptorSecret(privDesc)
   # If the wallet has no accounts yet (e.g. created blank), seed the default
   # BIP-84 native-segwit account so getnewaddress works immediately.
   if wallet.accounts.len == 0:

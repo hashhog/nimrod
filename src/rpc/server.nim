@@ -180,6 +180,7 @@ const
   RpcInvalidAddressOrKey* = -5     # Invalid address or key
   RpcTypeError* = -3               # Unexpected type was passed as parameter (Core RPC_TYPE_ERROR)
   RpcWalletError* = -4             # Generic wallet RPC error (Core RPC_WALLET_ERROR)
+  RpcWalletUnlockNeeded* = -13     # Encrypted wallet is locked (Core RPC_WALLET_UNLOCK_NEEDED)
   RpcWalletInsufficientFunds* = -6 # send-family cannot fund the request (Core RPC_WALLET_INSUFFICIENT_FUNDS)
   RpcWalletNotFound* = -18         # load/unload of a missing wallet (Core RPC_WALLET_NOT_FOUND)
   RpcWalletAlreadyLoaded* = -35    # loadwallet of an already-loaded name (Core RPC_WALLET_ALREADY_LOADED)
@@ -11145,9 +11146,14 @@ proc handleWalletPassphrase(rpc: RpcServer, params: JsonNode): JsonNode =
   try:
     if not w.unlockWallet(passphrase, timeout):
       raise newRpcError(RpcMiscError, "incorrect passphrase")
-    newJNull()
   except WalletError as e:
     raise newRpcError(RpcMiscError, e.msg)
+  # The seed is back: seal plaintext descriptor rows from an older build and
+  # watch the rows that needed their private form. Best-effort.
+  let lw = rpc.getTargetLoadedWallet()
+  if lw != nil:
+    discard restoreDescriptorSecrets(lw)
+  newJNull()
 
 proc handleWalletLock(rpc: RpcServer, params: JsonNode): JsonNode =
   ## Lock the wallet
@@ -11333,6 +11339,26 @@ proc handleListDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
   if priv and w.privateKeysDisabled:
     raise newRpcError(RpcWalletError,
       "Can't get private descriptor string for watch-only wallets")
+  # private=true needs the keys: EnsureWalletIsUnlocked (backup.cpp:503-505).
+  if priv and w.isEncrypted and w.isLocked:
+    raise newRpcError(RpcWalletUnlockNeeded,
+      "Error: Please enter the wallet passphrase with walletpassphrase first.")
+
+  # The string to emit for a stored descriptor. Stored rows and watch entries
+  # hold the PUBLIC form; a row written by an older build may still hold the
+  # private one, so the public form is derived again here either way. With
+  # private=true the sealed private form is opened (the wallet is unlocked,
+  # checked above). A descriptor without private keys is the same either way.
+  proc emitted(stored: string): string =
+    let pub = publicDescriptorString(stored)
+    if not priv:
+      return pub
+    if w.descriptorSecrets.hasKey(pub):
+      try:
+        return w.openDescriptorSecret(w.descriptorSecrets[pub])
+      except WalletError as e:
+        raise newRpcError(RpcWalletError, e.msg)
+    stored
 
   # Resolve the wallet name for the wallet_name field, same lookup chain as
   # getwalletinfo.
@@ -11368,17 +11394,21 @@ proc handleListDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
           ranged = parseDescriptor(payload).node.isRange()
         except CatchableError:
           ranged = row.rangeEnd > 0
-        entries[row.descriptor] = DescEntry(
-          descriptor: row.descriptor,
+        let shown = emitted(row.descriptor)
+        entries[shown] = DescEntry(
+          descriptor: shown,
           timestamp: row.timestamp,
           rangeEnd: row.rangeEnd,
           isRange: ranged)
+    except RpcError as e:
+      raise e
     except CatchableError:
       usedDb = false
 
   if not usedDb:
     for _, ws in w.watchedScripts:
-      if entries.hasKey(ws.descriptor):
+      let shown = emitted(ws.descriptor)
+      if entries.hasKey(shown):
         continue
       var ranged = false
       try:
@@ -11386,8 +11416,8 @@ proc handleListDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
         ranged = parseDescriptor(payload).node.isRange()
       except CatchableError:
         ranged = false
-      entries[ws.descriptor] = DescEntry(
-        descriptor: ws.descriptor,
+      entries[shown] = DescEntry(
+        descriptor: shown,
         timestamp: ws.timestamp,
         rangeEnd: 0,
         isRange: ranged)
@@ -11586,6 +11616,11 @@ proc handleImportDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
 
   var w = rpc.getTargetWallet()
   let lw = rpc.getTargetLoadedWallet()  # nil => no sqlite persistence
+  # EnsureWalletIsUnlocked before any element (backup.cpp:383): a locked
+  # wallet imports nothing, and the keys it would hold could not be sealed.
+  if w.isEncrypted and w.isLocked:
+    raise newRpcError(RpcWalletUnlockNeeded,
+      "Error: Please enter the wallet passphrase with walletpassphrase first.")
   if rpc.chainState == nil:
     raise newRpcError(RpcMiscError, "no chain state")
 
@@ -11680,17 +11715,53 @@ proc handleImportDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
           "Cannot import descriptor without private keys to a wallet with " &
           "private keys enabled")
 
+      # The row, the watch entries and listdescriptors hold the PUBLIC
+      # form; the private form is kept only sealed (descriptorSecrets /
+      # descriptor_secrets). Core: GetDescriptorString(priv=false) by
+      # default, keys stored encrypted.
+      let publicCanon = publicDescriptorString(canonical)
+      if publicCanon != canonical:
+        # The public form must describe the same scripts, or a reload (which
+        # expands the public form) would watch the wrong outputs. A form
+        # that cannot expand without its keys (xpub/*h) is expanded from the
+        # sealed private form instead (manager.restoreWatchedRow).
+        var pubDesc: Descriptor = nil
+        try:
+          pubDesc = parseDescriptor(publicCanon)
+        except CatchableError:
+          pubDesc = nil
+        if pubDesc != nil:
+          let lastPos = if desc.node.isRange(): max(rangeEnd, 0) else: 0
+          for pos in 0 .. lastPos:
+            var pubScripts: seq[seq[byte]]
+            try:
+              pubScripts = expandNode(pubDesc.node, pos).scripts
+            except CatchableError:
+              break
+            if pubScripts != expandNode(desc.node, pos).scripts:
+              raise newRpcError(RpcWalletError,
+                "Error: the public form of this descriptor does not describe " &
+                "the same scripts")
+      var sealed: seq[byte] = @[]
+      if hasPriv and not w.privateKeysDisabled:
+        try:
+          sealed = w.sealDescriptorSecret(canonical)
+        except WalletError as e:
+          raise newRpcError(RpcWalletError, e.msg)
+
       # Register the watch scripts (and, on an enabled wallet, the WIF keys
       # so the coins are spendable).
-      applyWatchedDescriptor(w, desc, canonical, label, ts, rangeEnd,
+      applyWatchedDescriptor(w, desc, publicCanon, label, ts, rangeEnd,
                              rpc.params.network == Mainnet)
       if hasPriv and not w.privateKeysDisabled:
         importDescriptorWifKeys(w, desc.node)
+      if sealed.len > 0:
+        w.descriptorSecrets[publicCanon] = sealed
 
       # Persist the descriptor row so the watch survives a wallet reload.
       if lw != nil and lw.db != nil:
         try:
-          lw.db.saveWatchedDescriptor(canonical, label, ts, rangeEnd)
+          lw.db.saveImportedDescriptor(publicCanon, label, ts, rangeEnd, sealed)
         except CatchableError:
           discard  # in-memory import still stands; reload-safety degraded
 
