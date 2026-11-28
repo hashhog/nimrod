@@ -58,8 +58,11 @@ type
                                          ## written (requestNodeShutdown), so
                                          ## `stop` and SIGTERM share one path.
     shutdownSignalled: bool
-    activeClients: int                   ## Connections in processClient, capped
-                                         ## at RpcMaxConnections by start().
+    inFlightRequests: int                ## Authenticated requests being
+                                         ## executed or answered, capped at
+                                         ## RpcMaxConnections by processClient.
+                                         ## Open connections that have not sent
+                                         ## a whole request do not count.
     p2pQueue*: P2PCmdQueue               ## RPC -> main-loop P2P commands (NI-6).
                                          ## nil outside the node (unit tests):
                                          ## postP2P then runs on this thread.
@@ -16823,8 +16826,16 @@ const
     ## Core DEFAULT_HTTP_SERVER_TIMEOUT (httpserver.h), libevent's
     ## evhttp_set_timeout.
   RpcMaxConnections* = 64
-    ## Concurrent RPC connections served; past this an accepted socket is
-    ## answered 503 and closed. Core DEFAULT_HTTP_WORKQUEUE (httpserver.h).
+    ## Authenticated requests in flight (read in full, executing or being
+    ## answered); past this a further request is answered 503. Core
+    ## DEFAULT_HTTP_WORKQUEUE (httpserver.h): the depth of the queue of
+    ## parsed, dispatched requests, checked in http_request_cb
+    ## (httpserver.cpp:255). Connections still sending their request do not
+    ## count, so idle local sockets cannot take the slots.
+  RpcHeaderDeadline* = chronos.seconds(30)
+    ## Time allowed for a request's whole request line and headers. The
+    ## per-read RpcServerTimeout alone let a client send one short line every
+    ## 29 s and hold its connection until the 8 KiB budget ran out (~19 h).
 
 func cumulativeHeaderBytes*(soFar: int, line: string): int {.inline.} =
   ## One HTTP line plus its terminating CRLF.
@@ -16872,15 +16883,21 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
   # -rpcwallet / multi-wallet endpoint convention). "" means no specific wallet.
   var reqPath = ""
   var headerBytes = 0
+  var headerDeadline = Moment.now() + RpcHeaderDeadline
 
   while not transp.closed:
     try:
       if inHeaders:
+        # One deadline for the whole header phase, so trickled lines cannot
+        # hold the connection open past it.
+        let headerTimeLeft = headerDeadline - Moment.now()
+        if headerTimeLeft <= ZeroDuration:
+          break
         # Bounded while reading, not after: an unlimited readLine buffered a
         # whole CRLF-less header line before the cap was checked, from any
         # local UID with no credentials (audit H6: 1 GiB -> 3.1 GB RSS).
         let lineFut = transp.readLine(limit = headerLineReadLimit(headerBytes))
-        if not await lineFut.withTimeout(RpcServerTimeout):
+        if not await lineFut.withTimeout(headerTimeLeft):
           break
         let line = lineFut.read()
         if headersExceedCap(headerBytes, line):
@@ -16913,6 +16930,18 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
             if not await bodyFut.withTimeout(RpcServerTimeout):
               break
             let body = cast[string](bodyFut.read())
+
+            # The request is now read in full and authenticated: only here does
+            # it take one of the RpcMaxConnections slots, like Core's work
+            # queue (httpserver.cpp:255).
+            if rpc.inFlightRequests >= RpcMaxConnections:
+              await transp.writeStatus("503 Service Unavailable",
+                                       "Work queue depth exceeded")
+              break
+            inc rpc.inFlightRequests
+            # Released however this block exits (answer written, write error,
+            # handler defect): a defer is a try/finally over the rest of it.
+            defer: dec rpc.inFlightRequests
 
             # Yield to the event loop before the synchronous chain-state read so
             # that other pending futures (peer I/O, sync loop heartbeats) are not
@@ -16951,6 +16980,7 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
           authHeader = ""
           reqPath = ""
           headerBytes = 0
+          headerDeadline = Moment.now() + RpcHeaderDeadline
 
         else:
           let rl = parseHttpRequestLine(line)
@@ -16996,17 +17026,6 @@ proc processClient(rpc: RpcServer, transp: StreamTransport) {.async.} =
       break
 
   await transp.closeWait()
-  dec rpc.activeClients
-
-proc rejectBusyClient(transp: StreamTransport) {.async.} =
-  ## Past RpcMaxConnections: answer like Core's full work queue
-  ## (httpserver.cpp, HTTP_SERVICE_UNAVAILABLE) and close, without reading.
-  try:
-    await transp.writeStatus("503 Service Unavailable",
-                             "Work queue depth exceeded")
-  except CatchableError:
-    discard
-  await transp.closeWait()
 
 proc start*(rpc: RpcServer) {.async.} =
   ## Start the RPC server (binds to localhost only)
@@ -17019,12 +17038,9 @@ proc start*(rpc: RpcServer) {.async.} =
   while rpc.running:
     try:
       let transp = await server.accept()
-      # Counted here, synchronously with accept, so a burst of connects
-      # cannot overshoot the cap before the handlers start running.
-      if rpc.activeClients >= RpcMaxConnections:
-        asyncSpawn rejectBusyClient(transp)
-        continue
-      inc rpc.activeClients
+      # Not counted against RpcMaxConnections here: a connection takes a
+      # slot only once processClient has its whole authenticated request.
+      # Until then it is bounded in time by RpcHeaderDeadline.
       asyncSpawn rpc.processClient(transp)
     except CatchableError as e:
       if rpc.running:
