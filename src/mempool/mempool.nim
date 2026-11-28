@@ -941,6 +941,13 @@ proc calculateAncestorStats*(mp: Mempool, tx: Transaction, selfVsize: int): (int
 
   (len(ancestors) + 1, totalVsize)  # +1 for self
 
+# Test hook: entries examined while expanding a descendant set, by
+# calculateDescendants (one per pool entry scanned) and descendantsBySpend (one
+# per descendant popped).  tests/test_cffix_rbf_descendants_index.nim reads it to
+# prove the RBF conflict expansion does not scale with unrelated pool entries.
+# A thread-local int: no locking, nothing reads it outside tests.
+var mempoolScanSteps* {.threadvar.}: int
+
 # Calculate descendant set for a transaction (BFS through children)
 proc calculateDescendants*(mp: Mempool, txid: TxId): HashSet[TxId] =
   ## Return the set of all descendant txids in the mempool (not including self)
@@ -949,6 +956,7 @@ proc calculateDescendants*(mp: Mempool, txid: TxId): HashSet[TxId] =
 
   # Find immediate children (transactions that spend outputs of this tx)
   for otherTxid, entry in mp.entries:
+    inc mempoolScanSteps
     for input in entry.tx.inputs:
       if input.prevOut.txid == txid:
         toVisit.add(otherTxid)
@@ -963,6 +971,7 @@ proc calculateDescendants*(mp: Mempool, txid: TxId): HashSet[TxId] =
 
     # Add grandchildren
     for otherTxid, entry in mp.entries:
+      inc mempoolScanSteps
       for input in entry.tx.inputs:
         if input.prevOut.txid == childTxid and otherTxid notin visited:
           toVisit.add(otherTxid)
@@ -1919,15 +1928,21 @@ proc removeTransaction*(mp: Mempool, txid: TxId, evictEphemeral: bool = true) =
 # kernel/disconnected_transactions.cpp)
 # ----------------------------------------------------------------------------
 
-proc descendantsBySpend(mp: Mempool, txid: TxId, nOutputs: int): seq[TxId] =
+proc descendantsBySpend(mp: Mempool, txid: TxId, nOutputs: int,
+                        seen: var HashSet[TxId]): seq[TxId] =
   ## In-mempool descendants of `txid` (not including it), found through the
   ## spentBy index — O(descendants), unlike calculateDescendants which scans
   ## every entry per step. `txid` itself need not be in the pool (a tx that
   ## was confirmed, or that failed to re-enter after a reorg).
-  var seen = initHashSet[TxId]()
+  ##
+  ## `seen` is shared across calls: a descendant already in it is neither
+  ## returned nor walked again, so expanding several roots whose descendant
+  ## sets overlap visits each tx once (Core CalculateDescendants' setDescendants
+  ## argument, txmempool.cpp).
   var queue: seq[(TxId, int)] = @[(txid, nOutputs)]
   while queue.len > 0:
     let (t, n) = queue.pop()
+    inc mempoolScanSteps
     for v in 0 ..< n:
       let op = OutPoint(txid: t, vout: uint32(v))
       if op in mp.spentBy:
@@ -1936,6 +1951,10 @@ proc descendantsBySpend(mp: Mempool, txid: TxId, nOutputs: int): seq[TxId] =
           seen.incl(child)
           result.add(child)
           queue.add((child, mp.entries[child].tx.outputs.len))
+
+proc descendantsBySpend(mp: Mempool, txid: TxId, nOutputs: int): seq[TxId] =
+  var seen = initHashSet[TxId]()
+  mp.descendantsBySpend(txid, nOutputs, seen)
 
 proc refreshAncestorState(mp: Mempool, txid: TxId) =
   ## Recompute an entry's cached ancestor aggregates after a parent entered or
@@ -2971,14 +2990,25 @@ proc findConflicts*(mp: Mempool, tx: Transaction): HashSet[TxId] =
       result.incl(mp.spentBy[input.prevOut])
 
 proc getAllConflictsWithDescendants*(mp: Mempool, conflicts: HashSet[TxId]): HashSet[TxId] =
-  ## Get all conflicts and their descendants (transactions that would be evicted)
+  ## Get all conflicts and their descendants (transactions that would be evicted).
+  ##
+  ## Core GetEntriesForConflicts (policy/rbf.cpp) calls
+  ## CalculateDescendants(it, all_conflicts) once per direct conflict with ONE
+  ## shared set, walking children through the mempool graph, so the cost is
+  ## O(evicted set).  This runs before the replacement's fee rules and script
+  ## checks, so a full-pool scan per descendant here (the old
+  ## calculateDescendants loop) let an unpaid replacement buy
+  ## conflicts x descendants x pool-size work.  Walk the spentBy index instead,
+  ## sharing `result` as the visited set: a conflict that is already a
+  ## descendant of an earlier one is not walked twice.
   result = initHashSet[TxId]()
   for conflictTxid in conflicts:
+    if conflictTxid in result:
+      continue   # reached as a descendant of an earlier conflict: already walked
     result.incl(conflictTxid)
-    # Add all descendants of this conflict
-    let descendants = mp.calculateDescendants(conflictTxid)
-    for descTxid in descendants:
-      result.incl(descTxid)
+    if conflictTxid in mp.entries:
+      discard mp.descendantsBySpend(conflictTxid,
+                                    mp.entries[conflictTxid].tx.outputs.len, result)
 
 proc calculateConflictFees*(mp: Mempool, allConflicts: HashSet[TxId]): (Satoshi, int) =
   ## Calculate total fee and vsize of all conflicting transactions

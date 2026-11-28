@@ -1740,6 +1740,9 @@ suite "Mempool RBF conflict removal":
       height: 100, ancestorFee: Satoshi(200), ancestorWeight: 800,
       ancestorCount: 2, ancestorSize: 200
     )
+    # addTransaction records every input in spentBy; the descendant walk reads
+    # that index, so a hand-built pool must keep it too.
+    mp.spentBy[childTx.inputs[0].prevOut] = TxId(childTxid)
 
     check mp.count == 2
 

@@ -87,6 +87,7 @@ const IncludedTests = [
   "test_campaign_builtin_confirmation",
   "test_cffix_64byte_mutation_rule",
   "test_cffix_psbt_sighash_mismatch",
+  "test_cffix_rbf_descendants_index",
   "test_cffix_reorg_bip68_mtp",
   "test_cffix_reorg_in_belowout",
   "test_cffix_reorg_sigop_cost",
