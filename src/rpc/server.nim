@@ -183,6 +183,7 @@ const
   RpcInvalidAddressOrKey* = -5     # Invalid address or key
   RpcTypeError* = -3               # Unexpected type was passed as parameter (Core RPC_TYPE_ERROR)
   RpcWalletError* = -4             # Generic wallet RPC error (Core RPC_WALLET_ERROR)
+  RpcWalletKeypoolRanOut* = -12    # locked wallet past its derived keys (Core RPC_WALLET_KEYPOOL_RAN_OUT)
   RpcWalletInsufficientFunds* = -6 # send-family cannot fund the request (Core RPC_WALLET_INSUFFICIENT_FUNDS)
   RpcWalletNotFound* = -18         # load/unload of a missing wallet (Core RPC_WALLET_NOT_FOUND)
   RpcWalletAlreadyLoaded* = -35    # loadwallet of an already-loaded name (Core RPC_WALLET_ALREADY_LOADED)
@@ -10041,6 +10042,8 @@ proc handleGetNewAddress(rpc: RpcServer, params: JsonNode): JsonNode =
     # address (gap-limit safety). DATA-LOSS FIX wa0fq5wtk.
     rpc.persistTargetWallet()
     %addrStr
+  except WalletKeypoolRanOutError as e:
+    raise newRpcError(RpcWalletKeypoolRanOut, e.msg)
   except WalletError as e:
     # Core ParseOutputType miss -> RPC_INVALID_ADDRESS_OR_KEY (-5)
     # "Unknown address type '%s'" (wallet/rpc/addresses.cpp:57).
@@ -10343,6 +10346,8 @@ proc handleGetRawChangeAddress(rpc: RpcServer, params: JsonNode): JsonNode =
     # Persist the internal keypool advance (gap-limit safety). DATA-LOSS FIX.
     rpc.persistTargetWallet()
     %addrStr
+  except WalletKeypoolRanOutError as e:
+    raise newRpcError(RpcWalletKeypoolRanOut, e.msg)
   except WalletError as e:
     raise newRpcError(RpcMiscError, e.msg)
 
