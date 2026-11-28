@@ -22,6 +22,10 @@ export db_sqlite.StoredWatchedDescriptor, db_sqlite.saveWatchedDescriptor,
 type
   WalletError* = object of CatchableError
 
+  WalletKeypoolRanOutError* = object of WalletError
+    ## A locked wallet was asked for a key past the ones it derived while
+    ## unlocked.  RPC maps it to Core's RPC_WALLET_KEYPOOL_RAN_OUT (-12).
+
   ExtendedKey* = object
     key*: array[32, byte]           ## Private key or chain code (public x-coord stored separately)
     chainCode*: array[32, byte]     ## Chain code for derivation
@@ -168,6 +172,10 @@ const BIP39_WORDLIST* = staticRead("../../resources/bip39-english.txt").strip().
 
 # Hardened derivation constant
 const HARDENED* = 0x80000000'u32
+
+# Core's message for GetNewDestination on an exhausted keypool
+# (wallet/rpc/addresses.cpp getnewaddress / getrawchangeaddress).
+const KeypoolRanOutMsg* = "Error: Keypool ran out, please call keypoolrefill first"
 
 # Coinbase maturity - outputs can only be spent after this many confirmations
 const CoinbaseMaturity* = 100
@@ -399,6 +407,23 @@ proc deriveChild*(parent: ExtendedKey, index: uint32): ExtendedKey =
   if hardened and not parent.isPrivate:
     raise newException(WalletError, "cannot derive hardened child from public key")
 
+  # The retry below is BIP-32's rule for an invalid CHILD (IL >= n or a zero
+  # result, ~2^-127 per index).  An invalid PARENT -- a zeroed private key,
+  # e.g. a locked wallet's cleared master, or an unparseable public key --
+  # makes libsecp reject every index, and the loop then walked the whole
+  # index space (~2^31 HMAC-SHA512 rounds) under the caller's locks.  Core's
+  # CExtKey::Derive only ever runs on a valid key.  The check costs one
+  # zero-tweak libsecp call and runs only after a rejection.
+  var zeroTweak: array[32, byte]
+  template failIfParentInvalid() =
+    let parentValid =
+      if parent.isPrivate: tweakSeckeyAdd(parent.key, zeroTweak).isSome
+      else: tweakPubkeyAdd(parent.publicKey, zeroTweak).isSome
+    if not parentValid:
+      raise newException(WalletError,
+        "cannot derive BIP-32 child: parent " &
+        (if parent.isPrivate: "private" else: "public") & " key is invalid")
+
   # W161 BUG-4: loop on the requested child index per BIP-32 spec.
   # Boundaries: hardened indexes live in [HARDENED, 2^32); unhardened in
   # [0, HARDENED). Wrapping past either edge is a spec violation and must
@@ -463,8 +488,10 @@ proc deriveChild*(parent: ExtendedKey, index: uint32): ExtendedKey =
         # (default array init) and isPrivate = false (already set above).
         return
 
-    # Libsecp rejected; bump curIndex per BIP-32 retry contract.
+    # Libsecp rejected.  First rule out an invalid parent (which no index can
+    # fix), then bump curIndex per the BIP-32 retry contract.
     # Preserve hardened/unhardened semantics: do not cross the boundary.
+    failIfParentInvalid()
     if hardened:
       if curIndex == high(uint32):
         raise newException(WalletError,
@@ -686,6 +713,11 @@ proc newWalletFromDb*(db: WalletDb, params: ConsensusParams,
 
 proc derivePath(wallet: Wallet, purpose, coinType, account, chain, index: uint32): DerivedKey =
   ## Derive a key at the specified BIP44/49/84/86 path
+  # Every path has hardened steps, which need the private master.  A locked
+  # encrypted wallet does not have it (lockWallet zeroes it); refuse here
+  # rather than hand a cleared key to BIP-32.
+  if wallet.isEncrypted and wallet.isLocked:
+    raise newException(WalletKeypoolRanOutError, KeypoolRanOutMsg)
   let path = "m/" & $purpose & "'/" & $coinType & "'/" & $account & "'/" & $chain & "/" & $index
   let extKey = derivePathStr(wallet.masterKey, path)
 
@@ -815,7 +847,13 @@ proc setHdSeedFromMnemonic*(wallet: var Wallet, mnemonic: string,
   wallet.setHdSeed(s)
 
 proc ensureGap(wallet: var Wallet, account: var Account, isInternal: bool) =
-  ## Ensure there are enough unused addresses ahead of the next index
+  ## Ensure there are enough unused addresses ahead of the next index.
+  ## Without a private master key (a locked encrypted wallet) nothing can be
+  ## derived: the keys already derived are the keypool, and the top-up waits
+  ## for the next unlock (unlockWallet -> materializeAccounts), as Core's
+  ## TopUp does.
+  if not wallet.canDeriveKeys():
+    return
   let nextIdx = if isInternal: account.nextInternal else: account.nextExternal
   let chain: uint32 = if isInternal: 1 else: 0
 
@@ -899,6 +937,12 @@ proc getNewAddress*(wallet: var Wallet, addrType: AddressType = P2WPKH,
     raise newException(WalletError, "account not found: " & $accountIdx)
 
   var account = wallet.accounts[actualIdx]
+
+  # Locked: serve only keys derived while unlocked; past them, fail fast.
+  let nextIdx = if isChange: account.nextInternal else: account.nextExternal
+  let poolLen = if isChange: account.internalKeys.len else: account.externalKeys.len
+  if nextIdx >= poolLen and not wallet.canDeriveKeys():
+    raise newException(WalletKeypoolRanOutError, KeypoolRanOutMsg)
 
   let key = if isChange:
     let idx = account.nextInternal
@@ -2097,6 +2141,9 @@ proc lockWallet*(wallet: var Wallet) =
 
   for i in 0 ..< wallet.masterKey.key.len:
     wallet.masterKey.key[i] = 0
+  # The key is gone, so the master is no longer a private key.  Leaving the
+  # flag set made canDeriveKeys-blind callers derive from an all-zero key.
+  wallet.masterKey.isPrivate = false
 
   wallet.isLocked = true
   wallet.unlockExpiry = 0
