@@ -2178,7 +2178,10 @@ proc relayAddresses(pm: PeerManager, source: Peer,
     return
   var candidates: seq[Peer]
   for _, p in pm.peers:
-    if p != source and p.isConnected() and not p.closing:
+    # psReady: Core sets up addr relay during the VERSION/VERACK exchange, so
+    # a peer still handshaking is not a target.
+    if p != source and p.isConnected() and p.state == psReady and
+        not p.closing:
       # Core relays only to peers with m_addr_relay_enabled, which
       # SetupAddressRelay never sets on a block-relay-only connection: sending
       # a peer's own address there would let it spot our hidden links.
@@ -2315,14 +2318,21 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
     peer.addrTokenTimestamp = nowSec
     # rate_limited = !HasPermission(Addr): NoBan/manual peers are exempt.
     var rateLimited = true
+    var fromBlockRelayOnly = false
     let pkey = peerKey(peer.address, peer.port)
     if pkey in pm.extendedPeers:
       let ext = pm.extendedPeers[pkey]
       if ext.noBan or ext.connType == pctManual:
         rateLimited = false
+      # Core ProcessAddrs ignores addr from a block-relay-only peer
+      # (net_processing.cpp:5630, SetupAddressRelay is false): relaying what
+      # it sends would confirm the hidden link to whoever sent it.
+      if ext.connType == pctBlockRelayOnly:
+        fromBlockRelayOnly = true
     # 3F FIX: Core net_processing.cpp:5690 relays only from a message of
     # <= 10 entries; a larger one is a getaddr response and is not relayed.
-    let relayGate = msg.addresses.len <= AddrRelayMaxEntries
+    let relayGate = msg.addresses.len <= AddrRelayMaxEntries and
+                    not fromBlockRelayOnly
     var toRelay: seq[TimestampedAddrV2]
     for i in 0..<count:
       # Apply rate limiting (Core: spend a token per processed addr; drop excess
@@ -2385,13 +2395,20 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
           peer.addrTokenBucket + elapsed * MaxAddrRatePerSecond)
     peer.addrTokenTimestamp = nowSec
     var rateLimited = true
+    var fromBlockRelayOnly = false
     let pkey = peerKey(peer.address, peer.port)
     if pkey in pm.extendedPeers:
       let ext = pm.extendedPeers[pkey]
       if ext.noBan or ext.connType == pctManual:
         rateLimited = false
+      # Core ProcessAddrs ignores addr from a block-relay-only peer
+      # (net_processing.cpp:5630, SetupAddressRelay is false): relaying what
+      # it sends would confirm the hidden link to whoever sent it.
+      if ext.connType == pctBlockRelayOnly:
+        fromBlockRelayOnly = true
     # 3F FIX: relay only from a message of <= 10 entries (Core :5690).
-    let relayGate = msg.addressesV2.len <= AddrRelayMaxEntries
+    let relayGate = msg.addressesV2.len <= AddrRelayMaxEntries and
+                    not fromBlockRelayOnly
     let v2RelayNow = uint32(getTime().toUnix())
     var toRelay: seq[TimestampedAddrV2]
     for i in 0..<count:
