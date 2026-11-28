@@ -6,14 +6,16 @@
 ## Core v31.1:
 ##   wallet/wallet.cpp CWallet::FillPSBT: "If we have no utxo, grab it from the
 ##     wallet" -- non_witness_utxo is filled from mapWallet when absent.
-##   psbt.cpp SignPSBTInput: the prevout comes from non_witness_utxo first,
-##     and only after `non_witness_utxo->GetHash() == prevout.hash` and
-##     `prevout.n < vout.size()` (else PSBTError::MISSING_INPUTS). When only
-##     witness_utxo is present `require_witness_sig = true`, and a
+##   psbt.h PartiallySignedTransaction::Unserialize: for every input, a
+##     non_witness_utxo whose hash is not the prevout txid throws "Non-witness
+##     UTXO does not match outpoint hash", and one with no output at the
+##     prevout index throws "Input specifies output index that does not
+##     exist". walletprocesspsbt (wallet/rpc/spend.cpp) turns a decode
+##     failure into RPC_DESERIALIZATION_ERROR (-22) "TX decode failed <reason>".
+##   psbt.cpp SignPSBTInput: the prevout comes from non_witness_utxo first.
+##     When only witness_utxo is present `require_witness_sig = true`, and a
 ##     non-witness signature is then refused (PSBTError::INCOMPLETE: the
 ##     input stays unsigned). After a witness signature `witness_utxo = utxo`.
-##   rpc/util.cpp: MISSING_INPUTS -> RPC_TRANSACTION_ERROR (-25),
-##     common/messages.cpp: "Inputs missing or spent".
 ##
 ## Run:
 ##   nim c -r tests/test_cffix_psbt_trusted_prevout.nim
@@ -133,11 +135,15 @@ suite "cffix walletprocesspsbt: sign owned inputs over the wallet's prevout, ver
       return e
     nil
 
-  proc checkMissingInputs(e: ref RpcError) =
+  const
+    HashMismatch = "TX decode failed Non-witness UTXO does not match outpoint hash"
+    IndexMissing = "TX decode failed Input specifies output index that does not exist"
+
+  proc checkDecodeRefused(e: ref RpcError, msg: string) =
     check e != nil
     if e != nil:
-      check e.code == RpcTransactionError   # -25, Core RPC_TRANSACTION_ERROR
-      check e.msg == "Inputs missing or spent"
+      check e.code == RpcDeserializationError  # -22, Core RPC_DESERIALIZATION_ERROR
+      check e.msg == msg
 
   ## The DER signature (sighash byte included) the wallet key makes for
   ## input 0 of `tx` under BIP-143 with `value` as the spent amount.
@@ -199,7 +205,7 @@ suite "cffix walletprocesspsbt: sign owned inputs over the wallet's prevout, ver
     let bogus = fundingTx(spk, LowValue, 4)
     doAssert bogus.txid() != fund.txid()
     p.inputs[0].nonWitnessUtxo = some(bogus)
-    checkMissingInputs(processErr(p))
+    checkDecodeRefused(processErr(p), HashMismatch)
 
   test "non_witness_utxo whose txid does not match is refused with sign=false too":
     let (key, spk) = walletKey(P2WPKH)
@@ -207,7 +213,7 @@ suite "cffix walletprocesspsbt: sign owned inputs over the wallet's prevout, ver
     ownCoin(fund, key)
     var p = createPsbt(spendTx(OutPoint(txid: fund.txid(), vout: 0'u32)))
     p.inputs[0].nonWitnessUtxo = some(fundingTx(spk, LowValue, 6))
-    checkMissingInputs(processErr(p, sign = false))
+    checkDecodeRefused(processErr(p, sign = false), HashMismatch)
 
   test "non_witness_utxo with too few outputs for the prevout index is refused":
     let (key, spk) = walletKey(P2WPKH)
@@ -220,7 +226,7 @@ suite "cffix walletprocesspsbt: sign owned inputs over the wallet's prevout, ver
               isInternal = false, isCoinbase = false)
     var p = createPsbt(spendTx(OutPoint(txid: fund.txid(), vout: 3'u32)))
     p.inputs[0].nonWitnessUtxo = some(fund)
-    checkMissingInputs(processErr(p))
+    checkDecodeRefused(processErr(p), IndexMissing)
 
   test "foreign input with a mismatched non_witness_utxo is refused (Core checks every input)":
     let (_, spk) = walletKey(P2WPKH)
@@ -229,7 +235,16 @@ suite "cffix walletprocesspsbt: sign owned inputs over the wallet's prevout, ver
     let foreignSpk = @[0x00'u8, 0x14] & newSeq[byte](20)
     var p = createPsbt(spendTx(OutPoint(txid: fund.txid(), vout: 0'u32)))
     p.inputs[0].nonWitnessUtxo = some(fundingTx(foreignSpk, LowValue, 9))
-    checkMissingInputs(processErr(p))
+    checkDecodeRefused(processErr(p), HashMismatch)
+
+  test "finalized input with a mismatched non_witness_utxo is refused (Core checks while decoding)":
+    let (_, spk) = walletKey(P2WPKH)
+    let fund = fundingTx(spk, TrueValue, 17)
+    var p = createPsbt(spendTx(OutPoint(txid: fund.txid(), vout: 0'u32)))
+    p.inputs[0].finalScriptWitness = @[@[0x01'u8]]
+    doAssert p.inputs[0].isSigned()
+    p.inputs[0].nonWitnessUtxo = some(fundingTx(spk, LowValue, 18))
+    checkDecodeRefused(processErr(p), HashMismatch)
 
   test "owned P2PKH key, coin unknown to the wallet: no legacy signature over witness_utxo-only data":
     # Legacy sighash does not commit to the amount or prove the script, so
