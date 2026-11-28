@@ -343,6 +343,7 @@ const IncludedTests = [
   "test_w141_zmq_rest_notify",
   "test_w160_sig_cache",
   "test_w162_genesis_presync",
+  "test_cffix_presync_cleanup_on_disconnect",
   "test_w163_header_chain_reload",
   "test_w164_apply_block_diffbits",
   "test_w165_ibd_tx_inv_suppression",
