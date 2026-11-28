@@ -266,6 +266,44 @@ suite "cffix addr relay: relay what was received, not the stored prefix":
     check relayedEntries(bro.received()).len == 0
     full.closeSink(); bro.closeSink(); removeDir(dir)
 
+  test "an address received from a block-relay-only peer is not relayed":
+    ## Core ProcessAddrs returns at once for a peer without addr relay
+    ## (SetupAddressRelay is false for block-relay-only, net_processing.cpp:
+    ## 5630), "to prevent providing adversaries with the additional
+    ## information of addr traffic to infer the link".
+    let (pm, dir) = freshPm("brosrc")
+    let full = pm.addSink("46.0.10.1", wantsV2 = false)
+    let src = sourcePeer(1000.0)
+    pm.extendedPeers[src.address & ":" & $src.port] = ExtendedPeer(peer: src,
+      connType: pctBlockRelayOnly, connectedTime: getTime())
+    let b = addrOf(47, 5, 0, 1, uint32(getTime().toUnix()) - 60'u32)
+    pm.handleAddrInternal(src, P2PMessage(kind: mkAddr, addresses: @[b]))
+    var v = NetAddressV2(networkId: netIPv4)
+    v.ipv4 = [47'u8, 5, 0, 2]
+    pm.handleAddrInternal(src, P2PMessage(kind: mkAddrV2, addressesV2: @[
+      TimestampedAddrV2(timestamp: uint32(getTime().toUnix()) - 60'u32,
+                        services: 1'u64, address: v, port: 8333)]))
+    check relayedEntries(full.received()).len == 0
+    # Control: the same address from a full-relay source is relayed.
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddr, addresses: @[b]))
+    check relayedEntries(full.received()).len == 1
+    full.closeSink(); removeDir(dir)
+
+  test "a peer still handshaking gets no addr relay":
+    ## Core relays only to peers with addr relay set up, which happens in the
+    ## VERSION/VERACK handling; a peer mid-handshake is not a target.
+    let (pm, dir) = freshPm("hs")
+    let ready = pm.addSink("46.0.11.1", wantsV2 = false)
+    let hs = pm.addSink("46.0.11.2", wantsV2 = false)
+    hs.peer.state = psHandshaking
+    let b = addrOf(47, 6, 0, 1, uint32(getTime().toUnix()) - 60'u32)
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddr, addresses: @[b]))
+    check relayedEntries(ready.received()).len == 1   # control
+    check relayedEntries(hs.received()).len == 0
+    ready.closeSink(); hs.closeSink(); removeDir(dir)
+
   test "an empty addr relays nothing":
     let (pm, dir) = freshPm("empty")
     pm.seedA(20, uint32(getTime().toUnix()) - 86400'u32)
