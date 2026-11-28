@@ -19,7 +19,8 @@
 ##     still holds the line open (base never answers: it waits for a CRLF);
 ##   * a Content-Length over 32 MiB is answered 413 before any body is read;
 ##   * a connection that sends nothing is closed within the 30 s timeout;
-##   * past the connection cap a new connection is answered 503;
+##   * silent sockets at the cap do not stop a real request (flipped; see
+##     test_cffix_rpc_preauth_slot.nim for the in-flight 503);
 ##   * a real request is still answered 200 while silent sockets are held.
 
 import unittest2
@@ -174,7 +175,12 @@ suite "RPC idle timeout and connection cap (audit H6)":
     defer: waitFor t.closeWait()
     check t.closedWithin(IdleUpperBound)
 
-  test "past the connection cap a new connection is answered 503":
+  test "silent sockets at the cap do not take it: a new request is answered 200":
+    ## Flipped: this asserted 503 here, which was the bug (cfaudit
+    ## processClient-preauth-connection-slot-starvation). Like Core's work
+    ## queue the cap counts authenticated requests in flight, not open
+    ## sockets; the 503 past 64 in-flight requests is pinned in
+    ## test_cffix_rpc_preauth_slot.nim.
     let f = setupFixture()
     defer: f.teardown()
     var silent: seq[StreamTransport]
@@ -187,7 +193,7 @@ suite "RPC idle timeout and connection cap (audit H6)":
     defer: waitFor t.closeWait()
     discard waitFor t.write(ValidRequest)
     let answer = t.readAnswer(AnswerBound)
-    check answer.statusLine == "HTTP/1.1 503 Service Unavailable"
+    check answer.statusLine == "HTTP/1.1 200 OK"
 
   test "a real request is still answered under the cap while silent sockets are held":
     let f = setupFixture()
