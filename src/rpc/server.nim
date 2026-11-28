@@ -11354,10 +11354,16 @@ proc handleListDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
     if not priv:
       return pub
     if w.descriptorSecrets.hasKey(pub):
+      var opened: string
       try:
-        return w.openDescriptorSecret(w.descriptorSecrets[pub])
+        opened = w.openDescriptorSecret(w.descriptorSecrets[pub])
       except WalletError as e:
         raise newRpcError(RpcWalletError, e.msg)
+      # AES-CBC carries no MAC: check it is this descriptor's private form.
+      if publicDescriptorString(opened) != pub:
+        raise newRpcError(RpcWalletError,
+          "descriptor secret does not match its descriptor")
+      return opened
     stored
 
   # Resolve the wallet name for the wallet_name field, same lookup chain as
@@ -11720,11 +11726,18 @@ proc handleImportDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
       # descriptor_secrets). Core: GetDescriptorString(priv=false) by
       # default, keys stored encrypted.
       let publicCanon = publicDescriptorString(canonical)
+      # A public form that cannot expand without its key (xpub/.../*h): keep
+      # its scripts (public data) so a wallet that loads locked still
+      # watches them (manager.restoreWatchedRow).
+      var scriptCache: seq[tuple[script: seq[byte], address: string]] = @[]
+      if publicCanon != canonical and not expandsWithoutKeys(publicCanon):
+        scriptCache = watchedScriptEntries(desc, rangeEnd,
+                                           rpc.params.network == Mainnet)
       if publicCanon != canonical:
         # The public form must describe the same scripts, or a reload (which
         # expands the public form) would watch the wrong outputs. A form
         # that cannot expand without its keys (xpub/*h) is expanded from the
-        # sealed private form instead (manager.restoreWatchedRow).
+        # cached scripts instead (manager.restoreWatchedRow).
         var pubDesc: Descriptor = nil
         try:
           pubDesc = parseDescriptor(publicCanon)
@@ -11761,7 +11774,8 @@ proc handleImportDescriptors*(rpc: RpcServer, params: JsonNode): JsonNode =
       # Persist the descriptor row so the watch survives a wallet reload.
       if lw != nil and lw.db != nil:
         try:
-          lw.db.saveImportedDescriptor(publicCanon, label, ts, rangeEnd, sealed)
+          lw.db.saveImportedDescriptor(publicCanon, label, ts, rangeEnd, sealed,
+                                       scriptCache)
         except CatchableError:
           discard  # in-memory import still stands; reload-safety degraded
 

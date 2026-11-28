@@ -259,10 +259,11 @@ suite "cffix listdescriptors private: no plaintext keys, gated private form":
             deriveScripts(parseDescriptor(d))
       check descStrings(rpc.handleMethod("listdescriptors", %[true])) == @[d]
 
-  test "hardened wildcard (/*h): reload of a locked wallet watches after unlock":
+  test "hardened wildcard (/*h): reload of a locked wallet still watches its scripts":
     withRig("nimrod_cffix_ldp_hwild"):
-      # xpub/*h cannot expand without the private key, so the reload must
-      # use the sealed private form, which needs the wallet unlocked.
+      # xpub/*h cannot expand without the private key. A wallet that loads
+      # locked keeps syncing, so it must watch these scripts before any
+      # unlock (the import caches them), or coins paid to them are missed.
       let tprv = "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK"
       let d = chk("wpkh(" & tprv & "/1h/*h)")
       check rpc.rpcCode("encryptwallet", %[Pass]) == 0
@@ -279,8 +280,10 @@ suite "cffix listdescriptors private: no plaintext keys, gated private form":
       discard wm.loadWallet("ew")
       var w = wm.getWallet("ew").get().wallet
       check w.isLocked
-      # Locked: the seed is not in memory, so these are not watched yet.
-      check (not w.watchedScripts.hasKey(spks[0]))
+      for spk in spks:
+        check w.watchedScripts.hasKey(spk)
+        if w.watchedScripts.hasKey(spk):
+          check w.watchedScripts[spk].descriptor == listed[0]
       check rpc.rpcCode("walletpassphrase", %[%Pass, %60]) == 0
       w = wm.getWallet("ew").get().wallet
       for spk in spks:
@@ -300,4 +303,25 @@ suite "cffix listdescriptors private: no plaintext keys, gated private form":
       for r in rpc.dbRows("ew"):
         check wif notin r
       check descStrings(rpc.handleListDescriptors(newJArray())) == @[pubDesc]
+      check descStrings(rpc.handleMethod("listdescriptors", %[true])) == @[privDesc]
+
+  test "legacy plaintext row in an encrypted wallet is sealed at walletpassphrase":
+    withRig("nimrod_cffix_ldp_legacyenc"):
+      check rpc.rpcCode("encryptwallet", %[Pass]) == 0
+      check rpc.rpcCode("walletpassphrase", %[%Pass, %60]) == 0
+      # An older build wrote the private string straight into the table.
+      let lw = wm.getWallet("ew").get()
+      lw.db.saveWatchedDescriptor(privDesc, "", 1, 0)
+      discard wm.unloadWallet("ew")
+      discard wm.loadWallet("ew")
+      check wm.getWallet("ew").get().wallet.isLocked
+      # Locked: listed public already; the row is rewritten at unlock.
+      check descStrings(rpc.handleListDescriptors(newJArray())) == @[pubDesc]
+      check rpc.rpcCode("walletpassphrase", %[%Pass, %60]) == 0
+      check rpc.dbRows("ew") == @[pubDesc]
+      check descStrings(rpc.handleMethod("listdescriptors", %[true])) == @[privDesc]
+      discard wm.unloadWallet("ew")
+      discard wm.loadWallet("ew")
+      check rpc.dbRows("ew") == @[pubDesc]
+      check rpc.rpcCode("walletpassphrase", %[%Pass, %60]) == 0
       check descStrings(rpc.handleMethod("listdescriptors", %[true])) == @[privDesc]

@@ -1409,15 +1409,11 @@ proc deriveScripts*(desc: Descriptor, start: int = 0, count: int = 1): seq[seq[b
 # Watch-only registration (importdescriptors)
 # =============================================================================
 
-proc applyWatchedDescriptor*(wallet: Wallet, desc: Descriptor,
-                             canonical, label: string, timestamp: int64,
-                             rangeEnd: int, mainnet: bool) =
-  ## Expand a parsed descriptor and register every derived scriptPubKey as a
-  ## watched script on the wallet (in-memory only — persisting the descriptor
-  ## row is the caller's job). `rangeEnd` is the inclusive expansion end for
-  ## ranged descriptors (ignored for non-ranged). Lives here rather than in
-  ## wallet.nim because this module imports wallet.nim (not vice versa).
-  var w = wallet
+proc watchedScriptEntries*(desc: Descriptor, rangeEnd: int, mainnet: bool):
+    seq[tuple[script: seq[byte], address: string]] =
+  ## Every scriptPubKey (with its address string, "" when it has none) that
+  ## applyWatchedDescriptor registers for `desc` over [0, rangeEnd].
+  result = @[]
   let lastPos = if desc.node.isRange(): max(rangeEnd, 0) else: 0
   for pos in 0 .. lastPos:
     let expanded = expandNode(desc.node, pos)
@@ -1428,7 +1424,29 @@ proc applyWatchedDescriptor*(wallet: Wallet, desc: Descriptor,
       let addrStr =
         if aligned: encodeAddress(expanded.addresses[si], mainnet)
         else: ""
-      w.registerWatchedScript(script, canonical, label, addrStr, timestamp)
+      result.add((script, addrStr))
+
+proc applyWatchedDescriptor*(wallet: Wallet, desc: Descriptor,
+                             canonical, label: string, timestamp: int64,
+                             rangeEnd: int, mainnet: bool) =
+  ## Expand a parsed descriptor and register every derived scriptPubKey as a
+  ## watched script on the wallet (in-memory only — persisting the descriptor
+  ## row is the caller's job). `rangeEnd` is the inclusive expansion end for
+  ## ranged descriptors (ignored for non-ranged). Lives here rather than in
+  ## wallet.nim because this module imports wallet.nim (not vice versa).
+  var w = wallet
+  for e in watchedScriptEntries(desc, rangeEnd, mainnet):
+    w.registerWatchedScript(e.script, canonical, label, e.address, timestamp)
+
+proc expandsWithoutKeys*(descriptor: string): bool =
+  ## True when `descriptor` parses and expands on its own. A public form
+  ## with a hardened step after the xpub (xpub/.../*h) does not: it needs the
+  ## private key, so its scripts are cached at import (descriptor_script_cache).
+  try:
+    discard expandNode(parseDescriptor(descriptor).node, 0)
+    true
+  except CatchableError:
+    false
 
 # =============================================================================
 # Descriptor Info

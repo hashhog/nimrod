@@ -19,6 +19,7 @@ export db_sqlite.StoredWatchedDescriptor, db_sqlite.saveWatchedDescriptor,
        db_sqlite.getWatchedDescriptors, db_sqlite.setWalletFlag,
        db_sqlite.saveDescriptorSecret, db_sqlite.getDescriptorSecrets,
        db_sqlite.deleteWatchedDescriptor, db_sqlite.saveImportedDescriptor,
+       db_sqlite.saveDescriptorScriptCache, db_sqlite.getDescriptorScriptCache,
        db_sqlite.getWalletFlag
 
 type
