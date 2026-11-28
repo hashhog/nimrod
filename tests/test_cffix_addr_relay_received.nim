@@ -88,8 +88,20 @@ proc addSink(pm: PeerManager, host: string, wantsV2: bool): Sink =
   asyncSpawn pump(remote, result.inbox)
 
 proc received(s: Sink): seq[P2PMessage] =
-  ## Every complete P2P message sent to the sink since the last call.
-  waitFor sleepAsync(chronos.milliseconds(300))   # let the spawned writers run
+  ## Every complete P2P message sent to the sink since the last call.  Lets
+  ## the spawned writers run until the socket has been quiet for 300 ms (at
+  ## most 3 s), so a slow write under load is still seen.
+  var quietMs = 0
+  var waitedMs = 0
+  var lastLen = s.inbox[].len
+  while quietMs < 300 and waitedMs < 3000:
+    waitFor sleepAsync(chronos.milliseconds(50))
+    waitedMs += 50
+    if s.inbox[].len != lastLen:
+      lastLen = s.inbox[].len
+      quietMs = 0
+    else:
+      quietMs += 50
   let data = s.inbox[]
   s.inbox[].setLen(0)
   var pos = 0
@@ -235,6 +247,35 @@ suite "cffix addr relay: relay what was received, not the stored prefix":
     check relayedEntries(s1.received()).len == 1
     check relayedEntries(s2.received()).len == 1
     s1.closeSink(); s2.closeSink(); removeDir(dir)
+
+  test "a received address is never relayed to a block-relay-only peer":
+    ## Core RelayAddress picks only peers with m_addr_relay_enabled, which
+    ## SetupAddressRelay never sets for a block-relay-only connection
+    ## (net_processing.cpp:2309, SetupAddressRelay).  Relaying there would
+    ## let whoever sent the address spot our hidden block-relay links.
+    let (pm, dir) = freshPm("bro")
+    let full = pm.addSink("46.0.8.1", wantsV2 = false)
+    let bro = pm.addSink("46.0.8.2", wantsV2 = false)
+    pm.extendedPeers["46.0.8.2:8333"] = ExtendedPeer(peer: bro.peer,
+      connType: pctBlockRelayOnly, connectedTime: getTime())
+    for k in 0 ..< 5:
+      let b = addrOf(47, 4, 0, byte(k + 1), uint32(getTime().toUnix()) - 60'u32)
+      pm.handleAddrInternal(sourcePeer(1000.0),
+        P2PMessage(kind: mkAddr, addresses: @[b]))
+    check relayedEntries(full.received()).len == 5   # control: relay works
+    check relayedEntries(bro.received()).len == 0
+    full.closeSink(); bro.closeSink(); removeDir(dir)
+
+  test "an empty addr relays nothing":
+    let (pm, dir) = freshPm("empty")
+    pm.seedA(20, uint32(getTime().toUnix()) - 86400'u32)
+    let s1 = pm.addSink("46.0.9.1", wantsV2 = false)
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddr, addresses: @[]))
+    pm.handleAddrInternal(sourcePeer(1000.0),
+      P2PMessage(kind: mkAddrV2, addressesV2: @[]))
+    check relayedEntries(s1.received()).len == 0
+    s1.closeSink(); removeDir(dir)
 
   test "an 11-entry addr relays nothing":
     let (pm, dir) = freshPm("eleven")
