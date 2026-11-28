@@ -10,8 +10,9 @@
 ##     non_witness_utxo whose hash is not the prevout txid throws "Non-witness
 ##     UTXO does not match outpoint hash", and one with no output at the
 ##     prevout index throws "Input specifies output index that does not
-##     exist". walletprocesspsbt (wallet/rpc/spend.cpp) turns a decode
-##     failure into RPC_DESERIALIZATION_ERROR (-22) "TX decode failed <reason>".
+##     exist" (std::ios_base::failure; libstdc++ appends ": iostream error").
+##     walletprocesspsbt (wallet/rpc/spend.cpp) turns a decode failure into
+##     RPC_DESERIALIZATION_ERROR (-22) "TX decode failed <reason>".
 ##   psbt.cpp SignPSBTInput: the prevout comes from non_witness_utxo first.
 ##     When only witness_utxo is present `require_witness_sig = true`, and a
 ##     non-witness signature is then refused (PSBTError::INCOMPLETE: the
@@ -136,8 +137,11 @@ suite "cffix walletprocesspsbt: sign owned inputs over the wallet's prevout, ver
     nil
 
   const
-    HashMismatch = "TX decode failed Non-witness UTXO does not match outpoint hash"
-    IndexMissing = "TX decode failed Input specifies output index that does not exist"
+    # Core throws std::ios_base::failure; on libstdc++ its what() ends in
+    # ": iostream error" (Core answers e.g. "TX decode failed Invalid pubkey:
+    # iostream error").
+    HashMismatch = "TX decode failed Non-witness UTXO does not match outpoint hash: iostream error"
+    IndexMissing = "TX decode failed Input specifies output index that does not exist: iostream error"
 
   proc checkDecodeRefused(e: ref RpcError, msg: string) =
     check e != nil
@@ -318,3 +322,23 @@ suite "cffix walletprocesspsbt: sign owned inputs over the wallet's prevout, ver
     let sig = onlySig(process(p))
     check sig != p2wpkhSig(tx, key, LowValue)
     check sig == p2wpkhSig(tx, key, TrueValue)
+
+  test "owned P2PKH key, coin only in chainstate, no PSBT data: left unsigned (Core's walletprocesspsbt has no chainstate source)":
+    let (_, spk) = walletKey(P2PKH)
+    let fund = fundingTx(spk, TrueValue, 19)
+    let op = OutPoint(txid: fund.txid(), vout: 0'u32)
+    cs.db.putUtxo(op, UtxoEntry(output: fund.outputs[0], height: 1,
+                                isCoinbase: false))
+    doAssert cs.getUtxo(op).isSome
+    doAssert op notin wallet().utxos
+    let outP = process(createPsbt(spendTx(op)))
+    check outP.inputs[0].partialSigs.len == 0
+
+  test "control: owned P2WPKH key, coin only in chainstate, no PSBT data: signed over the chainstate amount":
+    let (key, spk) = walletKey(P2WPKH)
+    let fund = fundingTx(spk, TrueValue, 20)
+    let op = OutPoint(txid: fund.txid(), vout: 0'u32)
+    cs.db.putUtxo(op, UtxoEntry(output: fund.outputs[0], height: 1,
+                                isCoinbase: false))
+    let tx = spendTx(op)
+    check onlySig(process(createPsbt(tx))) == p2wpkhSig(tx, key, TrueValue)
