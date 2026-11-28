@@ -12917,20 +12917,23 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   let unsignedTx = psbtObj.tx.get()
 
   # The PSBT's non_witness_utxo must be the transaction the input spends.
-  # Core's SignPSBTInput returns MISSING_INPUTS (RPC_TRANSACTION_ERROR,
-  # "Inputs missing or spent") when its hash differs from the prevout txid or
-  # it has no output at the prevout index; walletprocesspsbt reaches that for
-  # every unfinalized input, whether or not `sign` is set
-  # (DescriptorScriptPubKeyMan::FillPSBT). Without the check the signer below
-  # took the amount and script from whatever transaction the PSBT author
-  # attached.
-  for i in 0 ..< psbtObj.inputs.len:
-    if psbtObj.inputs[i].isSigned() or psbtObj.inputs[i].nonWitnessUtxo.isNone:
+  # Core refuses the PSBT while decoding it (psbt.h
+  # PartiallySignedTransaction::Unserialize), for every input, finalized or
+  # not, and walletprocesspsbt answers RPC_DESERIALIZATION_ERROR with
+  # "TX decode failed <reason>" (wallet/rpc/spend.cpp). Without the check the
+  # signer below took the amount and script from whatever transaction the
+  # PSBT author attached.
+  for i in 0 ..< min(psbtObj.inputs.len, unsignedTx.inputs.len):
+    if psbtObj.inputs[i].nonWitnessUtxo.isNone:
       continue
     let op = unsignedTx.inputs[i].prevOut
     let prevTx = psbtObj.inputs[i].nonWitnessUtxo.get()
-    if int(op.vout) >= prevTx.outputs.len or prevTx.txid() != op.txid:
-      raise newRpcError(RpcTransactionError, "Inputs missing or spent")
+    if prevTx.txid() != op.txid:
+      raise newRpcError(RpcDeserializationError,
+        "TX decode failed Non-witness UTXO does not match outpoint hash")
+    if int(op.vout) >= prevTx.outputs.len:
+      raise newRpcError(RpcDeserializationError,
+        "TX decode failed Input specifies output index that does not exist")
 
   # The wallet's own record of the output an input spends: an unspent wallet
   # coin, else an output of a transaction in the wallet's history. This is
