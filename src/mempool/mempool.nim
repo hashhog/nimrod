@@ -1110,7 +1110,8 @@ proc componentsTerm(mp: Mempool, seeds: seq[TxId]): int =
 
 proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
                             sigopCost: int64 = 0,
-                            countSpenders: bool = true): (int, int64) =
+                            countSpenders: bool = true,
+                            excluded: HashSet[TxId] = initHashSet[TxId]()): (int, int64) =
   ## Returns (cluster tx count including `tx`, cluster size in WEIGHT units
   ## including `tx`) for the cluster that `tx` would join.
   ##
@@ -1121,6 +1122,13 @@ proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
   ## other.  Core merges clusters on any dependency (txgraph.cpp Merge/
   ## GroupClusters), so an ancestor-scoped proxy silently accepts fan-outs
   ## Core rejects.
+  ##
+  ## `excluded` are entries treated as already gone: the conflicts (and their
+  ## descendants) a replacement would evict.  This measures the
+  ## POST-replacement cluster without touching the pool, which is what Core's
+  ## changeset does (CheckMemPoolPolicyLimits on a changeset whose removals are
+  ## staged, not applied).  Excluded entries are neither counted nor walked
+  ## through, so they cannot bridge two otherwise separate clusters.
   var visited = initHashSet[TxId]()
   var toVisit: seq[TxId]
   let selfTxid = tx.txid()
@@ -1132,7 +1140,7 @@ proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
   # Seed: in-mempool parents of the candidate, plus any in-mempool tx already
   # spending one of the candidate's outputs.
   for input in tx.inputs:
-    if input.prevOut.txid in mp.entries:
+    if input.prevOut.txid in mp.entries and input.prevOut.txid notin excluded:
       toVisit.add(input.prevOut.txid)
   ## countSpenders = false is the reorg re-add (bypass_limits): Core's ATMP
   ## assumes a new entry has no in-mempool children (validation.cpp:322-334
@@ -1146,7 +1154,8 @@ proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
 
   while toVisit.len > 0:
     let cur = toVisit.pop()
-    if cur == selfTxid or cur in visited or cur notin mp.entries:
+    if cur == selfTxid or cur in visited or cur notin mp.entries or
+        cur in excluded:
       continue
     visited.incl(cur)
 
@@ -1170,7 +1179,8 @@ proc calculateClusterStats*(mp: Mempool, tx: Transaction, weight: int,
 # Check cluster limits for a new transaction
 proc checkPackageLimits*(mp: Mempool, tx: Transaction, weight: int,
                          sigopCost: int64 = 0,
-                         countSpenders: bool = true): MempoolResult[void] =
+                         countSpenders: bool = true,
+                         excluded: HashSet[TxId] = initHashSet[TxId]()): MempoolResult[void] =
   ## Check whether adding this transaction would violate the CLUSTER limits.
   ## This is mempool POLICY, not consensus — it must never affect block
   ## validation.
@@ -1201,9 +1211,9 @@ proc checkPackageLimits*(mp: Mempool, tx: Transaction, weight: int,
   ## used at :452 and :487 here and in package.nim:433/:442) — untouched.
   ##
   ## Returns ok(()) if both limits are satisfied, err("too-large-cluster")
-  ## otherwise.
+  ## otherwise.  `excluded`: see calculateClusterStats.
   let (clusterCount, clusterSize) =
-    mp.calculateClusterStats(tx, weight, sigopCost, countSpenders)
+    mp.calculateClusterStats(tx, weight, sigopCost, countSpenders, excluded)
 
   # C1: cluster transaction count.  Strict `>` — a cluster of exactly
   # clusterLimit transactions is accepted.
@@ -1653,10 +1663,23 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
 
   # === Cluster size guard ===================================================
   # Core's AcceptSingleTransactionInternal:1342 — even when no RBF, the new
-  # tx (+ conflicts staged) must not push any cluster past the size limit.
-  # checkPackageLimits handles cluster count + vsize for the new entry.
-  # Defer the call until after conflicts are staged so the cluster shape is
-  # accurate.
+  # tx must not push its cluster past the count or size limit.  Core measures
+  # the POST-replacement cluster on a changeset whose removals are only
+  # STAGED (CheckMemPoolPolicyLimits); they are applied in FinalizeSubpackage
+  # (validation.cpp:1191), after every gate and after the m_test_accept return
+  # (:1388).  So the conflicts are excluded from the walk here, not removed:
+  # a tx rejected by this or any later gate, or a testmempoolaccept probe,
+  # must leave the conflicts it would have replaced in the pool.
+  # Core surfaces the BARE token with an empty debug string
+  # (validation.cpp:1024, :1116, :1343, :1521), so pass the error through
+  # verbatim rather than prefixing it.
+  # A reorg re-add (bypassLimits) does not count in-mempool spenders of the
+  # tx; maybeUpdateMempoolForReorg trims the merged cluster afterwards.
+  let packageLimitsResult = mp.checkPackageLimits(tx, weight, txSigopCost,
+                                                  countSpenders = not args.bypassLimits,
+                                                  excluded = conflictsToRemove)
+  if not packageLimitsResult.isOk:
+    return err(AtmpAcceptInfo, packageLimitsResult.error)
 
   # Standalone-ephemeral guard (validation.cpp:1375 — CheckEphemeralSpends on
   # a 1-element package). Runs BEFORE PolicyScriptChecks, matching Core.
@@ -1743,24 +1766,6 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
 
   # === Submission ===========================================================
 
-  # Stage conflict removal BEFORE checkPackageLimits so cluster shape is
-  # post-replacement (Core's changeset behaviour: validation.cpp:1196-1239).
-  if conflictsToRemove.len > 0:
-    mp.removeConflicts(conflictsToRemove)
-
-  # Cluster limits.  Core surfaces the BARE token with an empty debug string
-  # (validation.cpp:1024, :1116, :1343, :1521), so pass the error through
-  # verbatim rather than prefixing it.
-  # A reorg re-add (bypassLimits) does not count in-mempool spenders of the
-  # tx; maybeUpdateMempoolForReorg trims the merged cluster afterwards.
-  let packageLimitsResult = mp.checkPackageLimits(tx, weight, txSigopCost,
-                                                  countSpenders = not args.bypassLimits)
-  if not packageLimitsResult.isOk:
-    return err(AtmpAcceptInfo, packageLimitsResult.error)
-
-  let (ancestorFee, ancestorWeight) = mp.calculateAncestorFeesAndWeight(tx, modifiedFee, weight)
-  let (ancestorCount, ancestorSize) = mp.calculateAncestorStats(tx, vsizeInt)
-
   let info = AtmpAcceptInfo(
     txid: txid,
     wtxid: wtxid,
@@ -1775,6 +1780,14 @@ proc acceptTransactionWithArgs*(mp: Mempool, tx: Transaction,
   # any state mutation (validation.cpp:1388).
   if args.testAccept:
     return ok[AtmpAcceptInfo](info)
+
+  # Core FinalizeSubpackage (validation.cpp:1191): every gate has passed and
+  # this is not a test_accept, so the staged replacement is applied now.
+  if conflictsToRemove.len > 0:
+    mp.removeConflicts(conflictsToRemove)
+
+  let (ancestorFee, ancestorWeight) = mp.calculateAncestorFeesAndWeight(tx, modifiedFee, weight)
+  let (ancestorCount, ancestorSize) = mp.calculateAncestorStats(tx, vsizeInt)
 
   let entry = MempoolEntry(
     tx: tx,
