@@ -232,6 +232,13 @@ type
     #    asks for (getblockfrompeer). The SyncManager sets it so that body
     #    counts as requested (Core FetchBlock -> BlockRequested). nil = unused.
     blockFetchHook*: proc(hash: BlockHash) {.gcsafe, raises: [].}
+    #  - peerRemovedHook: told each peer that leaves `peers` after its
+    #    message loop may have run: removePeer, the ban path
+    #    disconnectMatching and the maintainConnections sweep. Drops before
+    #    the loop starts (feeler, failed handshake) and stop() cannot hold
+    #    sync state and do not call it. The SyncManager sets it to free its
+    #    per-peer header-sync state (Core FinalizeNode). nil = unused.
+    peerRemovedHook*: proc(peer: Peer) {.gcsafe, raises: [].}
 
 # Forward declarations
 proc removePeer*(pm: PeerManager, peer: Peer) {.async.}
@@ -669,6 +676,13 @@ proc inboundCount*(pm: PeerManager): int =
 proc isBanned*(pm: PeerManager, address: string): bool =
   pm.banManager.isBanned(address)
 
+proc notifyPeerRemoved(pm: PeerManager, peer: Peer) =
+  ## Called once a peer has been deleted from `pm.peers`, so owners of
+  ## per-peer state outside PeerManager can drop it. Mirrors Core's
+  ## PeerManagerImpl::FinalizeNode, which runs for every node CConnman deletes.
+  if pm.peerRemovedHook != nil and peer != nil:
+    pm.peerRemovedHook(peer)
+
 proc disconnectMatching*(pm: PeerManager, address: string, reason = "banned") =
   ## Drop every connected peer whose address matches `address` (Core
   ## CConnman::DisconnectNode(subnet/addr), used by setban). Main loop only.
@@ -688,6 +702,7 @@ proc disconnectMatching*(pm: PeerManager, address: string, reason = "banned") =
       pm.extendedPeers.del(key)
     asyncSpawn peer.disconnect(reason)
     pm.peers.del(key)
+    pm.notifyPeerRemoved(peer)
 
 proc banPeer*(pm: PeerManager, address: string, duration: times.Duration = BanDuration,
               reason: BanReason = brMisbehaving) =
@@ -1206,6 +1221,7 @@ proc removePeer*(pm: PeerManager, peer: Peer) {.async.} =
 
     await peer.disconnect()
     pm.peers.del(key)
+    pm.notifyPeerRemoved(peer)
 
     var toRequeue: seq[BlockHash]
     for hash, inflight in pm.inFlightBlocks:
@@ -1677,7 +1693,7 @@ proc updatePeerTxTime*(pm: PeerManager, peer: Peer) =
   if key in pm.extendedPeers:
     pm.extendedPeers[key].lastTxTime = getTime()
 
-proc maintainConnections(pm: PeerManager) {.async.} =
+proc maintainConnections*(pm: PeerManager) {.async.} =
   var toRemove: seq[string]
   for key, peer in pm.peers:
     if peer.state == psDisconnected:
@@ -1689,7 +1705,9 @@ proc maintainConnections(pm: PeerManager) {.async.} =
       if ext.connType in {pctFullRelay, pctBlockRelayOnly}:
         pm.outboundNetGroups.excl(ext.netGroup)
       pm.extendedPeers.del(key)
+    let peer = pm.peers[key]
     pm.peers.del(key)
+    pm.notifyPeerRemoved(peer)
 
   pm.cleanupBans()
 

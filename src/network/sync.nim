@@ -1047,6 +1047,10 @@ proc noteBlockFetchRequested*(sm: SyncManager, hash: BlockHash) =
     sm.fetchRequested.clear()
   sm.fetchRequested.incl(hash)
 
+# Forward declaration: newSyncManager installs it as PeerManager's
+# peerRemovedHook; it is defined next to cleanupPeerHeadersSync.
+proc onPeerDisconnected*(sm: SyncManager, peer: Peer) {.gcsafe, raises: [].}
+
 proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
                      params: ConsensusParams,
                      chainState: ChainState = nil,
@@ -1103,6 +1107,8 @@ proc newSyncManager*(pm: PeerManager, chainDb: ChainDb,
     let sm = result
     pm.blockFetchHook = proc(hash: BlockHash) {.gcsafe, raises: [].} =
       sm.noteBlockFetchRequested(hash)
+    pm.peerRemovedHook = proc(peer: Peer) {.gcsafe, raises: [].} =
+      sm.onPeerDisconnected(peer)
 
   # Initialize with genesis if chain is empty
   if chainDb.bestHeight < 0:
@@ -1766,6 +1772,18 @@ proc cleanupPeerHeadersSync*(sm: SyncManager, peerId: int64) =
       if stats.work > sm.presyncBestWork:
         sm.presyncBestWork = stats.work
         sm.presyncBestPeer = pid
+
+proc onPeerDisconnected*(sm: SyncManager, peer: Peer) {.gcsafe, raises: [].} =
+  ## Free this peer's per-peer header-sync state when it leaves PeerManager.
+  ## Mirrors Core PeerManagerImpl::FinalizeNode, which erases the Peer (and
+  ## with it m_headers_sync and m_num_unconnecting_headers_msgs) and its
+  ## m_headers_presync_stats entry, releasing m_headers_presync_bestpeer.
+  ## Without it the PRESYNC state of a peer that left mid-sync stayed in
+  ## memory for the life of the process: the keys hash address:port and
+  ## inbound peers use ephemeral ports, so the key is never seen again.
+  let peerId = getPeerId(peer)
+  sm.cleanupPeerHeadersSync(peerId)
+  sm.unconnectingHeaders.del(peerId)
 
 proc classifyHeaderBatch*(sm: SyncManager,
                           headers: seq[BlockHeader]): tuple[
