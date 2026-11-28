@@ -1305,34 +1305,103 @@ proc defaultPayJoinTlsConfig*(): PayJoinTlsConfig =
   ## Clearnet sender default — full chain-of-trust verification.
   PayJoinTlsConfig(policy: ptsVerify, pinnedCertPem: "")
 
+type
+  PayJoinEndpointHost = object
+    ## Result of `parsePayJoinEndpointHost`: the lower-cased scheme
+    ## ("" when the URL has none) and the bare host the HTTP client
+    ## will dial (no userinfo, no port, IPv6 brackets stripped).
+    ok: bool
+    scheme: string
+    host: string
+
+proc parsePayJoinEndpointHost(url: string): PayJoinEndpointHost =
+  ## Extract the host the sender would actually connect to.
+  ##
+  ## Every decision about an endpoint (is it an onion? is it loopback?)
+  ## must be made on THIS host, never on a substring of the whole URL:
+  ## `http://evil.test/p.onion` dials evil.test, and
+  ## `http://127.0.0.1.evil.test/` is not loopback.
+  ##
+  ## Fails closed (`ok = false`) on anything whose dial target is not
+  ## unambiguous: userinfo (`a.onion@evil.test` dials evil.test), a
+  ## backslash, a percent-escape, whitespace or control bytes in the
+  ## authority, a non-numeric port, or an empty host.  A BIP-21 `pj=`
+  ## endpoint never needs any of those.
+  result = PayJoinEndpointHost(ok: false)
+  let lc = url.toLowerAscii()
+  var rest = lc
+  let sep = lc.find("://")
+  if sep >= 0:
+    result.scheme = lc[0 ..< sep]
+    rest = lc[sep + 3 .. ^1]
+  var authEnd = rest.len
+  for i, c in rest:
+    if c in {'/', '?', '#'}:
+      authEnd = i
+      break
+  let authority = rest[0 ..< authEnd]
+  for c in authority:
+    if c in {'@', '\\', '%'} or ord(c) <= 0x20 or ord(c) >= 0x7f:
+      return
+  var host, portPart: string
+  if authority.startsWith("["):
+    let close = authority.find(']')
+    if close < 0:
+      return
+    host = authority[1 ..< close]
+    let after = authority[close + 1 .. ^1]
+    if after.len > 0:
+      if after[0] != ':':
+        return
+      portPart = after[1 .. ^1]
+  else:
+    let colon = authority.find(':')
+    if colon >= 0:
+      host = authority[0 ..< colon]
+      portPart = authority[colon + 1 .. ^1]
+    else:
+      host = authority
+  for c in portPart:
+    if c notin {'0' .. '9'}:
+      return
+  if host.len == 0:
+    return
+  result.host = host
+  result.ok = true
+
+proc isOnionHost(host: string): bool =
+  ## A `.onion` host with a non-empty label in front of the suffix.
+  host.len > ".onion".len and host.endsWith(".onion")
+
 proc verifyPayJoinTlsCert*(url: string, cfg: PayJoinTlsConfig): bool =
   ## G24 — surface check the sender uses BEFORE opening the connection.
   ##
-  ## Returns `true` iff:
-  ##   * URL is http://*.onion (Tor's own auth) regardless of `cfg`, OR
-  ##   * URL scheme is https:// AND policy is `ptsVerify` or `ptsPinned`
+  ## Returns `true` iff the URL scheme is http:// or https:// and:
+  ##   * the HOST ends in `.onion` (Tor's own auth) regardless of `cfg`, OR
+  ##   * the scheme is https:// AND policy is `ptsVerify` or `ptsPinned`
   ##     (cert-validating modes), OR
-  ##   * URL scheme is http:// AND policy is `ptsNoVerify` AND host is
-  ##     127.0.0.1 / localhost (tests).
+  ##   * the scheme is http:// AND policy is `ptsNoVerify` AND the host
+  ##     is exactly 127.0.0.1 / localhost / [::1] (tests).
+  ##
+  ## Every test is on the parsed host (`parsePayJoinEndpointHost`), not
+  ## on the URL string: `.onion` in the path or a `127.0.0.1.` prefix on
+  ## a public name used to pass, and the sender then POSTed the signed
+  ## Original PSBT to a clearnet host over plaintext.
   ##
   ## Rejects http:// against an arbitrary public host even when
   ## `ptsNoVerify` is set — clearnet PayJoin without TLS or .onion is a
   ## plaintext eavesdropping disaster.
-  let lc = url.toLowerAscii()
+  let ep = parsePayJoinEndpointHost(url)
+  if not ep.ok or ep.scheme notin ["http", "https"]:
+    return false
   # Tor: the address itself is the auth.
-  if lc.contains(".onion"):
+  if isOnionHost(ep.host):
     return true
-  if lc.startsWith("https://"):
+  if ep.scheme == "https":
     return cfg.policy in {ptsVerify, ptsPinned}
-  if lc.startsWith("http://"):
-    if cfg.policy != ptsNoVerify:
-      return false
-    let hostPart =
-      if lc.len > 7: lc[7 .. ^1] else: ""
-    return hostPart.startsWith("127.0.0.1") or
-           hostPart.startsWith("localhost") or
-           hostPart.startsWith("[::1]")
-  false
+  if cfg.policy != ptsNoVerify:
+    return false
+  ep.host in ["127.0.0.1", "localhost", "::1"]
 
 proc payjoinHttpsVerify*(url: string,
                         cfg: PayJoinTlsConfig =
@@ -1632,33 +1701,14 @@ proc isPayJoinOnionEndpoint*(url: string): bool =
   ## rend-spec-v3 check lives in `network/tor.nim` (FIX-57); this helper
   ## stays minimal so the PayJoin sender can pre-flight the URL before
   ## opening a socket.
-  if url.len == 0:
-    return false
-  let lc = url.toLowerAscii()
-  # Locate the host segment.
-  var hostStart = 0
-  if lc.startsWith("http://"):
-    hostStart = 7
-  elif lc.startsWith("https://"):
-    hostStart = 8
-  elif lc.contains("://"):
+  ##
+  ## The host comes from `parsePayJoinEndpointHost`, the same parser the
+  ## G24 gate uses, so `http://a.onion:1@evil.test/` (which dials
+  ## evil.test) is not an onion endpoint here either.
+  let ep = parsePayJoinEndpointHost(url)
+  if not ep.ok or ep.scheme notin ["", "http", "https"]:
     return false  # Some other scheme — refuse, the caller must be explicit.
-  # Strip any trailing path / query / port.
-  var hostEnd = lc.len
-  for i in hostStart ..< lc.len:
-    let c = lc[i]
-    if c == '/' or c == '?' or c == '#':
-      hostEnd = i
-      break
-  if hostStart >= hostEnd:
-    return false
-  let host = lc[hostStart ..< hostEnd]
-  # Allow optional `:port` suffix.
-  let colon = host.rfind(':')
-  let bare =
-    if colon >= 0: host[0 ..< colon]
-    else: host
-  bare.endsWith(".onion")
+  isOnionHost(ep.host)
 
 proc payjoinOnionClient*(req: PayJoinSendRequest): PayJoinSendResult =
   ## G25 surface — Tor onion sender. Currently routes through the
