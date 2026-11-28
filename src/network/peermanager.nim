@@ -56,6 +56,11 @@ const
   #    (Core MAX_PCT_ADDR_TO_SEND); the effective cap is the min of the two.
   MaxAddrToSend* = 1000        # Core MAX_ADDR_TO_SEND
   MaxPctAddrToSend* = 23       # Core MAX_PCT_ADDR_TO_SEND
+  # Core CConnman::GetAddresses (net.cpp:3734-3735): a getaddr reply is cached
+  # per network for 21 h plus a random 0-6 h, so reconnecting cannot scrape
+  # the whole store with its real timestamps.
+  GetAddrCacheBaseSec* = 21'i64 * 3600
+  GetAddrCacheJitterSec* = 6'i64 * 3600
   # Inbound addr-message rate limiting (token bucket; Core net_processing.cpp):
   #  - MaxAddrRatePerSecond: bucket refill rate (Core MAX_ADDR_RATE_PER_SECOND).
   #  - MaxAddrProcessingTokenBucket: soft cap on accumulated tokens
@@ -116,6 +121,11 @@ type
     peer*: Peer
     requestTime*: Time
 
+  GetAddrCacheEntry* = object
+    addrs*: seq[TimestampedAddr]
+    expiry*: int64              # unix seconds; redrawn once now > expiry
+    storeSize*: int             # knownAddresses.len when drawn
+
   PeerManager* = ref object
     peers*: Table[string, Peer]
     extendedPeers*: Table[string, ExtendedPeer]
@@ -130,6 +140,9 @@ type
     ## addrv2 messages here (they cannot be represented in the legacy 16-byte
     ## NetAddress format).  Relayed as addrv2 to peers that signaled wantsAddrV2.
     knownAddressesV2*: seq[TimestampedAddrV2]
+    ## Cached getaddr replies, keyed by the requesting peer's network
+    ## (Core m_addr_response_caches, net.cpp:3702-3738).
+    getAddrCache*: Table[string, GetAddrCacheEntry]
     ## AXIS #2: Core-bucketed address manager (CAddrMan).  knownAddresses above
     ## stays as the rich getnodeaddresses/addr-sharing metadata store; this
     ## table is the NEW[1024][64]/TRIED[256][64] placement + anti-Sybil engine +
@@ -2144,61 +2157,83 @@ proc injectKnownAddress*(pm: PeerManager, address: string, port: uint16,
     lastSeen: stamp))
   true
 
-proc relayAddresses(pm: PeerManager, source: Peer) =
-  ## Relay addresses to up to 2 random peers (not back to source).
-  ## BUG-7 FIX (W117): peers that signaled wantsAddrV2 receive addrv2;
-  ## others receive the legacy addr message.  Mirrors Core's
-  ## CConnman::RelayAddress() which calls PushAddress with CAddress → addrv2 or
-  ## addr depending on the peer's SENDADDRV2 negotiation state.
+proc relayAddresses(pm: PeerManager, source: Peer,
+                    received: seq[TimestampedAddrV2]) =
+  ## Relay the addresses `source` just sent us, each to up to 2 other peers
+  ## that can carry it, with the address's own timestamp.  Mirrors Core
+  ## ProcessAddrs -> RelayAddress (net_processing.cpp:5690-5693, :2277-2324):
+  ## the caller passes only the entries that spent a token and are routable
+  ## and recent, from a message of <= 10 entries.  Core picks 2 peers per
+  ## address among those with IsAddrCompatible (an addrv2-only network such as
+  ## Tor v3 / I2P / CJDNS goes only to peers that sent sendaddrv2) and batches
+  ## them per peer (m_addrs_to_send); here the per-peer batch is sent at once.
+  ## BUG-7 FIX (W117): peers that signaled wantsAddrV2 receive addrv2, others
+  ## the legacy addr message.
+  ##
+  ## Before 2026-11 this ignored what was received and sent the first 10
+  ## stored addresses stamped `now` to 2 random peers on every 1-10 entry
+  ## message, so any peer could make us re-advertise our oldest addresses as
+  ## fresh, and an address it announced was never passed on.
+  if received.len == 0:
+    return
   var candidates: seq[Peer]
   for _, p in pm.peers:
-    if p != source and p.isConnected() and not p.closing:
+    # psReady: Core sets up addr relay during the VERSION/VERACK exchange, so
+    # a peer still handshaking is not a target.
+    if p != source and p.isConnected() and p.state == psReady and
+        not p.closing:
+      # Core relays only to peers with m_addr_relay_enabled, which
+      # SetupAddressRelay never sets on a block-relay-only connection: sending
+      # a peer's own address there would let it spot our hidden links.
+      let key = peerKey(p)
+      if key in pm.extendedPeers and
+          pm.extendedPeers.getOrDefault(key).connType == pctBlockRelayOnly:
+        continue
       candidates.add(p)
   if candidates.len == 0:
     return
-  nodeRng().shuffle(candidates)
-  let n = min(2, candidates.len)
+  var batches = newSeq[seq[TimestampedAddrV2]](candidates.len)
+  for ta in received:
+    let legacyOk = ta.address.isAddrV1Compatible()
+    var compatible: seq[int]
+    for i, p in candidates:
+      if p.wantsAddrV2 or legacyOk:
+        compatible.add(i)
+    nodeRng().shuffle(compatible)
+    for k in 0 ..< min(2, compatible.len):
+      batches[compatible[k]].add(ta)
+  for i, p in candidates:
+    if batches[i].len == 0:
+      continue
+    if p.wantsAddrV2:
+      asyncSpawn spawnSafe(p.sendMessage(newAddrV2(batches[i])))
+    else:
+      var legacy: seq[TimestampedAddr]
+      for ta in batches[i]:
+        let la = toLegacyTimestampedAddr(ta)
+        if la.isSome:
+          legacy.add(la.get())
+      if legacy.len > 0:
+        asyncSpawn spawnSafe(p.sendMessage(newAddr(legacy)))
 
-  # Build legacy addr payload (IPv4/IPv6 only)
-  let addrCount = min(10, pm.knownAddresses.len)
-  var legacyMsg: P2PMessage
-  if addrCount > 0:
-    var timestamped: seq[TimestampedAddr]
-    for i in 0..<addrCount:
-      let a = pm.knownAddresses[i]
-      timestamped.add(TimestampedAddr(
-        timestamp: uint32(epochTime().int),
-        address: a
-      ))
-    legacyMsg = newAddr(timestamped)
-
-  # Build addrv2 payload (all network types: IPv4/IPv6 + Tor/I2P/CJDNS)
-  let v2Count = min(10, pm.knownAddressesV2.len + pm.knownAddresses.len)
-  var v2Msg: P2PMessage
-  if v2Count > 0:
-    var v2addrs: seq[TimestampedAddrV2]
-    # Add Tor/I2P/CJDNS addresses first
-    let privCount = min(10, pm.knownAddressesV2.len)
-    for i in 0..<privCount:
-      v2addrs.add(pm.knownAddressesV2[i])
-    # Fill remaining slots from IPv4/IPv6
-    let ipCount = min(10 - v2addrs.len, pm.knownAddresses.len)
-    for i in 0..<ipCount:
-      v2addrs.add(toTimestampedAddrV2(
-        TimestampedAddr(
-          timestamp: uint32(epochTime().int),
-          address: pm.knownAddresses[i]
-        )
-      ))
-    if v2addrs.len > 0:
-      v2Msg = newAddrV2(v2addrs)
-
-  for i in 0..<n:
-    let p = candidates[i]
-    if p.wantsAddrV2 and v2Msg.kind == mkAddrV2:
-      asyncSpawn spawnSafe(p.sendMessage(v2Msg))
-    elif addrCount > 0:
-      asyncSpawn spawnSafe(p.sendMessage(legacyMsg))
+proc isRelayableReceived(ta: TimestampedAddrV2, nowSec: uint32): bool =
+  ## Core ProcessAddrs relay gate per address (net_processing.cpp:5690):
+  ## `addr.nTime > current_time - 10min && addr.IsRoutable()` (the message
+  ## size gate is applied by the caller).  `ta.timestamp` is the already
+  ## clamped value, as in Core.  Core also skips, before relay, an address
+  ## whose services are not useful (:5672-5673, `!MayHaveUsefulAddressDB &&
+  ## !HasAllDesirableServiceFlags`); every desirable set includes NODE_NETWORK
+  ## or NODE_NETWORK_LIMITED, so that is "has neither flag".
+  if (ta.services and (NodeNetwork or NodeNetworkLimited)) == 0:
+    return false
+  if ta.timestamp <= nowSec - 600'u32:
+    return false
+  let legacy = toLegacyTimestampedAddr(ta)
+  if legacy.isSome:
+    return isRoutable(legacy.get().address.ip)
+  # Tor v3 / I2P / CJDNS are routable (Core CNetAddr::IsRoutable); a
+  # deprecated torv2 entry never reaches here (isValid rejects it).
+  ta.address.isValid()
 
 proc buildGetAddrResponse*(pm: PeerManager, peer: Peer): seq[TimestampedAddr] =
   ## Build the addr-message payload to send in reply to a peer's getaddr,
@@ -2224,11 +2259,42 @@ proc buildGetAddrResponse*(pm: PeerManager, peer: Peer): seq[TimestampedAddr] =
   if cap > MaxAddrToSend:
     cap = MaxAddrToSend
   let count = min(total, cap)
+  # Core GetAddresses (net.cpp:3702-3738): one cached reply per network,
+  # redrawn after 21 h + rand(6 h).  Core keys the cache on the local socket
+  # the request arrived on; nimrod keys it on the requesting peer's network.
+  let cacheKey =
+    if peer.address.endsWith(".onion"): "onion"
+    elif peer.address.endsWith(".i2p"): "i2p"
+    elif ':' in peer.address: "ipv6"
+    else: "ipv4"
+  let nowSec = getTime().toUnix()
+  # Unlike Core's addrman, knownAddresses starts empty on every boot (it is
+  # not loaded from peers.dat), so an entry drawn from a much smaller store
+  # is redrawn once the store has doubled, and an empty reply is never
+  # cached.  Otherwise a getaddr in the first minutes after a restart would
+  # freeze an empty or tiny reply for a day.  Doubling bounds the extra
+  # draws to log2(store size), so reconnecting still cannot scrape it.
+  if cacheKey in pm.getAddrCache:
+    let c = pm.getAddrCache[cacheKey]
+    if c.expiry >= nowSec and total < 2 * c.storeSize:
+      return c.addrs
+  # A uniform random sample, each entry with its stored timestamp, like Core's
+  # GetAddressesUnsafe (addrman.cpp GetAddr_: shuffled draw, stored nTime).
+  # It used to be knownAddresses[0..count) stamped `now`: the same oldest
+  # entries on every request, all looking fresh.  Partial Fisher-Yates.
+  var idx = newSeq[int](total)
+  for i in 0 ..< total: idx[i] = i
   var addrs: seq[TimestampedAddr]
-  for i in 0..<count:
-    addrs.add(TimestampedAddr(
-      timestamp: uint32(epochTime().int),
-      address: pm.knownAddresses[i]))
+  for i in 0 ..< count:
+    let j = nodeRng().rand(i .. total - 1)
+    swap(idx[i], idx[j])
+    let na = pm.knownAddresses[idx[i]]
+    addrs.add(TimestampedAddr(timestamp: na.lastSeen, address: na))
+  if addrs.len > 0:
+    pm.getAddrCache[cacheKey] = GetAddrCacheEntry(addrs: addrs,
+      expiry: nowSec + GetAddrCacheBaseSec +
+              nodeRng().rand(GetAddrCacheJitterSec - 1),
+      storeSize: total)
   addrs
 
 proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
@@ -2252,11 +2318,22 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
     peer.addrTokenTimestamp = nowSec
     # rate_limited = !HasPermission(Addr): NoBan/manual peers are exempt.
     var rateLimited = true
+    var fromBlockRelayOnly = false
     let pkey = peerKey(peer.address, peer.port)
     if pkey in pm.extendedPeers:
       let ext = pm.extendedPeers[pkey]
       if ext.noBan or ext.connType == pctManual:
         rateLimited = false
+      # Core ProcessAddrs ignores addr from a block-relay-only peer
+      # (net_processing.cpp:5630, SetupAddressRelay is false): relaying what
+      # it sends would confirm the hidden link to whoever sent it.
+      if ext.connType == pctBlockRelayOnly:
+        fromBlockRelayOnly = true
+    # 3F FIX: Core net_processing.cpp:5690 relays only from a message of
+    # <= 10 entries; a larger one is a getaddr response and is not relayed.
+    let relayGate = msg.addresses.len <= AddrRelayMaxEntries and
+                    not fromBlockRelayOnly
+    var toRelay: seq[TimestampedAddrV2]
     for i in 0..<count:
       # Apply rate limiting (Core: spend a token per processed addr; drop excess
       # for rate-limited peers).
@@ -2281,6 +2358,14 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
           addrNowSec - 5'u32 * 24'u32 * 3600'u32
         else:
           addrWireTs
+      # Core AddrMan::AddSingle drops a non-routable address (10/8,
+      # 192.168/16, loopback...), and the addrv2 path below already did.
+      if not isRoutable(na.ip):
+        continue
+      let relayTa = toTimestampedAddrV2(
+        TimestampedAddr(timestamp: na.lastSeen, address: na))
+      if relayGate and isRelayableReceived(relayTa, addrNowSec):
+        toRelay.add(relayTa)
       var found = false
       for ka in pm.knownAddresses:
         if ka.ip == na.ip and ka.port == na.port:
@@ -2288,12 +2373,8 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
           break
       if not found:
         pm.knownAddresses.add(na)
-    # Relay to up to 2 random peers (not back to source).
-    # 3F FIX: Core net_processing.cpp:5688 only relays when vAddr.size() <= 10.
-    # A large addr message is a getaddr response — those are not relayed.
-    # Reference: bitcoin-core/src/net_processing.cpp:5688.
-    if msg.addresses.len <= AddrRelayMaxEntries and msg.addresses.len > 0:
-      pm.relayAddresses(peer)
+    # Relay what was received to up to 2 peers each (not back to source).
+    pm.relayAddresses(peer, toRelay)
   of mkAddrV2:
     # BUG-4 FIX (W117): store all valid addrv2 addresses.  IPv4/IPv6 go into
     # knownAddresses (legacy pool); Tor v3, I2P, and CJDNS go into
@@ -2314,11 +2395,22 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
           peer.addrTokenBucket + elapsed * MaxAddrRatePerSecond)
     peer.addrTokenTimestamp = nowSec
     var rateLimited = true
+    var fromBlockRelayOnly = false
     let pkey = peerKey(peer.address, peer.port)
     if pkey in pm.extendedPeers:
       let ext = pm.extendedPeers[pkey]
       if ext.noBan or ext.connType == pctManual:
         rateLimited = false
+      # Core ProcessAddrs ignores addr from a block-relay-only peer
+      # (net_processing.cpp:5630, SetupAddressRelay is false): relaying what
+      # it sends would confirm the hidden link to whoever sent it.
+      if ext.connType == pctBlockRelayOnly:
+        fromBlockRelayOnly = true
+    # 3F FIX: relay only from a message of <= 10 entries (Core :5690).
+    let relayGate = msg.addressesV2.len <= AddrRelayMaxEntries and
+                    not fromBlockRelayOnly
+    let v2RelayNow = uint32(getTime().toUnix())
+    var toRelay: seq[TimestampedAddrV2]
     for i in 0..<count:
       # Spend a token per processed addr; drop excess for rate-limited peers
       # (Core spends before the routability/validity filter).
@@ -2346,6 +2438,10 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
           else:
             la.timestamp
         if isRoutable(la.address.ip):
+          var relayTa = ta
+          relayTa.timestamp = la.address.lastSeen   # the clamped value
+          if relayGate and isRelayableReceived(relayTa, v2RelayNow):
+            toRelay.add(relayTa)
           var found = false
           for ka in pm.knownAddresses:
             if ka.ip == la.address.ip and ka.port == la.address.port:
@@ -2371,20 +2467,19 @@ proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
               if ka.address.cjdns == ta.address.cjdns:
                 found = true; break
             else: discard
+        # 3G FIX: clamp the wire timestamp before storing (Tor/I2P/CJDNS path).
+        # Core net_processing.cpp:5678-5680: same clamp applies to addrv2.
+        var taStored = ta
+        let torNowSec = uint32(getTime().toUnix())
+        if taStored.timestamp <= 100_000_000'u32 or
+            taStored.timestamp > torNowSec + 600'u32:
+          taStored.timestamp = torNowSec - 5'u32 * 24'u32 * 3600'u32
+        if relayGate and isRelayableReceived(taStored, v2RelayNow):
+          toRelay.add(taStored)
         if not found:
-          # 3G FIX: clamp the wire timestamp before storing (Tor/I2P/CJDNS path).
-          # Core net_processing.cpp:5678-5680: same clamp applies to addrv2.
-          var taStored = ta
-          let torNowSec = uint32(getTime().toUnix())
-          if taStored.timestamp <= 100_000_000'u32 or
-              taStored.timestamp > torNowSec + 600'u32:
-            taStored.timestamp = torNowSec - 5'u32 * 24'u32 * 3600'u32
           pm.knownAddressesV2.add(taStored)
-    # 3F FIX: Core net_processing.cpp:5688 only relays when vAddr.size() <= 10.
-    # A large addrv2 message is a getaddr response — those are not relayed.
-    # Reference: bitcoin-core/src/net_processing.cpp:5688.
-    if msg.addressesV2.len <= AddrRelayMaxEntries and msg.addressesV2.len > 0:
-      pm.relayAddresses(peer)
+    # Relay what was received to up to 2 peers each (not back to source).
+    pm.relayAddresses(peer, toRelay)
   of mkGetAddr:
     let addrs = pm.buildGetAddrResponse(peer)
     if addrs.len > 0:
