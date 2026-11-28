@@ -13082,8 +13082,10 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     # The prevout whose type picks the default, in Core's order: the PSBT's
     # non_witness_utxo, else the wallet's own coin (CWallet::FillPSBT fills
     # non_witness_utxo from the wallet when absent), else witness_utxo
-    # (SignPSBTInput prefers non_witness_utxo). resolvePrevOut prefers
-    # witness_utxo, which the PSBT author controls, so it is not used here.
+    # (SignPSBTInput prefers non_witness_utxo). resolvePrevOut follows the
+    # same order but also reads the wallet's transaction history and falls
+    # back to chainstate, sources coreHasUtxo does not admit, so the check
+    # keeps its own lookup over the sources coreHasUtxo counts.
     let op = unsignedTx.inputs[i].prevOut
     var checkSpk: Option[seq[byte]]
     if psbtObj.inputs[i].nonWitnessUtxo.isSome:
