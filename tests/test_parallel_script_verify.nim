@@ -34,6 +34,10 @@ proc dummyTx(): Transaction =
     lockTime: 0
   )
 
+# ScriptCheck.tx points at the spending tx (Core: const CTransaction*), so the
+# tx every check here verifies against lives for the whole module.
+let gDummyTx = dummyTx()
+
 proc opTrue(): seq[byte] = @[0x51'u8]
 proc opFalse(): seq[byte] = @[0x00'u8]
 
@@ -53,7 +57,7 @@ proc mkCheck(spk: seq[byte]): ScriptCheck =
   ScriptCheck(
     scriptSig: @[],
     scriptPubKey: spk,
-    tx: dummyTx(),
+    tx: unsafeAddr gDummyTx,
     inputIndex: 0,
     amount: Satoshi(1000),
     flags: {},

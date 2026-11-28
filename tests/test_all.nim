@@ -89,6 +89,7 @@ const IncludedTests = [
   "test_cffix_psbt_sighash_mismatch",
   "test_cffix_reorg_bip68_mtp",
   "test_cffix_reorg_in_belowout",
+  "test_cffix_scriptcheck_shared_tx",
   "test_cffix_reorg_sigop_cost",
   "test_cffix_send_lock_check",
   "test_chain_lock_handoff",

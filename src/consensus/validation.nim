@@ -2282,6 +2282,10 @@ proc collectChecks*(
   ## are shared, not copied per input. CALLER must keep `txPrevoutsStore` alive
   ## for as long as any check in `checksOut` is accessed (runChecks blocks until
   ## all workers finish, so `verifyScripts` owns this contract automatically).
+  ##
+  ## Each `ScriptCheck.tx` points at `blk.txs[i]` itself, so `blk` must also
+  ## stay alive and unmodified while the checks are used (Core's CScriptCheck
+  ## holds `const CTransaction*` into the block the same way).
 
   # Compute block hash for script_flag_exceptions check
   let headerBytes = serialize(blk.header)
@@ -2357,7 +2361,7 @@ proc collectChecks*(
       checksOut.add(ScriptCheck(
         scriptSig: inp.scriptSig,
         scriptPubKey: utxo.output.scriptPubKey,
-        tx: tx,
+        tx: unsafeAddr blk.txs[i],
         inputIndex: inputIdx,
         amount: utxo.output.value,
         flags: flags,

@@ -20,8 +20,9 @@
 ## SAFETY: the only shared mutable state a worker touches is `globalSigCache`
 ## (lock-protected, `perf/sig_cache.nim`) and the read-only randomized secp256k1
 ## verify context (`globalContext`, pre-warmed by `initSecp256k1()` BEFORE any
-## dispatch). Every `ScriptCheck` is a by-value snapshot; workers never mutate
-## the block, the tx, or the UTXO set. Per-worker claimed buffers are bounded
+## dispatch). A `ScriptCheck` carries its own input's fields by value and
+## points at the transaction it checks (Core: `const CTransaction* ptxTo`);
+## workers never mutate the block, the tx, or the UTXO set. Per-worker claimed buffers are bounded
 ## by ScriptCheckBatchSize (128), matching Core — not O(inputs) and not
 ## O(threads × inputs).
 
@@ -112,9 +113,16 @@ type
     ## The BIP-341 committed-prevout arrays (allAmounts / allScriptPubKeys) are
     ## shared across ALL inputs of the same tx via a raw pointer (`prevoutsPtr`)
     ## into a block-level `seq[TxPrevouts]` owned by `verifyScripts`.
+    ##
+    ## `tx` points at the spending transaction itself (in collectChecks, the
+    ## block's own `blk.txs[i]`), like Core's `const CTransaction* ptxTo`
+    ## (validation.h:338). It used to be a by-value copy, so one tx with N
+    ## inputs held N copies of itself until runChecks returned: O(N x tx size)
+    ## memory for a single consensus-valid tx. The pointee must outlive every
+    ## run of the check; it is only read.
     scriptSig*: seq[byte]
     scriptPubKey*: seq[byte]
-    tx*: Transaction
+    tx*: ptr Transaction
     inputIndex*: int
     amount*: Satoshi
     flags*: set[ScriptFlags]
@@ -181,8 +189,9 @@ proc clampWorkers*(requested: int): int {.gcsafe.} =
   resolveScriptCheckThreads(requested) - 1
 
 ## Run one ScriptCheck. The {.cast(gcsafe).} is sound: the closure touches only
-## (a) by-value fields of `chk`, (b) the read-only `prevoutsPtr` (written once
-## by collectChecks before any worker runs, never mutated again), (c) the
+## (a) by-value fields of `chk`, (b) the read-only `tx` and `prevoutsPtr`
+## pointees (written by collectChecks before any worker runs, never mutated
+## while checks run), (c) the
 ## lock-protected globalSigCache, and (d) the read-only secp verify context.
 ## Mirrors Core's CScriptCheck::operator() running on a worker thread.
 # Gate-6 fault injection (tests only; nil in production). When the hook
@@ -209,7 +218,7 @@ proc runOne(chk: ScriptCheck): ScriptError {.gcsafe.} =
     result = verifyScriptWithError(
       chk.scriptSig,
       chk.scriptPubKey,
-      chk.tx,
+      chk.tx[],
       chk.inputIndex,
       chk.amount,
       chk.flags,

@@ -409,13 +409,16 @@ suite "checkPubKeyEncoding (interpreter.cpp:218-227)":
 suite "CHECKMULTISIG NULLDUMMY + NULLFAIL ordering (interpreter.cpp:1183-1203)":
   # Helpers
   proc makeMSCtx(): SigCheckContext =
-    var emptyTx = Transaction()
-    emptyTx.inputs.add(TxIn(
-      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
-      scriptSig: @[],
-      sequence: 0xFFFFFFFF'u32
-    ))
-    emptyTx.outputs.add(TxOut(value: Satoshi(0), scriptPubKey: @[]))
+    # SigCheckContext.tx borrows its tx ({.cursor.}), so the tx must outlive
+    # every context this returns: build it once, in a global.
+    var emptyTx {.global.} = Transaction()
+    if emptyTx.inputs.len == 0:
+      emptyTx.inputs.add(TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],
+        sequence: 0xFFFFFFFF'u32
+      ))
+      emptyTx.outputs.add(TxOut(value: Satoshi(0), scriptPubKey: @[]))
     SigCheckContext(
       tx: emptyTx,
       inputIndex: 0,
@@ -490,13 +493,16 @@ suite "CHECKMULTISIG NULLDUMMY + NULLFAIL ordering (interpreter.cpp:1183-1203)":
 
 suite "CHECKSIG NULLFAIL (interpreter.cpp:341-342)":
   proc makeCSCtx(): SigCheckContext =
-    var emptyTx = Transaction()
-    emptyTx.inputs.add(TxIn(
-      prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
-      scriptSig: @[],
-      sequence: 0xFFFFFFFF'u32
-    ))
-    emptyTx.outputs.add(TxOut(value: Satoshi(0), scriptPubKey: @[]))
+    # SigCheckContext.tx borrows its tx ({.cursor.}), so the tx must outlive
+    # every context this returns: build it once, in a global.
+    var emptyTx {.global.} = Transaction()
+    if emptyTx.inputs.len == 0:
+      emptyTx.inputs.add(TxIn(
+        prevOut: OutPoint(txid: TxId(default(array[32, byte])), vout: 0),
+        scriptSig: @[],
+        sequence: 0xFFFFFFFF'u32
+      ))
+      emptyTx.outputs.add(TxOut(value: Satoshi(0), scriptPubKey: @[]))
     SigCheckContext(
       tx: emptyTx,
       inputIndex: 0,
