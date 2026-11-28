@@ -521,7 +521,11 @@ suite "W140 G24 — -rpcservertimeout":
     let endIdx = serverSrc.find("\nproc ", idx + 1)
     let body = if endIdx >= 0: serverSrc[idx ..< endIdx] else: serverSrc[idx ..< serverSrc.len]
     check "while not transp.closed:" in body
-    check "lineFut.withTimeout(RpcServerTimeout)" in body
+    # Header lines share one whole-header deadline of the same 30 s (cfaudit
+    # processClient-preauth-connection-slot-starvation: a per-line timeout
+    # alone let trickled lines hold a connection for hours).
+    check "lineFut.withTimeout(headerTimeLeft)" in body
+    check "RpcHeaderDeadline* = chronos.seconds(30)" in serverSrc
     check "bodyFut.withTimeout(RpcServerTimeout)" in body
     check "RpcServerTimeout* = chronos.seconds(30)" in serverSrc
     check CORE_DEFAULT_HTTP_SERVER_TIMEOUT == 30
