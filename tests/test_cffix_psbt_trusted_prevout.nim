@@ -286,3 +286,20 @@ suite "cffix walletprocesspsbt: sign owned inputs over the wallet's prevout, ver
     p.inputs[0].nonWitnessUtxo = some(fund)
     let outP = process(p)
     check outP.inputs[0].partialSigs.len == 1
+
+  test "owned P2WPKH input known only from the wallet's history is signed over the recorded amount, not witness_utxo's":
+    # CWallet::FillPSBT backfills non_witness_utxo from mapWallet, which
+    # holds wallet transactions whether or not their outputs are unspent.
+    let (key, spk) = walletKey(P2WPKH)
+    let fund = fundingTx(spk, TrueValue, 16)
+    var w = wallet()
+    w.txHistory[fund.txid()] = WalletTxRecord(
+      txid: fund.txid(), rawTx: serialize(fund, includeWitness = true))
+    doAssert OutPoint(txid: fund.txid(), vout: 0'u32) notin w.utxos
+    let tx = spendTx(OutPoint(txid: fund.txid(), vout: 0'u32))
+    var p = createPsbt(tx)
+    p.inputs[0].witnessUtxo = some(TxOut(value: Satoshi(LowValue),
+                                         scriptPubKey: spk))
+    let sig = onlySig(process(p))
+    check sig != p2wpkhSig(tx, key, LowValue)
+    check sig == p2wpkhSig(tx, key, TrueValue)
