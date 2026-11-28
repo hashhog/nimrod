@@ -312,17 +312,17 @@ suite "G11 no stochastic nRefCount cap":
     # This prevents one popular address from monopolising the new table.
     # nimrod has no nRefCount — BUG: G11 MISSING ENTIRELY
 
-  test "nimrod allows address to appear any number of times":
+  test "nimrod stores an address once however often it is added":
     let pm = newPeerManager(regtestParams(), dataDir = "/tmp")
     var na = NetAddress()
     na.ip[10] = 0xFF; na.ip[11] = 0xFF  # IPv4-mapped prefix
     na.ip[12] = 8; na.ip[13] = 8; na.ip[14] = 8; na.ip[15] = 8  # 8.8.8.8
     na.port = 8333
-    # Same address can be added many times without any cap
+    # cffix-nimrod-knownaddresses-cap: the flat store dedups on (ip, port)
+    # with a hash index.  This used to assert 21 copies (no dedup).
     for _ in 0..20:
       pm.addKnownAddress(na)
-    check pm.knownAddresses.len == 21  # no dedup, no refcount cap
-    # BUG: G11 MISSING ENTIRELY
+    check pm.knownAddresses.len == 1
 
 # ---------------------------------------------------------------------------
 # G12 – Good() / MakeTried() absent

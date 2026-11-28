@@ -86,6 +86,7 @@ const IncludedTests = [
   "test_boot_body_audit_gate",
   "test_campaign_builtin_confirmation",
   "test_cffix_64byte_mutation_rule",
+  "test_cffix_knownaddresses_cap",
   "test_cffix_psbt_sighash_mismatch",
   "test_cffix_psbt_trusted_prevout",
   "test_cffix_reorg_bip68_mtp",

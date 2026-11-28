@@ -47,7 +47,12 @@ proc makeV2IPv4(a, b, c, d: byte; ts: uint32): TimestampedAddrV2 =
   )
 
 proc freshPeer(): Peer =
-  newPeer("10.0.0.1", 8333'u16, mainnetParams(), pdInbound)
+  ## A peer we have sent getaddr, so its reply is not cut to the 1-token
+  ## unsolicited allowance (Core m_addr_token_bucket starts at 1.0 and gains
+  ## MAX_ADDR_TO_SEND on our getaddr).  These tests are about the relay gate
+  ## and the timestamp clamp, not the rate limit.
+  result = newPeer("10.0.0.1", 8333'u16, mainnetParams(), pdInbound)
+  result.addrTokenBucket += float64(MaxAddrToSend)
 
 # ---------------------------------------------------------------------------
 # 3F — relay gate constant is 10 (not 1000)
