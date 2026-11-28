@@ -12948,24 +12948,68 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
       "PSBT is missing its unsigned transaction")
   let unsignedTx = psbtObj.tx.get()
 
-  # Helper: resolve a prevout TxOut for an input, preferring the PSBT's own
-  # witness_utxo / non_witness_utxo, then wallet UTXOs, then chainstate.
-  proc resolvePrevOut(idx: int): Option[TxOut] =
-    if psbtObj.inputs[idx].witnessUtxo.isSome:
-      return psbtObj.inputs[idx].witnessUtxo
+  # The PSBT's non_witness_utxo must be the transaction the input spends.
+  # Core refuses the PSBT while decoding it (psbt.h
+  # PartiallySignedTransaction::Unserialize), for every input, finalized or
+  # not, and walletprocesspsbt answers RPC_DESERIALIZATION_ERROR with
+  # "TX decode failed <reason>" (wallet/rpc/spend.cpp). Without the check the
+  # signer below took the amount and script from whatever transaction the
+  # PSBT author attached. Core throws std::ios_base::failure, whose what()
+  # on libstdc++ (the Linux release build) ends in ": iostream error", so
+  # that suffix is part of Core's answer.
+  for i in 0 ..< min(psbtObj.inputs.len, unsignedTx.inputs.len):
+    if psbtObj.inputs[i].nonWitnessUtxo.isNone:
+      continue
+    let op = unsignedTx.inputs[i].prevOut
+    let prevTx = psbtObj.inputs[i].nonWitnessUtxo.get()
+    if prevTx.txid() != op.txid:
+      raise newRpcError(RpcDeserializationError,
+        "TX decode failed Non-witness UTXO does not match outpoint hash: iostream error")
+    if int(op.vout) >= prevTx.outputs.len:
+      raise newRpcError(RpcDeserializationError,
+        "TX decode failed Input specifies output index that does not exist: iostream error")
+
+  # The wallet's own record of the output an input spends: an unspent wallet
+  # coin, else an output of a transaction in the wallet's history. This is
+  # what CWallet::FillPSBT backfills as non_witness_utxo from mapWallet.
+  proc walletPrevOut(idx: int): Option[TxOut] =
+    let op = unsignedTx.inputs[idx].prevOut
+    if op in w.utxos:
+      return some(w.utxos[op].output)
+    if op.txid in w.txHistory and w.txHistory[op.txid].rawTx.len > 0:
+      try:
+        let prevTx = deserializeTransaction(w.txHistory[op.txid].rawTx)
+        if int(op.vout) < prevTx.outputs.len:
+          return some(prevTx.outputs[int(op.vout)])
+      except CatchableError:
+        discard
+    none(TxOut)
+
+  # Helper: resolve a prevout TxOut for an input, and whether it can be
+  # trusted. In Core's order (SignPSBTInput after CWallet::FillPSBT): the
+  # PSBT's non_witness_utxo (checked against the prevout above), else the
+  # wallet's own record, else the PSBT's witness_utxo, which the PSBT author
+  # controls and nothing here can check, so it is not trusted. Chainstate
+  # last, for inputs the PSBT carries no data for; it is not wallet data and
+  # Core's walletprocesspsbt has no such source, so it gets no more trust
+  # than witness_utxo (the Updater stashes it there anyway).
+  proc resolvePrevOut(idx: int): tuple[prev: Option[TxOut], trusted: bool] =
     if psbtObj.inputs[idx].nonWitnessUtxo.isSome:
       let prevTx = psbtObj.inputs[idx].nonWitnessUtxo.get()
       let vout = int(unsignedTx.inputs[idx].prevOut.vout)
       if vout < prevTx.outputs.len:
-        return some(prevTx.outputs[vout])
+        return (some(prevTx.outputs[vout]), true)
+    let own = walletPrevOut(idx)
+    if own.isSome:
+      return (own, true)
+    if psbtObj.inputs[idx].witnessUtxo.isSome:
+      return (psbtObj.inputs[idx].witnessUtxo, false)
     let op = unsignedTx.inputs[idx].prevOut
-    if op in w.utxos:
-      return some(w.utxos[op].output)
     if rpc.chainState != nil:
       let u = rpc.chainState.getUtxo(op)
       if u.isSome:
-        return some(u.get().output)
-    none(TxOut)
+        return (some(u.get().output), false)
+    (none(TxOut), false)
 
   # Inputs Core's FillPSBT would see UTXO data for: the PSBT's own
   # witness_utxo / non_witness_utxo, or the wallet's coin. (CWallet::FillPSBT
@@ -12987,8 +13031,18 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
   for i in 0 ..< psbtObj.inputs.len:
     if psbtObj.inputs[i].witnessUtxo.isSome or
        psbtObj.inputs[i].nonWitnessUtxo.isSome:
+      # A witness_utxo that contradicts a trusted source (the checked
+      # non_witness_utxo or the wallet's own coin) is replaced by it, as
+      # Core's SignPSBTInput sets witness_utxo to the UTXO it used. An
+      # understated amount on our own input must not survive the round trip.
+      if psbtObj.inputs[i].witnessUtxo.isSome and
+         not psbtObj.inputs[i].isSigned():
+        let (trustedPrev, trusted) = resolvePrevOut(i)
+        if trusted and trustedPrev.isSome and
+           trustedPrev.get() != psbtObj.inputs[i].witnessUtxo.get():
+          psbtObj.inputs[i].witnessUtxo = trustedPrev
       continue
-    let prevOpt = resolvePrevOut(i)
+    let prevOpt = resolvePrevOut(i).prev
     if prevOpt.isNone:
       continue
     let prev = prevOpt.get()
@@ -13028,8 +13082,10 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     # The prevout whose type picks the default, in Core's order: the PSBT's
     # non_witness_utxo, else the wallet's own coin (CWallet::FillPSBT fills
     # non_witness_utxo from the wallet when absent), else witness_utxo
-    # (SignPSBTInput prefers non_witness_utxo). resolvePrevOut prefers
-    # witness_utxo, which the PSBT author controls, so it is not used here.
+    # (SignPSBTInput prefers non_witness_utxo). resolvePrevOut follows the
+    # same order but also reads the wallet's transaction history and falls
+    # back to chainstate, sources coreHasUtxo does not admit, so the check
+    # keeps its own lookup over the sources coreHasUtxo counts.
     let op = unsignedTx.inputs[i].prevOut
     var checkSpk: Option[seq[byte]]
     if psbtObj.inputs[i].nonWitnessUtxo.isSome:
@@ -13057,7 +13113,7 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
       if psbtObj.inputs[i].isSigned():
         continue
 
-      let prevOpt = resolvePrevOut(i)
+      let (prevOpt, prevTrusted) = resolvePrevOut(i)
       if prevOpt.isNone:
         continue
       let prev = prevOpt.get()
@@ -13100,7 +13156,12 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
             signedOk = true
         elif spk.len == 25 and spk[0] == 0x76 and spk[1] == 0xa9 and
              spk[2] == 0x14 and spk[23] == 0x88 and spk[24] == 0xac:
-          # P2PKH (legacy)
+          # P2PKH (legacy). A legacy signature commits to neither the amount
+          # nor a checked prevout, so it is only made over trusted data
+          # (Core's require_witness_sig: witness_utxo alone -> INCOMPLETE,
+          # the input stays unsigned).
+          if not prevTrusted:
+            continue
           signInputP2PKH(scratch, i, dkey.extKey.key, dkey.extKey.publicKey,
                          inHashType)
           # scriptSig = <len><derSig><len><pubkey>
