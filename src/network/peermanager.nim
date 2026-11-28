@@ -2178,6 +2178,13 @@ proc relayAddresses(pm: PeerManager, source: Peer,
   var candidates: seq[Peer]
   for _, p in pm.peers:
     if p != source and p.isConnected() and not p.closing:
+      # Core relays only to peers with m_addr_relay_enabled, which
+      # SetupAddressRelay never sets on a block-relay-only connection: sending
+      # a peer's own address there would let it spot our hidden links.
+      let key = peerKey(p)
+      if key in pm.extendedPeers and
+          pm.extendedPeers.getOrDefault(key).connType == pctBlockRelayOnly:
+        continue
       candidates.add(p)
   if candidates.len == 0:
     return
