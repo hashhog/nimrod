@@ -12892,9 +12892,17 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
 
   let sign = if params.len >= 2 and params[1].kind == JBool:
                params[1].getBool() else: true
-  let sighashStr = if params.len >= 3 and params[2].kind == JString:
-                     params[2].getStr() else: "ALL"
+  let sighashGiven = params.len >= 3 and params[2].kind == JString
+  let sighashStr = if sighashGiven: params[2].getStr() else: "ALL"
   let hashType = parseWalletSighashType(sighashStr)
+  # The sighash the CALLER asked for, as Core's ParseSighashString sees it:
+  # none when the argument is omitted/null, SIGHASH_DEFAULT (0) for "DEFAULT"
+  # (parseWalletSighashType folds DEFAULT into ALL for signing; the mismatch
+  # check below must not), otherwise the parsed flags.
+  let callerSighash: Option[uint32] =
+    if not sighashGiven: none(uint32)
+    elif sighashStr == "DEFAULT": some(0'u32)
+    else: some(hashType)
   let finalize = if params.len >= 5 and params[4].kind == JBool:
                    params[4].getBool() else: true
 
@@ -12935,6 +12943,19 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
         return some(u.get().output)
     none(TxOut)
 
+  # Inputs Core's FillPSBT would see UTXO data for: the PSBT's own
+  # witness_utxo / non_witness_utxo, or the wallet's coin. (CWallet::FillPSBT
+  # fills non_witness_utxo from any mapWallet transaction; this uses the
+  # wallet's unspent coins only, a narrower set.) Recorded before the Updater
+  # below, which also resolves prevouts from chainstate, something Core does
+  # not do.
+  var coreHasUtxo = newSeq[bool](psbtObj.inputs.len)
+  for i in 0 ..< psbtObj.inputs.len:
+    coreHasUtxo[i] = psbtObj.inputs[i].witnessUtxo.isSome or
+                     psbtObj.inputs[i].nonWitnessUtxo.isSome or
+                     (i < unsignedTx.inputs.len and
+                      unsignedTx.inputs[i].prevOut in w.utxos)
+
   # ------------------------------------------------------------------
   # Updater role: fill UTXO data for every input the wallet can resolve.
   # witness_utxo for segwit (v0/v1) scripts, non_witness_utxo otherwise.
@@ -12955,6 +12976,52 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
     # Updater pass carrying the full funding tx may upgrade this to
     # non_witness_utxo via updateInputWithTx.
     psbtObj.inputs[i].witnessUtxo = some(prev)
+
+  # Per-input sighash, resolved as Core's SignPSBTInput does: the caller's
+  # value, or SIGHASH_DEFAULT (0) for a taproot prevout and SIGHASH_ALL (1)
+  # for everything else when the caller gave none.
+  proc requestedSighash(spk: seq[byte]): uint32 =
+    if callerSighash.isSome:
+      return callerSighash.get()
+    if spk.len == 34 and spk[0] == 0x51 and spk[1] == 0x20:
+      return 0'u32
+    1'u32
+
+  # SIGHASH_MISMATCH (Core psbt.cpp SignPSBTInput, "For user safety, the
+  # desired sighash must be provided if the PSBT wants something other than
+  # the default"): a PSBT_IN_SIGHASH_TYPE that differs from the requested
+  # sighash refuses the whole call. Without this a counterparty who sets
+  # NONE on our input got a SIGHASH_NONE signature from a default-args call
+  # and could then redirect every output. Core runs the check for every
+  # unfinalized input with UTXO data, before any key lookup and with or
+  # without `sign` (DescriptorScriptPubKeyMan::FillPSBT), and maps it to
+  # RPC_DESERIALIZATION_ERROR (rpc/util.cpp RPCErrorFromPSBTError).
+  for i in 0 ..< psbtObj.inputs.len:
+    if psbtObj.inputs[i].isSigned() or not coreHasUtxo[i]:
+      continue
+    if psbtObj.inputs[i].sighashType.isNone:
+      continue
+    # The prevout whose type picks the default, in Core's order: the PSBT's
+    # non_witness_utxo, else the wallet's own coin (CWallet::FillPSBT fills
+    # non_witness_utxo from the wallet when absent), else witness_utxo
+    # (SignPSBTInput prefers non_witness_utxo). resolvePrevOut prefers
+    # witness_utxo, which the PSBT author controls, so it is not used here.
+    let op = unsignedTx.inputs[i].prevOut
+    var checkSpk: Option[seq[byte]]
+    if psbtObj.inputs[i].nonWitnessUtxo.isSome:
+      let prevTx = psbtObj.inputs[i].nonWitnessUtxo.get()
+      if int(op.vout) < prevTx.outputs.len:
+        checkSpk = some(prevTx.outputs[int(op.vout)].scriptPubKey)
+    elif op in w.utxos:
+      checkSpk = some(w.utxos[op].output.scriptPubKey)
+    elif psbtObj.inputs[i].witnessUtxo.isSome:
+      checkSpk = some(psbtObj.inputs[i].witnessUtxo.get().scriptPubKey)
+    if checkSpk.isNone:
+      continue
+    let wanted = requestedSighash(checkSpk.get())
+    if int64(psbtObj.inputs[i].sighashType.get()) != int64(wanted):
+      raise newRpcError(RpcDeserializationError,
+        "Specified sighash value does not match value stored in PSBT")
 
   # ------------------------------------------------------------------
   # Signer role: materialise the unsigned tx, drive the shared signInput*
@@ -12977,13 +13044,12 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
         continue  # not our key; leave for another signer (Core parity)
       let dkey = keyOpt.get()
 
-      # Per-input sighash override: honour PSBT_IN_SIGHASH_TYPE when present,
-      # else the RPC-level sighashtype.
-      let inHashType =
-        if psbtObj.inputs[i].sighashType.isSome:
-          uint32(psbtObj.inputs[i].sighashType.get())
-        else:
-          hashType
+      # Sign with the requested sighash. A stored PSBT_IN_SIGHASH_TYPE has
+      # already been checked equal to it above, so it never overrides the
+      # caller. Every script signed here is non-taproot, where Core aliases
+      # SIGHASH_DEFAULT to SIGHASH_ALL.
+      let wanted = requestedSighash(spk)
+      let inHashType = if wanted == 0'u32: 0x01'u32 else: wanted
 
       # Build a single-input scratch tx around this input so the existing
       # signers (which sign tx.inputs[idx] in place) operate on a faithful
@@ -13046,8 +13112,13 @@ proc handleWalletProcessPsbt(rpc: RpcServer, params: JsonNode): JsonNode =
         psbtObj.addPartialSig(i, pub, derSig)
         if redeemForPsbt.len > 0 and psbtObj.inputs[i].redeemScript.len == 0:
           psbtObj.inputs[i].redeemScript = redeemForPsbt
-        # Record the sighash type we signed with (BIP-174 PSBT_IN_SIGHASH_TYPE).
-        if psbtObj.inputs[i].sighashType.isNone:
+        # Record the sighash type we signed with (BIP-174 PSBT_IN_SIGHASH_TYPE)
+        # only when it is neither DEFAULT nor ALL, as Core's SignPSBTInput
+        # does for non-taproot inputs (the only kind signed here; DEFAULT has
+        # been aliased to ALL above). Writing 0x01 for a default sign would
+        # make the mismatch check above refuse a later "DEFAULT" call on this
+        # PSBT, which Core accepts.
+        if psbtObj.inputs[i].sighashType.isNone and inHashType != 0x01'u32:
           psbtObj.inputs[i].sighashType = some(int32(inHashType))
 
   # ------------------------------------------------------------------
