@@ -2112,10 +2112,30 @@ proc changePassphrase*(wallet: var Wallet, oldPassphrase: string,
   if newPassphrase.len == 0:
     raise newException(WalletError, "new passphrase cannot be empty")
 
-  # First unlock with old passphrase
+  # The old passphrase must decrypt the stored seed whether or not the wallet
+  # is unlocked. Core's ChangeWalletPassphrase runs DecryptMasterKey with the
+  # old passphrase unconditionally; skipping it while unlocked let anyone with
+  # RPC access during an unlock window replace a passphrase they did not know.
   let wasLocked = wallet.isLocked
   if wallet.isLocked:
     if not wallet.unlockWallet(oldPassphrase):
+      return false
+  else:
+    let (oldEncKey, _) = bytesToKeySha512Aes(wallet.encryptionSalt,
+                                              oldPassphrase,
+                                              wallet.encryptionRounds)
+    if wallet.encryptedSeed.len < 17:  # 16 bytes IV + at least 1 byte data
+      raise newException(WalletError, "invalid encrypted seed data")
+    var oldIv: array[32, byte]
+    copyMem(addr oldIv[0], addr wallet.encryptedSeed[0], 16)
+    let decrypted =
+      try:
+        decryptSecret(oldEncKey,
+                      wallet.encryptedSeed[16 ..< wallet.encryptedSeed.len],
+                      oldIv)
+      except CrypterError:
+        return false
+    if decrypted.len != wallet.seed.len or decrypted != @(wallet.seed):
       return false
 
   # Generate new salt
