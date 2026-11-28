@@ -390,3 +390,27 @@ suite "cffix getaddr: random sample with stored timestamps":
     check r3.len == 230
     check keys(r3) != keys(r1)          # redrawn
     removeDir(dir)
+
+  test "a getaddr reply drawn from a near-empty store does not stick once the store fills":
+    ## nimrod's knownAddresses starts empty on every boot (Core's addrman is
+    ## loaded from peers.dat first).  An early getaddr must not freeze an empty
+    ## or tiny reply for the cache lifetime.
+    let (pm, dir) = freshPm("gaboot")
+    let r0 = pm.buildGetAddrResponse(
+      newPeer("54.0.0.1", 8333'u16, regtestParams(), pdInbound))
+    check r0.len == 0                   # empty store, empty reply
+    for i in 0 ..< 10:
+      pm.knownAddresses.add(NetAddress(services: 1'u64,
+        ip: ip4(55, 0, 0, byte(i)), port: 8333,
+        lastSeen: uint32(getTime().toUnix()) - 86400'u32))
+    let r1 = pm.buildGetAddrResponse(
+      newPeer("54.0.0.2", 8333'u16, regtestParams(), pdInbound))
+    check r1.len == 2                   # floor(23% of 10)
+    for i in 0 ..< 1000:
+      pm.knownAddresses.add(NetAddress(services: 1'u64,
+        ip: ip4(56, 0, byte(i shr 8), byte(i and 0xFF)), port: 8333,
+        lastSeen: uint32(getTime().toUnix()) - 86400'u32))
+    let r2 = pm.buildGetAddrResponse(
+      newPeer("54.0.0.3", 8333'u16, regtestParams(), pdInbound))
+    check r2.len == 232                 # floor(23% of 1010), freshly drawn
+    removeDir(dir)
