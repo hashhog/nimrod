@@ -1860,6 +1860,27 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
 
       var success = false
 
+      # BASE scriptCode + FindAndDelete, BEFORE the encoding checks and for
+      # every sig, empty included (Core EvalChecksigPreTapscript,
+      # interpreter.cpp:326-333). scriptCode = CScript(pbegincodehash, pend):
+      # the subscript from the BYTE position just after the last executed
+      # OP_CODESEPARATOR (codesepByteOffset, not the opcode index in
+      # codesepPos). FindAndDelete deletes `CScript() << vchSig`, which for an
+      # empty sig is OP_0. If it removed anything and CONST_SCRIPTCODE is set
+      # (policy only; never a block flag), that is SIG_FINDANDDELETE, and it
+      # wins over a bad sig or pubkey encoding. Without the flag the stripped
+      # scriptCode only feeds the legacy sighash below, exactly as before.
+      var baseScriptCode: seq[byte]
+      if ctx.sigVersion == sigBase:
+        if interp.codesepByteOffset != 0xFFFFFFFF'u32 and int(interp.codesepByteOffset) <= script.len:
+          baseScriptCode = script[int(interp.codesepByteOffset) ..< script.len]
+        else:
+          baseScriptCode = @script
+        let scriptCodeBefore = baseScriptCode
+        baseScriptCode = findAndDelete(baseScriptCode, sig)
+        if baseScriptCode != scriptCodeBefore and sfConstScriptCode in interp.flags:
+          return seSigFindAndDelete
+
       # Encoding checks (DERSIG, STRICTENC, LOW_S) - done before verification,
       # even if pubkey is empty (Bitcoin Core checks sig encoding regardless)
       if ctx.sigVersion == sigBase or ctx.sigVersion == sigWitnessV0:
@@ -1902,24 +1923,10 @@ proc eval*(interp: var ScriptInterpreter, script: openArray[byte],
             let hashType = uint32(sig[sig.len - 1])
             let sigWithoutHashType = sig[0 ..< sig.len - 1]
 
-            # scriptCode = CScript(pbegincodehash, pend): the subscript from
-            # the BYTE position just after the last executed OP_CODESEPARATOR
-            # to the script end (Core interpreter.cpp:326). codesepByteOffset
-            # is a BYTE offset (not the opcode index in codesepPos).
-            var scriptCode: seq[byte]
-            if interp.codesepByteOffset != 0xFFFFFFFF'u32 and int(interp.codesepByteOffset) <= script.len:
-              scriptCode = script[int(interp.codesepByteOffset) ..< script.len]
-            else:
-              scriptCode = @script
-            # FindAndDelete - only for legacy. Per Core interpreter.cpp:330-332,
-            # if FindAndDelete actually removed a push (found > 0) and
-            # CONST_SCRIPTCODE is set, this is a hard error (SCRIPT_ERR_SIG_FINDANDDELETE).
-            let scriptCodeBefore = scriptCode
-            scriptCode = findAndDelete(scriptCode, sig)
-            if scriptCode != scriptCodeBefore and sfConstScriptCode in interp.flags:
-              return seSigFindAndDelete
-
-            let sighash = computeSighashLegacy(ctx.tx, ctx.inputIndex, scriptCode, hashType)
+            # baseScriptCode: the subscript after the last executed
+            # OP_CODESEPARATOR with this sig FindAndDelete'd, built above
+            # before the encoding checks.
+            let sighash = computeSighashLegacy(ctx.tx, ctx.inputIndex, baseScriptCode, hashType)
             # W160 BUG-11 fix: per-sig cache keyed on (sighash, pubkey, sig) —
             # mirrors Core's ComputeEntryECDSA in sigcache.cpp:39-50. Two
             # different (sig, pubkey) tuples that happen to share an input no

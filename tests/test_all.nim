@@ -227,6 +227,7 @@ const IncludedTests = [
   "test_psbt",
   "test_psbt_convert_join",
   "test_psbt_emptyvin_gate",
+  "test_r3fix_const_scriptcode_policy",
   "test_rbf",
   "test_rbf_clusters",
   "test_rbf_paysforrbf_reject_text",
