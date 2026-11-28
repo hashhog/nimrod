@@ -41,6 +41,9 @@ suite "cffix changePassphrase verifies the old passphrase (Core ChangeWalletPass
     check not w.changePassphrase("WRONG", "q")
 
     # The wallet is untouched: still unlocked, same seed, still under "p".
+    # Core differs here: ChangeWalletPassphrase calls Lock() before trying
+    # the old passphrase, so a refused attempt leaves a Core wallet locked.
+    # Matching that is a separate change; flip this check if it is made.
     check not w.isLocked
     check w.seed == seed
     w.lockWallet()
