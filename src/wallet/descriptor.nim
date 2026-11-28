@@ -1227,6 +1227,146 @@ proc toString*(desc: Descriptor, includeChecksum: bool = true,
     result = addDescriptorChecksum(result)
 
 # =============================================================================
+# Public form of a descriptor (listdescriptors, the watched_descriptors row)
+# =============================================================================
+
+proc normalizedPublicKey(key: ExtendedKey, keyMainnet: bool, pathText: string,
+                         originText: string, hasOrigin: bool): string =
+  ## Public form of one extended PRIVATE key expression `key/pathText`, with
+  ## `originText` the "[fp/path]" text written before it ("" when absent).
+  ## Like Core's BIP32PubkeyProvider::ToNormalizedString: hardened steps of
+  ## the derivation path are applied here with the private key and moved into
+  ## the origin, so the xpub that is left can still derive every script. A
+  ## hardened wildcard (/*h) cannot be moved; that form keeps the full path
+  ## after the xpub (Core does the same) and cannot expand without its key.
+  var rest = pathText
+  var wildcard = ""
+  for w in ["/*'", "/*h", "/*H", "/*"]:
+    if rest.endsWith(w):
+      wildcard = w
+      rest = rest[0 ..< rest.len - w.len]
+      break
+  if rest.startsWith("/"):
+    rest = rest[1 .. ^1]
+  let (steps, apos) =
+    if rest.len > 0: parseKeyPath(rest) else: (newSeq[uint32](), true)
+  # Keep the hardened marker the caller wrote (' or h).
+  let useApos = if 'h' in pathText or 'H' in pathText: false
+                elif '\'' in pathText: true
+                else: apos
+  var lastHardened = -1
+  if wildcard notin ["/*'", "/*h", "/*H"]:
+    for i, s in steps:
+      if (s and 0x80000000'u32) != 0:
+        lastHardened = i
+  if lastHardened < 0:
+    return originText & serializeExtendedKey(neuter(key), keyMainnet) & pathText
+  var derived = key
+  for i in 0 .. lastHardened:
+    derived = deriveChild(derived, steps[i])
+  let moved = pathToString(steps[0 .. lastHardened], useApos)
+  var origin: string
+  if hasOrigin:
+    # "[fp]" or "[fp/path]" -> append the moved hardened steps.
+    origin = originText[0 ..< originText.len - 1] & "/" & moved & "]"
+  else:
+    origin = "[" & toHex(fingerprint(key)) & "/" & moved & "]"
+  result = origin & serializeExtendedKey(neuter(derived), keyMainnet)
+  if lastHardened + 1 < steps.len:
+    result.add("/" & pathToString(steps[lastHardened + 1 .. ^1], useApos))
+  result.add(wildcard)
+
+proc publicDescriptorPayload*(payload: string): string =
+  ## The descriptor `payload` (no "#checksum") with every private key replaced
+  ## by its public form: a WIF by its hex public key (x-only inside tr() /
+  ## rawtr(), as Core prints it), an xprv/tprv by the matching xpub/tpub with
+  ## hardened steps normalized into the origin (normalizedPublicKey). Every
+  ## other character is kept, so script trees this parser does not model
+  ## (tr(KEY,TREE)) survive unchanged.
+  ##
+  ## Text-level on purpose: nodeToString drops tr() script trees and prints
+  ## extended keys as mainnet, so it cannot round-trip an imported string.
+  ## A token is only replaced when it decodes as a WIF / extended private key
+  ## (Base58Check), so function names, hex and addresses are left alone.
+  const Alnum = {'0'..'9', 'A'..'Z', 'a'..'z'}
+  const PathEnd = {',', ')', '}', '#', ' ', '\t'}
+  result = newStringOfCap(payload.len)
+  var fnStack: seq[string] = @[]
+  var i = 0
+  while i < payload.len:
+    let c = payload[i]
+    if c notin Alnum:
+      if c == ')' and fnStack.len > 0:
+        fnStack.setLen(fnStack.len - 1)
+      result.add(c)
+      inc i
+      continue
+    var j = i
+    while j < payload.len and payload[j] in Alnum:
+      inc j
+    let tok = payload[i ..< j]
+    if j < payload.len and payload[j] == '(':
+      fnStack.add(tok)
+      result.add(tok)
+      i = j
+      continue
+    let inTaproot = "tr" in fnStack or "rawtr" in fnStack
+    var replaced = false
+    if tok.len in 51 .. 52:
+      try:
+        let (k, _, _) = decodeWIF(tok)
+        let pub = derivePublicKey(k)
+        if inTaproot:
+          result.add(toHex(pub[1 .. 32]))
+        else:
+          result.add(toHex(pub))
+        replaced = true
+      except CatchableError:
+        discard
+    elif tok.startsWith("xprv") or tok.startsWith("tprv"):
+      var decoded = false
+      var ext: ExtendedKey
+      var isPriv, keyMainnet: bool
+      try:
+        (ext, isPriv, keyMainnet) = decodeExtendedKey(tok)
+        decoded = true
+      except CatchableError:
+        discard
+      if decoded and isPriv:
+        # The derivation path that follows the key, up to the next delimiter.
+        var k = j
+        while k < payload.len and payload[k] notin PathEnd:
+          inc k
+        let pathText = payload[j ..< k]
+        # An "[fp/path]" origin written right before the key is rewritten
+        # together with it.
+        var originText = ""
+        var hasOrigin = false
+        if result.len > 0 and result[^1] == ']':
+          let openPos = result.rfind('[')
+          if openPos >= 0:
+            originText = result[openPos .. ^1]
+            hasOrigin = true
+            result.setLen(openPos)
+        result.add(normalizedPublicKey(ext, keyMainnet, pathText, originText,
+                                       hasOrigin))
+        i = k
+        continue
+    if not replaced:
+      result.add(tok)
+    i = j
+
+proc publicDescriptorString*(descriptor: string): string =
+  ## Public form of a descriptor string, re-checksummed when the input had a
+  ## "#checksum". A descriptor with no private key comes back unchanged.
+  let hashPos = descriptor.rfind('#')
+  let payload = if hashPos >= 0: descriptor[0 ..< hashPos] else: descriptor
+  let pub = publicDescriptorPayload(payload)
+  if pub == payload:
+    return descriptor
+  if hashPos >= 0: pub & "#" & computeDescriptorChecksum(pub) else: pub
+
+# =============================================================================
 # Address Derivation
 # =============================================================================
 
@@ -1269,15 +1409,11 @@ proc deriveScripts*(desc: Descriptor, start: int = 0, count: int = 1): seq[seq[b
 # Watch-only registration (importdescriptors)
 # =============================================================================
 
-proc applyWatchedDescriptor*(wallet: Wallet, desc: Descriptor,
-                             canonical, label: string, timestamp: int64,
-                             rangeEnd: int, mainnet: bool) =
-  ## Expand a parsed descriptor and register every derived scriptPubKey as a
-  ## watched script on the wallet (in-memory only — persisting the descriptor
-  ## row is the caller's job). `rangeEnd` is the inclusive expansion end for
-  ## ranged descriptors (ignored for non-ranged). Lives here rather than in
-  ## wallet.nim because this module imports wallet.nim (not vice versa).
-  var w = wallet
+proc watchedScriptEntries*(desc: Descriptor, rangeEnd: int, mainnet: bool):
+    seq[tuple[script: seq[byte], address: string]] =
+  ## Every scriptPubKey (with its address string, "" when it has none) that
+  ## applyWatchedDescriptor registers for `desc` over [0, rangeEnd].
+  result = @[]
   let lastPos = if desc.node.isRange(): max(rangeEnd, 0) else: 0
   for pos in 0 .. lastPos:
     let expanded = expandNode(desc.node, pos)
@@ -1288,7 +1424,29 @@ proc applyWatchedDescriptor*(wallet: Wallet, desc: Descriptor,
       let addrStr =
         if aligned: encodeAddress(expanded.addresses[si], mainnet)
         else: ""
-      w.registerWatchedScript(script, canonical, label, addrStr, timestamp)
+      result.add((script, addrStr))
+
+proc applyWatchedDescriptor*(wallet: Wallet, desc: Descriptor,
+                             canonical, label: string, timestamp: int64,
+                             rangeEnd: int, mainnet: bool) =
+  ## Expand a parsed descriptor and register every derived scriptPubKey as a
+  ## watched script on the wallet (in-memory only — persisting the descriptor
+  ## row is the caller's job). `rangeEnd` is the inclusive expansion end for
+  ## ranged descriptors (ignored for non-ranged). Lives here rather than in
+  ## wallet.nim because this module imports wallet.nim (not vice versa).
+  var w = wallet
+  for e in watchedScriptEntries(desc, rangeEnd, mainnet):
+    w.registerWatchedScript(e.script, canonical, label, e.address, timestamp)
+
+proc expandsWithoutKeys*(descriptor: string): bool =
+  ## True when `descriptor` parses and expands on its own. A public form
+  ## with a hardened step after the xpub (xpub/.../*h) does not: it needs the
+  ## private key, so its scripts are cached at import (descriptor_script_cache).
+  try:
+    discard expandNode(parseDescriptor(descriptor).node, 0)
+    true
+  except CatchableError:
+    false
 
 # =============================================================================
 # Descriptor Info

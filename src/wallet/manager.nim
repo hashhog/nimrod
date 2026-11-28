@@ -239,6 +239,117 @@ proc writeKeyMaterial(db: WalletDb, wallet: Wallet) =
       purpose: acc.purpose, coinType: acc.coinType,
       accountIndex: acc.accountIndex, nextExternal: acc.nextExternal,
       nextInternal: acc.nextInternal, gap: acc.gap))
+  # sethdseed re-seals imported descriptor secrets under the new seed
+  # (wallet.setHdSeed); they must land in the same transaction as that seed.
+  for pubDesc, sealed in wallet.descriptorSecrets:
+    db.saveDescriptorSecret(pubDesc, sealed)
+
+proc openCheckedSecret(wallet: Wallet, pubDesc: string): string =
+  ## Open the sealed private form stored for `pubDesc` and check that it
+  ## really is that descriptor's private form (AES-CBC carries no MAC).
+  result = wallet.openDescriptorSecret(wallet.descriptorSecrets[pubDesc])
+  if publicDescriptorString(result) != pubDesc:
+    raise newException(WalletError,
+      "descriptor secret does not match its descriptor")
+
+proc restoreWatchedRow(wallet: Wallet, row: StoredWatchedDescriptor,
+                       db: WalletDb): bool =
+  ## Register the scripts of one persisted descriptor. The in-memory watch
+  ## entries always carry the PUBLIC string. A public form that cannot expand
+  ## on its own (a hardened step after the xpub, e.g. xpub/*h) is registered
+  ## from its script cache, written at import, so a wallet that loads locked
+  ## keeps watching. Without a cache it falls back to the sealed private
+  ## form, which needs the seed: returns false when the wallet is locked so
+  ## the caller can retry at walletpassphrase.
+  let listed = publicDescriptorString(row.descriptor)
+  try:
+    applyWatchedDescriptor(wallet, parseDescriptor(row.descriptor), listed,
+                           row.label, row.timestamp, row.rangeEnd,
+                           wallet.mainnet)
+    return true
+  except CatchableError as e:
+    let cached = db.getDescriptorScriptCache(row.descriptor)
+    if cached.len > 0:
+      var w = wallet
+      for c in cached:
+        w.registerWatchedScript(c.script, listed, row.label, c.address,
+                                row.timestamp)
+      return true
+    if not wallet.descriptorSecrets.hasKey(row.descriptor):
+      raise e
+    if wallet.isEncrypted and wallet.isLocked:
+      return false
+  let privDesc = wallet.openCheckedSecret(row.descriptor)
+  applyWatchedDescriptor(wallet, parseDescriptor(privDesc), listed,
+                         row.label, row.timestamp, row.rangeEnd, wallet.mainnet)
+  true
+
+proc sealPlaintextDescriptors*(lw: LoadedWallet): int =
+  ## Rewrite watched_descriptors rows that an older build stored with their
+  ## private keys in plaintext: the row becomes the public form and the
+  ## private form moves to descriptor_secrets, sealed. Needs the seed in
+  ## memory (an unencrypted wallet, or an unlocked one); returns 0 untouched
+  ## otherwise. Returns the number of rows rewritten. One transaction.
+  if lw == nil or lw.wallet == nil or lw.db == nil or not lw.db.isOpen:
+    return 0
+  let w = lw.wallet
+  if w.isEncrypted and w.isLocked:
+    return 0
+  var rows: seq[StoredWatchedDescriptor] = @[]
+  var pubs: seq[string] = @[]
+  var sealedList: seq[seq[byte]] = @[]
+  var caches: seq[seq[tuple[script: seq[byte], address: string]]] = @[]
+  for row in lw.db.getWatchedDescriptors():
+    let pub = publicDescriptorString(row.descriptor)
+    if pub == row.descriptor:
+      continue
+    rows.add(row)
+    pubs.add(pub)
+    # A watch-only wallet must hold no key at all: drop it.
+    sealedList.add(if w.privateKeysDisabled: @[]
+                   else: w.sealDescriptorSecret(row.descriptor))
+    # The rewritten row must stay watchable while locked (see
+    # restoreWatchedRow): cache its scripts when the public form needs keys.
+    caches.add(if expandsWithoutKeys(pub): @[]
+               else: watchedScriptEntries(parseDescriptor(row.descriptor),
+                                          row.rangeEnd, w.mainnet))
+  if rows.len == 0:
+    return 0
+  withWalletTx(lw.db):
+    for i, row in rows:
+      lw.db.deleteWatchedDescriptor(row.descriptor)
+      lw.db.saveWatchedDescriptor(pubs[i], row.label, row.timestamp,
+                                  row.rangeEnd)
+      if sealedList[i].len > 0:
+        lw.db.saveDescriptorSecret(pubs[i], sealedList[i])
+      if caches[i].len > 0:
+        lw.db.saveDescriptorScriptCache(pubs[i], caches[i])
+  for i in 0 ..< rows.len:
+    if sealedList[i].len > 0:
+      w.descriptorSecrets[pubs[i]] = sealedList[i]
+  rows.len
+
+proc restoreDescriptorSecrets*(lw: LoadedWallet): seq[string] =
+  ## Called once the seed is back in memory (walletpassphrase): seal any
+  ## plaintext rows left by an older build, and register the scripts of rows
+  ## whose public form could not expand while the wallet was locked.
+  ## Best-effort; returns warnings.
+  result = @[]
+  if lw == nil or lw.wallet == nil or lw.db == nil or not lw.db.isOpen:
+    return
+  try:
+    discard sealPlaintextDescriptors(lw)
+  except CatchableError as e:
+    result.add("Failed to seal plaintext descriptors: " & e.msg)
+  for row in lw.db.getWatchedDescriptors():
+    if not lw.wallet.descriptorSecrets.hasKey(row.descriptor):
+      continue
+    if expandsWithoutKeys(row.descriptor):
+      continue
+    try:
+      discard restoreWatchedRow(lw.wallet, row, lw.db)
+    except CatchableError as e:
+      result.add("Failed to restore watched descriptor: " & e.msg)
 
 proc persistKeyMaterial*(wm: WalletManager, name: string): bool {.gcsafe.} =
   ## Rewrite a loaded wallet's seed and accounts after encryptwallet,
@@ -380,14 +491,20 @@ proc loadWallet*(wm: WalletManager, filename: string,
   # wallet from loading.
   let dpkFlag = db.getWalletFlag("disable_private_keys")
   wallet.privateKeysDisabled = dpkFlag.isSome and dpkFlag.get() == "1"
+  for sec in db.getDescriptorSecrets():
+    wallet.descriptorSecrets[sec.descriptor] = sec.secret
   for row in db.getWatchedDescriptors():
+    # Name a failing row by its public form: a row from an older build may
+    # still hold the private one.
+    let shown = publicDescriptorString(row.descriptor)
     try:
-      let desc = parseDescriptor(row.descriptor)
-      applyWatchedDescriptor(wallet, desc, row.descriptor, row.label,
-                             row.timestamp, row.rangeEnd, mainnet)
+      if not restoreWatchedRow(wallet, row, db):
+        warnings.add("Watched descriptor (" &
+                     shown[0 ..< min(shown.len, 40)] &
+                     "...) is watched once the wallet is unlocked")
     except CatchableError as e:
       warnings.add("Failed to restore watched descriptor (" &
-                   row.descriptor[0 ..< min(row.descriptor.len, 40)] &
+                   shown[0 ..< min(shown.len, 40)] &
                    "...): " & e.msg)
 
   let lw = LoadedWallet(
@@ -396,6 +513,13 @@ proc loadWallet*(wm: WalletManager, filename: string,
     name: name,
     path: walletPath
   )
+
+  # Plaintext rows from an older build: seal them now if the seed is in
+  # memory (unencrypted wallet); an encrypted wallet does it at unlock.
+  try:
+    discard sealPlaintextDescriptors(lw)
+  except CatchableError as e:
+    warnings.add("Failed to seal plaintext descriptors: " & e.msg)
 
   withLock wm.walletsLock:
     wm.wallets[name] = lw

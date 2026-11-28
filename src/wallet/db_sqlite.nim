@@ -204,6 +204,26 @@ proc open*(wdb: var WalletDb) =
       range_end INTEGER NOT NULL DEFAULT 0
     );
 
+    -- Private forms of imported descriptors. `descriptor` is the PUBLIC
+    -- canonical string (the watched_descriptors key); `secret` is
+    -- IV || AES-256-CBC(private canonical string) under a key derived from
+    -- the HD seed (wallet.nim sealDescriptorSecret), so an encrypted wallet's
+    -- database holds no plaintext key. cffix-nimrod-listdescriptors-private.
+    CREATE TABLE IF NOT EXISTS descriptor_secrets (
+      descriptor TEXT PRIMARY KEY NOT NULL,
+      secret BLOB NOT NULL
+    );
+
+    -- Scripts of a descriptor whose public form cannot expand without its
+    -- private key (xpub/.../*h), so a wallet that loads locked still watches
+    -- them. Public data. Core keeps the same thing in its DescriptorCache.
+    CREATE TABLE IF NOT EXISTS descriptor_script_cache (
+      descriptor TEXT NOT NULL,
+      script BLOB NOT NULL,
+      address TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY (descriptor, script)
+    );
+
     CREATE TABLE IF NOT EXISTS wallet_flags (
       key TEXT PRIMARY KEY NOT NULL,
       value TEXT NOT NULL
@@ -885,6 +905,135 @@ proc getWatchedDescriptors*(wdb: WalletDb): seq[StoredWatchedDescriptor] =
       timestamp: sqlite3_column_int64(stmt, 2),
       rangeEnd: int(sqlite3_column_int(stmt, 3))))
 
+  discard sqlite3_finalize(stmt)
+
+proc deleteWatchedDescriptor*(wdb: WalletDb, descriptor: string) =
+  ## Remove one watched_descriptors row (migration of a plaintext row).
+  if not wdb.isOpen:
+    raise newException(WalletDbError, "database not open")
+  let db = Sqlite3(wdb.db)
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db,
+    "DELETE FROM watched_descriptors WHERE descriptor = ?".cstring, -1,
+    addr stmt, nil)
+  checkError(db, rc, "prepare watched descriptor delete")
+  try:
+    checkError(db, sqlite3_bind_text(stmt, 1, descriptor.cstring, -1,
+                                     SQLITE_TRANSIENT), "bind descriptor")
+    rc = sqlite3_step(stmt)
+    if rc != SQLITE_DONE:
+      checkError(db, rc, "step watched descriptor delete")
+  finally:
+    discard sqlite3_finalize(stmt)
+
+proc saveDescriptorSecret*(wdb: WalletDb, descriptor: string,
+                           secret: seq[byte]) =
+  ## Upsert the sealed private form of an imported descriptor, keyed by its
+  ## public canonical string.
+  if not wdb.isOpen:
+    raise newException(WalletDbError, "database not open")
+  if secret.len == 0:
+    raise newException(WalletDbError, "empty descriptor secret")
+  let db = Sqlite3(wdb.db)
+  var stmt: Sqlite3Stmt
+  var rc = sqlite3_prepare_v2(db,
+    "INSERT OR REPLACE INTO descriptor_secrets (descriptor, secret) VALUES (?, ?)".cstring,
+    -1, addr stmt, nil)
+  checkError(db, rc, "prepare descriptor secret upsert")
+  try:
+    checkError(db, sqlite3_bind_text(stmt, 1, descriptor.cstring, -1,
+                                     SQLITE_TRANSIENT), "bind descriptor")
+    checkError(db, sqlite3_bind_blob(stmt, 2, unsafeAddr secret[0],
+                                     cint(secret.len), SQLITE_TRANSIENT),
+               "bind secret")
+    rc = sqlite3_step(stmt)
+    if rc != SQLITE_DONE:
+      checkError(db, rc, "step descriptor secret upsert")
+  finally:
+    discard sqlite3_finalize(stmt)
+
+proc saveDescriptorScriptCache*(wdb: WalletDb, descriptor: string,
+    entries: seq[tuple[script: seq[byte], address: string]]) =
+  ## Upsert the cached scripts of one descriptor (descriptor_script_cache).
+  if not wdb.isOpen:
+    raise newException(WalletDbError, "database not open")
+  let db = Sqlite3(wdb.db)
+  for e in entries:
+    if e.script.len == 0:
+      continue
+    var stmt: Sqlite3Stmt
+    var rc = sqlite3_prepare_v2(db,
+      "INSERT OR REPLACE INTO descriptor_script_cache (descriptor, script, address) VALUES (?, ?, ?)".cstring,
+      -1, addr stmt, nil)
+    checkError(db, rc, "prepare script cache upsert")
+    try:
+      checkError(db, sqlite3_bind_text(stmt, 1, descriptor.cstring, -1,
+                                       SQLITE_TRANSIENT), "bind descriptor")
+      checkError(db, sqlite3_bind_blob(stmt, 2, unsafeAddr e.script[0],
+                                       cint(e.script.len), SQLITE_TRANSIENT),
+                 "bind script")
+      checkError(db, sqlite3_bind_text(stmt, 3, e.address.cstring, -1,
+                                       SQLITE_TRANSIENT), "bind address")
+      rc = sqlite3_step(stmt)
+      if rc != SQLITE_DONE:
+        checkError(db, rc, "step script cache upsert")
+    finally:
+      discard sqlite3_finalize(stmt)
+
+proc getDescriptorScriptCache*(wdb: WalletDb, descriptor: string):
+    seq[tuple[script: seq[byte], address: string]] =
+  ## The cached scripts of one descriptor ([] when none are cached).
+  result = @[]
+  if not wdb.isOpen:
+    return
+  let db = Sqlite3(wdb.db)
+  var stmt: Sqlite3Stmt
+  if sqlite3_prepare_v2(db,
+      "SELECT script, address FROM descriptor_script_cache WHERE descriptor = ?".cstring,
+      -1, addr stmt, nil) != SQLITE_OK:
+    return
+  if sqlite3_bind_text(stmt, 1, descriptor.cstring, -1, SQLITE_TRANSIENT) == SQLITE_OK:
+    while sqlite3_step(stmt) == SQLITE_ROW:
+      let n = sqlite3_column_bytes(stmt, 0)
+      if n <= 0:
+        continue
+      var script = newSeq[byte](n)
+      copyMem(addr script[0], sqlite3_column_blob(stmt, 0), n)
+      result.add((script, $sqlite3_column_text(stmt, 1)))
+  discard sqlite3_finalize(stmt)
+
+proc saveImportedDescriptor*(wdb: WalletDb, descriptor, label: string,
+    timestamp: int64, rangeEnd: int, secret: seq[byte],
+    scriptCache: seq[tuple[script: seq[byte], address: string]] = @[]) =
+  ## importdescriptors: the public row, (when the import carried keys) its
+  ## sealed private form, and (when the public form cannot expand on its
+  ## own) its scripts, in one transaction.
+  withWalletTx(wdb):
+    wdb.saveWatchedDescriptor(descriptor, label, timestamp, rangeEnd)
+    if secret.len > 0:
+      wdb.saveDescriptorSecret(descriptor, secret)
+    if scriptCache.len > 0:
+      wdb.saveDescriptorScriptCache(descriptor, scriptCache)
+
+proc getDescriptorSecrets*(wdb: WalletDb):
+    seq[tuple[descriptor: string, secret: seq[byte]]] =
+  ## Every sealed descriptor secret (loaded into wallet.descriptorSecrets).
+  result = @[]
+  if not wdb.isOpen:
+    return
+  let db = Sqlite3(wdb.db)
+  var stmt: Sqlite3Stmt
+  if sqlite3_prepare_v2(db,
+      "SELECT descriptor, secret FROM descriptor_secrets".cstring, -1,
+      addr stmt, nil) != SQLITE_OK:
+    return
+  while sqlite3_step(stmt) == SQLITE_ROW:
+    var secret: seq[byte]
+    let n = sqlite3_column_bytes(stmt, 1)
+    if n > 0:
+      secret = newSeq[byte](n)
+      copyMem(addr secret[0], sqlite3_column_blob(stmt, 1), n)
+    result.add(($sqlite3_column_text(stmt, 0), secret))
   discard sqlite3_finalize(stmt)
 
 proc setWalletFlag*(wdb: WalletDb, key, value: string) =
