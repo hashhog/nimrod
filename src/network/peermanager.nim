@@ -124,6 +124,7 @@ type
   GetAddrCacheEntry* = object
     addrs*: seq[TimestampedAddr]
     expiry*: int64              # unix seconds; redrawn once now > expiry
+    storeSize*: int             # knownAddresses.len when drawn
 
   PeerManager* = ref object
     peers*: Table[string, Peer]
@@ -2264,9 +2265,16 @@ proc buildGetAddrResponse*(pm: PeerManager, peer: Peer): seq[TimestampedAddr] =
     elif ':' in peer.address: "ipv6"
     else: "ipv4"
   let nowSec = getTime().toUnix()
-  if cacheKey in pm.getAddrCache and
-      pm.getAddrCache[cacheKey].expiry >= nowSec:
-    return pm.getAddrCache[cacheKey].addrs
+  # Unlike Core's addrman, knownAddresses starts empty on every boot (it is
+  # not loaded from peers.dat), so an entry drawn from a much smaller store
+  # is redrawn once the store has doubled, and an empty reply is never
+  # cached.  Otherwise a getaddr in the first minutes after a restart would
+  # freeze an empty or tiny reply for a day.  Doubling bounds the extra
+  # draws to log2(store size), so reconnecting still cannot scrape it.
+  if cacheKey in pm.getAddrCache:
+    let c = pm.getAddrCache[cacheKey]
+    if c.expiry >= nowSec and total < 2 * c.storeSize:
+      return c.addrs
   # A uniform random sample, each entry with its stored timestamp, like Core's
   # GetAddressesUnsafe (addrman.cpp GetAddr_: shuffled draw, stored nTime).
   # It used to be knownAddresses[0..count) stamped `now`: the same oldest
@@ -2279,9 +2287,11 @@ proc buildGetAddrResponse*(pm: PeerManager, peer: Peer): seq[TimestampedAddr] =
     swap(idx[i], idx[j])
     let na = pm.knownAddresses[idx[i]]
     addrs.add(TimestampedAddr(timestamp: na.lastSeen, address: na))
-  pm.getAddrCache[cacheKey] = GetAddrCacheEntry(addrs: addrs,
-    expiry: nowSec + GetAddrCacheBaseSec +
-            nodeRng().rand(GetAddrCacheJitterSec - 1))
+  if addrs.len > 0:
+    pm.getAddrCache[cacheKey] = GetAddrCacheEntry(addrs: addrs,
+      expiry: nowSec + GetAddrCacheBaseSec +
+              nodeRng().rand(GetAddrCacheJitterSec - 1),
+      storeSize: total)
   addrs
 
 proc handleAddrInternal*(pm: PeerManager, peer: Peer, msg: P2PMessage) =
